@@ -1,6 +1,8 @@
 defmodule Tightbeam.OrgTest do
   use ExUnit.Case, async: false
 
+  doctest Tightbeam.Org
+
   alias Tightbeam.{DB, Org}
 
   setup do

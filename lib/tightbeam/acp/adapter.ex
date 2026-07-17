@@ -11,7 +11,7 @@ defmodule Tightbeam.Acp.Adapter do
   2. Model via session/set_config_option {configId:"model"} with a BARE name;
      effort rides as "model[effort]" split and applied via the harness's effort
      config id.
-  4. Permission requests auto-allowed by Conn (YOLO); sessions run in the
+  3. Permission requests auto-allowed by Conn (YOLO); sessions run in the
      harness's bypass mode set at session/new time.
   """
 
@@ -35,18 +35,39 @@ defmodule Tightbeam.Acp.Adapter do
 
   ## Client
 
+  @type adapter :: GenServer.server()
+
+  @typedoc "Model reference — bare name or \"name[effort]\" (see parse_model_ref/1)."
+  @type model_ref :: String.t()
+
+  @doc """
+  Start the adapter. Required: `:harness` (:claude | :codex), `:cmd` (adapter
+  argv), `:home` (agent-home dir, exported via the harness's home env var),
+  `:cwd`. Optional: `:env`, `:stderr_path`, `:name`. Performs the ACP
+  initialize handshake before returning.
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
-  @doc "Create a fresh harness session, model applied. Returns {:ok, session_id}."
+  @doc "Create a fresh harness session, model applied (fable-trap rule). Returns {:ok, session_id}."
+  @spec new_session(adapter(), model_ref()) :: {:ok, String.t()}
   def new_session(adapter, model), do: GenServer.call(adapter, {:new_session, model}, 30_000)
 
-  @doc "Adopt an existing harness session (re-applies model). Returns :ok."
+  @doc "Adopt an existing harness session — re-applies the model; never trusts the advertised one."
+  @spec load_session(adapter(), String.t(), model_ref()) :: :ok
   def load_session(adapter, session_id, model), do: GenServer.call(adapter, {:load_session, session_id, model}, 30_000)
 
-  @doc "Run a turn; accumulates chunks; returns {:ok, %{stop_reason, text}}."
+  @doc """
+  Run a turn: sends session/prompt, accumulates agent_message_chunk text while
+  this GenServer keeps routing updates, replies when the harness finishes.
+  """
+  @spec prompt(adapter(), String.t(), String.t(), timeout()) ::
+          {:ok, %{stop_reason: String.t(), text: String.t()}} | {:error, term()}
   def prompt(adapter, session_id, text, timeout \\ 600_000),
     do: GenServer.call(adapter, {:prompt, session_id, text}, timeout + 5_000)
 
+  @doc "The underlying Acp.Conn (for pending_count / quiescence probes)."
+  @spec conn(adapter()) :: pid()
   def conn(adapter), do: GenServer.call(adapter, :conn)
 
   ## Server
@@ -155,7 +176,16 @@ defmodule Tightbeam.Acp.Adapter do
     :ok
   end
 
-  @doc "Split \"gpt-5.6-sol[medium]\" -> {\"gpt-5.6-sol\", \"medium\"}."
+  @doc """
+  Split a model ref into `{model, effort}`; effort is nil when absent.
+
+      iex> Tightbeam.Acp.Adapter.parse_model_ref("gpt-5.6-sol[medium]")
+      {"gpt-5.6-sol", "medium"}
+
+      iex> Tightbeam.Acp.Adapter.parse_model_ref("claude-fable-5")
+      {"claude-fable-5", nil}
+  """
+  @spec parse_model_ref(model_ref()) :: {String.t(), String.t() | nil}
   def parse_model_ref(ref) do
     case Regex.run(~r/^(.*?)\[(.*?)\]$/, ref) do
       [_, model, effort] -> {model, effort}

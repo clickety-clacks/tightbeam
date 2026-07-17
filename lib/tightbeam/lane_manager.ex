@@ -1,7 +1,7 @@
 defmodule Tightbeam.LaneManager do
   @moduledoc """
-  The Reconciler (port-spec review #1 — liveness). The doorbell (SessionLane.
-  nudge) is an optimization; THIS scan is the guarantee. At boot and every
+  The Reconciler — the liveness guarantee. The doorbell (SessionLane.nudge)
+  is an optimization; THIS scan is the guarantee. At boot and every
   `interval` ms it:
   1. recovers running turns → failed_unknown (survives a crash that left a lane
      mid-turn),
@@ -18,12 +18,21 @@ defmodule Tightbeam.LaneManager do
 
   defstruct [:db, :lane_sup, :task_sup, :runner, :interval]
 
+  @doc """
+  Start the reconciler. Required opts: `:lane_sup` (the lane
+  DynamicSupervisor), `:task_sup`, `:runner` (passed through to lanes).
+  Optional: `:db`, `:interval` (scan period, ms), `:name`. Boot recovery runs
+  before the first scan.
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc "Force a reconcile pass now (also used by tests)."
+  @spec reconcile(GenServer.server()) :: :ok
   def reconcile(server \\ __MODULE__), do: GenServer.call(server, :reconcile)
 
   @doc "Ensure a lane exists for a session (idempotent) and nudge it."
+  @spec ensure_lane(GenServer.server(), String.t()) :: :ok
   def ensure_lane(server \\ __MODULE__, session_key), do: GenServer.call(server, {:ensure_lane, session_key})
 
   @impl true

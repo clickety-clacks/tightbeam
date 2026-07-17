@@ -13,6 +13,27 @@ defmodule Tightbeam.EventLog do
 
   alias Tightbeam.DB
 
+  @type db :: GenServer.server()
+
+  @typedoc "A verb/denied event row (payload omitted — it is write-only observability)."
+  @type verb_event :: %{
+          id: integer(),
+          ts: integer(),
+          kind: String.t(),
+          verb: String.t(),
+          origin: String.t(),
+          session_key: String.t() | nil
+        }
+
+  @typedoc "A lifecycle event row (crashes, takeovers, dirty exits …)."
+  @type lifecycle_event :: %{
+          id: integer(),
+          ts: integer(),
+          kind: String.t(),
+          subject: String.t(),
+          detail: String.t() | nil
+        }
+
   @ddl """
   CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,10 +61,16 @@ defmodule Tightbeam.EventLog do
   );
   """
 
+  @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   ## Verb events (dispatch appends these)
 
+  @doc """
+  Append a verb event (`kind` is `"verb"` for an accepted call, `"denied"` for
+  a refused one). Every dispatch outcome gets a row — including the denials.
+  """
+  @spec append_event(db(), String.t(), String.t(), String.t(), String.t() | nil, term()) :: :ok
   def append_event(db \\ Tightbeam.DB, kind, verb, origin, session_key \\ nil, payload \\ nil)
       when kind in ~w(verb denied) do
     {:ok, _} =
@@ -55,6 +82,8 @@ defmodule Tightbeam.EventLog do
     :ok
   end
 
+  @doc "Verb events with id > `after_id`, oldest first — the advance/inspect feed."
+  @spec events_after(db(), integer(), pos_integer()) :: [verb_event()]
   def events_after(db \\ Tightbeam.DB, after_id, limit) do
     {:ok, rows} =
       DB.query(db, "SELECT id, ts, kind, verb, origin, sessionKey FROM events WHERE id > ?1 ORDER BY id LIMIT ?2", [
@@ -69,6 +98,12 @@ defmodule Tightbeam.EventLog do
 
   ## Lifecycle
 
+  @doc """
+  Record a lifecycle event (crash, takeover, dirty exit …). `kind` is open —
+  the lifecycle table deliberately has no CHECK, so new observations never
+  need a migration.
+  """
+  @spec lifecycle(db(), String.t(), String.t(), String.t() | nil) :: :ok
   def lifecycle(db \\ Tightbeam.DB, kind, subject, detail \\ nil) do
     {:ok, _} =
       DB.query(db, "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)", [
@@ -81,6 +116,8 @@ defmodule Tightbeam.EventLog do
     :ok
   end
 
+  @doc "All lifecycle events, oldest first."
+  @spec lifecycle_events(db()) :: [lifecycle_event()]
   def lifecycle_events(db \\ Tightbeam.DB) do
     {:ok, rows} = DB.query(db, "SELECT id, ts, kind, subject, detail FROM lifecycle_events ORDER BY id")
     Enum.map(rows, fn [id, ts, kind, subject, detail] -> %{id: id, ts: ts, kind: kind, subject: subject, detail: detail} end)
@@ -90,8 +127,11 @@ defmodule Tightbeam.EventLog do
 
   @doc """
   Open a new boot epoch. If the previous epoch was never cleanly stamped,
-  record a `dirty_exit` lifecycle event for it. Returns the new epoch id.
+  record a `dirty_exit` lifecycle event for it — crash recording is by
+  inference at the NEXT boot; no component claims to log its own death.
+  Returns the new epoch id.
   """
+  @spec boot(db()) :: pos_integer()
   def boot(db \\ Tightbeam.DB) do
     {:ok, epoch} =
       DB.transaction(db, fn txn ->
@@ -122,6 +162,12 @@ defmodule Tightbeam.EventLog do
     epoch
   end
 
+  @doc """
+  Stamp `epoch` as cleanly shut down. Must run while the DB is still up
+  (`c:Application.prep_stop/1`, not stop) or the next boot infers a dirty
+  exit.
+  """
+  @spec clean_shutdown(db(), pos_integer()) :: :ok
   def clean_shutdown(db \\ Tightbeam.DB, epoch) do
     {:ok, _} = DB.query(db, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
     :ok

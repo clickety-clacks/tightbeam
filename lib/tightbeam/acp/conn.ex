@@ -3,7 +3,7 @@ defmodule Tightbeam.Acp.Conn do
   Owner of one ACP adapter Port: ndjson JSON-RPC over stdio (binary stream
   mode, hand-buffered line splitting — not Erlang {:line,N}, which fragments).
 
-  The async protocol (port-spec review, binding):
+  The async protocol (binding invariants — do not weaken):
   - This GenServer NEVER blocks its own loop. `request/4` stores the caller's
     `from` and replies when the Port answers ({:noreply, ...} + later
     GenServer.reply). Callers (TurnTasks) may block on the call — they are
@@ -36,18 +36,37 @@ defmodule Tightbeam.Acp.Conn do
 
   ## Client
 
+  @type conn :: GenServer.server()
+
+  @doc """
+  Start the Conn. Required: `:cmd` (argv list for the adapter). Optional:
+  `:env` (list of {name, value}), `:stderr_path`, `:subscriber` (pid receiving
+  `{:acp_notification, ...}` / `{:acp_exit, ...}` / quiescence signals),
+  `:name`.
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
-  @doc "JSON-RPC request. opts: :timeout (ms), :session_id (for cancel-on-death)."
+  @doc """
+  JSON-RPC request; blocks the CALLER (never this GenServer) until the adapter
+  answers, the per-request timeout fires, or the Port closes. opts: `:timeout`
+  (ms, default 60_000), `:session_id` (enables cancel-on-caller-death).
+  """
+  @spec request(conn(), String.t(), map(), keyword()) :: {:ok, term()} | {:error, term()}
   def request(conn, method, params, opts \\ []) do
     GenServer.call(conn, {:request, method, params, opts}, :infinity)
   end
 
+  @doc "Fire-and-forget JSON-RPC notification (no id, no reply)."
+  @spec notify(conn(), String.t(), map()) :: :ok
   def notify(conn, method, params), do: GenServer.cast(conn, {:notify, method, params})
 
   @doc "Count of unresolved pending requests (quiescence probe)."
+  @spec pending_count(conn()) :: non_neg_integer()
   def pending_count(conn), do: GenServer.call(conn, :pending_count)
 
+  @doc "Close the Port; all still-waiting callers get `{:error, :closed}`."
+  @spec close(conn()) :: :ok
   def close(conn), do: GenServer.cast(conn, :close)
 
   ## Server

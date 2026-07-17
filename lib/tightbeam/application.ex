@@ -5,7 +5,7 @@ defmodule Tightbeam.Application do
   everything depends on it, so a DB restart deliberately restarts its
   dependents rather than leaving them holding a dead connection.
 
-  Restart intensities are explicit (review #9): the root tolerates few
+  Restart intensities are explicit and deliberate: the root tolerates few
   restarts before escalating; the lane DynamicSupervisor tolerates many
   (individual session lanes are cheap and independent). Adapter processes are
   coordinator-managed (a later child), so their restart/backoff policy lives
@@ -29,6 +29,7 @@ defmodule Tightbeam.Application do
   end
 
   @doc "The production child list (also started manually by the app test)."
+  @spec children() :: [Supervisor.child_spec() | {module(), term()} | module()]
   def children do
     base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())
     File.mkdir_p!(base_dir)
@@ -49,6 +50,8 @@ defmodule Tightbeam.Application do
     ]
   end
 
+  @doc "Root supervisor options — rest_for_one with a tight restart budget."
+  @spec root_opts() :: keyword()
   def root_opts, do: [strategy: :rest_for_one, name: Tightbeam.Supervisor, max_restarts: 3, max_seconds: 30]
 
   @impl true

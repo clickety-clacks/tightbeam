@@ -7,6 +7,43 @@ defmodule Tightbeam.Org do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
+  @type db :: GenServer.server()
+
+  @typedoc """
+  A session row. Identity-is-data: `origin`/`spawned_by` record WHO created it
+  (provenance is append-only fact, not judgment); `handle` is the addressable
+  name other sessions use; `archetype`/`harness`/`provider`/`model` are the
+  current tuning.
+  """
+  @type session :: %{
+          session_key: String.t(),
+          display_name: String.t(),
+          kind: String.t(),
+          order_index: integer(),
+          is_built_in: boolean(),
+          adopted: boolean(),
+          owner_user_id: String.t(),
+          origin: String.t(),
+          spawned_by: String.t() | nil,
+          handle: String.t() | nil,
+          archetype: String.t(),
+          harness: String.t(),
+          provider: String.t(),
+          model: String.t(),
+          thinking_level: String.t() | nil,
+          state: String.t(),
+          created_at: integer(),
+          updated_at: integer()
+        }
+
+  @typedoc "One link in a session's append-only harness-session pointer chain."
+  @type pointer :: %{
+          session_key: String.t(),
+          harness_session_id: String.t(),
+          reason: String.t(),
+          created_at: integer()
+        }
+
   @ddl """
   CREATE TABLE IF NOT EXISTS sessions (
     sessionKey    TEXT PRIMARY KEY,
@@ -39,8 +76,16 @@ defmodule Tightbeam.Org do
   CREATE INDEX IF NOT EXISTS pointers_session ON harness_pointers (sessionKey, id);
   """
 
+  @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
+  @doc """
+  Create a session. Required: `:display_name`, `:owner_user_id`, `:origin`,
+  `:archetype`, `:harness`, `:provider`, `:model`. `:session_key` defaults to
+  a fresh custom key. Raises on duplicate key/handle (UNIQUE) — spawn
+  idempotency lives in the dispatch layer, not here.
+  """
+  @spec create(db(), map()) :: session()
   def create(db \\ Tightbeam.DB, input) do
     transaction!(db, fn txn ->
       session_key =
@@ -81,6 +126,8 @@ defmodule Tightbeam.Org do
     end)
   end
 
+  @doc "Fetch a session by key, or nil."
+  @spec get(db(), String.t()) :: session() | nil
   def get(db \\ Tightbeam.DB, session_key) do
     {:ok, rows} = DB.query(db, select_session_sql() <> " WHERE sessionKey = ?1", [session_key])
 
@@ -90,6 +137,8 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc "Fetch a session by its addressable handle, or nil."
+  @spec get_by_handle(db(), String.t()) :: session() | nil
   def get_by_handle(db \\ Tightbeam.DB, handle) do
     {:ok, rows} = DB.query(db, select_session_sql() <> " WHERE handle = ?1", [handle])
 
@@ -105,6 +154,7 @@ defmodule Tightbeam.Org do
   replay, and broadcast are owner-only for everyone, admin included (spec
   §Multi-user: admin is powers, not a merged feed).
   """
+  @spec list_for_user(db(), String.t(), boolean()) :: [session()]
   def list_for_user(db \\ Tightbeam.DB, user_id, is_admin) do
     {where, params, order} =
       if is_admin do
@@ -119,18 +169,33 @@ defmodule Tightbeam.Org do
     Enum.map(rows, &to_session/1)
   end
 
+  @doc "Rename a session (raises if unknown). Returns the updated session."
+  @spec rename(db(), String.t(), String.t()) :: session()
   def rename(db \\ Tightbeam.DB, session_key, display_name) do
     update(db, session_key, "displayName = ?2", [display_name])
   end
 
+  @doc "Retune a session's model+provider (the `tune` verb's write). Returns the updated session."
+  @spec set_model(db(), String.t(), String.t(), String.t()) :: session()
   def set_model(db \\ Tightbeam.DB, session_key, model, provider) do
     update(db, session_key, "model = ?2, provider = ?3", [model, provider])
   end
 
+  @doc """
+  Retire a session — soft state flip, never a delete: history, provenance, and
+  the pointer chain remain queryable. Returns the updated session.
+  """
+  @spec retire(db(), String.t()) :: session()
   def retire(db \\ Tightbeam.DB, session_key) do
     update(db, session_key, "state = 'retired'", [])
   end
 
+  @doc """
+  Append a harness-session pointer (`reason`: created | loaded | fallback).
+  The chain is append-only — repointing never erases where the session used to
+  live. Raises if the session is unknown.
+  """
+  @spec append_pointer(db(), String.t(), String.t(), String.t()) :: pointer()
   def append_pointer(db \\ Tightbeam.DB, session_key, harness_session_id, reason) do
     transaction!(db, fn txn ->
       must_get(txn, session_key)
@@ -154,6 +219,8 @@ defmodule Tightbeam.Org do
     end)
   end
 
+  @doc "The newest pointer for a session (where it currently lives), or nil."
+  @spec current_pointer(db(), String.t()) :: pointer() | nil
   def current_pointer(db \\ Tightbeam.DB, session_key) do
     case Enum.reverse(pointer_chain(db, session_key)) do
       [pointer | _] -> pointer
@@ -161,6 +228,8 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc "The full pointer chain, oldest first — the session's harness-residence history."
+  @spec pointer_chain(db(), String.t()) :: [pointer()]
   def pointer_chain(db \\ Tightbeam.DB, session_key) do
     {:ok, rows} =
       DB.query(
@@ -182,8 +251,17 @@ defmodule Tightbeam.Org do
     end)
   end
 
+  @doc """
+  The canonical personal-session key for a user (Clawline wire format).
+
+      iex> Tightbeam.Org.personal_session_key("flynn")
+      "agent:main:clawline:flynn:main"
+  """
+  @spec personal_session_key(String.t()) :: String.t()
   def personal_session_key(user_id), do: "agent:main:clawline:#{user_id}:main"
 
+  @doc "A fresh custom-session key for a user (personal key + random suffix)."
+  @spec custom_session_key(String.t()) :: String.t()
   def custom_session_key(user_id) do
     "agent:main:clawline:#{user_id}:main s_#{String.slice(Tightbeam.Id.uuid4(), 0, 8)}"
   end

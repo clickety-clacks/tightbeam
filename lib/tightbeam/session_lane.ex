@@ -5,14 +5,14 @@ defmodule Tightbeam.SessionLane do
   (Ledger enforces one-per-session in SQL), runs it as a monitored TurnTask,
   and on completion records the terminal state + publishes, then drains.
 
-  Topology (port-spec review #4 — monitors, never links):
+  Topology (monitors, never links — a turn crash must never take the lane down):
   - The TurnTask runs under a Task.Supervisor via async_nolink; the lane
     MONITORS it. Task crash → lane gets :DOWN, marks the turn failed, drains on.
   - The turn work itself calls the Adapter (a bounded call the TurnTask may
     block on — it is designed to wait and is monitored by the Conn, which
     cancels on its death).
 
-  Quarantine (review #3): a turn recovered as failed_unknown quarantines its
+  Quarantine: a turn recovered as failed_unknown quarantines its
   session; the lane will not start the next queued turn until the orphaned ACP
   request is observed resolved (Conn.pending_count hits 0 / orphan_resolved) or
   the adapter generation is recycled. E1 proves the mechanism with a fake; the
@@ -33,14 +33,27 @@ defmodule Tightbeam.SessionLane do
     quarantined: false
   ]
 
+  @doc """
+  Start a lane. Required opts: `:session_key`, `:task_sup`, `:runner`
+  (`turn_map -> {:ok, result} | {:error, reason}` — injectable for tests).
+  Registered in `Tightbeam.LaneRegistry`, so at most one lane per session.
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     session_key = Keyword.fetch!(opts, :session_key)
     GenServer.start_link(__MODULE__, opts, name: via(session_key))
   end
 
+  @doc "Registry via-name for a session's lane."
+  @spec via(String.t()) :: {:via, module(), term()}
   def via(session_key), do: {:via, Registry, {Tightbeam.LaneRegistry, session_key}}
 
-  @doc "Nudge the lane to check for work (from client post, wake, or reconciler)."
+  @doc """
+  Nudge the lane to check for work (from client post, wake, or reconciler).
+  A doorbell, not a guarantee — the LaneManager scan is the liveness backstop,
+  so a lost nudge is never lost work.
+  """
+  @spec nudge(String.t()) :: :ok | :no_lane
   def nudge(session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
       [{pid, _}] -> GenServer.cast(pid, :nudge)
@@ -131,7 +144,7 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
-  # At-least-once publication (review #2): the runner already broadcast the
+  # At-least-once publication: the runner already broadcast the
   # assistant message + turn-state during the turn; here we ensure the terminal
   # row is marked published. The publisher hook is injected by the composition
   # root; in E1 the ledger's publishedAt marking is the observable seam.

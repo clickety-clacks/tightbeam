@@ -15,48 +15,75 @@ defmodule Tightbeam.DB do
   use GenServer
   alias Exqlite.Sqlite3
 
+  @typedoc "The DB owner process (name or pid) — pass a test-local name to isolate."
+  @type server :: GenServer.server()
+
+  @typedoc "One result row, positional (SELECT column order)."
+  @type row :: [term()]
+
   defmodule Error do
+    @moduledoc "SQLite failure surfaced as an exception (exqlite returns tuples; we raise)."
     defexception [:message]
   end
 
   ## Client
 
+  @doc "Start the owner. Required: `:path` (SQLite file or `\":memory:\"`). Optional `:name`."
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
-  @doc "Run one SQL statement with params; returns {:ok, rows} (list of lists)."
+  @doc "Run one SQL statement with params; returns `{:ok, rows}` (rows are positional lists)."
+  @spec query(server(), String.t(), [term()]) :: {:ok, [row()]} | {:error, Exception.t()}
   def query(server \\ __MODULE__, sql, params \\ []) do
     GenServer.call(server, {:query, sql, params})
   end
 
   @doc "Execute DDL / statements without results."
+  @spec execute(server(), String.t()) :: :ok | {:error, term()}
   def execute(server \\ __MODULE__, sql) do
     GenServer.call(server, {:execute, sql})
   end
 
   @doc """
-  Run `fun` inside BEGIN IMMEDIATE … COMMIT. `fun` receives a txn handle
-  supporting `q/2` and `exec/1`; any raise rolls back and re-raises.
-  Returns {:ok, fun_result}.
+  Run `fun` inside BEGIN IMMEDIATE … COMMIT, in the owner process — THE way to
+  make a multi-statement change atomic. `fun` receives a `Txn` handle
+  (`q/3`, `exec/2`, `changes/1`); any raise rolls back and is returned as
+  `{:error, exception}`. Returns `{:ok, fun_result}` on commit.
   """
+  @spec transaction(server(), (Tightbeam.DB.Txn.t() -> result)) ::
+          {:ok, result} | {:error, Exception.t()}
+        when result: term()
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
     GenServer.call(server, {:transaction, fun})
   end
 
   @doc "Rows changed by the last statement on this connection."
+  @spec changes(server()) :: non_neg_integer()
   def changes(server \\ __MODULE__), do: GenServer.call(server, :changes)
 
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
 
   defmodule Txn do
-    @moduledoc false
+    @moduledoc """
+    Handle passed to `Tightbeam.DB.transaction/2` callbacks. Runs in the owner
+    process — never hold one outside the callback. Errors RAISE (rolling the
+    transaction back) rather than returning tuples.
+    """
     @type t :: %__MODULE__{conn: reference()}
     defstruct [:conn]
 
+    @doc "Run one SQL statement inside the transaction; returns rows (positional lists)."
+    @spec q(t(), String.t(), [term()]) :: [Tightbeam.DB.row()]
     def q(%__MODULE__{conn: conn}, sql, params \\ []), do: Tightbeam.DB.run_query(conn, sql, params)
+
+    @doc "Execute a statement without results inside the transaction."
+    @spec exec(t(), String.t()) :: :ok
     def exec(%__MODULE__{conn: conn}, sql), do: :ok = Sqlite3.execute(conn, sql)
 
+    @doc "Rows changed by the last statement — the CAS check for guarded UPDATEs."
+    @spec changes(t()) :: non_neg_integer()
     def changes(%__MODULE__{conn: conn}) do
       {:ok, n} = Sqlite3.changes(conn)
       n

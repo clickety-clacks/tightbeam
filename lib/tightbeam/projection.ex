@@ -7,6 +7,28 @@ defmodule Tightbeam.Projection do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
+  @type db :: GenServer.server()
+
+  @typedoc """
+  A stored message. `seq` is the per-store commit order (the replay/live
+  de-dup watermark); `llm_visible_message_id` is the id the harness saw.
+  """
+  @type message :: %{
+          seq: integer(),
+          id: String.t(),
+          session_key: String.t(),
+          role: String.t(),
+          content: String.t(),
+          timestamp: integer(),
+          sender: String.t() | nil,
+          device_id: String.t() | nil,
+          client_message_id: String.t() | nil,
+          reply_to_message_id: String.t() | nil,
+          reply_to_client_message_id: String.t() | nil,
+          llm_visible_message_id: String.t(),
+          attachments: list()
+        }
+
   @ddl """
   CREATE TABLE IF NOT EXISTS messages (
     seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,8 +57,19 @@ defmodule Tightbeam.Projection do
   );
   """
 
+  @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
+  @doc """
+  Append a message, idempotently per client send. Dedupe scope is
+  `(session_key, device_id, client_message_id)` — when both ids are present
+  and a row already exists: same content → `{:duplicate, msg}` (safe client
+  retry), different content → `{:conflict, msg}` (id reuse; caller rejects).
+  Otherwise inserts and returns `{:appended, msg}`. Runs in one transaction so
+  the check and insert are atomic.
+  """
+  @spec append(db(), map()) ::
+          {:appended, message()} | {:duplicate, message()} | {:conflict, message()}
   def append(db \\ Tightbeam.DB, input) do
     transaction!(db, fn txn ->
       existing =
@@ -102,6 +135,8 @@ defmodule Tightbeam.Projection do
     end)
   end
 
+  @doc "Fetch one message by store id, or nil."
+  @spec get(db(), String.t()) :: message() | nil
   def get(db \\ Tightbeam.DB, id) do
     {:ok, rows} =
       DB.query(
@@ -121,6 +156,11 @@ defmodule Tightbeam.Projection do
     end
   end
 
+  @doc """
+  Messages after `after_message_id` (nil or unknown id → from the start), in
+  seq order — the replay feed. `limit` bounds the page.
+  """
+  @spec list_after(db(), String.t(), String.t() | nil, pos_integer()) :: [message()]
   def list_after(db \\ Tightbeam.DB, session_key, after_message_id, limit) do
     after_seq =
       case after_message_id && get(db, after_message_id) do
@@ -143,6 +183,9 @@ defmodule Tightbeam.Projection do
     Enum.map(rows, &to_message/1)
   end
 
+  @doc "Latest message's id + role for a session (catalog preview), or nil if empty."
+  @spec tail(db(), String.t()) ::
+          %{last_message_id: String.t(), last_message_role: String.t()} | nil
   def tail(db \\ Tightbeam.DB, session_key) do
     {:ok, rows} =
       DB.query(
@@ -157,6 +200,8 @@ defmodule Tightbeam.Projection do
     end
   end
 
+  @doc "Upsert a user's last-read pointer for a session (client display state only)."
+  @spec set_read_state(db(), String.t(), String.t(), String.t()) :: :ok
   def set_read_state(db \\ Tightbeam.DB, user_id, session_key, last_read_message_id) do
     transaction!(db, fn txn ->
       Txn.q(
@@ -173,6 +218,8 @@ defmodule Tightbeam.Projection do
     end)
   end
 
+  @doc "All of a user's read pointers, as `%{session_key => last_read_message_id}`."
+  @spec read_states(db(), String.t()) :: %{optional(String.t()) => String.t()}
   def read_states(db \\ Tightbeam.DB, user_id) do
     {:ok, rows} =
       DB.query(db, "SELECT sessionKey, lastReadMessageId FROM read_states WHERE userId = ?1", [

@@ -120,3 +120,16 @@ pattern-conformant; E1 spine sound. Four fixes applied:
 3. uuid4 deduplicated into Tightbeam.Id.
 4. Org.list_for_user documented: wire callers MUST pass is_admin=false
    (owner-only catalogs; admin is powers, not a merged feed).
+
+## Docs layer — Fable authoring pass
+
+Sol's mechanical sweep was reverted per Flynn: the documentation layer encodes
+invariants, so it is pattern-establishment work and Fable authors it. Every
+public function in every module now carries @doc (what + invariant) and @spec;
+shared shapes are @type'd (DB.row, Projection.message, Org.session/pointer,
+EventLog.verb_event/lifecycle_event, ConnRegistry.deliver, Adapter.model_ref);
+pure helpers (Org.personal_session_key, Adapter.parse_model_ref) have running
+doctests; DB.Txn is now documented (it is a cross-module contract, not private);
+all internal review-round citations in moduledocs replaced with the property
+they named. Gate: mix test green (3 doctests + 43 tests), mix docs zero
+warnings.

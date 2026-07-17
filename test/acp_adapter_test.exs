@@ -1,6 +1,8 @@
 defmodule Tightbeam.Acp.AdapterTest do
   use ExUnit.Case, async: false
 
+  doctest Tightbeam.Acp.Adapter
+
   alias Tightbeam.Acp.Adapter
 
   test "parse_model_ref splits effort" do
