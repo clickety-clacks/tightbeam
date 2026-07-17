@@ -320,3 +320,29 @@ Realizes the placement/identity design ruled this week (spec §Placement,
 - Tightbeam.Skeleton.todo!/1: compile-honest stub (typed term()) so the
   composition root compiles under --warnings-as-errors against unfilled
   bodies. Golden-turn test @tag :skip pending E4a (sol un-skips).
+
+## E4a — sol: placement/archetype bodies
+
+Implemented the authored Archetypes and Placement skeleton bodies, added their
+acceptance coverage, removed the compile-honest skeleton helper, and unskipped
+the local golden-turn test.
+
+Flag: the remote ACP adapter binary location is config-shaped and provisional.
+A host may supply `:adapter_bin_dir`; absent that, Placement applies the existing
+`../tightbeam/node_modules/.bin/<adapter>` convention relative to the remote
+host's `base_dir`. The correct fleet-wide installation location remains an
+operator/configuration decision rather than topology embedded in Placement.
+
+Review (Fable, E4a): sol bodies accepted as implemented — resolve/hosts
+exact to contract; the remote env PATH=$PATH trick is correct (ssh re-parses
+the command string, so $PATH expands in the REMOTE shell); stamp-check
+tolerates cat's exit 1; rsync without --delete verified; staging carries no
+auth. One live-fire find was MINE: the coordinator's health/1 and key_name/1
+destructured two-tuple keys after I widened keys to three — /version crashed
+the coordinator on the first post-E4 boot. Fixed (key_name now
+"harness:archetype@host", health maps via key_name; coordinator tests
+updated). Provisional flags standing: remote adapter binary location
+(host config :adapter_bin_dir, else base_dir-relative convention); remote
+session cwd is config.cwd verbatim (per-archetype workdirs later); stderr
+log path not yet host-keyed. wire-first-light re-run PASS against the
+post-E4 gateway (local-path parity proven end to end).

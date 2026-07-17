@@ -37,10 +37,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         do:
           assert(
             {:error, :degraded} =
-              AdapterCoordinator.adapter_for(coordinator, {:claude, "default"})
+              AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "local"})
           )
 
-    assert %{"claude:default" => %{circuit: :open, consecutive_failures: 5}} =
+    assert %{"claude:default@local" => %{circuit: :open, consecutive_failures: 5}} =
              AdapterCoordinator.health(coordinator)
   end
 
@@ -66,14 +66,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          name: :"coordinator_#{System.unique_integer([:positive])}"}
       )
 
-    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default"})
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "local"})
     Process.exit(adapter, :kill)
 
     assert eventually(fn ->
-             AdapterCoordinator.generation(coordinator, {:claude, "default"}) == 2
+             AdapterCoordinator.generation(coordinator, {:claude, "default", "local"}) == 2
            end)
 
-    assert [%{kind: "adapter_down", subject: "claude:default"}] =
+    assert [%{kind: "adapter_down", subject: "claude:default@local"}] =
              EventLog.lifecycle_events(ctx.db)
   end
 

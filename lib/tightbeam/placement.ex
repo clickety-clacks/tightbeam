@@ -81,7 +81,8 @@ defmodule Tightbeam.Placement do
   """
   @spec hosts(String.t()) :: %{optional(String.t()) => host_config()}
   def hosts(base_dir) do
-    Tightbeam.Skeleton.todo!("TODO(sol): merge %{\"local\" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}} under Application.get_env(:tightbeam, :hosts, %{}) — #{inspect(base_dir)}")
+    Application.get_env(:tightbeam, :hosts, %{})
+    |> Map.put("local", %{ssh: nil, base_dir: base_dir, cli_bin: nil})
   end
 
   @doc """
@@ -94,7 +95,23 @@ defmodule Tightbeam.Placement do
   @spec resolve(Archetypes.t(), String.t() | nil, %{optional(String.t()) => host_config()}) ::
           {:ok, String.t()} | {:error, %{code: String.t(), message: String.t()}}
   def resolve(archetype, requested_host, hosts) do
-    Tightbeam.Skeleton.todo!("TODO(sol): #{inspect({archetype, requested_host, hosts})}")
+    host = requested_host || hd(archetype.where)
+
+    cond do
+      host not in archetype.where ->
+        {:error,
+         %{
+           code: "host_not_allowed",
+           message:
+             "host #{host} is not allowed; allowed hosts: #{Enum.join(archetype.where, ", ")}"
+         }}
+
+      not Map.has_key?(hosts, host) ->
+        {:error, %{code: "unknown_host", message: "host #{host} is not configured"}}
+
+      true ->
+        {:ok, host}
+    end
   end
 
   @doc """
@@ -103,8 +120,58 @@ defmodule Tightbeam.Placement do
   produce exactly the pre-placement behavior. Calls deliver_home/3.
   """
   @spec adapter_opts(map(), adapter_key()) :: keyword()
-  def adapter_opts(config, {_harness, _archetype, _host} = key) do
-    Tightbeam.Skeleton.todo!("TODO(sol): #{inspect({config, key})}")
+  def adapter_opts(config, {harness, archetype, host} = key) do
+    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+    home = deliver_home(config, key, deliver_opts)
+    host_config = Map.fetch!(hosts(config.base_dir), host)
+    adapter = if harness == :codex, do: "codex-acp", else: "claude-agent-acp"
+
+    binary =
+      if host == "local" do
+        Path.expand("../tightbeam/node_modules/.bin/#{adapter}", File.cwd!())
+      else
+        case Map.get(host_config, :adapter_bin_dir) do
+          nil -> Path.expand("../tightbeam/node_modules/.bin/#{adapter}", host_config.base_dir)
+          adapter_bin_dir -> Path.join(adapter_bin_dir, adapter)
+        end
+      end
+
+    stderr_path = Path.join(config.base_dir, "adapter-#{harness}:#{archetype}.stderr.log")
+
+    if host == "local" do
+      [
+        harness: harness,
+        cmd: [binary],
+        home: home,
+        cwd: config.cwd,
+        stderr_path: stderr_path,
+        env: [
+          {"TIGHTBEAM_HOME", config.base_dir},
+          {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")}
+        ]
+      ]
+    else
+      gateway = config.base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+      cli_bin = host_config[:cli_bin] || ""
+      home_env = if harness == :codex, do: "CODEX_HOME", else: "CLAUDE_CONFIG_DIR"
+
+      remote_env = [
+        "#{home_env}=#{home}",
+        "TIGHTBEAM_HOME=#{host_config.base_dir}",
+        "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
+        "TIGHTBEAM_TOKEN=#{Map.fetch!(gateway, "cliToken")}",
+        "PATH=#{cli_bin}:$PATH"
+      ]
+
+      [
+        harness: harness,
+        cmd: ["ssh", host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+        home: home,
+        cwd: config.cwd,
+        stderr_path: stderr_path,
+        env: []
+      ]
+    end
   end
 
   @doc """
@@ -114,8 +181,70 @@ defmodule Tightbeam.Placement do
   `(cmd :: [String.t()]) -> {output :: String.t(), exit :: integer()}`).
   """
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
-  def deliver_home(config, {_harness, _archetype, _host} = key, opts \\ []) do
-    _ = Homes
-    Tightbeam.Skeleton.todo!("TODO(sol): #{inspect({config, key, opts})}")
+  def deliver_home(config, {harness, archetype_name, host}, opts \\ []) do
+    archetype = Archetypes.get(archetype_name)
+
+    spec = %{
+      harness: harness,
+      archetype: archetype_name,
+      guidance: Archetypes.guidance(archetype)
+    }
+
+    if host == "local" do
+      Homes.project(config.base_dir, spec).home_path
+    else
+      host_config = Map.fetch!(hosts(config.base_dir), host)
+      stage_base = Path.join([config.base_dir, "staging", host])
+      staged_home = Homes.project(stage_base, spec).home_path
+
+      remote_home =
+        Path.join([host_config.base_dir, "homes", archetype_name, Atom.to_string(harness)])
+
+      sh = Keyword.get(opts, :sh, &system_cmd/1)
+
+      {remote_stamp, stamp_exit} =
+        sh.(["ssh", host_config.ssh, "cat", Path.join(remote_home, ".tightbeam-manifest")])
+
+      if stamp_exit not in [0, 1], do: raise("remote stamp check failed with exit #{stamp_exit}")
+
+      staged_stamp = File.read!(Path.join(staged_home, ".tightbeam-manifest"))
+
+      if remote_stamp != staged_stamp do
+        run!(sh, [
+          "ssh",
+          host_config.ssh,
+          "rm",
+          "-rf",
+          remote_home,
+          "&&",
+          "mkdir",
+          "-p",
+          remote_home
+        ])
+      end
+
+      run!(sh, ["rsync", "-a", staged_home <> "/", "#{host_config.ssh}:#{remote_home}/"])
+
+      auth_dir = Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
+
+      link_script =
+        "for source in \"#{auth_dir}\"/*; do " <>
+          "[ -e \"$source\" ] || continue; " <>
+          "target=\"#{remote_home}/$(basename \"$source\")\"; " <>
+          "[ -e \"$target\" ] || [ -L \"$target\" ] || ln -s \"$source\" \"$target\"; " <>
+          "done"
+
+      run!(sh, ["ssh", host_config.ssh, "sh", "-c", link_script])
+      remote_home
+    end
+  end
+
+  defp system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
+
+  defp run!(sh, command) do
+    case sh.(command) do
+      {_output, 0} -> :ok
+      {_output, exit} -> raise "command failed with exit #{exit}: #{Enum.join(command, " ")}"
+    end
   end
 end

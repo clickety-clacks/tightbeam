@@ -3,7 +3,9 @@ defmodule Tightbeam.AdapterCoordinator do
   Owner of adapter lifecycle (port spec §Adapter lifecycle — this module IS
   that section; no TS equivalent, the TS gateway restarted nothing).
 
-  One `Tightbeam.Acp.Adapter` per adapter key `{harness, archetype}`, started
+  One `Tightbeam.Acp.Adapter` per adapter key `{harness, archetype, host}`
+  (§Placement — a host is part of WHERE an adapter is, so it is part of WHICH
+  adapter it is), started
   lazily under a DynamicSupervisor with restart: :temporary — the coordinator
   owns ALL restarts, so `normal` exits and crashes take the same path (no
   supervisor auto-restart racing the coordinator's bookkeeping).
@@ -29,7 +31,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   use GenServer
 
-  @type adapter_key :: {atom(), String.t()}
+  @type adapter_key :: Tightbeam.Placement.adapter_key()
 
   @typedoc "What a lane needs to run a turn: the adapter pid and the generation it belongs to."
   @type checkout :: {:ok, pid(), generation :: pos_integer()} | {:error, :degraded}
@@ -128,8 +130,8 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_call(:health, _from, state) do
     health =
-      Map.new(state.adapters, fn {{harness, archetype}, entry} ->
-        {"#{harness}:#{archetype}",
+      Map.new(state.adapters, fn {key, entry} ->
+        {key_name(key),
          %{
            generation: entry.generation,
            circuit: entry.circuit,
@@ -256,7 +258,7 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp backoff(failures), do: min(1_000 * Integer.pow(2, max(failures - 1, 0)), 60_000)
-  defp key_name({harness, archetype}), do: "#{harness}:#{archetype}"
+  defp key_name({harness, archetype, host}), do: "#{harness}:#{archetype}@#{host}"
 
   defp grant_slot(borrower, state) do
     slot = make_ref()

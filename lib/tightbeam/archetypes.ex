@@ -89,19 +89,36 @@ defmodule Tightbeam.Archetypes do
   """
   @spec load!(String.t()) :: %{optional(String.t()) => t()}
   def load!(base_dir) do
-    Tightbeam.Skeleton.todo!("TODO(sol): #{inspect(base_dir)} — parse with Toml.decode!/1; store via :persistent_term.put(#{inspect(@persist_key)}, map)")
+    manifest_dir = Path.join([base_dir, "identity", "archetypes"])
+
+    archetypes =
+      manifest_dir
+      |> Path.join("*.toml")
+      |> Path.wildcard()
+      |> Enum.sort()
+      |> Enum.reduce(%{"default" => builtin_default()}, fn path, loaded ->
+        manifest = path |> File.read!() |> Toml.decode!()
+        archetype = validate!(manifest, path)
+        Map.put(loaded, archetype.name, archetype)
+      end)
+
+    :persistent_term.put(@persist_key, archetypes)
+    archetypes
   end
 
   @doc "The loaded archetype by name, or nil. Reads :persistent_term (load!/1 must have run)."
   @spec get(String.t()) :: t() | nil
   def get(name) do
-    Tightbeam.Skeleton.todo!("TODO(sol): #{inspect(name)}")
+    Map.get(:persistent_term.get(@persist_key), name)
   end
 
   @doc "All loaded archetype names."
   @spec names() :: [String.t()]
   def names do
-    Tightbeam.Skeleton.todo!("TODO(sol)")
+    @persist_key
+    |> :persistent_term.get()
+    |> Map.keys()
+    |> Enum.sort()
   end
 
   @doc """
@@ -110,8 +127,42 @@ defmodule Tightbeam.Archetypes do
   """
   @spec guidance(t()) :: String.t()
   def guidance(archetype) do
-    _ = @scheduling_wakes_skill
-    Tightbeam.Skeleton.todo!("TODO(sol): #{inspect(archetype)}")
+    preamble =
+      [
+        "# Tightbeam · #{archetype.name}",
+        "",
+        "You are an agent in a Tightbeam dark factory. You can talk to other",
+        "sessions and schedule your own follow-ups with the `tightbeam` CLI.",
+        "See the scheduling-wakes skill below.",
+        "",
+        "## Skill: scheduling-wakes",
+        @scheduling_wakes_skill
+      ]
+      |> Enum.join("\n")
+
+    materials =
+      case archetype.references do
+        [] ->
+          nil
+
+        references ->
+          lines =
+            Enum.flat_map(references, fn reference ->
+              ["- #{reference.name}: #{reference.location}"] ++
+                if(reference.access, do: ["  access: #{reference.access}"], else: [])
+            end)
+
+          Enum.join(["## Your materials" | lines], "\n")
+      end
+
+    with_materials = if materials, do: preamble <> "\n" <> materials, else: preamble
+
+    if archetype.guidance do
+      separator = if materials, do: "\n\n", else: "\n"
+      with_materials <> separator <> archetype.guidance
+    else
+      with_materials
+    end
   end
 
   @doc "The built-in default archetype (used when no manifest overrides it)."
@@ -119,4 +170,61 @@ defmodule Tightbeam.Archetypes do
   def builtin_default do
     %{name: "default", where: ["local"], defaults: %{}, references: [], guidance: nil}
   end
+
+  defp validate!(manifest, path) do
+    allowed = MapSet.new(["name", "where", "defaults", "references", "guidance"])
+
+    unknown =
+      manifest |> Map.keys() |> MapSet.new() |> MapSet.difference(allowed) |> MapSet.to_list()
+
+    if unknown != [] do
+      raise ArgumentError,
+            "unknown top-level archetype keys in #{path}: #{unknown |> Enum.sort() |> Enum.join(", ")}"
+    end
+
+    name = Map.get(manifest, "name", Path.basename(path, ".toml"))
+    where = Map.get(manifest, "where", ["local"])
+
+    unless is_list(where) and where != [] and Enum.all?(where, &is_binary/1) do
+      raise ArgumentError, "archetype where must be a non-empty list of strings: #{path}"
+    end
+
+    raw_defaults = Map.get(manifest, "defaults", %{})
+    harness = raw_defaults["harness"]
+
+    if harness not in [nil, "claude", "codex"] do
+      raise ArgumentError, "archetype defaults.harness must be claude or codex: #{path}"
+    end
+
+    defaults =
+      %{}
+      |> maybe_put(:harness, harness && String.to_existing_atom(harness))
+      |> maybe_put(:model, raw_defaults["model"])
+
+    references =
+      manifest
+      |> Map.get("references", %{})
+      |> Enum.sort_by(fn {reference_name, _reference} -> reference_name end)
+      |> Enum.map(fn {reference_name, reference} ->
+        location = reference["location"]
+
+        unless is_binary(location) do
+          raise ArgumentError,
+                "archetype reference #{reference_name} is missing location: #{path}"
+        end
+
+        %{name: reference_name, location: location, access: reference["access"]}
+      end)
+
+    %{
+      name: name,
+      where: where,
+      defaults: defaults,
+      references: references,
+      guidance: get_in(manifest, ["guidance", "text"])
+    }
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end
