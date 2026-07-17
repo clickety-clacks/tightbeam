@@ -31,6 +31,7 @@ defmodule Tightbeam.Org do
           provider: String.t(),
           model: String.t(),
           thinking_level: String.t() | nil,
+          host: String.t(),
           state: String.t(),
           created_at: integer(),
           updated_at: integer()
@@ -61,6 +62,7 @@ defmodule Tightbeam.Org do
     provider      TEXT NOT NULL CHECK (provider IN ('anthropic','openai')),
     model         TEXT NOT NULL,
     thinkingLevel TEXT,
+    host          TEXT NOT NULL DEFAULT 'local',
     state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
     createdAt     INTEGER NOT NULL,
     updatedAt     INTEGER NOT NULL
@@ -77,7 +79,16 @@ defmodule Tightbeam.Org do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    result = DB.execute(db, @ddl)
+    # Additive migration for pre-placement databases (incl. TS-created ones,
+    # adopt-in-place): a DEFAULT'd column is invisible to writers that name
+    # their columns. Duplicate-column error means already migrated.
+    case DB.query(db, "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT 'local'") do
+      {:ok, _} -> result
+      {:error, e} -> if inspect(e) =~ "duplicate column", do: result, else: raise(e)
+    end
+  end
 
   @doc """
   Create a session. Required: `:display_name`, `:owner_user_id`, `:origin`,
@@ -98,9 +109,9 @@ defmodule Tightbeam.Org do
         """
           INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
             ownerUserId, origin, spawnedBy, handle, archetype, harness, provider, model,
-            thinkingLevel, state, createdAt, updatedAt)
+            thinkingLevel, host, state, createdAt, updatedAt)
           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-            ?15, 'active', ?16, ?16)
+            ?15, ?16, 'active', ?17, ?17)
         """,
         [
           session_key,
@@ -118,6 +129,7 @@ defmodule Tightbeam.Org do
           Map.fetch!(input, :provider),
           Map.fetch!(input, :model),
           Map.get(input, :thinking_level),
+          Map.get(input, :host, "local"),
           now
         ]
       )
@@ -179,6 +191,18 @@ defmodule Tightbeam.Org do
   @spec set_model(db(), String.t(), String.t(), String.t()) :: session()
   def set_model(db \\ Tightbeam.DB, session_key, model, provider) do
     update(db, session_key, "model = ?2, provider = ?3", [model, provider])
+  end
+
+  @doc """
+  Re-home a session (the move half of `tune`). Records the new host only —
+  the next turn's adapter checkout uses it; the old harness session's
+  load-failure falls back to a fresh session by existing pointer machinery.
+  Constitutional validation (host ∈ archetype.where) happens in Placement
+  BEFORE this write; this is the dumb recorder. Returns the updated session.
+  """
+  @spec set_host(db(), String.t(), String.t()) :: session()
+  def set_host(db \\ Tightbeam.DB, session_key, host) do
+    update(db, session_key, "host = ?2", [host])
   end
 
   @doc """
@@ -294,7 +318,7 @@ defmodule Tightbeam.Org do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, handle, archetype, harness, provider,
-           model, thinkingLevel, state, createdAt, updatedAt
+           model, thinkingLevel, host, state, createdAt, updatedAt
     FROM sessions
     """
   end
@@ -315,6 +339,7 @@ defmodule Tightbeam.Org do
          provider,
          model,
          thinking_level,
+         host,
          state,
          created_at,
          updated_at
@@ -335,6 +360,7 @@ defmodule Tightbeam.Org do
       provider: provider,
       model: model,
       thinking_level: thinking_level,
+      host: host,
       state: state,
       created_at: created_at,
       updated_at: updated_at

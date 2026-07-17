@@ -26,6 +26,8 @@ defmodule Tightbeam.MixProject do
       # Wire front: Bandit serves Plug (HTTP control plane) + WebSock (Clawline WS).
       {:bandit, "~> 1.5"},
       {:websock_adapter, "~> 0.5"},
+      # Archetype manifests are TOML (spec §Agent identity; rails will share the format).
+      {:toml, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

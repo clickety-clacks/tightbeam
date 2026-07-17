@@ -59,9 +59,10 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.{
     AdapterCoordinator,
+    Archetypes,
+    Placement,
     DB,
     Devices,
-    Homes,
     Idempotency,
     LaneManager,
     Ledger,
@@ -72,30 +73,6 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.Wire.Payloads
-
-  @scheduling_wakes_skill """
-  Use the `tightbeam` CLI to coordinate with other sessions. Run
-  `tightbeam help` any time for full, authoritative usage of every command and
-  flag. Your identity for every call is your own handle, passed with
-  `--as <handle>` (this is WHO the call is from, not the target).
-
-  - DM another session now (delivers a prompt it will act on):
-      tightbeam wake <sessionKeyOrHandle> --prompt "..." --as <your-handle>
-  - Schedule a follow-up for yourself or another session later:
-      tightbeam wake <target> --prompt "..." --after 5m --as <your-handle>
-      (durations: 30s, 5m, 2h)
-  - Hire a worker session:
-      tightbeam spawn --display "Reviewer" --name reviewer:x --harness codex \\
-        --model "gpt-5.6-sol[high]" --as <your-handle>
-  - See the org you can address:
-      tightbeam list --as <your-handle>
-  - Cancel a pending wake:
-      tightbeam cancel-wake <wakeId> --as <your-handle>
-
-  A wake always carries a prompt — there is no content-free ping. A wake is not
-  an obligation to reply; act only if you have something to add.
-  """
-  |> String.trim()
 
   @model_catalog %{
     "claude" => [
@@ -148,45 +125,11 @@ defmodule Tightbeam.Gateway do
     handler_table = handlers(Map.put(config, :db, db))
     runner = turn_runner(Map.put(config, :db, db))
 
-    adapter_opts = fn {harness, archetype} ->
-      guidance =
-        [
-          "# Tightbeam · #{archetype}",
-          "",
-          "You are an agent in a Tightbeam dark factory. You can talk to other",
-          "sessions and schedule your own follow-ups with the `tightbeam` CLI.",
-          "See the scheduling-wakes skill below.",
-          "",
-          "## Skill: scheduling-wakes",
-          @scheduling_wakes_skill
-        ]
-        |> Enum.join("\n")
+    # Identity is loaded at composition time; a malformed manifest fails the
+    # boot (bad law stops the factory). Placement owns every host mechanic.
+    Archetypes.load!(config.base_dir)
 
-      home =
-        Homes.project(config.base_dir, %{
-          harness: harness,
-          archetype: archetype,
-          guidance: guidance
-        })
-
-      binary =
-        Path.expand(
-          "../tightbeam/node_modules/.bin/#{if harness == :codex, do: "codex-acp", else: "claude-agent-acp"}",
-          File.cwd!()
-        )
-
-      [
-        harness: harness,
-        cmd: [binary],
-        home: home.home_path,
-        cwd: config.cwd,
-        stderr_path: Path.join(config.base_dir, "adapter-#{harness}:#{archetype}.stderr.log"),
-        env: [
-          {"TIGHTBEAM_HOME", config.base_dir},
-          {"PATH", cli_bin <> ":" <> (System.get_env("PATH") || "")}
-        ]
-      ]
-    end
+    adapter_opts = fn key -> Placement.adapter_opts(Map.put(config, :cli_bin, cli_bin), key) end
 
     socket_deps = %{
       db: db,
@@ -319,7 +262,7 @@ defmodule Tightbeam.Gateway do
       "inspect" => fn call -> inspect_result(db, call) end,
       "cancel" => fn _call -> %{ok: false, code: "not_running", message: "no turn in flight"} end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
-      "tune" => fn call -> tune_result(db, call) end,
+      "tune" => fn call -> tune_result(config, db, call) end,
       "retire" => fn call -> retire_result(db, call) end
     }
   end
@@ -534,7 +477,7 @@ defmodule Tightbeam.Gateway do
         with {:ok, adapter, generation} <-
                AdapterCoordinator.adapter_for(
                  Tightbeam.AdapterCoordinator,
-                 {String.to_existing_atom(session.harness), session.archetype}
+                 {String.to_existing_atom(session.harness), session.archetype, session.host}
                ),
              {:ok, harness_session_id} <-
                harness_session(db, adapter, generation, session, turn.seq),
@@ -713,12 +656,31 @@ defmodule Tightbeam.Gateway do
   defp create_spawn(config, db, call, caller) do
     p = call.params
     defaults = defaults(config)
-    harness = p[:harness] || defaults.harness
+    archetype_name = p[:archetype] || defaults.archetype
+
+    # Identity must exist; placement is constitutional set membership
+    # (spec §Placement) — Placement denies, we relay, nobody judges.
+    case Archetypes.get(archetype_name) do
+      nil ->
+        %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
+
+      archetype ->
+        case Placement.resolve(archetype, p[:host], Placement.hosts(config.base_dir)) do
+          {:error, denial} -> denial
+          {:ok, host} -> create_spawn(config, db, call, caller, archetype, host)
+        end
+    end
+  end
+
+  defp create_spawn(config, db, call, caller, archetype, host) do
+    p = call.params
+    defaults = defaults(config)
+    harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
     harness_string = to_string(harness)
     sessions = Org.list_for_user(db, caller.owner_user_id, false)
 
     model =
-      p[:model] ||
+      p[:model] || archetype.defaults[:model] ||
         if(harness == defaults.harness,
           do: defaults.model,
           else:
@@ -734,7 +696,8 @@ defmodule Tightbeam.Gateway do
         spawned_by: caller.caller_session && caller.caller_session.session_key,
         handle: p[:handle],
         order_index: length(sessions),
-        archetype: p[:archetype] || defaults.archetype,
+        archetype: archetype.name,
+        host: host,
         harness: harness_string,
         provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
         model: model
@@ -752,7 +715,7 @@ defmodule Tightbeam.Gateway do
     %{stream: stream, session_key: session.session_key, handle: session.handle}
   end
 
-  defp tune_result(db, call) do
+  defp tune_result(config, db, call) do
     p = call.params
 
     cond do
@@ -761,6 +724,29 @@ defmodule Tightbeam.Gateway do
         stream = Payloads.stream_session(session)
         broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
         %{stream: stream}
+
+      p[:setting] == "set_host" and is_binary(p[:host]) ->
+        case Org.get(db, call.session_key) do
+          nil ->
+            %{ok: false, code: "not_found"}
+
+          session ->
+            archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
+
+            case Placement.resolve(archetype, p.host, Placement.hosts(config.base_dir)) do
+              {:error, denial} ->
+                Map.put(denial, :ok, false)
+
+              {:ok, host} ->
+                # Fresh-context move (this increment): record the host; the
+                # next turn's checkout targets the new host's adapter, the
+                # old harness session's load-failure falls back per the
+                # existing pointer machinery. Transcript carry-over is a
+                # journaled later step.
+                Org.set_host(db, call.session_key, host)
+                %{ok: true, host: host}
+            end
+        end
 
       p[:setting] != "set_model" or not is_binary(p[:model]) ->
         %{ok: false, code: "unsupported", message: "tune does not support #{p[:setting]} yet"}
@@ -779,7 +765,7 @@ defmodule Tightbeam.Gateway do
                  {:ok, adapter, _generation} <-
                    AdapterCoordinator.adapter_for(
                      coordinator,
-                     {String.to_existing_atom(session.harness), session.archetype}
+                     {String.to_existing_atom(session.harness), session.archetype, session.host}
                    ) do
               AdapterCoordinator.with_load_slot(coordinator, fn ->
                 Adapter.load_session(adapter, pointer.harness_session_id, p.model)

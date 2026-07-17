@@ -31,3 +31,24 @@ end
 if value = System.get_env("TIGHTBEAM_WAKE_TICK_MS") do
   config :tightbeam, :wake_tick_ms, String.to_integer(value)
 end
+
+if value = System.get_env("TIGHTBEAM_ADVERTISED_URL") do
+  config :tightbeam, :advertised_url, value
+end
+
+# Hosts are instance config (spec §Placement): JSON map of
+# name => {"ssh": destination-or-null, "base_dir": path, "cli_bin": path?}.
+# "local" is reserved and merged in by Placement.hosts/1.
+if value = System.get_env("TIGHTBEAM_HOSTS") do
+  hosts =
+    for {name, h} <- JSON.decode!(value), into: %{} do
+      {name,
+       %{
+         ssh: h["ssh"],
+         base_dir: Map.fetch!(h, "base_dir"),
+         cli_bin: h["cli_bin"]
+       }}
+    end
+
+  config :tightbeam, :hosts, hosts
+end

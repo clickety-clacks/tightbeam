@@ -290,3 +290,33 @@ devices (client-invisible, but bytes crossed the wire). Fan-out is now
 owner-only in both publish_message and broadcast; test inverted to pin it.
 Skeleton bug (Fable), third of its kind — TS-as-built remains the oracle for
 every observable surface.
+
+## E4 skeleton (Fable): placement + minimal archetype manifests
+
+Realizes the placement/identity design ruled this week (spec §Placement,
+§Agent identity references; decisions ledger 2026-07-17 entries). Authored:
+- Tightbeam.Archetypes (skeleton): TOML manifests (name/where/defaults/
+  references/guidance) under identity/archetypes/, boot-time load into
+  :persistent_term, fail-boot on malformed law; guidance compilation owns
+  the wakes skill + renders references as "## Your materials". Deliberately
+  NOT the full identity compiler (fragments/skills/MCP/hash-homes remain
+  the later milestone). Built-in default archetype (where ["local"]).
+- Tightbeam.Placement (skeleton): the ONE module that knows hosts exist.
+  Hosts = instance config ("local" reserved); resolve/3 = constitutional
+  set-membership with deny-and-explain; adapter_opts/2 = ssh-wrapped cmd
+  with ALL agent env embedded remotely (advertised_url for TIGHTBEAM_URL);
+  deliver_home/3 = local Homes.project | stage-without-auth → remote stamp
+  compare → rsync (never --delete) → remote auth ln -s loop; injectable :sh.
+- Org: host column (additive migration, adopt-safe: DEFAULT 'local'),
+  host in create/select/mapper, set_host/3 (implemented, not skeleton).
+- Gateway wiring (implemented): Archetypes.load! at composition; adapter
+  keys widened to {harness, archetype, host} end-to-end; spawn goes
+  archetype-exists → Placement.resolve → create with host (archetype
+  defaults slot between explicit params and global defaults); tune gains
+  set_host (fresh-context move; transcript carry-over journaled as later).
+- Decisions: minimal manifests now / full compiler later; "local" reserved;
+  moves are fresh-context this increment; hosts via TIGHTBEAM_HOSTS JSON +
+  TIGHTBEAM_ADVERTISED_URL; deps + toml (~> 0.7).
+- Tightbeam.Skeleton.todo!/1: compile-honest stub (typed term()) so the
+  composition root compiles under --warnings-as-errors against unfilled
+  bodies. Golden-turn test @tag :skip pending E4a (sol un-skips).
