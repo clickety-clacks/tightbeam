@@ -173,4 +173,31 @@ defmodule Tightbeam.PlacementTest do
       0 -> Enum.reverse(acc)
     end
   end
+
+  test "hosts.json registry merges under env config and register_host records", %{} do
+    base = Path.join(System.tmp_dir!(), "tb-reg-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(base)
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    assert {:error, %{code: "invalid"}} = Placement.register_host(base, "local", %{ssh: "x", base_dir: "/y"})
+
+    assert {:ok, entry} =
+             Placement.register_host(base, "work-1", %{ssh: "work-1.example", base_dir: "/home/u/.tightbeam"})
+
+    assert entry.ssh == "work-1.example"
+
+    hosts = Placement.hosts(base)
+    assert hosts["work-1"].base_dir == "/home/u/.tightbeam"
+    assert hosts["local"].ssh == nil
+
+    # env config overrides the registry entry-for-entry
+    Application.put_env(:tightbeam, :hosts, %{"work-1" => %{ssh: "override", base_dir: "/o", cli_bin: nil}})
+    on_exit(fn -> Application.delete_env(:tightbeam, :hosts) end)
+    assert Placement.hosts(base)["work-1"].ssh == "override"
+
+    # re-register updates in place
+    assert {:ok, _} = Placement.register_host(base, "work-1", %{ssh: "w2", base_dir: "/z"})
+    Application.delete_env(:tightbeam, :hosts)
+    assert Placement.hosts(base)["work-1"].ssh == "w2"
+  end
 end

@@ -255,6 +255,21 @@ defmodule Tightbeam.Gateway do
           Devices.revoke(db, p.device_id)
           %{revoked: p.device_id}
         end),
+      "register-host" =>
+        admin_handler(db, fn p ->
+          # The dumb half of assimilation (spec §Placement): the CLI ceremony
+          # prepared the machine; this records the fact. Placement refuses
+          # "local"; everything else is the operator's topology to declare.
+          case Placement.register_host(config.base_dir, p.name, %{
+                 ssh: p[:ssh] || p.name,
+                 base_dir: Map.fetch!(p, :base_dir),
+                 cli_bin: p[:cli_bin],
+                 adapter_bin_dir: p[:adapter_bin_dir]
+               }) do
+            {:ok, entry} -> %{host: p.name, config: entry}
+            {:error, denial} -> denial
+          end
+        end),
       "promote-user" =>
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}

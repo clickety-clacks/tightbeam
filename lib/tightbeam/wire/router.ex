@@ -43,7 +43,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{Devices, Dispatch, Org}
   alias Tightbeam.Wire.{Payloads, Socket}
 
-  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user)
+  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host)
 
   @impl Plug
   def call(conn, opts) do

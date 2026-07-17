@@ -76,13 +76,67 @@ defmodule Tightbeam.Placement do
   @type adapter_key :: {harness :: atom(), archetype :: String.t(), host :: String.t()}
 
   @doc """
-  The configured hosts map with "local" always present (ssh: nil, base_dir =
-  the gateway's base_dir). Config hosts may not redefine "local" ssh.
+  The known hosts map with "local" always present (ssh: nil, base_dir = the
+  gateway's base_dir). Merge order, weakest first: the instance registry
+  (`<base_dir>/hosts.json`, written only by `register_host/3` — the
+  register-host verb's recorder), then env config (:tightbeam, :hosts — a
+  deploy-time override), then the reserved "local". Nothing may redefine
+  "local".
   """
   @spec hosts(String.t()) :: %{optional(String.t()) => host_config()}
   def hosts(base_dir) do
-    Application.get_env(:tightbeam, :hosts, %{})
+    registry_hosts(base_dir)
+    |> Map.merge(Application.get_env(:tightbeam, :hosts, %{}))
     |> Map.put("local", %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+  end
+
+  @doc """
+  Record (or update) a host in the instance registry — the DUMB half of
+  assimilation: the CLI ceremony prepares the machine; this writes the fact.
+  Admin gating happens in the verb handler, not here. "local" is refused.
+  Returns the stored config.
+  """
+  @spec register_host(String.t(), String.t(), host_config()) ::
+          {:ok, host_config()} | {:error, %{code: String.t(), message: String.t()}}
+  def register_host(_base_dir, "local", _config),
+    do: {:error, %{code: "invalid", message: "\"local\" is reserved and cannot be registered"}}
+
+  def register_host(base_dir, name, config) do
+    entry = %{
+      ssh: Map.fetch!(config, :ssh),
+      base_dir: Map.fetch!(config, :base_dir),
+      cli_bin: Map.get(config, :cli_bin),
+      adapter_bin_dir: Map.get(config, :adapter_bin_dir)
+    }
+
+    path = registry_path(base_dir)
+    updated = Map.put(read_registry(path), name, entry)
+    File.write!(path, JSON.encode!(updated))
+    {:ok, entry}
+  end
+
+  defp registry_path(base_dir), do: Path.join(base_dir, "hosts.json")
+
+  defp registry_hosts(base_dir) do
+    base_dir |> registry_path() |> read_registry()
+  end
+
+  defp read_registry(path) do
+    case File.read(path) do
+      {:ok, raw} ->
+        for {name, h} <- JSON.decode!(raw), into: %{} do
+          {name,
+           %{
+             ssh: h["ssh"],
+             base_dir: h["base_dir"],
+             cli_bin: h["cli_bin"],
+             adapter_bin_dir: h["adapter_bin_dir"]
+           }}
+        end
+
+      {:error, :enoent} ->
+        %{}
+    end
   end
 
   @doc """

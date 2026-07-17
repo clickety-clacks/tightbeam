@@ -346,3 +346,17 @@ updated). Provisional flags standing: remote adapter binary location
 session cwd is config.cwd verbatim (per-archetype workdirs later); stderr
 log path not yet host-keyed. wire-first-light re-run PASS against the
 post-E4 gateway (local-path parity proven end to end).
+
+## Host onboarding (Fable): register-host verb + hosts.json registry
+
+Per Flynn: satellite onboarding must be a CLI command, not a runbook. Design
+(now in spec §Placement): the ceremony lives in the CLIENT (`tightbeam
+assimilate <ssh-dest>` — prepares the machine over ssh), the FACT lives in
+the substrate (admin-gated register-host verb writing base_dir/hosts.json).
+Placement.hosts/1 merge order: hosts.json < env :tightbeam,:hosts < reserved
+"local". Credentials are HARVESTED from the satellite's own harness logins
+by default; pushing is an explicit flag. The substrate performs no remote
+setup — an incompletely assimilated host degrades as a failing adapter.
+Verb added to router AGENT_VERBS. CLI assimilate implementation dispatched
+to sol (TS repo — freeze exception journaled there: CLI is shared surface,
+placement-critical).
