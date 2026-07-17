@@ -92,3 +92,15 @@ established — port each module imitating existing lib/ + tests:
 E2 EXIT: scripts/blackbox/{wire,dm,agent-uses-cli} (the TS referee binaries)
 pass against the BEAM gateway on a real adapter. Then E3 (adopt-in-place, sim
 E2E, soak) + cutover.
+
+## E2b — sol — Projection + Org
+
+Ported Tightbeam.Projection from store.ts: messages/read_states schemas,
+transactional append with client-message duplicate/conflict semantics,
+provider-visible message ids, JSON attachments, cursor replay, tails, and read
+state upserts. Ported registry.ts as Tightbeam.Org (avoiding Elixir Registry):
+sessions/harness_pointers schemas, user/admin active catalogs, mutations,
+append-only pointer chains, and personal/custom session-key helpers. SQL keeps
+the TypeScript camelCase schema exactly; Elixir context inputs and returned maps
+use snake_case consistently with the existing modules. 44 tests + 1 doctest
+green.
