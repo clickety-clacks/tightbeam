@@ -20,6 +20,20 @@ defmodule Tightbeam.Ledger do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
+  @typedoc "A queued/claimed turn as returned by claim_next/3."
+  @type turn :: %{
+          seq: integer(),
+          message_id: String.t(),
+          origin: String.t(),
+          prompt: String.t(),
+          wake_id: String.t() | nil
+        }
+
+  @typedoc "Terminal states — one-way; no transition leaves them."
+  @type terminal :: String.t()
+
+  @type db :: GenServer.server()
+
   @ddl """
   CREATE TABLE IF NOT EXISTS turns (
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +62,7 @@ defmodule Tightbeam.Ledger do
     ON turns (endedAt) WHERE endedAt IS NOT NULL AND publishedAt IS NULL;
   """
 
+  @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc """
@@ -55,6 +70,7 @@ defmodule Tightbeam.Ledger do
   persists the message row, so message+turn commit together). Returns seq.
   Raises on wakeId conflict (caller treats as already-enqueued).
   """
+  @spec enqueue_in_txn(Txn.t(), map()) :: integer()
   def enqueue_in_txn(%Txn{} = txn, attrs) do
     now = System.system_time(:millisecond)
 
@@ -75,6 +91,7 @@ defmodule Tightbeam.Ledger do
   end
 
   @doc "Convenience: enqueue outside an existing transaction."
+  @spec enqueue(db(), map()) :: {:ok, integer()} | {:error, :duplicate_wake | term()}
   def enqueue(db \\ Tightbeam.DB, attrs) do
     case DB.transaction(db, fn txn -> enqueue_in_txn(txn, attrs) end) do
       {:ok, seq} -> {:ok, seq}
@@ -93,6 +110,7 @@ defmodule Tightbeam.Ledger do
   (one-turn-per-session in SQL). Returns {:ok, %{seq:, prompt:, ...}} or
   :none or :busy.
   """
+  @spec claim_next(db(), String.t(), String.t()) :: {:ok, turn()} | :busy | :none
   def claim_next(db \\ Tightbeam.DB, session_key, owner) do
     now = System.system_time(:millisecond)
 
@@ -135,6 +153,7 @@ defmodule Tightbeam.Ledger do
   Exactly-one durable terminal transition (CAS). Returns :ok if this caller
   won the transition, :already_terminal otherwise.
   """
+  @spec finish(db(), integer(), terminal(), String.t() | nil) :: :ok | :already_terminal
   def finish(db \\ Tightbeam.DB, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
     now = System.system_time(:millisecond)
@@ -157,6 +176,7 @@ defmodule Tightbeam.Ledger do
   failed_unknown (never auto-retried; tools may have executed). Returns the
   seqs transitioned, for exactly-one terminal publication by the caller.
   """
+  @spec recover_running(db()) :: [integer()]
   def recover_running(db \\ Tightbeam.DB) do
     now = System.system_time(:millisecond)
 
@@ -177,6 +197,7 @@ defmodule Tightbeam.Ledger do
   end
 
   @doc "Sessions with pending work — the Reconciler's feed (liveness scan)."
+  @spec pending_sessions(db()) :: [String.t()]
   def pending_sessions(db \\ Tightbeam.DB) do
     {:ok, rows} =
       DB.query(db, "SELECT DISTINCT sessionKey FROM turns WHERE status IN ('queued','running')")
@@ -185,6 +206,7 @@ defmodule Tightbeam.Ledger do
   end
 
   @doc "Terminal rows not yet published (at-least-once publication feed)."
+  @spec unpublished_terminals(db()) :: [map()]
   def unpublished_terminals(db \\ Tightbeam.DB) do
     {:ok, rows} =
       DB.query(db, """
@@ -197,6 +219,7 @@ defmodule Tightbeam.Ledger do
     end)
   end
 
+  @spec mark_published(db(), integer()) :: :ok
   def mark_published(db \\ Tightbeam.DB, seq) do
     now = System.system_time(:millisecond)
     {:ok, _} = DB.query(db, "UPDATE turns SET publishedAt = ?2 WHERE seq = ?1", [seq, now])
@@ -204,6 +227,7 @@ defmodule Tightbeam.Ledger do
   end
 
   @doc "Conservation audit: non-terminal rows older than max_age_ms. Must be []."
+  @spec non_terminal_older_than(db(), integer()) :: [integer()]
   def non_terminal_older_than(db \\ Tightbeam.DB, max_age_ms) do
     cutoff = System.system_time(:millisecond) - max_age_ms
 

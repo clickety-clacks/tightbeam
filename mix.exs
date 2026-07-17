@@ -7,7 +7,9 @@ defmodule Tightbeam.MixProject do
       version: "0.1.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      name: "Tightbeam",
+      docs: [main: "Tightbeam", extras: ["docs/ARCHITECTURE.md", "docs/HANDOFF.md"]]
     ]
   end
 
@@ -20,7 +22,8 @@ defmodule Tightbeam.MixProject do
 
   defp deps do
     [
-      {:exqlite, "~> 0.27"}
+      {:exqlite, "~> 0.27"},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
 end

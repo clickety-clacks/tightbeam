@@ -51,6 +51,7 @@ defmodule Tightbeam.DB do
 
   defmodule Txn do
     @moduledoc false
+    @type t :: %__MODULE__{conn: reference()}
     defstruct [:conn]
 
     def q(%__MODULE__{conn: conn}, sql, params \\ []), do: Tightbeam.DB.run_query(conn, sql, params)
