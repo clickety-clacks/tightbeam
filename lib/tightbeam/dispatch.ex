@@ -49,7 +49,37 @@ defmodule Tightbeam.Dispatch do
   """
   @spec dispatch(GenServer.server(), handlers(), call()) :: {:ok, map()} | {:error, map()}
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
-    _ = EventLog
-    raise "TODO(sol): #{inspect({db, handlers, call})}"
+    verb = Map.fetch!(call, :verb)
+    origin = Map.fetch!(call, :origin)
+    session_key = Map.get(call, :session_key)
+
+    case Map.fetch(handlers, verb) do
+      :error ->
+        error = %{code: "unknown_verb"}
+        :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error)
+        {:error, error}
+
+      {:ok, handler} ->
+        case invoke(handler, call) do
+          {:returned, %{code: _} = error} ->
+            :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error)
+            {:error, error}
+
+          {:returned, result} ->
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, result)
+            {:ok, result}
+
+          {:raised, exception} ->
+            error = %{code: "server_error", message: Exception.message(exception)}
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, error)
+            {:error, error}
+        end
+    end
+  end
+
+  defp invoke(handler, call) do
+    {:returned, handler.(call)}
+  rescue
+    exception -> {:raised, exception}
   end
 end

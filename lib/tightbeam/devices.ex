@@ -13,6 +13,7 @@ defmodule Tightbeam.Devices do
   """
 
   alias Tightbeam.DB
+  alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
 
@@ -73,19 +74,76 @@ defmodule Tightbeam.Devices do
           model: String.t() | nil
         }) :: pair_outcome()
   def pair(db \\ Tightbeam.DB, input) do
-    raise "TODO(sol): port devices.ts pair/1 — #{inspect({db, input})}"
+    transaction!(db, fn txn ->
+      device_id = Map.fetch!(input, :device_id)
+
+      case select_device(txn, "d.deviceId = ?1", [device_id]) do
+        [row] ->
+          case to_device(row) do
+            %{status: "denied"} ->
+              :denied
+
+            %{status: "pending"} = device ->
+              {:pending, device}
+
+            %{status: "allowlisted"} ->
+              Txn.q(txn, "UPDATE devices SET token = ?2 WHERE deviceId = ?1", [
+                device_id,
+                mint_token()
+              ])
+
+              {:paired, must_get(txn, device_id)}
+          end
+
+        [] ->
+          claimed_name = Map.fetch!(input, :claimed_name)
+          user_id = slug_user_id(claimed_name)
+          first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
+          ensure_user(txn, user_id, first_ever?)
+          status = if first_ever?, do: "allowlisted", else: "pending"
+          token = if first_ever?, do: mint_token(), else: nil
+
+          Txn.q(
+            txn,
+            """
+              INSERT INTO devices
+                (deviceId, userId, claimedName, status, token, platform, model, createdAt)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            """,
+            [
+              device_id,
+              user_id,
+              claimed_name,
+              status,
+              token,
+              Map.fetch!(input, :platform),
+              Map.fetch!(input, :model),
+              now()
+            ]
+          )
+
+          device = must_get(txn, device_id)
+          if first_ever?, do: {:paired, device}, else: {:pending, device}
+      end
+    end)
   end
 
   @doc "Device by bearer token — ONLY if allowlisted (revoked/pending tokens never resolve)."
   @spec by_token(db(), String.t()) :: device() | nil
   def by_token(db \\ Tightbeam.DB, token) do
-    raise "TODO(sol): #{inspect({db, token})}"
+    {:ok, rows} =
+      DB.query(db, select_device_sql() <> " WHERE d.token = ?1 AND d.status = 'allowlisted'", [
+        token
+      ])
+
+    one_device_or_nil(rows)
   end
 
   @doc "Device by id regardless of status (for auth-failure reason mapping)."
   @spec by_id(db(), String.t()) :: device() | nil
   def by_id(db \\ Tightbeam.DB, device_id) do
-    raise "TODO(sol): #{inspect({db, device_id})}"
+    {:ok, rows} = DB.query(db, select_device_sql() <> " WHERE d.deviceId = ?1", [device_id])
+    one_device_or_nil(rows)
   end
 
   @doc """
@@ -95,42 +153,184 @@ defmodule Tightbeam.Devices do
   """
   @spec approve(db(), String.t(), String.t() | nil) :: device()
   def approve(db \\ Tightbeam.DB, device_id, user_id \\ nil) do
-    raise "TODO(sol): #{inspect({db, device_id, user_id})}"
+    transaction!(db, fn txn ->
+      must_get(txn, device_id)
+      if user_id, do: ensure_user(txn, user_id, false)
+
+      Txn.q(
+        txn,
+        """
+          UPDATE devices
+          SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3
+          WHERE deviceId = ?1
+        """,
+        [device_id, user_id, mint_token()]
+      )
+
+      must_get(txn, device_id)
+    end)
   end
 
   @doc "Deny a device: status → denied, token cleared. Raises on unknown device."
   @spec deny(db(), String.t()) :: :ok
   def deny(db \\ Tightbeam.DB, device_id) do
-    raise "TODO(sol): #{inspect({db, device_id})}"
+    transaction!(db, fn txn ->
+      must_get(txn, device_id)
+
+      Txn.q(txn, "UPDATE devices SET status = 'denied', token = NULL WHERE deviceId = ?1", [
+        device_id
+      ])
+
+      :ok
+    end)
   end
 
   @doc "Revoke a device's token (status unchanged — it re-pairs). Raises on unknown device."
   @spec revoke(db(), String.t()) :: :ok
   def revoke(db \\ Tightbeam.DB, device_id) do
-    raise "TODO(sol): #{inspect({db, device_id})}"
+    transaction!(db, fn txn ->
+      must_get(txn, device_id)
+      Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
+      :ok
+    end)
   end
 
   @doc "User row by id, or nil."
   @spec user(db(), String.t()) :: user() | nil
   def user(db \\ Tightbeam.DB, user_id) do
-    raise "TODO(sol): #{inspect({db, user_id})}"
+    {:ok, rows} =
+      DB.query(db, "SELECT userId, isAdmin, createdAt FROM users WHERE userId = ?1", [user_id])
+
+    case rows do
+      [row] -> to_user(row)
+      [] -> nil
+    end
   end
 
   @doc "Set a user's admin bit (the promote-user verb's write). Raises on unknown user."
   @spec set_user_admin(db(), String.t(), boolean()) :: user()
   def set_user_admin(db \\ Tightbeam.DB, user_id, is_admin) do
-    raise "TODO(sol): #{inspect({db, user_id, is_admin})}"
+    transaction!(db, fn txn ->
+      must_get_user(txn, user_id)
+
+      Txn.q(txn, "UPDATE users SET isAdmin = ?2 WHERE userId = ?1", [
+        user_id,
+        if(is_admin, do: 1, else: 0)
+      ])
+
+      must_get_user(txn, user_id)
+    end)
   end
 
   @doc "Pending devices, oldest first (the approval queue)."
   @spec list_pending(db()) :: [device()]
   def list_pending(db \\ Tightbeam.DB) do
-    raise "TODO(sol): #{inspect(db)}"
+    {:ok, rows} =
+      DB.query(db, select_device_sql() <> " WHERE d.status = 'pending' ORDER BY d.createdAt")
+
+    Enum.map(rows, &to_device/1)
   end
 
   @doc "Count of users with at least one allowlisted device."
   @spec user_count(db()) :: non_neg_integer()
   def user_count(db \\ Tightbeam.DB) do
-    raise "TODO(sol): #{inspect(db)}"
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT COUNT(DISTINCT userId) FROM devices WHERE status = 'allowlisted'")
+
+    count
   end
+
+  defp select_device_sql do
+    """
+    SELECT d.deviceId, d.userId, d.claimedName, d.status, d.token, d.platform,
+           d.model, d.createdAt, u.isAdmin
+    FROM devices d JOIN users u ON u.userId = d.userId
+    """
+  end
+
+  defp select_device(txn, where, params) do
+    Txn.q(txn, select_device_sql() <> " WHERE #{where}", params)
+  end
+
+  defp must_get(txn, device_id) do
+    case select_device(txn, "d.deviceId = ?1", [device_id]) do
+      [row] -> to_device(row)
+      [] -> raise ArgumentError, "unknown device: #{device_id}"
+    end
+  end
+
+  defp one_device_or_nil([row]), do: to_device(row)
+  defp one_device_or_nil([]), do: nil
+
+  defp to_device([
+         device_id,
+         user_id,
+         claimed_name,
+         status,
+         token,
+         platform,
+         model,
+         created_at,
+         is_admin
+       ]) do
+    %{
+      device_id: device_id,
+      user_id: user_id,
+      claimed_name: claimed_name,
+      status: status,
+      is_admin: is_admin == 1,
+      token: token,
+      platform: platform,
+      model: model,
+      created_at: created_at
+    }
+  end
+
+  defp ensure_user(txn, user_id, is_admin) do
+    case Txn.q(txn, "SELECT userId FROM users WHERE userId = ?1", [user_id]) do
+      [] ->
+        Txn.q(txn, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, ?2, ?3)", [
+          user_id,
+          if(is_admin, do: 1, else: 0),
+          now()
+        ])
+
+      [_] ->
+        :ok
+    end
+  end
+
+  defp must_get_user(txn, user_id) do
+    case Txn.q(txn, "SELECT userId, isAdmin, createdAt FROM users WHERE userId = ?1", [user_id]) do
+      [row] -> to_user(row)
+      [] -> raise ArgumentError, "unknown user: #{user_id}"
+    end
+  end
+
+  defp to_user([user_id, is_admin, created_at]) do
+    %{user_id: user_id, is_admin: is_admin == 1, created_at: created_at}
+  end
+
+  defp slug_user_id(claimed_name) do
+    case claimed_name
+         |> String.downcase()
+         |> String.replace(~r/[^a-z0-9]+/, "-")
+         |> String.trim("-") do
+      "" -> "user"
+      slug -> slug
+    end
+  end
+
+  defp mint_token do
+    "tbt_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
+  end
+
+  defp transaction!(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp now, do: System.system_time(:millisecond)
 end

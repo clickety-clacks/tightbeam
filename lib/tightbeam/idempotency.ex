@@ -7,6 +7,7 @@ defmodule Tightbeam.Idempotency do
   """
 
   alias Tightbeam.DB
+  alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
 
@@ -33,12 +34,57 @@ defmodule Tightbeam.Idempotency do
   @doc "Prior result for this (owner, operation, key), or nil."
   @spec get(db(), String.t(), String.t(), String.t()) :: row() | nil
   def get(db \\ Tightbeam.DB, owner_user_id, operation, idempotency_key) do
-    raise "TODO(sol): #{inspect({db, owner_user_id, operation, idempotency_key})}"
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+          SELECT ownerUserId, operation, idempotencyKey, sessionKey
+          FROM wire_idempotency
+          WHERE ownerUserId = ?1 AND operation = ?2 AND idempotencyKey = ?3
+        """,
+        [owner_user_id, operation, idempotency_key]
+      )
+
+    case rows do
+      [[owner_user_id, operation, idempotency_key, session_key]] ->
+        %{
+          owner_user_id: owner_user_id,
+          operation: operation,
+          idempotency_key: idempotency_key,
+          session_key: session_key
+        }
+
+      [] ->
+        nil
+    end
   end
 
   @doc "Record a completed operation's session_key under its key."
   @spec put(db(), row()) :: :ok
   def put(db \\ Tightbeam.DB, row) do
-    raise "TODO(sol): #{inspect({db, row})}"
+    transaction!(db, fn txn ->
+      Txn.q(
+        txn,
+        """
+          INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey)
+          VALUES (?1, ?2, ?3, ?4)
+        """,
+        [
+          Map.fetch!(row, :owner_user_id),
+          Map.fetch!(row, :operation),
+          Map.fetch!(row, :idempotency_key),
+          Map.fetch!(row, :session_key)
+        ]
+      )
+
+      :ok
+    end)
+  end
+
+  defp transaction!(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
   end
 end

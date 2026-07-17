@@ -133,3 +133,34 @@ doctests; DB.Txn is now documented (it is a cross-module contract, not private);
 all internal review-round citations in moduledocs replaced with the property
 they named. Gate: mix test green (3 doctests + 43 tests), mix docs zero
 warnings.
+
+## E2a — sol: store layer
+
+Implemented the authored Devices, Idempotency, Wakes/WakeScheduler,
+Wire.Payloads, and Dispatch skeletons, plus their ExUnit acceptance coverage.
+
+TS-vs-skeleton discrepancies implemented in favor of the skeleton as directed:
+- wakes.ts delivers a due wake before changing it to fired, leaves failed
+  deliveries pending for retry, and stores firedAt. The skeleton instead
+  requires a transactional pending/due CAS to fired before delivery and has no
+  firedAt column.
+- wakes.ts listPending optionally filters by sessionKey and accepts an injected
+  clock. The skeleton exposes only unscoped list_pending/1 and uses system time.
+- payloads.ts includes sessionInfo and streamTailState builders, but the
+  skeleton defines no signatures for them, so no extra public functions were
+  added.
+- devices.ts makes platform/model optional and payloads.ts makes prompt-state
+  error optional. The skeleton map specs require those keys with nullable
+  values, so the Elixir functions require the keys and omit only nil wire keys.
+- dispatch.ts uses a mutable registry and guard, throws on unknown/denied calls,
+  and appends no event for unknown verbs or handler failures. The skeleton uses
+  an immutable handler map and requires error tuples plus exactly one denied or
+  verb event for every outcome.
+
+Review (Fable): sol correctly flagged the wakes.ts discrepancy above — the
+skeleton was wrong, not the port. wakes.ts order (deliver → mark fired on
+success; failures stay pending for retry) is load-bearing for the kill
+matrix, so Wakes was corrected to deliver-then-mark, firedAt restored (E3
+adopt-in-place needs TS-compatible schema), the wakes_due index made
+non-partial to match TS, and a failed-delivery-retries test added. All other
+E2a modules accepted as implemented.
