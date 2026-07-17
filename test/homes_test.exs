@@ -66,6 +66,32 @@ defmodule Tightbeam.HomesTest do
              ~S({"secret":"real"})
   end
 
+  test "unchanged manifest preserves nested harness state and tops up new auth", %{
+    base_dir: base_dir
+  } do
+    spec = %{harness: :codex, archetype: "coder", guidance: "v1"}
+    first = Homes.project(base_dir, spec)
+
+    # Harness session state nests inside the home; a restart must not kill it.
+    sessions_dir = Path.join(first.home_path, "sessions")
+    File.mkdir_p!(sessions_dir)
+    File.write!(Path.join(sessions_dir, "rollout-1.jsonl"), "conversation memory")
+
+    # A credential added after first projection gets linked on the next pass.
+    File.write!(Path.join([base_dir, "auth", "codex", "extra.pem"]), "later cred")
+
+    second = Homes.project(base_dir, spec)
+
+    assert File.read!(Path.join(sessions_dir, "rollout-1.jsonl")) == "conversation memory"
+    assert "extra.pem" in second.linked_auth_files
+    assert File.lstat!(Path.join(second.home_path, "extra.pem")).type == :symlink
+
+    # An identity CHANGE still deletes and reassembles (forfeiting nested state).
+    third = Homes.project(base_dir, %{spec | guidance: "v2"})
+    refute File.exists?(Path.join(third.home_path, "sessions/rollout-1.jsonl"))
+    assert File.read!(Path.join(third.home_path, "AGENTS.md")) == "v2"
+  end
+
   test "different archetypes get sibling homes sharing one auth source", %{base_dir: base_dir} do
     a = Homes.project(base_dir, %{harness: :codex, archetype: "coder", guidance: "c"})
 

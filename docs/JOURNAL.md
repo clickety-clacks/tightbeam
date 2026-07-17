@@ -263,3 +263,19 @@ against one substrate correctly yields pair_pending → auth denied.
 Remaining acceptance wall (E3): golden-trace comparator, ExUnit additions
 (kill matrix, replay-under-write over a real socket), adopt-in-place, sim
 E2E, soak.
+
+## Defect fix — projection wiped harness conversation memory (Fable)
+
+Found while answering "where do agent folders materialize": harnesses nest
+their session state (transcripts/sessions) INSIDE the config dir we project,
+and Homes.project (faithfully porting project.ts) rm_rf'd the home on every
+adapter start — so every gateway reboot silently destroyed all sessions'
+model-side memory and session/load would fall back to fresh sessions. The
+bible already said "regenerated on identity change"; both implementations
+over-triggered. Fix: projection is now idempotent, gated on a manifest hash
+stamped into the home (.tightbeam-manifest). Unchanged manifest → home left
+alone, missing auth symlinks topped up; changed manifest → full delete +
+reassemble (identity change forfeits nested state by design). Test added
+(nested state survives restart; new auth topped up; identity change still
+wipes). NOTE: the TS reference has the same defect (projectHome rm -rf on
+every adapterFor); TS repo is feature-frozen during the port — record only.
