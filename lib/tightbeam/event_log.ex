@@ -1,0 +1,135 @@
+defmodule Tightbeam.EventLog do
+  @moduledoc """
+  Append-only observability (T5): verb events, lifecycle events, and boot
+  epochs. Nothing consumes these to make decisions in the core — they exist so
+  every failure has a row and a reason, and so future rule reactions have a
+  feed. Additive tables only; the shared `events` table (verb|denied) keeps
+  its original CHECK — lifecycle records go to their own table.
+
+  Crash recording is BY INFERENCE (spec: lifecycle acceptance): a boot epoch
+  with no clean-shutdown stamp is recorded as a dirty exit at the NEXT boot.
+  No component claims to log its own death.
+  """
+
+  alias Tightbeam.DB
+
+  @ddl """
+  CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,
+    kind       TEXT    NOT NULL CHECK (kind IN ('verb','denied')),
+    verb       TEXT    NOT NULL,
+    origin     TEXT    NOT NULL,
+    sessionKey TEXT,
+    payload    TEXT    NOT NULL DEFAULT 'null'
+  );
+  CREATE INDEX IF NOT EXISTS events_session ON events (sessionKey, id);
+
+  CREATE TABLE IF NOT EXISTS lifecycle_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      INTEGER NOT NULL,
+    kind    TEXT    NOT NULL,
+    subject TEXT    NOT NULL,
+    detail  TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS boot_epochs (
+    epoch           INTEGER PRIMARY KEY AUTOINCREMENT,
+    bootedAt        INTEGER NOT NULL,
+    cleanShutdownAt INTEGER
+  );
+  """
+
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+
+  ## Verb events (dispatch appends these)
+
+  def append_event(db \\ Tightbeam.DB, kind, verb, origin, session_key \\ nil, payload \\ nil)
+      when kind in ~w(verb denied) do
+    {:ok, _} =
+      DB.query(db, """
+        INSERT INTO events (ts, kind, verb, origin, sessionKey, payload)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      """, [now(), kind, verb, origin, session_key, encode(payload)])
+
+    :ok
+  end
+
+  def events_after(db \\ Tightbeam.DB, after_id, limit) do
+    {:ok, rows} =
+      DB.query(db, "SELECT id, ts, kind, verb, origin, sessionKey FROM events WHERE id > ?1 ORDER BY id LIMIT ?2", [
+        after_id,
+        limit
+      ])
+
+    Enum.map(rows, fn [id, ts, kind, verb, origin, sk] ->
+      %{id: id, ts: ts, kind: kind, verb: verb, origin: origin, session_key: sk}
+    end)
+  end
+
+  ## Lifecycle
+
+  def lifecycle(db \\ Tightbeam.DB, kind, subject, detail \\ nil) do
+    {:ok, _} =
+      DB.query(db, "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)", [
+        now(),
+        kind,
+        subject,
+        detail
+      ])
+
+    :ok
+  end
+
+  def lifecycle_events(db \\ Tightbeam.DB) do
+    {:ok, rows} = DB.query(db, "SELECT id, ts, kind, subject, detail FROM lifecycle_events ORDER BY id")
+    Enum.map(rows, fn [id, ts, kind, subject, detail] -> %{id: id, ts: ts, kind: kind, subject: subject, detail: detail} end)
+  end
+
+  ## Boot epochs — dirty-exit inference
+
+  @doc """
+  Open a new boot epoch. If the previous epoch was never cleanly stamped,
+  record a `dirty_exit` lifecycle event for it. Returns the new epoch id.
+  """
+  def boot(db \\ Tightbeam.DB) do
+    {:ok, epoch} =
+      DB.transaction(db, fn txn ->
+        prior =
+          Tightbeam.DB.Txn.q(txn, """
+            SELECT epoch FROM boot_epochs
+            WHERE cleanShutdownAt IS NULL ORDER BY epoch DESC LIMIT 1
+          """)
+
+        case prior do
+          [[e]] ->
+            Tightbeam.DB.Txn.q(txn, "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1,?2,?3,?4)", [
+              now(),
+              "dirty_exit",
+              "epoch:#{e}",
+              "prior epoch had no clean shutdown"
+            ])
+
+          [] ->
+            :ok
+        end
+
+        Tightbeam.DB.Txn.q(txn, "INSERT INTO boot_epochs (bootedAt) VALUES (?1)", [now()])
+        [[epoch]] = Tightbeam.DB.Txn.q(txn, "SELECT last_insert_rowid()")
+        epoch
+      end)
+
+    epoch
+  end
+
+  def clean_shutdown(db \\ Tightbeam.DB, epoch) do
+    {:ok, _} = DB.query(db, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
+    :ok
+  end
+
+  defp now, do: System.system_time(:millisecond)
+
+  defp encode(nil), do: "null"
+  defp encode(term) when is_binary(term), do: term
+  defp encode(term), do: inspect(term)
+end
