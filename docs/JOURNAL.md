@@ -230,3 +230,14 @@ Sol's engine seams (append_in_txn, generation stamps, terminal-publish
 callback, registry-owned takeover, global rate windows) all accepted —
 registry-owned takeover judged MORE atomic than the skeleton's socket-owned
 variant.
+
+## E2c — sol: homes projection + runtime config
+
+Ported the disposable harness-home projection from `src/homes/project.ts`:
+homes are rebuilt at `homes/<archetype>/<harness>`, receive the harness-specific
+guidance file and optional extra files, and symlink operator-owned credentials
+from `auth/<harness>` without copying or modifying the auth source. Gateway
+adapter startup now projects those homes with the verbatim scheduling-wakes
+guidance and archetype header from `gateway.ts`. Added runtime environment
+projection for the six requested `TIGHTBEAM_*` settings without changing code
+defaults.

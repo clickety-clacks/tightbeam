@@ -1,0 +1,80 @@
+defmodule Tightbeam.HomesTest do
+  use ExUnit.Case, async: true
+
+  alias Tightbeam.Homes
+
+  setup do
+    base_dir =
+      Path.join(System.tmp_dir!(), "tb-homes-#{System.unique_integer([:positive])}")
+
+    auth_dir = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "auth.json"), ~S({"secret":"real"}))
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+    %{base_dir: base_dir}
+  end
+
+  test "projects instructions file per harness and symlinks auth in", %{base_dir: base_dir} do
+    home =
+      Homes.project(base_dir, %{
+        harness: :codex,
+        archetype: "coder",
+        guidance: "# Coder rules"
+      })
+
+    assert home.home_path == Path.join([base_dir, "homes", "coder", "codex"])
+    assert File.read!(Path.join(home.home_path, "AGENTS.md")) == "# Coder rules"
+    assert home.linked_auth_files == ["auth.json"]
+    link = Path.join(home.home_path, "auth.json")
+    assert File.lstat!(link).type == :symlink
+    assert File.read_link!(link) == Path.join([base_dir, "auth", "codex", "auth.json"])
+  end
+
+  test "claude homes get CLAUDE.md and tolerate a missing auth dir", %{base_dir: base_dir} do
+    home =
+      Homes.project(base_dir, %{
+        harness: :claude,
+        archetype: "default",
+        guidance: "# Hi"
+      })
+
+    assert File.exists?(Path.join(home.home_path, "CLAUDE.md"))
+    assert home.linked_auth_files == []
+  end
+
+  test "regeneration is delete + reassemble and never touches the auth source", %{
+    base_dir: base_dir
+  } do
+    first =
+      Homes.project(base_dir, %{harness: :codex, archetype: "coder", guidance: "v1"})
+
+    File.write!(Path.join(first.home_path, "stray-state.db"), "harness scribbles")
+
+    second =
+      Homes.project(base_dir, %{
+        harness: :codex,
+        archetype: "coder",
+        guidance: "v2",
+        extra_files: %{"skills/review/SKILL.md" => "# Review"}
+      })
+
+    assert File.read!(Path.join(second.home_path, "AGENTS.md")) == "v2"
+    refute File.exists?(Path.join(second.home_path, "stray-state.db"))
+    assert File.read!(Path.join(second.home_path, "skills/review/SKILL.md")) == "# Review"
+
+    assert File.read!(Path.join([base_dir, "auth", "codex", "auth.json"])) ==
+             ~S({"secret":"real"})
+  end
+
+  test "different archetypes get sibling homes sharing one auth source", %{base_dir: base_dir} do
+    a = Homes.project(base_dir, %{harness: :codex, archetype: "coder", guidance: "c"})
+
+    b =
+      Homes.project(base_dir, %{harness: :codex, archetype: "reviewer", guidance: "r"})
+
+    refute a.home_path == b.home_path
+
+    assert File.read_link!(Path.join(a.home_path, "auth.json")) ==
+             File.read_link!(Path.join(b.home_path, "auth.json"))
+  end
+end

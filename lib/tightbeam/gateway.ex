@@ -61,6 +61,7 @@ defmodule Tightbeam.Gateway do
     AdapterCoordinator,
     DB,
     Devices,
+    Homes,
     Idempotency,
     LaneManager,
     Ledger,
@@ -71,6 +72,30 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.Wire.Payloads
+
+  @scheduling_wakes_skill """
+  Use the `tightbeam` CLI to coordinate with other sessions. Run
+  `tightbeam help` any time for full, authoritative usage of every command and
+  flag. Your identity for every call is your own handle, passed with
+  `--as <handle>` (this is WHO the call is from, not the target).
+
+  - DM another session now (delivers a prompt it will act on):
+      tightbeam wake <sessionKeyOrHandle> --prompt "..." --as <your-handle>
+  - Schedule a follow-up for yourself or another session later:
+      tightbeam wake <target> --prompt "..." --after 5m --as <your-handle>
+      (durations: 30s, 5m, 2h)
+  - Hire a worker session:
+      tightbeam spawn --display "Reviewer" --name reviewer:x --harness codex \\
+        --model "gpt-5.6-sol[high]" --as <your-handle>
+  - See the org you can address:
+      tightbeam list --as <your-handle>
+  - Cancel a pending wake:
+      tightbeam cancel-wake <wakeId> --as <your-handle>
+
+  A wake always carries a prompt — there is no content-free ping. A wake is not
+  an obligation to reply; act only if you have something to add.
+  """
+  |> String.trim()
 
   @model_catalog %{
     "claude" => [
@@ -124,8 +149,25 @@ defmodule Tightbeam.Gateway do
     runner = turn_runner(Map.put(config, :db, db))
 
     adapter_opts = fn {harness, archetype} ->
-      home = Path.join([config.base_dir, "homes", "#{harness}-#{archetype}"])
-      File.mkdir_p!(home)
+      guidance =
+        [
+          "# Tightbeam · #{archetype}",
+          "",
+          "You are an agent in a Tightbeam dark factory. You can talk to other",
+          "sessions and schedule your own follow-ups with the `tightbeam` CLI.",
+          "See the scheduling-wakes skill below.",
+          "",
+          "## Skill: scheduling-wakes",
+          @scheduling_wakes_skill
+        ]
+        |> Enum.join("\n")
+
+      home =
+        Homes.project(config.base_dir, %{
+          harness: harness,
+          archetype: archetype,
+          guidance: guidance
+        })
 
       binary =
         Path.expand(
@@ -136,7 +178,7 @@ defmodule Tightbeam.Gateway do
       [
         harness: harness,
         cmd: [binary],
-        home: home,
+        home: home.home_path,
         cwd: config.cwd,
         stderr_path: Path.join(config.base_dir, "adapter-#{harness}:#{archetype}.stderr.log"),
         env: [
