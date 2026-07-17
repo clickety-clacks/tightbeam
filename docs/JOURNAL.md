@@ -52,3 +52,43 @@ Next (E2): Application supervision tree wiring these under one root w/ the
 review-specified restart intensities; then the wire (Bandit WS+HTTP +
 ConnRegistry w/ per-connection seq filter + generation takeover) driven by the
 E0 black-box drivers (sol building those now).
+
+## E2 status + wire handoff (Fable)
+
+DONE and green (30 tests): E1 full spine (DB, Ledger, EventLog, Acp.Conn,
+Acp.Adapter, SessionLane, LaneManager) + E1 vertical slice vs real adapter;
+E2a Application supervision tree (rest_for_one, Boot one-shot); ConnRegistry
+(generation takeover + per-connection seq filter — review #5). E0 referee
+black-box drivers pass in the TS repo.
+
+IN FLIGHT: sol porting Projection (store.ts) + Org (registry.ts) — E2b.
+
+REMAINING for E2 exit (black-box wire driver green vs BEAM), patterns all
+established — port each module imitating existing lib/ + tests:
+- Tightbeam.Devices (from devices.ts): users+devices tables, user-scoped
+  admin, approve/deny/revoke/promote, pairing.
+- Tightbeam.Wire.Payloads (from payloads.ts): pure builders, field-for-field
+  (iOS decoders are strict — echo deviceId+clientMessageId; assistant
+  replyTo*+sender; prompt_turn_state event; sessionKeys[] not sessions[]).
+- Tightbeam.Dispatch: the verb chokepoint (guard hook allow-all in E2; append
+  event post-dispatch) — the rails groove.
+- Verb handlers (post/wake/spawn/cancel/tune/retire/inspect/approve-device/
+  ...) composed in Tightbeam.Gateway (composition root): post/wake share a
+  deliverPrompt that persists via Projection + enqueues via Ledger (SAME
+  transaction: message+turn commit together) then LaneManager.ensure_lane;
+  the SessionLane runner = Acp.Adapter.prompt + persist assistant reply +
+  ConnRegistry.publish_message + Ledger terminal/publish.
+- Wire front: Bandit (add dep) — Plug.Router for HTTP (/version, /agent/
+  dispatch, /upload, /download, /api/*), WebSock handler per connection for
+  /ws (pair/auth/message/stream_read/typing; keepalive; global device rate
+  limits in ConnRegistry; auth registers w/ ConnRegistry, replays via
+  Projection.after advancing note_replayed, then sync_complete).
+- Tightbeam.WakeScheduler (from wakes.ts): durable, delivers by executing the
+  deliverPrompt transaction with wakeId (Ledger dedupe), timer + boot scan.
+- AdapterCoordinator: generation per (harness,archetype); lazy session/load
+  re-adoption bounded; circuit breaker; wire the SessionLane quarantine to
+  observed Acp.Conn quiescence / generation recycle.
+
+E2 EXIT: scripts/blackbox/{wire,dm,agent-uses-cli} (the TS referee binaries)
+pass against the BEAM gateway on a real adapter. Then E3 (adopt-in-place, sim
+E2E, soak) + cutover.
