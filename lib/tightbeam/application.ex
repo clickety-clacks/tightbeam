@@ -21,7 +21,25 @@ defmodule Tightbeam.Application do
   @impl true
   def start(_type, _args) do
     if Application.get_env(:tightbeam, :autostart, true) do
-      Supervisor.start_link(children(), root_opts())
+      with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
+        base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())
+
+        config = %{
+          base_dir: base_dir,
+          cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
+          port: Application.get_env(:tightbeam, :port, 4_321),
+          default_harness: Application.get_env(:tightbeam, :default_harness, :claude),
+          default_model: Application.get_env(:tightbeam, :default_model, "fable"),
+          max_live_sessions_per_user: Application.get_env(:tightbeam, :max_live_sessions_per_user, 50),
+          wake_tick_ms: Application.get_env(:tightbeam, :wake_tick_ms, 1_000)
+        }
+
+        Enum.each(Tightbeam.Gateway.children(config), fn child ->
+          {:ok, _pid} = Supervisor.start_child(supervisor, child)
+        end)
+
+        {:ok, supervisor}
+      end
     else
       # Test env: unit tests own their supervision; boot the tree explicitly.
       Supervisor.start_link([], strategy: :one_for_one, name: Tightbeam.Supervisor)

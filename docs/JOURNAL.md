@@ -164,3 +164,69 @@ matrix, so Wakes was corrected to deliver-then-mark, firedAt restored (E3
 adopt-in-place needs TS-compatible schema), the wakes_due index made
 non-partial to match TS, and a failed-delivery-retries test added. All other
 E2a modules accepted as implemented.
+
+## E2b — sol: wire/composition
+
+Implemented the authored WebSock wire handler, Plug control-plane router,
+adapter lifecycle/load coordinator, and Gateway composition root. The gateway
+now composes the E2 stores with the durable Ledger/Lane pipeline, creates the
+gateway-owned CLI credential/discovery file, exposes the closed verb table,
+and publishes the canonical turn frames in golden order. Added direct WebSock,
+Plug, coordinator, transactional delivery/dedupe, and fake-adapter golden-turn
+coverage.
+
+Skeleton-vs-TS discrepancies implemented in favor of the skeleton as directed:
+- http.ts exposes the client routes as `/api/streams`, `/api/session-status`,
+  and `/api/session-control`; the Router skeleton instead specifies `/streams`,
+  `/sessions/:key/status`, and `/sessions/:key/control`, so only the authored
+  skeleton paths were implemented.
+- gateway.ts appends the echo and enqueues its FIFO turn as separate writes;
+  the Gateway skeleton requires Projection insert + Ledger enqueue in ONE DB
+  transaction, so the Elixir path is atomic and wake UNIQUE rollback removes a
+  second echo as well as the duplicate turn.
+- server.ts performs device takeover in its wire-server connection set. The
+  authored ConnRegistry API returns only the replaced connection reference,
+  not its pid, although Socket's moduledoc says the socket sends the old pid
+  `{:takeover_close}`. ConnRegistry therefore captures the old pid and sends
+  the close notification only after installing the new generation; Socket
+  still owns the close frame/termination behavior.
+
+Documented E2b stubs:
+- `cancel` returns `%{code: "not_running"}` until turn-task kill wiring lands,
+  as explicitly required by the E2b task. Session status continues to advertise
+  the TS-compatible cancel capability.
+- `/upload` returns `{"error":{"code":"not_implemented"}}`; Assets is E3.
+
+Genuinely required engine seams added for the authored composition contract:
+- Projection gained `append_in_txn/2`; without a transaction-handle entry point,
+  Gateway could not atomically commit the echo with `Ledger.enqueue_in_txn/2`.
+- Ledger gained adapter-generation stamp/prior-generation queries, and
+  SessionLane now includes its owned session key in the runner input. The
+  existing claimed-turn map omitted the session key, while the authored runner
+  must resolve Org and lazily reload only after a generation change.
+- SessionLane recognizes a runner terminal-publication callback and invokes it
+  only after winning Ledger.finish CAS. The prior runner contract had no seam
+  capable of producing the documented assistant → terminal → typing-off →
+  activity-off order after durable terminal transition.
+- ConnRegistry gained the documented global per-device sliding windows for
+  pair and typing limits; per-socket state would reset on reconnect and violate
+  Socket's binding invariant.
+
+Review (Fable, E2b): sol implementation accepted with three fixes applied.
+1. SKELETON BUG (mine, sol flagged it): the Router skeleton invented cleaner
+   paths; the wire contract is the TS as-built surface. Routes corrected to
+   /api/streams, PATCH|DELETE /api/streams/:key, /api/session-status?sessionKey=,
+   /api/session-control, /api/trackable-sessions, /download stub — paths are
+   contract, never rename.
+2. RACE (real, in the drain): a message published between ConnRegistry.register
+   and note_replayed passes the registry filter (watermark 0) AND is in the
+   replay window → duplicate after unfiltered drain. Message pushes now arrive
+   as {:push_message, key, seq, payload}; the socket tracks replay watermarks
+   and drains THROUGH them; regression test added.
+3. RACE (narrow): stale :DOWN after adapter_for restarted a dead-but-unreaped
+   adapter would nil the fresh pid and schedule a spurious restart (leak).
+   Coordinator now ignores :DOWN whose ref is not the entry's current monitor.
+Sol's engine seams (append_in_txn, generation stamps, terminal-publish
+callback, registry-owned takeover, global rate windows) all accepted —
+registry-owned takeover judged MORE atomic than the skeleton's socket-owned
+variant.

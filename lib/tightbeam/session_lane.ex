@@ -116,7 +116,7 @@ defmodule Tightbeam.SessionLane do
 
         task =
           Task.Supervisor.async_nolink(state.task_sup, fn ->
-            {turn.seq, runner.(turn)}
+            {turn.seq, runner.(Map.put(turn, :session_key, state.session_key))}
           end)
 
         state
@@ -132,14 +132,18 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp finalize(state, seq, outcome) do
-    {terminal, error} =
+    {terminal, error, publish} =
       case outcome do
-        {:ok, _} -> {"delivered", nil}
-        {:error, reason} -> {"failed", inspect(reason)}
+        {:ok, %{terminal_publish: fun}} when is_function(fun, 1) -> {"delivered", nil, fun}
+        {:ok, _} -> {"delivered", nil, nil}
+        {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) -> {"failed", inspect(reason), fun}
+        {:error, reason} -> {"failed", inspect(reason), nil}
       end
 
     case Ledger.finish(state.db, seq, terminal, error) do
-      :ok -> publish_terminal(state, seq)
+      :ok ->
+        if publish, do: publish.(terminal)
+        publish_terminal(state, seq)
       :already_terminal -> :ok
     end
   end

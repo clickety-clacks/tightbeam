@@ -52,13 +52,13 @@ defmodule Tightbeam.AdapterCoordinator do
   """
   @spec adapter_for(GenServer.server(), adapter_key()) :: checkout()
   def adapter_for(server \\ __MODULE__, key) do
-    raise "TODO(sol): #{inspect({server, key})}"
+    GenServer.call(server, {:adapter_for, key}, 30_000)
   end
 
   @doc "Current generation for a key (0 if never started) — the lane's staleness probe."
   @spec generation(GenServer.server(), adapter_key()) :: non_neg_integer()
   def generation(server \\ __MODULE__, key) do
-    raise "TODO(sol): #{inspect({server, key})}"
+    GenServer.call(server, {:generation, key})
   end
 
   @doc """
@@ -67,17 +67,232 @@ defmodule Tightbeam.AdapterCoordinator do
   """
   @spec with_load_slot(GenServer.server(), (-> result)) :: result when result: term()
   def with_load_slot(server \\ __MODULE__, fun) do
-    raise "TODO(sol): #{inspect({server, fun})}"
+    slot = GenServer.call(server, {:acquire_load_slot, self()}, :infinity)
+
+    try do
+      fun.()
+    after
+      GenServer.cast(server, {:release_load_slot, slot})
+    end
   end
 
   @doc "Health projection for /version: per-key %{generation, circuit, consecutive_failures}."
   @spec health(GenServer.server()) :: %{optional(String.t()) => map()}
   def health(server \\ __MODULE__) do
-    raise "TODO(sol): #{inspect(server)}"
+    GenServer.call(server, :health)
   end
 
   @impl true
   def init(opts) do
-    raise "TODO(sol): #{inspect(opts)}"
+    {:ok,
+     %{
+       adapter_sup: Keyword.fetch!(opts, :adapter_sup),
+       adapter_opts: Keyword.fetch!(opts, :adapter_opts),
+       db: Keyword.get(opts, :db, Tightbeam.DB),
+       adapters: %{},
+       monitors: %{},
+       load_active: %{},
+       load_queue: :queue.new()
+     }}
+  end
+
+  @impl true
+  def handle_call({:adapter_for, key}, _from, state) do
+    entry = Map.get(state.adapters, key, fresh_entry())
+
+    cond do
+      entry.circuit == :open ->
+        {:reply, {:error, :degraded}, state}
+
+      is_pid(entry.pid) and Process.alive?(entry.pid) ->
+        {:reply, {:ok, entry.pid, entry.generation}, state}
+
+      true ->
+        {reply, state} = start_adapter(key, entry, state)
+        {:reply, reply, state}
+    end
+  end
+
+  def handle_call({:generation, key}, _from, state) do
+    {:reply, get_in(state.adapters, [key, :generation]) || 0, state}
+  end
+
+  def handle_call({:acquire_load_slot, borrower}, from, state) do
+    if map_size(state.load_active) < 3 do
+      {slot, state} = grant_slot(borrower, state)
+      {:reply, slot, state}
+    else
+      {:noreply, %{state | load_queue: :queue.in({from, borrower}, state.load_queue)}}
+    end
+  end
+
+  def handle_call(:health, _from, state) do
+    health =
+      Map.new(state.adapters, fn {{harness, archetype}, entry} ->
+        {"#{harness}:#{archetype}",
+         %{
+           generation: entry.generation,
+           circuit: entry.circuit,
+           consecutive_failures: entry.failures
+         }}
+      end)
+
+    {:reply, health, state}
+  end
+
+  @impl true
+  def handle_cast({:release_load_slot, slot}, state) do
+    {:noreply, release_slot(slot, state)}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    cond do
+      key = state.monitors[ref] ->
+        state = %{state | monitors: Map.delete(state.monitors, ref)}
+        entry = Map.fetch!(state.adapters, key)
+
+        # Stale-:DOWN guard: adapter_for may observe a dead pid
+        # (Process.alive? false) and start a replacement BEFORE this :DOWN is
+        # processed. If the ref no longer matches the entry's current monitor,
+        # the death was already absorbed by that replacement — treating it as
+        # a fresh death would nil the new adapter's pid and schedule a
+        # spurious restart (adapter leak). Dropping the ref is the cleanup.
+        if entry.monitor == ref do
+          :ok =
+            Tightbeam.EventLog.lifecycle(state.db, "adapter_down", key_name(key), inspect(reason))
+
+          failures = entry.failures + 1
+          circuit = if failures >= 5, do: :open, else: :closed
+          generation = entry.generation + 1
+          delay = backoff(failures)
+          timer = Process.send_after(self(), {:restart_adapter, key, generation}, delay)
+
+          entry = %{
+            entry
+            | pid: nil,
+              monitor: nil,
+              generation: generation,
+              failures: failures,
+              circuit: circuit,
+              timer: timer
+          }
+
+          {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
+        else
+          {:noreply, state}
+        end
+
+      slot = slot_for_monitor(state.load_active, ref) ->
+        {:noreply, release_slot(slot, state, false)}
+
+      true ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:restart_adapter, key, generation}, state) do
+    case state.adapters[key] do
+      %{generation: ^generation, pid: nil} = entry ->
+        {_reply, state} = start_adapter(key, %{entry | timer: nil}, state)
+        {:noreply, state}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  defp start_adapter(key, entry, state) do
+    child = %{
+      id: {Tightbeam.Acp.Adapter, key},
+      start: {Tightbeam.Acp.Adapter, :start_link, [state.adapter_opts.(key)]},
+      restart: :temporary,
+      type: :worker
+    }
+
+    case DynamicSupervisor.start_child(state.adapter_sup, child) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid)
+        generation = max(entry.generation, 1)
+
+        entry = %{
+          entry
+          | pid: pid,
+            monitor: ref,
+            generation: generation,
+            failures: 0,
+            circuit: :closed,
+            timer: nil
+        }
+
+        state = %{
+          state
+          | adapters: Map.put(state.adapters, key, entry),
+            monitors: Map.put(state.monitors, ref, key)
+        }
+
+        {{:ok, pid, generation}, state}
+
+      {:error, _reason} ->
+        failures = entry.failures + 1
+        circuit = if failures >= 5, do: :open, else: :closed
+        generation = max(entry.generation, 1)
+        timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(failures))
+
+        entry = %{
+          entry
+          | generation: generation,
+            failures: failures,
+            circuit: circuit,
+            timer: timer
+        }
+
+        {{:error, :degraded}, %{state | adapters: Map.put(state.adapters, key, entry)}}
+    end
+  end
+
+  defp fresh_entry do
+    %{pid: nil, monitor: nil, generation: 0, failures: 0, circuit: :closed, timer: nil}
+  end
+
+  defp backoff(failures), do: min(1_000 * Integer.pow(2, max(failures - 1, 0)), 60_000)
+  defp key_name({harness, archetype}), do: "#{harness}:#{archetype}"
+
+  defp grant_slot(borrower, state) do
+    slot = make_ref()
+    monitor = Process.monitor(borrower)
+    active = Map.put(state.load_active, slot, %{borrower: borrower, monitor: monitor})
+    {slot, %{state | load_active: active}}
+  end
+
+  defp release_slot(slot, state, demonitor? \\ true) do
+    case Map.pop(state.load_active, slot) do
+      {nil, _} ->
+        state
+
+      {%{monitor: monitor}, active} ->
+        if demonitor?, do: Process.demonitor(monitor, [:flush])
+        grant_next(%{state | load_active: active})
+    end
+  end
+
+  defp grant_next(state) do
+    case :queue.out(state.load_queue) do
+      {:empty, _} ->
+        state
+
+      {{:value, {from, borrower}}, queue} ->
+        if Process.alive?(borrower) do
+          {slot, state} = grant_slot(borrower, %{state | load_queue: queue})
+          GenServer.reply(from, slot)
+          state
+        else
+          grant_next(%{state | load_queue: queue})
+        end
+    end
+  end
+
+  defp slot_for_monitor(active, ref) do
+    Enum.find_value(active, fn {slot, entry} -> if entry.monitor == ref, do: slot end)
   end
 end

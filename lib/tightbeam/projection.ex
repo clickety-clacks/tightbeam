@@ -71,68 +71,59 @@ defmodule Tightbeam.Projection do
   @spec append(db(), map()) ::
           {:appended, message()} | {:duplicate, message()} | {:conflict, message()}
   def append(db \\ Tightbeam.DB, input) do
-    transaction!(db, fn txn ->
-      existing =
-        case {Map.get(input, :client_message_id), Map.get(input, :device_id)} do
-          {client_message_id, device_id}
-          when is_binary(client_message_id) and is_binary(device_id) ->
-            Txn.q(
-              txn,
-              """
-                SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
-                       clientMessageId, replyToMessageId, replyToClientMessageId,
-                       llmVisibleMessageId, attachments
-                FROM messages
-                WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
-              """,
-              [Map.fetch!(input, :session_key), device_id, client_message_id]
-            )
+    transaction!(db, &append_in_txn(&1, input))
+  end
 
-          _ ->
-            []
-        end
+  @doc "Append inside an existing DB transaction so a turn can commit with its echo."
+  @spec append_in_txn(Txn.t(), map()) ::
+          {:appended, message()} | {:duplicate, message()} | {:conflict, message()}
+  def append_in_txn(%Txn{} = txn, input) do
+    existing =
+      case {Map.get(input, :client_message_id), Map.get(input, :device_id)} do
+        {client_message_id, device_id} when is_binary(client_message_id) and is_binary(device_id) ->
+          Txn.q(txn, """
+            SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+                   clientMessageId, replyToMessageId, replyToClientMessageId,
+                   llmVisibleMessageId, attachments
+            FROM messages
+            WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
+          """, [Map.fetch!(input, :session_key), device_id, client_message_id])
 
-      case existing do
-        [row] ->
-          message = to_message(row)
-
-          if message.content == Map.fetch!(input, :content) do
-            {:duplicate, message}
-          else
-            {:conflict, message}
-          end
-
-        [] ->
-          id = "s_" <> Tightbeam.Id.uuid4()
-          client_message_id = Map.get(input, :client_message_id)
-
-          Txn.q(
-            txn,
-            """
-              INSERT INTO messages (id, sessionKey, role, content, timestamp, sender, deviceId,
-                clientMessageId, replyToMessageId, replyToClientMessageId, llmVisibleMessageId, attachments)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            """,
-            [
-              id,
-              Map.fetch!(input, :session_key),
-              Map.fetch!(input, :role),
-              Map.fetch!(input, :content),
-              Map.get(input, :timestamp, System.system_time(:millisecond)),
-              Map.get(input, :sender),
-              Map.get(input, :device_id),
-              client_message_id,
-              Map.get(input, :reply_to_message_id),
-              Map.get(input, :reply_to_client_message_id),
-              Map.get(input, :llm_visible_message_id) || client_message_id || id,
-              JSON.encode!(Map.get(input, :attachments, []))
-            ]
-          )
-
-          [row] = select_by_id(txn, id)
-          {:appended, to_message(row)}
+        _ ->
+          []
       end
-    end)
+
+    case existing do
+      [row] ->
+        message = to_message(row)
+        if message.content == Map.fetch!(input, :content), do: {:duplicate, message}, else: {:conflict, message}
+
+      [] ->
+        id = "s_" <> Tightbeam.Id.uuid4()
+        client_message_id = Map.get(input, :client_message_id)
+
+        Txn.q(txn, """
+          INSERT INTO messages (id, sessionKey, role, content, timestamp, sender, deviceId,
+            clientMessageId, replyToMessageId, replyToClientMessageId, llmVisibleMessageId, attachments)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        """, [
+          id,
+          Map.fetch!(input, :session_key),
+          Map.fetch!(input, :role),
+          Map.fetch!(input, :content),
+          Map.get(input, :timestamp, System.system_time(:millisecond)),
+          Map.get(input, :sender),
+          Map.get(input, :device_id),
+          client_message_id,
+          Map.get(input, :reply_to_message_id),
+          Map.get(input, :reply_to_client_message_id),
+          Map.get(input, :llm_visible_message_id) || client_message_id || id,
+          JSON.encode!(Map.get(input, :attachments, []))
+        ])
+
+        [row] = select_by_id(txn, id)
+        {:appended, to_message(row)}
+    end
   end
 
   @doc "Fetch one message by store id, or nil."

@@ -33,7 +33,7 @@ defmodule Tightbeam.ConnRegistry do
   @typedoc "Delivery function injected by the caller — `(pid, payload)`; tests capture, prod sends to the socket."
   @type deliver :: (pid(), term() -> any())
 
-  defstruct conns: %{}, devices: %{}
+  defstruct conns: %{}, devices: %{}, rate_windows: %{}
   # conns:   ref => %{pid, user_id, device_id, is_admin, gen, delivered: %{session_key => seq}}
   # devices: device_id => %{ref, gen}
 
@@ -83,6 +83,12 @@ defmodule Tightbeam.ConnRegistry do
   @spec count(server()) :: non_neg_integer()
   def count(server \\ __MODULE__), do: GenServer.call(server, :count)
 
+  @doc "Apply a global per-device sliding-window rate limit."
+  @spec within_rate_limit(server(), String.t(), atom(), pos_integer(), pos_integer()) :: boolean()
+  def within_rate_limit(server \\ __MODULE__, device_id, kind, limit, window_ms) do
+    GenServer.call(server, {:within_rate_limit, device_id, kind, limit, window_ms})
+  end
+
   ## Server
 
   @impl true
@@ -105,6 +111,13 @@ defmodule Tightbeam.ConnRegistry do
     }
 
     replaced = prior && prior.ref
+
+    # The old pid must be captured before its entry is removed. Installation
+    # of the replacement happens in this same callback before the message can
+    # be acted upon, preserving the generation takeover invariant.
+    if prior && state.conns[prior.ref] && is_pid(state.conns[prior.ref].pid) do
+      send(state.conns[prior.ref].pid, {:takeover_close})
+    end
 
     state = %{
       state
@@ -141,6 +154,15 @@ defmodule Tightbeam.ConnRegistry do
   end
 
   def handle_call(:count, _from, state), do: {:reply, map_size(state.conns), state}
+
+  def handle_call({:within_rate_limit, device_id, kind, limit, window_ms}, _from, state) do
+    now = System.monotonic_time(:millisecond)
+    key = {device_id, kind}
+    recent = state.rate_windows |> Map.get(key, []) |> Enum.filter(&(&1 > now - window_ms))
+    allowed = length(recent) < limit
+    windows = Map.put(state.rate_windows, key, if(allowed, do: [now | recent], else: recent))
+    {:reply, allowed, %{state | rate_windows: windows}}
+  end
 
   @impl true
   def handle_cast({:unregister, ref}, state) do
