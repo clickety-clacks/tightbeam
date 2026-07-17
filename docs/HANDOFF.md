@@ -1,9 +1,9 @@
 # Handoff — cold-start guide for a contributing agent
 
 Read in this order:
-1. `~/src/shared-workspace/shared/specs/tightbeam.md` — THE spec. Tenets
+1. `~/src/shared-workspace/shared/specs/tightbeam/tightbeam.md` — THE spec. Tenets
    first; hold every change against the eight-question test.
-2. `~/src/shared-workspace/shared/specs/tightbeam-elixir-port.md` — the port
+2. `~/src/shared-workspace/shared/specs/tightbeam/tightbeam-elixir-port.md` — the port
    plan: invariants, turn pipeline, supervision design, acceptance wall.
 3. `docs/ARCHITECTURE.md` (this repo) — module map + supervision tree.
 4. `docs/PATTERNS.md` — binding conventions, including documentation rules.
