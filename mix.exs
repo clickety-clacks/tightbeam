@@ -23,6 +23,9 @@ defmodule Tightbeam.MixProject do
   defp deps do
     [
       {:exqlite, "~> 0.27"},
+      # Wire front: Bandit serves Plug (HTTP control plane) + WebSock (Clawline WS).
+      {:bandit, "~> 1.5"},
+      {:websock_adapter, "~> 0.5"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
