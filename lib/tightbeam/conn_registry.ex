@@ -57,17 +57,20 @@ defmodule Tightbeam.ConnRegistry do
   def unregister(server \\ __MODULE__, ref), do: GenServer.cast(server, {:unregister, ref})
 
   @doc """
-  Publish a per-session message (with its store seq) to owner + admins,
-  applying each connection's monotonic filter. `deliver` is `(pid, payload) ->
-  any` — injected so tests capture without a real socket.
-  Callers must publish in seq order (see the moduledoc ordering dependency).
+  Publish a per-session message (with its store seq) to the OWNER's
+  connections only — admin grants powers, never a merged feed; not one byte
+  of another user's content reaches an admin device (TS parity:
+  server.ts broadcastMessage). Applies each connection's monotonic filter.
+  `deliver` is `(pid, payload) -> any` — injected so tests capture without a
+  real socket. Callers must publish in seq order (see the moduledoc ordering
+  dependency).
   """
   @spec publish_message(server(), String.t(), String.t(), integer(), term(), deliver()) :: :ok
   def publish_message(server \\ __MODULE__, session_key, owner_user_id, seq, payload, deliver) do
     GenServer.call(server, {:publish_message, session_key, owner_user_id, seq, payload, deliver})
   end
 
-  @doc "Publish a non-message event (turn state, typing, stream) — no seq filter."
+  @doc "Publish a non-message event (turn state, typing, stream) to the owner only — no seq filter."
   @spec broadcast(server(), String.t(), term(), deliver()) :: :ok
   def broadcast(server \\ __MODULE__, owner_user_id, payload, deliver) do
     GenServer.call(server, {:broadcast, owner_user_id, payload, deliver})
@@ -132,7 +135,7 @@ defmodule Tightbeam.ConnRegistry do
     conns =
       Enum.reduce(state.conns, state.conns, fn {ref, e}, acc ->
         cond do
-          e.user_id != owner and not e.is_admin ->
+          e.user_id != owner ->
             acc
 
           Map.get(e.delivered, session_key, 0) >= seq ->
@@ -149,7 +152,7 @@ defmodule Tightbeam.ConnRegistry do
   end
 
   def handle_call({:broadcast, owner, payload, deliver}, _from, state) do
-    for {_ref, e} <- state.conns, e.user_id == owner or e.is_admin, do: deliver.(e.pid, payload)
+    for {_ref, e} <- state.conns, e.user_id == owner, do: deliver.(e.pid, payload)
     {:reply, :ok, state}
   end
 

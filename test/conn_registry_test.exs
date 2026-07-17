@@ -11,14 +11,22 @@ defmodule Tightbeam.ConnRegistryTest do
     %{reg: reg, deliver: deliver, test_pid: test_pid}
   end
 
-  test "owner-scoped broadcast: owner + admin receive, others don't", %{reg: reg, deliver: d} do
+  test "owner-scoped broadcast: owner only — admin is powers, not a merged feed", %{
+    reg: reg,
+    deliver: d
+  } do
     {:ok, _, _} = ConnRegistry.register(reg, %{pid: :flynn, user_id: "flynn", device_id: "d1", is_admin: true})
     {:ok, _, _} = ConnRegistry.register(reg, %{pid: :mike, user_id: "mike", device_id: "d2", is_admin: false})
 
     :ok = ConnRegistry.broadcast(reg, "mike", %{t: "typing"}, d)
-    # mike (owner) gets it; flynn (admin) gets it; nobody else exists
+    # mike (owner) gets it; flynn (admin) gets NOTHING — not one byte of
+    # another user's content reaches an admin device.
     assert_received {:sent, :mike, %{t: "typing"}}
-    assert_received {:sent, :flynn, %{t: "typing"}}
+    refute_received {:sent, :flynn, _}
+
+    :ok = ConnRegistry.publish_message(reg, "k1", "mike", 1, %{t: "message"}, d)
+    assert_received {:sent, :mike, %{t: "message"}}
+    refute_received {:sent, :flynn, _}
   end
 
   test "per-connection seq filter drops already-delivered (late pre-watermark) messages", %{reg: reg, deliver: d} do

@@ -279,3 +279,14 @@ reassemble (identity change forfeits nested state by design). Test added
 (nested state survives restart; new auth topped up; identity change still
 wipes). NOTE: the TS reference has the same defect (projectHome rm -rf on
 every adapterFor); TS repo is feature-frozen during the port — record only.
+
+## Isolation fix — admin devices no longer receive foreign content (Fable)
+
+Found auditing isolation for Flynn: the ConnRegistry skeleton said fan-out =
+"owner + admins" and sol built+tested that — but the TS reference fans out
+strictly to the owner, and the admin ruling is powers-not-merged-feed. The
+Elixir gateway was pushing other users' message/turn/typing bytes to admin
+devices (client-invisible, but bytes crossed the wire). Fan-out is now
+owner-only in both publish_message and broadcast; test inverted to pin it.
+Skeleton bug (Fable), third of its kind — TS-as-built remains the oracle for
+every observable surface.
