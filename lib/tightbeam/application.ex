@@ -5,7 +5,7 @@ defmodule Tightbeam.Application do
   everything depends on it, so a DB restart deliberately restarts its
   dependents rather than leaving them holding a dead connection.
 
-  Restart intensities are explicit: the root tolerates few
+  Restart intensities are explicit (review #9): the root tolerates few
   restarts before escalating; the lane DynamicSupervisor tolerates many
   (individual session lanes are cheap and independent). Adapter processes are
   coordinator-managed (a later child), so their restart/backoff policy lives
@@ -18,8 +18,6 @@ defmodule Tightbeam.Application do
 
   use Application
 
-  @doc "Start the production tree, or an empty test-owned tree when autostart is disabled."
-  @spec start(Application.start_type(), term()) :: {:ok, pid()} | {:error, term()}
   @impl true
   def start(_type, _args) do
     if Application.get_env(:tightbeam, :autostart, true) do
@@ -31,7 +29,6 @@ defmodule Tightbeam.Application do
   end
 
   @doc "The production child list (also started manually by the app test)."
-  @spec children() :: [Supervisor.child_spec() | {module(), term()} | module()]
   def children do
     base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())
     File.mkdir_p!(base_dir)
@@ -46,20 +43,14 @@ defmodule Tightbeam.Application do
       {Registry, keys: :unique, name: Tightbeam.LaneRegistry},
       {Task.Supervisor, name: Tightbeam.TurnTaskSupervisor},
       # Lanes: many cheap independent children -> generous restart intensity.
-      {DynamicSupervisor,
-       strategy: :one_for_one, name: Tightbeam.LaneSupervisor, max_restarts: 50, max_seconds: 10}
+      {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.LaneSupervisor, max_restarts: 50, max_seconds: 10}
       # LaneManager (reconciler) is started once a runner is composed by the
       # gateway composition root; see Tightbeam.Gateway (E2).
     ]
   end
 
-  @doc "Return the root's dependency-preserving supervision strategy and restart intensity."
-  @spec root_opts() :: keyword()
-  def root_opts,
-    do: [strategy: :rest_for_one, name: Tightbeam.Supervisor, max_restarts: 3, max_seconds: 30]
+  def root_opts, do: [strategy: :rest_for_one, name: Tightbeam.Supervisor, max_restarts: 3, max_seconds: 30]
 
-  @doc "Stamp the current boot epoch clean while the database still belongs to the live tree."
-  @spec prep_stop(term()) :: term()
   @impl true
   def prep_stop(state) do
     # Clean-shutdown stamp MUST happen in prep_stop: stop/1 runs after the

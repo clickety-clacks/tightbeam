@@ -1,14 +1,7 @@
 defmodule Tightbeam.Id do
   @moduledoc "ID generation shared by stores (one boring implementation)."
 
-  @doc """
-  Generate a lowercase random UUIDv4 string with the RFC variant bits pinned.
-
-      iex> uuid = Tightbeam.Id.uuid4()
-      iex> Regex.match?(~r/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, uuid)
-      true
-  """
-  @spec uuid4() :: String.t()
+  @doc "Random UUIDv4 string."
   def uuid4 do
     <<a::48, _::4, b::12, _::2, c::62>> = :crypto.strong_rand_bytes(16)
     hex = Base.encode16(<<a::48, 4::4, b::12, 2::2, c::62>>, case: :lower)

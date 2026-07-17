@@ -120,16 +120,3 @@ pattern-conformant; E1 spine sound. Four fixes applied:
 3. uuid4 deduplicated into Tightbeam.Id.
 4. Org.list_for_user documented: wire callers MUST pass is_admin=false
    (owner-only catalogs; admin is powers, not a merged feed).
-
-## Docs sweep — sol
-
-Added Elixir-native `@doc` and `@spec` coverage across DB, EventLog,
-Projection, Org, ConnRegistry, SessionLane, LaneManager, ACP Conn/Adapter,
-Boot, Application, and Id. Repeated message, session, pointer, connection,
-lane, and ACP result shapes now have module types; pure model-ref, UUID, and
-session-key helpers have passing doctests. Internal review-round citations in
-module docs were replaced with the invariant itself. No type bug requiring a
-behavior change surfaced.
-
-Gate: 4 doctests + 43 tests pass; `mix docs` builds HTML, Markdown, and EPUB
-with no warnings.

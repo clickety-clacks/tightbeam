@@ -18,20 +18,6 @@ defmodule Tightbeam.Acp.Adapter do
   use GenServer
   alias Tightbeam.Acp.Conn
 
-  @type server :: GenServer.server()
-  @type prompt_result :: %{stop_reason: String.t(), text: String.t()}
-  @type preset :: %{
-          home_env: String.t(),
-          yolo_mode: String.t(),
-          effort_config: String.t()
-        }
-  @type t :: %__MODULE__{
-          conn: server(),
-          preset: preset(),
-          cwd: String.t(),
-          chunks: %{String.t() => [String.t()]}
-        }
-
   @presets %{
     claude: %{
       home_env: "CLAUDE_CONFIG_DIR",
@@ -49,33 +35,22 @@ defmodule Tightbeam.Acp.Adapter do
 
   ## Client
 
-  @doc "Start one harness adapter and its owned ACP connection."
-  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
   @doc "Create a fresh harness session, model applied. Returns {:ok, session_id}."
-  @spec new_session(server(), String.t()) :: {:ok, String.t()}
   def new_session(adapter, model), do: GenServer.call(adapter, {:new_session, model}, 30_000)
 
   @doc "Adopt an existing harness session (re-applies model). Returns :ok."
-  @spec load_session(server(), String.t(), String.t()) :: :ok
-  def load_session(adapter, session_id, model),
-    do: GenServer.call(adapter, {:load_session, session_id, model}, 30_000)
+  def load_session(adapter, session_id, model), do: GenServer.call(adapter, {:load_session, session_id, model}, 30_000)
 
   @doc "Run a turn; accumulates chunks; returns {:ok, %{stop_reason, text}}."
-  @spec prompt(server(), String.t(), String.t(), non_neg_integer()) ::
-          {:ok, prompt_result()} | {:error, term()}
   def prompt(adapter, session_id, text, timeout \\ 600_000),
     do: GenServer.call(adapter, {:prompt, session_id, text}, timeout + 5_000)
 
-  @doc "Return the ACP connection owned by this adapter."
-  @spec conn(server()) :: Conn.server()
   def conn(adapter), do: GenServer.call(adapter, :conn)
 
   ## Server
 
-  @doc "Initialize the ACP protocol and pin the adapter's harness preset."
-  @spec init(keyword()) :: {:ok, t()}
   @impl true
   def init(opts) do
     harness = Keyword.fetch!(opts, :harness)
@@ -98,21 +73,12 @@ defmodule Tightbeam.Acp.Adapter do
     {:ok, %__MODULE__{conn: conn, preset: preset, cwd: Keyword.fetch!(opts, :cwd)}}
   end
 
-  @doc "Handle harness session creation, adoption, prompting, and connection lookup."
-  @spec handle_call(term(), GenServer.from(), t()) ::
-          {:reply, term(), t()} | {:noreply, t()}
   @impl true
   def handle_call({:new_session, model}, _from, state) do
     {:ok, result} = Conn.request(state.conn, "session/new", %{cwd: state.cwd, mcpServers: []})
     sid = result["sessionId"]
     :ok = apply_model(state, sid, model)
-
-    _ =
-      Conn.request(state.conn, "session/set_mode", %{
-        sessionId: sid,
-        modeId: state.preset.yolo_mode
-      })
-
+    _ = Conn.request(state.conn, "session/set_mode", %{sessionId: sid, modeId: state.preset.yolo_mode})
     {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
   end
 
@@ -129,12 +95,7 @@ defmodule Tightbeam.Acp.Adapter do
     parent = self()
 
     Task.start(fn ->
-      result =
-        Conn.request(
-          state.conn,
-          "session/prompt",
-          %{sessionId: sid, prompt: [%{type: "text", text: text}]}, timeout: 600_000)
-
+      result = Conn.request(state.conn, "session/prompt", %{sessionId: sid, prompt: [%{type: "text", text: text}]}, timeout: 600_000)
       send(parent, {:prompt_done, sid, from, result})
     end)
 
@@ -143,8 +104,6 @@ defmodule Tightbeam.Acp.Adapter do
 
   def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
 
-  @doc "Accumulate session chunks and resolve completed prompts for their waiting callers."
-  @spec handle_info(term(), t()) :: {:noreply, t()}
   @impl true
   def handle_info({:acp_notification, "session/update", params}, state) do
     sid = params["sessionId"]
@@ -182,13 +141,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp apply_model(state, sid, model_ref) do
     {model, effort} = parse_model_ref(model_ref)
-
-    {:ok, _} =
-      Conn.request(state.conn, "session/set_config_option", %{
-        sessionId: sid,
-        configId: "model",
-        value: model
-      })
+    {:ok, _} = Conn.request(state.conn, "session/set_config_option", %{sessionId: sid, configId: "model", value: model})
 
     if effort do
       {:ok, _} =
@@ -202,15 +155,7 @@ defmodule Tightbeam.Acp.Adapter do
     :ok
   end
 
-  @doc """
-  Split a model reference into its bare model name and optional effort.
-
-      iex> Tightbeam.Acp.Adapter.parse_model_ref("gpt-5.6-sol[medium]")
-      {"gpt-5.6-sol", "medium"}
-      iex> Tightbeam.Acp.Adapter.parse_model_ref("haiku")
-      {"haiku", nil}
-  """
-  @spec parse_model_ref(String.t()) :: {String.t(), String.t() | nil}
+  @doc "Split \"gpt-5.6-sol[medium]\" -> {\"gpt-5.6-sol\", \"medium\"}."
   def parse_model_ref(ref) do
     case Regex.run(~r/^(.*?)\[(.*?)\]$/, ref) do
       [_, model, effort] -> {model, effort}

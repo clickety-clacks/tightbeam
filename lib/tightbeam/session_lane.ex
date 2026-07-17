@@ -5,14 +5,14 @@ defmodule Tightbeam.SessionLane do
   (Ledger enforces one-per-session in SQL), runs it as a monitored TurnTask,
   and on completion records the terminal state + publishes, then drains.
 
-  Topology (monitors, never links):
+  Topology (port-spec review #4 — monitors, never links):
   - The TurnTask runs under a Task.Supervisor via async_nolink; the lane
     MONITORS it. Task crash → lane gets :DOWN, marks the turn failed, drains on.
   - The turn work itself calls the Adapter (a bounded call the TurnTask may
     block on — it is designed to wait and is monitored by the Conn, which
     cancels on its death).
 
-  Quarantine: a turn recovered as failed_unknown quarantines its
+  Quarantine (review #3): a turn recovered as failed_unknown quarantines its
   session; the lane will not start the next queued turn until the orphaned ACP
   request is observed resolved (Conn.pending_count hits 0 / orphan_resolved) or
   the adapter generation is recycled. E1 proves the mechanism with a fake; the
@@ -22,17 +22,6 @@ defmodule Tightbeam.SessionLane do
   use GenServer
   require Logger
   alias Tightbeam.{Ledger, EventLog}
-
-  @type runner :: (Ledger.turn() -> {:ok, term()} | {:error, term()})
-  @type t :: %__MODULE__{
-          session_key: String.t(),
-          db: GenServer.server(),
-          runner: runner(),
-          task_sup: GenServer.server(),
-          task_ref: reference() | nil,
-          current_seq: integer() | nil,
-          quarantined: boolean()
-        }
 
   defstruct [
     :session_key,
@@ -44,19 +33,14 @@ defmodule Tightbeam.SessionLane do
     quarantined: false
   ]
 
-  @doc "Start the uniquely named serialized runner for one session."
-  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     session_key = Keyword.fetch!(opts, :session_key)
     GenServer.start_link(__MODULE__, opts, name: via(session_key))
   end
 
-  @doc "Build the unique Registry name for a session lane."
-  @spec via(String.t()) :: {:via, Registry, {module(), String.t()}}
   def via(session_key), do: {:via, Registry, {Tightbeam.LaneRegistry, session_key}}
 
   @doc "Nudge the lane to check for work (from client post, wake, or reconciler)."
-  @spec nudge(String.t()) :: :ok | :no_lane
   def nudge(session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
       [{pid, _}] -> GenServer.cast(pid, :nudge)
@@ -66,8 +50,6 @@ defmodule Tightbeam.SessionLane do
 
   ## Server
 
-  @doc "Initialize the lane and immediately schedule its first ledger check."
-  @spec init(keyword()) :: {:ok, t()}
   @impl true
   def init(opts) do
     state = %__MODULE__{
@@ -82,13 +64,9 @@ defmodule Tightbeam.SessionLane do
     {:ok, state}
   end
 
-  @doc "Handle a nudge without adding an in-memory queue."
-  @spec handle_cast(:nudge, t()) :: {:noreply, t()}
   @impl true
   def handle_cast(:nudge, state), do: {:noreply, maybe_start(state)}
 
-  @doc "Handle task completion, task death, and scheduled nudges while draining durably."
-  @spec handle_info(term(), t()) :: {:noreply, t()}
   @impl true
   def handle_info(:nudge, state), do: {:noreply, maybe_start(state)}
 
@@ -100,10 +78,7 @@ defmodule Tightbeam.SessionLane do
   end
 
   # TurnTask crashed.
-  def handle_info(
-        {:DOWN, ref, :process, _pid, reason},
-        %{task_ref: ref, current_seq: seq} = state
-      )
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{task_ref: ref, current_seq: seq} = state)
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
     finalize(state, seq, {:error, :task_crash})
