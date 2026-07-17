@@ -82,7 +82,7 @@ established — port each module imitating existing lib/ + tests:
   dispatch, /upload, /download, /api/*), WebSock handler per connection for
   /ws (pair/auth/message/stream_read/typing; keepalive; global device rate
   limits in ConnRegistry; auth registers w/ ConnRegistry, replays via
-  Projection.after advancing note_replayed, then sync_complete).
+  Projection.list_after advancing note_replayed, then sync_complete).
 - Tightbeam.WakeScheduler (from wakes.ts): durable, delivers by executing the
   deliverPrompt transaction with wakeId (Ledger dedupe), timer + boot scan.
 - AdapterCoordinator: generation per (harness,archetype); lazy session/load
@@ -104,3 +104,19 @@ append-only pointer chains, and personal/custom session-key helpers. SQL keeps
 the TypeScript camelCase schema exactly; Elixir context inputs and returned maps
 use snake_case consistently with the existing modules. 44 tests + 1 doctest
 green.
+
+
+## Review pass — Fable (post model-drift audit)
+
+Read all 1,911 lines as committed (every module + test) against the port
+spec, the tenets, and OTP semantics, after Flynn flagged that some impl
+happened under Opus. Verdict: sol ports (Projection/Org) faithful and
+pattern-conformant; E1 spine sound. Four fixes applied:
+1. BUG (Fable E2a): clean-shutdown stamp moved stop/1 -> prep_stop/1 —
+   stop runs after the tree (and DB) is down, so every shutdown would have
+   been inferred dirty, destroying the dirty-exit signal.
+2. Projection.after -> list_after (reserved-word unquote trick was un-boring;
+   T6).
+3. uuid4 deduplicated into Tightbeam.Id.
+4. Org.list_for_user documented: wire callers MUST pass is_admin=false
+   (owner-only catalogs; admin is powers, not a merged feed).

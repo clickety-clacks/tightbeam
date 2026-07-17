@@ -70,7 +70,7 @@ defmodule Tightbeam.Projection do
           end
 
         [] ->
-          id = "s_" <> uuid4()
+          id = "s_" <> Tightbeam.Id.uuid4()
           client_message_id = Map.get(input, :client_message_id)
 
           Txn.q(
@@ -121,7 +121,7 @@ defmodule Tightbeam.Projection do
     end
   end
 
-  def unquote(:after)(db \\ Tightbeam.DB, session_key, after_message_id, limit) do
+  def list_after(db \\ Tightbeam.DB, session_key, after_message_id, limit) do
     after_seq =
       case after_message_id && get(db, after_message_id) do
         %{seq: seq} -> seq
@@ -236,19 +236,4 @@ defmodule Tightbeam.Projection do
     end
   end
 
-  defp uuid4 do
-    <<a::48, _::4, b::12, _::2, c::62>> = :crypto.strong_rand_bytes(16)
-    hex = Base.encode16(<<a::48, 4::4, b::12, 2::2, c::62>>, case: :lower)
-
-    Enum.join(
-      [
-        binary_part(hex, 0, 8),
-        binary_part(hex, 8, 4),
-        binary_part(hex, 12, 4),
-        binary_part(hex, 16, 4),
-        binary_part(hex, 20, 12)
-      ],
-      "-"
-    )
-  end
 end

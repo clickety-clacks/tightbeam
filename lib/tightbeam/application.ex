@@ -52,9 +52,10 @@ defmodule Tightbeam.Application do
   def root_opts, do: [strategy: :rest_for_one, name: Tightbeam.Supervisor, max_restarts: 3, max_seconds: 30]
 
   @impl true
-  def stop(_state) do
-    # Best-effort clean-shutdown stamp so the next boot does not infer a dirty
-    # exit (review #9). If the DB is already gone this is a no-op.
+  def prep_stop(state) do
+    # Clean-shutdown stamp MUST happen in prep_stop: stop/1 runs after the
+    # supervision tree (and the DB) is already down, so stamping there would
+    # silently fail and every shutdown would be inferred dirty at next boot.
     with epoch when is_integer(epoch) <- Application.get_env(:tightbeam, :boot_epoch) do
       try do
         Tightbeam.EventLog.clean_shutdown(Tightbeam.DB, epoch)
@@ -63,7 +64,7 @@ defmodule Tightbeam.Application do
       end
     end
 
-    :ok
+    state
   end
 
   defp default_base_dir, do: Path.join(System.user_home!(), ".tightbeam")

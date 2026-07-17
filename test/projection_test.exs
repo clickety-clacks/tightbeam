@@ -99,15 +99,15 @@ defmodule Tightbeam.ProjectionTest do
     {:appended, _} =
       Projection.append(db, %{session_key: "OTHER", role: "assistant", content: "noise"})
 
-    assert Enum.map(Projection.after(db, "k1", nil, 10), & &1.content) == ["one", "two", "three"]
+    assert Enum.map(Projection.list_after(db, "k1", nil, 10), & &1.content) == ["one", "two", "three"]
 
-    assert Enum.map(Projection.after(db, "k1", hd(messages).id, 10), & &1.content) == [
+    assert Enum.map(Projection.list_after(db, "k1", hd(messages).id, 10), & &1.content) == [
              "two",
              "three"
            ]
 
-    assert length(Projection.after(db, "k1", "s_unknown", 10)) == 3
-    assert Projection.after(db, "k1", List.last(messages).id, 10) == []
+    assert length(Projection.list_after(db, "k1", "s_unknown", 10)) == 3
+    assert Projection.list_after(db, "k1", List.last(messages).id, 10) == []
   end
 
   test "tail reports the latest row per session", %{db: db} do

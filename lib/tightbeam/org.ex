@@ -99,6 +99,12 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc """
+  Sessions for a user. `is_admin: true` returns ALL active sessions — a
+  management capability. WIRE CALLERS MUST PASS `false`: chat catalogs,
+  replay, and broadcast are owner-only for everyone, admin included (spec
+  §Multi-user: admin is powers, not a merged feed).
+  """
   def list_for_user(db \\ Tightbeam.DB, user_id, is_admin) do
     {where, params, order} =
       if is_admin do
@@ -179,7 +185,7 @@ defmodule Tightbeam.Org do
   def personal_session_key(user_id), do: "agent:main:clawline:#{user_id}:main"
 
   def custom_session_key(user_id) do
-    "agent:main:clawline:#{user_id}:main s_#{String.slice(uuid4(), 0, 8)}"
+    "agent:main:clawline:#{user_id}:main s_#{String.slice(Tightbeam.Id.uuid4(), 0, 8)}"
   end
 
   defp update(db, session_key, sets, values) do
@@ -266,19 +272,4 @@ defmodule Tightbeam.Org do
 
   defp now, do: System.system_time(:millisecond)
 
-  defp uuid4 do
-    <<a::48, _::4, b::12, _::2, c::62>> = :crypto.strong_rand_bytes(16)
-    hex = Base.encode16(<<a::48, 4::4, b::12, 2::2, c::62>>, case: :lower)
-
-    Enum.join(
-      [
-        binary_part(hex, 0, 8),
-        binary_part(hex, 8, 4),
-        binary_part(hex, 12, 4),
-        binary_part(hex, 16, 4),
-        binary_part(hex, 20, 12)
-      ],
-      "-"
-    )
-  end
 end
