@@ -39,22 +39,22 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "resolve defaults to first allowed host and explains denials" do
-    archetype = %{Archetypes.builtin_default() | where: ["eezo", "racter"]}
-    hosts = %{"eezo" => %{ssh: "e", base_dir: "/e"}}
+    archetype = %{Archetypes.builtin_default() | where: ["work-1", "work-2"]}
+    hosts = %{"work-1" => %{ssh: "e", base_dir: "/e"}}
 
-    assert Placement.resolve(archetype, nil, hosts) == {:ok, "eezo"}
-    assert Placement.resolve(archetype, "eezo", hosts) == {:ok, "eezo"}
+    assert Placement.resolve(archetype, nil, hosts) == {:ok, "work-1"}
+    assert Placement.resolve(archetype, "work-1", hosts) == {:ok, "work-1"}
 
     assert {:error, %{code: "host_not_allowed", message: message}} =
              Placement.resolve(archetype, "tars", hosts)
 
     assert message =~ "tars"
-    assert message =~ "eezo, racter"
+    assert message =~ "work-1, work-2"
 
     assert {:error, %{code: "unknown_host", message: unknown}} =
-             Placement.resolve(archetype, "racter", hosts)
+             Placement.resolve(archetype, "work-2", hosts)
 
-    assert unknown =~ "racter"
+    assert unknown =~ "work-2"
   end
 
   test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir} do
@@ -78,7 +78,7 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "adapter_opts embeds every remote agent env in the ssh command", %{base_dir: base_dir} do
-    Application.put_env(:tightbeam, :advertised_url, "http://eezo:4000")
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
     Application.put_env(:tightbeam, :hosts, %{
       "worker" => %{
@@ -101,7 +101,7 @@ defmodule Tightbeam.PlacementTest do
              "env",
              "CODEX_HOME=#{remote_home}",
              "TIGHTBEAM_HOME=/srv/tb",
-             "TIGHTBEAM_URL=http://eezo:4000",
+             "TIGHTBEAM_URL=http://gateway.example:4000",
              "TIGHTBEAM_TOKEN=tbc_test",
              "PATH=/srv/tb/bin:$PATH",
              "/opt/acp/codex-acp"

@@ -14,15 +14,15 @@ defmodule Tightbeam.ArchetypesTest do
   test "loads all fields, merges the built-in default, and permits default override", ctx do
     File.write!(Path.join(ctx.manifests, "coder.toml"), """
     name = "coder"
-    where = ["eezo", "racter"]
+    where = ["work-1", "work-2"]
 
     [defaults]
     harness = "codex"
     model = "gpt-5.6-sol[medium]"
 
     [references]
-    repo = { location = "eezo:~/src/tightbeam_ex", access = "git; gate: mix test" }
-    brief = { location = "eezo:~/brief.md" }
+    repo = { location = "work-1:~/src/example-repo", access = "git; gate: run the tests" }
+    brief = { location = "work-1:~/brief.md" }
 
     [guidance]
     text = "Ship the requested change."
@@ -34,14 +34,14 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert loaded["coder"] == %{
              name: "coder",
-             where: ["eezo", "racter"],
+             where: ["work-1", "work-2"],
              defaults: %{harness: :codex, model: "gpt-5.6-sol[medium]"},
              references: [
-               %{name: "brief", location: "eezo:~/brief.md", access: nil},
+               %{name: "brief", location: "work-1:~/brief.md", access: nil},
                %{
                  name: "repo",
-                 location: "eezo:~/src/tightbeam_ex",
-                 access: "git; gate: mix test"
+                 location: "work-1:~/src/example-repo",
+                 access: "git; gate: run the tests"
                }
              ],
              guidance: "Ship the requested change."
@@ -52,10 +52,10 @@ defmodule Tightbeam.ArchetypesTest do
 
     File.write!(Path.join(ctx.manifests, "default.toml"), """
     name = "default"
-    where = ["eezo"]
+    where = ["work-1"]
     """)
 
-    assert Archetypes.load!(ctx.base_dir)["default"].where == ["eezo"]
+    assert Archetypes.load!(ctx.base_dir)["default"].where == ["work-1"]
   end
 
   test "unknown top-level keys raise", ctx do
@@ -96,8 +96,8 @@ defmodule Tightbeam.ArchetypesTest do
       where: ["local"],
       defaults: %{},
       references: [
-        %{name: "repo", location: "eezo:~/src/tightbeam_ex", access: "git"},
-        %{name: "brief", location: "eezo:~/brief.md", access: nil}
+        %{name: "repo", location: "work-1:~/src/example-repo", access: "git"},
+        %{name: "brief", location: "work-1:~/brief.md", access: nil}
       ],
       guidance: "## Assignment\nImplement E4a."
     }
@@ -133,9 +133,9 @@ defmodule Tightbeam.ArchetypesTest do
       an obligation to reply; act only if you have something to add.
 
       ## Your materials
-      - repo: eezo:~/src/tightbeam_ex
+      - repo: work-1:~/src/example-repo
         access: git
-      - brief: eezo:~/brief.md
+      - brief: work-1:~/brief.md
 
       ## Assignment
       Implement E4a.

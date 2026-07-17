@@ -9,7 +9,7 @@ defmodule Tightbeam.Archetypes do
   design needs and nothing else:
 
       name = "coder"
-      where = ["eezo", "racter"]        # allowed host-set (§Placement).
+      where = ["work-1", "work-2"]        # allowed host-set (§Placement).
                                         # Optional; default ["local"].
 
       [defaults]                        # optional spawn defaults
@@ -22,7 +22,7 @@ defmodule Tightbeam.Archetypes do
                                         # (point at the docs; copy the
                                         # identity; move the credentials
                                         # never).
-      repo = { location = "eezo:~/src/tightbeam_ex", access = "git; gate: mix test" }
+      repo = { location = "work-1:~/src/example-repo", access = "git; gate: run the tests" }
 
       [guidance]                        # optional extra guidance, appended
       text = \"\"\"...\"\"\"
