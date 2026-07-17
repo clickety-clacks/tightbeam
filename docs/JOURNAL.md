@@ -33,3 +33,22 @@ orphan_resolved or generation recycle) + LaneManager (Registry-named lanes,
 boot+5s reconciler over Ledger.pending_sessions, unpublished-terminal
 re-publish). Then Adapter (initialize/session lifecycle over Conn) + the E1
 vertical slice against the real claude adapter.
+
+## E1f — Fable — VERTICAL SLICE (E1 EXIT) ✅
+
+scripts/e1_first_light.exs: a prompt round-trips through the SUPERVISED spine
+(DB + Ledger + LaneManager reconciler + SessionLane + Acp.Adapter) to a REAL
+claude-agent-acp adapter. PASS: reply "ELIXIR FIRST LIGHT", ledger row
+delivered+published, conservation audit []. The turn was picked up by the
+RECONCILER path (ensure_lane), executed one-per-session, terminal-transitioned
+via CAS. This is E1 done — the review defects that could not be proven in prose
+are now proven in code + 25 unit tests.
+
+E1 modules: DB (single-writer), Ledger (all invariants in SQL), EventLog
+(+epochs), Acp.Conn (async Port, quiescence signal), Acp.Adapter (fable-trap
+model rule), SessionLane (monitors-not-links), LaneManager (reconciler).
+
+Next (E2): Application supervision tree wiring these under one root w/ the
+review-specified restart intensities; then the wire (Bandit WS+HTTP +
+ConnRegistry w/ per-connection seq filter + generation takeover) driven by the
+E0 black-box drivers (sol building those now).
