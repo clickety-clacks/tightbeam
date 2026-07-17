@@ -7,6 +7,39 @@ defmodule Tightbeam.Projection do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
+  @type db :: GenServer.server()
+  @typedoc "A finalized message as stored for replay and display."
+  @type message :: %{
+          seq: integer(),
+          id: String.t(),
+          session_key: String.t(),
+          role: String.t(),
+          content: String.t(),
+          timestamp: integer(),
+          sender: String.t() | nil,
+          device_id: String.t() | nil,
+          client_message_id: String.t() | nil,
+          reply_to_message_id: String.t() | nil,
+          reply_to_client_message_id: String.t() | nil,
+          llm_visible_message_id: String.t(),
+          attachments: [term()]
+        }
+  @typedoc "Fields accepted when appending a finalized message."
+  @type message_input :: %{
+          required(:session_key) => String.t(),
+          required(:role) => String.t(),
+          required(:content) => String.t(),
+          optional(:timestamp) => integer(),
+          optional(:sender) => String.t() | nil,
+          optional(:device_id) => String.t() | nil,
+          optional(:client_message_id) => String.t() | nil,
+          optional(:reply_to_message_id) => String.t() | nil,
+          optional(:reply_to_client_message_id) => String.t() | nil,
+          optional(:llm_visible_message_id) => String.t() | nil,
+          optional(:attachments) => [term()]
+        }
+  @type tail :: %{last_message_id: String.t(), last_message_role: String.t()}
+
   @ddl """
   CREATE TABLE IF NOT EXISTS messages (
     seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,8 +68,13 @@ defmodule Tightbeam.Projection do
   );
   """
 
+  @doc "Ensure the additive messages projection schema exists."
+  @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
+  @doc "Append one finalized message, preserving per-device client-message deduplication."
+  @spec append(db(), message_input()) ::
+          {:appended, message()} | {:duplicate, message()} | {:conflict, message()}
   def append(db \\ Tightbeam.DB, input) do
     transaction!(db, fn txn ->
       existing =
@@ -102,6 +140,8 @@ defmodule Tightbeam.Projection do
     end)
   end
 
+  @doc "Return one projected message by id, or nil when it is absent."
+  @spec get(db(), String.t()) :: message() | nil
   def get(db \\ Tightbeam.DB, id) do
     {:ok, rows} =
       DB.query(
@@ -121,6 +161,8 @@ defmodule Tightbeam.Projection do
     end
   end
 
+  @doc "List a session's messages after a cursor in durable sequence order."
+  @spec list_after(db(), String.t(), String.t() | nil, pos_integer()) :: [message()]
   def list_after(db \\ Tightbeam.DB, session_key, after_message_id, limit) do
     after_seq =
       case after_message_id && get(db, after_message_id) do
@@ -143,6 +185,8 @@ defmodule Tightbeam.Projection do
     Enum.map(rows, &to_message/1)
   end
 
+  @doc "Return a session's latest message identity and role, or nil when empty."
+  @spec tail(db(), String.t()) :: tail() | nil
   def tail(db \\ Tightbeam.DB, session_key) do
     {:ok, rows} =
       DB.query(
@@ -157,6 +201,8 @@ defmodule Tightbeam.Projection do
     end
   end
 
+  @doc "Upsert a user's last-read message for one session."
+  @spec set_read_state(db(), String.t(), String.t(), String.t()) :: :ok
   def set_read_state(db \\ Tightbeam.DB, user_id, session_key, last_read_message_id) do
     transaction!(db, fn txn ->
       Txn.q(
@@ -173,6 +219,8 @@ defmodule Tightbeam.Projection do
     end)
   end
 
+  @doc "Return a user's last-read message ids keyed by session."
+  @spec read_states(db(), String.t()) :: %{String.t() => String.t()}
   def read_states(db \\ Tightbeam.DB, user_id) do
     {:ok, rows} =
       DB.query(db, "SELECT sessionKey, lastReadMessageId FROM read_states WHERE userId = ?1", [
@@ -235,5 +283,4 @@ defmodule Tightbeam.Projection do
       {:error, error} -> raise error
     end
   end
-
 end

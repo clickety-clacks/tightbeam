@@ -1,7 +1,7 @@
 defmodule Tightbeam.LaneManager do
   @moduledoc """
-  The Reconciler (port-spec review #1 — liveness). The doorbell (SessionLane.
-  nudge) is an optimization; THIS scan is the guarantee. At boot and every
+  The Reconciler is the liveness guarantee. The doorbell (SessionLane.nudge)
+  is an optimization; THIS scan is the guarantee. At boot and every
   `interval` ms it:
   1. recovers running turns → failed_unknown (survives a crash that left a lane
      mid-turn),
@@ -16,16 +16,32 @@ defmodule Tightbeam.LaneManager do
   use GenServer
   alias Tightbeam.{Ledger, SessionLane}
 
+  @type t :: %__MODULE__{
+          db: GenServer.server(),
+          lane_sup: GenServer.server(),
+          task_sup: GenServer.server(),
+          runner: SessionLane.runner(),
+          interval: non_neg_integer()
+        }
+
   defstruct [:db, :lane_sup, :task_sup, :runner, :interval]
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+  @doc "Start the periodic reconciler for durable lane work."
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts),
+    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc "Force a reconcile pass now (also used by tests)."
+  @spec reconcile(GenServer.server()) :: :ok
   def reconcile(server \\ __MODULE__), do: GenServer.call(server, :reconcile)
 
   @doc "Ensure a lane exists for a session (idempotent) and nudge it."
-  def ensure_lane(server \\ __MODULE__, session_key), do: GenServer.call(server, {:ensure_lane, session_key})
+  @spec ensure_lane(GenServer.server(), String.t()) :: :ok
+  def ensure_lane(server \\ __MODULE__, session_key),
+    do: GenServer.call(server, {:ensure_lane, session_key})
 
+  @doc "Initialize recovery before scheduling the first reconciliation scan."
+  @spec init(keyword()) :: {:ok, t()}
   @impl true
   def init(opts) do
     state = %__MODULE__{
@@ -42,6 +58,8 @@ defmodule Tightbeam.LaneManager do
     {:ok, do_reconcile(state)}
   end
 
+  @doc "Handle forced reconciliation and idempotent lane creation calls."
+  @spec handle_call(term(), GenServer.from(), t()) :: {:reply, :ok, t()}
   @impl true
   def handle_call(:reconcile, _from, state), do: {:reply, :ok, do_reconcile(state)}
 
@@ -51,6 +69,8 @@ defmodule Tightbeam.LaneManager do
     {:reply, :ok, state}
   end
 
+  @doc "Run and reschedule the periodic reconciliation scan."
+  @spec handle_info(:tick, t()) :: {:noreply, t()}
   @impl true
   def handle_info(:tick, state) do
     schedule(state.interval)
@@ -59,7 +79,8 @@ defmodule Tightbeam.LaneManager do
 
   defp do_reconcile(state) do
     # Re-publish terminals whose publication may have been lost to a crash.
-    for %{seq: seq} <- Ledger.unpublished_terminals(state.db), do: Ledger.mark_published(state.db, seq)
+    for %{seq: seq} <- Ledger.unpublished_terminals(state.db),
+        do: Ledger.mark_published(state.db, seq)
 
     for session_key <- Ledger.pending_sessions(state.db) do
       ensure(state, session_key)
@@ -77,7 +98,8 @@ defmodule Tightbeam.LaneManager do
       [] ->
         DynamicSupervisor.start_child(
           state.lane_sup,
-          {SessionLane, session_key: session_key, db: state.db, task_sup: state.task_sup, runner: state.runner}
+          {SessionLane,
+           session_key: session_key, db: state.db, task_sup: state.task_sup, runner: state.runner}
         )
     end
   end

@@ -2,7 +2,7 @@ defmodule Tightbeam.Boot do
   @moduledoc """
   One-shot boot step under the tree, after the DB is up: ensure all schemas
   exist (additive-only), open a boot epoch (recording a dirty exit for any
-  prior unstamped epoch — review #9), recover any turns left `running` by a
+  prior unstamped epoch), recover any turns left `running` by a
   crash, and stash the epoch for the clean-shutdown stamp on stop.
 
   Runs as a :transient child that returns :ignore, so it does its work at
@@ -11,10 +11,14 @@ defmodule Tightbeam.Boot do
 
   alias Tightbeam.{Ledger, EventLog}
 
+  @doc "Describe the one-shot boot worker as a transient supervision child."
+  @spec child_spec(term()) :: Supervisor.child_spec()
   def child_spec(_opts) do
     %{id: __MODULE__, start: {__MODULE__, :start_link, []}, type: :worker, restart: :transient}
   end
 
+  @doc "Ensure schemas, infer dirty exit, and recover unknown running turns once."
+  @spec start_link() :: :ignore
   def start_link do
     :ok = Ledger.ensure_schema()
     :ok = EventLog.ensure_schema()

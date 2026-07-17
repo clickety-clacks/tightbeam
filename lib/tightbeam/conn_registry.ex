@@ -1,11 +1,11 @@
 defmodule Tightbeam.ConnRegistry do
   @moduledoc """
-  Owns the set of live authed connections and all fan-out (port-spec review
-  #5). A Bandit WebSock handler is one process per socket, but broadcast
+  Owns the set of live authed connections and all fan-out. A Bandit WebSock
+  handler is one process per socket, but broadcast
   scoping, device takeover, and the replay/live de-dup barrier are shared
   state, so they live here.
 
-  Two review-hardened mechanisms:
+  Two shared-state mechanisms:
 
   1. Generation-tagged takeover. Each device slot holds a monotonically
      increasing generation. A new auth for a device atomically installs a new
@@ -20,7 +20,7 @@ defmodule Tightbeam.ConnRegistry do
      publication of a pre-watermark commit forever, closing the
      replay/live race.
 
-  ORDERING DEPENDENCY (review #5): the filter is safe ONLY if publications for
+  ORDERING DEPENDENCY: the filter is safe ONLY if publications for
   a session arrive in commit (seq) order. That is guaranteed by publishing
   from the single-writer commit path (Tightbeam.DB), not by this module. This
   module enforces the per-connection monotonic filter; the caller must not
@@ -29,11 +29,25 @@ defmodule Tightbeam.ConnRegistry do
 
   use GenServer
 
+  @type server :: GenServer.server()
+  @type registration :: %{
+          pid: pid(),
+          user_id: String.t(),
+          device_id: String.t(),
+          is_admin: boolean()
+        }
+  @type connection_ref :: reference()
+  @type deliver :: (pid(), term() -> term())
+  @type t :: %__MODULE__{conns: map(), devices: map()}
+
   defstruct conns: %{}, devices: %{}
   # conns:   ref => %{pid, user_id, device_id, is_admin, gen, delivered: %{session_key => seq}}
   # devices: device_id => %{ref, gen}
 
-  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, :ok, name: Keyword.get(opts, :name, __MODULE__))
+  @doc "Start the registry that owns connection and device-slot state."
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts \\ []),
+    do: GenServer.start_link(__MODULE__, :ok, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc """
   Register/authenticate a connection for a device. Returns
@@ -41,11 +55,14 @@ defmodule Tightbeam.ConnRegistry do
   (or nil). The caller sends session_replaced+close to `replaced` — AFTER this
   returns, so the new registration already owns the slot.
   """
+  @spec register(server(), registration()) ::
+          {:ok, connection_ref(), connection_ref() | nil}
   def register(server \\ __MODULE__, %{pid: _, user_id: _, device_id: _, is_admin: _} = conn) do
     GenServer.call(server, {:register, conn})
   end
 
   @doc "Unregister a connection (idempotent; generation-guarded for device slot)."
+  @spec unregister(server(), connection_ref()) :: :ok
   def unregister(server \\ __MODULE__, ref), do: GenServer.cast(server, {:unregister, ref})
 
   @doc """
@@ -53,27 +70,36 @@ defmodule Tightbeam.ConnRegistry do
   applying each connection's monotonic filter. `deliver` is `(pid, payload) ->
   any` — injected so tests capture without a real socket.
   """
+  @spec publish_message(server(), String.t(), String.t(), integer(), term(), deliver()) :: :ok
   def publish_message(server \\ __MODULE__, session_key, owner_user_id, seq, payload, deliver) do
     GenServer.call(server, {:publish_message, session_key, owner_user_id, seq, payload, deliver})
   end
 
   @doc "Publish a non-message event (turn state, typing, stream) — no seq filter."
+  @spec broadcast(server(), String.t(), term(), deliver()) :: :ok
   def broadcast(server \\ __MODULE__, owner_user_id, payload, deliver) do
     GenServer.call(server, {:broadcast, owner_user_id, payload, deliver})
   end
 
   @doc "Advance a connection's delivered watermark during replay (per session)."
+  @spec note_replayed(server(), connection_ref(), String.t(), integer()) :: :ok
   def note_replayed(server \\ __MODULE__, ref, session_key, seq) do
     GenServer.cast(server, {:note_replayed, ref, session_key, seq})
   end
 
+  @doc "Return the number of live authenticated connections."
+  @spec count(server()) :: non_neg_integer()
   def count(server \\ __MODULE__), do: GenServer.call(server, :count)
 
   ## Server
 
+  @doc "Initialize an empty connection and device-slot registry."
+  @spec init(:ok) :: {:ok, t()}
   @impl true
   def init(:ok), do: {:ok, %__MODULE__{}}
 
+  @doc "Handle registration, filtered publication, broadcast, and count calls."
+  @spec handle_call(term(), GenServer.from(), t()) :: {:reply, term(), t()}
   @impl true
   def handle_call({:register, conn}, _from, state) do
     ref = make_ref()
@@ -128,6 +154,8 @@ defmodule Tightbeam.ConnRegistry do
 
   def handle_call(:count, _from, state), do: {:reply, map_size(state.conns), state}
 
+  @doc "Handle generation-guarded unregisters and monotonic replay watermarks."
+  @spec handle_cast(term(), t()) :: {:noreply, t()}
   @impl true
   def handle_cast({:unregister, ref}, state) do
     case state.conns[ref] do
@@ -152,7 +180,8 @@ defmodule Tightbeam.ConnRegistry do
         {:noreply, state}
 
       _ ->
-        {:noreply, update_in(state.conns[ref].delivered[session_key], fn cur -> max(cur || 0, seq) end)}
+        {:noreply,
+         update_in(state.conns[ref].delivered[session_key], fn cur -> max(cur || 0, seq) end)}
     end
   end
 

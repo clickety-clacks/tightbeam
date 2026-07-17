@@ -3,7 +3,7 @@ defmodule Tightbeam.Acp.Conn do
   Owner of one ACP adapter Port: ndjson JSON-RPC over stdio (binary stream
   mode, hand-buffered line splitting — not Erlang {:line,N}, which fragments).
 
-  The async protocol (port-spec review, binding):
+  The async protocol is binding:
   - This GenServer NEVER blocks its own loop. `request/4` stores the caller's
     `from` and replies when the Port answers ({:noreply, ...} + later
     GenServer.reply). Callers (TurnTasks) may block on the call — they are
@@ -26,6 +26,18 @@ defmodule Tightbeam.Acp.Conn do
 
   use GenServer
 
+  @type server :: GenServer.server()
+  @type request_opts :: [timeout: non_neg_integer(), session_id: String.t()]
+  @type response :: {:ok, term()} | {:error, term()}
+  @type t :: %__MODULE__{
+          port: port() | nil,
+          buf: String.t(),
+          next_id: pos_integer(),
+          pending: map(),
+          subscriber: pid() | nil,
+          closed: boolean()
+        }
+
   defstruct port: nil,
             buf: "",
             next_id: 1,
@@ -36,22 +48,32 @@ defmodule Tightbeam.Acp.Conn do
 
   ## Client
 
+  @doc "Start one owner for an ACP adapter port and its unresolved requests."
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
   @doc "JSON-RPC request. opts: :timeout (ms), :session_id (for cancel-on-death)."
+  @spec request(server(), String.t(), map(), request_opts()) :: response()
   def request(conn, method, params, opts \\ []) do
     GenServer.call(conn, {:request, method, params, opts}, :infinity)
   end
 
+  @doc "Send a JSON-RPC notification without creating pending request state."
+  @spec notify(server(), String.t(), map()) :: :ok
   def notify(conn, method, params), do: GenServer.cast(conn, {:notify, method, params})
 
   @doc "Count of unresolved pending requests (quiescence probe)."
+  @spec pending_count(server()) :: non_neg_integer()
   def pending_count(conn), do: GenServer.call(conn, :pending_count)
 
+  @doc "Close the adapter port and fail every unresolved request exactly once."
+  @spec close(server()) :: :ok
   def close(conn), do: GenServer.cast(conn, :close)
 
   ## Server
 
+  @doc "Open the ACP subprocess and initialize its hand-buffered stream state."
+  @spec init(keyword()) :: {:ok, t()}
   @impl true
   def init(opts) do
     cmd = Keyword.fetch!(opts, :cmd)
@@ -71,6 +93,9 @@ defmodule Tightbeam.Acp.Conn do
     {:ok, %__MODULE__{port: port, subscriber: Keyword.get(opts, :subscriber)}}
   end
 
+  @doc "Handle asynchronous JSON-RPC requests and the quiescence count probe."
+  @spec handle_call(term(), GenServer.from(), t()) ::
+          {:reply, term(), t()} | {:noreply, t()}
   @impl true
   def handle_call({:request, method, params, opts}, {pid, _} = from, state) do
     if state.closed do
@@ -96,9 +121,13 @@ defmodule Tightbeam.Acp.Conn do
 
   def handle_call(:pending_count, _from, state), do: {:reply, map_size(state.pending), state}
 
+  @doc "Handle outbound notifications and explicit port closure."
+  @spec handle_cast(term(), t()) :: {:noreply, t()}
   @impl true
   def handle_cast({:notify, method, params}, state) do
-    unless state.closed, do: send_json(state.port, %{jsonrpc: "2.0", method: method, params: params})
+    unless state.closed,
+      do: send_json(state.port, %{jsonrpc: "2.0", method: method, params: params})
+
     {:noreply, state}
   end
 
@@ -107,6 +136,8 @@ defmodule Tightbeam.Acp.Conn do
     {:noreply, fail_all(%{state | closed: true}, {:error, :closed})}
   end
 
+  @doc "Route port frames, exits, timeouts, and requester deaths without blocking the owner."
+  @spec handle_info(term(), t()) :: {:noreply, t()}
   @impl true
   def handle_info({port, {:data, chunk}}, %{port: port} = state) do
     {lines, buf} = split_lines(state.buf <> chunk)
