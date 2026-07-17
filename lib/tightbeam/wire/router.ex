@@ -55,8 +55,23 @@ defmodule Tightbeam.Wire.Router do
   plug(:match)
   plug(:dispatch)
 
+  # The TS reference upgrades WebSocket on ANY path (bare WebSocketServer);
+  # the client connects at "/". Upgrade wherever the upgrade header appears,
+  # at "/" and "/ws" alike — the path is not part of the WS contract.
+  get "/" do
+    upgrade_socket(conn)
+  end
+
   get "/ws" do
-    WebSockAdapter.upgrade(conn, Socket, deps(conn), max_frame_size: 2 * 1024 * 1024)
+    upgrade_socket(conn)
+  end
+
+  defp upgrade_socket(conn) do
+    if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] do
+      WebSockAdapter.upgrade(conn, Socket, deps(conn), max_frame_size: 2 * 1024 * 1024)
+    else
+      error(conn, 404, "not_found")
+    end
   end
 
   get "/version" do

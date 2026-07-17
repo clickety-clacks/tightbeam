@@ -241,3 +241,25 @@ adapter startup now projects those homes with the verbatim scheduling-wakes
 guidance and archetype header from `gateway.ts`. Added runtime environment
 projection for the six requested `TIGHTBEAM_*` settings without changing code
 defaults.
+
+## E2 EXIT — black-box drivers pass on BEAM (Fable)
+
+One more contract fix found by the driver itself: the TS reference upgrades
+WebSocket on ANY path (client connects at "/"); the router upgraded only at
+/ws. Root upgrade added (guarded on the upgrade header; /ws kept as alias).
+
+Then, against a live BEAM gateway (mix run, env config, real
+claude-agent-acp adapter, haiku):
+- wire-first-light  ✅ pair→auth→sync→post→echo→accepted→running→real
+  assistant reply→delivered + /version /api/streams /api/session-status.
+- dm-first-light    ✅ CLI spawn (stream_created broadcast), agent-origin
+  immediate wake DM (assistant "DM ACK"), durable 2s delayed wake
+  ("DELAYED ACK" after ~4s incl. turn time), inspect from the agent's seat.
+- agent-uses-cli    ✅ a real harness agent ran the tightbeam CLI from its
+  own shell (TIGHTBEAM_HOME discovery + PATH bin from the home projection)
+  and reported COUNT=3 through its own turn.
+Note: drivers each need a FRESH base_dir (first-user bootstrap); running two
+against one substrate correctly yields pair_pending → auth denied.
+Remaining acceptance wall (E3): golden-trace comparator, ExUnit additions
+(kill matrix, replay-under-write over a real socket), adopt-in-place, sim
+E2E, soak.
