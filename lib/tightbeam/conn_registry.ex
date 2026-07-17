@@ -1,0 +1,161 @@
+defmodule Tightbeam.ConnRegistry do
+  @moduledoc """
+  Owns the set of live authed connections and all fan-out (port-spec review
+  #5). A Bandit WebSock handler is one process per socket, but broadcast
+  scoping, device takeover, and the replay/live de-dup barrier are shared
+  state, so they live here.
+
+  Two review-hardened mechanisms:
+
+  1. Generation-tagged takeover. Each device slot holds a monotonically
+     increasing generation. A new auth for a device atomically installs a new
+     (gen+1) registration BEFORE the old socket is told to close; the old
+     connection's unregister compares generations and cannot delete its
+     replacement. So a slow-closing old socket can never evict the new one.
+
+  2. Persistent per-connection delivered-seq filter. Every message carries its
+     per-session store `seq`. A connection tracks `lastDeliveredSeq` per
+     session for its WHOLE lifetime (not just during replay drain): any push
+     with seq <= lastDeliveredSeq is dropped. This suppresses a late
+     publication of a pre-watermark commit forever, closing the
+     replay/live race.
+
+  ORDERING DEPENDENCY (review #5): the filter is safe ONLY if publications for
+  a session arrive in commit (seq) order. That is guaranteed by publishing
+  from the single-writer commit path (Tightbeam.DB), not by this module. This
+  module enforces the per-connection monotonic filter; the caller must not
+  publish out of seq order.
+  """
+
+  use GenServer
+
+  defstruct conns: %{}, devices: %{}
+  # conns:   ref => %{pid, user_id, device_id, is_admin, gen, delivered: %{session_key => seq}}
+  # devices: device_id => %{ref, gen}
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, :ok, name: Keyword.get(opts, :name, __MODULE__))
+
+  @doc """
+  Register/authenticate a connection for a device. Returns
+  {:ok, ref, replaced} where `replaced` is the ref of the taken-over socket
+  (or nil). The caller sends session_replaced+close to `replaced` — AFTER this
+  returns, so the new registration already owns the slot.
+  """
+  def register(server \\ __MODULE__, %{pid: _, user_id: _, device_id: _, is_admin: _} = conn) do
+    GenServer.call(server, {:register, conn})
+  end
+
+  @doc "Unregister a connection (idempotent; generation-guarded for device slot)."
+  def unregister(server \\ __MODULE__, ref), do: GenServer.cast(server, {:unregister, ref})
+
+  @doc """
+  Publish a per-session message (with its store seq) to owner + admins,
+  applying each connection's monotonic filter. `deliver` is `(pid, payload) ->
+  any` — injected so tests capture without a real socket.
+  """
+  def publish_message(server \\ __MODULE__, session_key, owner_user_id, seq, payload, deliver) do
+    GenServer.call(server, {:publish_message, session_key, owner_user_id, seq, payload, deliver})
+  end
+
+  @doc "Publish a non-message event (turn state, typing, stream) — no seq filter."
+  def broadcast(server \\ __MODULE__, owner_user_id, payload, deliver) do
+    GenServer.call(server, {:broadcast, owner_user_id, payload, deliver})
+  end
+
+  @doc "Advance a connection's delivered watermark during replay (per session)."
+  def note_replayed(server \\ __MODULE__, ref, session_key, seq) do
+    GenServer.cast(server, {:note_replayed, ref, session_key, seq})
+  end
+
+  def count(server \\ __MODULE__), do: GenServer.call(server, :count)
+
+  ## Server
+
+  @impl true
+  def init(:ok), do: {:ok, %__MODULE__{}}
+
+  @impl true
+  def handle_call({:register, conn}, _from, state) do
+    ref = make_ref()
+    device_id = conn.device_id
+    prior = state.devices[device_id]
+    gen = (prior && prior.gen + 1) || 1
+
+    entry = %{
+      pid: conn.pid,
+      user_id: conn.user_id,
+      device_id: device_id,
+      is_admin: conn.is_admin,
+      gen: gen,
+      delivered: %{}
+    }
+
+    replaced = prior && prior.ref
+
+    state = %{
+      state
+      | conns: state.conns |> Map.put(ref, entry) |> maybe_drop(replaced),
+        devices: Map.put(state.devices, device_id, %{ref: ref, gen: gen})
+    }
+
+    {:reply, {:ok, ref, replaced}, state}
+  end
+
+  def handle_call({:publish_message, session_key, owner, seq, payload, deliver}, _from, state) do
+    conns =
+      Enum.reduce(state.conns, state.conns, fn {ref, e}, acc ->
+        cond do
+          e.user_id != owner and not e.is_admin ->
+            acc
+
+          Map.get(e.delivered, session_key, 0) >= seq ->
+            # already delivered (late pre-watermark publication) — drop forever
+            acc
+
+          true ->
+            deliver.(e.pid, payload)
+            put_in(acc[ref].delivered[session_key], seq)
+        end
+      end)
+
+    {:reply, :ok, %{state | conns: conns}}
+  end
+
+  def handle_call({:broadcast, owner, payload, deliver}, _from, state) do
+    for {_ref, e} <- state.conns, e.user_id == owner or e.is_admin, do: deliver.(e.pid, payload)
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:count, _from, state), do: {:reply, map_size(state.conns), state}
+
+  @impl true
+  def handle_cast({:unregister, ref}, state) do
+    case state.conns[ref] do
+      nil ->
+        {:noreply, state}
+
+      e ->
+        # Generation guard: only clear the device slot if THIS ref still owns it.
+        devices =
+          case state.devices[e.device_id] do
+            %{ref: ^ref} -> Map.delete(state.devices, e.device_id)
+            _ -> state.devices
+          end
+
+        {:noreply, %{state | conns: Map.delete(state.conns, ref), devices: devices}}
+    end
+  end
+
+  def handle_cast({:note_replayed, ref, session_key, seq}, state) do
+    case state.conns[ref] do
+      nil ->
+        {:noreply, state}
+
+      _ ->
+        {:noreply, update_in(state.conns[ref].delivered[session_key], fn cur -> max(cur || 0, seq) end)}
+    end
+  end
+
+  defp maybe_drop(conns, nil), do: conns
+  defp maybe_drop(conns, ref), do: Map.delete(conns, ref)
+end
