@@ -15,3 +15,21 @@ Next: EventLog (events + lifecycle_events + boot_epochs w/ dirty-exit
 inference), then Acp.Conn (Port owner, ndjson binary-mode hand-buffered
 framing, async request protocol — NO blocking calls), then SessionLane +
 LaneManager reconciler, then the E1 vertical slice against a real adapter.
+
+## E1c — Fable — Acp.Conn (Port owner, async protocol)
+
+Done: Tightbeam.Acp.Conn — binary-mode Port w/ hand-buffered ndjson framing
+(built-in JSON module, no dep); NEVER blocks its own loop (noreply+from, per-
+request send_after timeouts); requester monitoring → session/cancel on caller
+death; pending entries RETAINED past timeout/orphan until the adapter answers
+— that answer emits {:acp_orphan_resolved, session_id}, the QUIESCENCE signal
+review-3 demanded; permission requests auto-allowed (allow-kind preferred);
+stderr via sh 2>> redirect; port exit fails pending + emits acp_exit. Fake
+adapter is the same node -e protocol as the TS test fakes. 6 tests (18 total).
+
+Next: SessionLane (claims from Ledger, runs TurnTask via Task.Supervisor
+async_nolink + mutual monitors, quarantine on failed_unknown until
+orphan_resolved or generation recycle) + LaneManager (Registry-named lanes,
+boot+5s reconciler over Ledger.pending_sessions, unpublished-terminal
+re-publish). Then Adapter (initialize/session lifecycle over Conn) + the E1
+vertical slice against the real claude adapter.
