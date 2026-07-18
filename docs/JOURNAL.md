@@ -807,3 +807,16 @@ list is environment-dependent — same home/auth offers fable at cwd=$HOME
 fresh workdir; every "intermittent" fable refusal tonight was this.
 Documented in harness-support.md as an open investigation; loopback
 completed on opus to keep vendor flakiness out of the machinery verdict.
+
+CODEX ONBOARDED + FIRST CODEX LEG (Flynn provided the grant). Login driven
+headlessly: codex login's localhost:1455 callback reverse-tunneled to
+serenity's browser (ssh -R); grant landed in the org store (auth.json,
+0600); discovered codex login --device-auth exists (hidden from --help) —
+matrix corrected, codex onboarding now ✅ headless. First codex session
+through the entire system: spawn (gpt-5.6-sol[medium]) → turn DELIVERED —
+tool use (uname), projected AGENTS.md identity, and the read-on-demand
+skill path (it read tightbeam-harnesses by path and quoted the bullet
+describing that exact mechanism). Matrix rows upgraded to verified;
+remaining codex-unverified rows enumerated. Note: the skill content
+update propagated LIVE through the library symlink — no home regen, no
+memory cost — the skills-replication design paying off in the field.

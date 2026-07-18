@@ -260,6 +260,9 @@ defmodule Tightbeam.Archetypes do
     so the rotation caveat applies to shared logins.
   - Slash-command vocabulary differs from claude and is unverified — do
     not promise specific commands.
+  - Verified working (2026-07-18): turns, tool use, AGENTS.md identity,
+    read-on-demand skills, gpt-5.6-sol model selection. Headless login
+    exists: codex login --device-auth.
 
   Both: sessions/turns/cancel/load, model+effort selection, projected
   identity (CLAUDE.md vs AGENTS.md), hash-gated homes with surviving
