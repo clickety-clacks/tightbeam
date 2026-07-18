@@ -376,3 +376,20 @@ without running help. Default compiled output byte-identical to
 pre-fragment guidance (projection hashes unchanged). Base skills answer:
 the wakes skill IS baked into every home; a richer shared skills library
 (SKILL.md dirs chosen by name) remains the full-compiler milestone.
+
+## E4b — sol: CLI assimilate (reviewed Fable)
+
+Implemented `tightbeam assimilate <ssh-dest>` in the reference CLI per
+contract (freeze exception, journaled above): BatchMode ssh probe with
+diagnostic failures (keys/node/rsync named), remote mkdirs + ~-resolution,
+HARVEST-by-default credentials (remote-side cp; --push-credentials scp's
+local creds with a loud line), npm adapter install under <base>/adapters,
+single-file CLI ship + sh shim, then the register-host verb through the
+normal dispatch facade. --dry-run prints every command (cannot resolve
+remote ~ or credential state without executing — reported as such; sol
+flag, accepted). Also introduced proper boolean flags in the arg parser
+(fixes latent --demote arg-swallowing). Review: contract-faithful; quoted-
+heredoc shim correct; argv-only exec throughout. Gate outside sol's sandbox:
+tsc clean, 84/84 TS tests pass, help entry verified, dry-run smoke against
+a REAL remote (tars) emitted the exact command sequence. TS repo commit
+89c3063 (repo is local-only; no remote configured).
