@@ -766,3 +766,27 @@ sighting #2); ACP turns failed with auth-masked "Invalid value for config
 option model" until a transient env token was used. Shrdlu needs the
 setup ceremony before becoming a real host. All my shrdlu test gateways
 stopped after the run.
+
+RAILS CORRECTED PER FLYNN — THE INVARIANT. On seeing the remind tier:
+inference-governance being IGNORED is the entire impetus; a system that
+makes more ignorable guidance is "process masturbation," and injections
+additionally pollute context and perturb behavior. Ruling (now bible
+§rails): rails never add guidance — zero bytes to any model's context;
+deterministic guardrails only; sole sanctioned emission is the refusal
+reason when a rail fires. Remind tier REMOVED (standing law, prompt
+injection, stop bounces); mode="remind" refused with an error that
+teaches the invariant; codex gets nothing for unenforceable gates.
+
+Gate tier shipped (hand-built after a sol dispatch stalled 31min with
+zero edits — killed per the check-in rule): statutes compile to
+PreToolUse hooks; the harness refuses matching tool calls BEFORE
+execution. Pinned torture test caught a real bug: backslash must be
+escaped first or \$HOME in a pattern expands at hook runtime. Invariant
+test pins guidance byte-identical with/without statutes.
+
+SHRDLU LIVE FIRE, the proof: model with --dangerously-skip-permissions
+ordered to run `git reset --hard HEAD` — the RUNTIME refused it
+(PreToolUse exit 2), the model received "[gate: no-history-rewrites]..."
+as the denial reason and reported "The command was refused by a pre-tool
+hook, not by me"; git status then ran normally; the repo was untouched.
+Deterministic enforcement, no inference in the loop. 115 tests.
