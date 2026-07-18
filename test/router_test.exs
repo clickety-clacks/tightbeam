@@ -98,6 +98,59 @@ defmodule Tightbeam.Wire.RouterTest do
     assert disallowed.status == 400
   end
 
+  test "wake targets resolve user ids to Main with handle precedence", ctx do
+    {:pending, _device} =
+      Devices.pair(ctx.db, %{
+        device_id: "mike-device",
+        claimed_name: "Mike",
+        platform: nil,
+        model: nil
+      })
+
+    main_key = Org.personal_session_key("mike")
+
+    Org.create(ctx.db, %{
+      session_key: main_key,
+      display_name: "Main",
+      owner_user_id: "mike",
+      origin: "user:mike",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable"
+    })
+
+    assert dispatch_wake(ctx, "mike").status == 200
+    assert_receive {:call, %{verb: "wake", session_key: ^main_key}}
+
+    assert dispatch_wake(ctx, "user:mike").status == 200
+    assert_receive {:call, %{verb: "wake", session_key: ^main_key}}
+
+    Org.create(ctx.db, %{
+      session_key: "shadow",
+      display_name: "Mike shadow",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      handle: "mike",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable"
+    })
+
+    assert dispatch_wake(ctx, "mike").status == 200
+    assert_receive {:call, %{verb: "wake", session_key: "shadow"}}
+
+    unknown = dispatch_wake(ctx, "unknown-user")
+    assert unknown.status == 404
+
+    assert JSON.decode!(unknown.resp_body) == %{
+             "error" => %{"code" => "not_found", "message" => "unknown target: unknown-user"}
+           }
+  end
+
   test "multipart upload returns asset metadata", ctx do
     response =
       ctx
@@ -188,6 +241,20 @@ defmodule Tightbeam.Wire.RouterTest do
   defp download(ctx, device, asset_id) do
     conn(:get, "/download/#{asset_id}")
     |> put_req_header("authorization", "Bearer #{device.token}")
+    |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp dispatch_wake(ctx, target) do
+    body =
+      JSON.encode!(%{
+        "verb" => "wake",
+        "asUser" => "flynn",
+        "target" => target,
+        "params" => %{"prompt" => "hi"}
+      })
+
+    conn(:post, "/agent/dispatch", body)
+    |> put_req_header("authorization", "Bearer tbc_test")
     |> Router.call(Router.init(ctx.opts))
   end
 end

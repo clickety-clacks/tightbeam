@@ -332,13 +332,27 @@ defmodule Tightbeam.Wire.Router do
   defp target_session("", _conn), do: {:ok, nil}
 
   defp target_session(target, conn) when is_binary(target) do
+    # Session keys and handles keep precedence; only an unshadowed bare id
+    # falls through to user Main resolution.
     case Org.get(db(conn), target) || Org.get_by_handle(db(conn), target) do
-      nil -> {:error, 404, "not_found", "unknown target: #{target}"}
+      nil -> user_target_session(target, conn)
       session -> {:ok, session.session_key}
     end
   end
 
   defp target_session(_target, _conn), do: {:ok, nil}
+
+  defp user_target_session("user:" <> user_id, conn) do
+    if Devices.user(db(conn), user_id),
+      do: {:ok, Org.personal_session_key(user_id)},
+      else: {:error, 404, "not_found", "unknown target: user:#{user_id}"}
+  end
+
+  defp user_target_session(user_id, conn) do
+    if Devices.user(db(conn), user_id),
+      do: {:ok, Org.personal_session_key(user_id)},
+      else: {:error, 404, "not_found", "unknown target: #{user_id}"}
+  end
 
   defp owned_session(key, device, conn) do
     case Org.get(db(conn), key) do

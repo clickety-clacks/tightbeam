@@ -1,7 +1,18 @@
 defmodule Tightbeam.GatewayTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, EventLog, Gateway, Ledger, Org, Projection}
+  alias Tightbeam.{
+    Archetypes,
+    ConnRegistry,
+    DB,
+    EventLog,
+    Gateway,
+    Idempotency,
+    Ledger,
+    Org,
+    Projection,
+    Wakes
+  }
 
   defmodule LaneDoorbell do
     use GenServer
@@ -66,7 +77,16 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: registry})
     lane = start_supervised!({LaneDoorbell, self()})
-    for module <- [EventLog, Ledger, Org, Projection], do: :ok = module.ensure_schema(db)
+    old_hosts = Application.get_env(:tightbeam, :hosts)
+
+    on_exit(fn ->
+      if old_hosts,
+        do: Application.put_env(:tightbeam, :hosts, old_hosts),
+        else: Application.delete_env(:tightbeam, :hosts)
+    end)
+
+    for module <- [EventLog, Idempotency, Ledger, Org, Projection, Wakes],
+        do: :ok = module.ensure_schema(db)
 
     Org.create(db, %{
       session_key: "k1",
@@ -89,6 +109,178 @@ defmodule Tightbeam.GatewayTest do
       })
 
     %{db: db, registry: registry, lane: lane}
+  end
+
+  test "children preserves the cli token while refreshing the gateway port", ctx do
+    base_dir = Path.join(System.tmp_dir!(), "gateway_token_#{System.unique_integer([:positive])}")
+    config = gateway_config(base_dir, ctx.db, 4_321)
+
+    Gateway.children(config)
+    first = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
+    Gateway.children(%{config | port: 5_432})
+    second = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
+    assert first["cliToken"] == second["cliToken"]
+    assert second["port"] == 5_432
+    assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
+  end
+
+  test "children mints a cli token when gateway.json is missing", ctx do
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_missing_#{System.unique_integer([:positive])}")
+
+    Gateway.children(gateway_config(base_dir, ctx.db, 0))
+
+    assert %{"cliToken" => "tbc_" <> token} =
+             base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
+    assert token != ""
+  end
+
+  test "children mints a cli token when gateway.json is corrupt", ctx do
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_corrupt_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(base_dir)
+    File.write!(Path.join(base_dir, "gateway.json"), "not json")
+
+    Gateway.children(gateway_config(base_dir, ctx.db, 0))
+
+    assert %{"cliToken" => "tbc_" <> token} =
+             base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
+    assert token != ""
+  end
+
+  test "wake idempotency replays one scheduled wake", ctx do
+    wake = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["wake"]
+    due_at = System.system_time(:millisecond) + 60_000
+
+    call = %{
+      origin: "process:scheduler",
+      session_key: "k1",
+      params: %{prompt: "follow up", at: due_at, idempotency_key: "schedule-1"}
+    }
+
+    first = wake.(call)
+    second = wake.(call)
+
+    assert first.wake_id == second.wake_id
+    assert first == second
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  test "process inspect returns exactly its own pending wakes", ctx do
+    own =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:scheduler",
+        prompt: "own wake",
+        due_at: 2_000
+      })
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "k1",
+      origin: "process:other",
+      prompt: "other wake",
+      due_at: 1_000
+    })
+
+    inspect_handler = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["inspect"]
+
+    assert inspect_handler.(%{origin: "process:scheduler", params: %{}, session_key: nil}) == %{
+             wakes: [
+               %{
+                 wake_id: own.wake_id,
+                 session_key: "k1",
+                 due_at: 2_000,
+                 prompt: "own wake"
+               }
+             ]
+           }
+  end
+
+  test "process cancel-wake cancels only its own pending wakes", ctx do
+    own =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:scheduler",
+        prompt: "own wake",
+        due_at: 1_000
+      })
+
+    other =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:other",
+        prompt: "other wake",
+        due_at: 2_000
+      })
+
+    wake = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["wake"]
+
+    assert wake.(%{
+             origin: "process:scheduler",
+             session_key: nil,
+             params: %{cancel_wake_id: own.wake_id}
+           }) == %{canceled: true}
+
+    assert wake.(%{
+             origin: "process:scheduler",
+             session_key: nil,
+             params: %{cancel_wake_id: other.wake_id}
+           }) == %{canceled: false}
+
+    assert Wakes.get(ctx.db, own.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, other.wake_id).state == "pending"
+  end
+
+  test "set_host denies on workdir sync failure and leaves Org unchanged", ctx do
+    base_dir = move_test_base("failure")
+    source = test_workdir(base_dir, "k1")
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "memory.md"), "keep")
+
+    sh = fn command ->
+      if hd(command) == "rsync", do: {"copy failed", 23}, else: {"", 0}
+    end
+
+    tune =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+
+    result =
+      tune.(%{
+        origin: "user:flynn",
+        session_key: "k1",
+        params: %{setting: "set_host", host: "worker"}
+      })
+
+    assert %{code: "workdir_move_failed", message: message} = result
+    assert message =~ "exit 23"
+    assert Org.get(ctx.db, "k1").host == "testhost"
+  end
+
+  test "set_host proceeds when the source workdir is missing", ctx do
+    base_dir = move_test_base("missing")
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:unexpected_command, command})
+      {"", 0}
+    end
+
+    tune =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+
+    assert tune.(%{
+             origin: "user:flynn",
+             session_key: "k1",
+             params: %{setting: "set_host", host: "worker"}
+           }) == %{ok: true, host: "worker"}
+
+    assert Org.get(ctx.db, "k1").host == "worker"
+    refute_received {:unexpected_command, _}
   end
 
   test "deliver_prompt commits echo+turn once and client duplicate short-circuits", ctx do
@@ -352,6 +544,50 @@ defmodule Tightbeam.GatewayTest do
                &1
              )
            )
+  end
+
+  defp gateway_config(base_dir, db, port) do
+    %{
+      base_dir: base_dir,
+      cwd: "/tmp",
+      port: port,
+      default_harness: :claude,
+      default_model: "fable",
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      db: db
+    }
+  end
+
+  defp move_test_base(suffix) do
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_move_#{suffix}_#{System.unique_integer([:positive])}")
+
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "default.toml"), """
+    name = "default"
+    where = ["testhost", "worker"]
+    """)
+
+    Archetypes.load!(base_dir)
+    on_exit(fn -> :persistent_term.erase(Archetypes) end)
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
+    })
+
+    base_dir
+  end
+
+  defp test_workdir(base_dir, session_key) do
+    digest =
+      :crypto.hash(:sha256, session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    Path.join([base_dir, "work", digest])
   end
 
   defp collect_pushes(0, acc), do: Enum.reverse(acc)

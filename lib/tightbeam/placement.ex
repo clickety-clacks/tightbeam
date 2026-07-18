@@ -15,7 +15,7 @@ defmodule Tightbeam.Placement do
   destination is how to reach one. WHY a host set contains what it does is
   the operator's statute — nothing here hardcodes a topology.
 
-  Three responsibilities, each a pure-ish function:
+  Four responsibilities, each a pure-ish function:
 
   1. `resolve/2` — the CONSTITUTIONAL check (set membership of data against
      data, no rule engine): a spawn/tune host must be a member of the
@@ -41,6 +41,10 @@ defmodule Tightbeam.Placement do
        the gateway over the network.
 
   3. `deliver_home/3` — materialize the projected home on the session's host:
+     Claude homes pin their session-facing default model in settings.json;
+     that pin participates in the projected identity, so the first deploy
+     regenerates each Claude home once and the expected context-reset
+     markers make that identity change visible.
      - local: `Homes.project(base_dir, spec)` directly (unchanged path).
      - remote: STAGE the projection on the gateway machine under
        `<base_dir>/staging/<host>/` — the staging tree has NO auth/ dir, so
@@ -60,6 +64,13 @@ defmodule Tightbeam.Placement do
      Shell execution goes through an injectable runner (`:sh` opt, default
      System.cmd) so tests capture command lines instead of running ssh —
      same pattern as ConnRegistry's injected deliver.
+
+  4. `move_workdir/4` — carry a session's durable scratch when placement
+     changes. Local copies use File.cp_r!; remote legs use gateway-originated
+     rsync, and remote→remote stages through the gateway because rsync's
+     source-host hop is unsupported. Missing source means a fresh session;
+     every other failure is returned so the caller can refuse the host write
+     rather than silently strand memory.
 
   Failure posture: deliver_home raising fails the adapter start, which the
   AdapterCoordinator already treats as a failed start (backoff, circuit) —
@@ -178,6 +189,126 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
+  Move a session workdir between configured hosts. The host names are
+  resolved from `config.base_dir`; `config.sh` may inject the same argv
+  runner used by home delivery. Returns `{:error, message}` on every copy or
+  command failure so `tune set_host` can fail closed before changing Org.
+  """
+  @spec move_workdir(map(), String.t(), String.t(), String.t()) ::
+          :ok | {:error, String.t()}
+  def move_workdir(config, session_key, old_host_name, new_host_name) do
+    try do
+      configured_hosts = hosts(config.base_dir)
+      old_host = Map.fetch!(configured_hosts, old_host_name)
+      new_host = Map.fetch!(configured_hosts, new_host_name)
+      source = workdir_path(old_host, session_key)
+      destination = workdir_path(new_host, session_key)
+      sh = Map.get(config, :sh) || (&system_cmd/1)
+
+      if source != destination do
+        move_workdir(sh, config.base_dir, old_host, source, new_host, destination)
+      end
+
+      :ok
+    rescue
+      error -> {:error, Exception.message(error)}
+    end
+  end
+
+  defp move_workdir(_sh, _base_dir, %{ssh: nil}, source, %{ssh: nil}, destination) do
+    if File.dir?(source) do
+      File.mkdir_p!(Path.dirname(destination))
+      File.cp_r!(source, destination)
+    end
+  end
+
+  defp move_workdir(sh, _base_dir, %{ssh: nil}, source, %{ssh: destination_host}, destination) do
+    if File.dir?(source) do
+      run!(sh, ["ssh" | @ssh_opts] ++ [destination_host, "mkdir", "-p", destination])
+
+      run!(sh, [
+        "rsync",
+        "-a",
+        "-e",
+        Enum.join(["ssh" | @ssh_opts], " "),
+        source <> "/",
+        "#{destination_host}:#{destination}/"
+      ])
+    end
+  end
+
+  defp move_workdir(sh, _base_dir, %{ssh: source_host}, source, %{ssh: nil}, destination) do
+    if remote_dir?(sh, source_host, source) do
+      File.mkdir_p!(destination)
+
+      run!(sh, [
+        "rsync",
+        "-a",
+        "-e",
+        Enum.join(["ssh" | @ssh_opts], " "),
+        "#{source_host}:#{source}/",
+        destination <> "/"
+      ])
+    end
+  end
+
+  defp move_workdir(
+         sh,
+         base_dir,
+         %{ssh: source_host},
+         source,
+         %{ssh: destination_host},
+         destination
+       ) do
+    if remote_dir?(sh, source_host, source) do
+      digest = Path.basename(source)
+      stage = Path.join([base_dir, "staging", "workdir-moves", digest])
+      File.mkdir_p!(stage)
+
+      try do
+        run!(sh, [
+          "rsync",
+          "-a",
+          "-e",
+          Enum.join(["ssh" | @ssh_opts], " "),
+          "#{source_host}:#{source}/",
+          stage <> "/"
+        ])
+
+        run!(sh, ["ssh" | @ssh_opts] ++ [destination_host, "mkdir", "-p", destination])
+
+        run!(sh, [
+          "rsync",
+          "-a",
+          "-e",
+          Enum.join(["ssh" | @ssh_opts], " "),
+          stage <> "/",
+          "#{destination_host}:#{destination}/"
+        ])
+      after
+        File.rm_rf!(stage)
+      end
+    end
+  end
+
+  defp remote_dir?(sh, host, path) do
+    case sh.(["ssh" | @ssh_opts] ++ [host, "test", "-d", path]) do
+      {_output, 0} -> true
+      {_output, 1} -> false
+      {_output, exit} -> raise "remote workdir check failed with exit #{exit}: #{host}:#{path}"
+    end
+  end
+
+  defp workdir_path(host, session_key) do
+    digest =
+      :crypto.hash(:sha256, session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    Path.join([host.base_dir, "work", digest])
+  end
+
+  @doc """
   Resolve + constitutionally check a requested host for an archetype.
   nil → first of archetype.where. `where = ["*"]` grants ANYWHERE: any
   configured host is allowed and nil resolves to the gateway's own host (an
@@ -233,7 +364,7 @@ defmodule Tightbeam.Placement do
         end
       end
 
-    stderr_path = Path.join(config.base_dir, "adapter-#{harness}:#{archetype}.stderr.log")
+    stderr_path = Path.join(config.base_dir, "adapter-#{harness}:#{archetype}@#{host}.stderr.log")
 
     if host_config.ssh == nil do
       [
@@ -380,14 +511,13 @@ defmodule Tightbeam.Placement do
       guidance: Archetypes.guidance(archetype)
     }
 
-    spec =
-      case {harness, Rails.claude_settings()} do
-        {:claude, settings} when not is_nil(settings) ->
-          Map.put(spec, :extra_files, %{"settings.json" => JSON.encode!(settings)})
+    rails_settings = if harness == :claude, do: Rails.claude_settings()
+    settings = merge_settings(rails_settings, model_settings(harness, archetype, config))
 
-        _ ->
-          spec
-      end
+    spec =
+      if settings,
+        do: Map.put(spec, :extra_files, %{"settings.json" => JSON.encode!(settings)}),
+        else: spec
 
     if host_config.ssh == nil do
       local_skills = skills.(Archetypes.skills_dir(config.base_dir))
@@ -473,6 +603,23 @@ defmodule Tightbeam.Placement do
       remote_home
     end
   end
+
+  defp merge_settings(nil, nil), do: nil
+  defp merge_settings(settings, nil), do: settings
+  defp merge_settings(nil, additions), do: additions
+  defp merge_settings(settings, additions), do: Map.merge(settings, additions)
+
+  defp model_settings(:claude, archetype, config) do
+    default_ref = archetype.defaults[:model] || config.default_model
+
+    pinned_model =
+      Application.get_env(:tightbeam, :model_pins, %{"fable" => "claude-fable-5[1m]"})
+      |> Map.get(default_ref, default_ref)
+
+    %{"model" => pinned_model}
+  end
+
+  defp model_settings(_harness, _archetype, _config), do: nil
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
 

@@ -124,8 +124,17 @@ defmodule Tightbeam.Gateway do
         Placement.local_host_name()
       ])
 
-    cli_token = "tbc_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
     gateway_path = Path.join(config.base_dir, "gateway.json")
+
+    cli_token =
+      with {:ok, encoded} <- File.read(gateway_path),
+           {:ok, %{"cliToken" => token}} <- JSON.decode(encoded),
+           true <- is_binary(token) and token != "" do
+        token
+      else
+        _ -> "tbc_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
+      end
+
     File.write!(gateway_path, JSON.encode!(%{port: config.port, cliToken: cli_token}))
     File.chmod!(gateway_path, 0o600)
     cli_bin = install_cli_bin(config.base_dir)
@@ -225,30 +234,7 @@ defmodule Tightbeam.Gateway do
             %{code: "unknown_caller"}
 
           true ->
-            case Org.get(db, call.session_key) do
-              %{state: "active"} = target ->
-                due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
-
-                wake =
-                  Wakes.schedule(db, %{
-                    session_key: target.session_key,
-                    origin: call.origin,
-                    prompt: p.prompt,
-                    due_at: due_at
-                  })
-
-                if due_at <= System.system_time(:millisecond),
-                  do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
-
-                %{
-                  wake_id: wake.wake_id,
-                  due_at: due_at,
-                  state: (Wakes.get(db, wake.wake_id) || wake).state
-                }
-
-              _ ->
-                %{code: "not_found"}
-            end
+            wake_result(config, db, call)
         end
       end,
       "approve-device" =>
@@ -877,6 +863,14 @@ defmodule Tightbeam.Gateway do
       nil ->
         %{code: "unknown_caller"}
 
+      %{owner_user_id: nil} ->
+        wakes =
+          Wakes.list_pending(db)
+          |> Enum.filter(&(&1.origin == call.origin))
+          |> Enum.map(&Map.take(&1, [:wake_id, :session_key, :due_at, :prompt]))
+
+        %{wakes: wakes}
+
       caller ->
         sessions = Org.list_for_user(db, caller.owner_user_id, false)
         keys = MapSet.new(sessions, & &1.session_key)
@@ -929,6 +923,52 @@ defmodule Tightbeam.Gateway do
           result
         end
     end
+  end
+
+  defp wake_result(config, db, call) do
+    p = call.params
+
+    prior =
+      if p[:idempotency_key],
+        do: Idempotency.get(db, call.origin, "wake", p.idempotency_key)
+
+    if prior do
+      db |> Wakes.get(prior.session_key) |> wake_response()
+    else
+      case Org.get(db, call.session_key) do
+        %{state: "active"} = target ->
+          due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
+
+          wake =
+            Wakes.schedule(db, %{
+              session_key: target.session_key,
+              origin: call.origin,
+              prompt: p.prompt,
+              due_at: due_at
+            })
+
+          if p[:idempotency_key] do
+            Idempotency.put(db, %{
+              owner_user_id: call.origin,
+              operation: "wake",
+              idempotency_key: p.idempotency_key,
+              session_key: wake.wake_id
+            })
+          end
+
+          if due_at <= System.system_time(:millisecond),
+            do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
+
+          db |> Wakes.get(wake.wake_id) |> wake_response()
+
+        _ ->
+          %{code: "not_found"}
+      end
+    end
+  end
+
+  defp wake_response(wake) do
+    %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
   end
 
   defp spawn_result(config, db, call) do
@@ -1083,13 +1123,14 @@ defmodule Tightbeam.Gateway do
                 Map.put(denial, :ok, false)
 
               {:ok, host} ->
-                # Fresh-context move (this increment): record the host; the
-                # next turn's checkout targets the new host's adapter, the
-                # old harness session's load-failure falls back per the
-                # existing pointer machinery. Transcript carry-over is a
-                # journaled later step.
-                Org.set_host(db, call.session_key, host)
-                %{ok: true, host: host}
+                case Placement.move_workdir(config, call.session_key, session.host, host) do
+                  :ok ->
+                    Org.set_host(db, call.session_key, host)
+                    %{ok: true, host: host}
+
+                  {:error, message} ->
+                    %{code: "workdir_move_failed", message: message}
+                end
             end
         end
 

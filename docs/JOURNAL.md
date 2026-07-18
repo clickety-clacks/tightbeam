@@ -820,3 +820,18 @@ describing that exact mechanism). Matrix rows upgraded to verified;
 remaining codex-unverified rows enumerated. Note: the skill content
 update propagated LIVE through the library symlink — no home regen, no
 memory cost — the skills-replication design paying off in the field.
+
+OPS HARDENING V1 (sol against ops-hardening-v1.md; reviewed). Six
+sections: cliToken persists across boots; wake targets accept user ids
+(bare or user:<id>, resolving to the Main via derivation — interim until
+the roles registry subsumes it); claude homes pin their default model in
+settings.json (the fable fix — TIGHTBEAM_MODEL_PINS, fable →
+claude-fable-5[1m]; one-time home regen on deploy); host-keyed stderr
+logs; external wake seam formalized (wake idempotency_key, process-origin
+inspect lists own wakes, cancel scoped); workdir follows tune set_host
+across all four topologies with fail-closed denial (workdir_move_failed —
+silent memory loss never acceptable). Review found: sol stored wake
+idempotency under operation "spawn" because the table CHECK didn't allow
+'wake' — a constraint-driven workaround where the spec's STOP-and-report
+rule should have fired; fixed properly (operation "wake" + CHECK widened
+via rename-rebuild migration). 130 tests.

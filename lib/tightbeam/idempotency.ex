@@ -21,7 +21,7 @@ defmodule Tightbeam.Idempotency do
   @ddl """
   CREATE TABLE IF NOT EXISTS wire_idempotency (
     ownerUserId    TEXT NOT NULL,
-    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire')),
+    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake')),
     idempotencyKey TEXT NOT NULL,
     sessionKey     TEXT NOT NULL,
     PRIMARY KEY (ownerUserId, operation, idempotencyKey)
@@ -29,7 +29,36 @@ defmodule Tightbeam.Idempotency do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    :ok = DB.execute(db, @ddl)
+    widen_operation_check(db)
+  end
+
+  # SQLite cannot ALTER a CHECK: databases created before 'wake' joined the
+  # operation set get a rebuild (rename, recreate with the widened CHECK,
+  # copy, drop). Detected via the stored DDL; idempotent.
+  defp widen_operation_check(db) do
+    {:ok, rows} =
+      DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wire_idempotency'", [])
+
+    case rows do
+      [[sql]] ->
+        if String.contains?(sql, "'wake'") do
+          :ok
+        else
+          :ok = DB.execute(db, "ALTER TABLE wire_idempotency RENAME TO wire_idempotency_old;")
+          :ok = DB.execute(db, @ddl)
+
+          {:ok, _} =
+            DB.query(db, "INSERT INTO wire_idempotency SELECT * FROM wire_idempotency_old", [])
+
+          :ok = DB.execute(db, "DROP TABLE wire_idempotency_old;")
+        end
+
+      _ ->
+        :ok
+    end
+  end
 
   @doc "Prior result for this (owner, operation, key), or nil."
   @spec get(db(), String.t(), String.t(), String.t()) :: row() | nil

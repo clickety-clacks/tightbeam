@@ -12,6 +12,8 @@ defmodule Tightbeam.PlacementTest do
 
     old_hosts = Application.get_env(:tightbeam, :hosts)
     old_url = Application.get_env(:tightbeam, :advertised_url)
+    old_model_pins = Application.get_env(:tightbeam, :model_pins)
+    Application.delete_env(:tightbeam, :model_pins)
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -24,6 +26,10 @@ defmodule Tightbeam.PlacementTest do
       if old_url,
         do: Application.put_env(:tightbeam, :advertised_url, old_url),
         else: Application.delete_env(:tightbeam, :advertised_url)
+
+      if old_model_pins,
+        do: Application.put_env(:tightbeam, :model_pins, old_model_pins),
+        else: Application.delete_env(:tightbeam, :model_pins)
     end)
 
     %{base_dir: base_dir}
@@ -63,8 +69,184 @@ defmodule Tightbeam.PlacementTest do
     assert unknown =~ "work-2"
   end
 
+  test "move_workdir copies local to local", %{base_dir: base_dir} do
+    old_base = Path.join(base_dir, "old-local")
+    new_base = Path.join(base_dir, "new-local")
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "old-local" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
+      "new-local" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
+    })
+
+    source = test_workdir(old_base, "session-1")
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "memory.md"), "remember")
+
+    assert :ok =
+             Placement.move_workdir(%{base_dir: base_dir}, "session-1", "old-local", "new-local")
+
+    assert File.read!(Path.join(test_workdir(new_base, "session-1"), "memory.md")) == "remember"
+  end
+
+  test "move_workdir rsyncs local to remote", %{base_dir: base_dir} do
+    old_base = Path.join(base_dir, "old-local")
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "old-local" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
+      "remote" => %{ssh: "remote", base_dir: "/remote/tb", cli_bin: nil}
+    })
+
+    source = test_workdir(old_base, "session-2")
+    destination = test_workdir("/remote/tb", "session-2")
+    File.mkdir_p!(source)
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+      {"", 0}
+    end
+
+    assert :ok =
+             Placement.move_workdir(
+               %{base_dir: base_dir, sh: sh},
+               "session-2",
+               "old-local",
+               "remote"
+             )
+
+    assert [mkdir, rsync] = collect_commands([])
+
+    assert mkdir == [
+             "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
+             "remote",
+             "mkdir",
+             "-p",
+             destination
+           ]
+
+    assert rsync == [
+             "rsync",
+             "-a",
+             "-e",
+             "ssh -o BatchMode=yes -o ConnectTimeout=5",
+             source <> "/",
+             "remote:#{destination}/"
+           ]
+  end
+
+  test "move_workdir rsyncs remote to local", %{base_dir: base_dir} do
+    new_base = Path.join(base_dir, "new-local")
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "remote" => %{ssh: "remote", base_dir: "/remote/tb", cli_bin: nil},
+      "new-local" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
+    })
+
+    source = test_workdir("/remote/tb", "session-3")
+    destination = test_workdir(new_base, "session-3")
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+      {"", 0}
+    end
+
+    assert :ok =
+             Placement.move_workdir(
+               %{base_dir: base_dir, sh: sh},
+               "session-3",
+               "remote",
+               "new-local"
+             )
+
+    assert [probe, rsync] = collect_commands([])
+
+    assert probe == [
+             "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
+             "remote",
+             "test",
+             "-d",
+             source
+           ]
+
+    assert rsync == [
+             "rsync",
+             "-a",
+             "-e",
+             "ssh -o BatchMode=yes -o ConnectTimeout=5",
+             "remote:#{source}/",
+             destination <> "/"
+           ]
+  end
+
+  test "move_workdir stages remote to remote through the gateway", %{base_dir: base_dir} do
+    Application.put_env(:tightbeam, :hosts, %{
+      "old-remote" => %{ssh: "old-remote", base_dir: "/old/tb", cli_bin: nil},
+      "new-remote" => %{ssh: "new-remote", base_dir: "/new/tb", cli_bin: nil}
+    })
+
+    source = test_workdir("/old/tb", "session-4")
+    destination = test_workdir("/new/tb", "session-4")
+    stage = Path.join([base_dir, "staging", "workdir-moves", Path.basename(source)])
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+      {"", 0}
+    end
+
+    assert :ok =
+             Placement.move_workdir(
+               %{base_dir: base_dir, sh: sh},
+               "session-4",
+               "old-remote",
+               "new-remote"
+             )
+
+    assert [probe, pull, mkdir, push] = collect_commands([])
+
+    assert probe == [
+             "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
+             "old-remote",
+             "test",
+             "-d",
+             source
+           ]
+
+    assert Enum.at(pull, -2) == "old-remote:#{source}/"
+    assert List.last(pull) == stage <> "/"
+
+    assert mkdir == [
+             "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
+             "new-remote",
+             "mkdir",
+             "-p",
+             destination
+           ]
+
+    assert Enum.at(push, -2) == stage <> "/"
+    assert List.last(push) == "new-remote:#{destination}/"
+    refute File.exists?(stage)
+  end
+
   test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir} do
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     expected_binary = Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
@@ -75,7 +257,7 @@ defmodule Tightbeam.PlacementTest do
              cmd: [expected_binary],
              home: expected_home,
              cwd: "/work",
-             stderr_path: Path.join(base_dir, "adapter-codex:default.stderr.log"),
+             stderr_path: Path.join(base_dir, "adapter-codex:default@testhost.stderr.log"),
              env: [
                {"TIGHTBEAM_HOME", base_dir},
                {"PATH", "/local/bin:" <> (System.get_env("PATH") || "")}
@@ -90,7 +272,7 @@ defmodule Tightbeam.PlacementTest do
     File.mkdir_p!(token_dir)
     File.write!(Path.join(token_dir, "oauth-token"), "sk-ant-oat01-test\n")
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
 
     claude_env = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
     assert {"CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test"} in claude_env
@@ -113,7 +295,7 @@ defmodule Tightbeam.PlacementTest do
     })
 
     sh = fn _command -> {"", 0} end
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", sh: sh}
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable", sh: sh}
     opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
     remote_home = "/srv/tb/homes/default/codex"
 
@@ -135,6 +317,7 @@ defmodule Tightbeam.PlacementTest do
            ]
 
     assert opts[:home] == remote_home
+    assert opts[:stderr_path] == Path.join(base_dir, "adapter-codex:default@worker.stderr.log")
     assert opts[:env] == []
 
     claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
@@ -162,7 +345,7 @@ defmodule Tightbeam.PlacementTest do
       if "cat" in command, do: {"", 1}, else: {"", 0}
     end
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
 
     assert Placement.deliver_home(config, {:codex, "default", "worker"}, sh: sh) ==
              "/remote/tb/homes/default/codex"
@@ -241,6 +424,52 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join(staged_home, "auth.json"))
   end
 
+  test "deliver_home pins the default Claude model without statutes", %{base_dir: base_dir} do
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+
+    settings =
+      config
+      |> Placement.deliver_home({:claude, "default", "testhost"})
+      |> Path.join("settings.json")
+      |> File.read!()
+      |> JSON.decode!()
+
+    assert settings == %{"model" => "claude-fable-5[1m]"}
+  end
+
+  test "deliver_home lets the archetype default model override the org default", %{
+    base_dir: base_dir
+  } do
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "coder.toml"), """
+    name = "coder"
+    where = ["testhost"]
+
+    [defaults]
+    model = "sonnet"
+    """)
+
+    Archetypes.load!(base_dir)
+
+    Application.put_env(:tightbeam, :model_pins, %{
+      "fable" => "claude-fable-5[1m]",
+      "sonnet" => "claude-sonnet-4-6"
+    })
+
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+
+    settings =
+      config
+      |> Placement.deliver_home({:claude, "coder", "testhost"})
+      |> Path.join("settings.json")
+      |> File.read!()
+      |> JSON.decode!()
+
+    assert settings == %{"model" => "claude-sonnet-4-6"}
+  end
+
   test "deliver_home projects gate hooks for local Claude only and guidance stays law-free", %{
     base_dir: base_dir
   } do
@@ -257,7 +486,7 @@ defmodule Tightbeam.PlacementTest do
     """)
 
     Rails.load!(base_dir)
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
 
     claude_home = Placement.deliver_home(config, {:claude, "default", "testhost"})
     codex_home = Placement.deliver_home(config, {:codex, "default", "testhost"})
@@ -265,7 +494,8 @@ defmodule Tightbeam.PlacementTest do
     assert claude_home
            |> Path.join("settings.json")
            |> File.read!()
-           |> JSON.decode!() == Rails.claude_settings()
+           |> JSON.decode!() ==
+             Map.merge(Rails.claude_settings(), %{"model" => "claude-fable-5[1m]"})
 
     # THE INVARIANT (bible §rails): rails never add guidance — the
     # instruction files are byte-identical to a lawless org's, and no
@@ -280,7 +510,7 @@ defmodule Tightbeam.PlacementTest do
   test "deliver_home preserves the manifest and nested state with zero statutes", %{
     base_dir: base_dir
   } do
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
     home = Placement.deliver_home(config, {:codex, "default", "testhost"})
     stamp_path = Path.join(home, ".tightbeam-manifest")
     stamp_before = File.read!(stamp_path)
@@ -291,6 +521,7 @@ defmodule Tightbeam.PlacementTest do
     assert Placement.deliver_home(config, {:codex, "default", "testhost"}) == home
     assert File.read!(stamp_path) == stamp_before
     assert File.read!(marker) == "keep"
+    refute File.exists?(Path.join(home, "settings.json"))
   end
 
   defp collect_commands(acc) do
@@ -299,6 +530,15 @@ defmodule Tightbeam.PlacementTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  defp test_workdir(base_dir, session_key) do
+    digest =
+      :crypto.hash(:sha256, session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    Path.join([base_dir, "work", digest])
   end
 
   test "push_skill syncs every remote replica and degrades per host", %{base_dir: base_dir} do
