@@ -679,3 +679,19 @@ Exactly-once by construction: both routes are already gated on the
 ledger's CAS / unpublished-terminal scan. Payloads §MARKER MESSAGES now
 lists both kinds; bible updated. Tests: failed-turn marker with humanized
 reason; fallback marker golden order.
+
+## 2026-07-18 — assimilation as shipped guidance
+
+Flynn live-fired assimilation from Clawline; the agent got there, but by
+archaeology: source-dove ~/src/tightbeam_ex to learn archetypes are TOML,
+guessed the where format, and discovered by accident that manifests load
+at boot. Everything it had to excavate is now a builtin guidance fragment
+(assimilation.md, its own ## Assimilation section in every archetype's
+composed identity): the full ceremony — command + flags, credential
+doctrine (relay the printed login commands to the operator VERBATIM;
+"missing" is degraded-not-failed; never --push-credentials uninvited),
+default.toml override recipe with the where edit called out as
+memory-safe, the restart-to-apply rule stated as a reporting obligation,
+and the verify step. Guidance change = manifest hash change → homes
+regenerate on next adapter boot → sessions fall back (visible via the
+[context reset] marker — the cost of an identity change, by design).
