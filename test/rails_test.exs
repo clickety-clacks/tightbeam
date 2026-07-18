@@ -16,213 +16,118 @@ defmodule Tightbeam.RailsTest do
     %{base_dir: base_dir, rails_dir: rails_dir}
   end
 
-  test "reserved gate mode fails closed", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "turn-end"\nmode = "gate"\ntext = "law"|)
+  @valid %{
+    "name" => ~s("no-history-rewrites"),
+    "on" => ~s("tool-call"),
+    "tool" => ~s("Bash"),
+    "pattern" => ~s{"git (reset|stash|rebase|checkout \\\\.|restore|clean)"},
+    "text" =>
+      ~s("History-rewriting git commands are forbidden here: other agents may have uncommitted work in this tree.")
+  }
 
-    assert_raise ArgumentError, ~r/mode "gate" is reserved for a later stage/, fn ->
-      Rails.load!(ctx.base_dir)
-    end
+  defp write_statute(ctx, overrides, file \\ "statutes.toml") do
+    fields =
+      @valid
+      |> Map.merge(overrides)
+      |> Enum.reject(fn {_k, v} -> v == :omit end)
+      |> Enum.map_join("\n", fn {k, v} -> "#{k} = #{v}" end)
+
+    File.write!(Path.join(ctx.rails_dir, file), "[[statute]]\n" <> fields <> "\n")
   end
 
-  test "reserved block mode fails closed", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "turn-end"\nmode = "block"\ntext = "law"|)
+  test "empty and missing rails dirs are a valid empty set", ctx do
+    assert Rails.load!(ctx.base_dir) == []
+    assert Rails.claude_settings() == nil
 
-    assert_raise ArgumentError, ~r/mode "block" is reserved for a later stage/, fn ->
-      Rails.load!(ctx.base_dir)
-    end
+    File.rm_rf!(ctx.rails_dir)
+    assert Rails.load!(ctx.base_dir) == []
   end
 
-  test "predicate statute check fails closed", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "turn-end"\ntext = "law"\ncheck = "curl example"|)
+  test "a valid gate statute loads with mode defaulted", ctx do
+    write_statute(ctx, %{"mode" => :omit})
+
+    assert [statute] = Rails.load!(ctx.base_dir)
+    assert statute.name == "no-history-rewrites"
+    assert statute.on == :tool_call
+    assert statute.mode == :gate
+    assert statute.tool == "Bash"
+  end
+
+  test "the invariant refusal: remind is not law", ctx do
+    write_statute(ctx, %{"mode" => ~s("remind")})
 
     assert_raise ArgumentError,
-                 ~r/"check" \(predicate statutes\) is reserved for a later stage/,
+                 ~r/rails never add guidance; put prose in guidance or a skill/,
                  fn -> Rails.load!(ctx.base_dir) end
   end
 
-  test "unknown mode is rejected", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "turn-end"\nmode = "nonsense"\ntext = "law"|)
+  test "reserved and malformed statutes fail the boot with named errors", ctx do
+    cases = [
+      {%{"mode" => ~s("block")}, ~r/mode "block" is reserved for a later stage/},
+      {%{"check" => ~s("curl janus")},
+       ~r/"check" \(predicate statutes\) is reserved for a later stage/},
+      {%{"mode" => ~s("nonsense")}, ~r/unknown statute mode/},
+      {%{"on" => ~s("turn-end")}, ~r/unknown statute event/},
+      {%{"on" => :omit}, ~r/statute no-history-rewrites is missing "on"/},
+      {%{"tool" => :omit}, ~r/is missing "tool"/},
+      {%{"pattern" => :omit}, ~r/is missing "pattern"/},
+      {%{"text" => :omit}, ~r/is missing "text"/},
+      {%{"text" => ~s("  ")}, ~r/is missing "text"/},
+      {%{"name" => :omit}, ~r/statute is missing "name"/},
+      {%{"name" => ~s("Bad_Name")}, ~r/invalid statute name/},
+      {%{"sevrity" => "1"}, ~r/unknown statute keys.*sevrity/},
+      {%{"pattern" => ~s{"("}}, ~r/invalid gate pattern/}
+    ]
 
-    assert_raise ArgumentError, ~r/unknown statute mode/, fn -> Rails.load!(ctx.base_dir) end
+    for {overrides, error} <- cases do
+      write_statute(ctx, overrides)
+      assert_raise ArgumentError, error, fn -> Rails.load!(ctx.base_dir) end
+    end
   end
 
-  test "unknown event is rejected", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "tool-call"\ntext = "law"|)
+  test "duplicate names across files fail; files load in filename order", ctx do
+    write_statute(ctx, %{}, "a.toml")
+    write_statute(ctx, %{"name" => ~s("zz-second")}, "b.toml")
 
-    assert_raise ArgumentError, ~r/unknown statute event/, fn -> Rails.load!(ctx.base_dir) end
-  end
+    assert Enum.map(Rails.load!(ctx.base_dir), & &1.name) == [
+             "no-history-rewrites",
+             "zz-second"
+           ]
 
-  test "event is required and never defaulted", ctx do
-    write_statute(ctx, ~s|name = "announce-new-work"\ntext = "law"|)
+    write_statute(ctx, %{}, "b.toml")
 
-    assert_raise ArgumentError, ~r/statute announce-new-work is missing "on"/, fn ->
+    assert_raise ArgumentError, ~r/duplicate statute name: no-history-rewrites/, fn ->
       Rails.load!(ctx.base_dir)
     end
   end
 
-  test "text is required", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "turn-end"|)
-
-    assert_raise ArgumentError, ~r/is missing "text"/, fn -> Rails.load!(ctx.base_dir) end
-  end
-
-  test "blank text is rejected", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "turn-end"\ntext = "   "|)
-
-    assert_raise ArgumentError, ~r/is missing "text"/, fn -> Rails.load!(ctx.base_dir) end
-  end
-
-  test "name is required", ctx do
-    write_statute(ctx, ~s|on = "turn-end"\ntext = "law"|)
-
-    assert_raise ArgumentError, ~r/statute is missing "name"/, fn -> Rails.load!(ctx.base_dir) end
-  end
-
-  test "name must use statute segments", ctx do
-    write_statute(ctx, ~s|name = "Bad_Name"\non = "turn-end"\ntext = "law"|)
-
-    assert_raise ArgumentError, ~r/invalid statute name/, fn -> Rails.load!(ctx.base_dir) end
-  end
-
-  test "names are unique across files", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "work-received"\ntext = "first"|, "a.toml")
-    write_statute(ctx, ~s|name = "x"\non = "turn-end"\ntext = "second"|, "b.toml")
-
-    assert_raise ArgumentError, ~r/duplicate statute name: x/, fn -> Rails.load!(ctx.base_dir) end
-  end
-
-  test "unknown statute keys name the typo", ctx do
-    write_statute(ctx, ~s|name = "x"\non = "turn-end"\ntext = "law"\nsevrity = 1|)
-
-    assert_raise ArgumentError, ~r/unknown statute keys.*sevrity/, fn ->
-      Rails.load!(ctx.base_dir)
-    end
-  end
-
-  test "missing directory and zero statute files load as an empty set", ctx do
-    File.rm_rf!(ctx.rails_dir)
-
-    assert Rails.load!(ctx.base_dir) == []
-    assert Rails.standing_law() == nil
-    assert Rails.claude_settings() == nil
-  end
-
-  test "files and tables retain deterministic load order", ctx do
-    write_statute(ctx, ~s|name = "second"\non = "turn-end"\ntext = "second"|, "b.toml")
-
-    File.write!(Path.join(ctx.rails_dir, "a.toml"), """
-    [[statute]]
-    name = "first"
-    on = "work-received"
-    text = "first"
-
-    [[statute]]
-    name = "first-next"
-    on = "turn-end"
-    text = "next"
-    """)
-
-    assert Enum.map(Rails.load!(ctx.base_dir), & &1.name) == ["first", "first-next", "second"]
-  end
-
-  test "standing law is byte-pinned", ctx do
-    write_examples(ctx)
+  test "claude_settings compiles the byte-pinned PreToolUse entry", ctx do
+    write_statute(ctx, %{})
     Rails.load!(ctx.base_dir)
 
-    assert Rails.standing_law() ==
-             """
-             ## Standing law
+    assert %{"hooks" => %{"PreToolUse" => [entry]}} = Rails.claude_settings()
+    assert entry["matcher"] == "Bash"
+    assert [%{"type" => "command", "command" => command}] = entry["hooks"]
 
-             Deterministic law of this org, delivered by rail. Each statute is also
-             re-presented at its moment; these are the same obligations, standing.
-
-             - announce-new-work (on work-received): If this message assigns you new
-               work, wake your coordinator session to acknowledge it before starting.
-             - ticket-on-done (on turn-end): If this turn completed coding work tied to
-               a tracked ticket, update the ticket state before ending.
-             """
-             |> String.trim_trailing()
+    assert command ==
+             "sh -c 'grep -qE \"git (reset|stash|rebase|checkout \\\\.|restore|clean)\" - || exit 0; " <>
+               "echo \"[gate: no-history-rewrites] History-rewriting git commands are forbidden here: " <>
+               "other agents may have uncommitted work in this tree.\" >&2; exit 2'"
   end
 
-  test "Claude hook settings and example commands are byte-pinned", ctx do
-    write_examples(ctx)
+  test "escaping torture: ERE metacharacters and $ in pattern, single quote in text", ctx do
+    write_statute(ctx, %{
+      "name" => ~s("no-env-dollars"),
+      "pattern" => ~s{"echo (\\\\$HOME|\\\\$PATH)\\\\."},
+      "text" => ~s("Don't expand env here.")
+    })
+
     Rails.load!(ctx.base_dir)
+    %{"hooks" => %{"PreToolUse" => [entry]}} = Rails.claude_settings()
+    [%{"command" => command}] = entry["hooks"]
 
-    assert Rails.claude_settings() == %{
-             "hooks" => %{
-               "UserPromptSubmit" => [
-                 %{
-                   "hooks" => [
-                     %{
-                       "type" => "command",
-                       "command" =>
-                         "echo '[standing law: announce-new-work] If this message assigns you new work, wake your coordinator session to acknowledge it before starting.'"
-                     }
-                   ]
-                 }
-               ],
-               "Stop" => [
-                 %{
-                   "hooks" => [
-                     %{
-                       "type" => "command",
-                       "command" =>
-                         "sh -c 'if grep -q \"\\\"stop_hook_active\\\"[[:space:]]*:[[:space:]]*true\" -; then exit 0; fi; echo \"[standing law: ticket-on-done] If this turn completed coding work tied to a tracked ticket, update the ticket state before ending.\" >&2; exit 2'"
-                     }
-                   ]
-                 }
-               ]
-             }
-           }
-  end
-
-  test "Claude command quoting is byte-pinned for single and double quotes", ctx do
-    File.write!(Path.join(ctx.rails_dir, "quotes.toml"), """
-    [[statute]]
-    name = "quote-work"
-    on = "work-received"
-    text = "Don't say \\\"done\\\" without proof."
-
-    [[statute]]
-    name = "quote-stop"
-    on = "turn-end"
-    text = "Don't say \\\"done\\\" without proof."
-    """)
-
-    settings = Rails.load!(ctx.base_dir) && Rails.claude_settings()
-
-    assert get_in(settings, [
-             "hooks",
-             "UserPromptSubmit",
-             Access.at(0),
-             "hooks",
-             Access.at(0),
-             "command"
-           ]) ==
-             "echo '[standing law: quote-work] Don'\\''t say \"done\" without proof.'"
-
-    assert get_in(settings, ["hooks", "Stop", Access.at(0), "hooks", Access.at(0), "command"]) ==
-             "sh -c 'if grep -q \"\\\"stop_hook_active\\\"[[:space:]]*:[[:space:]]*true\" -; then exit 0; fi; echo \"[standing law: quote-stop] Don'\\''t say \\\"done\\\" without proof.\" >&2; exit 2'"
-  end
-
-  defp write_statute(ctx, body, filename \\ "statute.toml") do
-    File.write!(Path.join(ctx.rails_dir, filename), "[[statute]]\n#{body}\n")
-  end
-
-  defp write_examples(ctx) do
-    File.write!(Path.join(ctx.rails_dir, "examples.toml"), """
-    [[statute]]
-    name = "announce-new-work"
-    on = "work-received"
-    mode = "remind"
-    text = \"""
-    If this message assigns you new work, wake your coordinator session to
-    acknowledge it before starting.\"""
-
-    [[statute]]
-    name = "ticket-on-done"
-    on = "turn-end"
-    text = "If this turn completed coding work tied to a tracked ticket, update the ticket state before ending."
-    """)
+    assert command ==
+             "sh -c 'grep -qE \"echo (\\\\\\$HOME|\\\\\\$PATH)\\\\.\" - || exit 0; " <>
+               "echo \"[gate: no-env-dollars] Don'\\''t expand env here.\" >&2; exit 2'"
   end
 end

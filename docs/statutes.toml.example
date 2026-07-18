@@ -1,17 +1,18 @@
-# Copy this file into <base_dir>/identity/rails/ to install these statutes.
-# Restart the substrate to apply statute changes.
-# A law change regenerates homes, so sessions lose model memory.
-# The context-reset marker makes that memory loss visible.
+# Gate statutes: deterministic tool-call refusal (claude harness today).
+# Copy into <base_dir>/identity/rails/ and restart the substrate to apply.
+# A statute change regenerates homes — sessions there lose model memory,
+# visibly (the context-reset marker shows where).
 
 [[statute]]
-name = "announce-new-work"
-on   = "work-received"
-mode = "remind"
-text = """
-If this message assigns you new work, wake your coordinator session to
-acknowledge it before starting."""
+name = "no-history-rewrites"
+on = "tool-call"
+tool = "Bash"
+pattern = "git (reset|stash|rebase|checkout \\.|restore|clean)"
+text = "History-rewriting git commands are forbidden here: other agents may have uncommitted work in this tree."
 
 [[statute]]
-name = "ticket-on-done"
-on   = "turn-end"
-text = "If this turn completed coding work tied to a tracked ticket, update the ticket state before ending."
+name = "no-push-main"
+on = "tool-call"
+tool = "Bash"
+pattern = "git push[^&|;]*\\b(main|master)\\b"
+text = "Pushing to main is forbidden: work lands on branches; the operator merges."

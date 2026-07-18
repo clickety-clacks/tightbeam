@@ -1,36 +1,55 @@
 defmodule Tightbeam.Rails do
   @moduledoc """
-  Loads the org's operator-authored statutes and compiles their remind-tier
-  delivery surfaces. Statutes bind the whole org: every home receives the
-  same standing law, while Claude homes also receive event hooks that
-  re-present each obligation at its moment.
+  Statutes: operator-authored TOML law compiled into deterministic
+  guardrails (spec §rails; tenets T1, T4).
 
-  Loading is boot-time and fail-closed. Files under
-  `<base_dir>/identity/rails/*.toml` are read in filename order, every
-  statute is validated before the set is stored in `:persistent_term`, and
-  reserved predicate, gate, and block behavior is refused rather than
-  silently weakened into reminders.
+  THE INVARIANT — rails never add guidance. A rail contributes ZERO bytes
+  to any model's context: no standing sections, no reminders, no injected
+  obligations. Inference is nondeterministic and finite-attention; feeding
+  it more prose both pollutes the context and changes behavior it cannot
+  guarantee — the exact failure this system replaces. The ONLY text a rail
+  ever emits is the refusal reason at the moment it fires, delivered by
+  the enforcing mechanism itself: the agent learns the law by hitting it,
+  never by reading it. `mode = "remind"` is refused at load for this
+  reason, not treated as unknown.
 
-  `work-received` compiles to a self-contained Claude `UserPromptSubmit`
-  command whose stdout is injected into model context. `turn-end` compiles
-  to a Claude `Stop` command whose stderr and exit 2 bounce the model once;
-  the vendor's `stop_hook_active` input guard then exits 0 so the next stop
-  ends the turn. Commands contain no home paths or environment dependencies.
+  V1 is the GATE tier: a statute compiles to a Claude Code `PreToolUse`
+  hook. The harness presents every proposed tool call to the hook BEFORE
+  execution; on pattern match the hook exits 2 and the call is REFUSED —
+  the action never happens, no inference in the loop, and the statute's
+  text reaches the model as the denial reason. Honest limit: pattern
+  matching over command strings is accident-grade enforcement — a
+  determined agent can evade patterns; adversarial containment belongs to
+  sandboxes and credentials. Gates stop mistakes deterministically.
 
-  Standing law is part of projected guidance. Adding, removing, or changing
-  a statute therefore changes the home manifest hash and regenerates the
-  home; an empty statute set contributes no bytes or files and preserves the
-  pre-rails manifest exactly.
+  Codex has no hook surface, so a gate simply does not exist on codex
+  homes — no settings file and, per the invariant, no advisory text
+  (advisory text would be guidance). Reserved for later stages, refused by
+  name at load: `mode = "block"` and `check` predicates.
+
+  Loading is boot-time and fail-closed: `<base_dir>/identity/rails/*.toml`
+  in filename order, every statute validated before the set is stored in
+  `:persistent_term`; a malformed statute fails the boot (bad law stops
+  the boot). Statute changes ride the home's extra_files into the manifest
+  hash: a law change is an identity change and regenerates homes.
+
+  Hook commands are self-contained (no file paths, no environment
+  dependencies — homes live at different paths on gateway, staging, and
+  satellites) and match the statute's POSIX ERE against the RAW tool-call
+  JSON on stdin, so no jq is required on satellites; patterns should not
+  rely on matching bare `"` characters, which arrive JSON-escaped.
   """
 
   @persist_key __MODULE__
-  @statute_keys MapSet.new(["name", "on", "mode", "text", "check"])
+  @statute_keys MapSet.new(["name", "on", "mode", "text", "check", "tool", "pattern"])
 
-  @typedoc "A validated remind-tier statute."
+  @typedoc "A validated gate statute."
   @type statute :: %{
           name: String.t(),
-          on: :work_received | :turn_end,
-          mode: :remind,
+          on: :tool_call,
+          mode: :gate,
+          tool: String.t(),
+          pattern: String.t(),
           text: String.t()
         }
 
@@ -69,28 +88,6 @@ defmodule Tightbeam.Rails do
     statutes
   end
 
-  @doc "The standing-law guidance section, or nil for an empty statute set."
-  @spec standing_law() :: String.t() | nil
-  def standing_law do
-    case :persistent_term.get(@persist_key) do
-      [] ->
-        nil
-
-      statutes ->
-        bullets = Enum.map_join(statutes, "\n", &standing_bullet/1)
-
-        """
-        ## Standing law
-
-        Deterministic law of this org, delivered by rail. Each statute is also
-        re-presented at its moment; these are the same obligations, standing.
-
-        #{bullets}
-        """
-        |> String.trim_trailing()
-    end
-  end
-
   @doc "The Claude settings hook map, or nil for an empty statute set."
   @spec claude_settings() :: map() | nil
   def claude_settings do
@@ -99,16 +96,7 @@ defmodule Tightbeam.Rails do
         nil
 
       statutes ->
-        hooks =
-          statutes
-          |> Enum.reduce(%{"UserPromptSubmit" => [], "Stop" => []}, fn statute, hooks ->
-            {event, entry} = claude_hook(statute)
-            Map.update!(hooks, event, &(&1 ++ [entry]))
-          end)
-          |> Enum.reject(fn {_event, entries} -> entries == [] end)
-          |> Map.new()
-
-        %{"hooks" => hooks}
+        %{"hooks" => %{"PreToolUse" => Enum.map(statutes, &pre_tool_use_entry/1)}}
     end
   end
 
@@ -141,18 +129,42 @@ defmodule Tightbeam.Rails do
     on =
       case Map.fetch(statute, "on") do
         :error -> raise ArgumentError, ~s(statute #{name} is missing "on")
-        {:ok, "work-received"} -> :work_received
-        {:ok, "turn-end"} -> :turn_end
+        {:ok, "tool-call"} -> :tool_call
         {:ok, event} -> raise ArgumentError, "unknown statute event: #{inspect(event)}"
       end
 
     mode =
-      case Map.get(statute, "mode", "remind") do
-        "remind" -> :remind
-        "gate" -> raise ArgumentError, ~s(mode "gate" is reserved for a later stage)
-        "block" -> raise ArgumentError, ~s(mode "block" is reserved for a later stage)
-        value -> raise ArgumentError, "unknown statute mode: #{inspect(value)}"
+      case Map.get(statute, "mode", "gate") do
+        "gate" ->
+          :gate
+
+        "remind" ->
+          raise ArgumentError,
+                "rails never add guidance; put prose in guidance or a skill"
+
+        "block" ->
+          raise ArgumentError, ~s(mode "block" is reserved for a later stage)
+
+        value ->
+          raise ArgumentError, "unknown statute mode: #{inspect(value)}"
       end
+
+    tool = Map.get(statute, "tool")
+
+    unless is_binary(tool) and String.trim(tool) != "" do
+      raise ArgumentError, ~s(statute #{name} is missing "tool")
+    end
+
+    pattern = Map.get(statute, "pattern")
+
+    unless is_binary(pattern) and String.trim(pattern) != "" do
+      raise ArgumentError, ~s(statute #{name} is missing "pattern")
+    end
+
+    case Regex.compile(pattern) do
+      {:ok, _} -> :ok
+      {:error, _} -> raise ArgumentError, "invalid gate pattern: #{inspect(pattern)}"
+    end
 
     text = Map.get(statute, "text")
 
@@ -160,53 +172,39 @@ defmodule Tightbeam.Rails do
       raise ArgumentError, ~s(statute #{name} is missing "text")
     end
 
-    %{name: name, on: on, mode: mode, text: String.trim(text)}
+    %{
+      name: name,
+      on: on,
+      mode: mode,
+      tool: String.trim(tool),
+      pattern: pattern,
+      text: String.trim(text)
+    }
   end
 
-  defp standing_bullet(statute) do
-    event = event_name(statute.on)
-    prefix = "- #{statute.name} (on #{event}): "
-    [first | rest] = String.split(one_line(statute.text))
-
-    rest
-    |> Enum.reduce({[], prefix <> first}, fn word, {lines, line} ->
-      if String.length(line) + String.length(word) + 1 < 76 do
-        {lines, line <> " " <> word}
-      else
-        {[line | lines], "  " <> word}
-      end
-    end)
-    |> then(fn {lines, line} -> Enum.reverse([line | lines]) end)
-    |> Enum.join("\n")
-  end
-
-  defp claude_hook(%{on: :work_received} = statute) do
-    command = "echo '" <> (statute |> hook_message() |> escape_single_quotes()) <> "'"
-    {"UserPromptSubmit", %{"hooks" => [%{"type" => "command", "command" => command}]}}
-  end
-
-  defp claude_hook(%{on: :turn_end} = statute) do
-    message = statute |> hook_message() |> escape_double_quoted()
-
+  defp pre_tool_use_entry(statute) do
     payload =
-      "if grep -q \"\\\"stop_hook_active\\\"[[:space:]]*:[[:space:]]*true\" -; then exit 0; fi; " <>
-        "echo \"#{message}\" >&2; exit 2"
+      "grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0; " <>
+        "echo \"[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}\" >&2; exit 2"
 
-    command = "sh -c '" <> escape_single_quotes(payload) <> "'"
-    {"Stop", %{"hooks" => [%{"type" => "command", "command" => command}]}}
+    %{
+      "matcher" => statute.tool,
+      "hooks" => [
+        %{"type" => "command", "command" => "sh -c '" <> escape_single_quotes(payload) <> "'"}
+      ]
+    }
   end
-
-  defp hook_message(statute), do: "[standing law: #{statute.name}] #{one_line(statute.text)}"
 
   defp one_line(text), do: text |> String.split() |> Enum.join(" ")
 
-  defp event_name(:work_received), do: "work-received"
-  defp event_name(:turn_end), do: "turn-end"
-
   defp escape_single_quotes(text), do: String.replace(text, "'", "'\\''")
 
+  # Backslash FIRST: inside a shell double-quoted string a pattern's own
+  # backslash would otherwise pair with a following escape and un-escape it
+  # — `\$HOME` must reach grep as a literal-dollar regex, never expand.
   defp escape_double_quoted(text) do
     text
+    |> String.replace("\\", "\\\\")
     |> String.replace("\"", "\\\"")
     |> String.replace("$", "\\$")
     |> String.replace("`", "\\`")

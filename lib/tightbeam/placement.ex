@@ -358,16 +358,10 @@ defmodule Tightbeam.Placement do
       Enum.map(archetype.skills, fn name -> %{name: name, link_to: Path.join(library_dir, name)} end)
     end
 
-    suffix =
-      case Rails.standing_law() do
-        nil -> ""
-        standing_law -> "\n\n" <> standing_law
-      end
-
     spec = %{
       harness: harness,
       archetype: archetype_name,
-      guidance: Archetypes.guidance(archetype) <> suffix
+      guidance: Archetypes.guidance(archetype)
     }
 
     spec =

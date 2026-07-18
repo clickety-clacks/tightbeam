@@ -233,7 +233,7 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join(staged_home, "auth.json"))
   end
 
-  test "deliver_home projects standing law for all homes and hooks only for local Claude", %{
+  test "deliver_home projects gate hooks for local Claude only and guidance stays law-free", %{
     base_dir: base_dir
   } do
     rails_dir = Path.join([base_dir, "identity", "rails"])
@@ -241,9 +241,11 @@ defmodule Tightbeam.PlacementTest do
 
     File.write!(Path.join(rails_dir, "law.toml"), """
     [[statute]]
-    name = "announce-new-work"
-    on = "work-received"
-    text = "Acknowledge new work before starting."
+    name = "no-history-rewrites"
+    on = "tool-call"
+    tool = "Bash"
+    pattern = "git (reset|stash|rebase)"
+    text = "History-rewriting git commands are forbidden here."
     """)
 
     Rails.load!(base_dir)
@@ -257,14 +259,13 @@ defmodule Tightbeam.PlacementTest do
            |> File.read!()
            |> JSON.decode!() == Rails.claude_settings()
 
-    standing_law = Rails.standing_law()
-
-    assert claude_home
-           |> Path.join("CLAUDE.md")
-           |> File.read!()
-           |> String.ends_with?(standing_law)
-
-    assert codex_home |> Path.join("AGENTS.md") |> File.read!() |> String.ends_with?(standing_law)
+    # THE INVARIANT (bible §rails): rails never add guidance — the
+    # instruction files are byte-identical to a lawless org's, and no
+    # statute text exists anywhere a model reads standing context.
+    archetype = Tightbeam.Archetypes.get("default")
+    assert claude_home |> Path.join("CLAUDE.md") |> File.read!() == Tightbeam.Archetypes.guidance(archetype)
+    assert codex_home |> Path.join("AGENTS.md") |> File.read!() == Tightbeam.Archetypes.guidance(archetype)
+    refute claude_home |> Path.join("CLAUDE.md") |> File.read!() =~ "no-history-rewrites"
     refute File.exists?(Path.join(codex_home, "settings.json"))
   end
 
