@@ -242,10 +242,11 @@ defmodule Tightbeam.Placement do
         home: home,
         cwd: config.cwd,
         stderr_path: stderr_path,
-        env: [
-          {"TIGHTBEAM_HOME", config.base_dir},
-          {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")}
-        ]
+        env:
+          [
+            {"TIGHTBEAM_HOME", config.base_dir},
+            {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")}
+          ] ++ harness_token_env(config.base_dir, harness)
       ]
     else
       gateway = config.base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
@@ -270,6 +271,23 @@ defmodule Tightbeam.Placement do
       ]
     end
   end
+
+  # The org's own long-lived grant, injected as the harness's token env —
+  # the strongest form of the credential doctrine: an env token never
+  # refreshes, so there is no rotation and nothing to race. The file is
+  # written by the operator from `tightbeam setup`'s output (0600); absent
+  # file → the harness falls back to the auth store's credential file.
+  # Remote hosts are NOT covered here yet: the satellite's token file lives
+  # on the satellite, and the ssh env assembly can't read it locally —
+  # that's the remote-placement live-fire milestone's work.
+  defp harness_token_env(base_dir, :claude) do
+    case File.read(Path.join([base_dir, "auth", "claude", "oauth-token"])) do
+      {:ok, token} -> [{"CLAUDE_CODE_OAUTH_TOKEN", String.trim(token)}]
+      _ -> []
+    end
+  end
+
+  defp harness_token_env(_base_dir, _harness), do: []
 
   @doc """
   Materialize the home for an adapter key on its host per the moduledoc.

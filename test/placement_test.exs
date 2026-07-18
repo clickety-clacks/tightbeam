@@ -81,6 +81,23 @@ defmodule Tightbeam.PlacementTest do
            ]
   end
 
+  test "adapter_opts injects the org's claude token env when the store holds one", %{
+    base_dir: base_dir
+  } do
+    token_dir = Path.join([base_dir, "auth", "claude"])
+    File.mkdir_p!(token_dir)
+    File.write!(Path.join(token_dir, "oauth-token"), "sk-ant-oat01-test\n")
+
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
+
+    claude_env = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    assert {"CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test"} in claude_env
+
+    # The token is harness-scoped: codex adapters never receive claude's.
+    codex_env = Placement.adapter_opts(config, {:codex, "default", "testhost"})[:env]
+    refute Enum.any?(codex_env, fn {k, _} -> k == "CLAUDE_CODE_OAUTH_TOKEN" end)
+  end
+
   test "adapter_opts embeds every remote agent env in the ssh command", %{base_dir: base_dir} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
