@@ -149,15 +149,20 @@ defmodule Tightbeam.Projection do
 
   @doc """
   Messages after `after_message_id` (nil or unknown id → from the start), in
-  seq order — the replay feed. `limit` bounds the page.
+  seq order — the replay feed. `limit` bounds the page. `min_seq` is the
+  session's history barrier (clearedThroughSeq): rows at or below it exist
+  but are never served — cleared history is retained, not presented.
   """
-  @spec list_after(db(), String.t(), String.t() | nil, pos_integer()) :: [message()]
-  def list_after(db \\ Tightbeam.DB, session_key, after_message_id, limit) do
+  @spec list_after(db(), String.t(), String.t() | nil, pos_integer(), integer()) :: [message()]
+  def list_after(db \\ Tightbeam.DB, session_key, after_message_id, limit, min_seq \\ 0) do
     after_seq =
-      case after_message_id && get(db, after_message_id) do
-        %{seq: seq} -> seq
-        _ -> 0
-      end
+      max(
+        min_seq,
+        case after_message_id && get(db, after_message_id) do
+          %{seq: seq} -> seq
+          _ -> 0
+        end
+      )
 
     {:ok, rows} =
       DB.query(

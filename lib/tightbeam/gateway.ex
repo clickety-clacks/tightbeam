@@ -362,6 +362,32 @@ defmodule Tightbeam.Gateway do
   end
 
   @doc """
+  Org options for client creation/tuning pickers (device-authed via
+  GET /api/org-options): harnesses, per-harness model catalog, assimilated
+  hosts, archetypes with their WHERE. Same data inspect gives agents —
+  discovery beats documentation, for humans too.
+  """
+  @spec org_options() :: map()
+  def org_options do
+    base_dir = Application.get_env(:tightbeam, :base_dir, Path.join(System.user_home!(), ".tightbeam"))
+
+    %{
+      harnesses: ["claude", "codex"],
+      models:
+        Map.new(@model_catalog, fn {harness, models} ->
+          provider = if harness == "codex", do: "openai", else: "anthropic"
+          {harness, Enum.map(models, &%{id: &1.ref, ref: &1.ref, name: &1.name, provider: provider})}
+        end),
+      hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
+      archetypes:
+        Enum.map(Archetypes.names(), fn name ->
+          a = Archetypes.get(name)
+          %{name: a.name, where: a.where, defaults: a.defaults}
+        end)
+    }
+  end
+
+  @doc """
   SessionStatusPayload projection for the status route (gateway.ts
   `sessionStatus`): registry provenance + ledger run state (queue depth from
   pending turns) + per-harness capability advertisement from the model
@@ -403,6 +429,7 @@ defmodule Tightbeam.Gateway do
             fallbackModels: fallback_models,
             provider: session.provider,
             harness: session.harness,
+            host: session.host,
             authMode: nil,
             reasoningLevel: effort,
             thinkingLevel: nil,
@@ -920,7 +947,7 @@ defmodule Tightbeam.Gateway do
           nil ->
             %{ok: false, code: "not_found"}
 
-          _session ->
+          session ->
             harness = p.harness
             provider = if harness == "codex", do: "openai", else: "anthropic"
 
@@ -931,10 +958,21 @@ defmodule Tightbeam.Gateway do
                 end
 
             Org.set_harness(db, call.session_key, harness, provider, model)
-            # No pointer surgery needed: next checkout hits the new
-            # harness's adapter; the old harness session can't load there →
-            # fallback pointer, fresh model context, history intact.
-            %{ok: true, harness: harness, model: model, note: "engine swapped; model context starts fresh (chat history unaffected)"}
+
+            # History barrier (product ruling): a new engine gets a fresh
+            # visible slate. Rows are RETAINED (never deleted) but replay
+            # stops at the barrier, and live clients are told to drop their
+            # local view. No pointer surgery: the old harness session can't
+            # load on the new engine → fallback pointer, fresh context.
+            {:ok, [[max_seq]]} =
+              DB.query(db, "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1", [
+                call.session_key
+              ])
+
+            Org.set_cleared_through(db, call.session_key, max_seq)
+            broadcast(db, session.owner_user_id, Payloads.stream_history_cleared(call.session_key))
+
+            %{ok: true, harness: harness, model: model, note: "engine swapped; chat cleared (rows retained); model context starts fresh"}
         end
 
       p[:setting] == "set_host" and is_binary(p[:host]) ->

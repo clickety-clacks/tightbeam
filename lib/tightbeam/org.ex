@@ -32,6 +32,7 @@ defmodule Tightbeam.Org do
           model: String.t(),
           thinking_level: String.t() | nil,
           host: String.t(),
+          cleared_through_seq: integer(),
           state: String.t(),
           created_at: integer(),
           updated_at: integer()
@@ -63,6 +64,7 @@ defmodule Tightbeam.Org do
     model         TEXT NOT NULL,
     thinkingLevel TEXT,
     host          TEXT NOT NULL DEFAULT 'local',
+    clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
     state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
     createdAt     INTEGER NOT NULL,
     updatedAt     INTEGER NOT NULL
@@ -84,10 +86,17 @@ defmodule Tightbeam.Org do
     # Additive migration for pre-placement databases (incl. TS-created ones,
     # adopt-in-place): a DEFAULT'd column is invisible to writers that name
     # their columns. Duplicate-column error means already migrated.
-    case DB.query(db, "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT 'local'") do
-      {:ok, _} -> result
-      {:error, e} -> if inspect(e) =~ "duplicate column", do: result, else: raise(e)
+    for ddl <- [
+          "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT 'local'",
+          "ALTER TABLE sessions ADD COLUMN clearedThroughSeq INTEGER NOT NULL DEFAULT 0"
+        ] do
+      case DB.query(db, ddl) do
+        {:ok, _} -> :ok
+        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+      end
     end
+
+    result
   end
 
   @doc """
@@ -219,6 +228,17 @@ defmodule Tightbeam.Org do
   end
 
   @doc """
+  Record the history barrier: replay serves only messages with seq > this.
+  Rows are never deleted — the chat's past remains in the store (and in any
+  export) but stops being presented. Set on harness switches (fresh engine,
+  fresh visible slate) or any future explicit clear.
+  """
+  @spec set_cleared_through(db(), String.t(), integer()) :: session()
+  def set_cleared_through(db \\ Tightbeam.DB, session_key, seq) do
+    update(db, session_key, "clearedThroughSeq = ?2", [seq])
+  end
+
+  @doc """
   Retire a session — soft state flip, never a delete: history, provenance, and
   the pointer chain remain queryable. Returns the updated session.
   """
@@ -331,7 +351,7 @@ defmodule Tightbeam.Org do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, handle, archetype, harness, provider,
-           model, thinkingLevel, host, state, createdAt, updatedAt
+           model, thinkingLevel, host, clearedThroughSeq, state, createdAt, updatedAt
     FROM sessions
     """
   end
@@ -353,6 +373,7 @@ defmodule Tightbeam.Org do
          model,
          thinking_level,
          host,
+         cleared_through_seq,
          state,
          created_at,
          updated_at
@@ -374,6 +395,7 @@ defmodule Tightbeam.Org do
       model: model,
       thinking_level: thinking_level,
       host: host,
+      cleared_through_seq: cleared_through_seq,
       state: state,
       created_at: created_at,
       updated_at: updated_at

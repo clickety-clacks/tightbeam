@@ -87,7 +87,7 @@ defmodule Tightbeam.Wire.Router do
         do: Tightbeam.AdapterCoordinator.health(coordinator),
         else: %{}
 
-    json(conn, 200, %{"protocolVersion" => 1, "adapters" => health})
+    json(conn, 200, %{"protocolVersion" => 1, "server" => "tightbeam", "adapters" => health})
   end
 
   post "/agent/dispatch" do
@@ -121,6 +121,14 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  get "/api/org-options" do
+    with {:ok, _device} <- device_auth(conn) do
+      json(conn, 200, Tightbeam.Gateway.org_options())
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
   get "/api/trackable-sessions" do
     with {:ok, _device} <- device_auth(conn) do
       json(conn, 200, %{"sessions" => []})
@@ -134,11 +142,17 @@ defmodule Tightbeam.Wire.Router do
          {:ok, body, conn} <- read_json(conn),
          {:ok, display_name} <- required_string(body["displayName"]),
          {:ok, idempotency_key} <- required_string(body["idempotencyKey"]) do
+      picker =
+        for {k, atom} <- [{"harness", :harness}, {"model", :model}, {"host", :host}, {"archetype", :archetype}],
+            is_binary(body[k]) and body[k] != "",
+            into: %{},
+            do: {atom, body[k]}
+
       call = %{
         verb: "spawn",
         origin: "user:#{device.user_id}",
         session_key: nil,
-        params: %{display_name: display_name, idempotency_key: idempotency_key}
+        params: Map.merge(%{display_name: display_name, idempotency_key: idempotency_key}, picker)
       }
 
       dispatch_response(conn, call, 201, & &1)

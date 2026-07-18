@@ -134,6 +134,11 @@ defmodule Tightbeam.Wire.Payloads do
   @spec stream_updated(payload()) :: payload()
   def stream_updated(stream), do: %{"type" => "stream_updated", "stream" => stream}
 
+  @doc "History barrier applied: live clients drop their local view of the stream."
+  @spec stream_history_cleared(String.t()) :: payload()
+  def stream_history_cleared(session_key),
+    do: %{"type" => "stream_history_cleared", "sessionKey" => session_key}
+
   @spec stream_deleted(String.t()) :: payload()
   def stream_deleted(session_key), do: %{"type" => "stream_deleted", "sessionKey" => session_key}
 

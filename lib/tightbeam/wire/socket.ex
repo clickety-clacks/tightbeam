@@ -276,7 +276,8 @@ defmodule Tightbeam.Wire.Socket do
 
         {replay, truncated?, watermarks} =
           Enum.reduce(keys, {[], false, %{}}, fn key, {messages, truncated, marks} ->
-            rows = Projection.list_after(db(state), key, cursors[key], 501)
+            barrier = Enum.find_value(sessions, 0, &(&1.session_key == key && &1.cleared_through_seq))
+            rows = Projection.list_after(db(state), key, cursors[key], 501, barrier || 0)
             selected = Enum.take(rows, 500)
 
             Enum.each(selected, fn message ->
@@ -317,7 +318,7 @@ defmodule Tightbeam.Wire.Socket do
             session_keys: keys,
             stream_read_states: read_states,
             stream_tail_states: tail_states,
-            features: [],
+            features: ["tightbeam"],
             dm_scope: if(device.is_admin, do: "admin", else: nil)
           })
 
