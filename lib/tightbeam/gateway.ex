@@ -394,6 +394,10 @@ defmodule Tightbeam.Gateway do
         unsupported = fn reason -> %{supported: false, reason: reason} end
 
         %{
+          # sessionKey is REQUIRED by the client's SessionStatus decoder — its
+          # absence fails the whole decode and the model footer never
+          # populates (found live; the TS reference omitted it too).
+          sessionKey: session_key,
           display: %{
             model: session.model,
             fallbackModels: fallback_models,
