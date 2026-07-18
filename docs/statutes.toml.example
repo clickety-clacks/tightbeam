@@ -1,0 +1,17 @@
+# Copy this file into <base_dir>/identity/rails/ to install these statutes.
+# Restart the substrate to apply statute changes.
+# A law change regenerates homes, so sessions lose model memory.
+# The context-reset marker makes that memory loss visible.
+
+[[statute]]
+name = "announce-new-work"
+on   = "work-received"
+mode = "remind"
+text = """
+If this message assigns you new work, wake your coordinator session to
+acknowledge it before starting."""
+
+[[statute]]
+name = "ticket-on-done"
+on   = "turn-end"
+text = "If this turn completed coding work tied to a tracked ticket, update the ticket state before ending."

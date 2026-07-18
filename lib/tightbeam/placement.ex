@@ -66,7 +66,7 @@ defmodule Tightbeam.Placement do
   an unreachable host degrades exactly like a dead adapter, per spec.
   """
 
-  alias Tightbeam.{Archetypes, Homes}
+  alias Tightbeam.{Archetypes, Homes, Rails}
 
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
   # misconfigured host must fail in seconds with a reason, never hang on TCP
@@ -358,11 +358,26 @@ defmodule Tightbeam.Placement do
       Enum.map(archetype.skills, fn name -> %{name: name, link_to: Path.join(library_dir, name)} end)
     end
 
+    suffix =
+      case Rails.standing_law() do
+        nil -> ""
+        standing_law -> "\n\n" <> standing_law
+      end
+
     spec = %{
       harness: harness,
       archetype: archetype_name,
-      guidance: Archetypes.guidance(archetype)
+      guidance: Archetypes.guidance(archetype) <> suffix
     }
+
+    spec =
+      case {harness, Rails.claude_settings()} do
+        {:claude, settings} when not is_nil(settings) ->
+          Map.put(spec, :extra_files, %{"settings.json" => JSON.encode!(settings)})
+
+        _ ->
+          spec
+      end
 
     if host_config.ssh == nil do
       local_skills = skills.(Archetypes.skills_dir(config.base_dir))

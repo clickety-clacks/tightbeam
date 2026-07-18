@@ -1,19 +1,21 @@
 defmodule Tightbeam.PlacementTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.{Archetypes, Placement}
+  alias Tightbeam.{Archetypes, Placement, Rails}
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base_dir)
     File.write!(Path.join(base_dir, "gateway.json"), JSON.encode!(%{cliToken: "tbc_test"}))
     Archetypes.load!(base_dir)
+    Rails.load!(base_dir)
 
     old_hosts = Application.get_env(:tightbeam, :hosts)
     old_url = Application.get_env(:tightbeam, :advertised_url)
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
+      :persistent_term.erase(Tightbeam.Rails)
 
       if old_hosts,
         do: Application.put_env(:tightbeam, :hosts, old_hosts),
@@ -229,6 +231,57 @@ defmodule Tightbeam.PlacementTest do
            |> File.read_link!() == "/remote/tb/identity/skills/tightbeam-assimilate"
 
     refute File.exists?(Path.join(staged_home, "auth.json"))
+  end
+
+  test "deliver_home projects standing law for all homes and hooks only for local Claude", %{
+    base_dir: base_dir
+  } do
+    rails_dir = Path.join([base_dir, "identity", "rails"])
+    File.mkdir_p!(rails_dir)
+
+    File.write!(Path.join(rails_dir, "law.toml"), """
+    [[statute]]
+    name = "announce-new-work"
+    on = "work-received"
+    text = "Acknowledge new work before starting."
+    """)
+
+    Rails.load!(base_dir)
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
+
+    claude_home = Placement.deliver_home(config, {:claude, "default", "testhost"})
+    codex_home = Placement.deliver_home(config, {:codex, "default", "testhost"})
+
+    assert claude_home
+           |> Path.join("settings.json")
+           |> File.read!()
+           |> JSON.decode!() == Rails.claude_settings()
+
+    standing_law = Rails.standing_law()
+
+    assert claude_home
+           |> Path.join("CLAUDE.md")
+           |> File.read!()
+           |> String.ends_with?(standing_law)
+
+    assert codex_home |> Path.join("AGENTS.md") |> File.read!() |> String.ends_with?(standing_law)
+    refute File.exists?(Path.join(codex_home, "settings.json"))
+  end
+
+  test "deliver_home preserves the manifest and nested state with zero statutes", %{
+    base_dir: base_dir
+  } do
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
+    home = Placement.deliver_home(config, {:codex, "default", "testhost"})
+    stamp_path = Path.join(home, ".tightbeam-manifest")
+    stamp_before = File.read!(stamp_path)
+    marker = Path.join([home, "sessions", "nested-marker"])
+    File.mkdir_p!(Path.dirname(marker))
+    File.write!(marker, "keep")
+
+    assert Placement.deliver_home(config, {:codex, "default", "testhost"}) == home
+    assert File.read!(stamp_path) == stamp_before
+    assert File.read!(marker) == "keep"
   end
 
   defp collect_commands(acc) do

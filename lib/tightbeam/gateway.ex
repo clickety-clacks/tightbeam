@@ -68,6 +68,7 @@ defmodule Tightbeam.Gateway do
     Ledger,
     Org,
     Projection,
+    Rails,
     Wakes
   }
 
@@ -135,6 +136,7 @@ defmodule Tightbeam.Gateway do
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
     Archetypes.load!(config.base_dir)
+    Rails.load!(config.base_dir)
 
     adapter_opts = fn key -> Placement.adapter_opts(Map.put(config, :cli_bin, cli_bin), key) end
 
