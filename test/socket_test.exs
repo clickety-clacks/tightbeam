@@ -15,7 +15,8 @@ defmodule Tightbeam.Wire.SocketTest do
       db: db,
       conn_registry: registry,
       handlers: %{},
-      defaults: %{archetype: "default", harness: :claude, provider: :anthropic, model: "fable"},
+      defaults: %{archetype: "default",
+        host: "testhost", harness: :claude, provider: :anthropic, model: "fable"},
       ping_interval_ms: 60_000,
       pong_timeout_ms: 60_000
     }
@@ -86,6 +87,7 @@ defmodule Tightbeam.Wire.SocketTest do
       owner_user_id: device.user_id,
       origin: "user:#{device.user_id}",
       archetype: "default",
+        host: "testhost",
       harness: "claude",
       provider: "anthropic",
       model: "fable"
@@ -126,6 +128,7 @@ defmodule Tightbeam.Wire.SocketTest do
       owner_user_id: device.user_id,
       origin: "user:#{device.user_id}",
       archetype: "default",
+        host: "testhost",
       harness: "claude",
       provider: "anthropic",
       model: "fable"

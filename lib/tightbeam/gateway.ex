@@ -116,6 +116,13 @@ defmodule Tightbeam.Gateway do
       :ok = module.ensure_schema(db)
     end
 
+    # Sessions created before real-hostname registration stored the retired
+    # "local" indexical; rewrite once so rows speak the org's vocabulary.
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET host = ?1 WHERE host = 'local'", [
+        Placement.local_host_name()
+      ])
+
     cli_token = "tbc_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
     gateway_path = Path.join(config.base_dir, "gateway.json")
     File.write!(gateway_path, JSON.encode!(%{port: config.port, cliToken: cli_token}))
@@ -260,17 +267,17 @@ defmodule Tightbeam.Gateway do
       "register-host" =>
         admin_handler(db, fn p ->
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
-          # prepared the machine; this records the fact. Placement refuses
-          # "local"; everything else is the operator's topology to declare.
-          case Placement.register_host(config.base_dir, p.name, %{
-                 ssh: p[:ssh] || p.name,
-                 base_dir: Map.fetch!(p, :base_dir),
-                 cli_bin: p[:cli_bin],
-                 adapter_bin_dir: p[:adapter_bin_dir]
-               }) do
-            {:ok, entry} -> %{host: p.name, config: entry}
-            {:error, denial} -> denial
-          end
+          # prepared the machine; this records the fact. The topology is the
+          # operator's to declare.
+          {:ok, entry} =
+            Placement.register_host(config.base_dir, p.name, %{
+              ssh: p[:ssh] || p.name,
+              base_dir: Map.fetch!(p, :base_dir),
+              cli_bin: p[:cli_bin],
+              adapter_bin_dir: p[:adapter_bin_dir]
+            })
+
+          %{host: p.name, config: entry}
         end),
       "promote-user" =>
         admin_handler(db, fn p ->

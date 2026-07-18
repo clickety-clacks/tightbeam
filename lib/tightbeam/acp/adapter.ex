@@ -159,13 +159,19 @@ defmodule Tightbeam.Acp.Adapter do
 
   @impl true
   def handle_call({:new_session, model, cwd}, _from, state) do
-    {:ok, result} = Conn.request(state.conn, "session/new", %{cwd: cwd, mcpServers: []})
-    sid = result["sessionId"]
-    :ok = apply_model(state, sid, model)
-    _ = Conn.request(state.conn, "session/set_mode", %{sessionId: sid, modeId: state.preset.yolo_mode})
-    state = %{state | known: MapSet.put(state.known, sid)}
-    {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
+    with {:ok, result} <- Conn.request(state.conn, "session/new", %{cwd: cwd, mcpServers: []}),
+         sid = result["sessionId"],
+         :ok <- apply_model(state, sid, model) do
+      _ = Conn.request(state.conn, "session/set_mode", %{sessionId: sid, modeId: state.preset.yolo_mode})
+      state = %{state | known: MapSet.put(state.known, sid)}
+      {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
+    else
+      # Refused config (e.g. an unavailable model) is a turn failure with a
+      # reason — never a crash of the shared adapter's caller chain.
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
   end
+
 
   def handle_call({:load_session, sid, model, cwd}, _from, state) do
     case Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: cwd}) do
@@ -260,18 +266,25 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp apply_model(state, sid, model_ref) do
     {model, effort} = parse_model_ref(model_ref)
-    {:ok, _} = Conn.request(state.conn, "session/set_config_option", %{sessionId: sid, configId: "model", value: model})
 
-    if effort do
-      {:ok, _} =
-        Conn.request(state.conn, "session/set_config_option", %{
-          sessionId: sid,
-          configId: state.preset.effort_config,
-          value: effort
-        })
+    with {:ok, _} <-
+           Conn.request(state.conn, "session/set_config_option", %{
+             sessionId: sid,
+             configId: "model",
+             value: model
+           }),
+         {:ok, _} <-
+           (if effort do
+              Conn.request(state.conn, "session/set_config_option", %{
+                sessionId: sid,
+                configId: state.preset.effort_config,
+                value: effort
+              })
+            else
+              {:ok, nil}
+            end) do
+      :ok
     end
-
-    :ok
   end
 
   @doc """

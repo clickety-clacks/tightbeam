@@ -98,7 +98,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "guidance renders exact sections in order and is pure" do
     archetype = %{
       name: "coder",
-      where: ["local"],
+      where: ["testhost"],
       defaults: %{},
       references: [
         %{name: "repo", location: "work-1:~/src/example-repo", access: "git"},

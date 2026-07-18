@@ -10,7 +10,8 @@ defmodule Tightbeam.Archetypes do
 
       name = "coder"
       where = ["work-1", "work-2"]      # allowed host-set (§Placement).
-                                        # Optional; default ["local"].
+                                        # Optional; default: the gateway's
+                                        # own hostname.
                                         # ["*"] alone = any configured host.
                                         # Empty = error, never a grant.
 
@@ -35,8 +36,9 @@ defmodule Tightbeam.Archetypes do
       [guidance]                        # optional extra guidance, appended
       text = \"\"\"...\"\"\"
 
-  A built-in "default" archetype always exists (where ["local"], no
-  references, no defaults) so a fresh install works with zero manifests. A
+  A built-in "default" archetype always exists (where = the gateway's own
+  hostname, no references, no defaults) so a fresh install works with zero
+  manifests. A
   manifest file named default.toml OVERRIDES the built-in.
 
   GUIDANCE FRAGMENTS (spec §Agent identity): shared guidance lives as files
@@ -325,7 +327,7 @@ defmodule Tightbeam.Archetypes do
   def builtin_default do
     %{
       name: "default",
-      where: ["local"],
+      where: [Tightbeam.Placement.local_host_name()],
       defaults: %{},
       references: [],
       fallback_models: [],
@@ -345,7 +347,7 @@ defmodule Tightbeam.Archetypes do
     end
 
     name = Map.get(manifest, "name", Path.basename(path, ".toml"))
-    where = Map.get(manifest, "where", ["local"])
+    where = Map.get(manifest, "where", [Tightbeam.Placement.local_host_name()])
 
     unless is_list(where) and where != [] and Enum.all?(where, &is_binary/1) do
       raise ArgumentError, "archetype where must be a non-empty list of strings: #{path}"

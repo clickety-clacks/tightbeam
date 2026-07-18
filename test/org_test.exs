@@ -19,6 +19,7 @@ defmodule Tightbeam.OrgTest do
         owner_user_id: "flynn",
         origin: "user:flynn",
         archetype: "default",
+        host: "testhost",
         harness: "claude",
         provider: "anthropic",
         model: "fable"
@@ -37,6 +38,7 @@ defmodule Tightbeam.OrgTest do
 
     assert %{
              archetype: "default",
+        host: "testhost",
              provider: "anthropic",
              state: "active",
              is_built_in: true,

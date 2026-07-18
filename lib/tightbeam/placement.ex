@@ -6,11 +6,14 @@ defmodule Tightbeam.Placement do
 
   Hosts are INSTANCE CONFIG, never DB rows: `Application.get_env(:tightbeam,
   :hosts)` maps name => %{ssh: destination-or-nil, base_dir: path, cli_bin:
-  path-or-nil}. The name "local" is RESERVED: the gateway's own machine
-  (ssh: nil); it always exists (merged in) and is the default WHERE of every
-  archetype. Host names are what archetype `where` lists and session rows
-  refer to; the ssh destination is how to reach one. WHY a host set contains
-  what it does is the operator's statute — nothing here hardcodes a topology.
+  path-or-nil}. The gateway's own machine is always registered under its
+  REAL hostname (`local_host_name/0`; ssh: nil) — never under an indexical
+  like "local", because the org's vocabulary must match the operator's
+  ("spawn on eezo" has to resolve on eezo, including on eezo itself). Which
+  machine is local is carried by `ssh: nil`, not by a special name. Host
+  names are what archetype `where` lists and session rows refer to; the ssh
+  destination is how to reach one. WHY a host set contains what it does is
+  the operator's statute — nothing here hardcodes a topology.
 
   Three responsibilities, each a pure-ish function:
 
@@ -81,31 +84,42 @@ defmodule Tightbeam.Placement do
   @type adapter_key :: {harness :: atom(), archetype :: String.t(), host :: String.t()}
 
   @doc """
-  The known hosts map with "local" always present (ssh: nil, base_dir = the
-  gateway's base_dir). Merge order, weakest first: the instance registry
-  (`<base_dir>/hosts.json`, written only by `register_host/3` — the
-  register-host verb's recorder), then env config (:tightbeam, :hosts — a
-  deploy-time override), then the reserved "local". Nothing may redefine
-  "local".
+  The known hosts map with the gateway's own machine always present under
+  `local_host_name/0` (ssh: nil, base_dir = the gateway's base_dir). Merge
+  order, weakest first: the instance registry (`<base_dir>/hosts.json`,
+  written only by `register_host/3` — the register-host verb's recorder),
+  then env config (:tightbeam, :hosts — a deploy-time override), then the
+  gateway's own entry. Nothing may redefine the gateway's own entry.
   """
   @spec hosts(String.t()) :: %{optional(String.t()) => host_config()}
   def hosts(base_dir) do
     registry_hosts(base_dir)
     |> Map.merge(Application.get_env(:tightbeam, :hosts, %{}))
-    |> Map.put("local", %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+    |> Map.put(local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+  end
+
+  @doc """
+  The gateway machine's registered name — its real hostname (override:
+  :local_host_name config / TIGHTBEAM_LOCAL_HOST_NAME). This is a NAME, not
+  a role: it participates in `where` sets, session rows, and displays like
+  any other host's.
+  """
+  @spec local_host_name() :: String.t()
+  def local_host_name do
+    Application.get_env(:tightbeam, :local_host_name) ||
+      (
+        {:ok, name} = :inet.gethostname()
+        List.to_string(name)
+      )
   end
 
   @doc """
   Record (or update) a host in the instance registry — the DUMB half of
   assimilation: the CLI ceremony prepares the machine; this writes the fact.
-  Admin gating happens in the verb handler, not here. "local" is refused.
-  Returns the stored config.
+  Admin gating happens in the verb handler, not here. Returns the stored
+  config.
   """
-  @spec register_host(String.t(), String.t(), host_config()) ::
-          {:ok, host_config()} | {:error, %{code: String.t(), message: String.t()}}
-  def register_host(_base_dir, "local", _config),
-    do: {:error, %{code: "invalid", message: "\"local\" is reserved and cannot be registered"}}
-
+  @spec register_host(String.t(), String.t(), host_config()) :: {:ok, host_config()}
   def register_host(base_dir, name, config) do
     entry = %{
       ssh: Map.fetch!(config, :ssh),
@@ -166,9 +180,9 @@ defmodule Tightbeam.Placement do
   @doc """
   Resolve + constitutionally check a requested host for an archetype.
   nil → first of archetype.where. `where = ["*"]` grants ANYWHERE: any
-  configured host is allowed and nil resolves to "local" (an explicit grant
-  only — an empty where is an error at load, never a grant; law fails
-  closed). Denies (never raises) with %{code: "host_not_allowed", message:
+  configured host is allowed and nil resolves to the gateway's own host (an
+  explicit grant only — an empty where is an error at load, never a grant;
+  law fails closed). Denies (never raises) with %{code: "host_not_allowed", message:
   names the host and the allowed set} when host ∉ archetype.where, and
   %{code: "unknown_host", message: ...} when host has no config entry.
   """
@@ -176,7 +190,9 @@ defmodule Tightbeam.Placement do
           {:ok, String.t()} | {:error, %{code: String.t(), message: String.t()}}
   def resolve(archetype, requested_host, hosts) do
     anywhere? = archetype.where == ["*"]
-    host = requested_host || if(anywhere?, do: "local", else: hd(archetype.where))
+
+    host =
+      requested_host || if(anywhere?, do: local_host_name(), else: hd(archetype.where))
 
     cond do
       not anywhere? and host not in archetype.where ->
@@ -208,7 +224,7 @@ defmodule Tightbeam.Placement do
     adapter = if harness == :codex, do: "codex-acp", else: "claude-agent-acp"
 
     binary =
-      if host == "local" do
+      if host_config.ssh == nil do
         Path.expand("../tightbeam/node_modules/.bin/#{adapter}", File.cwd!())
       else
         case Map.get(host_config, :adapter_bin_dir) do
@@ -219,7 +235,7 @@ defmodule Tightbeam.Placement do
 
     stderr_path = Path.join(config.base_dir, "adapter-#{harness}:#{archetype}.stderr.log")
 
-    if host == "local" do
+    if host_config.ssh == nil do
       [
         harness: harness,
         cmd: [binary],
@@ -271,10 +287,11 @@ defmodule Tightbeam.Placement do
       guidance: Archetypes.guidance(archetype)
     }
 
-    if host == "local" do
+    host_config = Map.fetch!(hosts(config.base_dir), host)
+
+    if host_config.ssh == nil do
       Homes.project(config.base_dir, spec).home_path
     else
-      host_config = Map.fetch!(hosts(config.base_dir), host)
       stage_base = Path.join([config.base_dir, "staging", host])
       staged_home = Homes.project(stage_base, spec).home_path
 

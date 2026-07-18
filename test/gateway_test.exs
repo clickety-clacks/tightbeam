@@ -66,6 +66,7 @@ defmodule Tightbeam.GatewayTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
+        host: "testhost",
       harness: "claude",
       provider: "anthropic",
       model: "fable"

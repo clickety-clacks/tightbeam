@@ -138,7 +138,7 @@ defmodule Tightbeam.Org do
           Map.fetch!(input, :provider),
           Map.fetch!(input, :model),
           Map.get(input, :thinking_level),
-          Map.get(input, :host, "local"),
+          Map.fetch!(input, :host),
           now
         ]
       )

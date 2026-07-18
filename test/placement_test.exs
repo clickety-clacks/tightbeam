@@ -27,14 +27,18 @@ defmodule Tightbeam.PlacementTest do
     %{base_dir: base_dir}
   end
 
-  test "hosts merges the reserved local host", %{base_dir: base_dir} do
+  test "hosts registers the gateway machine under its real name; nothing redefines it", %{
+    base_dir: base_dir
+  } do
     Application.put_env(:tightbeam, :hosts, %{
       "remote" => %{ssh: "worker", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"},
-      "local" => %{ssh: "forbidden", base_dir: "/wrong", cli_bin: "/wrong/bin"}
+      "testhost" => %{ssh: "forbidden", base_dir: "/wrong", cli_bin: "/wrong/bin"}
     })
 
     hosts = Placement.hosts(base_dir)
-    assert hosts["local"] == %{ssh: nil, base_dir: base_dir, cli_bin: nil}
+    assert Placement.local_host_name() == "testhost"
+    assert hosts["testhost"] == %{ssh: nil, base_dir: base_dir, cli_bin: nil}
+    refute Map.has_key?(hosts, "local")
     assert hosts["remote"].ssh == "worker"
   end
 
@@ -59,7 +63,7 @@ defmodule Tightbeam.PlacementTest do
 
   test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir} do
     config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin"}
-    opts = Placement.adapter_opts(config, {:codex, "default", "local"})
+    opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     expected_binary = Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
     expected_home = Path.join([base_dir, "homes", "default", "codex"])
@@ -189,8 +193,6 @@ defmodule Tightbeam.PlacementTest do
     File.mkdir_p!(base)
     on_exit(fn -> File.rm_rf!(base) end)
 
-    assert {:error, %{code: "invalid"}} = Placement.register_host(base, "local", %{ssh: "x", base_dir: "/y"})
-
     assert {:ok, entry} =
              Placement.register_host(base, "work-1", %{ssh: "work-1.example", base_dir: "/home/u/.tightbeam"})
 
@@ -198,7 +200,7 @@ defmodule Tightbeam.PlacementTest do
 
     hosts = Placement.hosts(base)
     assert hosts["work-1"].base_dir == "/home/u/.tightbeam"
-    assert hosts["local"].ssh == nil
+    assert hosts["testhost"].ssh == nil
 
     # env config overrides the registry entry-for-entry
     Application.put_env(:tightbeam, :hosts, %{"work-1" => %{ssh: "override", base_dir: "/o", cli_bin: nil}})
@@ -213,9 +215,9 @@ defmodule Tightbeam.PlacementTest do
 
   test "where [\"*\"] grants any configured host; empty stays an error upstream" do
     anywhere = %{name: "roamer", where: ["*"], defaults: %{}, references: [], guidance: nil}
-    hosts = %{"local" => %{ssh: nil, base_dir: "/b", cli_bin: nil}, "work-1" => %{ssh: "w", base_dir: "/b", cli_bin: nil}}
+    hosts = %{"testhost" => %{ssh: nil, base_dir: "/b", cli_bin: nil}, "work-1" => %{ssh: "w", base_dir: "/b", cli_bin: nil}}
 
-    assert {:ok, "local"} = Placement.resolve(anywhere, nil, hosts)
+    assert {:ok, "testhost"} = Placement.resolve(anywhere, nil, hosts)
     assert {:ok, "work-1"} = Placement.resolve(anywhere, "work-1", hosts)
     assert {:error, %{code: "unknown_host"}} = Placement.resolve(anywhere, "nope", hosts)
   end

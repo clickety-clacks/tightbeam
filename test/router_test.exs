@@ -64,6 +64,7 @@ defmodule Tightbeam.Wire.RouterTest do
       origin: "user:flynn",
       handle: "orchestrator:demo",
       archetype: "default",
+        host: "testhost",
       harness: "claude",
       provider: "anthropic",
       model: "fable"

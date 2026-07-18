@@ -37,19 +37,19 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # Async boot: the first checkout hands out a pid whose boot then fails;
     # crashes count via :DOWN on the (fast) backoff clock until the circuit
     # opens and checkout fails fast.
-    assert {:ok, _pid, _gen} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "local"})
+    assert {:ok, _pid, _gen} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
 
     assert wait_until(fn ->
              match?(
-               %{"claude:default@local" => %{circuit: :open}},
+               %{"claude:default@testhost" => %{circuit: :open}},
                AdapterCoordinator.health(coordinator)
              )
            end)
 
     assert {:error, :degraded} =
-             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "local"})
+             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
 
-    assert %{"claude:default@local" => %{consecutive_failures: failures}} =
+    assert %{"claude:default@testhost" => %{consecutive_failures: failures}} =
              AdapterCoordinator.health(coordinator)
 
     assert failures >= 5
@@ -87,14 +87,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          name: :"coordinator_#{System.unique_integer([:positive])}"}
       )
 
-    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "local"})
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
     Process.exit(adapter, :kill)
 
     assert eventually(fn ->
-             AdapterCoordinator.generation(coordinator, {:claude, "default", "local"}) == 2
+             AdapterCoordinator.generation(coordinator, {:claude, "default", "testhost"}) == 2
            end)
 
-    assert [%{kind: "adapter_down", subject: "claude:default@local"}] =
+    assert [%{kind: "adapter_down", subject: "claude:default@testhost"}] =
              EventLog.lifecycle_events(ctx.db)
   end
 

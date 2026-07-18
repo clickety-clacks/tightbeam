@@ -38,7 +38,8 @@ end
 
 # Hosts are instance config (spec §Placement): JSON map of
 # name => {"ssh": destination-or-null, "base_dir": path, "cli_bin": path?}.
-# "local" is reserved and merged in by Placement.hosts/1.
+# The gateway's own machine is merged in by Placement.hosts/1 under its
+# real hostname (override: TIGHTBEAM_LOCAL_HOST_NAME).
 if value = System.get_env("TIGHTBEAM_HOSTS") do
   hosts =
     for {name, h} <- JSON.decode!(value), into: %{} do
@@ -55,4 +56,8 @@ end
 
 if value = System.get_env("TIGHTBEAM_DRAIN_TIMEOUT_MS") do
   config :tightbeam, :drain_timeout_ms, String.to_integer(value)
+end
+
+if value = System.get_env("TIGHTBEAM_LOCAL_HOST_NAME") do
+  config :tightbeam, :local_host_name, value
 end

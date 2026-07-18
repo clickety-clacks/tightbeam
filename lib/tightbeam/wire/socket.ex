@@ -405,6 +405,7 @@ defmodule Tightbeam.Wire.Socket do
         owner_user_id: user_id,
         origin: "user:#{user_id}",
         archetype: Map.fetch!(defaults, :archetype),
+        host: Tightbeam.Placement.local_host_name(),
         harness: defaults |> Map.fetch!(:harness) |> to_string(),
         provider: defaults |> Map.fetch!(:provider) |> to_string(),
         model: Map.fetch!(defaults, :model)
