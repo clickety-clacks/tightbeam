@@ -133,7 +133,9 @@ defmodule Tightbeam.Archetypes do
     self following up; act, don't reply). Origins come in three classes —
     user:<id> (a human), agent:<handle> (a colleague), process:<name>
     (automation: cron, CI, webhooks) — and ALL carry the same standing:
-    read and act regardless of class.
+    read and act regardless of class. Only user and agent origins can be
+    woken back; a process cannot receive a wake — for process-stamped
+    messages, your visible reply and your ACTIONS are the response.
   - `tune` changes a session (rename, set_model, set_host — set_host moves
     it to another allowed machine); `retire` ends one (its history
     survives); `cancel-wake <id>` cancels a scheduled wake.
