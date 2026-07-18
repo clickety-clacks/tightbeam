@@ -519,3 +519,34 @@ to finish. Past the deadline, remaining turns die exactly as a crash: the
 graceful path is an optimization, the crash path remains the guarantee.
 SIGTERM (kill <pid>) triggers it; kill -9 skips it by nature, covered by
 recovery + terminal publisher. Deploy SOP: plain kill, wait for exit, start.
+
+## Smoke run #1 — sim (eezo) vs BEAM gateway on SHRDLU (Fable)
+
+First execution of docs/SMOKE.md, and the first fully cross-machine
+deployment: gateway + adapter + agent shell on shrdlu (Ubuntu x86_64,
+Erlang/Elixir via mise), driven by the real Clawline iOS client in the eezo
+simulator. Gateway @ dc7a788+; client build Jul 15.
+
+PASS: §0 pair/first-user-admin; §1 converse + tool use (assistant quoted
+"Linux shrdlu 6.8.0-134-generic" — the agent's hands demonstrably on the
+work machine); §2 spawn (org-shape discovery incl archetypes/hosts/models)
++ rename + retire (soft; messages survive); §3 cancel mid-turn (verb path;
+this client build has no stop control — ⌥); §4 queueing ONE/TWO/THREE in
+order, one-at-a-time; §5 concurrency (Smoke B's turn started AND finished
+inside Main's running turn; Main's next turn started 1ms after its prior);
+§6 /new /compact /model all delivered, zero stuck indicators (regression
+class dead); §7 drain (SIGTERM waited through a real 45s tool turn, then
+exited; instant exit when idle) + durable work across death (wake scheduled
+→ killed → restarted → fired → "PHOENIX"); §8 wakes immediate + delayed.
+
+Findings for follow-up:
+- cliToken re-mints every boot; should persist (agents/operators hold stale
+  tokens across restarts).
+- Client (Jul 15 build): posts sent while the socket is down are silently
+  dropped, not queued for resend — Clawline-upgrade list.
+- Mid-turn progress label not visually captured (turns too fast for
+  snapshot cadence); frames verified by tests. Sim autocorrect mangles
+  typed commands ("uname"→"inane" — which the agent then correctly ran and
+  reported as not found, inadvertently proving tool execution).
+- OTP 28.0.2 on shrdlu logs a "use 28.1+" warning at boot — upgrade when
+  convenient. pgrep-based process watching self-matches; use port/pid.
