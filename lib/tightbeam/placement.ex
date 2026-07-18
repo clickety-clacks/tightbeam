@@ -299,19 +299,25 @@ defmodule Tightbeam.Placement do
   def deliver_home(config, {harness, archetype_name, host}, opts \\ []) do
     archetype = Archetypes.get(archetype_name)
 
+    host_config = Map.fetch!(hosts(config.base_dir), host)
+
+    skills = fn mode ->
+      Enum.map(archetype.skills, fn name ->
+        %{name: name, source: Path.join(Archetypes.skills_dir(config.base_dir), name), mode: mode}
+      end)
+    end
+
     spec = %{
       harness: harness,
       archetype: archetype_name,
       guidance: Archetypes.guidance(archetype)
     }
 
-    host_config = Map.fetch!(hosts(config.base_dir), host)
-
     if host_config.ssh == nil do
-      Homes.project(config.base_dir, spec).home_path
+      Homes.project(config.base_dir, Map.put(spec, :skills, skills.(:link))).home_path
     else
       stage_base = Path.join([config.base_dir, "staging", host])
-      staged_home = Homes.project(stage_base, spec).home_path
+      staged_home = Homes.project(stage_base, Map.put(spec, :skills, skills.(:copy))).home_path
 
       remote_home =
         Path.join([host_config.base_dir, "homes", archetype_name, Atom.to_string(harness)])

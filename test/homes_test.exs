@@ -103,4 +103,46 @@ defmodule Tightbeam.HomesTest do
     assert File.read_link!(Path.join(a.home_path, "auth.json")) ==
              File.read_link!(Path.join(b.home_path, "auth.json"))
   end
+  test "skills project by reference: links live-update, copies refresh, election keys the hash",
+       %{base_dir: base_dir} do
+    library = Path.join(base_dir, "library/deploy")
+    File.mkdir_p!(library)
+    File.write!(Path.join(library, "SKILL.md"), "v1")
+
+    spec = %{
+      harness: :codex,
+      archetype: "default",
+      guidance: "# G",
+      skills: [%{name: "deploy", source: library, mode: :link}]
+    }
+
+    home = Homes.project(base_dir, spec).home_path
+    link = Path.join(home, "skills/deploy")
+    assert File.lstat!(link).type == :symlink
+
+    # Content edit flows through the link with NO regeneration (stamp intact).
+    stamp = File.read!(Path.join(home, ".tightbeam-manifest"))
+    File.write!(Path.join(library, "SKILL.md"), "v2")
+    assert File.read!(Path.join(link, "SKILL.md")) == "v2"
+    Homes.project(base_dir, spec)
+    assert File.read!(Path.join(home, ".tightbeam-manifest")) == stamp
+
+    # Copy mode materializes and refreshes on every projection.
+    copy_base = Path.join(base_dir, "staging")
+    copy_spec = %{spec | skills: [%{name: "deploy", source: library, mode: :copy}]}
+    copy_home = Homes.project(copy_base, copy_spec).home_path
+    copied = Path.join(copy_home, "skills/deploy/SKILL.md")
+    assert File.read!(copied) == "v2"
+    refute File.lstat!(Path.join(copy_home, "skills/deploy")).type == :symlink
+    File.write!(Path.join(library, "SKILL.md"), "v3")
+    Homes.project(copy_base, copy_spec)
+    assert File.read!(copied) == "v3"
+
+    # Election change (not content) regenerates: the hash covers names+modes.
+    marker = Path.join(home, "nested-state")
+    File.write!(marker, "keep?")
+    Homes.project(base_dir, %{spec | skills: []})
+    refute File.exists?(marker)
+  end
+
 end

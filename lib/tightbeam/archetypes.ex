@@ -9,6 +9,11 @@ defmodule Tightbeam.Archetypes do
   design needs and nothing else:
 
       name = "coder"
+      skills = ["tightbeam-assimilate"] # election from the shared skills
+                                        # library (identity/skills/<name>/
+                                        # SKILL.md). Omitted = the built-in
+                                        # set; named = exactly that list.
+                                        # Unknown names fail the boot.
       where = ["work-1", "work-2"]      # allowed host-set (§Placement).
                                         # Optional; default: the gateway's
                                         # own hostname.
@@ -73,6 +78,7 @@ defmodule Tightbeam.Archetypes do
   @typedoc "A validated archetype."
   @type t :: %{
           name: String.t(),
+          skills: [String.t()],
           where: [String.t()],
           defaults: %{optional(:harness) => :claude | :codex, optional(:model) => String.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
@@ -129,17 +135,17 @@ defmodule Tightbeam.Archetypes do
   - `tune` changes a session (rename, set_model, set_host — set_host moves
     it to another allowed machine); `retire` ends one (its history
     survives); `cancel-wake <id>` cancels a scheduled wake.
-  - `assimilate <ssh-dest>` (admin) onboards a machine as a host — the
-    full ceremony, including credentials and archetype WHERE, is the
-    Assimilation section below.
+  - `assimilate <ssh-dest>` (admin) onboards a machine as a host. The
+    full ceremony is the `tightbeam-assimilate` skill in your home
+    (`skills/tightbeam-assimilate/SKILL.md`) — load it WHEN the operator
+    asks for an assimilation, not before, and follow it exactly.
   - Every action is attributed: --as <your-handle> (you) or --as-user
     <human>. You cannot act as anyone you are not.
   """
 
   @builtin_preamble """
   You are a resident session of a Tightbeam org. Orientation below explains
-  your existence here; Operations, how you act; Assimilation, how machines
-  join the org; Comms, how you correspond.
+  your existence here; Operations, how you act; Comms, how you correspond.
   """
 
   @builtin_assimilation """
@@ -181,6 +187,18 @@ defmodule Tightbeam.Archetypes do
      `spawn --host <name>` places a session there.
   """
 
+  @builtin_skills %{
+    "tightbeam-assimilate" =>
+      """
+      ---
+      name: tightbeam-assimilate
+      description: Onboard a machine as a tightbeam host — the complete assimilation ceremony (probe, credentials, archetype WHERE, restart, verify). Use when the operator asks to assimilate a machine.
+      ---
+
+      """ <> @builtin_assimilation
+  }
+
+
   @builtin_comms """
   You correspond through WAKES: a wake delivers a prompt to a session — now
   (a DM) or on a schedule — one mechanism for both. A wake always carries a
@@ -217,6 +235,23 @@ defmodule Tightbeam.Archetypes do
   def load!(base_dir) do
     manifest_dir = Path.join([base_dir, "identity", "archetypes"])
 
+    for {name, content} <- @builtin_skills do
+      path = Path.join([skills_dir(base_dir), name, "SKILL.md"])
+
+      unless File.exists?(path) do
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, content)
+      end
+    end
+
+    library =
+      base_dir
+      |> skills_dir()
+      |> Path.join("*/SKILL.md")
+      |> Path.wildcard()
+      |> Enum.map(&(&1 |> Path.dirname() |> Path.basename()))
+      |> MapSet.new()
+
     archetypes =
       manifest_dir
       |> Path.join("*.toml")
@@ -239,8 +274,20 @@ defmodule Tightbeam.Archetypes do
       end)
 
     # Validate ALL law at load: every archetype's guidance must compose
-    # (missing fragments and include cycles fail the boot, not a turn).
-    for {_name, archetype} <- archetypes, do: guidance_with(archetype, fragments)
+    # (missing fragments and include cycles fail the boot, not a turn), and
+    # every elected skill must exist in the library.
+    for {_name, archetype} <- archetypes do
+      guidance_with(archetype, fragments)
+
+      case Enum.reject(archetype.skills, &MapSet.member?(library, &1)) do
+        [] ->
+          :ok
+
+        unknown ->
+          raise ArgumentError,
+                "archetype #{archetype.name} elects unknown skills: #{Enum.join(unknown, ", ")}"
+      end
+    end
 
     :persistent_term.put(@persist_key, {archetypes, fragments})
     archetypes
@@ -287,9 +334,6 @@ defmodule Tightbeam.Archetypes do
         "",
         "## Operations",
         resolve_includes(~s(#include "operations.md"), fragments, []),
-        "",
-        "## Assimilation",
-        resolve_includes(~s(#include "assimilation.md"), fragments, []),
         "",
         "## Comms",
         resolve_includes(~s(#include "comms.md"), fragments, [])
@@ -361,16 +405,37 @@ defmodule Tightbeam.Archetypes do
       "preamble.md" => @builtin_preamble,
       "orientation.md" => @builtin_orientation,
       "operations.md" => @builtin_operations,
-      "assimilation.md" => @builtin_assimilation,
       "comms.md" => @builtin_comms
     }
   end
+
+  @doc """
+  The shared skills LIBRARY (spec §Agent identity: "skills chosen by name
+  from one shared library"): `<base_dir>/identity/skills/<name>/SKILL.md`.
+  Built-in skills are materialized into the library at load — only when the
+  file is ABSENT, so an operator's edit always wins and deleting the file
+  restores the built-in at next boot. Archetypes elect skills by name;
+  election is validated against the library at load (an unknown name fails
+  the boot — bad law stops the boot).
+
+  Projection is BY REFERENCE (Homes): a local home gets a symlink into the
+  library, so editing a skill updates every electing agent LIVE — no home
+  regeneration, no memory cost. Only the election (the name list) keys the
+  manifest hash; skill CONTENT deliberately does not.
+  """
+  @spec skills_dir(String.t()) :: String.t()
+  def skills_dir(base_dir), do: Path.join([base_dir, "identity", "skills"])
+
+  @doc "Built-in skill names — the default election when a manifest names none."
+  @spec builtin_skill_names() :: [String.t()]
+  def builtin_skill_names, do: @builtin_skills |> Map.keys() |> Enum.sort()
 
   @doc "The built-in default archetype (used when no manifest overrides it)."
   @spec builtin_default() :: t()
   def builtin_default do
     %{
       name: "default",
+      skills: builtin_skill_names(),
       where: [Tightbeam.Placement.local_host_name()],
       defaults: %{},
       references: [],
@@ -380,7 +445,8 @@ defmodule Tightbeam.Archetypes do
   end
 
   defp validate!(manifest, path) do
-    allowed = MapSet.new(["name", "where", "defaults", "references", "fallback_models", "guidance"])
+    allowed =
+      MapSet.new(["name", "skills", "where", "defaults", "references", "fallback_models", "guidance"])
 
     unknown =
       manifest |> Map.keys() |> MapSet.new() |> MapSet.difference(allowed) |> MapSet.to_list()
@@ -392,6 +458,11 @@ defmodule Tightbeam.Archetypes do
 
     name = Map.get(manifest, "name", Path.basename(path, ".toml"))
     where = Map.get(manifest, "where", [Tightbeam.Placement.local_host_name()])
+    skills = Map.get(manifest, "skills", builtin_skill_names())
+
+    unless is_list(skills) and Enum.all?(skills, &is_binary/1) do
+      raise ArgumentError, "archetype skills must be a list of strings: #{path}"
+    end
 
     unless is_list(where) and where != [] and Enum.all?(where, &is_binary/1) do
       raise ArgumentError, "archetype where must be a non-empty list of strings: #{path}"
@@ -440,6 +511,7 @@ defmodule Tightbeam.Archetypes do
 
     %{
       name: name,
+      skills: skills,
       where: where,
       fallback_models: fallback_models,
       defaults: defaults,

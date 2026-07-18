@@ -695,3 +695,14 @@ memory-safe, the restart-to-apply rule stated as a reporting obligation,
 and the verify step. Guidance change = manifest hash change → homes
 regenerate on next adapter boot → sessions fall back (visible via the
 [context reset] marker — the cost of an identity change, by design).
+
+Same morning, refined per Flynn: assimilation guidance must not be
+always-loaded, and skills are first-class — not extra_files freight. Built
+the spec's skills library for real: identity/skills/<name>/SKILL.md, manifest
+`skills` election (omitted = builtin set; unknown fails boot), builtins
+materialized only-if-absent (operator edits win), projection by reference —
+symlink locally (content edits propagate live, hash unaffected), copy into
+staged homes for satellites. Election is in the manifest hash; content is
+not. Composed guidance now carries only a one-line Operations pointer at
+the skill. Tests: election validation, materialization precedence, link
+live-update with stamp intact, copy refresh, election-change regeneration.

@@ -193,7 +193,11 @@ defmodule Tightbeam.PlacementTest do
     assert List.last(auth) =~ "ln -s"
 
     staged_home = Path.join([base_dir, "staging", "worker", "homes", "default", "codex"])
-    assert Enum.sort(File.ls!(staged_home)) == [".tightbeam-manifest", "AGENTS.md"]
+    assert Enum.sort(File.ls!(staged_home)) == [".tightbeam-manifest", "AGENTS.md", "skills"]
+
+    assert staged_home
+           |> Path.join("skills/tightbeam-assimilate/SKILL.md")
+           |> File.read!() =~ "name: tightbeam-assimilate"
     refute File.exists?(Path.join(staged_home, "auth.json"))
   end
 
