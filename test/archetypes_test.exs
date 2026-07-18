@@ -151,4 +151,64 @@ defmodule Tightbeam.ArchetypesTest do
     refute compiled =~ "## Your materials"
     assert String.ends_with?(compiled, "something to add.\n\nAdditional law.")
   end
+
+  test "fragments: operator files override built-ins and #include composes", ctx do
+    gdir = Path.join([ctx.base_dir, "identity", "guidance"])
+    File.mkdir_p!(gdir)
+    File.write!(Path.join(gdir, "preamble.md"), "Custom preamble.")
+    File.write!(Path.join(gdir, "topology.md"), "Coders live on work hosts.")
+    File.write!(Path.join(gdir, "outer.md"), ~s(before\n#include "topology.md"\nafter))
+
+    adir = Path.join([ctx.base_dir, "identity", "archetypes"])
+    File.mkdir_p!(adir)
+
+    File.write!(Path.join(adir, "coder.toml"), """
+    name = "coder"
+    [guidance]
+    text = \"\"\"
+    #include "outer.md"
+    \"\"\"
+    """)
+
+    Archetypes.load!(ctx.base_dir)
+    text = Archetypes.guidance(Archetypes.get("coder"))
+
+    assert text =~ "Custom preamble."
+    refute text =~ "dark factory"
+    assert text =~ "before\nCoders live on work hosts.\nafter"
+    refute text =~ "#include"
+  end
+
+  test "missing fragment and include cycles fail the boot", ctx do
+    adir = Path.join([ctx.base_dir, "identity", "archetypes"])
+    File.mkdir_p!(adir)
+
+    File.write!(Path.join(adir, "broken.toml"), """
+    name = "broken"
+    [guidance]
+    text = \"\"\"
+    #include "nope.md"
+    \"\"\"
+    """)
+
+    assert_raise ArgumentError, ~r/unknown guidance fragment "nope.md"/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end
+
+    gdir = Path.join([ctx.base_dir, "identity", "guidance"])
+    File.mkdir_p!(gdir)
+    File.write!(Path.join(gdir, "a.md"), ~s(#include "b.md"))
+    File.write!(Path.join(gdir, "b.md"), ~s(#include "a.md"))
+    File.write!(Path.join(adir, "broken.toml"), """
+    name = "broken"
+    [guidance]
+    text = \"\"\"
+    #include "a.md"
+    \"\"\"
+    """)
+
+    assert_raise ArgumentError, ~r/include cycle: a.md -> b.md -> a.md/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end
+  end
 end

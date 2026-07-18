@@ -31,6 +31,19 @@ defmodule Tightbeam.Archetypes do
   references, no defaults) so a fresh install works with zero manifests. A
   manifest file named default.toml OVERRIDES the built-in.
 
+  GUIDANCE FRAGMENTS (spec §Agent identity): shared guidance lives as files
+  in `<base_dir>/identity/guidance/*.md` and is composed via an include
+  directive — a line of exactly `#include "fragment.md"` — resolved
+  recursively at compile time. Includes are parts-listing in-text and
+  nothing more: no variables, no conditionals, no logic (a template that can
+  compute is an agent that can't be audited). The substrate ships two
+  built-in fragments every home receives — "preamble.md" (the factory
+  preamble) and "scheduling-wakes.md" (the CLI skill) — and an operator
+  fragment of the same name OVERRIDES the built-in. Resolution is validated
+  at load!: a missing fragment or an include cycle fails the boot. Because
+  composition happens before the projection hash, editing a fragment
+  regenerates exactly the homes that include it.
+
   Loading is boot-time and whole-set: `load!/1` parses every manifest,
   validates (unknown top-level keys are ERRORS — a typo'd field must not
   silently become no-op law), and stores the set in `:persistent_term`
@@ -56,6 +69,12 @@ defmodule Tightbeam.Archetypes do
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           guidance: String.t() | nil
         }
+
+  @builtin_preamble """
+  You are an agent in a Tightbeam dark factory. You can talk to other
+  sessions and schedule your own follow-ups with the `tightbeam` CLI.
+  See the scheduling-wakes skill below.
+  """
 
   @scheduling_wakes_skill """
   Use the `tightbeam` CLI to coordinate with other sessions. Run
@@ -102,23 +121,44 @@ defmodule Tightbeam.Archetypes do
         Map.put(loaded, archetype.name, archetype)
       end)
 
-    :persistent_term.put(@persist_key, archetypes)
+    fragments =
+      [base_dir, "identity", "guidance"]
+      |> Path.join()
+      |> Path.join("*.md")
+      |> Path.wildcard()
+      |> Enum.sort()
+      |> Enum.reduce(builtin_fragments(), fn path, acc ->
+        Map.put(acc, Path.basename(path), File.read!(path))
+      end)
+
+    # Validate ALL law at load: every archetype's guidance must compose
+    # (missing fragments and include cycles fail the boot, not a turn).
+    for {_name, archetype} <- archetypes, do: guidance_with(archetype, fragments)
+
+    :persistent_term.put(@persist_key, {archetypes, fragments})
     archetypes
+  end
+
+  @doc "The loaded fragment library — built-ins overridden by identity/guidance files."
+  @spec fragments() :: %{optional(String.t()) => String.t()}
+  def fragments do
+    # Before load!/1 has run (unit tests, tooling) the built-ins stand alone.
+    {_archetypes, fragments} = :persistent_term.get(@persist_key, {%{}, builtin_fragments()})
+    fragments
   end
 
   @doc "The loaded archetype by name, or nil. Reads :persistent_term (load!/1 must have run)."
   @spec get(String.t()) :: t() | nil
   def get(name) do
-    Map.get(:persistent_term.get(@persist_key), name)
+    {archetypes, _fragments} = :persistent_term.get(@persist_key)
+    Map.get(archetypes, name)
   end
 
   @doc "All loaded archetype names."
   @spec names() :: [String.t()]
   def names do
-    @persist_key
-    |> :persistent_term.get()
-    |> Map.keys()
-    |> Enum.sort()
+    {archetypes, _fragments} = :persistent_term.get(@persist_key)
+    archetypes |> Map.keys() |> Enum.sort()
   end
 
   @doc """
@@ -126,17 +166,17 @@ defmodule Tightbeam.Archetypes do
   for the section order). Pure: identical manifest → identical bytes.
   """
   @spec guidance(t()) :: String.t()
-  def guidance(archetype) do
+  def guidance(archetype), do: guidance_with(archetype, fragments())
+
+  defp guidance_with(archetype, fragments) do
     preamble =
       [
         "# Tightbeam · #{archetype.name}",
         "",
-        "You are an agent in a Tightbeam dark factory. You can talk to other",
-        "sessions and schedule your own follow-ups with the `tightbeam` CLI.",
-        "See the scheduling-wakes skill below.",
+        resolve_includes(~s(#include "preamble.md"), fragments, []),
         "",
         "## Skill: scheduling-wakes",
-        @scheduling_wakes_skill
+        resolve_includes(~s(#include "scheduling-wakes.md"), fragments, [])
       ]
       |> Enum.join("\n")
 
@@ -155,14 +195,56 @@ defmodule Tightbeam.Archetypes do
           Enum.join(["## Your materials" | lines], "\n")
       end
 
-    with_materials = if materials, do: preamble <> "\n" <> materials, else: preamble
+    with_materials = if materials, do: preamble <> "\n\n" <> materials, else: preamble
 
     if archetype.guidance do
-      separator = if materials, do: "\n\n", else: "\n"
-      with_materials <> separator <> archetype.guidance
+      with_materials <> "\n\n" <> resolve_includes(archetype.guidance, fragments, [])
     else
       with_materials
     end
+  end
+
+  # Include resolution: a line of exactly `#include "name.md"` is replaced by
+  # the named fragment, itself resolved (stack detects cycles; depth-capped).
+  # No other line is touched — includes only, never logic.
+  defp resolve_includes(text, fragments, stack) do
+    text
+    |> String.split("\n")
+    |> Enum.map(fn line ->
+      case Regex.run(~r/^#include "([^"]+)"\s*$/, line) do
+        [_, name] ->
+          cond do
+            name in stack ->
+              raise ArgumentError,
+                    "guidance include cycle: #{Enum.join(Enum.reverse([name | stack]), " -> ")}"
+
+            length(stack) >= 10 ->
+              raise ArgumentError, "guidance include depth exceeded at #{name}"
+
+            true ->
+              case Map.fetch(fragments, name) do
+                {:ok, content} ->
+                  content |> String.trim_trailing("\n") |> resolve_includes(fragments, [name | stack])
+
+                :error ->
+                  raise ArgumentError,
+                        "unknown guidance fragment #{inspect(name)}; available: " <>
+                          (fragments |> Map.keys() |> Enum.sort() |> Enum.join(", "))
+              end
+          end
+
+        nil ->
+          line
+      end
+    end)
+    |> Enum.join("\n")
+  end
+
+  defp builtin_fragments do
+    %{
+      "preamble.md" => @builtin_preamble,
+      "scheduling-wakes.md" => @scheduling_wakes_skill
+    }
   end
 
   @doc "The built-in default archetype (used when no manifest overrides it)."

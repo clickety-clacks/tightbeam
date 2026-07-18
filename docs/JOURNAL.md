@@ -360,3 +360,19 @@ setup — an incompletely assimilated host degrades as a failing adapter.
 Verb added to router AGENT_VERBS. CLI assimilate implementation dispatched
 to sol (TS repo — freeze exception journaled there: CLI is shared surface,
 placement-critical).
+
+## Guidance fragments + #include (Fable)
+
+Per Flynn: shared guidance across archetypes with an include mechanism.
+Implemented (spec §Agent identity amended): fragment library at
+identity/guidance/*.md; a line of exactly `#include "fragment.md"` resolves
+recursively at compile (cycle + missing fragment fail the BOOT via load!
+whole-set validation — bad law stops the factory); depth-capped; includes
+only, never variables/conditionals ("a template that can compute is an
+agent that can't be audited"). Built-in fragments preamble.md and
+scheduling-wakes.md ship in code and are overridable by same-named operator
+files — so every session already carries CLI operating knowledge at spawn
+without running help. Default compiled output byte-identical to
+pre-fragment guidance (projection hashes unchanged). Base skills answer:
+the wakes skill IS baked into every home; a richer shared skills library
+(SKILL.md dirs chosen by name) remains the full-compiler milestone.
