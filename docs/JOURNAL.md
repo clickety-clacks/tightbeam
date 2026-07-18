@@ -629,3 +629,15 @@ Fixes:
 
 Verification: deploy → turn → pointer reason `loaded` (SMOKE §7 step 14
 condition), and the session remembers pre-deploy turns.
+
+Followup, same night: the new pointer_fallback event exposed the TRUE root
+cause on its first firing — session/load was rejected with -32602
+"mcpServers: Required value is missing". The gateway's load request sent
+only {sessionId, cwd}; claude-agent-acp requires mcpServers (the direct ACP
+probe passed [], which is why probe loads succeeded while gateway loads
+never did). Every load since the field became required failed on protocol
+shape — the "lost session" was never lost. Fix: mcpServers: [] on
+session/load, matching session/new. The model-refusal observed at 23:20 was
+a secondary symptom on the same path. Note: the agent aced the continuity
+check even on a fallback because it had written itself a memory file — nice
+validation of agent-side memory, but the pointer reason is the truth.

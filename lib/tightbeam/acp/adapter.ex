@@ -174,7 +174,7 @@ defmodule Tightbeam.Acp.Adapter do
 
 
   def handle_call({:load_session, sid, model, cwd}, _from, state) do
-    case Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: cwd}) do
+    case Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: cwd, mcpServers: []}) do
       {:ok, _} ->
         # Best-effort: a loaded session already HAS a model. The option's
         # valid set is populated asynchronously in the harness and can lag
