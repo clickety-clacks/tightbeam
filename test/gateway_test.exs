@@ -39,6 +39,11 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:new_session, _model, _cwd}, _from, parent),
       do: {:reply, {:ok, "harness-1"}, parent}
 
+    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
+
+    def handle_call({:load_session, _sid, _model, _cwd}, _from, parent),
+      do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
+
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
@@ -66,7 +71,7 @@ defmodule Tightbeam.GatewayTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
-        host: "testhost",
+      host: "testhost",
       harness: "claude",
       provider: "anthropic",
       model: "fable"
@@ -190,6 +195,90 @@ defmodule Tightbeam.GatewayTest do
              "typing:false",
              "activity:false"
            ]
+  end
+
+  test "a fallback turn appends the context-reset marker between echo and reply", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :marker_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "marker",
+        is_admin: false
+      })
+
+    base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: "fable",
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    # A pre-existing pointer the stub adapter refuses to load → the runner
+    # must fall back AND put the memory-loss line on the wire.
+    Org.append_pointer(ctx.db, "k1", "stale-harness-sid", "created")
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "ping",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "marker",
+               client_message_id: "c_marker"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
+    assert_receive {:prompt_started, ^adapter}
+    send(adapter, :continue_prompt)
+    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    publish.("delivered")
+
+    frames = collect_pushes(10, [])
+
+    assert Enum.map(frames, &frame_name/1) == [
+             "message:user",
+             "turn:accepted",
+             "turn:running",
+             "typing:true",
+             "activity:true",
+             "message:assistant",
+             "message:assistant",
+             "turn:delivered",
+             "typing:false",
+             "activity:false"
+           ]
+
+    marker = Enum.find(frames, &(&1["type"] == "message" and &1["sender"] == "process:tightbeam"))
+    assert String.starts_with?(marker["content"], "[context reset]\n")
+
+    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
+
+    assert [%{kind: "pointer_fallback", subject: "k1"}] =
+             EventLog.lifecycle_events(ctx.db) |> Enum.filter(&(&1.kind == "pointer_fallback"))
   end
 
   defp collect_pushes(0, acc), do: Enum.reverse(acc)

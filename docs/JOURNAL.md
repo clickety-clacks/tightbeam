@@ -641,3 +641,29 @@ session/load, matching session/new. The model-refusal observed at 23:20 was
 a secondary symptom on the same path. Note: the agent aced the continuity
 check even on a fallback because it had written itself a memory file — nice
 validation of agent-side memory, but the pointer reason is the truth.
+
+## 2026-07-18 — context-reset marker; credential rotation war
+
+Flynn (UX): a fallback is invisible in the client — "i dunno where that
+line is and it looks like a bug." Added the [context reset] MARKER MESSAGE:
+on fallback the substrate appends an ordinary message at the reset point
+(role assistant, sender "process:tightbeam", bracketed first line), so it
+rides replay/live-push with no new frame type. Anti-forgery: model output
+always commits with sender "tightbeam", so no session can emit a marker by
+typing one. Convention documented normatively in Payloads (§MARKER
+MESSAGES); bible §source-of-truth updated: the log is the operator's
+record, the context is the model's working set — history is never trimmed
+to match model memory. Test: fallback turn's golden order shows marker
+between echo and reply.
+
+Separately, live: mike:main turn failed "OAuth session expired and could
+not be refreshed." Cause: the harvested credential copy shares one OAuth
+grant with the operator's interactive ~/.claude login; refresh tokens
+rotate on use, so the two stores race — ~/.claude refreshed 00:07, the
+gateway's copy tried at 00:09 with the now-dead token. Also found: harness
+refresh replaces our auth symlink via rename, so the home holds the only
+live lineage; a home wipe then bricks the login. Fixes: (a) re-harvested
+fresh creds (unstick); (b) Homes now harvests regular-file auth entries
+back to the store BEFORE a wipe. Open risk, flagged to Flynn: sharing the
+grant with an interactive login will race again — the durable fix is a
+dedicated harness login for tightbeam's auth store (needs Flynn's browser).

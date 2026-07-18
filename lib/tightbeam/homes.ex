@@ -2,8 +2,16 @@ defmodule Tightbeam.Homes do
   @moduledoc """
   Projects disposable harness homes from archetype guidance and extra files
   (TS reference: `src/homes/project.ts`). Credentials remain owned by
-  `<base_dir>/auth/<harness>` and are only symlinked into generated homes;
-  regeneration never writes to or deletes the auth source.
+  `<base_dir>/auth/<harness>` and are only symlinked into generated homes.
+
+  The auth store is written from exactly one place: the harvest-back that
+  precedes a wipe. OAuth refresh tokens ROTATE on use, and the harness
+  refreshes by write-temp-then-rename — which replaces our symlink with a
+  regular file, leaving the home holding the only live credential lineage
+  while the store's copy is silently dead. A wipe that discarded it would
+  brick the login ("OAuth session expired and could not be refreshed" —
+  this shipped once). So regeneration first copies any regular-file auth
+  entry back over its store source, then wipes, then relinks.
 
   Projection is IDEMPOTENT, gated on a manifest hash stamped into the home
   (spec: homes are regenerated on IDENTITY CHANGE, never on process restart).
@@ -38,7 +46,8 @@ defmodule Tightbeam.Homes do
   and symlinks for every harness auth entry. Idempotent via the manifest-hash
   stamp (see moduledoc): an unchanged spec never deletes the home — nested
   harness session state survives restarts — and only missing auth symlinks
-  are topped up. The auth source is never modified.
+  are topped up. A wipe harvests rotated credentials back to the auth store
+  first (see moduledoc).
   """
   @spec project(String.t(), spec()) :: projected_home()
   def project(base_dir, spec) do
@@ -52,6 +61,7 @@ defmodule Tightbeam.Homes do
     instructions_path = Path.join(home_path, instructions_file)
 
     unless File.exists?(stamp_path) and File.read!(stamp_path) == hash do
+      harvest_auth_back(auth_dir, home_path)
       File.rm_rf!(home_path)
       File.mkdir_p!(home_path)
       File.write!(instructions_path, spec.guidance)
@@ -70,6 +80,28 @@ defmodule Tightbeam.Homes do
       instructions_file: instructions_path,
       linked_auth_files: link_auth(auth_dir, home_path)
     }
+  end
+
+  # An auth entry that is a REGULAR file in the home (not our symlink) was
+  # rotated in place by the harness and is the only live copy of that
+  # credential — copy it back over its store source before the wipe (see
+  # moduledoc). Symlinks and absent entries mean the store is still current.
+  defp harvest_auth_back(auth_dir, home_path) do
+    case File.ls(auth_dir) do
+      {:ok, files} ->
+        for file <- files do
+          home_file = Path.join(home_path, file)
+
+          with {:ok, %File.Stat{type: :regular}} <- File.lstat(home_file) do
+            File.cp!(home_file, Path.join(auth_dir, file))
+          end
+        end
+
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+    end
   end
 
   # Top up symlinks for any auth entry not yet linked (idempotent; never

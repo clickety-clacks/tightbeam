@@ -784,6 +784,7 @@ defmodule Tightbeam.Gateway do
 
                   with {:ok, sid} <- Adapter.new_session(adapter, session.model, cwd) do
                     Org.append_pointer(db, session.session_key, sid, "fallback")
+                    append_context_reset_marker(db, session)
                     {:ok, sid}
                   end
               end
@@ -1120,6 +1121,32 @@ defmodule Tightbeam.Gateway do
           _ ->
             %{code: "not_found"}
         end
+    end
+  end
+
+  # A fallback is the one substrate event a reader of the CHAT must see:
+  # the model's working memory ended here while the visible history did not
+  # — without a line, the boundary is invisible and the next reply reads as
+  # a bug. The marker is an ordinary appended message (Payloads "MARKER
+  # MESSAGES" — the seam clients render from) so it rides replay and live
+  # push with no new frame type. Position is the truth: fallback is
+  # discovered lazily at turn start, AFTER this turn's echo committed, so
+  # the marker lands between echo and reply — the message directly above IS
+  # delivered to the fresh context, everything before it is not.
+  defp append_context_reset_marker(db, session) do
+    content =
+      "[context reset]\n\n" <>
+        "The agent's working memory was reset while handling the message above. " <>
+        "Earlier messages stay visible here, but the agent no longer remembers them."
+
+    case Projection.append(db, %{
+           session_key: session.session_key,
+           role: "assistant",
+           content: content,
+           sender: "process:tightbeam"
+         }) do
+      {:appended, marker} -> publish_message(db, session.session_key, marker)
+      _ -> :ok
     end
   end
 

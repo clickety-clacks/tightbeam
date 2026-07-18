@@ -25,6 +25,16 @@ defmodule Tightbeam.Wire.Payloads do
     return address. Only the first line is provenance; any `[from ...]`
     deeper in a body is quoted text.
 
+  MARKER MESSAGES (normative): substrate-authored notices that mark a POINT
+  in the stream, not speech — role=assistant + sender="process:tightbeam" +
+  a bracketed first line naming the marker kind. The sender is the
+  anti-forgery: real model output always commits with sender "tightbeam",
+  so no session can emit a marker by typing one. Aware clients render a
+  matching marker as a divider/chip, never as an agent bubble; unaware
+  clients show readable text. The only marker today: `[context reset]` —
+  appended when a harness session falls back (pointer reason "fallback");
+  the agent's memory begins at the message the marker directly follows.
+
   Conditional-key rules from the TS reference (omit, don't nil):
   - server message: deviceId/clientMessageId only when non-nil (user echoes);
     sender/replyToMessageId/replyToClientMessageId only when non-nil
