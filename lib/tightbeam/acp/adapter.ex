@@ -57,13 +57,20 @@ defmodule Tightbeam.Acp.Adapter do
   def start_link(fun) when is_function(fun, 0), do: GenServer.start_link(__MODULE__, fun)
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
-  @doc "Create a fresh harness session, model applied (fable-trap rule). Returns {:ok, session_id}."
-  @spec new_session(adapter(), model_ref()) :: {:ok, String.t()}
-  def new_session(adapter, model), do: GenServer.call(adapter, {:new_session, model}, 30_000)
+  @doc """
+  Create a fresh harness session, model applied (fable-trap rule), rooted at
+  `cwd` — the SESSION's isolated workdir, never a shared/operator directory
+  (harnesses load project-level instruction files walking up from cwd; an
+  un-isolated cwd leaks the operator's own guidance and files into the
+  agent). Returns {:ok, session_id}.
+  """
+  @spec new_session(adapter(), model_ref(), String.t()) :: {:ok, String.t()}
+  def new_session(adapter, model, cwd), do: GenServer.call(adapter, {:new_session, model, cwd}, 30_000)
 
-  @doc "Adopt an existing harness session — re-applies the model; never trusts the advertised one."
-  @spec load_session(adapter(), String.t(), model_ref()) :: :ok
-  def load_session(adapter, session_id, model), do: GenServer.call(adapter, {:load_session, session_id, model}, 30_000)
+  @doc "Adopt an existing harness session at its workdir — re-applies the model; never trusts the advertised one."
+  @spec load_session(adapter(), String.t(), model_ref(), String.t()) :: :ok | {:error, term()}
+  def load_session(adapter, session_id, model, cwd),
+    do: GenServer.call(adapter, {:load_session, session_id, model, cwd}, 30_000)
 
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
@@ -151,8 +158,8 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
-  def handle_call({:new_session, model}, _from, state) do
-    {:ok, result} = Conn.request(state.conn, "session/new", %{cwd: state.cwd, mcpServers: []})
+  def handle_call({:new_session, model, cwd}, _from, state) do
+    {:ok, result} = Conn.request(state.conn, "session/new", %{cwd: cwd, mcpServers: []})
     sid = result["sessionId"]
     :ok = apply_model(state, sid, model)
     _ = Conn.request(state.conn, "session/set_mode", %{sessionId: sid, modeId: state.preset.yolo_mode})
@@ -160,8 +167,8 @@ defmodule Tightbeam.Acp.Adapter do
     {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
   end
 
-  def handle_call({:load_session, sid, model}, _from, state) do
-    case Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: state.cwd}) do
+  def handle_call({:load_session, sid, model, cwd}, _from, state) do
+    case Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: cwd}) do
       {:ok, _} ->
         :ok = apply_model(state, sid, model)
         state = %{state | known: MapSet.put(state.known, sid)}

@@ -551,7 +551,7 @@ defmodule Tightbeam.Gateway do
         with {:ok, adapter, generation} <-
                checkout_adapter(session),
              {:ok, harness_session_id} <-
-               harness_session(db, adapter, generation, session, turn.seq),
+               harness_session(config, db, adapter, generation, session, turn.seq),
              {:ok, result} <-
                Adapter.prompt(adapter, harness_session_id, turn.prompt, 600_000,
                  progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
@@ -724,11 +724,29 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp harness_session(db, adapter, generation, session, turn_seq) do
+  # Every session works in its OWN directory on its host — never the
+  # operator's home, never shared: harnesses load project-level instruction
+  # files walking up from cwd, so an un-isolated cwd leaks operator guidance
+  # (and files) into the agent. The workdir is also the agent's durable
+  # scratch across engine swaps (artifact continuity).
+  defp session_workdir(config, session) do
+    host = Placement.hosts(config.base_dir)[session.host] || %{ssh: nil, base_dir: config.base_dir}
+
+    digest =
+      :crypto.hash(:sha256, session.session_key) |> Base.encode16(case: :lower) |> binary_part(0, 12)
+
+    path = Path.join([host.base_dir, "work", digest])
+    Placement.ensure_dir(host, path)
+    path
+  end
+
+  defp harness_session(config, db, adapter, generation, session, turn_seq) do
+    cwd = session_workdir(config, session)
+
     result =
       case Org.current_pointer(db, session.session_key) do
         nil ->
-          with {:ok, sid} <- Adapter.new_session(adapter, session.model) do
+          with {:ok, sid} <- Adapter.new_session(adapter, session.model, cwd) do
             Org.append_pointer(db, session.session_key, sid, "created")
             {:ok, sid}
           end
@@ -740,7 +758,7 @@ defmodule Tightbeam.Gateway do
             {:ok, pointer.harness_session_id}
           else
             AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, fn ->
-              case Adapter.load_session(adapter, pointer.harness_session_id, session.model) do
+              case Adapter.load_session(adapter, pointer.harness_session_id, session.model, cwd) do
                 :ok ->
                   Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
                   {:ok, pointer.harness_session_id}
@@ -749,7 +767,7 @@ defmodule Tightbeam.Gateway do
                   # Spec §pointer chain: reason "fallback" — the harness lost
                   # the session; start fresh, on the record, model context
                   # forfeited but chat history substrate-side and intact.
-                  with {:ok, sid} <- Adapter.new_session(adapter, session.model) do
+                  with {:ok, sid} <- Adapter.new_session(adapter, session.model, cwd) do
                     Org.append_pointer(db, session.session_key, sid, "fallback")
                     {:ok, sid}
                   end
@@ -1039,7 +1057,12 @@ defmodule Tightbeam.Gateway do
                      {String.to_existing_atom(session.harness), session.archetype, session.host}
                    ) do
               AdapterCoordinator.with_load_slot(coordinator, fn ->
-                Adapter.load_session(adapter, pointer.harness_session_id, p.model)
+                Adapter.load_session(
+                  adapter,
+                  pointer.harness_session_id,
+                  p.model,
+                  session_workdir(config, session)
+                )
               end)
             else
               _ -> :ok

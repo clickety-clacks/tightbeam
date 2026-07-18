@@ -145,6 +145,25 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
+  Ensure a directory exists on a host (local mkdir_p; remote ssh mkdir -p).
+  Used for per-session workdirs. Raises on failure — an unmakeable workdir
+  fails the turn visibly, same posture as home delivery.
+  """
+  @spec ensure_dir(host_config(), String.t()) :: :ok
+  def ensure_dir(%{ssh: nil}, path) do
+    File.mkdir_p!(path)
+    :ok
+  end
+
+  def ensure_dir(%{ssh: dest}, path) do
+    {_out, code} =
+      System.cmd("ssh", @ssh_opts ++ [dest, "mkdir", "-p", path], stderr_to_stdout: true)
+
+    if code != 0, do: raise("remote workdir mkdir failed (#{dest}): #{path}")
+    :ok
+  end
+
+  @doc """
   Resolve + constitutionally check a requested host for an archetype.
   nil → first of archetype.where. `where = ["*"]` grants ANYWHERE: any
   configured host is allowed and nil resolves to "local" (an explicit grant

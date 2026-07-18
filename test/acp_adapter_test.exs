@@ -62,19 +62,19 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "new_session applies model then prompt streams+accumulates, permission auto-allowed" do
     a = start_adapter()
-    assert {:ok, "sess-1"} = Adapter.new_session(a, "haiku")
+    assert {:ok, "sess-1"} = Adapter.new_session(a, "haiku", "/tmp")
     assert {:ok, %{stop_reason: "end_turn", text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "say pong")
   end
 
   test "load_session then prompt (rule #1 re-apply path)" do
     a = start_adapter()
-    assert :ok = Adapter.load_session(a, "sess-1", "haiku")
+    assert :ok = Adapter.load_session(a, "sess-1", "haiku", "/tmp")
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
   end
 
   test "consecutive prompts reset the accumulator" do
     a = start_adapter()
-    {:ok, _} = Adapter.new_session(a, "haiku")
+    {:ok, _} = Adapter.new_session(a, "haiku", "/tmp")
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "one")
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "two")
   end
