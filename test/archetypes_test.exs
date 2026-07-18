@@ -211,4 +211,30 @@ defmodule Tightbeam.ArchetypesTest do
       Archetypes.load!(ctx.base_dir)
     end
   end
+
+  test "where wildcard must stand alone; empty where rejected", ctx do
+    adir = Path.join([ctx.base_dir, "identity", "archetypes"])
+    File.mkdir_p!(adir)
+
+    File.write!(Path.join(adir, "bad.toml"), """
+    name = "bad"
+    where = ["*", "work-1"]
+    """)
+
+    assert_raise ArgumentError, ~r/must be the only element/, fn -> Archetypes.load!(ctx.base_dir) end
+
+    File.write!(Path.join(adir, "bad.toml"), """
+    name = "bad"
+    where = []
+    """)
+
+    assert_raise ArgumentError, ~r/non-empty list/, fn -> Archetypes.load!(ctx.base_dir) end
+
+    File.write!(Path.join(adir, "bad.toml"), """
+    name = "roamer"
+    where = ["*"]
+    """)
+
+    assert Archetypes.load!(ctx.base_dir)["roamer"].where == ["*"]
+  end
 end

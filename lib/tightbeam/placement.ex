@@ -141,18 +141,21 @@ defmodule Tightbeam.Placement do
 
   @doc """
   Resolve + constitutionally check a requested host for an archetype.
-  nil → first of archetype.where. Denies (never raises) with
-  %{code: "host_not_allowed", message: names the host and the allowed set}
-  when host ∉ archetype.where, and %{code: "unknown_host", message: ...}
-  when host has no config entry.
+  nil → first of archetype.where. `where = ["*"]` grants ANYWHERE: any
+  configured host is allowed and nil resolves to "local" (an explicit grant
+  only — an empty where is an error at load, never a grant; law fails
+  closed). Denies (never raises) with %{code: "host_not_allowed", message:
+  names the host and the allowed set} when host ∉ archetype.where, and
+  %{code: "unknown_host", message: ...} when host has no config entry.
   """
   @spec resolve(Archetypes.t(), String.t() | nil, %{optional(String.t()) => host_config()}) ::
           {:ok, String.t()} | {:error, %{code: String.t(), message: String.t()}}
   def resolve(archetype, requested_host, hosts) do
-    host = requested_host || hd(archetype.where)
+    anywhere? = archetype.where == ["*"]
+    host = requested_host || if(anywhere?, do: "local", else: hd(archetype.where))
 
     cond do
-      host not in archetype.where ->
+      not anywhere? and host not in archetype.where ->
         {:error,
          %{
            code: "host_not_allowed",

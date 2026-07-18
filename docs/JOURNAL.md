@@ -393,3 +393,11 @@ heredoc shim correct; argv-only exec throughout. Gate outside sol's sandbox:
 tsc clean, 84/84 TS tests pass, help entry verified, dry-run smoke against
 a REAL remote (tars) emitted the exact command sequence. TS repo commit
 89c3063 (repo is local-only; no remote configured).
+
+## where wildcard (Fable)
+
+Per Flynn: `where = ["*"]` (alone) grants any CONFIGURED host; nil-host
+under "*" resolves to "local". Empty where remains a load error — law fails
+closed; in set logic an empty where is nowhere, and a typo must never be
+the most permissive value. "*" mixed with names rejected as incoherent.
+Spec §Placement amended.

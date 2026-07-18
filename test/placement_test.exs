@@ -200,4 +200,13 @@ defmodule Tightbeam.PlacementTest do
     Application.delete_env(:tightbeam, :hosts)
     assert Placement.hosts(base)["work-1"].ssh == "w2"
   end
+
+  test "where [\"*\"] grants any configured host; empty stays an error upstream" do
+    anywhere = %{name: "roamer", where: ["*"], defaults: %{}, references: [], guidance: nil}
+    hosts = %{"local" => %{ssh: nil, base_dir: "/b", cli_bin: nil}, "work-1" => %{ssh: "w", base_dir: "/b", cli_bin: nil}}
+
+    assert {:ok, "local"} = Placement.resolve(anywhere, nil, hosts)
+    assert {:ok, "work-1"} = Placement.resolve(anywhere, "work-1", hosts)
+    assert {:error, %{code: "unknown_host"}} = Placement.resolve(anywhere, "nope", hosts)
+  end
 end

@@ -9,8 +9,10 @@ defmodule Tightbeam.Archetypes do
   design needs and nothing else:
 
       name = "coder"
-      where = ["work-1", "work-2"]        # allowed host-set (§Placement).
+      where = ["work-1", "work-2"]      # allowed host-set (§Placement).
                                         # Optional; default ["local"].
+                                        # ["*"] alone = any configured host.
+                                        # Empty = error, never a grant.
 
       [defaults]                        # optional spawn defaults
       harness = "codex"                 # "claude" | "codex"
@@ -269,6 +271,14 @@ defmodule Tightbeam.Archetypes do
 
     unless is_list(where) and where != [] and Enum.all?(where, &is_binary/1) do
       raise ArgumentError, "archetype where must be a non-empty list of strings: #{path}"
+    end
+
+    # "anywhere" is an EXPLICIT grant, never an accident: ["*"] and nothing
+    # else. An empty list stays an error (law fails closed — in set logic an
+    # empty where is nowhere, and a typo must not be the most permissive
+    # value); "*" mixed with names is incoherent.
+    if "*" in where and where != ["*"] do
+      raise ArgumentError, ~s(archetype where: "*" must be the only element: #{path})
     end
 
     raw_defaults = Map.get(manifest, "defaults", %{})
