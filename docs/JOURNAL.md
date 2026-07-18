@@ -835,3 +835,15 @@ idempotency under operation "spawn" because the table CHECK didn't allow
 'wake' — a constraint-driven workaround where the spec's STOP-and-report
 rule should have fired; fixed properly (operation "wake" + CHECK widened
 via rename-rebuild migration). 130 tests.
+
+ROLES REGISTRY V1 shipped and live-verified. Two parallel sol lanes
+(Elixir high / TS CLI medium) against roles-registry-v1.md — first
+two-lane parallel dispatch; both green first pass, review found no
+defects (the invariants-first spec format works). Live arc on prod:
+role-create notetaker → wake while UNSTAFFED delivered to mike's Main
+with roleFallback=1 → role-bind to the codex session → wake again
+delivered to the office-holder with roleFallback=0; turn rows carry
+roleRef + resolution both times ("late-bind the future, pin the past"
+observed in the ledger). Bible gains the roles paragraph in §Primitives;
+handles subsumed (migration ran; empty — no handles existed in prod).
+138 Elixir tests, 14 CLI tests.
