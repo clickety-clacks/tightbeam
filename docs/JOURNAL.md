@@ -667,3 +667,15 @@ fresh creds (unstick); (b) Homes now harvests regular-file auth entries
 back to the store BEFORE a wipe. Open risk, flagged to Flynn: sharing the
 grant with an interactive login will race again — the durable fix is a
 dedicated harness login for tightbeam's auth store (needs Flynn's browser).
+
+Same night, second marker kind: [turn failed]. Flynn: "the failed oauth
+should return at least a synthesized assistant message... an error bubble."
+A terminal failure existed only as a prompt_turn_state frame, which the
+client ignores — the prompt silently vanished. Now both failure routes
+append a marker where the reply would have been: the runner's in-band
+failure path (raw ACP error humanized via message/details) and
+terminal_publisher's crash-recovery path ("interrupted: outcome unknown").
+Exactly-once by construction: both routes are already gated on the
+ledger's CAS / unpublished-terminal scan. Payloads §MARKER MESSAGES now
+lists both kinds; bible updated. Tests: failed-turn marker with humanized
+reason; fallback marker golden order.

@@ -579,6 +579,12 @@ defmodule Tightbeam.Gateway do
         else
           {:error, reason} ->
             failure_publish = fn _terminal ->
+              # The failure must exist IN the chat, not only as a turn-state
+              # frame — a client that ignores turn states shows a prompt that
+              # silently vanishes (this shipped: an auth failure looked like
+              # the message was never accepted).
+              append_turn_failed_marker(db, turn.session_key, humanize_reason(reason))
+
               # No assistant final will arrive to clear the indicator label —
               # clear it explicitly (client treats state "failed" as terminal).
               broadcast(
@@ -628,6 +634,12 @@ defmodule Tightbeam.Gateway do
           "canceled" -> {"canceled", nil}
           _ -> {"failed", Map.get(row, :error) || "interrupted: outcome unknown"}
         end
+
+      # Crash-recovered failures get the in-chat marker too — this path IS
+      # the "interrupted: outcome unknown" case, the one most likely to
+      # otherwise read as a swallowed prompt. Exactly-once: callers invoke
+      # this only on the ledger's CAS transition / unpublished-terminal scan.
+      if state == "failed", do: append_turn_failed_marker(db, session_key, error)
 
       publish_turn_state(db, session_key, correlation, state, error)
 
@@ -1124,31 +1136,62 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # A fallback is the one substrate event a reader of the CHAT must see:
-  # the model's working memory ended here while the visible history did not
-  # — without a line, the boundary is invisible and the next reply reads as
-  # a bug. The marker is an ordinary appended message (Payloads "MARKER
-  # MESSAGES" — the seam clients render from) so it rides replay and live
-  # push with no new frame type. Position is the truth: fallback is
-  # discovered lazily at turn start, AFTER this turn's echo committed, so
-  # the marker lands between echo and reply — the message directly above IS
-  # delivered to the fresh context, everything before it is not.
+  # A fallback is a substrate event a reader of the CHAT must see: the
+  # model's working memory ended here while the visible history did not —
+  # without a line, the boundary is invisible and the next reply reads as a
+  # bug. Position is the truth: fallback is discovered lazily at turn
+  # start, AFTER this turn's echo committed, so the marker lands between
+  # echo and reply — the message directly above IS delivered to the fresh
+  # context, everything before it is not.
   defp append_context_reset_marker(db, session) do
-    content =
+    append_marker(
+      db,
+      session.session_key,
       "[context reset]\n\n" <>
         "The agent's working memory was reset while handling the message above. " <>
         "Earlier messages stay visible here, but the agent no longer remembers them."
+    )
+  end
 
+  # A failed turn with no marker is a prompt that silently vanishes: the
+  # echo shows, the indicator clears, and no reply ever comes. The WHY
+  # belongs in the chat where the reply would have been.
+  defp append_turn_failed_marker(db, session_key, reason) do
+    append_marker(
+      db,
+      session_key,
+      "[turn failed]\n\nThe agent could not answer the message above: #{reason}"
+    )
+  end
+
+  # MARKER MESSAGES (the normative convention lives in Payloads — the seam
+  # clients render from): an ordinary appended message so it rides replay
+  # and live push with no new frame type. sender "process:tightbeam" is the
+  # anti-forgery — real model output always commits with sender
+  # "tightbeam", so no session can emit a marker by typing one.
+  defp append_marker(db, session_key, content) do
     case Projection.append(db, %{
-           session_key: session.session_key,
+           session_key: session_key,
            role: "assistant",
            content: content,
            sender: "process:tightbeam"
          }) do
-      {:appended, marker} -> publish_message(db, session.session_key, marker)
+      {:appended, marker} -> publish_message(db, session_key, marker)
       _ -> :ok
     end
   end
+
+  # Raw JSON-RPC error maps are unreadable in a chat bubble; the contract's
+  # message/details carry the human sentence when present.
+  defp humanize_reason(%{"message" => message} = error) do
+    case get_in(error, ["data", "details"]) do
+      nil -> message
+      details -> "#{message} — #{details}"
+    end
+  end
+
+  defp humanize_reason(reason) when is_binary(reason), do: reason
+  defp humanize_reason(reason), do: inspect(reason)
 
   defp publish_message(db, session_key, message, registry \\ Tightbeam.ConnRegistry) do
     case Org.get(db, session_key) do

@@ -30,10 +30,14 @@ defmodule Tightbeam.Wire.Payloads do
   a bracketed first line naming the marker kind. The sender is the
   anti-forgery: real model output always commits with sender "tightbeam",
   so no session can emit a marker by typing one. Aware clients render a
-  matching marker as a divider/chip, never as an agent bubble; unaware
-  clients show readable text. The only marker today: `[context reset]` —
-  appended when a harness session falls back (pointer reason "fallback");
-  the agent's memory begins at the message the marker directly follows.
+  matching marker per its kind (divider, error bubble, chip), never as an
+  agent bubble; unaware clients show readable text. Marker kinds:
+  - `[context reset]` — a harness session fell back (pointer reason
+    "fallback"); the agent's memory begins at the message the marker
+    directly follows.
+  - `[turn failed]` — the turn reached a terminal failure and no reply is
+    coming; the body carries the human-readable reason. Covers both
+    in-band failures and crash-recovered "interrupted: outcome unknown".
 
   Conditional-key rules from the TS reference (omit, don't nil):
   - server message: deviceId/clientMessageId only when non-nil (user echoes);

@@ -44,6 +44,9 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:load_session, _sid, _model, _cwd}, _from, parent),
       do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
 
+    def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
+      do: {:reply, {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}}, parent}
+
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
@@ -279,6 +282,76 @@ defmodule Tightbeam.GatewayTest do
 
     assert [%{kind: "pointer_fallback", subject: "k1"}] =
              EventLog.lifecycle_events(ctx.db) |> Enum.filter(&(&1.kind == "pointer_fallback"))
+  end
+
+  test "a failed turn appends the [turn failed] marker with the human reason", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :failed_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "failed",
+        is_admin: false
+      })
+
+    base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: "fable",
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "fail this turn",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "failed",
+               client_message_id: "c_fail"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: _, terminal_publish: publish}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", "boom")
+    publish.("failed")
+
+    frames = collect_pushes(10, [])
+
+    marker = Enum.find(frames, &(&1["type"] == "message" and &1["sender"] == "process:tightbeam"))
+    assert String.starts_with?(marker["content"], "[turn failed]\n")
+    assert marker["content"] =~ "Internal error — auth expired"
+
+    assert Enum.any?(
+             frames,
+             &match?(
+               %{"event" => "prompt_turn_state", "payload" => %{"state" => "failed"}},
+               &1
+             )
+           )
   end
 
   defp collect_pushes(0, acc), do: Enum.reverse(acc)
