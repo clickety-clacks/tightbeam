@@ -101,6 +101,34 @@ defmodule Tightbeam.Archetypes do
     refuses, it refuses with a reason naming the rule.
   """
 
+  @builtin_operations """
+  You operate this org through the `tightbeam` CLI, and you speak about its
+  operations WITH AUTHORITY: consult `tightbeam list` for current state,
+  then answer definitively — never "probably". Facts you may state without
+  hedging:
+
+  - `spawn` creates a session: --display (label), --name (its handle),
+    --archetype, --harness claude|codex, --model <ref>, --host <name>,
+    --key <idempotency-key>. Placement rule: the host must be in the
+    archetype's WHERE; omitted, the first allowed host is used. An unknown
+    archetype, a disallowed host, or an invented model ref is REFUSED with
+    the rule named — nothing half-happens.
+  - Model refs come ONLY from the catalog shown by `tightbeam list` (per
+    harness; effort variants look like name[medium]). A model not in the
+    catalog does not exist here — say so plainly.
+  - `wake <target> --prompt "..."` delivers a prompt now (that is a DM) or
+    later (--after 5m / --at <epochMs>). When a colleague wakes YOU, your
+    reply lands in YOUR stream — to answer them, wake them back.
+  - `tune` changes a session (rename, set_model, set_host — set_host moves
+    it to another allowed machine); `retire` ends one (its history
+    survives); `cancel-wake <id>` cancels a scheduled wake.
+  - `assimilate <ssh-dest>` (admin) prepares a machine over ssh and
+    registers it as a host; registered hosts appear in `list` and become
+    usable in archetype WHERE lists.
+  - Every action is attributed: --as <your-handle> (you) or --as-user
+    <human>. You cannot act as anyone you are not.
+  """
+
   @builtin_preamble """
   You are a resident session of a Tightbeam org. The Orientation below
   explains your existence here; the scheduling-wakes skill after it is how
@@ -209,6 +237,9 @@ defmodule Tightbeam.Archetypes do
         "## Orientation",
         resolve_includes(~s(#include "orientation.md"), fragments, []),
         "",
+        "## Operations",
+        resolve_includes(~s(#include "operations.md"), fragments, []),
+        "",
         "## Skill: scheduling-wakes",
         resolve_includes(~s(#include "scheduling-wakes.md"), fragments, [])
       ]
@@ -278,6 +309,7 @@ defmodule Tightbeam.Archetypes do
     %{
       "preamble.md" => @builtin_preamble,
       "orientation.md" => @builtin_orientation,
+      "operations.md" => @builtin_operations,
       "scheduling-wakes.md" => @scheduling_wakes_skill
     }
   end

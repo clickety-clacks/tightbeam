@@ -474,3 +474,20 @@ called-into-being POV: the agent doesn't live in Tightbeam — Tightbeam
 summoned it ("Between turns you are not running; you are woken. That is not
 a limitation. It is how you persist."). Guidance hash changes again →
 default homes regenerate on next adapter start.
+
+## Live-fire round 2 (Fable): typing-indicator progress + operational authority
+
+1. agent_progress frames (the client's existing AgentProgressEvent contract,
+   never sent by TS): the Adapter maps ACP session/updates to status lines
+   (thought chunk → "Thinking…", tool_call → its title) via pure
+   progress_status/1 (doctested), deduped on text change, relayed through a
+   per-turn progress fun into an owner-scoped broadcast with the turn's
+   correlation id — so the assistant final clears the label (client-side
+   contract), and failed turns clear it explicitly (state "failed"). Success
+   path emits no terminal frame: golden frame order unchanged.
+2. Operations fragment (builtin, overridable): authoritative ops facts —
+   spawn flags incl --host + the placement rule, catalog-only model refs,
+   wake/DM semantics incl reply-lands-in-your-stream, tune/retire/
+   cancel-wake, assimilate, attribution — prefixed with the norm: consult
+   list, then answer definitively, never "probably" (Flynn: agents must
+   speak with authority on tightbeam operations).

@@ -31,7 +31,7 @@ defmodule Tightbeam.Acp.Adapter do
     }
   }
 
-  defstruct [:conn, :preset, :cwd, chunks: %{}]
+  defstruct [:conn, :preset, :cwd, chunks: %{}, progress: %{}]
 
   ## Client
 
@@ -69,10 +69,36 @@ defmodule Tightbeam.Acp.Adapter do
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
   this GenServer keeps routing updates, replies when the harness finishes.
   """
-  @spec prompt(adapter(), String.t(), String.t(), timeout()) ::
+  @spec prompt(adapter(), String.t(), String.t(), timeout(), keyword()) ::
           {:ok, %{stop_reason: String.t(), text: String.t()}} | {:error, term()}
-  def prompt(adapter, session_id, text, timeout \\ 600_000),
-    do: GenServer.call(adapter, {:prompt, session_id, text}, timeout + 5_000)
+  def prompt(adapter, session_id, text, timeout \\ 600_000, opts \\ []),
+    do: GenServer.call(adapter, {:prompt, session_id, text, opts}, timeout + 5_000)
+
+  @doc """
+  Map one ACP session/update to a typing-indicator status line, or :skip.
+  Pure — the substrate relays what the harness reports; it never interprets.
+
+      iex> Tightbeam.Acp.Adapter.progress_status(%{"sessionUpdate" => "agent_thought_chunk"})
+      {:ok, "Thinking…"}
+
+      iex> Tightbeam.Acp.Adapter.progress_status(%{"sessionUpdate" => "tool_call", "title" => "Read config/runtime.exs"})
+      {:ok, "Read config/runtime.exs"}
+
+      iex> Tightbeam.Acp.Adapter.progress_status(%{"sessionUpdate" => "agent_message_chunk"})
+      :skip
+  """
+  @spec progress_status(map()) :: {:ok, String.t()} | :skip
+  def progress_status(%{"sessionUpdate" => "agent_thought_chunk"}), do: {:ok, "Thinking…"}
+
+  def progress_status(%{"sessionUpdate" => kind} = update)
+      when kind in ["tool_call", "tool_call_update"] do
+    case update["title"] || update["kind"] do
+      title when is_binary(title) and title != "" -> {:ok, title}
+      _ -> if kind == "tool_call", do: {:ok, "Using a tool"}, else: :skip
+    end
+  end
+
+  def progress_status(_update), do: :skip
 
   @doc "The underlying Acp.Conn (for pending_count / quiescence probes)."
   @spec conn(adapter()) :: pid()
@@ -129,8 +155,15 @@ defmodule Tightbeam.Acp.Adapter do
     {:reply, :ok, put_in(state.chunks[sid], [])}
   end
 
-  def handle_call({:prompt, sid, text}, from, state) do
+  def handle_call({:prompt, sid, text, opts}, from, state) do
     state = put_in(state.chunks[sid], [])
+    # Per-turn progress channel: {fun, last_status, seq}. Deduped on text so
+    # per-token thought chunks emit ONE "Thinking…" until something changes.
+    state =
+      case Keyword.get(opts, :progress) do
+        fun when is_function(fun, 2) -> put_in(state.progress[sid], {fun, nil, 0})
+        _ -> state
+      end
     # Fire the ACP prompt asynchronously so this GenServer keeps routing
     # session/update chunks while the turn runs.
     parent = self()
@@ -149,6 +182,7 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_info({:acp_notification, "session/update", params}, state) do
     sid = params["sessionId"]
     update = params["update"] || %{}
+    state = emit_progress(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
       text = get_in(update, ["content", "text"])
@@ -173,10 +207,24 @@ defmodule Tightbeam.Acp.Adapter do
       end
 
     GenServer.reply(from, reply)
+    state = %{state | progress: Map.delete(state.progress, sid)}
     {:noreply, put_in(state.chunks[sid], [])}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # Invoke the per-turn progress fun on status CHANGE only. The fun is fast
+  # by contract (an in-memory registry broadcast) — see PATTERNS on shared
+  # serializers; anything slower belongs to the turn, not here.
+  defp emit_progress(state, sid, update) do
+    with {fun, last, seq} <- Map.get(state.progress, sid),
+         {:ok, text} when text != last <- progress_status(update) do
+      fun.(text, seq + 1)
+      put_in(state.progress[sid], {fun, text, seq + 1})
+    else
+      _ -> state
+    end
+  end
 
   ## Model application (the fable-trap rule)
 

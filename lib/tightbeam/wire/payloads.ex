@@ -174,6 +174,26 @@ defmodule Tightbeam.Wire.Payloads do
   @spec sync_complete() :: payload()
   def sync_complete, do: %{"type" => "sync_complete"}
 
+  @doc """
+  Live turn progress for the typing indicator's label (client contract:
+  AgentProgressEvent — first non-empty of progressText/title/summary/name is
+  shown; messageId matching the turn's correlation lets the assistant final
+  clear it; a terminal `state` ("completed"/"failed") clears it explicitly).
+  `seq` is a per-turn monotonic counter for the client's stale-guard.
+  """
+  @spec agent_progress(String.t(), String.t(), pos_integer(), String.t(), String.t() | nil) ::
+          payload()
+  def agent_progress(session_key, message_id, seq, progress_text, state \\ nil) do
+    %{
+      "type" => "agent_progress",
+      "sessionKey" => session_key,
+      "messageId" => message_id,
+      "seq" => seq,
+      "progressText" => progress_text
+    }
+    |> put_if_present("state", state)
+  end
+
   defp put_if_present(map, _key, nil), do: map
   defp put_if_present(map, key, value), do: Map.put(map, key, value)
 end

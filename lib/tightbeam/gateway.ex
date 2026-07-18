@@ -494,7 +494,10 @@ defmodule Tightbeam.Gateway do
                checkout_adapter(session),
              {:ok, harness_session_id} <-
                harness_session(db, adapter, generation, session, turn.seq),
-             {:ok, result} <- Adapter.prompt(adapter, harness_session_id, turn.prompt) do
+             {:ok, result} <-
+               Adapter.prompt(adapter, harness_session_id, turn.prompt, 600_000,
+                 progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
+               ) do
           case Projection.append(db, %{
                  session_key: turn.session_key,
                  role: "assistant",
@@ -511,6 +514,14 @@ defmodule Tightbeam.Gateway do
         else
           {:error, reason} ->
             failure_publish = fn _terminal ->
+              # No assistant final will arrive to clear the indicator label —
+              # clear it explicitly (client treats state "failed" as terminal).
+              broadcast(
+                db,
+                session.owner_user_id,
+                Payloads.agent_progress(turn.session_key, correlation, 1_000_000, "", "failed")
+              )
+
               publish_turn_state(db, turn.session_key, correlation, "failed", inspect(reason))
 
               broadcast(
@@ -534,6 +545,15 @@ defmodule Tightbeam.Gateway do
         end
 
       outcome
+    end
+  end
+
+  # Live progress for the typing indicator: relayed from ACP updates
+  # (thoughts, tool calls) as agent_progress frames. Runs IN the adapter
+  # process — an in-memory registry broadcast, bounded by contract.
+  defp progress_fun(db, session_key, owner, correlation) do
+    fn text, seq ->
+      broadcast(db, owner, Payloads.agent_progress(session_key, correlation, seq, text))
     end
   end
 

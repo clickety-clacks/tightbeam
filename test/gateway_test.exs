@@ -39,7 +39,7 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:new_session, _model}, _from, parent),
       do: {:reply, {:ok, "harness-1"}, parent}
 
-    def handle_call({:prompt, _sid, prompt}, from, parent) do
+    def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
       receive do: (:continue_prompt ->
