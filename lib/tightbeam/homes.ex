@@ -26,12 +26,14 @@ defmodule Tightbeam.Homes do
 
   @typedoc """
   A structured harness-home projection input. `skills` is the archetype's
-  election resolved to library sources; `mode` decides the projection form —
-  :link (a symlink into the library: local homes, so a skill edit updates
-  every electing agent live) or :copy (a materialized copy: staged homes
-  bound for rsync to a satellite, where a symlink would dangle).
+  election; every entry projects the same way — a symlink at
+  `skills/<name>` pointing at `link_to`, the electing HOST's library
+  replica (local library for local homes; the satellite's replica path for
+  staged homes — dangling in staging by design, valid on arrival). One
+  mode everywhere: content updates flow through the replica, never through
+  home regeneration.
   """
-  @type skill_ref :: %{name: String.t(), source: String.t(), mode: :link | :copy}
+  @type skill_ref :: %{name: String.t(), link_to: String.t()}
   @type spec :: %{
           required(:harness) => :claude | :codex,
           required(:archetype) => String.t(),
@@ -92,30 +94,28 @@ defmodule Tightbeam.Homes do
     }
   end
 
-  # Skills project OUTSIDE the hash gate on every call: :link entries are
-  # idempotent symlinks into the library (content lives there — editing a
-  # skill updates every electing home live, which is exactly why content is
-  # not in the manifest hash); :copy entries are refreshed each projection
-  # so staged homes carry the current library state to rsync.
+  # Skills project OUTSIDE the hash gate on every call: idempotent symlinks
+  # into the host's library replica (content lives there — editing a skill
+  # updates every electing home live, which is exactly why content is not
+  # in the manifest hash). A wrong-target or non-link entry is replaced —
+  # the skills dir is substrate-managed, and re-pointing is how a home
+  # follows a moved replica.
   defp project_skills(_home_path, []), do: :ok
 
   defp project_skills(home_path, skills) do
     skills_root = Path.join(home_path, "skills")
     File.mkdir_p!(skills_root)
 
-    for %{name: name, source: source, mode: mode} <- skills do
+    for %{name: name, link_to: link_to} <- skills do
       target = Path.join(skills_root, name)
 
-      case mode do
-        :link ->
-          case File.lstat(target) do
-            {:error, :enoent} -> File.ln_s!(source, target)
-            _ -> :ok
-          end
+      case File.read_link(target) do
+        {:ok, ^link_to} ->
+          :ok
 
-        :copy ->
+        _ ->
           File.rm_rf!(target)
-          File.cp_r!(source, target)
+          File.ln_s!(link_to, target)
       end
     end
 
@@ -175,7 +175,7 @@ defmodule Tightbeam.Homes do
     skills =
       spec
       |> Map.get(:skills, [])
-      |> Enum.map(&[&1.name, 0, Atom.to_string(&1.mode), 0])
+      |> Enum.map(&[&1.name, 0])
       |> Enum.sort()
 
     :crypto.hash(:sha256, [Atom.to_string(spec.harness), 0, spec.guidance, 0, extra, 0, skills])

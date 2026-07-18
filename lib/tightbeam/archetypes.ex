@@ -308,6 +308,13 @@ defmodule Tightbeam.Archetypes do
     Map.get(archetypes, name)
   end
 
+  @doc "The loaded archetype map (name => archetype)."
+  @spec all() :: %{optional(String.t()) => t()}
+  def all do
+    {archetypes, _fragments} = :persistent_term.get(@persist_key)
+    archetypes
+  end
+
   @doc "All loaded archetype names."
   @spec names() :: [String.t()]
   def names do
@@ -429,6 +436,98 @@ defmodule Tightbeam.Archetypes do
   @doc "Built-in skill names — the default election when a manifest names none."
   @spec builtin_skill_names() :: [String.t()]
   def builtin_skill_names, do: @builtin_skills |> Map.keys() |> Enum.sort()
+
+  @doc """
+  Library CRUD (the skill verbs' engine — mutation reaches here only
+  through the chokepoint). `name` is a relative path of plain segments:
+  a top-level name is a one-shot skill or a tree ROOT; a nested path
+  ("swift/concurrency") is a technique inside a subject tree. Only roots
+  are electable (election is atomic at the root — electing a subject takes
+  the whole tree); writing inside a tree is a content edit, visible to
+  every electing agent through the replica links, never a regeneration.
+  """
+  @spec put_skill!(String.t(), String.t(), String.t()) :: String.t()
+  def put_skill!(base_dir, name, content) do
+    path = Path.join([skills_dir(base_dir), validate_skill_path!(name), "SKILL.md"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, content)
+    path
+  end
+
+  @doc """
+  Remove a skill (or tree node). Refused when `name` is a top-level root
+  some archetype elects — election is a live dependency, and law fails
+  closed; retire the election first. Pruning INSIDE an elected tree is a
+  content edit and allowed.
+  """
+  @spec rm_skill(String.t(), String.t()) :: :ok | {:error, %{code: String.t(), message: String.t()}}
+  def rm_skill(base_dir, name) do
+    relative = validate_skill_path!(name)
+
+    electors =
+      if relative =~ "/" do
+        []
+      else
+        for {arch_name, archetype} <- all(), relative in archetype.skills, do: arch_name
+      end
+
+    case electors do
+      [] ->
+        File.rm_rf!(Path.join(skills_dir(base_dir), relative))
+        :ok
+
+      names ->
+        {:error,
+         %{
+           code: "skill_elected",
+           message:
+             "skill #{relative} is elected by: #{names |> Enum.sort() |> Enum.join(", ")} — retire the election first"
+         }}
+    end
+  end
+
+  @doc "Walk the library: every SKILL.md as %{name, root, elected_by (roots only)}."
+  @spec list_skills(String.t()) :: [%{name: String.t(), root: boolean(), elected_by: [String.t()]}]
+  def list_skills(base_dir) do
+    dir = skills_dir(base_dir)
+    archetypes = all()
+
+    dir
+    |> Path.join("**/SKILL.md")
+    |> Path.wildcard()
+    |> Enum.map(fn path ->
+      name = path |> Path.dirname() |> Path.relative_to(dir)
+      root = not (name =~ "/")
+
+      %{
+        name: name,
+        root: root,
+        elected_by:
+          if(root,
+            do: for({arch_name, a} <- archetypes, name in a.skills, do: arch_name) |> Enum.sort(),
+            else: []
+          )
+      }
+    end)
+    |> Enum.sort_by(& &1.name)
+  end
+
+  # A skill path is dumb data with teeth: plain relative segments only —
+  # no traversal, no absolutes, no hidden files (the library is reachable
+  # by ssh-wrapped rsync; a crafted name must not escape it).
+  defp validate_skill_path!(name) do
+    segments = String.split(name, "/")
+
+    valid? =
+      segments != [] and
+        Enum.all?(segments, fn seg ->
+          seg != "" and seg != "." and seg != ".." and not String.starts_with?(seg, ".") and
+            seg =~ ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
+        end)
+
+    unless valid?, do: raise(ArgumentError, "invalid skill name: #{inspect(name)}")
+    Enum.join(segments, "/")
+  end
 
   @doc "The built-in default archetype (used when no manifest overrides it)."
   @spec builtin_default() :: t()

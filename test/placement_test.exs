@@ -159,7 +159,7 @@ defmodule Tightbeam.PlacementTest do
              "/remote/tb/homes/default/codex"
 
     commands = collect_commands([])
-    assert [stamp, wipe, rsync, auth] = commands
+    assert [stamp, wipe, rsync, lib_mkdir, lib_rsync, auth] = commands
     assert stamp == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "cat", "/remote/tb/homes/default/codex/.tightbeam-manifest"]
 
     assert wipe == [
@@ -188,6 +188,30 @@ defmodule Tightbeam.PlacementTest do
            ]
 
     refute "--delete" in rsync
+
+    # Library replica catch-up: the satellite's replica receives every
+    # elected skill so the staged home's links resolve on arrival.
+    assert lib_mkdir == [
+             "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
+             "worker",
+             "mkdir",
+             "-p",
+             "/remote/tb/identity/skills"
+           ]
+
+    assert lib_rsync == [
+             "rsync",
+             "-a",
+             "-e",
+             "ssh -o BatchMode=yes -o ConnectTimeout=5",
+             Path.join([base_dir, "identity", "skills", "tightbeam-assimilate"]),
+             "worker:/remote/tb/identity/skills/"
+           ]
+
     assert Enum.take(auth, 8) == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "sh", "-c"]
     assert List.last(auth) =~ "/remote/tb/auth/codex\"/*"
     assert List.last(auth) =~ "ln -s"
@@ -195,9 +219,12 @@ defmodule Tightbeam.PlacementTest do
     staged_home = Path.join([base_dir, "staging", "worker", "homes", "default", "codex"])
     assert Enum.sort(File.ls!(staged_home)) == [".tightbeam-manifest", "AGENTS.md", "skills"]
 
+    # The staged link dangles HERE and resolves on the satellite — it
+    # points into the satellite's replica, not the gateway's library.
     assert staged_home
-           |> Path.join("skills/tightbeam-assimilate/SKILL.md")
-           |> File.read!() =~ "name: tightbeam-assimilate"
+           |> Path.join("skills/tightbeam-assimilate")
+           |> File.read_link!() == "/remote/tb/identity/skills/tightbeam-assimilate"
+
     refute File.exists?(Path.join(staged_home, "auth.json"))
   end
 
@@ -207,6 +234,40 @@ defmodule Tightbeam.PlacementTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  test "push_skill syncs every remote replica and degrades per host", %{base_dir: base_dir} do
+    Application.put_env(:tightbeam, :hosts, %{
+      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil},
+      "flaky" => %{ssh: "flaky", base_dir: "/r2", cli_bin: nil}
+    })
+
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+      if Enum.at(command, 5) == "flaky" or List.last(command) =~ "flaky:",
+        do: {"boom", 255},
+        else: {"", 0}
+    end
+
+    config = %{base_dir: base_dir}
+    results = Placement.push_skill(config, "swift", :put, sh: sh)
+    assert results["worker"] == "ok"
+    assert results["flaky"] =~ "error"
+
+    assert Placement.push_skill(config, "swift", :rm, sh: sh)["worker"] == "ok"
+
+    commands = collect_commands([])
+
+    assert Enum.any?(commands, fn c ->
+             "rsync" in c and List.last(c) == "worker:/remote/tb/identity/skills/" and
+               "--delete" in c
+           end)
+
+    assert Enum.any?(commands, fn c ->
+             "rm" in c and List.last(c) == "/remote/tb/identity/skills/swift"
+           end)
   end
 
   test "hosts.json registry merges under env config and register_host records", %{} do

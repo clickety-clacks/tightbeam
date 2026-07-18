@@ -290,6 +290,56 @@ defmodule Tightbeam.Placement do
   defp harness_token_env(_base_dir, _harness), do: []
 
   @doc """
+  Push one library root (a one-shot skill or a whole subject tree) to every
+  REMOTE host's replica — the propagation half of the skill verbs. Per-host
+  results, never a raise: an unreachable host is a visible degradation
+  ("error: ..."), healed by the catch-up sync at its next home delivery.
+  For a removal the push is an rm -rf of the replica path.
+  """
+  @spec push_skill(map(), String.t(), :put | :rm, keyword()) :: %{
+          optional(String.t()) => String.t()
+        }
+  def push_skill(config, root, action, opts \\ []) do
+    sh = Keyword.get(opts, :sh, &system_cmd/1)
+
+    for {name, host_config} <- hosts(config.base_dir), host_config.ssh != nil, into: %{} do
+      remote_library = Archetypes.skills_dir(host_config.base_dir)
+
+      result =
+        try do
+          case action do
+            :put ->
+              run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "mkdir", "-p", remote_library])
+
+              run!(sh, [
+                "rsync",
+                "-a",
+                "--delete",
+                "-e",
+                Enum.join(["ssh" | @ssh_opts], " "),
+                Path.join(Archetypes.skills_dir(config.base_dir), root),
+                "#{host_config.ssh}:#{remote_library}/"
+              ])
+
+            :rm ->
+              run!(sh, ["ssh" | @ssh_opts] ++ [
+                host_config.ssh,
+                "rm",
+                "-rf",
+                Path.join(remote_library, root)
+              ])
+          end
+
+          "ok"
+        rescue
+          e -> "error: #{Exception.message(e)}"
+        end
+
+      {name, result}
+    end
+  end
+
+  @doc """
   Materialize the home for an adapter key on its host per the moduledoc.
   Returns the home path AS SEEN BY THE ADAPTER PROCESS (local path for
   local, remote path for remote). opts: :sh (injectable runner,
@@ -301,10 +351,11 @@ defmodule Tightbeam.Placement do
 
     host_config = Map.fetch!(hosts(config.base_dir), host)
 
-    skills = fn mode ->
-      Enum.map(archetype.skills, fn name ->
-        %{name: name, source: Path.join(Archetypes.skills_dir(config.base_dir), name), mode: mode}
-      end)
+    # Homes symlink into their HOST's library replica — the gateway's
+    # library locally, the satellite's replica remotely (the staged link
+    # dangles here and resolves there; delivery syncs the replica below).
+    skills = fn library_dir ->
+      Enum.map(archetype.skills, fn name -> %{name: name, link_to: Path.join(library_dir, name)} end)
     end
 
     spec = %{
@@ -314,10 +365,14 @@ defmodule Tightbeam.Placement do
     }
 
     if host_config.ssh == nil do
-      Homes.project(config.base_dir, Map.put(spec, :skills, skills.(:link))).home_path
+      local_skills = skills.(Archetypes.skills_dir(config.base_dir))
+      Homes.project(config.base_dir, Map.put(spec, :skills, local_skills)).home_path
     else
       stage_base = Path.join([config.base_dir, "staging", host])
-      staged_home = Homes.project(stage_base, Map.put(spec, :skills, skills.(:copy))).home_path
+      remote_library = Archetypes.skills_dir(host_config.base_dir)
+
+      staged_home =
+        Homes.project(stage_base, Map.put(spec, :skills, skills.(remote_library))).home_path
 
       remote_home =
         Path.join([host_config.base_dir, "homes", archetype_name, Atom.to_string(harness)])
@@ -352,6 +407,24 @@ defmodule Tightbeam.Placement do
         staged_home <> "/",
         "#{host_config.ssh}:#{remote_home}/"
       ])
+
+      # Library replica catch-up: the staged home's skill links point into
+      # the satellite's replica; delivery makes them resolve even for a
+      # host that missed a skill-put push (degrade heals at next delivery).
+      if archetype.skills != [] do
+        run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "mkdir", "-p", remote_library])
+
+        for name <- archetype.skills do
+          run!(sh, [
+            "rsync",
+            "-a",
+            "-e",
+            Enum.join(["ssh" | @ssh_opts], " "),
+            Path.join(Archetypes.skills_dir(config.base_dir), name),
+            "#{host_config.ssh}:#{remote_library}/"
+          ])
+        end
+      end
 
       auth_dir = Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
 

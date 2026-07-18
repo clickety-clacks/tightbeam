@@ -96,6 +96,48 @@ defmodule Tightbeam.ArchetypesTest do
     assert Archetypes.load!(ctx.base_dir)["coder"].skills == ["deploy"]
   end
 
+  test "skill CRUD: trees nest, roots are electable units, elected roots refuse removal", ctx do
+    Archetypes.load!(ctx.base_dir)
+
+    # A subject tree: parent manifest + nested technique.
+    Archetypes.put_skill!(ctx.base_dir, "swift", "# Swift\nIndex: see concurrency/SKILL.md")
+    Archetypes.put_skill!(ctx.base_dir, "swift/concurrency", "# Concurrency")
+
+    names = ctx.base_dir |> Archetypes.list_skills() |> Enum.map(&{&1.name, &1.root})
+    assert {"swift", true} in names
+    assert {"swift/concurrency", false} in names
+
+    # Nested nodes are not electable: election is atomic at the root.
+    File.write!(Path.join(ctx.manifests, "coder.toml"), """
+    name = "coder"
+    skills = ["swift/concurrency"]
+    """)
+
+    assert_raise ArgumentError, ~r/elects unknown skills: swift\/concurrency/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end
+
+    File.write!(Path.join(ctx.manifests, "coder.toml"), """
+    name = "coder"
+    skills = ["swift"]
+    """)
+
+    Archetypes.load!(ctx.base_dir)
+
+    # An elected root refuses removal; pruning inside its tree is an edit.
+    assert {:error, %{code: "skill_elected", message: message}} =
+             Archetypes.rm_skill(ctx.base_dir, "swift")
+
+    assert message =~ "coder"
+    assert :ok = Archetypes.rm_skill(ctx.base_dir, "swift/concurrency")
+    refute File.exists?(Path.join(Archetypes.skills_dir(ctx.base_dir), "swift/concurrency"))
+
+    # Traversal never escapes the library.
+    assert_raise ArgumentError, ~r/invalid skill name/, fn ->
+      Archetypes.put_skill!(ctx.base_dir, "../escape", "nope")
+    end
+  end
+
   test "unknown top-level keys raise", ctx do
     File.write!(Path.join(ctx.manifests, "bad.toml"), "name = \"bad\"\nware = [\"local\"]\n")
 

@@ -279,6 +279,31 @@ defmodule Tightbeam.Gateway do
 
           %{host: p.name, config: entry}
         end),
+      "skill-put" =>
+        admin_handler(db, fn p ->
+          # Library mutation through the chokepoint (identity is law; law
+          # changes are audited verb rows). Push-on-write: every remote
+          # replica syncs now; a host that misses it heals at delivery.
+          path = Archetypes.put_skill!(config.base_dir, p.name, Map.fetch!(p, :content))
+          root = p.name |> String.split("/") |> hd()
+          %{skill: p.name, path: path, pushed: Placement.push_skill(config, root, :put)}
+        end),
+      "skill-rm" =>
+        admin_handler(db, fn p ->
+          case Archetypes.rm_skill(config.base_dir, p.name) do
+            :ok ->
+              root = p.name |> String.split("/") |> hd()
+              action = if p.name == root, do: :rm, else: :put
+              %{removed: p.name, pushed: Placement.push_skill(config, root, action)}
+
+            {:error, denial} ->
+              denial
+          end
+        end),
+      "skill-list" =>
+        admin_handler(db, fn _p ->
+          %{skills: Archetypes.list_skills(config.base_dir)}
+        end),
       "promote-user" =>
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}

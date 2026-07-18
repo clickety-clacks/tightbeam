@@ -706,3 +706,16 @@ staged homes for satellites. Election is in the manifest hash; content is
 not. Composed guidance now carries only a one-line Operations pointer at
 the skill. Tests: election validation, materialization precedence, link
 live-update with stamp intact, copy refresh, election-change regeneration.
+
+Continued: skill trees + replicated library + skill verbs (Flynn design
+session). Trees are a CONVENTION carried by existing mechanism — subject
+dir, root SKILL.md as routing manifest, techniques nested; election atomic
+at roots (nested names simply don't exist as electable). Killed the
+link-vs-copy special case: every host now holds a library replica at
+identity/skills/, homes always symlink into their OWN host's replica
+(staged links dangle by design, resolve on arrival), and deliver_home
+syncs elected roots to the satellite replica as catch-up. New chokepoint
+surface: skill-put / skill-rm / skill-list verbs (admin, audited) + CLI
+`tightbeam skill ...`; put pushes all remote replicas immediately
+(--delete rsync so tree prunes propagate), rm refuses elected roots,
+per-host push results degrade visibly instead of raising. 106 tests.
