@@ -1362,6 +1362,15 @@ defmodule Tightbeam.Gateway do
 
       true ->
         case Org.get(db, call.session_key) do
+          # A Main is every role's fallback and every user reference's
+          # resolution target: retiring one would open the void invariant 1
+          # forbids. Mains are permanent by construction, not by vigilance.
+          %{owner_user_id: ^owner, is_built_in: true} ->
+            %{
+              code: "denied",
+              message: "main sessions are permanent — they are the fallback for roles and user references"
+            }
+
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
               Org.retire(db, session.session_key)

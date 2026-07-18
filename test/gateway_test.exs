@@ -122,6 +122,34 @@ defmodule Tightbeam.GatewayTest do
     %{db: db, registry: registry, lane: lane}
   end
 
+  test "retire refuses built-in mains — the fallback target is permanent", ctx do
+    Org.create(ctx.db, %{
+      session_key: Org.personal_session_key("flynn"),
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable"
+    })
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: System.tmp_dir!(), default_harness: :claude, default_model: "fable", max_live_sessions_per_user: 5})
+
+    assert %{code: "denied", message: message} =
+             handlers["retire"].(%{
+               origin: "user:flynn",
+               session_key: Org.personal_session_key("flynn"),
+               params: %{}
+             })
+
+    assert message =~ "permanent"
+    assert Org.get(ctx.db, Org.personal_session_key("flynn")).state == "active"
+  end
+
   test "children preserves the cli token while refreshing the gateway port", ctx do
     base_dir = Path.join(System.tmp_dir!(), "gateway_token_#{System.unique_integer([:positive])}")
     config = gateway_config(base_dir, ctx.db, 4_321)

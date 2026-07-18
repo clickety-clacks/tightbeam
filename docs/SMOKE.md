@@ -233,3 +233,46 @@ the tool call, with the statute text delivered only as the denial reason.
     creds): after step 17, deliver a home to the satellite (adapter boot
     there) and repeat steps 18–19 on the satellite's projected home.
     PASS: identical behavior — the staged `settings.json` rode rsync.
+
+## 10. Roles (offices: typed targets, binding, fallback, late binding)
+
+Roles are substrate-level — run once per harness leg (bind to that leg's
+session where a binding is called for). ⌥ all steps are CLI/dispatch.
+
+24. Typed grammar: `wake user:<admin>` lands in the admin's Main;
+    `wake <admin-bare-word>` FAILS with "unknown role" (bare words are
+    role-typed, never user-typed); `wake agent:garbage` fails with
+    "unknown target" WITHOUT falling through to role lookup.
+    PASS: all three behave exactly so.
+25. Unstaffed office: `role create probe-office`, then `wake probe-office`.
+    PASS: message lands in the role OWNER's Main; the turn row has
+    roleRef='probe-office' AND roleFallback=1. DB is the check — fallback
+    is recorded, never disguised.
+26. Staffed office: `role bind probe-office <sessionKey of this leg's
+    smoke session>`, wake again.
+    PASS: delivered to the bound session; turn row roleFallback=0.
+27. Late binding: `wake probe-office --after 30s`, then IMMEDIATELY
+    `role bind probe-office <a different session>`. Wait for fire.
+    PASS: delivered to the NEW binding (the one at fire time, not at
+    schedule time); turn row records the role and the new key.
+28. Reply spelling round trip: from the bound session, have the agent
+    reply to a role-stamped message per its Comms guidance.
+    PASS: the agent wakes the bare role name (stripping `agent:`), and
+    for a user-stamped message uses `user:<id>` verbatim — no 404s.
+29. Deleted office: `role rm probe-office`, then `wake probe-office`.
+    PASS: named error ("unknown role: probe-office") — the name errors by
+    name, never silently reroutes. A wake SCHEDULED before the rm and
+    firing after it produces a `wake_unresolved` lifecycle row and no
+    delivery.
+30. Permanence of Mains: attempt `retire <admin's Main key>`.
+    PASS: refused with "main sessions are permanent" — the fallback
+    target cannot be destroyed; Main remains active.
+31. Spawn sugar atomicity: `spawn --display X --name probe-office` while
+    that role still exists.
+    PASS: the spawn FAILS with role_exists and NO session row was
+    created. Then with a fresh name: session + role both exist, role
+    bound to the new session.
+32. Acting-as requires the office: `wake <target> --as probe-office` from
+    a context where the role is unbound.
+    PASS: refused ("unknown or unbound role"); after binding, the same
+    call succeeds and the delivered stamp reads `[from agent:probe-office]`.

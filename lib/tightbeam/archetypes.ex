@@ -320,9 +320,11 @@ defmodule Tightbeam.Archetypes do
     the same standing — read and act regardless of class; "automated" is
     never grounds to skim or skip.
   - Reply semantics: your turn's output lands in YOUR stream, always. To
-    answer a user: or agent: sender, wake the stamped origin back — a
-    deliberate act, never an automatic echo; reply only when you have
-    something to say. A process cannot be woken back: for process-stamped
+    answer a sender, wake them back — a deliberate act, never an automatic
+    echo; reply only when you have something to say. The reply SPELLING
+    differs by class: `[from user:mike]` → wake `user:mike` (verbatim);
+    `[from agent:notetaker]` → wake `notetaker` (STRIP the `agent:` class
+    prefix — the bare word is the role; the full stamp is not a target). A process cannot be woken back: for process-stamped
     messages, your visible reply and your ACTIONS are the response. A stamp
     bearing your own role is your earlier self following up: act, don't
     reply.
