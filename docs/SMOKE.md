@@ -89,7 +89,10 @@ once: a `/new` that died pre-model with `Session not found`).
 13. `/model` — PASS: completes as above. Then change the model for real via
     the client's picker (session-status → set_model; ⌥ POST
     /api/session-control `set_model`). PASS: `GET /api/session-status`
-    shows the new ref; next turn still completes.
+    shows the new ref; next turn still completes; AND the client's model
+    FOOTER populates (this asserts the Swift decode contract, which raw
+    JSON checks miss — a missing required field like sessionKey fails the
+    whole decode and the footer silently never fills).
 
 ## 7. Restart resilience (deploy semantics)
 
