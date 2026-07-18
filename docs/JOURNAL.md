@@ -446,3 +446,20 @@ TS discrepancy: Plug's multipart limit counts multipart headers and fields,
 where Busboy's `fileSize` limit counts only file bytes. The parser therefore
 gets Busboy's default 1,000,000-byte non-file allowance beyond the 32 MiB file
 cap, and the parsed `Plug.Upload` file itself is checked against exactly 32 MiB.
+
+## Live-fire feedback round 1 (Fable) — discovery + orientation
+
+First real resident conversation (Flynn ↔ fable on the BEAM gateway)
+surfaced three deficits, all confirmed against code:
+1. inspect exposed sessions+wakes but not the ORG SHAPE — agents could not
+   discover archetypes (or their WHERE), known hosts, or valid model refs,
+   so the resident guessed a nonexistent model. inspect now returns
+   archetypes/hosts/models ("discovery beats documentation"); the CLI's
+   list renders them via its JSON passthrough.
+2. CLI spawn had no --host though the verb supports it. Added + help.
+3. Guidance taught operation, not orientation. New built-in overridable
+   fragment orientation.md ("## Orientation" section in every home): what
+   the substrate is, the nouns, discovery-first/never-guess-model-refs,
+   placement, refusals-name-rules. NOTE: this changes the default manifest
+   hash → homes regenerate on next adapter start (identity change wipes
+   nested harness session state by design).

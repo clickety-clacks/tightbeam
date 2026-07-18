@@ -275,7 +275,7 @@ defmodule Tightbeam.Gateway do
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
-      "inspect" => fn call -> inspect_result(db, call) end,
+      "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
       "tune" => fn call -> tune_result(config, db, call) end,
@@ -659,7 +659,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp inspect_result(db, call) do
+  defp inspect_result(config, db, call) do
     case resolve_caller(db, call.origin) do
       nil ->
         %{code: "unknown_caller"}
@@ -668,6 +668,20 @@ defmodule Tightbeam.Gateway do
         sessions = Org.list_for_user(db, caller.owner_user_id, false)
         keys = MapSet.new(sessions, & &1.session_key)
         wakes = Wakes.list_pending(db) |> Enum.filter(&MapSet.member?(keys, &1.session_key))
+
+        # Discovery beats documentation: the org's SHAPE — what archetypes
+        # exist (and their WHERE), what hosts are known, what model refs are
+        # valid — is not a secret from its members. Without this, agents
+        # guess (and guess model names wrong).
+        org_shape = %{
+          archetypes:
+            Enum.map(Archetypes.names(), fn name ->
+              a = Archetypes.get(name)
+              %{name: a.name, where: a.where, defaults: a.defaults}
+            end),
+          hosts: config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
+          models: @model_catalog
+        }
 
         result = %{
           sessions:
@@ -685,7 +699,10 @@ defmodule Tightbeam.Gateway do
                 :state
               ])
             ),
-          wakes: wakes
+          wakes: wakes,
+          archetypes: org_shape.archetypes,
+          hosts: org_shape.hosts,
+          models: org_shape.models
         }
 
         if admin_origin?(db, call.origin) do

@@ -72,6 +72,27 @@ defmodule Tightbeam.Archetypes do
           guidance: String.t() | nil
         }
 
+  @builtin_orientation """
+  Tightbeam is the substrate you live in: it delivers your turns, holds your
+  mailbox, and connects you to the rest of the org. You are a durable SESSION
+  with an address; other sessions are colleagues, not subprocesses.
+
+  - Nouns: a session (you — it may carry a handle like coder:x); an archetype
+    (an identity template: guidance, skills, defaults, and WHERE — the hosts
+    its sessions may run on); a wake (a prompt delivered to a session — the
+    DM and the scheduling primitive, one mechanism); the operator (the human
+    admin).
+  - Discovery first, guessing never: `tightbeam list` shows the sessions you
+    can address AND the org's shape — archetypes with their WHERE, the known
+    hosts, and the valid model catalog per harness. Use model refs from the
+    catalog verbatim; never invent one.
+  - Placement: which machine a session runs on is chosen from its archetype's
+    WHERE at spawn (`--host` requests one within that set). Machines are
+    workplaces; identity, mailbox, and chat history live in the substrate and
+    survive any machine.
+  - Anything the substrate refuses, it refuses with a reason naming the rule.
+  """
+
   @builtin_preamble """
   You are an agent in a Tightbeam dark factory. You can talk to other
   sessions and schedule your own follow-ups with the `tightbeam` CLI.
@@ -177,6 +198,9 @@ defmodule Tightbeam.Archetypes do
         "",
         resolve_includes(~s(#include "preamble.md"), fragments, []),
         "",
+        "## Orientation",
+        resolve_includes(~s(#include "orientation.md"), fragments, []),
+        "",
         "## Skill: scheduling-wakes",
         resolve_includes(~s(#include "scheduling-wakes.md"), fragments, [])
       ]
@@ -245,6 +269,7 @@ defmodule Tightbeam.Archetypes do
   defp builtin_fragments do
     %{
       "preamble.md" => @builtin_preamble,
+      "orientation.md" => @builtin_orientation,
       "scheduling-wakes.md" => @scheduling_wakes_skill
     }
   end

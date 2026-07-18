@@ -110,6 +110,26 @@ defmodule Tightbeam.ArchetypesTest do
       sessions and schedule your own follow-ups with the `tightbeam` CLI.
       See the scheduling-wakes skill below.
 
+      ## Orientation
+      Tightbeam is the substrate you live in: it delivers your turns, holds your
+      mailbox, and connects you to the rest of the org. You are a durable SESSION
+      with an address; other sessions are colleagues, not subprocesses.
+
+      - Nouns: a session (you — it may carry a handle like coder:x); an archetype
+        (an identity template: guidance, skills, defaults, and WHERE — the hosts
+        its sessions may run on); a wake (a prompt delivered to a session — the
+        DM and the scheduling primitive, one mechanism); the operator (the human
+        admin).
+      - Discovery first, guessing never: `tightbeam list` shows the sessions you
+        can address AND the org's shape — archetypes with their WHERE, the known
+        hosts, and the valid model catalog per harness. Use model refs from the
+        catalog verbatim; never invent one.
+      - Placement: which machine a session runs on is chosen from its archetype's
+        WHERE at spawn (`--host` requests one within that set). Machines are
+        workplaces; identity, mailbox, and chat history live in the substrate and
+        survive any machine.
+      - Anything the substrate refuses, it refuses with a reason naming the rule.
+
       ## Skill: scheduling-wakes
       Use the `tightbeam` CLI to coordinate with other sessions. Run
       `tightbeam help` any time for full, authoritative usage of every command and
