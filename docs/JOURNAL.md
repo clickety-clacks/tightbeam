@@ -719,3 +719,12 @@ surface: skill-put / skill-rm / skill-list verbs (admin, audited) + CLI
 `tightbeam skill ...`; put pushes all remote replicas immediately
 (--delete rsync so tree prunes propagate), rm refuses elected roots,
 per-host push results degrade visibly instead of raising. 106 tests.
+
+Flynn: "this skill api has a skill for its operation?" — it didn't; now it
+does. Second builtin: tightbeam-skills (the skill about skills) — library
+shapes, tree-authoring convention (parent routes, never teaches),
+verbs/CLI, propagation semantics (immediate push, per-host degradation,
+delivery catch-up), election atomicity + the two facts to always report on
+election changes (restart-to-apply; homes regenerate = memory cost).
+Operations gains the one-line pointer. Default election is now both
+builtins — an election change, so deployed homes regenerate once.

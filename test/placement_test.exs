@@ -159,7 +159,7 @@ defmodule Tightbeam.PlacementTest do
              "/remote/tb/homes/default/codex"
 
     commands = collect_commands([])
-    assert [stamp, wipe, rsync, lib_mkdir, lib_rsync, auth] = commands
+    assert [stamp, wipe, rsync, lib_mkdir, lib_rsync, lib_rsync_2, auth] = commands
     assert stamp == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "cat", "/remote/tb/homes/default/codex/.tightbeam-manifest"]
 
     assert wipe == [
@@ -211,6 +211,9 @@ defmodule Tightbeam.PlacementTest do
              Path.join([base_dir, "identity", "skills", "tightbeam-assimilate"]),
              "worker:/remote/tb/identity/skills/"
            ]
+
+    assert List.last(lib_rsync_2) == "worker:/remote/tb/identity/skills/"
+    assert Enum.at(lib_rsync_2, -2) =~ "tightbeam-skills"
 
     assert Enum.take(auth, 8) == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "sh", "-c"]
     assert List.last(auth) =~ "/remote/tb/auth/codex\"/*"

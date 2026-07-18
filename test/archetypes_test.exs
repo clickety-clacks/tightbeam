@@ -38,7 +38,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert loaded["coder"] == %{
              name: "coder",
-             skills: ["tightbeam-assimilate"],
+             skills: ["tightbeam-assimilate", "tightbeam-skills"],
              where: ["work-1", "work-2"],
              fallback_models: [],
              defaults: %{harness: :codex, model: "gpt-5.6-sol[medium]"},
@@ -241,6 +241,10 @@ defmodule Tightbeam.ArchetypesTest do
         full ceremony is the `tightbeam-assimilate` skill in your home
         (`skills/tightbeam-assimilate/SKILL.md`) — load it WHEN the operator
         asks for an assimilation, not before, and follow it exactly.
+      - `skill list|put|rm` (admin) manages the org's skill library. The full
+        procedure — shapes, trees, election, propagation — is the
+        `tightbeam-skills` skill in your home; load it when the operator asks
+        to add or change skills.
       - Every action is attributed: --as <your-handle> (you) or --as-user
         <human>. You cannot act as anyone you are not.
 
