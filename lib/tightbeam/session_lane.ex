@@ -28,6 +28,7 @@ defmodule Tightbeam.SessionLane do
     :db,
     :runner,
     :task_sup,
+    terminal_publisher: nil,
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
@@ -88,7 +89,11 @@ defmodule Tightbeam.SessionLane do
       db: Keyword.get(opts, :db, Tightbeam.DB),
       task_sup: Keyword.fetch!(opts, :task_sup),
       # runner: (turn_map -> {:ok, result_map} | {:error, term}); injectable for tests
-      runner: Keyword.fetch!(opts, :runner)
+      runner: Keyword.fetch!(opts, :runner),
+      # Wire-notifies terminals that have NO runner closure (task crash,
+      # cancel races) — without it a crashed turn leaves the client's typing
+      # indicator stuck forever. No-op default keeps unit tests standalone.
+      terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end)
     }
 
     send(self(), :nudge)
@@ -180,9 +185,21 @@ defmodule Tightbeam.SessionLane do
 
     case Ledger.finish(state.db, seq, terminal, error) do
       :ok ->
-        if publish, do: publish.(terminal)
+        if publish do
+          publish.(terminal)
+        else
+          state.terminal_publisher.(%{
+            session_key: state.session_key,
+            message_id: state.current_message_id,
+            status: terminal,
+            error: error
+          })
+        end
+
         publish_terminal(state, seq)
-      :already_terminal -> :ok
+
+      :already_terminal ->
+        :ok
     end
   end
 

@@ -175,6 +175,7 @@ defmodule Tightbeam.Gateway do
        lane_sup: Tightbeam.LaneSupervisor,
        task_sup: Tightbeam.TurnTaskSupervisor,
        runner: runner,
+       terminal_publisher: terminal_publisher(db),
        name: Tightbeam.LaneManager},
       {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
     ]
@@ -553,6 +554,50 @@ defmodule Tightbeam.Gateway do
         end
 
       outcome
+    end
+  end
+
+  # Wire publication for terminals that lost their runner closure: turns
+  # recovered at boot (failed_unknown), task crashes, republished rows. The
+  # client learns the truth it was owed — terminal turn-state with the
+  # reason, typing/activity cleared, progress label cleared.
+  defp terminal_publisher(db) do
+    fn %{session_key: session_key, message_id: message_id, status: status} = row ->
+      echo = Projection.get(db, message_id)
+      correlation = (echo && echo.client_message_id) || message_id
+
+      {state, error} =
+        case status do
+          "delivered" -> {"delivered", nil}
+          "canceled" -> {"canceled", nil}
+          _ -> {"failed", Map.get(row, :error) || "interrupted: outcome unknown"}
+        end
+
+      publish_turn_state(db, session_key, correlation, state, error)
+
+      with %{} = session <- Org.get(db, session_key) do
+        broadcast(db, session.owner_user_id, Payloads.assistant_typing(session_key, false))
+
+        broadcast(
+          db,
+          session.owner_user_id,
+          Payloads.activity_event(%{
+            is_active: false,
+            message_id: correlation,
+            session_key: session_key
+          })
+        )
+
+        progress_state = if state == "delivered", do: "completed", else: "failed"
+
+        broadcast(
+          db,
+          session.owner_user_id,
+          Payloads.agent_progress(session_key, correlation, 1_000_000, "", progress_state)
+        )
+      end
+
+      :ok
     end
   end
 

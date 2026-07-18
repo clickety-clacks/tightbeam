@@ -7,7 +7,11 @@ defmodule Tightbeam.ArchetypesTest do
     base_dir = Path.join(System.tmp_dir!(), "tb-archetypes-#{System.unique_integer([:positive])}")
     manifests = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
-    on_exit(fn -> File.rm_rf!(base_dir) end)
+    on_exit(fn ->
+      File.rm_rf!(base_dir)
+      :persistent_term.erase(Tightbeam.Archetypes)
+    end)
+
     %{base_dir: base_dir, manifests: manifests}
   end
 

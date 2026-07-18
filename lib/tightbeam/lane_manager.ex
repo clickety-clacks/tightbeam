@@ -16,7 +16,7 @@ defmodule Tightbeam.LaneManager do
   use GenServer
   alias Tightbeam.{Ledger, SessionLane}
 
-  defstruct [:db, :lane_sup, :task_sup, :runner, :interval]
+  defstruct [:db, :lane_sup, :task_sup, :runner, :interval, :terminal_publisher]
 
   @doc """
   Start the reconciler. Required opts: `:lane_sup` (the lane
@@ -42,6 +42,7 @@ defmodule Tightbeam.LaneManager do
       lane_sup: Keyword.fetch!(opts, :lane_sup),
       task_sup: Keyword.fetch!(opts, :task_sup),
       runner: Keyword.fetch!(opts, :runner),
+      terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       interval: Keyword.get(opts, :interval, 5_000)
     }
 
@@ -67,8 +68,13 @@ defmodule Tightbeam.LaneManager do
   end
 
   defp do_reconcile(state) do
-    # Re-publish terminals whose publication may have been lost to a crash.
-    for %{seq: seq} <- Ledger.unpublished_terminals(state.db), do: Ledger.mark_published(state.db, seq)
+    # Re-publish terminals whose publication may have been lost to a crash —
+    # to the WIRE, not just the ledger: without frames, a client whose turn
+    # died with the gateway keeps a stuck typing indicator forever.
+    for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db) do
+      state.terminal_publisher.(row)
+      Ledger.mark_published(state.db, seq)
+    end
 
     for session_key <- Ledger.pending_sessions(state.db) do
       ensure(state, session_key)
@@ -86,7 +92,12 @@ defmodule Tightbeam.LaneManager do
       [] ->
         DynamicSupervisor.start_child(
           state.lane_sup,
-          {SessionLane, session_key: session_key, db: state.db, task_sup: state.task_sup, runner: state.runner}
+          {SessionLane,
+           session_key: session_key,
+           db: state.db,
+           task_sup: state.task_sup,
+           runner: state.runner,
+           terminal_publisher: state.terminal_publisher}
         )
     end
   end

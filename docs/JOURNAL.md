@@ -491,3 +491,20 @@ default homes regenerate on next adapter start.
    cancel-wake, assimilate, attribution — prefixed with the norm: consult
    list, then answer definitively, never "probably" (Flynn: agents must
    speak with authority on tightbeam operations).
+
+## Stuck-indicator fix (Fable) — terminals now reach the wire after crashes
+
+Live-fire find (Flynn): gateway bounce killed an in-flight turn; boot
+recovery marked it failed_unknown but the "re-publish" step only stamped
+publishedAt — NO wire frames — so the client's typing indicator stuck until
+its own timeout ("agent progress interrupted"). Same hole on the lane's
+task-crash path (runner died before returning its terminal_publish
+closure). Fix: a real terminal publisher (built in Gateway, closure over
+db) is injected into LaneManager (reconciler republish path) and
+SessionLane (no-closure finalize path): terminal prompt_turn_state with the
+recorded reason ("interrupted: outcome unknown" for failed_unknown),
+typing/activity cleared, progress label cleared. Ledger.unpublished_terminals
+now carries the error column. Also fixed a silent test-hygiene miss:
+persistent_term cleanup in archetypes tests targeted a stale setup literal
+and never applied (Python replace without assert — the lesson is asserted
+replaces from now on).
