@@ -17,10 +17,13 @@ defmodule Tightbeam.Wire.Payloads do
     role=user + sender=<origin> → delivered by wake (colleague DM,
     operator CLI action, or automation, per the sender's class prefix);
     role=assistant (+ sender "tightbeam") → the session's own output.
-  - The MODEL-visible prompt of a wake carries a first-line
-    `[from <origin>]` stamp (the return address). The stamp never appears
-    in message content — UI chrome comes from `sender`. Only the first
-    line is provenance; any `[from ...]` inside a body is quoted text.
+  - Wake-delivered messages carry a first-line `[from <origin>]` stamp in
+    BOTH stored content and the model prompt — one string, three
+    audiences: readable text in any client, a rendering cue in aware ones
+    (strip the first line and show a chip ONLY when it matches the
+    `sender` field — the cross-check is the anti-forgery), and the model's
+    return address. Only the first line is provenance; any `[from ...]`
+    deeper in a body is quoted text.
 
   Conditional-key rules from the TS reference (omit, don't nil):
   - server message: deviceId/clientMessageId only when non-nil (user echoes);

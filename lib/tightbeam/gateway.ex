@@ -294,25 +294,27 @@ defmodule Tightbeam.Gateway do
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
+    # Return address, one representation for three audiences: wake-delivered
+    # messages carry a first-line `[from <origin>]` stamp in BOTH the stored
+    # content and the model prompt. Humans read it as text in any client;
+    # aware clients strip it and render a chip (validating it against the
+    # sender field — the anti-forgery cross-check); the model reads it as
+    # the address to wake back. Fact-stamping, never content authorship.
+    stamped =
+      case opts[:sender] do
+        sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
+        _ -> prompt
+      end
+
     input = %{
       session_key: session_key,
       role: "user",
-      content: prompt,
+      content: stamped,
       device_id: opts[:device_id],
       client_message_id: opts[:client_message_id],
       attachments: opts[:attachments] || [],
       sender: opts[:sender]
     }
-
-    # Return address: wake-delivered prompts carry a provenance envelope in
-    # the MODEL-visible prompt (the stream message stays clean — the UI shows
-    # the sender field). Fact-stamping, not content: without it the receiving
-    # model cannot know whom to wake back.
-    model_prompt =
-      case opts[:sender] do
-        sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
-        _ -> prompt
-      end
 
     result =
       DB.transaction(db, fn txn ->
@@ -324,7 +326,7 @@ defmodule Tightbeam.Gateway do
                 message_id: message.id,
                 wake_id: opts[:wake_id],
                 origin: origin,
-                prompt: model_prompt
+                prompt: stamped
               })
 
             {:appended, message}
