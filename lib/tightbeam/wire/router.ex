@@ -316,6 +316,13 @@ defmodule Tightbeam.Wire.Router do
       is_binary(body["asUser"]) and body["asUser"] != "" ->
         {:ok, "user:#{body["asUser"]}"}
 
+      is_binary(body["asProcess"]) and body["asProcess"] != "" ->
+        # Third origin class (closed set: user | agent | process): automation
+        # that is neither a person nor a session — cron, CI, webhooks.
+        # Local-trust like --as (named, not authenticated — v1 decision);
+        # powers are narrow: wake + cancel-wake, nothing else.
+        {:ok, "process:#{body["asProcess"]}"}
+
       true ->
         {:error, 400, "invalid_message", "as (handle) or asUser required"}
     end

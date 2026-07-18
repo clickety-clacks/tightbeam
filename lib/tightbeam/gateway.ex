@@ -764,6 +764,12 @@ defmodule Tightbeam.Gateway do
 
   defp resolve_caller(_db, "user:" <> user_id), do: %{owner_user_id: user_id, caller_session: nil}
 
+  # Processes (cron/CI/automation) resolve as callers with NO owner and NO
+  # session: enough standing to wake and cancel their own wakes; every
+  # owner- or admin-gated path falls through to denial naturally.
+  defp resolve_caller(_db, "process:" <> name) when name != "",
+    do: %{owner_user_id: nil, caller_session: nil}
+
   defp resolve_caller(db, "agent:" <> handle) do
     case Org.get_by_handle(db, handle) do
       %{state: "active"} = caller ->
@@ -855,6 +861,9 @@ defmodule Tightbeam.Gateway do
     case resolve_caller(db, call.origin) do
       nil ->
         %{code: "unknown_caller"}
+
+      %{owner_user_id: nil} ->
+        %{code: "forbidden", message: "processes cannot spawn sessions"}
 
       caller ->
         prior = Idempotency.get(db, caller.owner_user_id, "spawn", p.idempotency_key)
