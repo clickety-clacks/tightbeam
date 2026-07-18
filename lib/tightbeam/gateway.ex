@@ -304,6 +304,16 @@ defmodule Tightbeam.Gateway do
       sender: opts[:sender]
     }
 
+    # Return address: wake-delivered prompts carry a provenance envelope in
+    # the MODEL-visible prompt (the stream message stays clean — the UI shows
+    # the sender field). Fact-stamping, not content: without it the receiving
+    # model cannot know whom to wake back.
+    model_prompt =
+      case opts[:sender] do
+        sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
+        _ -> prompt
+      end
+
     result =
       DB.transaction(db, fn txn ->
         case Projection.append_in_txn(txn, input) do
@@ -314,7 +324,7 @@ defmodule Tightbeam.Gateway do
                 message_id: message.id,
                 wake_id: opts[:wake_id],
                 origin: origin,
-                prompt: prompt
+                prompt: model_prompt
               })
 
             {:appended, message}

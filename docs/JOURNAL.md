@@ -580,3 +580,18 @@ harness's catalog when unspecified; old harness session can't load on the
 new engine so the existing fallback pointer path yields a fresh model
 context, chat history untouched). The spec's "swaps the engine underneath a
 stable identity" is now an actual verb.
+
+## DM return address (Fable)
+
+Flynn's question exposed it: the wake's origin reached the UI (sender tag)
+but NOT the model — prompts were delivered raw, so a DM'd agent could not
+know whom to wake back (inherited from the TS reference). Fix: wake-
+delivered prompts (any deliver_prompt with :sender) are stamped
+`[from <origin>]` in the MODEL-visible prompt only; the stream message
+stays clean (UI already shows sender). Fact-stamping — mechanical
+provenance, like a mail header — not content fabrication. Operations
+guidance updated: the stamp is the return address; a stamp bearing your own
+handle is your scheduled self (act, don't reply). Delivery mechanics
+confirmed unchanged and documented: a DM IS a turn (content delivered
+directly into context, no go-look pointer), and the lane serializes it
+behind any in-flight user turn — DMs never interrupt, they queue.

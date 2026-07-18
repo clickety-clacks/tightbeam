@@ -159,8 +159,11 @@ defmodule Tightbeam.ArchetypesTest do
         harness; effort variants look like name[medium]). A model not in the
         catalog does not exist here — say so plainly.
       - `wake <target> --prompt "..."` delivers a prompt now (that is a DM) or
-        later (--after 5m / --at <epochMs>). When a colleague wakes YOU, your
-        reply lands in YOUR stream — to answer them, wake them back.
+        later (--after 5m / --at <epochMs>). Incoming wakes arrive stamped
+        `[from <origin>]` — that is the RETURN ADDRESS. When a colleague wakes
+        YOU, your reply lands in YOUR stream — to answer them, wake the stamped
+        origin back (a `[from ...]` bearing your own handle is your earlier self
+        following up; act, don't reply).
       - `tune` changes a session (rename, set_model, set_host — set_host moves
         it to another allowed machine); `retire` ends one (its history
         survives); `cancel-wake <id>` cancels a scheduled wake.
