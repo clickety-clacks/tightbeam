@@ -439,7 +439,13 @@ defmodule Tightbeam.Gateway do
           },
           modelCatalog: %{
             available: true,
-            models: Enum.map(catalog, &%{ref: &1.ref, name: &1.name, provider: session.provider})
+            # Client Model decoder REQUIRES id + provider + ref (id is the
+            # stable identity; ref doubles as it here).
+            models:
+              Enum.map(
+                catalog,
+                &%{id: &1.ref, ref: &1.ref, name: &1.name, provider: session.provider}
+              )
           }
         }
     end
@@ -908,6 +914,28 @@ defmodule Tightbeam.Gateway do
         stream = Payloads.stream_session(session)
         broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
         %{stream: stream}
+
+      p[:setting] == "set_harness" and p[:harness] in ["claude", "codex"] ->
+        case Org.get(db, call.session_key) do
+          nil ->
+            %{ok: false, code: "not_found"}
+
+          _session ->
+            harness = p.harness
+            provider = if harness == "codex", do: "openai", else: "anthropic"
+
+            model =
+              p[:model] ||
+                case Map.fetch!(@model_catalog, harness) do
+                  [first | _] -> first.ref
+                end
+
+            Org.set_harness(db, call.session_key, harness, provider, model)
+            # No pointer surgery needed: next checkout hits the new
+            # harness's adapter; the old harness session can't load there →
+            # fallback pointer, fresh model context, history intact.
+            %{ok: true, harness: harness, model: model, note: "engine swapped; model context starts fresh (chat history unaffected)"}
+        end
 
       p[:setting] == "set_host" and is_binary(p[:host]) ->
         case Org.get(db, call.session_key) do

@@ -187,6 +187,19 @@ defmodule Tightbeam.Org do
     update(db, session_key, "displayName = ?2", [display_name])
   end
 
+  @doc """
+  Retune a session's engine wholesale — harness+provider+model (the `tune`
+  set_harness write). Same identity, different engine: the next turn's
+  adapter checkout targets the new harness; the old harness session can't
+  load there, so the existing fallback pointer path starts a fresh model
+  context. Chat history is substrate-side and unaffected. Returns the
+  updated session.
+  """
+  @spec set_harness(db(), String.t(), String.t(), String.t(), String.t()) :: session()
+  def set_harness(db \\ Tightbeam.DB, session_key, harness, provider, model) do
+    update(db, session_key, "harness = ?2, provider = ?3, model = ?4", [harness, provider, model])
+  end
+
   @doc "Retune a session's model+provider (the `tune` verb's write). Returns the updated session."
   @spec set_model(db(), String.t(), String.t(), String.t()) :: session()
   def set_model(db \\ Tightbeam.DB, session_key, model, provider) do
