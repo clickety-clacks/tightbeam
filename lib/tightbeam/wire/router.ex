@@ -377,6 +377,9 @@ defmodule Tightbeam.Wire.Router do
   defp control_call(%{"action" => "set_model", "model" => model}),
     do: {:ok, "tune", %{setting: "set_model", model: model}}
 
+  defp control_call(%{"action" => "set_harness", "harness" => harness} = body),
+    do: {:ok, "tune", %{setting: "set_harness", harness: harness, model: body["model"]}}
+
   defp control_call(%{"action" => action} = body)
        when action in ~w(set_thinking set_reasoning set_fast_mode set_mode set_verbosity) do
     key =
