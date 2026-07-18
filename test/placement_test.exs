@@ -96,6 +96,10 @@ defmodule Tightbeam.PlacementTest do
 
     assert opts[:cmd] == [
              "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
              "codex@worker",
              "exec",
              "env",
@@ -135,10 +139,14 @@ defmodule Tightbeam.PlacementTest do
 
     commands = collect_commands([])
     assert [stamp, wipe, rsync, auth] = commands
-    assert stamp == ["ssh", "worker", "cat", "/remote/tb/homes/default/codex/.tightbeam-manifest"]
+    assert stamp == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "cat", "/remote/tb/homes/default/codex/.tightbeam-manifest"]
 
     assert wipe == [
              "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
              "worker",
              "rm",
              "-rf",
@@ -152,12 +160,14 @@ defmodule Tightbeam.PlacementTest do
     assert rsync == [
              "rsync",
              "-a",
+             "-e",
+             "ssh -o BatchMode=yes -o ConnectTimeout=5",
              Path.join([base_dir, "staging", "worker", "homes", "default", "codex"]) <> "/",
              "worker:/remote/tb/homes/default/codex/"
            ]
 
     refute "--delete" in rsync
-    assert Enum.take(auth, 4) == ["ssh", "worker", "sh", "-c"]
+    assert Enum.take(auth, 8) == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "sh", "-c"]
     assert List.last(auth) =~ "/remote/tb/auth/codex\"/*"
     assert List.last(auth) =~ "ln -s"
 

@@ -43,10 +43,18 @@ defmodule Tightbeam.Acp.Adapter do
   @doc """
   Start the adapter. Required: `:harness` (:claude | :codex), `:cmd` (adapter
   argv), `:home` (agent-home dir, exported via the harness's home env var),
-  `:cwd`. Optional: `:env`, `:stderr_path`, `:name`. Performs the ACP
-  initialize handshake before returning.
+  `:cwd`. Optional: `:env`, `:stderr_path`, `:name`.
+
+  Accepts either the opts keyword directly, or a ZERO-ARITY FUN producing it.
+  The fun form is the coordinator's: opts-building may be expensive or hang
+  (remote home delivery over ssh), so it and the ACP initialize handshake run
+  AFTER init via handle_continue — inside this process, never blocking the
+  caller. A boot failure is then an ordinary adapter crash, taking the
+  coordinator's uniform :DOWN → backoff → circuit path. Calls made while
+  booting queue behind the continue and are answered when it completes.
   """
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link(keyword() | (-> keyword())) :: GenServer.on_start()
+  def start_link(fun) when is_function(fun, 0), do: GenServer.start_link(__MODULE__, fun)
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
   @doc "Create a fresh harness session, model applied (fable-trap rule). Returns {:ok, session_id}."
@@ -73,7 +81,15 @@ defmodule Tightbeam.Acp.Adapter do
   ## Server
 
   @impl true
-  def init(opts) do
+  def init(opts_or_fun) do
+    {:ok, nil, {:continue, {:boot, opts_or_fun}}}
+  end
+
+  @impl true
+  def handle_continue({:boot, fun}, nil) when is_function(fun, 0),
+    do: handle_continue({:boot, fun.()}, nil)
+
+  def handle_continue({:boot, opts}, nil) do
     harness = Keyword.fetch!(opts, :harness)
     preset = Map.fetch!(@presets, harness)
 
@@ -91,7 +107,11 @@ defmodule Tightbeam.Acp.Adapter do
         clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
       })
 
-    {:ok, %__MODULE__{conn: conn, preset: preset, cwd: Keyword.fetch!(opts, :cwd)}}
+    # Boot completed — the only trustworthy health signal under lazy boot
+    # (spawn success means nothing). The coordinator closes its circuit here.
+    with ready when is_function(ready, 0) <- Keyword.get(opts, :on_ready), do: ready.()
+
+    {:noreply, %__MODULE__{conn: conn, preset: preset, cwd: Keyword.fetch!(opts, :cwd)}}
   end
 
   @impl true

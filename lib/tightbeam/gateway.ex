@@ -490,10 +490,7 @@ defmodule Tightbeam.Gateway do
 
       outcome =
         with {:ok, adapter, generation} <-
-               AdapterCoordinator.adapter_for(
-                 Tightbeam.AdapterCoordinator,
-                 {String.to_existing_atom(session.harness), session.archetype, session.host}
-               ),
+               checkout_adapter(session),
              {:ok, harness_session_id} <-
                harness_session(db, adapter, generation, session, turn.seq),
              {:ok, result} <- Adapter.prompt(adapter, harness_session_id, turn.prompt) do
@@ -536,6 +533,22 @@ defmodule Tightbeam.Gateway do
         end
 
       outcome
+    end
+  end
+
+  # Adapter checkout with a HUMAN-readable failure: :degraded is an atom
+  # for machines; the chat bubble names the host.
+  defp checkout_adapter(session) do
+    key = {String.to_existing_atom(session.harness), session.archetype, session.host}
+
+    case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
+      {:ok, adapter, generation} ->
+        {:ok, adapter, generation}
+
+      {:error, :degraded} ->
+        {:error,
+         "adapter for #{session.harness}/#{session.archetype} on host #{session.host} is degraded " <>
+           "(host unreachable or adapter failing); see /version"}
     end
   end
 

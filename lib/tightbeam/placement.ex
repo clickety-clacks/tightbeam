@@ -65,6 +65,11 @@ defmodule Tightbeam.Placement do
 
   alias Tightbeam.{Archetypes, Homes}
 
+  # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
+  # misconfigured host must fail in seconds with a reason, never hang on TCP
+  # timeouts or an invisible password prompt.
+  @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+
   @typedoc "A configured host. ssh: nil marks the reserved local host."
   @type host_config :: %{
           required(:ssh) => String.t() | nil,
@@ -222,7 +227,7 @@ defmodule Tightbeam.Placement do
 
       [
         harness: harness,
-        cmd: ["ssh", host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+        cmd: ["ssh" | @ssh_opts] ++ [host_config.ssh, "exec", "env" | remote_env] ++ [binary],
         home: home,
         cwd: config.cwd,
         stderr_path: stderr_path,
@@ -260,15 +265,14 @@ defmodule Tightbeam.Placement do
       sh = Keyword.get(opts, :sh, &system_cmd/1)
 
       {remote_stamp, stamp_exit} =
-        sh.(["ssh", host_config.ssh, "cat", Path.join(remote_home, ".tightbeam-manifest")])
+        sh.(["ssh" | @ssh_opts] ++ [host_config.ssh, "cat", Path.join(remote_home, ".tightbeam-manifest")])
 
       if stamp_exit not in [0, 1], do: raise("remote stamp check failed with exit #{stamp_exit}")
 
       staged_stamp = File.read!(Path.join(staged_home, ".tightbeam-manifest"))
 
       if remote_stamp != staged_stamp do
-        run!(sh, [
-          "ssh",
+        run!(sh, ["ssh" | @ssh_opts] ++ [
           host_config.ssh,
           "rm",
           "-rf",
@@ -280,7 +284,14 @@ defmodule Tightbeam.Placement do
         ])
       end
 
-      run!(sh, ["rsync", "-a", staged_home <> "/", "#{host_config.ssh}:#{remote_home}/"])
+      run!(sh, [
+        "rsync",
+        "-a",
+        "-e",
+        Enum.join(["ssh" | @ssh_opts], " "),
+        staged_home <> "/",
+        "#{host_config.ssh}:#{remote_home}/"
+      ])
 
       auth_dir = Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
 
@@ -291,7 +302,7 @@ defmodule Tightbeam.Placement do
           "[ -e \"$target\" ] || [ -L \"$target\" ] || ln -s \"$source\" \"$target\"; " <>
           "done"
 
-      run!(sh, ["ssh", host_config.ssh, "sh", "-c", link_script])
+      run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "sh", "-c", link_script])
       remote_home
     end
   end

@@ -401,3 +401,23 @@ under "*" resolves to "local". Empty where remains a load error — law fails
 closed; in set logic an empty where is nowhere, and a typo must never be
 the most permissive value. "*" mixed with names rejected as incoherent.
 Spec §Placement amended.
+
+## Dead-host hardening (Fable)
+
+Deficit audit prompted by Flynn's disconnected-host question. Three fixes:
+1. ARCHITECTURAL: adapter boot made lazy (init → handle_continue). Opts
+   building — including remote home delivery over ssh — previously ran in
+   the AdapterCoordinator's loop, so one slow/dead host could stall every
+   session's checkout and /version for seconds-to-minutes. Boot now runs in
+   the adapter's own process; a boot failure is an ordinary adapter crash on
+   the uniform :DOWN → backoff → circuit path. Corollary fixed in review:
+   under lazy boot a spawned pid proves nothing, so the circuit no longer
+   closes on spawn — only on {:adapter_ready} (boot completed), via a new
+   on_ready callback. Backoff base made injectable for tests.
+2. ssh hardening: BatchMode=yes + ConnectTimeout=5 on the adapter ssh wrap
+   and every deliver_home ssh/rsync (-e) call — dead hosts fail in seconds
+   with a reason; a password prompt can never hang an adapter.
+3. UX: circuit-open turns now fail with a readable reason naming the
+   harness/archetype/host and pointing at /version, not the atom :degraded.
+Gate: 92 tests + 3 doctests green; wire-first-light re-PASS on the
+lazy-boot gateway.

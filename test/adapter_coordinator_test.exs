@@ -21,27 +21,48 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     %{db: db, sup: sup}
   end
 
-  test "five consecutive start failures open the circuit", ctx do
+  test "five consecutive boot failures open the circuit (async boot)", ctx do
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
+         backoff_base_ms: 1,
          adapter_opts: fn _ ->
            [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
          end,
          db: ctx.db,
-         name: :"coordinator_#{System.unique_integer([:positive])}"}
+         name: :"coord_#{System.unique_integer([:positive])}"}
       )
 
-    for _ <- 1..5,
-        do:
-          assert(
-            {:error, :degraded} =
-              AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "local"})
-          )
+    # Async boot: the first checkout hands out a pid whose boot then fails;
+    # crashes count via :DOWN on the (fast) backoff clock until the circuit
+    # opens and checkout fails fast.
+    assert {:ok, _pid, _gen} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "local"})
 
-    assert %{"claude:default@local" => %{circuit: :open, consecutive_failures: 5}} =
+    assert wait_until(fn ->
+             match?(
+               %{"claude:default@local" => %{circuit: :open}},
+               AdapterCoordinator.health(coordinator)
+             )
+           end)
+
+    assert {:error, :degraded} =
+             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "local"})
+
+    assert %{"claude:default@local" => %{consecutive_failures: failures}} =
              AdapterCoordinator.health(coordinator)
+
+    assert failures >= 5
+  end
+
+  defp wait_until(fun, tries \\ 200) do
+    cond do
+      fun.() -> true
+      tries == 0 -> false
+      true ->
+        Process.sleep(10)
+        wait_until(fun, tries - 1)
+    end
   end
 
   test "adapter death bumps generation and records lifecycle", ctx do

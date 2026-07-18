@@ -91,6 +91,7 @@ defmodule Tightbeam.AdapterCoordinator do
        adapter_sup: Keyword.fetch!(opts, :adapter_sup),
        adapter_opts: Keyword.fetch!(opts, :adapter_opts),
        db: Keyword.get(opts, :db, Tightbeam.DB),
+       backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
        adapters: %{},
        monitors: %{},
        load_active: %{},
@@ -167,7 +168,7 @@ defmodule Tightbeam.AdapterCoordinator do
           failures = entry.failures + 1
           circuit = if failures >= 5, do: :open, else: :closed
           generation = entry.generation + 1
-          delay = backoff(failures)
+          delay = backoff(state, failures)
           timer = Process.send_after(self(), {:restart_adapter, key, generation}, delay)
 
           entry = %{
@@ -193,6 +194,17 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
+  def handle_info({:adapter_ready, key}, state) do
+    case state.adapters[key] do
+      %{pid: pid} = entry when is_pid(pid) ->
+        entry = %{entry | failures: 0, circuit: :closed}
+        {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:restart_adapter, key, generation}, state) do
     case state.adapters[key] do
       %{generation: ^generation, pid: nil} = entry ->
@@ -205,9 +217,20 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp start_adapter(key, entry, state) do
+    # Opts building (incl. remote home delivery) is potentially expensive or
+    # hangable — a fn defers it into the adapter's own process (lazy boot via
+    # its handle_continue), so this coordinator NEVER blocks on a slow or
+    # dead host. Boot failures arrive as :DOWN — the uniform recovery path.
+    adapter_opts = state.adapter_opts
+    coordinator = self()
+
+    boot = fn ->
+      adapter_opts.(key) ++ [on_ready: fn -> send(coordinator, {:adapter_ready, key}) end]
+    end
+
     child = %{
       id: {Tightbeam.Acp.Adapter, key},
-      start: {Tightbeam.Acp.Adapter, :start_link, [state.adapter_opts.(key)]},
+      start: {Tightbeam.Acp.Adapter, :start_link, [boot]},
       restart: :temporary,
       type: :worker
     }
@@ -217,15 +240,9 @@ defmodule Tightbeam.AdapterCoordinator do
         ref = Process.monitor(pid)
         generation = max(entry.generation, 1)
 
-        entry = %{
-          entry
-          | pid: pid,
-            monitor: ref,
-            generation: generation,
-            failures: 0,
-            circuit: :closed,
-            timer: nil
-        }
+        # Boot is LAZY: a spawned pid proves nothing. failures/circuit are
+        # reset only by {:adapter_ready, key} — the completed-boot signal.
+        entry = %{entry | pid: pid, monitor: ref, generation: generation, timer: nil}
 
         state = %{
           state
@@ -239,7 +256,7 @@ defmodule Tightbeam.AdapterCoordinator do
         failures = entry.failures + 1
         circuit = if failures >= 5, do: :open, else: :closed
         generation = max(entry.generation, 1)
-        timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(failures))
+        timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(state, failures))
 
         entry = %{
           entry
@@ -257,7 +274,7 @@ defmodule Tightbeam.AdapterCoordinator do
     %{pid: nil, monitor: nil, generation: 0, failures: 0, circuit: :closed, timer: nil}
   end
 
-  defp backoff(failures), do: min(1_000 * Integer.pow(2, max(failures - 1, 0)), 60_000)
+  defp backoff(state, failures), do: min(state.backoff_base_ms * Integer.pow(2, max(failures - 1, 0)), 60_000)
   defp key_name({harness, archetype, host}), do: "#{harness}:#{archetype}@#{host}"
 
   defp grant_slot(borrower, state) do
