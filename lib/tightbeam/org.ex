@@ -11,9 +11,9 @@ defmodule Tightbeam.Org do
 
   @typedoc """
   A session row. Identity-is-data: `origin`/`spawned_by` record WHO created it
-  (provenance is append-only fact, not judgment); `handle` is the addressable
-  name other sessions use; `archetype`/`harness`/`provider`/`model` are the
-  current tuning.
+  (provenance is append-only fact, not judgment); `handle` is the vestigial
+  spawn-time name record; `archetype`/`harness`/`provider`/`model` are the current
+  tuning.
   """
   @type session :: %{
           session_key: String.t(),
@@ -107,61 +107,54 @@ defmodule Tightbeam.Org do
   """
   @spec create(db(), map()) :: session()
   def create(db \\ Tightbeam.DB, input) do
-    transaction!(db, fn txn ->
-      session_key =
-        Map.get(input, :session_key) || custom_session_key(Map.fetch!(input, :owner_user_id))
+    transaction!(db, fn txn -> create_in_txn(txn, input) end)
+  end
 
-      now = now()
+  @doc false
+  @spec create_in_txn(Txn.t(), map()) :: session()
+  def create_in_txn(%Txn{} = txn, input) do
+    session_key =
+      Map.get(input, :session_key) || custom_session_key(Map.fetch!(input, :owner_user_id))
 
-      Txn.q(
-        txn,
-        """
-          INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-            ownerUserId, origin, spawnedBy, handle, archetype, harness, provider, model,
-            thinkingLevel, host, state, createdAt, updatedAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-            ?15, ?16, 'active', ?17, ?17)
-        """,
-        [
-          session_key,
-          Map.fetch!(input, :display_name),
-          Map.get(input, :kind, "custom"),
-          Map.get(input, :order_index, 0),
-          if(Map.get(input, :is_built_in, false), do: 1, else: 0),
-          if(Map.get(input, :adopted, false), do: 1, else: 0),
-          Map.fetch!(input, :owner_user_id),
-          Map.fetch!(input, :origin),
-          Map.get(input, :spawned_by),
-          Map.get(input, :handle),
-          Map.fetch!(input, :archetype),
-          Map.fetch!(input, :harness),
-          Map.fetch!(input, :provider),
-          Map.fetch!(input, :model),
-          Map.get(input, :thinking_level),
-          Map.fetch!(input, :host),
-          now
-        ]
-      )
+    now = now()
 
-      must_get(txn, session_key)
-    end)
+    Txn.q(
+      txn,
+      """
+        INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+          ownerUserId, origin, spawnedBy, handle, archetype, harness, provider, model,
+          thinkingLevel, host, state, createdAt, updatedAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+          ?15, ?16, 'active', ?17, ?17)
+      """,
+      [
+        session_key,
+        Map.fetch!(input, :display_name),
+        Map.get(input, :kind, "custom"),
+        Map.get(input, :order_index, 0),
+        if(Map.get(input, :is_built_in, false), do: 1, else: 0),
+        if(Map.get(input, :adopted, false), do: 1, else: 0),
+        Map.fetch!(input, :owner_user_id),
+        Map.fetch!(input, :origin),
+        Map.get(input, :spawned_by),
+        Map.get(input, :handle),
+        Map.fetch!(input, :archetype),
+        Map.fetch!(input, :harness),
+        Map.fetch!(input, :provider),
+        Map.fetch!(input, :model),
+        Map.get(input, :thinking_level),
+        Map.fetch!(input, :host),
+        now
+      ]
+    )
+
+    must_get(txn, session_key)
   end
 
   @doc "Fetch a session by key, or nil."
   @spec get(db(), String.t()) :: session() | nil
   def get(db \\ Tightbeam.DB, session_key) do
     {:ok, rows} = DB.query(db, select_session_sql() <> " WHERE sessionKey = ?1", [session_key])
-
-    case rows do
-      [row] -> to_session(row)
-      [] -> nil
-    end
-  end
-
-  @doc "Fetch a session by its addressable handle, or nil."
-  @spec get_by_handle(db(), String.t()) :: session() | nil
-  def get_by_handle(db \\ Tightbeam.DB, handle) do
-    {:ok, rows} = DB.query(db, select_session_sql() <> " WHERE handle = ?1", [handle])
 
     case rows do
       [row] -> to_session(row)

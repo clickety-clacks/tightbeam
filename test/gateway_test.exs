@@ -5,17 +5,20 @@ defmodule Tightbeam.GatewayTest do
     Archetypes,
     ConnRegistry,
     DB,
+    Devices,
     EventLog,
     Gateway,
     Idempotency,
     Ledger,
     Org,
     Projection,
+    Roles,
     Wakes
   }
 
   defmodule LaneDoorbell do
     use GenServer
+    def start_link({parent, name}), do: GenServer.start_link(__MODULE__, parent, name: name)
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
@@ -85,8 +88,16 @@ defmodule Tightbeam.GatewayTest do
         else: Application.delete_env(:tightbeam, :hosts)
     end)
 
-    for module <- [EventLog, Idempotency, Ledger, Org, Projection, Wakes],
+    for module <- [Devices, EventLog, Idempotency, Ledger, Org, Projection, Roles, Wakes],
         do: :ok = module.ensure_schema(db)
+
+    {:paired, _device} =
+      Devices.pair(db, %{
+        device_id: "flynn-device",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
 
     Org.create(db, %{
       session_key: "k1",
@@ -190,6 +201,7 @@ defmodule Tightbeam.GatewayTest do
     inspect_handler = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["inspect"]
 
     assert inspect_handler.(%{origin: "process:scheduler", params: %{}, session_key: nil}) == %{
+             roles: [],
              wakes: [
                %{
                  wake_id: own.wake_id,
@@ -234,6 +246,235 @@ defmodule Tightbeam.GatewayTest do
 
     assert Wakes.get(ctx.db, own.wake_id).state == "canceled"
     assert Wakes.get(ctx.db, other.wake_id).state == "pending"
+  end
+
+  test "role wakes late-bind at fire time and deleted roles fail visibly", ctx do
+    base_dir = role_test_base("late-bind")
+    config = gateway_config(base_dir, ctx.db, 0)
+    children = Gateway.children(config)
+    {Wakes, wake_opts} = Enum.find(children, &match?({Wakes, _}, &1))
+    scheduler = :"role_wakes_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: :role_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    start_supervised!(%{
+      id: :role_lane_manager,
+      start: {LaneDoorbell, :start_link, [{self(), Tightbeam.LaneManager}]}
+    })
+
+    start_supervised!({Wakes, Keyword.put(wake_opts, :name, scheduler)})
+
+    old = create_session(ctx.db, "agent:old", "flynn")
+    new = create_session(ctx.db, "agent:new", "flynn")
+    Roles.create!(ctx.db, "reviewer", "flynn", old.session_key)
+    wake_handler = Gateway.handlers(Map.put(config, :wake_scheduler, scheduler))["wake"]
+    future = System.system_time(:millisecond) + 60_000
+
+    scheduled =
+      wake_handler.(%{
+        origin: "user:flynn",
+        session_key: old.session_key,
+        target_role: "reviewer",
+        role_fallback: false,
+        params: %{prompt: "review this", at: future}
+      })
+
+    assert Wakes.get(ctx.db, scheduled.wake_id).target_role == "reviewer"
+    assert :ok = Roles.bind(ctx.db, "reviewer", new.session_key)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [scheduled.wake_id])
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [["agent:new", "reviewer", 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey, roleRef, roleFallback FROM turns WHERE wakeId = ?1",
+               [scheduled.wake_id]
+             )
+
+    deleted =
+      wake_handler.(%{
+        origin: "user:flynn",
+        session_key: new.session_key,
+        target_role: "reviewer",
+        role_fallback: false,
+        params: %{prompt: "will disappear", at: future}
+      })
+
+    assert :ok = Roles.rm(ctx.db, "reviewer")
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [deleted.wake_id])
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, deleted.wake_id).state == "fired"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [deleted.wake_id])
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "wake_unresolved" and event.subject == deleted.wake_id and
+               event.detail == "role reviewer no longer exists"
+           end)
+  end
+
+  test "spawn --name creates a bound role and role_exists rolls back the session", ctx do
+    base_dir = role_test_base("spawn")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :spawn_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    created =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{
+          display_name: "Builder",
+          handle: "builder",
+          idempotency_key: "spawn-builder"
+        }
+      })
+
+    assert %{name: "builder", bound_session_key: key, owner_user_id: "flynn"} =
+             Roles.get(ctx.db, "builder")
+
+    assert key == created.session_key
+    assert Org.get(ctx.db, key).handle == "builder"
+
+    Roles.create!(ctx.db, "taken", "flynn", nil)
+    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+
+    assert %{code: "role_exists"} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Must roll back",
+                 handle: "taken",
+                 idempotency_key: "spawn-taken"
+               }
+             })
+
+    assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
+  end
+
+  test "boot migration turns legacy handles into roles idempotently", ctx do
+    legacy =
+      Org.create(ctx.db, %{
+        session_key: "legacy-session",
+        display_name: "Legacy",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        handle: "legacy-office",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    base_dir = role_test_base("migration")
+    config = gateway_config(base_dir, ctx.db, 0)
+    Gateway.children(config)
+    Gateway.children(config)
+
+    assert %{bound_session_key: key, owner_user_id: "flynn"} =
+             Roles.get(ctx.db, "legacy-office")
+
+    assert key == legacy.session_key
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM roles WHERE name = 'legacy-office'")
+  end
+
+  test "role verbs enforce owner, admin, binding ownership, and process denials", ctx do
+    {:pending, _} =
+      Devices.pair(ctx.db, %{
+        device_id: "other-device",
+        claimed_name: "Other",
+        platform: nil,
+        model: nil
+      })
+
+    other = create_session(ctx.db, "agent:other", "other")
+    other_second = create_session(ctx.db, "agent:other-second", "other")
+    handlers = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))
+
+    assert %{role: %{owner_user_id: "flynn"}} =
+             handlers["role-create"].(%{
+               origin: "user:flynn",
+               params: %{name: "flynn-office"}
+             })
+
+    Roles.create!(ctx.db, "other-office", "other", other.session_key)
+
+    for verb <- ["role-create", "role-bind", "role-rm"] do
+      params =
+        case verb do
+          "role-create" -> %{name: "process-office"}
+          "role-bind" -> %{name: "flynn-office", session_key: "k1"}
+          "role-rm" -> %{name: "flynn-office"}
+        end
+
+      assert %{code: "denied"} = handlers[verb].(%{origin: "process:cron", params: params})
+    end
+
+    assert %{code: "denied"} =
+             handlers["role-bind"].(%{
+               origin: "user:other",
+               params: %{name: "flynn-office", session_key: other.session_key}
+             })
+
+    assert %{code: "denied"} =
+             handlers["role-create"].(%{
+               origin: "user:other",
+               params: %{name: "foreign-binding", bind: "k1"}
+             })
+
+    assert %{code: "denied"} =
+             handlers["role-bind"].(%{
+               origin: "user:other",
+               params: %{name: "other-office", session_key: "k1"}
+             })
+
+    assert %{role: %{bound_session_key: "agent:other-second"}} =
+             handlers["role-bind"].(%{
+               origin: "user:other",
+               params: %{name: "other-office", session_key: other_second.session_key}
+             })
+
+    Roles.create!(ctx.db, "other-remove", "other", nil)
+
+    assert %{removed: "other-remove"} =
+             handlers["role-rm"].(%{
+               origin: "user:other",
+               params: %{name: "other-remove"}
+             })
+
+    assert %{role: %{bound_session_key: "k1"}} =
+             handlers["role-bind"].(%{
+               origin: "user:flynn",
+               params: %{name: "other-office", session_key: "k1"}
+             })
+
+    assert %{removed: "other-office"} =
+             handlers["role-rm"].(%{origin: "user:flynn", params: %{name: "other-office"}})
+
+    assert %{roles: roles} = handlers["role-list"].(%{origin: "process:cron", params: %{}})
+
+    assert Enum.any?(
+             roles,
+             &(&1.name == "flynn-office" and
+                 &1.fallback_target == Org.personal_session_key("flynn"))
+           )
   end
 
   test "set_host denies on workdir sync failure and leaves Org unchanged", ctx do
@@ -557,6 +798,37 @@ defmodule Tightbeam.GatewayTest do
       wake_tick_ms: 1_000,
       db: db
     }
+  end
+
+  defp role_test_base(suffix) do
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_roles_#{suffix}_#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(base_dir)
+
+    on_exit(fn ->
+      File.rm_rf!(base_dir)
+      :persistent_term.erase(Archetypes)
+    end)
+
+    base_dir
+  end
+
+  defp create_session(db, session_key, owner_user_id) do
+    Org.create(db, %{
+      session_key: session_key,
+      display_name: session_key,
+      owner_user_id: owner_user_id,
+      origin: "user:#{owner_user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable"
+    })
   end
 
   defp move_test_base(suffix) do

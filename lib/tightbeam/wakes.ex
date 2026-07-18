@@ -29,6 +29,7 @@ defmodule Tightbeam.Wakes do
   @type wake :: %{
           wake_id: String.t(),
           session_key: String.t(),
+          target_role: String.t() | nil,
           origin: String.t(),
           prompt: String.t(),
           due_at: integer(),
@@ -44,6 +45,7 @@ defmodule Tightbeam.Wakes do
   CREATE TABLE IF NOT EXISTS wakes (
     wakeId     TEXT PRIMARY KEY,
     sessionKey TEXT NOT NULL,
+    targetRole TEXT,
     origin     TEXT NOT NULL,
     prompt     TEXT NOT NULL,
     dueAt      INTEGER NOT NULL,
@@ -55,13 +57,23 @@ defmodule Tightbeam.Wakes do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    result = DB.execute(db, @ddl)
+
+    case DB.query(db, "ALTER TABLE wakes ADD COLUMN targetRole TEXT") do
+      {:ok, _} -> :ok
+      {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+    end
+
+    result
+  end
 
   ## Store (pure DB ops — callable without the scheduler process, e.g. by inspect)
 
   @doc "Persist a pending wake (id minted here, prefix `w_`). Returns the row."
   @spec schedule(db(), %{
           session_key: String.t(),
+          target_role: String.t() | nil,
           origin: String.t(),
           prompt: String.t(),
           due_at: integer()
@@ -70,6 +82,7 @@ defmodule Tightbeam.Wakes do
     wake = %{
       wake_id: "w_" <> Tightbeam.Id.uuid4(),
       session_key: Map.fetch!(input, :session_key),
+      target_role: Map.get(input, :target_role),
       origin: Map.fetch!(input, :origin),
       prompt: Map.fetch!(input, :prompt),
       due_at: Map.fetch!(input, :due_at),
@@ -82,12 +95,14 @@ defmodule Tightbeam.Wakes do
       Txn.q(
         txn,
         """
-          INSERT INTO wakes (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL)
+          INSERT INTO wakes
+            (wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL)
         """,
         [
           wake.wake_id,
           wake.session_key,
+          wake.target_role,
           wake.origin,
           wake.prompt,
           wake.due_at,
@@ -218,13 +233,24 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql do
-    "SELECT wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt FROM wakes"
   end
 
-  defp to_wake([wake_id, session_key, origin, prompt, due_at, state, created_at, fired_at]) do
+  defp to_wake([
+         wake_id,
+         session_key,
+         target_role,
+         origin,
+         prompt,
+         due_at,
+         state,
+         created_at,
+         fired_at
+       ]) do
     %{
       wake_id: wake_id,
       session_key: session_key,
+      target_role: target_role,
       origin: origin,
       prompt: prompt,
       due_at: due_at,

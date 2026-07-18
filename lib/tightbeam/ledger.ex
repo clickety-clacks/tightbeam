@@ -42,6 +42,8 @@ defmodule Tightbeam.Ledger do
     wakeId     TEXT UNIQUE,
     origin     TEXT NOT NULL,
     prompt     TEXT NOT NULL,
+    roleRef    TEXT,
+    roleFallback INTEGER NOT NULL DEFAULT 0,
     status     TEXT NOT NULL DEFAULT 'queued'
                CHECK (status IN ('queued','running','delivered','canceled',
                                  'failed','failed_unknown')),
@@ -63,7 +65,21 @@ defmodule Tightbeam.Ledger do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    result = DB.execute(db, @ddl)
+
+    for ddl <- [
+          "ALTER TABLE turns ADD COLUMN roleRef TEXT",
+          "ALTER TABLE turns ADD COLUMN roleFallback INTEGER NOT NULL DEFAULT 0"
+        ] do
+      case DB.query(db, ddl) do
+        {:ok, _} -> :ok
+        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+      end
+    end
+
+    result
+  end
 
   @doc """
   Transactionally enqueue a turn (call inside the same DB.transaction that
@@ -74,17 +90,24 @@ defmodule Tightbeam.Ledger do
   def enqueue_in_txn(%Txn{} = txn, attrs) do
     now = System.system_time(:millisecond)
 
-    Txn.q(txn, """
-      INSERT INTO turns (sessionKey, messageId, wakeId, origin, prompt, createdAt)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-    """, [
-      Map.fetch!(attrs, :session_key),
-      Map.fetch!(attrs, :message_id),
-      Map.get(attrs, :wake_id),
-      Map.fetch!(attrs, :origin),
-      Map.fetch!(attrs, :prompt),
-      now
-    ])
+    Txn.q(
+      txn,
+      """
+        INSERT INTO turns
+          (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      """,
+      [
+        Map.fetch!(attrs, :session_key),
+        Map.fetch!(attrs, :message_id),
+        Map.get(attrs, :wake_id),
+        Map.fetch!(attrs, :origin),
+        Map.fetch!(attrs, :prompt),
+        Map.get(attrs, :role_ref),
+        if(Map.get(attrs, :role_fallback, false), do: 1, else: 0),
+        now
+      ]
+    )
 
     [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
     seq

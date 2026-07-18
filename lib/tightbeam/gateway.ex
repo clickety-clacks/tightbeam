@@ -48,13 +48,13 @@ defmodule Tightbeam.Gateway do
   port each from gateway.ts's dispatcher.register blocks, including):
   - post (echo+enqueue; dedupe contract), wake (schedule/cancel/immediate
     fire; a wake MUST carry a prompt), spawn (idempotency, headcount cap,
-    handle uniqueness, owner inherited from spawn tree), retire (idempotent,
+    role-name uniqueness, owner inherited from spawn tree), retire (idempotent,
     owner-only), tune (rename | set_model; live-session apply), cancel,
     inspect (owned sessions + owned pending wakes + admin: pending devices),
     approve-device/deny-device/revoke-device/promote-user (admin-gated via
     the origin's owning USER — user-scoped admin).
   - Caller resolution (gateway.ts `resolveCaller`): "user:x" → x;
-    "agent:handle" → active session's owner; anything else → unknown_caller.
+    "agent:role" → the active role holder's owner; anything else → unknown_caller.
   """
 
   alias Tightbeam.{
@@ -63,12 +63,14 @@ defmodule Tightbeam.Gateway do
     Placement,
     DB,
     Devices,
+    EventLog,
     Idempotency,
     LaneManager,
     Ledger,
     Org,
     Projection,
     Rails,
+    Roles,
     Wakes
   }
 
@@ -113,9 +115,11 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     File.mkdir_p!(config.base_dir)
 
-    for module <- [Tightbeam.Assets, Devices, Idempotency, Wakes, Projection, Org] do
+    for module <- [Tightbeam.Assets, Devices, Idempotency, Wakes, Projection, Org, Roles] do
       :ok = module.ensure_schema(db)
     end
+
+    migrate_handle_roles(db)
 
     # Sessions created before real-hostname registration stored the retired
     # "local" indexical; rewrite once so rows speak the org's vocabulary.
@@ -165,16 +169,39 @@ defmodule Tightbeam.Gateway do
       })
 
     deliver = fn wake ->
-      case Org.get(db, wake.session_key) do
-        %{state: "active"} ->
-          deliver_prompt(wake.session_key, wake.origin, wake.prompt,
-            db: db,
-            wake_id: wake.wake_id,
-            sender: wake.origin
-          )
+      case wake.target_role do
+        role when is_binary(role) ->
+          case Roles.resolve(db, role) do
+            {:ok, session_key, fallback} ->
+              deliver_prompt(session_key, wake.origin, wake.prompt,
+                db: db,
+                wake_id: wake.wake_id,
+                sender: wake.origin,
+                role_ref: role,
+                role_fallback: fallback
+              )
 
-        _ ->
-          :ok
+            {:error, %{code: "unknown_role"}} ->
+              EventLog.lifecycle(
+                db,
+                "wake_unresolved",
+                wake.wake_id,
+                "role #{role} no longer exists"
+              )
+          end
+
+        nil ->
+          case Org.get(db, wake.session_key) do
+            %{state: "active"} ->
+              deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+                db: db,
+                wake_id: wake.wake_id,
+                sender: wake.origin
+              )
+
+            _ ->
+              :ok
+          end
       end
     end
 
@@ -296,6 +323,10 @@ defmodule Tightbeam.Gateway do
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
+      "role-create" => fn call -> role_create_result(db, call) end,
+      "role-bind" => fn call -> role_bind_result(db, call) end,
+      "role-rm" => fn call -> role_rm_result(db, call) end,
+      "role-list" => fn _call -> role_list_result(db) end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
@@ -346,7 +377,9 @@ defmodule Tightbeam.Gateway do
                 message_id: message.id,
                 wake_id: opts[:wake_id],
                 origin: origin,
-                prompt: stamped
+                prompt: stamped,
+                role_ref: opts[:role_ref],
+                role_fallback: opts[:role_fallback] || false
               })
 
             {:appended, message}
@@ -823,25 +856,144 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp resolve_caller(_db, "user:" <> user_id), do: %{owner_user_id: user_id, caller_session: nil}
+  defp role_create_result(db, call) do
+    case resolve_caller(db, call.origin) do
+      nil ->
+        %{code: "unknown_caller"}
+
+      %{owner_user_id: nil} ->
+        %{code: "denied", message: "processes cannot create roles"}
+
+      caller ->
+        with :ok <-
+               creation_binding_allowed(
+                 db,
+                 call.origin,
+                 caller.owner_user_id,
+                 call.params[:bind]
+               ) do
+          case Roles.create!(db, call.params[:name], caller.owner_user_id, call.params[:bind]) do
+            {:error, error} -> error
+            role -> %{role: role}
+          end
+        else
+          {:error, error} -> error
+        end
+    end
+  end
+
+  defp role_bind_result(db, call) do
+    name = call.params[:name]
+    session_key = call.params[:session_key]
+
+    with role when not is_nil(role) <- Roles.get(db, name),
+         {:ok, caller} <- caller_for_role_mutation(db, call.origin),
+         :ok <- role_mutation_allowed(db, caller, call.origin, role),
+         :ok <- binding_owner_allowed(db, call.origin, role, session_key),
+         :ok <- Roles.bind(db, name, session_key) do
+      %{role: Roles.get(db, name)}
+    else
+      nil -> %{code: "unknown_role", message: "unknown role: #{name}"}
+      {:error, error} -> error
+    end
+  end
+
+  defp role_rm_result(db, call) do
+    name = call.params[:name]
+
+    with role when not is_nil(role) <- Roles.get(db, name),
+         {:ok, caller} <- caller_for_role_mutation(db, call.origin),
+         :ok <- role_mutation_allowed(db, caller, call.origin, role),
+         :ok <- Roles.rm(db, name) do
+      %{removed: name}
+    else
+      nil -> %{code: "unknown_role", message: "unknown role: #{name}"}
+      {:error, error} -> error
+    end
+  end
+
+  defp role_list_result(db) do
+    roles =
+      Enum.map(Roles.list(db), fn role ->
+        Map.put(role, :fallback_target, Org.personal_session_key(role.owner_user_id))
+      end)
+
+    %{roles: roles}
+  end
+
+  defp role_mutation_allowed(_db, %{owner_user_id: nil}, _origin, _role),
+    do: {:error, %{code: "denied", message: "processes cannot mutate roles"}}
+
+  defp role_mutation_allowed(db, caller, origin, role) do
+    if caller.owner_user_id == role.owner_user_id or admin_origin?(db, origin),
+      do: :ok,
+      else: {:error, %{code: "denied", message: "role owner or admin required"}}
+  end
+
+  defp caller_for_role_mutation(db, origin) do
+    case resolve_caller(db, origin) do
+      nil -> {:error, %{code: "unknown_caller", message: "unknown caller"}}
+      caller -> {:ok, caller}
+    end
+  end
+
+  defp binding_owner_allowed(db, origin, role, session_key) do
+    case Org.get(db, session_key) do
+      %{state: "active"} = session ->
+        if session.owner_user_id == role.owner_user_id or admin_origin?(db, origin),
+          do: :ok,
+          else:
+            {:error, %{code: "denied", message: "binding target must be owned by the role owner"}}
+
+      _ ->
+        {:error, %{code: "unknown_session", message: "unknown active session: #{session_key}"}}
+    end
+  end
+
+  defp creation_binding_allowed(_db, _origin, _owner_user_id, nil), do: :ok
+
+  defp creation_binding_allowed(db, origin, owner_user_id, session_key) do
+    binding_owner_allowed(db, origin, %{owner_user_id: owner_user_id}, session_key)
+  end
 
   # Processes (cron/CI/automation) resolve as callers with NO owner and NO
   # session: enough standing to wake and cancel their own wakes; every
   # owner- or admin-gated path falls through to denial naturally.
+  defp resolve_caller(_db, "user:" <> user_id), do: %{owner_user_id: user_id, caller_session: nil}
+
   defp resolve_caller(_db, "process:" <> name) when name != "",
     do: %{owner_user_id: nil, caller_session: nil}
 
-  defp resolve_caller(db, "agent:" <> handle) do
-    case Org.get_by_handle(db, handle) do
-      %{state: "active"} = caller ->
-        %{owner_user_id: caller.owner_user_id, caller_session: caller}
-
-      _ ->
-        nil
+  defp resolve_caller(db, "agent:" <> role) do
+    with {:ok, session_key, false} <- Roles.resolve(db, role),
+         %{state: "active"} = caller <- Org.get(db, session_key) do
+      %{owner_user_id: caller.owner_user_id, caller_session: caller}
+    else
+      _ -> nil
     end
   end
 
   defp resolve_caller(_db, _origin), do: nil
+
+  defp migrate_handle_roles(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT handle, sessionKey, ownerUserId
+        FROM sessions WHERE handle IS NOT NULL ORDER BY createdAt, sessionKey
+        """
+      )
+
+    Enum.each(rows, fn [handle, session_key, owner_user_id] ->
+      if is_nil(Roles.get(db, handle)) do
+        case Roles.migrate_handle(db, handle, owner_user_id, session_key) do
+          {:error, error} -> raise error.message
+          _role -> :ok
+        end
+      end
+    end)
+  end
 
   defp admin_origin?(db, origin) do
     case resolve_caller(db, origin) do
@@ -869,7 +1021,7 @@ defmodule Tightbeam.Gateway do
           |> Enum.filter(&(&1.origin == call.origin))
           |> Enum.map(&Map.take(&1, [:wake_id, :session_key, :due_at, :prompt]))
 
-        %{wakes: wakes}
+        Map.put(%{wakes: wakes}, :roles, role_list_result(db).roles)
 
       caller ->
         sessions = Org.list_for_user(db, caller.owner_user_id, false)
@@ -908,6 +1060,7 @@ defmodule Tightbeam.Gateway do
               ])
             ),
           wakes: wakes,
+          roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
           hosts: org_shape.hosts,
           models: org_shape.models
@@ -935,13 +1088,14 @@ defmodule Tightbeam.Gateway do
     if prior do
       db |> Wakes.get(prior.session_key) |> wake_response()
     else
-      case Org.get(db, call.session_key) do
-        %{state: "active"} = target ->
+      case call.session_key do
+        session_key when is_binary(session_key) ->
           due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
 
           wake =
             Wakes.schedule(db, %{
-              session_key: target.session_key,
+              session_key: session_key,
+              target_role: Map.get(call, :target_role),
               origin: call.origin,
               prompt: p.prompt,
               due_at: due_at
@@ -996,9 +1150,6 @@ defmodule Tightbeam.Gateway do
                 "live-session cap (#{config.max_live_sessions_per_user}) reached for #{caller.owner_user_id}"
             }
 
-          p[:handle] && Org.get_by_handle(db, p.handle) ->
-            %{code: "handle_taken", message: "handle already in use: #{p.handle}"}
-
           true ->
             create_spawn(config, db, call, caller)
         end
@@ -1039,21 +1190,51 @@ defmodule Tightbeam.Gateway do
             if(harness == :codex or harness == "codex", do: "gpt-5.6-sol[medium]", else: "haiku")
         )
 
-    session =
-      Org.create(db, %{
-        display_name: p.display_name,
-        kind: "custom",
-        owner_user_id: caller.owner_user_id,
-        origin: call.origin,
-        spawned_by: caller.caller_session && caller.caller_session.session_key,
-        handle: p[:handle],
-        order_index: length(sessions),
-        archetype: archetype.name,
-        host: host,
-        harness: harness_string,
-        provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
-        model: model
-      })
+    input = %{
+      display_name: p.display_name,
+      kind: "custom",
+      owner_user_id: caller.owner_user_id,
+      origin: call.origin,
+      spawned_by: caller.caller_session && caller.caller_session.session_key,
+      handle: p[:handle],
+      order_index: length(sessions),
+      archetype: archetype.name,
+      host: host,
+      harness: harness_string,
+      provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
+      model: model
+    }
+
+    session_result =
+      DB.transaction(db, fn txn ->
+        session = Org.create_in_txn(txn, input)
+
+        if p[:handle] do
+          Roles.create_in_txn!(
+            txn,
+            p.handle,
+            caller.owner_user_id,
+            session.session_key
+          )
+        end
+
+        session
+      end)
+
+    case session_result do
+      {:error, %Roles.TransactionError{error: error}} ->
+        error
+
+      {:error, error} ->
+        raise error
+
+      {:ok, session} ->
+        finish_spawn(db, call, caller, session)
+    end
+  end
+
+  defp finish_spawn(db, call, caller, session) do
+    p = call.params
 
     Idempotency.put(db, %{
       owner_user_id: caller.owner_user_id,

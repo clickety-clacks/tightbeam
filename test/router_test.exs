@@ -3,13 +3,13 @@ defmodule Tightbeam.Wire.RouterTest do
   import Plug.Test
   import Plug.Conn
 
-  alias Tightbeam.{Assets, DB, Devices, EventLog, Org}
+  alias Tightbeam.{Assets, DB, Devices, EventLog, Org, Roles}
   alias Tightbeam.Wire.Router
 
   setup do
     db = :"router_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    for module <- [Assets, Devices, EventLog, Org], do: :ok = module.ensure_schema(db)
+    for module <- [Assets, Devices, EventLog, Org, Roles], do: :ok = module.ensure_schema(db)
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-router-#{System.unique_integer([:positive])}")
@@ -57,18 +57,21 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "agent dispatch enforces cli bearer, allowlist, and identity/target resolution", ctx do
-    Org.create(ctx.db, %{
-      session_key: "orch",
-      display_name: "Orchestrator",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      handle: "orchestrator:demo",
-      archetype: "default",
+    actor =
+      Org.create(ctx.db, %{
+        session_key: "orch",
+        display_name: "Orchestrator",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        handle: "orchestrator:demo",
+        archetype: "default",
         host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: "fable"
-    })
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    Roles.create!(ctx.db, "orchestrator:demo", "flynn", actor.session_key)
 
     body =
       JSON.encode!(%{
@@ -98,7 +101,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert disallowed.status == 400
   end
 
-  test "wake targets resolve user ids to Main with handle precedence", ctx do
+  test "typed target grammar distinguishes keys, users, and roles without unions", ctx do
     {:pending, _device} =
       Devices.pair(ctx.db, %{
         device_id: "mike-device",
@@ -121,18 +124,40 @@ defmodule Tightbeam.Wire.RouterTest do
       model: "fable"
     })
 
-    assert dispatch_wake(ctx, "mike").status == 200
-    assert_receive {:call, %{verb: "wake", session_key: ^main_key}}
-
     assert dispatch_wake(ctx, "user:mike").status == 200
-    assert_receive {:call, %{verb: "wake", session_key: ^main_key}}
+    assert_receive {:call, %{verb: "wake", session_key: ^main_key, target_role: nil}}
+
+    bare_user = dispatch_wake(ctx, "mike")
+    assert bare_user.status == 404
+    assert JSON.decode!(bare_user.resp_body)["error"]["message"] == "unknown role: mike"
+
+    unknown_user = dispatch_wake(ctx, "user:missing")
+    assert unknown_user.status == 404
+
+    key =
+      Org.create(ctx.db, %{
+        session_key: "agent:direct",
+        display_name: "Direct",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    assert dispatch_wake(ctx, key.session_key).status == 200
+    assert_receive {:call, %{session_key: "agent:direct", target_role: nil}}
+
+    unknown_key = dispatch_wake(ctx, "agent:missing")
+    assert unknown_key.status == 404
 
     Org.create(ctx.db, %{
-      session_key: "shadow",
-      display_name: "Mike shadow",
+      session_key: "role-session",
+      display_name: "Role holder",
       owner_user_id: "flynn",
       origin: "user:flynn",
-      handle: "mike",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -140,15 +165,60 @@ defmodule Tightbeam.Wire.RouterTest do
       model: "fable"
     })
 
-    assert dispatch_wake(ctx, "mike").status == 200
-    assert_receive {:call, %{verb: "wake", session_key: "shadow"}}
+    Roles.create!(ctx.db, "mike", "flynn", "role-session")
+    Roles.create!(ctx.db, "fallback", "mike", nil)
 
-    unknown = dispatch_wake(ctx, "unknown-user")
+    assert dispatch_wake(ctx, "mike").status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "wake",
+                      session_key: "role-session",
+                      target_role: "mike",
+                      role_fallback: false
+                    }}
+
+    assert dispatch_wake(ctx, "fallback").status == 200
+
+    assert_receive {:call,
+                    %{
+                      session_key: ^main_key,
+                      target_role: "fallback",
+                      role_fallback: true
+                    }}
+
+    unknown = dispatch_wake(ctx, "unknown-role")
     assert unknown.status == 404
 
     assert JSON.decode!(unknown.resp_body) == %{
-             "error" => %{"code" => "not_found", "message" => "unknown target: unknown-user"}
+             "error" => %{"code" => "not_found", "message" => "unknown role: unknown-role"}
            }
+  end
+
+  test "acting as a role requires its active binding", ctx do
+    holder =
+      Org.create(ctx.db, %{
+        session_key: "holder",
+        display_name: "Holder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    Roles.create!(ctx.db, "held", "flynn", holder.session_key)
+    Roles.create!(ctx.db, "vacant", "flynn", nil)
+
+    held = dispatch_as_role(ctx, "held")
+    assert held.status == 200
+    assert_receive {:call, %{origin: "agent:held"}}
+
+    vacant = dispatch_as_role(ctx, "vacant")
+    assert vacant.status == 400
+    assert JSON.decode!(vacant.resp_body)["error"]["message"] =~ "vacant"
   end
 
   test "multipart upload returns asset metadata", ctx do
@@ -251,6 +321,19 @@ defmodule Tightbeam.Wire.RouterTest do
         "asUser" => "flynn",
         "target" => target,
         "params" => %{"prompt" => "hi"}
+      })
+
+    conn(:post, "/agent/dispatch", body)
+    |> put_req_header("authorization", "Bearer tbc_test")
+    |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp dispatch_as_role(ctx, role) do
+    body =
+      JSON.encode!(%{
+        "verb" => "inspect",
+        "as" => role,
+        "params" => %{}
       })
 
     conn(:post, "/agent/dispatch", body)

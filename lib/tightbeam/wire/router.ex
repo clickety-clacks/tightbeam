@@ -40,10 +40,10 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
-  alias Tightbeam.{Assets, Devices, Dispatch, Org}
+  alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles}
   alias Tightbeam.Wire.{Payloads, Socket}
 
-  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list)
+  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -96,11 +96,13 @@ defmodule Tightbeam.Wire.Router do
          {:ok, verb} <- required_string(body["verb"]),
          :ok <- allowed_agent_verb(verb),
          {:ok, origin} <- agent_origin(body, conn),
-         {:ok, session_key} <- target_session(body["target"], conn) do
+         {:ok, session_key, target_meta} <- target_session(body["target"], conn) do
       call = %{
         verb: verb,
         origin: origin,
         session_key: session_key,
+        target_role: target_meta.role,
+        role_fallback: target_meta.fallback,
         params: atomize_params(body["params"] || %{})
       }
 
@@ -307,10 +309,14 @@ defmodule Tightbeam.Wire.Router do
   defp agent_origin(body, conn) do
     cond do
       is_binary(body["as"]) and body["as"] != "" ->
-        if Org.get_by_handle(db(conn), body["as"]) do
-          {:ok, "agent:#{body["as"]}"}
-        else
-          {:error, 400, "invalid_message", "unknown handle: #{body["as"]}"}
+        role = body["as"]
+
+        case Roles.resolve(db(conn), role) do
+          {:ok, _session_key, false} ->
+            {:ok, "agent:#{role}"}
+
+          _ ->
+            {:error, 400, "invalid_message", "unknown or unbound role: #{role}"}
         end
 
       is_binary(body["asUser"]) and body["asUser"] != "" ->
@@ -324,35 +330,37 @@ defmodule Tightbeam.Wire.Router do
         {:ok, "process:#{body["asProcess"]}"}
 
       true ->
-        {:error, 400, "invalid_message", "as (handle) or asUser required"}
+        {:error, 400, "invalid_message", "as (role) or asUser required"}
     end
   end
 
-  defp target_session(nil, _conn), do: {:ok, nil}
-  defp target_session("", _conn), do: {:ok, nil}
+  defp target_session(nil, _conn), do: {:ok, nil, %{role: nil, fallback: false}}
+  defp target_session("", _conn), do: {:ok, nil, %{role: nil, fallback: false}}
 
-  defp target_session(target, conn) when is_binary(target) do
-    # Session keys and handles keep precedence; only an unshadowed bare id
-    # falls through to user Main resolution.
-    case Org.get(db(conn), target) || Org.get_by_handle(db(conn), target) do
-      nil -> user_target_session(target, conn)
-      session -> {:ok, session.session_key}
+  defp target_session("agent:" <> _ = target, conn) do
+    case Org.get(db(conn), target) do
+      nil -> {:error, 404, "not_found", "unknown target: #{target}"}
+      session -> {:ok, session.session_key, %{role: nil, fallback: false}}
     end
   end
 
-  defp target_session(_target, _conn), do: {:ok, nil}
-
-  defp user_target_session("user:" <> user_id, conn) do
+  defp target_session("user:" <> user_id, conn) do
     if Devices.user(db(conn), user_id),
-      do: {:ok, Org.personal_session_key(user_id)},
+      do: {:ok, Org.personal_session_key(user_id), %{role: nil, fallback: false}},
       else: {:error, 404, "not_found", "unknown target: user:#{user_id}"}
   end
 
-  defp user_target_session(user_id, conn) do
-    if Devices.user(db(conn), user_id),
-      do: {:ok, Org.personal_session_key(user_id)},
-      else: {:error, 404, "not_found", "unknown target: #{user_id}"}
+  defp target_session(target, conn) when is_binary(target) do
+    case Roles.resolve(db(conn), target) do
+      {:ok, session_key, fallback} ->
+        {:ok, session_key, %{role: target, fallback: fallback}}
+
+      {:error, %{code: "unknown_role"}} ->
+        {:error, 404, "not_found", "unknown role: #{target}"}
+    end
   end
+
+  defp target_session(_target, _conn), do: {:ok, nil, %{role: nil, fallback: false}}
 
   defp owned_session(key, device, conn) do
     case Org.get(db(conn), key) do

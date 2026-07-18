@@ -73,7 +73,7 @@ defmodule Tightbeam.OrgTest do
     {:ok, [["retired"]]} = DB.query(db, "SELECT state FROM sessions WHERE sessionKey = 'k1'")
   end
 
-  test "handles resolve and spawned-by provenance is retained", %{db: db} do
+  test "spawned-by provenance is retained", %{db: db} do
     Org.create(db, base(%{session_key: "root", handle: "orchestrator:news"}))
 
     child =
@@ -90,10 +90,8 @@ defmodule Tightbeam.OrgTest do
         })
       )
 
-    assert Org.get_by_handle(db, "orchestrator:news").session_key == "root"
     assert child.spawned_by == "root"
     assert child.provider == "openai"
-    assert Org.get_by_handle(db, "missing") == nil
   end
 
   test "rename and set_model update the row", %{db: db} do
