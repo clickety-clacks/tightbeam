@@ -728,3 +728,20 @@ delivery catch-up), election atomicity + the two facts to always report on
 election changes (restart-to-apply; homes regenerate = memory cost).
 Operations gains the one-line pointer. Default election is now both
 builtins — an election change, so deployed homes regenerate once.
+
+E2E assembly probe (Flynn: "you tested in a new session that these skills
+and guidance are assembled correctly and tested custom sample skills and
+guidance fragments?"). Authored operator material: custom fragment with a
+RECURSIVE #include (probe-fragment → probe-inner), a custom skill TREE via
+skill-put (probe-subject + probe-subject/technique, both pushed to tars),
+and a probe.toml archetype electing [probe-subject, tightbeam-skills] with
+#include in its [guidance]. Restart → spawn fresh "Assembly Probe" session
+→ quiz. ALL PASS: both fragment markers quoted from context (recursive
+include composed); election exact (tightbeam-assimilate correctly ABSENT);
+nested tree file read from inside the home and its marker quoted. Home
+bytes confirmed both markers; skills dir linked exactly the elected two.
+Observation: the harness surfaces its OWN built-in skill set (init,
+review, security-review, deep-research, ...) alongside ours — harness-
+native, NOT a leak of eezo's personal ~/.claude skills (none of those
+appeared). Probe artifacts fully cleaned after (retire, rm skill w/ tars
+push, fragments+toml deleted, restart).
