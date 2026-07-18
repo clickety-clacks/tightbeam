@@ -12,6 +12,41 @@ says otherwise). First device to pair becomes the admin user. `tb` = the
 reference CLI with TIGHTBEAM_URL/TIGHTBEAM_TOKEN pointed at GATEWAY (token
 from `<base_dir>/gateway.json`).
 
+## Harness parity (normative for every run)
+
+This runbook is a MATRIX, not a list: one full pass PER HARNESS the org
+supports (today: claude on `fable`, codex on `gpt-5.6-sol[medium]`), using a
+session of that harness for every step. A smoke run's verdict is
+INCOMPLETE — not passed — until every harness leg has run or been WAIVED by
+name with the blocker stated (e.g. "codex leg waived: no codex grant in the
+org's auth store"). A silent single-harness run is not a smoke run.
+
+Steps behave identically across harnesses unless annotated:
+- **[claude-only]** — the mechanism exists only on claude per
+  `shared/specs/tightbeam/harness-support.md` (the canonical matrix). On
+  codex the step becomes its NEGATIVE check where one is stated.
+- **[divergent]** — both harnesses run it, PASS conditions differ as noted.
+
+The matrix document is the authority on which rows diverge; a smoke step
+verifying a matrix row cites it, and a matrix claim with no verifying smoke
+step or test is marked unverified there. Discovering un-annotated divergence
+during a run is itself a FINDING: record it, amend the matrix and this
+runbook in the same change.
+
+Per-harness annotations for the existing sections:
+- §1 step 4 (tool use): [divergent] — codex tool titles/progress vocabulary
+  differ; PASS is still "progress label during turn, output reported".
+- §6 step 13 (model picker/footer): [divergent] — codex refs are
+  `gpt-5.6-sol[low..xhigh]`, `gpt-5.6-luna[medium]`.
+- §9 rails (17–23): [claude-only]. Codex negative check: with statutes
+  installed, the codex home has NO settings.json, its AGENTS.md contains no
+  statute text, and the step-19 forbidden command is NOT refused by any
+  hook (matrix: gates do not exist on codex).
+- Skills verification (when a step exercises one): [divergent] — claude
+  invokes via its native Skill tool; codex must READ the skill file by the
+  path the Operations pointer names. PASS for codex is the agent quoting
+  skill content it read on demand, not a claim of native discovery.
+
 ## 0. Boot + pair
 
 1. Boot the gateway (fresh base_dir; auth seeded for the claude harness).
