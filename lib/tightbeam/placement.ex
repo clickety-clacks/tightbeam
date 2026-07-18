@@ -253,13 +253,29 @@ defmodule Tightbeam.Placement do
       cli_bin = host_config[:cli_bin] || ""
       home_env = if harness == :codex, do: "CODEX_HOME", else: "CLAUDE_CONFIG_DIR"
 
-      remote_env = [
-        "#{home_env}=#{home}",
-        "TIGHTBEAM_HOME=#{host_config.base_dir}",
-        "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
-        "TIGHTBEAM_TOKEN=#{Map.fetch!(gateway, "cliToken")}",
-        "PATH=#{cli_bin}:$PATH"
-      ]
+      # The org token env, satellite edition: the token file lives on the
+      # SATELLITE (its auth store), unreadable at env-assembly time — so the
+      # value is a shell expansion evaluated remotely, the same
+      # remote-expansion trick as PATH=$PATH below. A missing file expands
+      # empty and the harness falls back to the auth store's credential
+      # file, exactly like the local branch.
+      token_env =
+        if harness == :claude do
+          token_path = Path.join([host_config.base_dir, "auth", "claude", "oauth-token"])
+          ["CLAUDE_CODE_OAUTH_TOKEN=$(cat #{token_path} 2>/dev/null)"]
+        else
+          []
+        end
+
+      remote_env =
+        token_env ++
+          [
+            "#{home_env}=#{home}",
+            "TIGHTBEAM_HOME=#{host_config.base_dir}",
+            "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
+            "TIGHTBEAM_TOKEN=#{Map.fetch!(gateway, "cliToken")}",
+            "PATH=#{cli_bin}:$PATH"
+          ]
 
       [
         harness: harness,

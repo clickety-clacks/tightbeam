@@ -38,7 +38,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert loaded["coder"] == %{
              name: "coder",
-             skills: ["tightbeam-assimilate", "tightbeam-skills"],
+             skills: ["tightbeam-assimilate", "tightbeam-harnesses", "tightbeam-skills"],
              where: ["work-1", "work-2"],
              fallback_models: [],
              defaults: %{harness: :codex, model: "gpt-5.6-sol[medium]"},
@@ -245,6 +245,9 @@ defmodule Tightbeam.ArchetypesTest do
         procedure — shapes, trees, election, propagation — is the
         `tightbeam-skills` skill in your home; load it when the operator asks
         to add or change skills.
+      - Harness features DIFFER (skills discovery, rails gates, credentials).
+        Before promising a feature on a specific harness, consult the
+        `tightbeam-harnesses` skill in your home — facts, not guesses.
       - Every action is attributed: --as <your-handle> (you) or --as-user
         <human>. You cannot act as anyone you are not.
 

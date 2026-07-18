@@ -136,6 +136,13 @@ defmodule Tightbeam.PlacementTest do
 
     assert opts[:home] == remote_home
     assert opts[:env] == []
+
+    claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
+
+    assert "CLAUDE_CODE_OAUTH_TOKEN=$(cat /srv/tb/auth/claude/oauth-token 2>/dev/null)" in claude_opts[:cmd]
+
+    # Harness-scoped: codex remote env never carries claude's token expansion.
+    refute Enum.any?(opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
   end
 
   test "deliver_home stages without auth and performs the remote flow in order", %{
@@ -161,7 +168,7 @@ defmodule Tightbeam.PlacementTest do
              "/remote/tb/homes/default/codex"
 
     commands = collect_commands([])
-    assert [stamp, wipe, rsync, lib_mkdir, lib_rsync, lib_rsync_2, auth] = commands
+    assert [stamp, wipe, rsync, lib_mkdir, lib_rsync, lib_rsync_h, lib_rsync_2, auth] = commands
     assert stamp == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "cat", "/remote/tb/homes/default/codex/.tightbeam-manifest"]
 
     assert wipe == [
@@ -214,6 +221,7 @@ defmodule Tightbeam.PlacementTest do
              "worker:/remote/tb/identity/skills/"
            ]
 
+    assert Enum.at(lib_rsync_h, -2) =~ "tightbeam-harnesses"
     assert List.last(lib_rsync_2) == "worker:/remote/tb/identity/skills/"
     assert Enum.at(lib_rsync_2, -2) =~ "tightbeam-skills"
 
