@@ -7,6 +7,21 @@ defmodule Tightbeam.Wire.Payloads do
   contract is camelCase (sessionKey, clientMessageId, …), so builders do the
   snake→camel translation at this boundary and nowhere else.
 
+  PROVENANCE CONVENTION (normative — clients render from these fields,
+  never from text parsing; the bible's §wakes origin-class set is the
+  source of truth):
+  - Origin classes are a CLOSED set: `user:<id>` (human), `agent:<handle>`
+    (session), `process:<name>` (automation — cron/CI/webhooks).
+  - A message's class is derivable from wire fields alone:
+    role=user + deviceId/clientMessageId, no sender → typed on a device;
+    role=user + sender=<origin> → delivered by wake (colleague DM,
+    operator CLI action, or automation, per the sender's class prefix);
+    role=assistant (+ sender "tightbeam") → the session's own output.
+  - The MODEL-visible prompt of a wake carries a first-line
+    `[from <origin>]` stamp (the return address). The stamp never appears
+    in message content — UI chrome comes from `sender`. Only the first
+    line is provenance; any `[from ...]` inside a body is quoted text.
+
   Conditional-key rules from the TS reference (omit, don't nil):
   - server message: deviceId/clientMessageId only when non-nil (user echoes);
     sender/replyToMessageId/replyToClientMessageId only when non-nil
