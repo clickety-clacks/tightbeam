@@ -151,6 +151,17 @@ defmodule Tightbeam.SessionLane do
   defp maybe_start(%{quarantined: true} = state), do: state
 
   defp maybe_start(state) do
+    if Tightbeam.Application.draining?() do
+      # Graceful deploy: no NEW claims while draining. Queued turns stay
+      # durable in the ledger and run on the next boot; the in-flight turn
+      # (handled above) finishes normally.
+      state
+    else
+      claim_and_start(state)
+    end
+  end
+
+  defp claim_and_start(state) do
     case Ledger.claim_next(state.db, state.session_key, "lane:#{inspect(self())}") do
       {:ok, turn} ->
         runner = state.runner

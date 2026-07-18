@@ -72,8 +72,25 @@ defmodule Tightbeam.Application do
   @spec root_opts() :: keyword()
   def root_opts, do: [strategy: :rest_for_one, name: Tightbeam.Supervisor, max_restarts: 3, max_seconds: 30]
 
+  @doc "True while the gateway is shutting down — lanes refuse new claims."
+  @spec draining?() :: boolean()
+  def draining?, do: :persistent_term.get({__MODULE__, :draining}, false)
+
   @impl true
   def prep_stop(state) do
+    # Graceful drain (deploys must not eat turns): flip the draining flag so
+    # lanes claim nothing new, then wait — bounded — for in-flight turns to
+    # finish. Whatever is still running after the deadline dies exactly as a
+    # crash would (failed_unknown, published with a reason at next boot);
+    # queued turns are durable and simply run after the restart.
+    :persistent_term.put({__MODULE__, :draining}, true)
+
+    deadline =
+      System.monotonic_time(:millisecond) +
+        Application.get_env(:tightbeam, :drain_timeout_ms, 90_000)
+
+    drain_until(deadline)
+
     # Clean-shutdown stamp MUST happen in prep_stop: stop/1 runs after the
     # supervision tree (and the DB) is already down, so stamping there would
     # silently fail and every shutdown would be inferred dirty at next boot.
@@ -86,6 +103,26 @@ defmodule Tightbeam.Application do
     end
 
     state
+  end
+
+  defp drain_until(deadline) do
+    running =
+      try do
+        {:ok, [[n]]} =
+          Tightbeam.DB.query(Tightbeam.DB, "SELECT COUNT(*) FROM turns WHERE status = 'running'")
+
+        n
+      catch
+        _, _ -> 0
+      end
+
+    cond do
+      running == 0 -> :ok
+      System.monotonic_time(:millisecond) >= deadline -> :ok
+      true ->
+        Process.sleep(250)
+        drain_until(deadline)
+    end
   end
 
   defp default_base_dir, do: Path.join(System.user_home!(), ".tightbeam")

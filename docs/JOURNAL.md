@@ -508,3 +508,14 @@ now carries the error column. Also fixed a silent test-hygiene miss:
 persistent_term cleanup in archetypes tests targeted a stale setup literal
 and never applied (Python replace without assert — the lesson is asserted
 replaces from now on).
+
+## Graceful drain (Fable) — deploys must not eat turns
+
+Flynn, after the deploy-broke-comms incident: a bounce's designed cost was
+still "in-flight turns die failed_unknown". Now: prep_stop flips a draining
+flag (lanes claim nothing new; queued turns stay durable and run next boot)
+and waits — bounded by :drain_timeout_ms, default 90s — for running turns
+to finish. Past the deadline, remaining turns die exactly as a crash: the
+graceful path is an optimization, the crash path remains the guarantee.
+SIGTERM (kill <pid>) triggers it; kill -9 skips it by nature, covered by
+recovery + terminal publisher. Deploy SOP: plain kill, wait for exit, start.
