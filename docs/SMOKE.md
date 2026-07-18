@@ -178,10 +178,18 @@ once: a `/new` that died pre-model with `Session not found`).
     replies "WAKE OK". Then `--after 15s` variant: fires after the delay
     (row visible in `tb list` until it fires).
 
-## Recording results
+## Recording results — the scorecard
 
-Note gateway commit hash, client build, date, and any step's deviation in
-docs/JOURNAL.md. A FAIL on any step blocks deploy of whatever changed.
+Every run produces a SCORECARD: copy `docs/smoke-runs/TEMPLATE.md` to
+`docs/smoke-runs/<date>-<short-sha>.md` and fill it in — one column per
+{harness x host} leg, one row per step (P1..P3, 1..23), each cell
+PASS / FAIL(note) / WAIVED(blocker) / N/A[claude-only]. The scorecard also
+carries a copy of the harness-support matrix's rows with a verified?
+column — a run is how matrix claims EARN their checkmarks, and a filled
+scorecard is the evidence the matrix cites. Gateway commit hash, client
+build, and date go in the header; deviations get a line each. A FAIL on
+any step blocks deploy of whatever changed; an incomplete leg without a
+named waiver blocks calling the run a pass at all.
 
 ## 9. Rails (gate statutes — deterministic tool refusal)
 
