@@ -560,3 +560,23 @@ no automatic outbox replay on reconnect — an observation for the Clawline
 upgrade, not a bug. Also still true: this build exposes no stop/cancel
 control. Lesson recorded: verify the failure is real before attributing —
 a blocked UI tap looks identical to a network drop from the DB's side.
+
+## Footer saga + set_harness (Fable)
+
+Flynn: footer stuck on "unavailable" even after the sessionKey fix. Root
+cause found DEFINITIVELY by compiling the client's own SessionStatus.swift
+into a CLI decoder and feeding it the live payload: modelCatalog.models[*]
+REQUIRES an `id` key (we sent ref/name/provider). Swift decode fails the
+whole document per missing key, and the client's failure state renders as
+"unavailable" — invisible server-side (200 + valid JSON every time). Fixed
+(id = ref), deployed, decoder now prints DECODE OK. LESSON, now practice:
+wire-contract checks against Swift clients must run the client's decoder,
+not eyeball JSON — harness kept at scripts/decode-status.swift (compile
+with the app's SessionStatus.swift + JSONValue.swift).
+
+Also landed: tune set_harness — engine swap on a live session (same
+identity, different harness; provider+model updated, model from the target
+harness's catalog when unspecified; old harness session can't load on the
+new engine so the existing fallback pointer path yields a fresh model
+context, chat history untouched). The spec's "swaps the engine underneath a
+stable identity" is now an actual verb.
