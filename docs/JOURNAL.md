@@ -745,3 +745,24 @@ review, security-review, deep-research, ...) alongside ours — harness-
 native, NOT a leak of eezo's personal ~/.claude skills (none of those
 appeared). Probe artifacts fully cleaned after (retire, rm skill w/ tars
 push, fragments+toml deleted, restart).
+
+Rails v1 shipped and live-fired on SHRDLU (per Flynn: testing belongs
+there, not on mike:main). Build: sol (gpt-5.6-sol high) against
+shared/specs/tightbeam/rails-v1-implementation.md — one dispatch, all six
+authorized files, gate green in well under the ceiling; review found one
+defect IN THE SPEC (byte-pinned stop_hook_active guard assumed compact
+JSON — a vendor formatting change would have left turns unable to end;
+guard made whitespace-tolerant in code/tests/spec). Shrdlu verification:
+fresh gateway + statutes.toml; claude home settings.json carries both
+hooks byte-correct; CLAUDE.md and codex AGENTS.md carry Standing law;
+codex gets no settings.json. Native claude -p inside the projected home:
+UserPromptSubmit injection CONFIRMED in the user turn (model quoted
+"[standing law: announce-new-work] ..." verbatim, named the mechanism);
+Stop hook bounced once, model addressed ticket-on-done, turn ENDED (loop
+guard released). Bonus: [turn failed] markers fired on shrdlu too. Found
+in the wild again: shrdlu's harvested smoke-era claude creds are DEAD —
+the leftover smoke gateways rotated the lineage (the rotation war,
+sighting #2); ACP turns failed with auth-masked "Invalid value for config
+option model" until a transient env token was used. Shrdlu needs the
+setup ceremony before becoming a real host. All my shrdlu test gateways
+stopped after the run.
