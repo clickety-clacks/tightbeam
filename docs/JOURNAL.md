@@ -550,3 +550,13 @@ Findings for follow-up:
   reported as not found, inadvertently proving tool execution).
 - OTP 28.0.2 on shrdlu logs a "use 28.1+" warning at boot — upgrade when
   convenient. pgrep-based process watching self-matches; use port/pid.
+
+Correction to smoke run #1: the "client silently drops posts while socket
+is down" finding is RETRACTED — the drain-window message never left the
+compose field (the automation's Send tap didn't register); the client
+neither sent nor dropped anything. What remains as fact: the client's
+offline story is failed-bubble + MANUAL tap-to-retry (resendFailedMessage);
+no automatic outbox replay on reconnect — an observation for the Clawline
+upgrade, not a bug. Also still true: this build exposes no stop/cancel
+control. Lesson recorded: verify the failure is real before attributing —
+a blocked UI tap looks identical to a network drop from the DB's side.
