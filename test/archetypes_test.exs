@@ -218,7 +218,7 @@ defmodule Tightbeam.ArchetypesTest do
     without_references = %{archetype | references: [], guidance: "Additional law."}
     compiled = Archetypes.guidance(without_references)
     refute compiled =~ "## Your materials"
-    assert String.ends_with?(compiled, "something to add.\n\nAdditional law.")
+    assert String.ends_with?(compiled, "read and act.\n\nAdditional law.")
   end
 
   test "fragments: operator files override built-ins and #include composes", ctx do
