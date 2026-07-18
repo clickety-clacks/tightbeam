@@ -29,7 +29,9 @@ defmodule Tightbeam.SessionLane do
     :runner,
     :task_sup,
     task_ref: nil,
+    task_pid: nil,
     current_seq: nil,
+    current_message_id: nil,
     quarantined: false
   ]
 
@@ -61,6 +63,22 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  @doc """
+  Cancel the turn in flight, if any. The LANE owns the kill: a CAS terminal
+  transition to "canceled" first (if the TurnTask finishes in the same
+  instant, the CAS decides the winner — exactly one terminal state either
+  way), then the task is killed and the lane drains on. Returns
+  {:ok, %{seq, message_id}} when this call won the transition; :not_running
+  when no turn is in flight or the turn just finished.
+  """
+  @spec cancel_current(String.t()) :: {:ok, %{seq: integer(), message_id: String.t()}} | :not_running | :no_lane
+  def cancel_current(session_key) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, :cancel_current)
+      [] -> :no_lane
+    end
+  end
+
   ## Server
 
   @impl true
@@ -75,6 +93,24 @@ defmodule Tightbeam.SessionLane do
 
     send(self(), :nudge)
     {:ok, state}
+  end
+
+  @impl true
+  def handle_call(:cancel_current, _from, %{task_ref: nil} = state),
+    do: {:reply, :not_running, state}
+
+  def handle_call(:cancel_current, _from, state) do
+    case Ledger.finish(state.db, state.current_seq, "canceled") do
+      :ok ->
+        reply = {:ok, %{seq: state.current_seq, message_id: state.current_message_id}}
+        if is_pid(state.task_pid), do: Process.exit(state.task_pid, :kill)
+        # The :DOWN for the killed task clears task_ref and drains; its
+        # finalize hits :already_terminal (we won the CAS) — no double publish.
+        {:reply, reply, state}
+
+      :already_terminal ->
+        {:reply, :not_running, state}
+    end
   end
 
   @impl true
@@ -121,7 +157,9 @@ defmodule Tightbeam.SessionLane do
 
         state
         |> Map.put(:task_ref, task.ref)
+        |> Map.put(:task_pid, task.pid)
         |> Map.put(:current_seq, turn.seq)
+        |> Map.put(:current_message_id, turn.message_id)
 
       :busy ->
         state

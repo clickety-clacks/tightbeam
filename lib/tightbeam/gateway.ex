@@ -140,6 +140,7 @@ defmodule Tightbeam.Gateway do
 
     router_deps =
       Map.merge(socket_deps, %{
+        base_dir: config.base_dir,
         cli_token: cli_token,
         session_status: &session_status/1,
         adapter_coordinator: Tightbeam.AdapterCoordinator
@@ -275,7 +276,7 @@ defmodule Tightbeam.Gateway do
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
       "inspect" => fn call -> inspect_result(db, call) end,
-      "cancel" => fn _call -> %{ok: false, code: "not_running", message: "no turn in flight"} end,
+      "cancel" => fn call -> cancel_result(db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
       "tune" => fn call -> tune_result(config, db, call) end,
       "retire" => fn call -> retire_result(db, call) end
@@ -538,6 +539,55 @@ defmodule Tightbeam.Gateway do
 
   # Adapter checkout with a HUMAN-readable failure: :degraded is an atom
   # for machines; the chat bubble names the host.
+  # Real cancel (gateway.ts cancelCurrent parity, upgraded): the lane owns
+  # the CAS-then-kill; here we broadcast the terminal frames and best-effort
+  # tell the harness to stop generating (ACP session/cancel notification —
+  # fire-and-forget; the substrate's truth is the ledger row either way).
+  defp cancel_result(db, call) do
+    case Tightbeam.SessionLane.cancel_current(call.session_key) do
+      {:ok, %{message_id: message_id, seq: seq}} ->
+        echo = Projection.get(db, message_id)
+        correlation = (echo && echo.client_message_id) || message_id
+        publish_turn_state(db, call.session_key, correlation, "canceled", nil)
+
+        with %{} = session <- Org.get(db, call.session_key) do
+          broadcast(db, session.owner_user_id, Payloads.assistant_typing(call.session_key, false))
+
+          broadcast(
+            db,
+            session.owner_user_id,
+            Payloads.activity_event(%{
+              is_active: false,
+              message_id: correlation,
+              session_key: call.session_key
+            })
+          )
+
+          harness_cancel(session)
+        end
+
+        Ledger.mark_published(db, seq)
+        %{ok: true}
+
+      _ ->
+        %{ok: false, code: "not_running", message: "no turn in flight"}
+    end
+  end
+
+  # Best-effort: the model should stop burning tokens, but a failure here
+  # changes nothing durable (the ledger row is already terminal).
+  defp harness_cancel(session) do
+    with %{harness_session_id: sid} <- Org.current_pointer(Tightbeam.DB, session.session_key),
+         key = {String.to_existing_atom(session.harness), session.archetype, session.host},
+         {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
+      Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{sessionId: sid})
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
   defp checkout_adapter(session) do
     key = {String.to_existing_atom(session.harness), session.archetype, session.host}
 

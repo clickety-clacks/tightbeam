@@ -421,3 +421,15 @@ Deficit audit prompted by Flynn's disconnected-host question. Three fixes:
    harness/archetype/host and pointing at /version, not the atom :degraded.
 Gate: 92 tests + 3 doctests green; wire-first-light re-PASS on the
 lazy-boot gateway.
+
+## Real cancel (Fable)
+
+Replaced the E2b cancel stub. The LANE owns the kill: cancel_current does a
+CAS terminal transition to "canceled" FIRST (if the TurnTask completes in
+the same instant the CAS decides the winner — exactly one terminal state
+either way), then kills the task; the killed task's :DOWN finalize hits
+:already_terminal, no double publish, and the lane drains on immediately.
+The gateway's cancel handler broadcasts canceled turn-state + typing/
+activity-off and best-effort notifies the harness via ACP session/cancel
+(fire-and-forget — the ledger row is the truth regardless). Lane test added;
+the drain-races-second-cancel window is documented in the test.

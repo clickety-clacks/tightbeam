@@ -99,4 +99,45 @@ defmodule Tightbeam.LaneTest do
         eventually(fun, tries - 1)
     end
   end
+
+  test "cancel_current CAS-cancels the running turn, kills the task, drains on", ctx do
+    test_pid = self()
+
+    runner = fn turn ->
+      send(test_pid, {:started, turn.prompt})
+
+      if turn.prompt == "hang" do
+        receive do: (:never -> :ok)
+      else
+        {:ok, %{}}
+      end
+    end
+
+    mgr_name = :"mgr_#{System.unique_integer([:positive])}"
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
+        runner: runner, interval: 60_000, name: mgr_name
+      )
+
+    {:ok, seq1} =
+      Ledger.enqueue(ctx.db, %{session_key: "k1", message_id: "m_hang", origin: "user:u", prompt: "hang"})
+
+    {:ok, _} =
+      Ledger.enqueue(ctx.db, %{session_key: "k1", message_id: "m_next", origin: "user:u", prompt: "next"})
+
+    :ok = LaneManager.ensure_lane(mgr_name, "k1")
+    assert_receive {:started, "hang"}
+
+    assert {:ok, %{seq: ^seq1, message_id: "m_hang"}} = SessionLane.cancel_current("k1")
+
+    # canceled is terminal and the lane drains to the next queued turn
+    # IMMEDIATELY (a second cancel in that window legitimately targets it).
+    assert_receive {:started, "next"}
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+    assert SessionLane.cancel_current("k1") == :not_running
+    {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq = ?1", [seq1])
+    assert status == "canceled"
+  end
 end
