@@ -463,3 +463,14 @@ surfaced three deficits, all confirmed against code:
    placement, refusals-name-rules. NOTE: this changes the default manifest
    hash → homes regenerate on next adapter start (identity change wipes
    nested harness session state by design).
+
+## De-branding + called-into-being orientation (Fable)
+
+Per Flynn: "dark factory" swept from the bible and ALL agent-facing text —
+it is one use of the substrate, not its identity (the substrate carries no
+ticketing/workflow machinery). Bible §Spirit/§What-it-is reworded; CLI help
+"in this factory" → "in this org". Orientation rewritten from the
+called-into-being POV: the agent doesn't live in Tightbeam — Tightbeam
+summoned it ("Between turns you are not running; you are woken. That is not
+a limitation. It is how you persist."). Guidance hash changes again →
+default homes regenerate on next adapter start.

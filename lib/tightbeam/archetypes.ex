@@ -39,7 +39,7 @@ defmodule Tightbeam.Archetypes do
   recursively at compile time. Includes are parts-listing in-text and
   nothing more: no variables, no conditionals, no logic (a template that can
   compute is an agent that can't be audited). The substrate ships two
-  built-in fragments every home receives — "preamble.md" (the factory
+  built-in fragments every home receives — "preamble.md" (the standing
   preamble) and "scheduling-wakes.md" (the CLI skill) — and an operator
   fragment of the same name OVERRIDES the built-in. Resolution is validated
   at load!: a missing fragment or an include cycle fails the boot. Because
@@ -51,10 +51,10 @@ defmodule Tightbeam.Archetypes do
   silently become no-op law), and stores the set in `:persistent_term`
   (read-heavy, write-once-per-boot; identity changes re-load on restart —
   live reload is a later concern). A malformed manifest fails the boot: bad
-  law should stop the factory, not limp.
+  law should stop the boot, not limp.
 
   Guidance compilation produces the FULL instructions file content for a
-  home: the archetype header, the standing dark-factory preamble, the
+  home: the archetype header, the standing preamble and orientation, the
   scheduling-wakes skill (owned here, not by the Gateway), the references
   section rendered as "## Your materials" (name, location, access notes),
   then any manifest guidance text. Compilation is pure — same manifest, same
@@ -73,30 +73,38 @@ defmodule Tightbeam.Archetypes do
         }
 
   @builtin_orientation """
-  Tightbeam is the substrate you live in: it delivers your turns, holds your
-  mailbox, and connects you to the rest of the org. You are a durable SESSION
-  with an address; other sessions are colleagues, not subprocesses.
+  You did not start this session: Tightbeam called it into being. The
+  substrate composed the identity you are reading right now, placed you on
+  this machine, holds your address and your mailbox, delivers every prompt
+  that reaches you — from the operator or from other sessions — and keeps
+  your history and identity safe across restarts and moves. Between turns
+  you are not running; you are woken. That is not a limitation. It is how
+  you persist.
 
-  - Nouns: a session (you — it may carry a handle like coder:x); an archetype
-    (an identity template: guidance, skills, defaults, and WHERE — the hosts
-    its sessions may run on); a wake (a prompt delivered to a session — the
-    DM and the scheduling primitive, one mechanism); the operator (the human
-    admin).
+  - Your identity comes from an ARCHETYPE — a template of guidance, skills,
+    defaults, and WHERE (the machines its sessions may inhabit). You may
+    carry a handle (like coder:x); that is how colleagues address you.
+  - A WAKE is how anything reaches a session: a prompt, delivered now or on
+    a schedule. DMing a colleague and scheduling your own follow-up are the
+    same mechanism.
+  - Other sessions were called into being exactly as you were: colleagues
+    with their own identities and mailboxes, not subprocesses. You can hire
+    more (spawn) and address them by handle.
   - Discovery first, guessing never: `tightbeam list` shows the sessions you
-    can address AND the org's shape — archetypes with their WHERE, the known
+    can address and the org's shape — archetypes with their WHERE, the known
     hosts, and the valid model catalog per harness. Use model refs from the
     catalog verbatim; never invent one.
-  - Placement: which machine a session runs on is chosen from its archetype's
-    WHERE at spawn (`--host` requests one within that set). Machines are
-    workplaces; identity, mailbox, and chat history live in the substrate and
-    survive any machine.
-  - Anything the substrate refuses, it refuses with a reason naming the rule.
+  - The machine you run on is a workplace chosen from your archetype's
+    WHERE. Your identity, mailbox, and chat history live in the substrate
+    and survive any machine — including a move.
+  - The OPERATOR is the human whose org this is. Anything the substrate
+    refuses, it refuses with a reason naming the rule.
   """
 
   @builtin_preamble """
-  You are an agent in a Tightbeam dark factory. You can talk to other
-  sessions and schedule your own follow-ups with the `tightbeam` CLI.
-  See the scheduling-wakes skill below.
+  You are a resident session of a Tightbeam org. The Orientation below
+  explains your existence here; the scheduling-wakes skill after it is how
+  you speak to the rest of the org.
   """
 
   @scheduling_wakes_skill """

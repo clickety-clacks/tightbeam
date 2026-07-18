@@ -126,7 +126,7 @@ defmodule Tightbeam.Gateway do
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
-    # boot (bad law stops the factory). Placement owns every host mechanic.
+    # boot (bad law stops the boot). Placement owns every host mechanic.
     Archetypes.load!(config.base_dir)
 
     adapter_opts = fn key -> Placement.adapter_opts(Map.put(config, :cli_bin, cli_bin), key) end
