@@ -31,7 +31,7 @@ defmodule Tightbeam.Acp.Adapter do
     }
   }
 
-  defstruct [:conn, :preset, :cwd, chunks: %{}, progress: %{}]
+  defstruct [:conn, :preset, :cwd, chunks: %{}, progress: %{}, known: MapSet.new()]
 
   ## Client
 
@@ -100,6 +100,16 @@ defmodule Tightbeam.Acp.Adapter do
 
   def progress_status(_update), do: :skip
 
+  @doc """
+  Whether THIS adapter process has created or loaded the harness session —
+  the authority for lazy re-adoption. Generation numbers reset across boots
+  (a fresh coordinator counts from 1 again), so comparing stamped
+  generations can spuriously match across a restart; asking the process
+  itself cannot.
+  """
+  @spec knows_session?(adapter(), String.t()) :: boolean()
+  def knows_session?(adapter, session_id), do: GenServer.call(adapter, {:knows_session?, session_id})
+
   @doc "The underlying Acp.Conn (for pending_count / quiescence probes)."
   @spec conn(adapter()) :: pid()
   def conn(adapter), do: GenServer.call(adapter, :conn)
@@ -146,14 +156,27 @@ defmodule Tightbeam.Acp.Adapter do
     sid = result["sessionId"]
     :ok = apply_model(state, sid, model)
     _ = Conn.request(state.conn, "session/set_mode", %{sessionId: sid, modeId: state.preset.yolo_mode})
+    state = %{state | known: MapSet.put(state.known, sid)}
     {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
   end
 
   def handle_call({:load_session, sid, model}, _from, state) do
-    {:ok, _} = Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: state.cwd})
-    :ok = apply_model(state, sid, model)
-    {:reply, :ok, put_in(state.chunks[sid], [])}
+    case Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: state.cwd}) do
+      {:ok, _} ->
+        :ok = apply_model(state, sid, model)
+        state = %{state | known: MapSet.put(state.known, sid)}
+        {:reply, :ok, put_in(state.chunks[sid], [])}
+
+      {:error, error} ->
+        # The harness no longer has this session (lost files, other host…).
+        # The caller falls back to a fresh session (pointer reason
+        # "fallback") — never a crash, never a silent retry.
+        {:reply, {:error, error}, state}
+    end
   end
+
+  def handle_call({:knows_session?, sid}, _from, state),
+    do: {:reply, MapSet.member?(state.known, sid), state}
 
   def handle_call({:prompt, sid, text, opts}, from, state) do
     state = put_in(state.chunks[sid], [])

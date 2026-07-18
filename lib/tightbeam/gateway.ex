@@ -685,13 +685,25 @@ defmodule Tightbeam.Gateway do
           end
 
         pointer ->
-          if Ledger.prior_adapter_generation(db, session.session_key, turn_seq) == generation do
+          # The adapter PROCESS is the authority on residency: stamped
+          # generations reset across boots and can spuriously match.
+          if Adapter.knows_session?(adapter, pointer.harness_session_id) do
             {:ok, pointer.harness_session_id}
           else
             AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, fn ->
-              with :ok <- Adapter.load_session(adapter, pointer.harness_session_id, session.model) do
-                Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
-                {:ok, pointer.harness_session_id}
+              case Adapter.load_session(adapter, pointer.harness_session_id, session.model) do
+                :ok ->
+                  Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
+                  {:ok, pointer.harness_session_id}
+
+                {:error, _lost} ->
+                  # Spec §pointer chain: reason "fallback" — the harness lost
+                  # the session; start fresh, on the record, model context
+                  # forfeited but chat history substrate-side and intact.
+                  with {:ok, sid} <- Adapter.new_session(adapter, session.model) do
+                    Org.append_pointer(db, session.session_key, sid, "fallback")
+                    {:ok, sid}
+                  end
               end
             end)
           end
