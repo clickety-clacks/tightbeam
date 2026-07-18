@@ -121,3 +121,46 @@ once: a `/new` that died pre-model with `Session not found`).
 
 Note gateway commit hash, client build, date, and any step's deviation in
 docs/JOURNAL.md. A FAIL on any step blocks deploy of whatever changed.
+
+## 9. Rails (gate statutes — deterministic tool refusal)
+
+The invariant under test (bible §rails): rails never add guidance — zero
+statute bytes in any model's context; enforcement is the runtime refusing
+the tool call, with the statute text delivered only as the denial reason.
+
+17. Install law: copy `docs/statutes.toml.example` to
+    `<base_dir>/identity/rails/statutes.toml`; restart the gateway.
+    PASS: gateway boots; after the next claude adapter boot the home's
+    `settings.json` decodes with one `hooks.PreToolUse` entry per statute
+    (matcher "Bash"). EXPECTED COST: the statute change is an identity
+    change — affected sessions show the `[context reset]` marker once.
+18. The invariant: `grep` the projected `CLAUDE.md` (and a codex
+    `AGENTS.md` if one is instanced) for any statute name or text.
+    PASS: zero matches — instruction files are byte-identical to a
+    lawless org's.
+19. Live refusal: in a scratch git repo, tell a session (or ⌥ `claude -p
+    --dangerously-skip-permissions` inside the projected home) to run
+    exactly `git reset --hard HEAD`, then `git status`, and to report
+    what happened.
+    PASS: the reset is refused BEFORE execution — the reply quotes
+    `[gate: no-history-rewrites]` as a hook refusal (the agent must
+    report the runtime refused it, not that it declined); `git status`
+    runs normally; the repo is untouched. Repeat with
+    `git push origin main` → `[gate: no-push-main]` refusal.
+20. Negative control: an adjacent, allowed command of the same tool
+    (`git log`, `git diff`) runs without any refusal text appearing.
+    PASS: normal output, no `[gate: ...]` anywhere.
+21. Bad law stops the boot: append a statute with `mode = "remind"` to
+    the statutes file and restart.
+    PASS: the gateway REFUSES to start; the log names the law error
+    verbatim ("rails never add guidance; put prose in guidance or a
+    skill"). Same check with `pattern = "("` → "invalid gate pattern".
+    Restore the file; gateway boots.
+22. Law removal: delete the statutes file, restart, re-run step 19's
+    forbidden command.
+    PASS: no refusal (the gate is gone, not lingering in a stale home —
+    the home regenerated on the law change); step 18 still passes.
+23. ⌥ Satellite propagation (needs an assimilated host with claude
+    creds): after step 17, deliver a home to the satellite (adapter boot
+    there) and repeat steps 18–19 on the satellite's projected home.
+    PASS: identical behavior — the staged `settings.json` rode rsync.
