@@ -29,8 +29,8 @@ defmodule Tightbeam.Wire.Router do
     (owner or admin; picker surface).
   - POST /api/session-control  — body {sessionKey, action}; actions map to
     verbs (cancel_current_run → cancel, set_* → tune); unknown action → 400.
-  - POST /upload, GET /download/:id — Assets (E3; not_implemented until
-    ported).
+  - POST /upload, GET /download/:id — owner-scoped Assets; admins may download
+    any asset.
 
   Elixir shape: `use Plug.Router`; deps (handlers table, db, cli_token,
   session_status fun) arrive via `init_opts` from the composition root and
@@ -40,10 +40,15 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
-  alias Tightbeam.{Devices, Dispatch, Org}
+  alias Tightbeam.{Assets, Devices, Dispatch, Org}
   alias Tightbeam.Wire.{Payloads, Socket}
 
   @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host)
+  @max_upload_bytes 32 * 1024 * 1024
+  @multipart_opts Plug.Parsers.init(
+                    parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
+                    pass: ["*/*"]
+                  )
 
   @impl Plug
   def call(conn, opts) do
@@ -211,16 +216,37 @@ defmodule Tightbeam.Wire.Router do
   end
 
   post "/upload" do
-    with {:ok, _device} <- device_auth(conn) do
-      error(conn, 501, "not_implemented")
+    with {:ok, device} <- device_auth(conn),
+         {:ok, upload, conn} <- read_upload(conn) do
+      data = File.read!(upload.path)
+
+      row =
+        Assets.put(
+          db(conn),
+          deps(conn).base_dir,
+          device.user_id,
+          upload.content_type,
+          upload.filename,
+          data
+        )
+
+      json(conn, 200, %{asset_id: row.asset_id, mime_type: row.mime_type, size: row.size})
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
   end
 
-  get "/download/:_asset_id" do
-    with {:ok, _device} <- device_auth(conn) do
-      error(conn, 501, "not_implemented")
+  get "/download/:asset_id" do
+    with {:ok, device} <- device_auth(conn),
+         {:ok, asset} <- visible_asset(asset_id, device, conn) do
+      conn
+      |> Plug.Conn.put_resp_header("content-type", asset.mime_type)
+      |> Plug.Conn.send_file(
+        200,
+        Assets.file_path(deps(conn).base_dir, asset.asset_id),
+        0,
+        asset.size
+      )
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -308,6 +334,32 @@ defmodule Tightbeam.Wire.Router do
       _ ->
         {:error, 404, "not_found", nil}
     end
+  end
+
+  defp visible_asset(asset_id, device, conn) do
+    case Assets.get(db(conn), asset_id) do
+      %{owner_user_id: owner} = asset when owner == device.user_id or device.is_admin ->
+        {:ok, asset}
+
+      _ ->
+        {:error, 404, "not_found", nil}
+    end
+  end
+
+  defp read_upload(conn) do
+    conn = Plug.Parsers.call(conn, @multipart_opts)
+
+    case conn.body_params["file"] do
+      %Plug.Upload{} = upload ->
+        if File.stat!(upload.path).size > @max_upload_bytes,
+          do: {:error, 413, "payload_too_large", nil},
+          else: {:ok, upload, conn}
+
+      _ ->
+        {:error, 400, "invalid_message", "multipart field 'file' required"}
+    end
+  rescue
+    Plug.Parsers.RequestTooLargeError -> {:error, 413, "payload_too_large", nil}
   end
 
   defp retire_target(key, body, device, conn) do

@@ -112,7 +112,7 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     File.mkdir_p!(config.base_dir)
 
-    for module <- [Devices, Idempotency, Wakes, Projection, Org] do
+    for module <- [Tightbeam.Assets, Devices, Idempotency, Wakes, Projection, Org] do
       :ok = module.ensure_schema(db)
     end
 

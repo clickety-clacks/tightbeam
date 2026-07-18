@@ -433,3 +433,16 @@ The gateway's cancel handler broadcasts canceled turn-state + typing/
 activity-off and best-effort notifies the harness via ACP session/cancel
 (fire-and-forget — the ledger row is the truth regardless). Lane test added;
 the drain-races-second-cancel window is documented in the test.
+
+## E5 — sol: assets
+
+Ported the final attachments wire gap from `assets.ts` and `http.ts`: camelCase
+adopt-in-place SQLite metadata, flat `assets/a_<uuid>` blob layout, request-
+process file I/O with no Assets process, 32 MiB multipart upload handling, and
+owner-or-admin downloads via file streaming. The live upload response remains
+the TS `{assetId, mimeType, size}` contract.
+
+TS discrepancy: Plug's multipart limit counts multipart headers and fields,
+where Busboy's `fileSize` limit counts only file bytes. The parser therefore
+gets Busboy's default 1,000,000-byte non-file allowance beyond the 32 MiB file
+cap, and the parsed `Plug.Upload` file itself is checked against exactly 32 MiB.
