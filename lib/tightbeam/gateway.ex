@@ -857,6 +857,7 @@ defmodule Tightbeam.Gateway do
                 :display_name,
                 :handle,
                 :archetype,
+                :host,
                 :harness,
                 :model,
                 :origin,
