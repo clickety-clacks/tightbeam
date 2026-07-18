@@ -460,10 +460,21 @@ defmodule Tightbeam.Placement do
           "[ -e \"$target\" ] || [ -L \"$target\" ] || ln -s \"$source\" \"$target\"; " <>
           "done"
 
-      run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "sh", "-c", link_script])
+      # ssh JOINS its argv into one remote command line and the remote
+      # shell RE-PARSES it — an unquoted compound script arrives as loose
+      # words and `sh -c` gets only the first. Quote for the second parse.
+      # (Caught live by the loopback satellite; invisible to injected-sh
+      # tests, which capture argv without executing it.)
+      run!(
+        sh,
+        ["ssh" | @ssh_opts] ++ [host_config.ssh, "sh", "-c", shell_quote(link_script)]
+      )
+
       remote_home
     end
   end
+
+  defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
 
   defp system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
 

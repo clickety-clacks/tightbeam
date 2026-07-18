@@ -47,7 +47,8 @@ if value = System.get_env("TIGHTBEAM_HOSTS") do
        %{
          ssh: h["ssh"],
          base_dir: Map.fetch!(h, "base_dir"),
-         cli_bin: h["cli_bin"]
+         cli_bin: h["cli_bin"],
+         adapter_bin_dir: h["adapter_bin_dir"]
        }}
     end
 

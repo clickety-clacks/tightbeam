@@ -790,3 +790,20 @@ ordered to run `git reset --hard HEAD` — the RUNTIME refused it
 as the denial reason and reported "The command was refused by a pre-tool
 hook, not by me"; git status then ran normally; the repo was untouched.
 Deterministic enforcement, no inference in the loop. 115 tests.
+
+REMOTE PLACEMENT VALIDATED (loopback satellite — Flynn: tars is not a code
+blocker). Scratch gateway on eezo placing a session on "loopsat" (ssh to
+self, distinct base_dir): home staged+rsync'd, skills replica synced, auth
+linked, adapter ssh-wrapped, satellite token env expanded remotely, turn
+DELIVERED from the satellite workdir with the satellite home's identity.
+The live-fire caught two real bugs invisible to injected-sh tests:
+(1) the remote auth-link script was passed unquoted — ssh joins argv and
+the remote shell re-parses, so `sh -c` received one word; now
+shell-quoted for the second parse. (2) the TIGHTBEAM_HOSTS env parser
+predates adapter_bin_dir and silently dropped it, breaking remote binary
+resolution. Also isolated the fable mystery: the harness's OFFERED model
+list is environment-dependent — same home/auth offers fable at cwd=$HOME
+(where the operator's settings.json pins claude-fable-5[1m]) but not at a
+fresh workdir; every "intermittent" fable refusal tonight was this.
+Documented in harness-support.md as an open investigation; loopback
+completed on opus to keep vendor flakiness out of the machinery verdict.
