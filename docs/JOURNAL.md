@@ -595,3 +595,37 @@ handle is your scheduled self (act, don't reply). Delivery mechanics
 confirmed unchanged and documented: a DM IS a turn (content delivered
 directly into context, no go-look pointer), and the lane serializes it
 behind any in-flight user turn — DMs never interrupt, they queue.
+
+## 2026-07-18 — deploy amnesia: loaded sessions abandoned over a refused model re-assert
+
+Flynn: mike:main "doesn't remember my earlier messages" with no /new issued.
+Pointer chain read 1 created + 10 fallbacks — every fallback a fresh harness
+session, model context gone (chat history intact substrate-side).
+
+Two contributing causes, one mechanism:
+1. Earlier in the evening: guidance churn changed the manifest hash, and the
+   hash-gated home projection correctly wiped the home — identity change
+   forfeits nested harness state by design. Those losses were expected.
+2. The recurring one: on the load path, `apply_model` re-asserts the
+   session's model after `session/load`. claude-agent-acp's valid-value set
+   for the model option is populated ASYNCHRONOUSLY and can lag adapter
+   boot — both live refusals ("Invalid value for config option model:
+   fable") landed within ~5s of adapter spawn; direct ACP probes minutes
+   later accepted the same value (and showed the valid list itself
+   shifting: `claude-fable-5` vs `claude-fable-5[1m]`). So the first turn
+   after every deploy could hit load → refused re-assert → fallback →
+   amnesia. Deploys drained turns cleanly and still cost memory.
+
+Fixes:
+- Adapter load path: apply_model after a successful load is BEST-EFFORT. A
+  loaded session already has a model; a refused config re-assert must never
+  cost the session's memory — continuity outranks the option. (This also
+  removes a residual `:ok = apply_model` match-raise the hardening pass had
+  missed on the load success branch.)
+- Gateway fallback branch: every fallback now records a `pointer_fallback`
+  lifecycle event carrying the load error — memory loss always has a row
+  and a reason (T5). Tonight's fallbacks were undiagnosable precisely
+  because the hardened path failed silently.
+
+Verification: deploy → turn → pointer reason `loaded` (SMOKE §7 step 14
+condition), and the session remembers pre-deploy turns.

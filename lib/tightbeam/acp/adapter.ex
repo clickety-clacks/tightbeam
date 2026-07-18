@@ -176,7 +176,11 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_call({:load_session, sid, model, cwd}, _from, state) do
     case Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: cwd}) do
       {:ok, _} ->
-        :ok = apply_model(state, sid, model)
+        # Best-effort: a loaded session already HAS a model. The option's
+        # valid set is populated asynchronously in the harness and can lag
+        # adapter boot, so a refused re-assert here must never cost the
+        # session's memory — continuity outranks the config option.
+        _ = apply_model(state, sid, model)
         state = %{state | known: MapSet.put(state.known, sid)}
         {:reply, :ok, put_in(state.chunks[sid], [])}
 

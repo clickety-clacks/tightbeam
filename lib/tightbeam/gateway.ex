@@ -770,10 +770,18 @@ defmodule Tightbeam.Gateway do
                   Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
                   {:ok, pointer.harness_session_id}
 
-                {:error, _lost} ->
+                {:error, lost} ->
                   # Spec §pointer chain: reason "fallback" — the harness lost
                   # the session; start fresh, on the record, model context
                   # forfeited but chat history substrate-side and intact.
+                  # A fallback is a memory loss: the WHY goes on the record.
+                  Tightbeam.EventLog.lifecycle(
+                    db,
+                    "pointer_fallback",
+                    session.session_key,
+                    inspect(lost)
+                  )
+
                   with {:ok, sid} <- Adapter.new_session(adapter, session.model, cwd) do
                     Org.append_pointer(db, session.session_key, sid, "fallback")
                     {:ok, sid}
