@@ -47,6 +47,32 @@ Per-harness annotations for the existing sections:
   path the Operations pointer names. PASS for codex is the agent quoting
   skill content it read on demand, not a claim of native discovery.
 
+## Preflight: credential validity (FIRST, before anything boots)
+
+Dead OAuth does not fail as "auth" downstream — it masquerades (an expired
+claude grant surfaces as "Invalid value for config option model: <ref>",
+because no auth → no model catalog → every value invalid; this cost a
+diagnostic hour on 2026-07-18). So the run starts by proving every grant
+in scope is LIVE, per {harness × host}: the gateway machine and every
+satellite a leg will place sessions on.
+
+P1. claude, per host (run ON the host; ssh for satellites):
+    `env CLAUDE_CONFIG_DIR=<scratch dir> CLAUDE_CODE_OAUTH_TOKEN=$(cat
+    <base_dir>/auth/claude/oauth-token) claude -p "reply with exactly: OK"`
+    — or, for file-credential installs, point CLAUDE_CONFIG_DIR at a
+    scratch copy of `<base_dir>/auth/claude` instead of the token env.
+    PASS: the reply "OK". FAIL signatures: "OAuth session expired and
+    could not be refreshed" (dead lineage — re-run the setup ceremony;
+    do NOT re-harvest a shared login), 401s.
+P2. codex, per host: `env CODEX_HOME=<base_dir>/auth/codex codex login
+    status`. PASS: reports logged in. (If the codex leg is waived for a
+    missing grant, say so here — the waiver is named at preflight, not
+    discovered mid-run.)
+P3. Rule: a preflight FAIL blocks that {harness × host} leg until fixed or
+    waived by name. After a clean preflight, any downstream auth-shaped
+    failure is a FINDING (something rotated or leaked mid-run), never
+    noise to shrug at.
+
 ## 0. Boot + pair
 
 1. Boot the gateway (fresh base_dir; auth seeded for the claude harness).
