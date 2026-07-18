@@ -35,6 +35,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert loaded["coder"] == %{
              name: "coder",
              where: ["work-1", "work-2"],
+             fallback_models: [],
              defaults: %{harness: :codex, model: "gpt-5.6-sol[medium]"},
              references: [
                %{name: "brief", location: "work-1:~/brief.md", access: nil},

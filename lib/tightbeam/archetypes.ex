@@ -18,6 +18,12 @@ defmodule Tightbeam.Archetypes do
       harness = "codex"                 # "claude" | "codex"
       model   = "gpt-5.6-sol[medium]"
 
+      fallback_models = ["fable"]       # optional PREFERENCE chain (may cross
+                                        # harnesses). Data only: surfaced to
+                                        # clients; SWITCHING is a reaction
+                                        # rail (deliberate, audited), never
+                                        # silent substrate retry.
+
       [references]                      # optional — named pointers to work
                                         # materials; compile into guidance
                                         # TEXT, never substrate machinery
@@ -69,6 +75,7 @@ defmodule Tightbeam.Archetypes do
           where: [String.t()],
           defaults: %{optional(:harness) => :claude | :codex, optional(:model) => String.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
+          fallback_models: [String.t()],
           guidance: String.t() | nil
         }
 
@@ -317,11 +324,18 @@ defmodule Tightbeam.Archetypes do
   @doc "The built-in default archetype (used when no manifest overrides it)."
   @spec builtin_default() :: t()
   def builtin_default do
-    %{name: "default", where: ["local"], defaults: %{}, references: [], guidance: nil}
+    %{
+      name: "default",
+      where: ["local"],
+      defaults: %{},
+      references: [],
+      fallback_models: [],
+      guidance: nil
+    }
   end
 
   defp validate!(manifest, path) do
-    allowed = MapSet.new(["name", "where", "defaults", "references", "guidance"])
+    allowed = MapSet.new(["name", "where", "defaults", "references", "fallback_models", "guidance"])
 
     unknown =
       manifest |> Map.keys() |> MapSet.new() |> MapSet.difference(allowed) |> MapSet.to_list()
@@ -372,10 +386,17 @@ defmodule Tightbeam.Archetypes do
 
         %{name: reference_name, location: location, access: reference["access"]}
       end)
+    fallback_models = Map.get(manifest, "fallback_models", [])
+
+    unless is_list(fallback_models) and Enum.all?(fallback_models, &is_binary/1) do
+      raise ArgumentError, "archetype fallback_models must be a list of strings: #{path}"
+    end
+
 
     %{
       name: name,
       where: where,
+      fallback_models: fallback_models,
       defaults: defaults,
       references: references,
       guidance: get_in(manifest, ["guidance", "text"])

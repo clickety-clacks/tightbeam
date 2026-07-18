@@ -380,6 +380,14 @@ defmodule Tightbeam.Gateway do
             [session_key]
           )
 
+        archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
+
+        fallback_models =
+          case archetype.fallback_models do
+            [] -> nil
+            chain -> chain
+          end
+
         {_model, effort} = Adapter.parse_model_ref(session.model)
         catalog = Map.fetch!(@model_catalog, session.harness)
         unsupported = fn reason -> %{supported: false, reason: reason} end
@@ -387,7 +395,7 @@ defmodule Tightbeam.Gateway do
         %{
           display: %{
             model: session.model,
-            fallbackModels: nil,
+            fallbackModels: fallback_models,
             provider: session.provider,
             harness: session.harness,
             authMode: nil,
@@ -697,7 +705,7 @@ defmodule Tightbeam.Gateway do
           archetypes:
             Enum.map(Archetypes.names(), fn name ->
               a = Archetypes.get(name)
-              %{name: a.name, where: a.where, defaults: a.defaults}
+              %{name: a.name, where: a.where, defaults: a.defaults, fallback_models: a.fallback_models}
             end),
           hosts: config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
           models: @model_catalog
