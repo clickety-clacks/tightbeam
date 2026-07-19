@@ -39,10 +39,17 @@ defmodule Tightbeam.Soak do
   end
 
   defp parse_options(argv) do
-    # `mix run script -- --flags` can deliver the literal "--" in argv, and
-    # OptionParser treats it as the end-of-flags marker, demoting every real
-    # flag to positional. Strip it; it carries no information here.
-    argv = Enum.reject(argv, &(&1 == "--"))
+    # `mix run script -- --flags` can deliver a LEADING literal "--" in
+    # argv, and OptionParser treats it as the end-of-flags marker, demoting
+    # every real flag to positional. Strip only that leading delimiter — a
+    # later "--" is the CALLER'S end-of-options marker and must keep its
+    # meaning (codex review finding: rejecting all of them silently
+    # legalized flag-shaped positionals).
+    argv =
+      case argv do
+        ["--" | rest] -> rest
+        other -> other
+      end
 
     {parsed, positional} =
       OptionParser.parse!(argv,
