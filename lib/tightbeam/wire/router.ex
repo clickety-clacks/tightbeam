@@ -96,7 +96,7 @@ defmodule Tightbeam.Wire.Router do
          {:ok, verb} <- required_string(body["verb"]),
          :ok <- allowed_agent_verb(verb),
          {:ok, origin} <- agent_origin(body, conn),
-         {:ok, session_key, target_meta} <- target_session(body["target"], conn) do
+         {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
       call = %{
         verb: verb,
         origin: origin,
@@ -334,33 +334,51 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp target_session(nil, _conn), do: {:ok, nil, %{role: nil, fallback: false}}
-  defp target_session("", _conn), do: {:ok, nil, %{role: nil, fallback: false}}
+  # Strictly typed target seam (spec Addendum A): the reference TYPE is
+  # carried by the field name — sessionKey | role | userId, exactly one —
+  # never inferred from a string's shape. Nothing here classifies; a
+  # request that offers none, several, or the retired `target` field is
+  # refused naming the seam. Modeled on the as/asUser/asProcess
+  # attribution fields, the seam that was always right.
+  @target_fields ["sessionKey", "role", "userId"]
 
-  defp target_session("agent:" <> _ = target, conn) do
-    case Org.get(db(conn), target) do
-      nil -> {:error, 404, "not_found", "unknown target: #{target}"}
-      session -> {:ok, session.session_key, %{role: nil, fallback: false}}
+  defp typed_target(verb, body, conn) do
+    given = Enum.filter(@target_fields, &is_binary(body[&1]))
+
+    cond do
+      is_binary(body["target"]) ->
+        {:error, 400, "invalid_message", ~s("target" is retired: use sessionKey | role | userId)}
+
+      length(given) > 1 ->
+        {:error, 400, "invalid_message", "exactly one of sessionKey, role, userId"}
+
+      verb == "retire" and (given == ["role"] or given == ["userId"]) ->
+        {:error, 400, "invalid_message", "retire takes sessionKey only"}
+
+      given == [] ->
+        {:ok, nil, %{role: nil, fallback: false}}
+
+      given == ["sessionKey"] ->
+        case Org.get(db(conn), body["sessionKey"]) do
+          nil -> {:error, 404, "not_found", "unknown sessionKey: #{body["sessionKey"]}"}
+          session -> {:ok, session.session_key, %{role: nil, fallback: false}}
+        end
+
+      given == ["userId"] ->
+        if Devices.user(db(conn), body["userId"]),
+          do: {:ok, Org.personal_session_key(body["userId"]), %{role: nil, fallback: false}},
+          else: {:error, 404, "not_found", "unknown userId: #{body["userId"]}"}
+
+      given == ["role"] ->
+        case Roles.resolve(db(conn), body["role"]) do
+          {:ok, session_key, fallback} ->
+            {:ok, session_key, %{role: body["role"], fallback: fallback}}
+
+          {:error, %{code: "unknown_role"}} ->
+            {:error, 404, "not_found", "unknown role: #{body["role"]}"}
+        end
     end
   end
-
-  defp target_session("user:" <> user_id, conn) do
-    if Devices.user(db(conn), user_id),
-      do: {:ok, Org.personal_session_key(user_id), %{role: nil, fallback: false}},
-      else: {:error, 404, "not_found", "unknown target: user:#{user_id}"}
-  end
-
-  defp target_session(target, conn) when is_binary(target) do
-    case Roles.resolve(db(conn), target) do
-      {:ok, session_key, fallback} ->
-        {:ok, session_key, %{role: target, fallback: fallback}}
-
-      {:error, %{code: "unknown_role"}} ->
-        {:error, 404, "not_found", "unknown role: #{target}"}
-    end
-  end
-
-  defp target_session(_target, _conn), do: {:ok, nil, %{role: nil, fallback: false}}
 
   defp owned_session(key, device, conn) do
     case Org.get(db(conn), key) do

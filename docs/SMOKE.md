@@ -172,7 +172,7 @@ once: a `/new` that died pre-model with `Session not found`).
 
 ## 8. Wakes (agent comms surface)
 
-16. ⌥ `tb wake <mainKey> --prompt "reply with exactly: WAKE OK" --as-user
+16. ⌥ `tb wake --session <mainKey> --prompt "reply with exactly: WAKE OK" --as-user
     <admin>`.
     PASS: the prompt appears in Main as a sender-tagged message; assistant
     replies "WAKE OK". Then `--after 15s` variant: fires after the delay
@@ -239,12 +239,14 @@ the tool call, with the statute text delivered only as the denial reason.
 Roles are substrate-level — run once per harness leg (bind to that leg's
 session where a binding is called for). ⌥ all steps are CLI/dispatch.
 
-24. Typed grammar: `wake user:<admin>` lands in the admin's Main;
-    `wake <admin-bare-word>` FAILS with "unknown role" (bare words are
-    role-typed, never user-typed); `wake agent:garbage` fails with
-    "unknown target" WITHOUT falling through to role lookup.
-    PASS: all three behave exactly so.
-25. Unstaffed office: `role create probe-office`, then `wake probe-office`.
+24. Typed target seam: `wake --user <admin>` lands in the admin's Main;
+    `wake --role <admin-id>` FAILS with "unknown role" (the field is the
+    type — a user id in the role field is a role lookup, period);
+    `wake --session agent:garbage` fails "unknown sessionKey"; sending
+    BOTH --role and --user fails "exactly one of"; the retired single
+    `target` param fails naming the three fields.
+    PASS: all five behave exactly so.
+25. Unstaffed office: `role create probe-office`, then `wake --role probe-office`.
     PASS: message lands in the role OWNER's Main; the turn row has
     roleRef='probe-office' AND roleFallback=1. DB is the check — fallback
     is recorded, never disguised.
@@ -257,9 +259,9 @@ session where a binding is called for). ⌥ all steps are CLI/dispatch.
     schedule time); turn row records the role and the new key.
 28. Reply spelling round trip: from the bound session, have the agent
     reply to a role-stamped message per its Comms guidance.
-    PASS: the agent wakes the bare role name (stripping `agent:`), and
-    for a user-stamped message uses `user:<id>` verbatim — no 404s.
-29. Deleted office: `role rm probe-office`, then `wake probe-office`.
+    PASS: for `[from agent:X]` the agent runs `wake --role X`; for
+    `[from user:Y]` it runs `wake --user Y` — typed flags, no 404s.
+29. Deleted office: `role rm probe-office`, then `wake --role probe-office`.
     PASS: named error ("unknown role: probe-office") — the name errors by
     name, never silently reroutes. A wake SCHEDULED before the rm and
     firing after it produces a `wake_unresolved` lifecycle row and no

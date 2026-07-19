@@ -77,7 +77,7 @@ defmodule Tightbeam.Wire.RouterTest do
       JSON.encode!(%{
         verb: "wake",
         as: "orchestrator:demo",
-        target: "orchestrator:demo",
+        role: "orchestrator:demo",
         params: %{prompt: "hi"}
       })
 
@@ -124,15 +124,25 @@ defmodule Tightbeam.Wire.RouterTest do
       model: "fable"
     })
 
-    assert dispatch_wake(ctx, "user:mike").status == 200
+    assert dispatch_wake(ctx, %{"userId" => "mike"}).status == 200
     assert_receive {:call, %{verb: "wake", session_key: ^main_key, target_role: nil}}
 
-    bare_user = dispatch_wake(ctx, "mike")
+    # The type is the FIELD: "mike" as a role is a role lookup, never a user.
+    bare_user = dispatch_wake(ctx, %{"role" => "mike"})
     assert bare_user.status == 404
     assert JSON.decode!(bare_user.resp_body)["error"]["message"] == "unknown role: mike"
 
-    unknown_user = dispatch_wake(ctx, "user:missing")
+    unknown_user = dispatch_wake(ctx, %{"userId" => "missing"})
     assert unknown_user.status == 404
+
+    # Seam validation: retired field teaches; unions are refused.
+    retired = dispatch_wake(ctx, %{"target" => "anything"})
+    assert retired.status == 400
+    assert JSON.decode!(retired.resp_body)["error"]["message"] =~ ~s("target" is retired)
+
+    union = dispatch_wake(ctx, %{"role" => "x", "userId" => "mike"})
+    assert union.status == 400
+    assert JSON.decode!(union.resp_body)["error"]["message"] == "exactly one of sessionKey, role, userId"
 
     key =
       Org.create(ctx.db, %{
@@ -147,11 +157,12 @@ defmodule Tightbeam.Wire.RouterTest do
         model: "fable"
       })
 
-    assert dispatch_wake(ctx, key.session_key).status == 200
+    assert dispatch_wake(ctx, %{"sessionKey" => key.session_key}).status == 200
     assert_receive {:call, %{session_key: "agent:direct", target_role: nil}}
 
-    unknown_key = dispatch_wake(ctx, "agent:missing")
+    unknown_key = dispatch_wake(ctx, %{"sessionKey" => "agent:missing"})
     assert unknown_key.status == 404
+    assert JSON.decode!(unknown_key.resp_body)["error"]["message"] =~ "unknown sessionKey"
 
     Org.create(ctx.db, %{
       session_key: "role-session",
@@ -168,7 +179,7 @@ defmodule Tightbeam.Wire.RouterTest do
     Roles.create!(ctx.db, "mike", "flynn", "role-session")
     Roles.create!(ctx.db, "fallback", "mike", nil)
 
-    assert dispatch_wake(ctx, "mike").status == 200
+    assert dispatch_wake(ctx, %{"role" => "mike"}).status == 200
 
     assert_receive {:call,
                     %{
@@ -178,7 +189,7 @@ defmodule Tightbeam.Wire.RouterTest do
                       role_fallback: false
                     }}
 
-    assert dispatch_wake(ctx, "fallback").status == 200
+    assert dispatch_wake(ctx, %{"role" => "fallback"}).status == 200
 
     assert_receive {:call,
                     %{
@@ -187,7 +198,7 @@ defmodule Tightbeam.Wire.RouterTest do
                       role_fallback: true
                     }}
 
-    unknown = dispatch_wake(ctx, "unknown-role")
+    unknown = dispatch_wake(ctx, %{"role" => "unknown-role"})
     assert unknown.status == 404
 
     assert JSON.decode!(unknown.resp_body) == %{
@@ -314,14 +325,14 @@ defmodule Tightbeam.Wire.RouterTest do
     |> Router.call(Router.init(ctx.opts))
   end
 
-  defp dispatch_wake(ctx, target) do
+  defp dispatch_wake(ctx, fields) when is_map(fields) do
     body =
-      JSON.encode!(%{
-        "verb" => "wake",
-        "asUser" => "flynn",
-        "target" => target,
-        "params" => %{"prompt" => "hi"}
-      })
+      JSON.encode!(
+        Map.merge(
+          %{"verb" => "wake", "asUser" => "flynn", "params" => %{"prompt" => "hi"}},
+          fields
+        )
+      )
 
     conn(:post, "/agent/dispatch", body)
     |> put_req_header("authorization", "Bearer tbc_test")

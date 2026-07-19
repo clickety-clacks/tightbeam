@@ -847,3 +847,19 @@ roleRef + resolution both times ("late-bind the future, pin the past"
 observed in the ledger). Bible gains the roles paragraph in §Primitives;
 handles subsumed (migration ran; empty — no handles existed in prod).
 138 Elixir tests, 14 CLI tests.
+
+TYPED TARGET SEAM (Flynn ruling: "it's either a userid, role, session
+key, never a union — basic tenet of typed apis"). The prefix-classified
+`target` string — a tagged-union-by-convention, and root of both
+adversarial findings — is gone. Verbs take exactly one of sessionKey |
+role | userId (modeled on the as/asUser/asProcess seam, which was always
+right); retire is sessionKey-only; the retired `target` field errors
+teaching the seam; CLI wake/retire take --session/--role/--user. Lane C
+by sol (20/20); lane E hand-built after a second zero-edit sol stall
+(killed at check-in per the rule). Overengineering review (Flynn asked):
+TransactionError raise/catch is the legitimate price of spawn atomicity —
+kept; migrate_handle duplicates create!'s insert for a one-time
+migration — noted, not churned; a stale classification-era comment on the
+name lexicon corrected (reservation kept for human-hostility, not
+parsing). Guidance rewritten to typed flags (identity change, homes
+regenerate once). SMOKE §10 steps updated to the flag forms.

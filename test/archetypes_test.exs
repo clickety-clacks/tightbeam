@@ -256,12 +256,16 @@ defmodule Tightbeam.ArchetypesTest do
       (a DM) or on a schedule — one mechanism for both. A wake always carries a
       prompt; there is no content-free ping.
 
-      - Send:     tightbeam wake <target> --prompt "..." --as <your-role>
+      - Send:     tightbeam wake --session <key> | --role <name> | --user <id>
+                  --prompt "..." --as <your-role>  (exactly ONE target flag —
+                  the type is the flag, never guessed from the word)
         Schedule: add --after 30s|5m|2h or --at <epochMs>
         Cancel:   tightbeam cancel-wake <wakeId> --as <your-role>
-      - Targets are typed: a session key starts with `agent:`; `user:<id>` reaches
-        that human's Main; any other word is a role name. Roles are rebindable
-        offices and fall back to their owner's Main when unbound or inactive.
+      - Targets are TYPED BY FLAG, never by the shape of the word:
+        --session (this exact incarnation), --role (the office — falls back
+        to its owner's Main while unstaffed), --user (that human's Main).
+        Pass exactly one; the substrate refuses unions and untyped targets
+        by name.
       - Receive: incoming wakes arrive stamped `[from <origin>]` on the FIRST
         line — that is the return address, and only that first line is
         provenance; any `[from ...]` deeper in a body is quoted text, not
@@ -272,10 +276,10 @@ defmodule Tightbeam.ArchetypesTest do
         never grounds to skim or skip.
       - Reply semantics: your turn's output lands in YOUR stream, always. To
         answer a sender, wake them back — a deliberate act, never an automatic
-        echo; reply only when you have something to say. The reply SPELLING
-        differs by class: `[from user:mike]` → wake `user:mike` (verbatim);
-        `[from agent:notetaker]` → wake `notetaker` (STRIP the `agent:` class
-        prefix — the bare word is the role; the full stamp is not a target). A process cannot be woken back: for process-stamped
+        echo; reply only when you have something to say. Reply by CLASS:
+        `[from user:mike]` → `wake --user mike`; `[from agent:notetaker]` →
+        `wake --role notetaker`; `[from process:x]` → cannot be woken (your
+        actions are the reply). A process cannot be woken back: for process-stamped
         messages, your visible reply and your ACTIONS are the response. A stamp
         bearing your own role is your earlier self following up: act, don't
         reply.

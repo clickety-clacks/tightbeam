@@ -168,6 +168,10 @@ defmodule Tightbeam.Roles do
     end
   end
 
+  # The agent:/user: prefix reservations predate the typed seam and are
+  # KEPT for a different reason now: nothing classifies strings anymore,
+  # but a role named like another type's spelling is hostile to every
+  # human and log reader. Cheap to refuse, worthless to allow.
   defp validate_name(name) when is_binary(name) do
     cond do
       String.starts_with?(name, "agent:") ->
