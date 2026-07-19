@@ -262,8 +262,10 @@ defmodule Tightbeam.Archetypes do
   - Skills: NO native discovery — the same skill files exist at the same
     paths in your home; READ them when the operator asks (the Operations
     pointer names the path).
-  - Rails gates: DO NOT EXIST here — codex has no hook surface. Never
-    claim a gate protects a codex session.
+  - Rails gates: NOT YET WIRED here. Codex 0.144+ DOES have a hook
+    surface (Claude-compatible), but tightbeam does not compile gates for
+    it yet — so today, never claim a gate protects a codex session; the
+    gap is tightbeam projection work, no longer the vendor.
   - Credentials: auth.json via codex login only; no token-env equivalent,
     so the rotation caveat applies to shared logins.
   - Slash-command vocabulary differs from claude and is unverified — do
