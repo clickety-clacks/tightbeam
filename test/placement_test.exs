@@ -313,7 +313,7 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "TIGHTBEAM_TOKEN=tbc_test",
              "PATH=/srv/tb/bin:$PATH",
-             "/opt/acp/codex-acp"
+             "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]
 
     assert opts[:home] == remote_home

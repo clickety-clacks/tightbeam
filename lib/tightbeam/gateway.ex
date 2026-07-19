@@ -71,6 +71,7 @@ defmodule Tightbeam.Gateway do
     Projection,
     Rails,
     Roles,
+    Spinup,
     Wakes
   }
 
@@ -1180,6 +1181,7 @@ defmodule Tightbeam.Gateway do
     defaults = defaults(config)
     harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
     harness_string = to_string(harness)
+    harness_atom = if harness_string == "codex", do: :codex, else: :claude
     sessions = Org.list_for_user(db, caller.owner_user_id, false)
 
     model =
@@ -1190,46 +1192,52 @@ defmodule Tightbeam.Gateway do
             if(harness == :codex or harness == "codex", do: "gpt-5.6-sol[medium]", else: "haiku")
         )
 
-    input = %{
-      display_name: p.display_name,
-      kind: "custom",
-      owner_user_id: caller.owner_user_id,
-      origin: call.origin,
-      spawned_by: caller.caller_session && caller.caller_session.session_key,
-      handle: p[:handle],
-      order_index: length(sessions),
-      archetype: archetype.name,
-      host: host,
-      harness: harness_string,
-      provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
-      model: model
-    }
+    case Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
+      {:error, denial} ->
+        denial
 
-    session_result =
-      DB.transaction(db, fn txn ->
-        session = Org.create_in_txn(txn, input)
+      :ok ->
+        input = %{
+          display_name: p.display_name,
+          kind: "custom",
+          owner_user_id: caller.owner_user_id,
+          origin: call.origin,
+          spawned_by: caller.caller_session && caller.caller_session.session_key,
+          handle: p[:handle],
+          order_index: length(sessions),
+          archetype: archetype.name,
+          host: host,
+          harness: harness_string,
+          provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
+          model: model
+        }
 
-        if p[:handle] do
-          Roles.create_in_txn!(
-            txn,
-            p.handle,
-            caller.owner_user_id,
-            session.session_key
-          )
+        session_result =
+          DB.transaction(db, fn txn ->
+            session = Org.create_in_txn(txn, input)
+
+            if p[:handle] do
+              Roles.create_in_txn!(
+                txn,
+                p.handle,
+                caller.owner_user_id,
+                session.session_key
+              )
+            end
+
+            session
+          end)
+
+        case session_result do
+          {:error, %Roles.TransactionError{error: error}} ->
+            error
+
+          {:error, error} ->
+            raise error
+
+          {:ok, session} ->
+            finish_spawn(db, call, caller, session)
         end
-
-        session
-      end)
-
-    case session_result do
-      {:error, %Roles.TransactionError{error: error}} ->
-        error
-
-      {:error, error} ->
-        raise error
-
-      {:ok, session} ->
-        finish_spawn(db, call, caller, session)
     end
   end
 
@@ -1265,6 +1273,7 @@ defmodule Tightbeam.Gateway do
 
           session ->
             harness = p.harness
+            harness_atom = if harness == "codex", do: :codex, else: :claude
             provider = if harness == "codex", do: "openai", else: "anthropic"
 
             model =
@@ -1273,22 +1282,45 @@ defmodule Tightbeam.Gateway do
                   [first | _] -> first.ref
                 end
 
-            Org.set_harness(db, call.session_key, harness, provider, model)
+            case Spinup.ensure_ready(
+                   config,
+                   harness_atom,
+                   session.host,
+                   spinup_opts(config, db)
+                 ) do
+              {:error, denial} ->
+                denial
 
-            # History barrier (product ruling): a new engine gets a fresh
-            # visible slate. Rows are RETAINED (never deleted) but replay
-            # stops at the barrier, and live clients are told to drop their
-            # local view. No pointer surgery: the old harness session can't
-            # load on the new engine → fallback pointer, fresh context.
-            {:ok, [[max_seq]]} =
-              DB.query(db, "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1", [
-                call.session_key
-              ])
+              :ok ->
+                Org.set_harness(db, call.session_key, harness, provider, model)
 
-            Org.set_cleared_through(db, call.session_key, max_seq)
-            broadcast(db, session.owner_user_id, Payloads.stream_history_cleared(call.session_key))
+                # History barrier (product ruling): a new engine gets a fresh
+                # visible slate. Rows are RETAINED (never deleted) but replay
+                # stops at the barrier, and live clients are told to drop their
+                # local view. No pointer surgery: the old harness session can't
+                # load on the new engine → fallback pointer, fresh context.
+                {:ok, [[max_seq]]} =
+                  DB.query(
+                    db,
+                    "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+                    [call.session_key]
+                  )
 
-            %{ok: true, harness: harness, model: model, note: "engine swapped; chat cleared (rows retained); model context starts fresh"}
+                Org.set_cleared_through(db, call.session_key, max_seq)
+
+                broadcast(
+                  db,
+                  session.owner_user_id,
+                  Payloads.stream_history_cleared(call.session_key)
+                )
+
+                %{
+                  ok: true,
+                  harness: harness,
+                  model: model,
+                  note: "engine swapped; chat cleared (rows retained); model context starts fresh"
+                }
+            end
         end
 
       p[:setting] == "set_host" and is_binary(p[:host]) ->
@@ -1304,13 +1336,21 @@ defmodule Tightbeam.Gateway do
                 Map.put(denial, :ok, false)
 
               {:ok, host} ->
-                case Placement.move_workdir(config, call.session_key, session.host, host) do
-                  :ok ->
-                    Org.set_host(db, call.session_key, host)
-                    %{ok: true, host: host}
+                harness = if session.harness == "codex", do: :codex, else: :claude
 
-                  {:error, message} ->
-                    %{code: "workdir_move_failed", message: message}
+                case Spinup.ensure_ready(config, harness, host, spinup_opts(config, db)) do
+                  {:error, denial} ->
+                    denial
+
+                  :ok ->
+                    case Placement.move_workdir(config, call.session_key, session.host, host) do
+                      :ok ->
+                        Org.set_host(db, call.session_key, host)
+                        %{ok: true, host: host}
+
+                      {:error, message} ->
+                        %{code: "workdir_move_failed", message: message}
+                    end
                 end
             end
         end
@@ -1349,6 +1389,10 @@ defmodule Tightbeam.Gateway do
             %{ok: true}
         end
     end
+  end
+
+  defp spinup_opts(config, db) do
+    if config[:sh], do: [db: db, sh: config.sh], else: [db: db]
   end
 
   defp retire_result(db, call) do

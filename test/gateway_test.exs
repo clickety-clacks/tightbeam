@@ -394,6 +394,62 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
   end
 
+  test "spawn readiness denial creates no session, role, or idempotency row", ctx do
+    base_dir = role_test_base("spawn-unready", false)
+    Archetypes.load!(base_dir)
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+
+    result =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{
+          display_name: "Unready",
+          handle: "unready",
+          idempotency_key: "spawn-unready"
+        }
+      })
+
+    assert %{code: "host_unready", message: message} = result
+    assert message =~ "no claude credentials"
+    assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    assert Roles.get(ctx.db, "unready") == nil
+    assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
+  end
+
+  test "spawn proceeds after a live remote readiness probe", ctx do
+    base_dir = move_test_base("spawn-ready")
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:spinup_command, command})
+      {"", 0}
+    end
+
+    start_supervised!(%{
+      id: :ready_spawn_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    spawn =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+
+    assert %{session_key: session_key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Remote",
+                 host: "worker",
+                 idempotency_key: "spawn-remote"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "worker"
+    assert_receive {:spinup_command, ["ssh" | _]}
+  end
+
   test "boot migration turns legacy handles into roles idempotently", ctx do
     legacy =
       Org.create(ctx.db, %{
@@ -535,7 +591,7 @@ defmodule Tightbeam.GatewayTest do
     parent = self()
 
     sh = fn command ->
-      send(parent, {:unexpected_command, command})
+      if hd(command) == "rsync", do: send(parent, {:unexpected_command, command})
       {"", 0}
     end
 
@@ -550,6 +606,43 @@ defmodule Tightbeam.GatewayTest do
 
     assert Org.get(ctx.db, "k1").host == "worker"
     refute_received {:unexpected_command, _}
+  end
+
+  test "set_host readiness denial leaves Org unchanged", ctx do
+    base_dir = move_test_base("readiness-denial")
+
+    sh = fn command ->
+      if String.contains?(List.last(command), "test -f"), do: {"", 1}, else: {"", 0}
+    end
+
+    tune =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+
+    assert %{code: "host_unready", message: message} =
+             tune.(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_host", host: "worker"}
+             })
+
+    assert message =~ "no claude credentials"
+    assert Org.get(ctx.db, "k1").host == "testhost"
+  end
+
+  test "set_harness readiness denial leaves Org unchanged", ctx do
+    base_dir = role_test_base("harness-unready", false)
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
+    before = Org.get(ctx.db, "k1")
+
+    assert %{code: "host_unready", message: message} =
+             tune.(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_harness", harness: "codex"}
+             })
+
+    assert message =~ "no codex credentials"
+    assert Org.get(ctx.db, "k1") == before
   end
 
   test "deliver_prompt commits echo+turn once and client duplicate short-circuits", ctx do
@@ -828,7 +921,7 @@ defmodule Tightbeam.GatewayTest do
     }
   end
 
-  defp role_test_base(suffix) do
+  defp role_test_base(suffix, ready? \\ true) do
     base_dir =
       Path.join(
         System.tmp_dir!(),
@@ -836,6 +929,12 @@ defmodule Tightbeam.GatewayTest do
       )
 
     File.mkdir_p!(base_dir)
+
+    if ready? do
+      auth_dir = Path.join([base_dir, "auth", "claude"])
+      File.mkdir_p!(auth_dir)
+      File.write!(Path.join(auth_dir, "oauth-token"), "test-token")
+    end
 
     on_exit(fn ->
       File.rm_rf!(base_dir)

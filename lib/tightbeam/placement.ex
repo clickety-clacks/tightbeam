@@ -352,17 +352,7 @@ defmodule Tightbeam.Placement do
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
     home = deliver_home(config, key, deliver_opts)
     host_config = Map.fetch!(hosts(config.base_dir), host)
-    adapter = if harness == :codex, do: "codex-acp", else: "claude-agent-acp"
-
-    binary =
-      if host_config.ssh == nil do
-        Path.expand("../tightbeam/node_modules/.bin/#{adapter}", File.cwd!())
-      else
-        case Map.get(host_config, :adapter_bin_dir) do
-          nil -> Path.expand("../tightbeam/node_modules/.bin/#{adapter}", host_config.base_dir)
-          adapter_bin_dir -> Path.join(adapter_bin_dir, adapter)
-        end
-      end
+    binary = adapter_binary_path(harness, host_config)
 
     stderr_path = Path.join(config.base_dir, "adapter-#{harness}:#{archetype}@#{host}.stderr.log")
 
@@ -416,6 +406,26 @@ defmodule Tightbeam.Placement do
         stderr_path: stderr_path,
         env: []
       ]
+    end
+  end
+
+  @doc """
+  Where a harness's ACP adapter lives on a host. Remote hosts have exactly
+  ONE answer — `<base_dir>/adapters/node_modules/.bin` — because adapters
+  are org-owned artifacts deployed by spinup to the org's lease; the old
+  per-host `adapter_bin_dir` hint was a drift-capable record of the kind
+  the topology ruling outlaws, and is no longer consulted (field removal
+  rides the assimilate-reduction follow-up). Local resolution is the
+  operator's repo checkout, unchanged.
+  """
+  @spec adapter_binary_path(:claude | :codex, host_config()) :: String.t()
+  def adapter_binary_path(harness, host_config) do
+    adapter = if harness == :codex, do: "codex-acp", else: "claude-agent-acp"
+
+    if host_config.ssh == nil do
+      Path.expand("../tightbeam/node_modules/.bin/#{adapter}", File.cwd!())
+    else
+      Path.join([host_config.base_dir, "adapters", "node_modules", ".bin", adapter])
     end
   end
 
