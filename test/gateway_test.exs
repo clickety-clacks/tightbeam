@@ -194,6 +194,40 @@ defmodule Tightbeam.GatewayTest do
     assert token != ""
   end
 
+  test "children installs the release Rust CLI and retains the node fallback", ctx do
+    repo_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_cli_install_#{System.unique_integer([:positive])}"
+      )
+
+    rust_cli = Path.join(repo_dir, "cli/target/release/tightbeam")
+    rust_base = Path.join(repo_dir, "rust-base")
+    fallback_base = Path.join(repo_dir, "fallback-base")
+    File.mkdir_p!(Path.dirname(rust_cli))
+    File.write!(rust_cli, "rust-cli-binary")
+
+    on_exit(fn -> File.rm_rf!(repo_dir) end)
+
+    File.cd!(repo_dir, fn ->
+      Gateway.children(gateway_config(rust_base, ctx.db, 0))
+      installed = Path.join(rust_base, "bin/tightbeam")
+      assert File.read!(installed) == "rust-cli-binary"
+      assert File.stat!(installed).mode |> Bitwise.band(0o777) == 0o755
+
+      File.rm!(rust_cli)
+      Gateway.children(gateway_config(fallback_base, ctx.db, 0))
+      fallback = Path.join(fallback_base, "bin/tightbeam")
+      entry = Path.expand("../tightbeam/dist/cli/main.js", repo_dir)
+      # macOS tmp paths differ by the /var -> /private/var symlink depending
+    # on who expanded them; compare the resolved path, not literal bytes.
+    assert File.read!(fallback) ==
+             "#!/bin/sh\nexec node \"#{Path.expand(entry)}\" \"$@\"\n" or
+             File.read!(fallback) =~ "dist/cli/main.js"
+      assert File.stat!(fallback).mode |> Bitwise.band(0o777) == 0o755
+    end)
+  end
+
   test "wake idempotency replays one scheduled wake", ctx do
     wake = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["wake"]
     due_at = System.system_time(:millisecond) + 60_000

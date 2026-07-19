@@ -559,8 +559,15 @@ defmodule Tightbeam.Gateway do
     bin_dir = Path.join(base_dir, "bin")
     File.mkdir_p!(bin_dir)
     wrapper = Path.join(bin_dir, "tightbeam")
-    entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
-    File.write!(wrapper, "#!/bin/sh\nexec node \"#{entry}\" \"$@\"\n")
+    rust_cli = Path.expand("cli/target/release/tightbeam", File.cwd!())
+
+    if File.exists?(rust_cli) do
+      File.cp!(rust_cli, wrapper)
+    else
+      entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
+      File.write!(wrapper, "#!/bin/sh\nexec node \"#{entry}\" \"$@\"\n")
+    end
+
     File.chmod!(wrapper, 0o755)
     bin_dir
   end
