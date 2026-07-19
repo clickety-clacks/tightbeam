@@ -50,12 +50,14 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
-    def handle_call({:new_session, _model, _cwd}, _from, parent),
-      do: {:reply, {:ok, "harness-1"}, parent}
+    def handle_call({:new_session, _model, _cwd, mcp_servers}, _from, parent) do
+      send(parent, {:new_session_mcp_servers, mcp_servers})
+      {:reply, {:ok, "harness-1"}, parent}
+    end
 
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
 
-    def handle_call({:load_session, _sid, _model, _cwd}, _from, parent),
+    def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers}, _from, parent),
       do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
 
     def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
@@ -700,6 +702,15 @@ defmodule Tightbeam.GatewayTest do
       })
 
     base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
+    manifests = Path.join([base, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "default.toml"), """
+    [mcp.xcodebuild]
+    command = "xcodebuildmcp"
+    args = ["--daemon"]
+    env = { XCODEBUILD_MCP_MODE = "cli" }
+    """)
 
     config = %{
       base_dir: base,
@@ -731,6 +742,19 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
     task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
+
+    assert_receive {:new_session_mcp_servers,
+                    [
+                      %{
+                        "name" => "xcodebuild",
+                        "command" => "xcodebuildmcp",
+                        "args" => ["--daemon"],
+                        "env" => [
+                          %{"name" => "XCODEBUILD_MCP_MODE", "value" => "cli"}
+                        ]
+                      }
+                    ]}
+
     assert_receive {:prompt_started, ^adapter}
     send(self(), {:push, Tightbeam.Wire.Payloads.ack("c_gold")})
     send(adapter, :continue_prompt)

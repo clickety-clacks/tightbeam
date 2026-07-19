@@ -64,13 +64,15 @@ defmodule Tightbeam.Acp.Adapter do
   un-isolated cwd leaks the operator's own guidance and files into the
   agent). Returns {:ok, session_id}.
   """
-  @spec new_session(adapter(), model_ref(), String.t()) :: {:ok, String.t()}
-  def new_session(adapter, model, cwd), do: GenServer.call(adapter, {:new_session, model, cwd}, 30_000)
+  @spec new_session(adapter(), model_ref(), String.t(), [map()]) :: {:ok, String.t()}
+  def new_session(adapter, model, cwd, mcp_servers),
+    do: GenServer.call(adapter, {:new_session, model, cwd, mcp_servers}, 30_000)
 
   @doc "Adopt an existing harness session at its workdir — re-applies the model; never trusts the advertised one."
-  @spec load_session(adapter(), String.t(), model_ref(), String.t()) :: :ok | {:error, term()}
-  def load_session(adapter, session_id, model, cwd),
-    do: GenServer.call(adapter, {:load_session, session_id, model, cwd}, 30_000)
+  @spec load_session(adapter(), String.t(), model_ref(), String.t(), [map()]) ::
+          :ok | {:error, term()}
+  def load_session(adapter, session_id, model, cwd, mcp_servers),
+    do: GenServer.call(adapter, {:load_session, session_id, model, cwd, mcp_servers}, 30_000)
 
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
@@ -158,8 +160,9 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
-  def handle_call({:new_session, model, cwd}, _from, state) do
-    with {:ok, result} <- Conn.request(state.conn, "session/new", %{cwd: cwd, mcpServers: []}),
+  def handle_call({:new_session, model, cwd, mcp_servers}, _from, state) do
+    with {:ok, result} <-
+           Conn.request(state.conn, "session/new", %{cwd: cwd, mcpServers: mcp_servers}),
          sid = result["sessionId"],
          :ok <- apply_model(state, sid, model) do
       _ = Conn.request(state.conn, "session/set_mode", %{sessionId: sid, modeId: state.preset.yolo_mode})
@@ -172,9 +175,12 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-
-  def handle_call({:load_session, sid, model, cwd}, _from, state) do
-    case Conn.request(state.conn, "session/load", %{sessionId: sid, cwd: cwd, mcpServers: []}) do
+  def handle_call({:load_session, sid, model, cwd, mcp_servers}, _from, state) do
+    case Conn.request(state.conn, "session/load", %{
+           sessionId: sid,
+           cwd: cwd,
+           mcpServers: mcp_servers
+         }) do
       {:ok, _} ->
         # Best-effort: a loaded session already HAS a model. The option's
         # valid set is populated asynchronously in the harness and can lag

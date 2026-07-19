@@ -83,6 +83,14 @@ defmodule Tightbeam.Archetypes do
           defaults: %{optional(:harness) => :claude | :codex, optional(:model) => String.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           fallback_models: [String.t()],
+          mcp: [
+            %{
+              name: String.t(),
+              command: String.t(),
+              args: [String.t()],
+              env: %{optional(String.t()) => String.t()}
+            }
+          ],
           guidance: String.t() | nil
         }
 
@@ -418,6 +426,22 @@ defmodule Tightbeam.Archetypes do
     Map.get(archetypes, name)
   end
 
+  @doc "Compile an archetype's MCP declarations to the ACP mcpServers shape."
+  @spec acp_mcp_servers(t()) :: [map()]
+  def acp_mcp_servers(archetype) do
+    Enum.map(archetype.mcp, fn server ->
+      %{
+        "name" => server.name,
+        "command" => server.command,
+        "args" => server.args,
+        "env" =>
+          server.env
+          |> Enum.sort_by(fn {name, _value} -> name end)
+          |> Enum.map(fn {name, value} -> %{"name" => name, "value" => value} end)
+      }
+    end)
+  end
+
   @doc "The loaded archetype map (name => archetype)."
   @spec all() :: %{optional(String.t()) => t()}
   def all do
@@ -649,13 +673,23 @@ defmodule Tightbeam.Archetypes do
       defaults: %{},
       references: [],
       fallback_models: [],
+      mcp: [],
       guidance: nil
     }
   end
 
   defp validate!(manifest, path) do
     allowed =
-      MapSet.new(["name", "skills", "where", "defaults", "references", "fallback_models", "guidance"])
+      MapSet.new([
+        "name",
+        "skills",
+        "where",
+        "defaults",
+        "references",
+        "fallback_models",
+        "guidance",
+        "mcp"
+      ])
 
     unknown =
       manifest |> Map.keys() |> MapSet.new() |> MapSet.difference(allowed) |> MapSet.to_list()
@@ -717,6 +751,7 @@ defmodule Tightbeam.Archetypes do
       raise ArgumentError, "archetype fallback_models must be a list of strings: #{path}"
     end
 
+    mcp = validate_mcp!(Map.get(manifest, "mcp", %{}))
 
     %{
       name: name,
@@ -725,9 +760,56 @@ defmodule Tightbeam.Archetypes do
       fallback_models: fallback_models,
       defaults: defaults,
       references: references,
+      mcp: mcp,
       guidance: get_in(manifest, ["guidance", "text"])
     }
   end
+
+  defp validate_mcp!(servers) do
+    # Deterministic NAME order: manifest order would carry no semantics
+    # (the harness receives a set) and recovering it from TOML would mean
+    # re-parsing raw text — complexity with no law behind it.
+    order = servers |> Map.keys() |> Enum.sort()
+
+    Enum.map(order, fn name ->
+      unless Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, name) do
+        raise ArgumentError, "invalid mcp server name: #{name}"
+      end
+
+      server = Map.fetch!(servers, name)
+      allowed = MapSet.new(["command", "args", "env"])
+
+      unknown =
+        server |> Map.keys() |> MapSet.new() |> MapSet.difference(allowed) |> MapSet.to_list()
+
+      if unknown != [] do
+        raise ArgumentError,
+              "mcp server #{name}: unknown mcp server keys: #{unknown |> Enum.sort() |> Enum.join(", ")}"
+      end
+
+      command = server["command"]
+
+      unless is_binary(command) and command != "" do
+        raise ArgumentError, ~s(mcp server #{name} is missing "command")
+      end
+
+      args = Map.get(server, "args", [])
+
+      unless is_list(args) and Enum.all?(args, &is_binary/1) do
+        raise ArgumentError, "mcp server #{name}: args must be a list of strings"
+      end
+
+      env = Map.get(server, "env", %{})
+
+      unless is_map(env) and
+               Enum.all?(env, fn {key, value} -> is_binary(key) and is_binary(value) end) do
+        raise ArgumentError, "mcp server #{name}: env must be string keys and values"
+      end
+
+      %{name: name, command: command, args: args, env: env}
+    end)
+  end
+
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
