@@ -258,10 +258,19 @@ pub fn build_register_host_request(
 }
 
 pub fn discover() -> Result<Endpoint, String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    #[allow(deprecated)]
+    let home = std::env::home_dir().unwrap_or_default();
     discover_with(|name| std::env::var(name).ok(), &home)
+}
+
+fn gateway_config_path<F>(get_env: &F, home_dir: &Path) -> PathBuf
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env("TIGHTBEAM_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir.join(".tightbeam"))
+        .join("gateway.json")
 }
 
 fn discover_with<F>(get_env: F, home_dir: &Path) -> Result<Endpoint, String>
@@ -274,11 +283,7 @@ where
         return Ok(Endpoint { base, token });
     }
 
-    let tightbeam_home = get_env("TIGHTBEAM_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir.join(".tightbeam"));
-    let path = tightbeam_home.join("gateway.json");
+    let path = gateway_config_path(&get_env, home_dir);
     let encoded = fs::read_to_string(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -422,6 +427,34 @@ mod tests {
             ]),
             r#"{"asProcess":"cron","verb":"wake","userId":"mike","params":{"prompt":"go","at":123}}"#
         );
+        assert_eq!(
+            body(&[
+                "wake",
+                "--user",
+                "mike",
+                "--prompt",
+                "go",
+                "--at",
+                "+1",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":1}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake",
+                "--user",
+                "mike",
+                "--prompt",
+                "go",
+                "--at",
+                "0x10",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
+        );
     }
 
     #[test]
@@ -530,6 +563,11 @@ mod tests {
                 base: "http://127.0.0.1:9876".to_owned(),
                 token: "default".to_owned()
             })
+        );
+        let env = HashMap::from([("TIGHTBEAM_HOME".to_owned(), String::new())]);
+        assert_eq!(
+            gateway_config_path(&|name| env.get(name).cloned(), &root),
+            PathBuf::from("gateway.json")
         );
         fs::remove_dir_all(root).unwrap();
     }

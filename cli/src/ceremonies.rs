@@ -229,24 +229,12 @@ pub fn setup_non_tty_message(base_dir: &str, harnesses: &[String]) -> String {
     format!("setup needs an interactive terminal. Run manually:\n{commands}")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CredentialStatus {
-    Harvested,
-    Present,
-    Pushed,
-    Missing,
-    Onboarded,
-}
-
-impl CredentialStatus {
-    fn parse(value: &str) -> Self {
-        match value {
-            "harvested" => Self::Harvested,
-            "present" => Self::Present,
-            "pushed" => Self::Pushed,
-            "onboarded" => Self::Onboarded,
-            _ => Self::Missing,
-        }
+fn credential_status(output: &str) -> String {
+    let status = output.trim();
+    if status.is_empty() {
+        "missing".to_owned()
+    } else {
+        status.to_owned()
     }
 }
 
@@ -297,7 +285,7 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
         })
     })?;
 
-    let mut credentials = Vec::<(String, CredentialStatus)>::new();
+    let mut credentials = Vec::<(String, String)>::new();
     step(io, "CREDENTIALS", command_failure, |io| {
         for harness in &args.harnesses {
             let flow = login_flow(harness).expect("harnesses were validated");
@@ -311,8 +299,8 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
                 "if [ -f {source} ]; then if [ -e {target} ]; then printf 'present\\n'; else cp {source} {target}; printf 'harvested\\n'; fi; else printf 'missing\\n'; fi"
             );
             let output = ssh(io, dry_run, &args.ssh_dest, &script)?;
-            let mut status = CredentialStatus::parse(output.trim());
-            if status == CredentialStatus::Missing && args.push_credentials {
+            let mut status = credential_status(&output);
+            if status == "missing" && args.push_credentials {
                 let local_credential = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
                     .join(flow.credential_file);
                 run_command(
@@ -326,12 +314,12 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
                         format!("{}:{resolved_base}/auth/{harness}/", args.ssh_dest),
                     ],
                 )?;
-                status = CredentialStatus::Pushed;
+                status = "pushed".to_owned();
                 io.log(&format!(
                     "[assimilate] CREDENTIALS: PUSHED LOCAL {harness} credentials to {}",
                     args.ssh_dest
                 ));
-            } else if status == CredentialStatus::Missing && !dry_run {
+            } else if status == "missing" && !dry_run {
                 io.warn(&format!(
                     "[assimilate] WARNING: no {harness} credentials found on the satellite; continuing"
                 ));
@@ -343,7 +331,7 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
 
     if !dry_run && !args.no_onboard {
         for (harness, status) in &mut credentials {
-            if *status != CredentialStatus::Missing {
+            if status != "missing" {
                 continue;
             }
             let harness = harness.clone();
@@ -366,7 +354,7 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
                         &[],
                     )
                 })?;
-                *status = CredentialStatus::Onboarded;
+                *status = "onboarded".to_owned();
             } else {
                 io.warn(&onboard_warning(&harness, &resolved_base));
             }
@@ -457,11 +445,11 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
         io.log("  credentials: dry run; not checked");
     } else {
         for (label, status) in [
-            ("onboarded (own grant)", CredentialStatus::Onboarded),
-            ("harvested", CredentialStatus::Harvested),
-            ("already present", CredentialStatus::Present),
-            ("pushed", CredentialStatus::Pushed),
-            ("missing", CredentialStatus::Missing),
+            ("onboarded (own grant)", "onboarded"),
+            ("harvested", "harvested"),
+            ("already present", "present"),
+            ("pushed", "pushed"),
+            ("missing", "missing"),
         ] {
             io.log(&format!(
                 "  credentials {label}: {}",
@@ -573,9 +561,10 @@ fn shell_quote(value: &str) -> String {
 
 fn remote_path(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
-        if rest
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte))
+        if !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte))
         {
             return path.to_owned();
         }
@@ -605,13 +594,7 @@ pub fn onboard_warning(harness: &str, resolved_base: &str) -> String {
 }
 
 fn local_target_triple() -> &'static str {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        _ => "unknown-target",
-    }
+    env!("TIGHTBEAM_BUILD_TARGET")
 }
 
 fn target_from_probe(output: &str) -> Option<String> {
@@ -632,10 +615,10 @@ fn target_from_probe(output: &str) -> Option<String> {
     }
 }
 
-fn by_status(credentials: &[(String, CredentialStatus)], status: CredentialStatus) -> String {
+fn by_status(credentials: &[(String, String)], status: &str) -> String {
     let names = credentials
         .iter()
-        .filter(|(_, value)| *value == status)
+        .filter(|(_, value)| value == status)
         .map(|(harness, _)| harness.as_str())
         .collect::<Vec<_>>()
         .join(", ");
@@ -733,6 +716,24 @@ mod tests {
             onboard_warning("codex", "/org"),
             "[assimilate] no terminal for codex onboarding — run on the satellite: CODEX_HOME=/org/auth/codex codex login"
         );
+    }
+
+    #[test]
+    fn credential_status_defaults_only_empty_output_to_missing() {
+        assert_eq!(credential_status("\n"), "missing");
+        assert_eq!(credential_status("present\n"), "present");
+        assert_eq!(credential_status("unexpected\n"), "unexpected");
+    }
+
+    #[test]
+    fn empty_tilde_suffix_is_shell_quoted_like_typescript() {
+        assert_eq!(remote_path("~/"), "~/''");
+        assert_eq!(remote_path("~/.tightbeam"), "~/.tightbeam");
+    }
+
+    #[test]
+    fn local_target_is_the_cargo_compile_target() {
+        assert_eq!(local_target_triple(), env!("TIGHTBEAM_BUILD_TARGET"));
     }
 
     #[test]

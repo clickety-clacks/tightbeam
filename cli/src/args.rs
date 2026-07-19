@@ -28,8 +28,8 @@ pub enum Command {
         identity: Identity,
         target: Target,
         prompt: String,
-        after_ms: Option<u64>,
-        at: Option<serde_json::Value>,
+        after_ms: Option<String>,
+        at: Option<String>,
     },
     Spawn {
         identity: Identity,
@@ -298,39 +298,117 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
     }
 }
 
-pub fn parse_after(text: &str) -> Result<u64, String> {
+pub fn parse_after(text: &str) -> Result<String, String> {
     let (digits, multiplier) = if let Some(value) = text.strip_suffix("ms") {
-        (value, 1)
+        (value, 1.0)
     } else if let Some(value) = text.strip_suffix('s') {
-        (value, 1_000)
+        (value, 1_000.0)
     } else if let Some(value) = text.strip_suffix('m') {
-        (value, 60_000)
+        (value, 60_000.0)
     } else if let Some(value) = text.strip_suffix('h') {
-        (value, 3_600_000)
+        (value, 3_600_000.0)
     } else {
         return Err(bad_after(text));
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(bad_after(text));
     }
-    digits
-        .parse::<u64>()
-        .ok()
-        .and_then(|value| value.checked_mul(multiplier))
-        .ok_or_else(|| bad_after(text))
+    let value = digits
+        .parse::<f64>()
+        .expect("an ASCII digit sequence parses as a JavaScript number");
+    Ok(js_number_json(value * multiplier))
 }
 
 fn bad_after(text: &str) -> String {
     format!("bad --after value: {text} (use e.g. 30s, 5m, 2h)")
 }
 
-fn ts_number(text: &str) -> serde_json::Value {
-    if text.trim().is_empty() {
-        return serde_json::Value::from(0);
+fn number_coercion(text: &str) -> f64 {
+    let text =
+        text.trim_matches(|character: char| character.is_whitespace() || character == '\u{feff}');
+    if text.is_empty() {
+        return 0.0;
     }
-    text.parse::<serde_json::Number>()
-        .map(serde_json::Value::Number)
-        .unwrap_or(serde_json::Value::Null)
+
+    for (prefix, radix) in [
+        ("0x", 16),
+        ("0X", 16),
+        ("0b", 2),
+        ("0B", 2),
+        ("0o", 8),
+        ("0O", 8),
+    ] {
+        if let Some(digits) = text.strip_prefix(prefix) {
+            if digits.is_empty() {
+                return f64::NAN;
+            }
+            let mut value = 0.0;
+            for digit in digits.chars() {
+                let Some(digit) = digit.to_digit(radix) else {
+                    return f64::NAN;
+                };
+                value = value * f64::from(radix) + f64::from(digit);
+            }
+            return value;
+        }
+    }
+
+    match text {
+        "Infinity" | "+Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        _ => text.parse::<f64>().unwrap_or(f64::NAN),
+    }
+}
+
+fn js_number_json(value: f64) -> String {
+    if !value.is_finite() {
+        return "null".to_owned();
+    }
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+
+    let negative = value.is_sign_negative();
+    let rendered = value.abs().to_string();
+    let (mantissa, explicit_exponent) =
+        rendered
+            .split_once(['e', 'E'])
+            .map_or((rendered.as_str(), 0), |(mantissa, exponent)| {
+                (
+                    mantissa,
+                    exponent.parse::<i32>().expect("f64 exponent is valid"),
+                )
+            });
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len());
+    let mut digits = mantissa.replace('.', "");
+    let leading_zeroes = digits.bytes().take_while(|byte| *byte == b'0').count();
+    digits.drain(..leading_zeroes);
+    let exponent = explicit_exponent + decimal as i32 - leading_zeroes as i32 - 1;
+
+    let body = if (-6..=20).contains(&exponent) {
+        let decimal = exponent + 1;
+        if decimal <= 0 {
+            format!("0.{}{}", "0".repeat((-decimal) as usize), digits)
+        } else if decimal as usize >= digits.len() {
+            format!("{}{}", digits, "0".repeat(decimal as usize - digits.len()))
+        } else {
+            let decimal = decimal as usize;
+            format!("{}.{}", &digits[..decimal], &digits[decimal..])
+        }
+    } else {
+        while digits.ends_with('0') {
+            digits.pop();
+        }
+        let fraction = if digits.len() > 1 {
+            format!(".{}", &digits[1..])
+        } else {
+            String::new()
+        };
+        let sign = if exponent >= 0 { "+" } else { "" };
+        format!("{}{fraction}e{sign}{exponent}", &digits[..1])
+    };
+
+    if negative { format!("-{body}") } else { body }
 }
 
 fn generated_key() -> String {
@@ -378,7 +456,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             let after_ms = nonempty(flags, "after")
                 .map(|value| parse_after(&value))
                 .transpose()?;
-            let at = nonempty(flags, "at").map(|value| ts_number(&value));
+            let at = nonempty(flags, "at").map(|value| js_number_json(number_coercion(&value)));
             Ok(Command::Wake {
                 identity: identity(flags)?,
                 target: targets.into_iter().next().expect("exactly one target"),
@@ -559,7 +637,9 @@ fn parse_skill(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comman
                 name.ok_or_else(|| "usage: tightbeam skill put <name> --file <path>".to_owned())?;
             let path = nonempty(flags, "file")
                 .ok_or_else(|| "usage: tightbeam skill put <name> --file <path>".to_owned())?;
-            let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+            let content = fs::read(path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .map_err(|error| error.to_string())?;
             Ok(Command::SkillPut {
                 identity: identity(flags)?,
                 name,
@@ -607,14 +687,39 @@ mod tests {
 
     #[test]
     fn parses_all_duration_units() {
-        assert_eq!(parse_after("30s"), Ok(30_000));
-        assert_eq!(parse_after("5m"), Ok(300_000));
-        assert_eq!(parse_after("2h"), Ok(7_200_000));
-        assert_eq!(parse_after("250ms"), Ok(250));
+        assert_eq!(parse_after("30s"), Ok("30000".to_owned()));
+        assert_eq!(parse_after("5m"), Ok("300000".to_owned()));
+        assert_eq!(parse_after("2h"), Ok("7200000".to_owned()));
+        assert_eq!(parse_after("250ms"), Ok("250".to_owned()));
+        assert_eq!(
+            parse_after("18446744073709551616ms"),
+            Ok("18446744073709552000".to_owned())
+        );
         assert_eq!(
             parse_after("soon"),
             Err("bad --after value: soon (use e.g. 30s, 5m, 2h)".to_owned())
         );
+    }
+
+    #[test]
+    fn coerces_and_serializes_numbers_like_javascript() {
+        for (input, expected) in [
+            ("+1", "1"),
+            ("0x10", "16"),
+            ("0b10", "2"),
+            ("0o10", "8"),
+            ("1.0", "1"),
+            ("1e20", "100000000000000000000"),
+            ("1e21", "1e+21"),
+            ("1e-6", "0.000001"),
+            ("1e-7", "1e-7"),
+            ("Infinity", "null"),
+            ("not-a-number", "null"),
+            ("-0", "0"),
+            ("\u{feff}1\u{feff}", "1"),
+        ] {
+            assert_eq!(js_number_json(number_coercion(input)), expected);
+        }
     }
 
     #[test]
@@ -722,5 +827,33 @@ mod tests {
         ]);
         fs::remove_file(skill_path).unwrap();
         assert!(matches!(skill_put, Ok(Command::SkillPut { .. })));
+    }
+
+    #[test]
+    fn skill_put_decodes_invalid_utf8_with_replacement_characters() {
+        let skill_path = std::env::temp_dir().join(format!(
+            "tightbeam_invalid_utf8_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&skill_path, [b'a', 0xff, b'b']).unwrap();
+        let command = parse(vec![
+            "skill".to_owned(),
+            "put".to_owned(),
+            "bytes".to_owned(),
+            "--file".to_owned(),
+            skill_path.display().to_string(),
+            "--as-user".to_owned(),
+            "flynn".to_owned(),
+        ])
+        .unwrap();
+        fs::remove_file(skill_path).unwrap();
+
+        assert!(matches!(
+            command,
+            Command::SkillPut { content, .. } if content == "a\u{fffd}b"
+        ));
     }
 }

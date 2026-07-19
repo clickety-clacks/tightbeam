@@ -218,12 +218,9 @@ defmodule Tightbeam.GatewayTest do
       File.rm!(rust_cli)
       Gateway.children(gateway_config(fallback_base, ctx.db, 0))
       fallback = Path.join(fallback_base, "bin/tightbeam")
-      entry = Path.expand("../tightbeam/dist/cli/main.js", repo_dir)
-      # macOS tmp paths differ by the /var -> /private/var symlink depending
-    # on who expanded them; compare the resolved path, not literal bytes.
-    assert File.read!(fallback) ==
-             "#!/bin/sh\nexec node \"#{Path.expand(entry)}\" \"$@\"\n" or
-             File.read!(fallback) =~ "dist/cli/main.js"
+      entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
+
+      assert File.read!(fallback) == "#!/bin/sh\nexec node \"#{entry}\" \"$@\"\n"
       assert File.stat!(fallback).mode |> Bitwise.band(0o777) == 0o755
     end)
   end
