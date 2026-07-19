@@ -296,6 +296,9 @@ defmodule Tightbeam.ArchetypesTest do
 
     refute File.exists?(Path.join(Archetypes.skills_dir(ctx.base_dir), "swift/concurrency"))
 
+    assert {:error, %{code: "unknown_skill", message: "unknown skill: missing"}} =
+             Archetypes.rm_skill(ctx.base_dir, "missing")
+
     # Traversal never escapes the library.
     assert_raise ArgumentError, ~r/invalid skill name/, fn ->
       Archetypes.put_skill!(ctx.base_dir, "../escape", "nope")

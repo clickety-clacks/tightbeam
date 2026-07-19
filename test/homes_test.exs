@@ -279,6 +279,23 @@ defmodule Tightbeam.HomesTest do
     assert File.read!(store) == "rotated-twice"
   end
 
+  test "credential sweep discovers known regular credentials absent from the store", %{
+    base_dir: base_dir
+  } do
+    auth_dir = Path.join([base_dir, "auth", "codex"])
+    File.rm_rf!(auth_dir)
+    home = Path.join([base_dir, "homes", "abandoned-id", "codex"])
+    File.mkdir_p!(home)
+    File.write!(Path.join(home, ".credentials.json"), "rotated")
+    File.write!(Path.join(home, "AGENTS.md"), "instructions")
+    File.write!(Path.join(home, ".tightbeam-manifest"), "manifest")
+
+    assert :ok = Homes.sweep_auth(base_dir, :codex)
+    assert File.read!(Path.join(auth_dir, ".credentials.json")) == "rotated"
+    refute File.exists?(Path.join(auth_dir, "AGENTS.md"))
+    refute File.exists?(Path.join(auth_dir, ".tightbeam-manifest"))
+  end
+
   defp home_spec(overrides) do
     Map.merge(
       %{

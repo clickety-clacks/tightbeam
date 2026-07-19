@@ -119,6 +119,45 @@ defmodule Tightbeam.PlacementTest do
     end
   end
 
+  test "reconstruction refuses active sessions with colliding effective content", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    base = Archetypes.load!(base_dir)["default"]
+    first = %{"guidance_extra" => "First"}
+    second = %{"guidance_extra" => "Second"}
+
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "fable",
+      db: db
+    }
+
+    identity_name = Placement.identity_name(config, base, first, :codex)
+
+    for {session_key, overrides} <- [{"first", first}, {"second", second}] do
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: session_key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        overrides: overrides,
+        identity_name: identity_name,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+    end
+
+    assert_raise ArgumentError, ~r/identity name collision/, fn ->
+      Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+    end
+  end
+
   test "overridden adapters keep MCP and model pins on the base while all identity paths use --",
        %{base_dir: base_dir, db: db} do
     manifests = Path.join([base_dir, "identity", "archetypes"])

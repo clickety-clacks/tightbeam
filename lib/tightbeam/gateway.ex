@@ -312,48 +312,53 @@ defmodule Tightbeam.Gateway do
         admin_handler(db, fn p ->
           root = p.name |> String.split("/") |> hd()
 
-          pinned_sessions =
-            if p.name == root,
-              do: pin_override_sessions(config.base_dir, db, root),
-              else: []
+          if Enum.any?(Archetypes.list_skills(config.base_dir), &(&1.name == p.name)) do
+            pinned_sessions =
+              if p.name == root,
+                do: pin_override_sessions(config.base_dir, db, root),
+                else: []
 
-          case Archetypes.rm_skill(config.base_dir, p.name) do
-            {:ok, removal} ->
-              action = if p.name == root, do: :rm, else: :put
+            reproject_pinned_sessions(config, pinned_sessions)
+            {:ok, removal} = Archetypes.rm_skill(config.base_dir, p.name)
+            action = if p.name == root, do: :rm, else: :put
+            pushed = Placement.push_skill(config, root, action)
 
-              notified =
-                db
-                |> Org.list_for_user("", true)
-                |> Enum.flat_map(fn session ->
-                  cond do
-                    Enum.any?(pinned_sessions, &(&1.session_key == session.session_key)) ->
-                      prompt =
-                        "The skill \"#{p.name}\" was removed from the library, but your session " <>
-                          "elected it at spawn, so your copy is preserved. Use \"tune\" override " <>
-                          "removal if you no longer want it."
+            notified =
+              db
+              |> Org.list_for_user("", true)
+              |> Enum.flat_map(fn session ->
+                cond do
+                  Enum.any?(pinned_sessions, &(&1.session_key == session.session_key)) ->
+                    prompt =
+                      "The skill \"#{p.name}\" was removed from the library, but your session " <>
+                        "elected it at spawn, so your copy is preserved. Use \"tune\" override " <>
+                        "removal if you no longer want it."
 
-                      notify_session(config, db, session.session_key, prompt)
-                      [session.session_key]
+                    notify_session(config, db, session.session_key, prompt)
+                    [session.session_key]
 
-                    session.archetype in removal.archetype_electors ->
-                      prompt =
-                        "The skill \"#{p.name}\" has been removed from this org's library. " <>
-                          "Disregard it, including anything from it already in your context."
+                  session.archetype in removal.archetype_electors ->
+                    prompt =
+                      "The skill \"#{p.name}\" has been removed from this org's library. " <>
+                        "Disregard it, including anything from it already in your context."
 
-                      notify_session(config, db, session.session_key, prompt)
-                      [session.session_key]
+                    notify_session(config, db, session.session_key, prompt)
+                    [session.session_key]
 
-                    true ->
-                      []
-                  end
-                end)
+                  true ->
+                    []
+                end
+              end)
 
-              %{
-                removed: p.name,
-                pushed: Placement.push_skill(config, root, action),
-                notified: notified,
-                manifest_warnings: removal.manifest_warnings
-              }
+            %{
+              removed: p.name,
+              pushed: pushed,
+              notified: notified,
+              manifest_warnings: removal.manifest_warnings
+            }
+          else
+            {:error, error} = Archetypes.rm_skill(config.base_dir, p.name)
+            error
           end
         end),
       "skill-list" =>
@@ -1106,6 +1111,18 @@ defmodule Tightbeam.Gateway do
     sessions
   end
 
+  defp reproject_pinned_sessions(config, sessions) do
+    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+
+    sessions
+    |> Enum.filter(&(&1.state == "active"))
+    |> Enum.map(fn session ->
+      {String.to_existing_atom(session.harness), session.identity_name, session.host}
+    end)
+    |> Enum.uniq()
+    |> Enum.each(&Placement.deliver_home(config, &1, deliver_opts))
+  end
+
   defp override_skill_names(nil), do: []
   defp override_skill_names(overrides), do: Map.get(overrides, "skills_add", [])
 
@@ -1443,7 +1460,14 @@ defmodule Tightbeam.Gateway do
                 denial
 
               :ok ->
-                Org.set_harness(db, call.session_key, harness, provider, model)
+                updated = Org.set_harness(db, call.session_key, harness, provider, model)
+                deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+
+                Placement.deliver_home(
+                  config,
+                  {harness_atom, updated.identity_name, updated.host},
+                  deliver_opts
+                )
 
                 # History barrier (product ruling): a new engine gets a fresh
                 # visible slate. Rows are RETAINED (never deleted) but replay

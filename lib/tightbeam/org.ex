@@ -204,18 +204,24 @@ defmodule Tightbeam.Org do
   @doc "An active session carrying an effective identity name, or nil."
   @spec active_by_identity_name(db(), String.t()) :: session() | nil
   def active_by_identity_name(db \\ Tightbeam.DB, identity_name) do
+    case active_all_by_identity_name(db, identity_name) do
+      [session | _] -> session
+      [] -> nil
+    end
+  end
+
+  @doc "All active sessions carrying an effective identity name."
+  @spec active_all_by_identity_name(db(), String.t()) :: [session()]
+  def active_all_by_identity_name(db \\ Tightbeam.DB, identity_name) do
     {:ok, rows} =
       DB.query(
         db,
         select_session_sql() <>
-          " WHERE identityName = ?1 AND state = 'active' ORDER BY createdAt, sessionKey LIMIT 1",
+          " WHERE identityName = ?1 AND state = 'active' ORDER BY createdAt, sessionKey",
         [identity_name]
       )
 
-    case rows do
-      [row] -> to_session(row)
-      [] -> nil
-    end
+    Enum.map(rows, &to_session/1)
   end
 
   @doc "Whether any session row still references an effective identity name."

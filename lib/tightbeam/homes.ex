@@ -58,6 +58,7 @@ defmodule Tightbeam.Homes do
         }
 
   @stamp_file ".tightbeam-manifest"
+  @known_credential_files [".credentials.json", "oauth-token", "auth.json"]
 
   @doc """
   Projects one home from its spec: the harness instruction file, extra files,
@@ -143,13 +144,17 @@ defmodule Tightbeam.Homes do
     |> canonical_json()
   end
 
-  @doc "Full digest used to derive an overridden identity name."
+  @doc "Harness-independent digest used to derive an overridden identity name."
   @spec identity_fingerprint(spec()) :: String.t()
   def identity_fingerprint(spec) do
-    spec
-    |> Map.delete(:identity_sha256)
-    |> manifest_bytes()
-    |> sha256()
+    skill_names =
+      spec
+      |> Map.get(:skills, [])
+      |> Enum.map(& &1.name)
+      |> Enum.sort()
+      |> Enum.intersperse(<<0>>)
+
+    sha256([spec.guidance, <<0>>, skill_names])
   end
 
   @doc "Recover newer regular-file credentials from every projected home for one harness."
@@ -157,38 +162,40 @@ defmodule Tightbeam.Homes do
   def sweep_auth(base_dir, harness) do
     auth_dir = Path.join([base_dir, "auth", Atom.to_string(harness)])
     home_dirs = Path.wildcard(Path.join([base_dir, "homes", "*", Atom.to_string(harness)]))
+    instruction_file = if harness == :claude, do: "CLAUDE.md", else: "AGENTS.md"
+    File.mkdir_p!(auth_dir)
 
-    case File.ls(auth_dir) do
-      {:ok, files} ->
-        for file <- files do
-          store_path = Path.join(auth_dir, file)
-          store_mtime = regular_mtime(store_path)
+    store_files =
+      auth_dir
+      |> File.ls!()
+      |> MapSet.new()
 
-          newest =
-            home_dirs
-            |> Enum.map(&Path.join(&1, file))
-            |> Enum.flat_map(fn path ->
-              case regular_mtime(path) do
-                nil -> []
-                mtime -> [{mtime, path}]
-              end
-            end)
-            |> Enum.max_by(&elem(&1, 0), fn -> nil end)
+    home_dirs
+    |> Enum.flat_map(fn home_dir ->
+      home_dir
+      |> File.ls!()
+      |> Enum.reject(&(&1 in [@stamp_file, instruction_file]))
+      |> Enum.filter(&(MapSet.member?(store_files, &1) or &1 in @known_credential_files))
+      |> Enum.flat_map(fn file ->
+        path = Path.join(home_dir, file)
 
-          case newest do
-            {mtime, path} when is_nil(store_mtime) or mtime > store_mtime ->
-              File.cp!(path, store_path)
-
-            _ ->
-              :ok
-          end
+        case regular_mtime(path) do
+          nil -> []
+          mtime -> [{file, mtime, path}]
         end
+      end)
+    end)
+    |> Enum.group_by(&elem(&1, 0))
+    |> Enum.each(fn {file, entries} ->
+      {^file, mtime, path} = Enum.max_by(entries, &elem(&1, 1))
+      store_path = Path.join(auth_dir, file)
 
-        :ok
+      if is_nil(regular_mtime(store_path)) or mtime > regular_mtime(store_path) do
+        File.cp!(path, store_path)
+      end
+    end)
 
-      {:error, :enoent} ->
-        :ok
-    end
+    :ok
   end
 
   # Skills project OUTSIDE the hash gate on every call: idempotent symlinks

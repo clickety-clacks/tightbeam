@@ -422,16 +422,14 @@ defmodule Tightbeam.Placement do
   @spec identity_name(map(), Archetypes.t(), map(), :claude | :codex, String.t()) :: String.t()
   def identity_name(_config, archetype, nil, _harness, _source_identity_name), do: archetype.name
 
-  def identity_name(config, archetype, overrides, harness, source_identity_name) do
+  def identity_name(config, archetype, overrides, _harness, source_identity_name) do
     effective =
       Archetypes.effective(archetype, overrides,
         base_dir: config.base_dir,
         identity_name: source_identity_name
       )
 
-    refs = skill_refs(config.base_dir, archetype, effective, overrides, source_identity_name)
-    spec = projection_spec(config, harness, archetype.name, archetype, effective, refs)
-    digest = Homes.identity_fingerprint(spec)
+    digest = effective_identity_fingerprint(effective)
     archetype.name <> "--" <> binary_part(digest, 0, 16)
   end
 
@@ -441,22 +439,36 @@ defmodule Tightbeam.Placement do
     if String.contains?(identity_name, "--") do
       db = Map.get(config, :db, Tightbeam.DB)
 
-      case Org.active_by_identity_name(db, identity_name) do
-        nil ->
+      case Org.active_all_by_identity_name(db, identity_name) do
+        [] ->
           raise ArgumentError, "no active session carries identity #{identity_name}"
 
-        session ->
-          base =
-            Archetypes.get(session.archetype) || raise "unknown archetype: #{session.archetype}"
+        sessions ->
+          resolved =
+            Enum.map(sessions, fn session ->
+              base =
+                Archetypes.get(session.archetype) ||
+                  raise "unknown archetype: #{session.archetype}"
 
-          effective =
-            Archetypes.effective(base, session.overrides,
-              base_dir: config.base_dir,
-              db: db,
-              identity_name: identity_name
-            )
+              effective =
+                Archetypes.effective(base, session.overrides,
+                  base_dir: config.base_dir,
+                  db: db,
+                  identity_name: identity_name
+                )
 
-          {base, effective, session.overrides}
+              {effective_identity_fingerprint(effective), base, effective, session.overrides}
+            end)
+
+          case resolved |> Enum.map(&elem(&1, 0)) |> Enum.uniq() do
+            [_fingerprint] ->
+              [{_fingerprint, base, effective, overrides} | _] = resolved
+              {base, effective, overrides}
+
+            _fingerprints ->
+              raise ArgumentError,
+                    "identity name collision: active sessions carry distinct effective content for #{identity_name}"
+          end
       end
     else
       base = Archetypes.get(identity_name) || raise "unknown archetype: #{identity_name}"
@@ -735,6 +747,13 @@ defmodule Tightbeam.Placement do
   defp with_identity_fingerprint(spec, _overrides),
     do: Map.put(spec, :identity_sha256, Homes.identity_fingerprint(spec))
 
+  defp effective_identity_fingerprint(effective) do
+    Homes.identity_fingerprint(%{
+      guidance: Archetypes.guidance(effective),
+      skills: Enum.map(effective.skills, &%{name: &1})
+    })
+  end
+
   defp skill_refs(base_dir, base, effective, overrides, identity_name) do
     skill_refs(
       base_dir,
@@ -760,12 +779,10 @@ defmodule Tightbeam.Placement do
 
     Enum.map(effective.skills, fn name ->
       provenance = if name in override_names, do: "override", else: "template"
-      local_library = Path.join(Archetypes.skills_dir(base_dir), name)
       local_pinned = Path.join([base_dir, "identity", "pinned", identity_name, name])
 
       {linkage, link_to} =
-        if provenance == "override" and not File.exists?(local_library) and
-             File.exists?(local_pinned) do
+        if provenance == "override" and File.exists?(local_pinned) do
           {"pinned", Path.join(pinned_dir, name)}
         else
           {"linked", Path.join(library_dir, name)}

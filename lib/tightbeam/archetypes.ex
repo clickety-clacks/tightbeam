@@ -829,9 +829,19 @@ defmodule Tightbeam.Archetypes do
   """
   @spec rm_skill(String.t(), String.t()) ::
           {:ok, %{archetype_electors: [String.t()], manifest_warnings: [String.t()]}}
+          | {:error, %{code: String.t(), message: String.t()}}
   def rm_skill(base_dir, name) do
     relative = validate_skill_path!(name)
+    path = Path.join(skills_dir(base_dir), relative)
 
+    if not File.exists?(path) do
+      {:error, %{code: "unknown_skill", message: "unknown skill: #{relative}"}}
+    else
+      remove_skill(path, relative)
+    end
+  end
+
+  defp remove_skill(path, relative) do
     electors =
       if relative =~ "/" do
         []
@@ -850,7 +860,7 @@ defmodule Tightbeam.Archetypes do
           "edit it before the next restart (boot validation is fail-closed)"
       end)
 
-    File.rm_rf!(Path.join(skills_dir(base_dir), relative))
+    File.rm_rf!(path)
     {:ok, %{archetype_electors: electors, manifest_warnings: warnings}}
   end
 

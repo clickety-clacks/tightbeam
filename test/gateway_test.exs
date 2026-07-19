@@ -566,6 +566,18 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
+  test "skill-rm returns unknown_skill without notifications for a missing skill", ctx do
+    base_dir = role_test_base("skill-rm-missing")
+    Archetypes.load!(base_dir)
+
+    remove = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["skill-rm"]
+
+    assert %{code: "unknown_skill", message: "unknown skill: missing"} =
+             remove.(%{origin: "user:flynn", params: %{name: "missing"}})
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
   test "invalid spawn overrides fail before spinup or any session side effect", ctx do
     base_dir = role_test_base("invalid-overrides")
     Archetypes.load!(base_dir)
@@ -684,6 +696,11 @@ defmodule Tightbeam.GatewayTest do
         model: "fable"
       })
 
+    home = Placement.deliver_home(config, {:claude, identity_name, "testhost"})
+    old_stamp = File.read!(Path.join(home, ".tightbeam-manifest"))
+    marker = Path.join(home, "old-home-marker")
+    File.write!(marker, "remove on regeneration")
+
     handlers = Gateway.handlers(config)
     removed = handlers["skill-rm"].(%{origin: "user:flynn", params: %{name: "review"}})
     assert removed.notified == [session.session_key]
@@ -692,8 +709,10 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(pinned) == "# Preserved review content"
     refute File.exists?(Path.join([Archetypes.skills_dir(base_dir), "review"]))
 
-    home = Placement.deliver_home(config, {:claude, identity_name, "testhost"})
     assert File.read_link!(Path.join(home, "skills/review")) == Path.dirname(pinned)
+    assert Org.get(ctx.db, session.session_key).identity_name == identity_name
+    refute File.exists?(marker)
+    refute File.read!(Path.join(home, ".tightbeam-manifest")) == old_stamp
 
     manifest = home |> Path.join(".tightbeam-manifest") |> File.read!() |> JSON.decode!()
 
@@ -1046,6 +1065,44 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "no codex credentials"
     assert Org.get(ctx.db, "k1") == before
+  end
+
+  test "set_harness keeps an overridden identity name and projects the new harness home", ctx do
+    base_dir = role_test_base("harness-override")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.put_skill!(base_dir, "review", "# Review")
+    base = Archetypes.load!(base_dir)["default"]
+
+    {:ok, overrides} =
+      Archetypes.normalize_overrides(base_dir, base, %{"skills_add" => ["review"]})
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    start_supervised!(%{
+      id: :harness_override_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    identity_name = Placement.identity_name(config, base, overrides, :claude)
+    assert Placement.identity_name(config, base, overrides, :codex) == identity_name
+    Org.set_identity(ctx.db, "k1", overrides, identity_name)
+
+    assert %{ok: true, harness: "codex"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_harness", harness: "codex"}
+             })
+
+    assert Org.get(ctx.db, "k1").identity_name == identity_name
+    home = Path.join([base_dir, "homes", identity_name, "codex"])
+    assert File.exists?(Path.join(home, "AGENTS.md"))
+    assert JSON.decode!(File.read!(Path.join(home, ".tightbeam-manifest")))["harness"] == "codex"
   end
 
   test "deliver_prompt commits echo+turn once and client duplicate short-circuits", ctx do
