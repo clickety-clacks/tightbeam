@@ -313,13 +313,14 @@ defmodule Tightbeam.Gateway do
           root = p.name |> String.split("/") |> hd()
 
           if Enum.any?(Archetypes.list_skills(config.base_dir), &(&1.name == p.name)) do
-            pinned_sessions =
+            {pinned_sessions, staged_pins} =
               if p.name == root,
-                do: pin_override_sessions(config.base_dir, db, root),
-                else: []
+                do: stage_override_sessions(config.base_dir, db, root),
+                else: {[], []}
 
-            reproject_pinned_sessions(config, pinned_sessions)
             {:ok, removal} = Archetypes.rm_skill(config.base_dir, p.name)
+            commit_pinned_sessions(staged_pins)
+            reproject_pinned_sessions(config, pinned_sessions)
             action = if p.name == root, do: :rm, else: :put
             pushed = Placement.push_skill(config, root, action)
 
@@ -1087,28 +1088,55 @@ defmodule Tightbeam.Gateway do
     )
   end
 
-  defp pin_override_sessions(base_dir, db, skill) do
+  defp stage_override_sessions(base_dir, db, skill) do
     source = Path.join(Archetypes.skills_dir(base_dir), skill)
+
+    staging_root =
+      Path.join([
+        base_dir,
+        "identity",
+        "staging",
+        "pins-#{System.unique_integer([:positive])}"
+      ])
 
     sessions =
       db
       |> Org.list_all()
       |> Enum.filter(&(skill in override_skill_names(&1.overrides)))
 
-    sessions
-    |> Enum.uniq_by(& &1.identity_name)
-    |> Enum.each(fn session ->
-      destination =
-        Path.join([base_dir, "identity", "pinned", session.identity_name, skill])
+    staged_pins =
+      sessions
+      |> Enum.uniq_by(& &1.identity_name)
+      |> Enum.map(fn session ->
+        staged = Path.join([staging_root, session.identity_name, skill])
 
-      if File.exists?(source) do
-        File.rm_rf!(destination)
-        File.mkdir_p!(Path.dirname(destination))
-        File.cp_r!(source, destination)
-      end
+        destination =
+          Path.join([base_dir, "identity", "pinned", session.identity_name, skill])
+
+        if File.exists?(source) do
+          File.mkdir_p!(Path.dirname(staged))
+          File.cp_r!(source, staged)
+        end
+
+        {staged, destination}
+      end)
+
+    {sessions, staged_pins}
+  end
+
+  defp commit_pinned_sessions(staged_pins) do
+    Enum.each(staged_pins, fn {staged, destination} ->
+      File.rm_rf!(destination)
+      File.mkdir_p!(Path.dirname(destination))
+      File.cp_r!(staged, destination)
     end)
 
-    sessions
+    staged_pins
+    |> List.first()
+    |> case do
+      nil -> :ok
+      {staged, _destination} -> File.rm_rf!(staged |> Path.dirname() |> Path.dirname())
+    end
   end
 
   defp reproject_pinned_sessions(config, sessions) do
@@ -1460,14 +1488,15 @@ defmodule Tightbeam.Gateway do
                 denial
 
               :ok ->
-                updated = Org.set_harness(db, call.session_key, harness, provider, model)
                 deliver_opts = if config[:sh], do: [sh: config.sh], else: []
 
                 Placement.deliver_home(
                   config,
-                  {harness_atom, updated.identity_name, updated.host},
+                  {harness_atom, session.identity_name, session.host},
                   deliver_opts
                 )
+
+                Org.set_harness(db, call.session_key, harness, provider, model)
 
                 # History barrier (product ruling): a new engine gets a fresh
                 # visible slate. Rows are RETAINED (never deleted) but replay

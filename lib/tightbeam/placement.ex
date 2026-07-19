@@ -439,9 +439,9 @@ defmodule Tightbeam.Placement do
     if String.contains?(identity_name, "--") do
       db = Map.get(config, :db, Tightbeam.DB)
 
-      case Org.active_all_by_identity_name(db, identity_name) do
+      case Org.all_by_identity_name(db, identity_name) do
         [] ->
-          raise ArgumentError, "no active session carries identity #{identity_name}"
+          raise ArgumentError, "no session carries identity #{identity_name}"
 
         sessions ->
           resolved =
@@ -467,7 +467,7 @@ defmodule Tightbeam.Placement do
 
             _fingerprints ->
               raise ArgumentError,
-                    "identity name collision: active sessions carry distinct effective content for #{identity_name}"
+                    "identity name collision: sessions carry distinct effective content for #{identity_name}"
           end
       end
     else

@@ -114,12 +114,11 @@ defmodule Tightbeam.PlacementTest do
 
     Org.retire(db, "overridden")
 
-    assert_raise ArgumentError, ~r/no active session carries identity/, fn ->
-      Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
-    end
+    restarted = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+    assert File.read!(Path.join(restarted[:home], "AGENTS.md")) == bytes
   end
 
-  test "reconstruction refuses active sessions with colliding effective content", %{
+  test "reconstruction refuses retired sessions with colliding effective content", %{
     base_dir: base_dir,
     db: db
   } do
@@ -152,6 +151,8 @@ defmodule Tightbeam.PlacementTest do
         model: "gpt-5.6-sol[medium]"
       })
     end
+
+    Org.retire(db, "second")
 
     assert_raise ArgumentError, ~r/identity name collision/, fn ->
       Placement.adapter_opts(config, {:codex, identity_name, "testhost"})

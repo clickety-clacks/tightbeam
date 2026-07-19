@@ -1105,6 +1105,51 @@ defmodule Tightbeam.GatewayTest do
     assert JSON.decode!(File.read!(Path.join(home, ".tightbeam-manifest")))["harness"] == "codex"
   end
 
+  test "set_harness delivery failure leaves Org unchanged", ctx do
+    base_dir = role_test_base("harness-delivery-failure")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    base = Archetypes.load!(base_dir)["default"]
+
+    identity_name =
+      Placement.identity_name(
+        %{base_dir: base_dir},
+        base,
+        %{"guidance_extra" => "First"},
+        :claude
+      )
+
+    Org.set_identity(ctx.db, "k1", %{"guidance_extra" => "First"}, identity_name)
+
+    Org.create(ctx.db, %{
+      session_key: "retired-collision",
+      display_name: "Retired collision",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      overrides: %{"guidance_extra" => "Second"},
+      identity_name: identity_name,
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable"
+    })
+
+    Org.retire(ctx.db, "retired-collision")
+    before = Org.get(ctx.db, "k1")
+
+    assert_raise ArgumentError, ~r/identity name collision/, fn ->
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"].(%{
+        origin: "user:flynn",
+        session_key: "k1",
+        params: %{setting: "set_harness", harness: "codex"}
+      })
+    end
+
+    assert Org.get(ctx.db, "k1") == before
+  end
+
   test "deliver_prompt commits echo+turn once and client duplicate short-circuits", ctx do
     opts = [
       db: ctx.db,

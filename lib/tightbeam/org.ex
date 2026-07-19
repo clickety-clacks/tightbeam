@@ -224,6 +224,19 @@ defmodule Tightbeam.Org do
     Enum.map(rows, &to_session/1)
   end
 
+  @doc "Every session carrying an identity name, including retired rows."
+  @spec all_by_identity_name(db(), String.t()) :: [session()]
+  def all_by_identity_name(db \\ Tightbeam.DB, identity_name) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        select_session_sql() <> " WHERE identityName = ?1 ORDER BY createdAt, sessionKey",
+        [identity_name]
+      )
+
+    Enum.map(rows, &to_session/1)
+  end
+
   @doc "Whether any session row still references an effective identity name."
   @spec identity_name_exists?(db(), String.t()) :: boolean()
   def identity_name_exists?(db \\ Tightbeam.DB, identity_name) do
