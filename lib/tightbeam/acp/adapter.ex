@@ -257,6 +257,17 @@ defmodule Tightbeam.Acp.Adapter do
     {:noreply, put_in(state.chunks[sid], [])}
   end
 
+  # The harness OS process died. The Conn survives that (closed, failing
+  # pendings) but survival here would WEDGE the org: the coordinator
+  # monitors THIS process, so staying alive means no adapter_down row, no
+  # generation bump, no fresh adapter — every future turn fails against a
+  # dead conn until a deploy. Dying is the contract: :DOWN fires, the
+  # death is recorded, the next turn boots a replacement and re-adopts
+  # sessions. (Found by the soak driver's A3 audit: an adapter SIGKILL
+  # left zero substrate records.)
+  def handle_info({:acp_exit, status}, state),
+    do: {:stop, {:acp_exit, status}, state}
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # Invoke the per-turn progress fun on status CHANGE only. The fun is fast

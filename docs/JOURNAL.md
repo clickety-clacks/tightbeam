@@ -863,3 +863,18 @@ migration — noted, not churned; a stale classification-era comment on the
 name lexicon corrected (reservation kept for human-hostility, not
 parsing). Guidance rewritten to typed flags (identity change, homes
 regenerate once). SMOKE §10 steps updated to the flag forms.
+
+SOAK DRIVER'S FIRST CATCH — the acp_exit wedge. The self-check's A3 audit
+failed: an adapter SIGKILL left ZERO substrate records. Root cause: Conn
+survives its OS process's death (closed, failing pendings) and emits
+{:acp_exit, status} — which NOTHING consumed. The Adapter GenServer lived
+on with a dead conn; the coordinator's monitor never fired; no
+adapter_down row, no generation bump, no circuit (boot-failures only) —
+every future turn fails until a deploy. The "near-impossible in Elixir"
+wedge class, again, and only a chaos audit found it (all prior adapter
+death tests killed the GENSERVER, not the OS process). Fix: the adapter
+stops on acp_exit — :DOWN fires, death recorded, generation bumps, next
+turn boots a replacement and re-adopts. Regression test kills via the
+message; driver A3 is the standing OS-level guard. Also in the soak lane
+review: argv "--" handling and httpc→curl (this Erlang build's inets
+cannot load :http_util).

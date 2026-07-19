@@ -65,6 +65,44 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     end
   end
 
+  test "harness OS-process death (acp_exit) kills the adapter — no silent wedge", ctx do
+    path =
+      Path.join(System.tmp_dir!(), "coordinator_acp_exit_#{System.unique_integer([:positive])}.js")
+
+    File.write!(path, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_opts: fn _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: "/tmp",
+             cwd: "/tmp"
+           ]
+         end,
+         db: ctx.db,
+         name: :"coordinator_#{System.unique_integer([:positive])}"}
+      )
+
+    assert {:ok, adapter, 1} =
+             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+
+    ref = Process.monitor(adapter)
+    send(adapter, {:acp_exit, 137})
+
+    assert_receive {:DOWN, ^ref, :process, ^adapter, {:acp_exit, 137}}, 2_000
+
+    assert eventually(fn ->
+             AdapterCoordinator.generation(coordinator, {:claude, "default", "testhost"}) == 2
+           end)
+
+    assert [%{kind: "adapter_down"}] =
+             ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
+  end
+
   test "adapter death bumps generation and records lifecycle", ctx do
     path =
       Path.join(System.tmp_dir!(), "coordinator_adapter_#{System.unique_integer([:positive])}.js")
