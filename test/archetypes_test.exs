@@ -50,6 +50,7 @@ defmodule Tightbeam.ArchetypesTest do
                  access: "git; gate: run the tests"
                }
              ],
+             mcp: [],
              guidance: "Ship the requested change."
            }
 
@@ -168,6 +169,81 @@ defmodule Tightbeam.ArchetypesTest do
     assert_raise ArgumentError, ~r/reference repo is missing location/, fn ->
       Archetypes.load!(ctx.base_dir)
     end
+  end
+
+  test "mcp declarations load and compile to the byte-pinned ACP shape", ctx do
+    File.write!(Path.join(ctx.manifests, "coder.toml"), """
+    name = "coder"
+
+    [mcp.xcodebuild]
+    command = "xcodebuildmcp"
+    args = ["--daemon"]
+    env = { Z_LAST = "last", XCODEBUILD_MCP_MODE = "cli" }
+    """)
+
+    archetype = Archetypes.load!(ctx.base_dir)["coder"]
+
+    assert archetype.mcp == [
+             %{
+               name: "xcodebuild",
+               command: "xcodebuildmcp",
+               args: ["--daemon"],
+               env: %{"XCODEBUILD_MCP_MODE" => "cli", "Z_LAST" => "last"}
+             }
+           ]
+
+    assert Archetypes.acp_mcp_servers(archetype) == [
+             %{
+               "name" => "xcodebuild",
+               "command" => "xcodebuildmcp",
+               "args" => ["--daemon"],
+               "env" => [
+                 %{"name" => "XCODEBUILD_MCP_MODE", "value" => "cli"},
+                 %{"name" => "Z_LAST", "value" => "last"}
+               ]
+             }
+           ]
+
+    assert Archetypes.acp_mcp_servers(Archetypes.builtin_default()) == []
+  end
+
+  test "mcp declarations sort by name and default args and env", ctx do
+    File.write!(Path.join(ctx.manifests, "coder.toml"), """
+    [mcp.zeta]
+    command = "z"
+
+    [mcp.alpha]
+    command = "a"
+    """)
+
+    assert Enum.map(Archetypes.load!(ctx.base_dir)["coder"].mcp, & &1.name) == [
+             "alpha",
+             "zeta"
+           ]
+
+    assert Enum.map(Archetypes.load!(ctx.base_dir)["coder"].mcp, &{&1.args, &1.env}) == [
+             {[], %{}},
+             {[], %{}}
+           ]
+  end
+
+  test "invalid mcp declarations fail load with the validation fragments", ctx do
+    cases = [
+      {"[mcp.bad_name]\ncommand = \"ok\"\n", ~r/invalid mcp server name/},
+      {"[mcp.missing]\nargs = []\n", ~r/mcp server missing is missing \"command\"/},
+      {"[mcp.empty]\ncommand = \"\"\n", ~r/mcp server empty is missing \"command\"/},
+      {"[mcp.badargs]\ncommand = \"ok\"\nargs = [1]\n",
+       ~r/mcp server badargs: args must be a list of strings/},
+      {"[mcp.badenv]\ncommand = \"ok\"\nenv = { MODE = 1 }\n",
+       ~r/mcp server badenv: env must be string keys and values/},
+      {"[mcp.remote]\ncommand = \"ok\"\nurl = \"https:\/\/example.test\"\n",
+       ~r/unknown mcp server keys.*url/}
+    ]
+
+    Enum.each(cases, fn {manifest, message} ->
+      File.write!(Path.join(ctx.manifests, "bad.toml"), manifest)
+      assert_raise ArgumentError, message, fn -> Archetypes.load!(ctx.base_dir) end
+    end)
   end
 
   test "guidance renders exact sections in order and is pure" do

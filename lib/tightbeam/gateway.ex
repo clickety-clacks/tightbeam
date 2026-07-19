@@ -807,11 +807,12 @@ defmodule Tightbeam.Gateway do
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
     cwd = session_workdir(config, session)
+    mcp_servers = session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
 
     result =
       case Org.current_pointer(db, session.session_key) do
         nil ->
-          with {:ok, sid} <- Adapter.new_session(adapter, session.model, cwd) do
+          with {:ok, sid} <- Adapter.new_session(adapter, session.model, cwd, mcp_servers) do
             Org.append_pointer(db, session.session_key, sid, "created")
             {:ok, sid}
           end
@@ -823,7 +824,13 @@ defmodule Tightbeam.Gateway do
             {:ok, pointer.harness_session_id}
           else
             AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, fn ->
-              case Adapter.load_session(adapter, pointer.harness_session_id, session.model, cwd) do
+              case Adapter.load_session(
+                     adapter,
+                     pointer.harness_session_id,
+                     session.model,
+                     cwd,
+                     mcp_servers
+                   ) do
                 :ok ->
                   Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
                   {:ok, pointer.harness_session_id}
@@ -840,7 +847,8 @@ defmodule Tightbeam.Gateway do
                     inspect(lost)
                   )
 
-                  with {:ok, sid} <- Adapter.new_session(adapter, session.model, cwd) do
+                  with {:ok, sid} <-
+                         Adapter.new_session(adapter, session.model, cwd, mcp_servers) do
                     Org.append_pointer(db, session.session_key, sid, "fallback")
                     append_context_reset_marker(db, session)
                     {:ok, sid}
@@ -1339,7 +1347,8 @@ defmodule Tightbeam.Gateway do
                   adapter,
                   pointer.harness_session_id,
                   p.model,
-                  session_workdir(config, session)
+                  session_workdir(config, session),
+                  session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
                 )
               end)
             else
