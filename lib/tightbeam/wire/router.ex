@@ -142,10 +142,16 @@ defmodule Tightbeam.Wire.Router do
   post "/api/streams" do
     with {:ok, device} <- device_auth(conn),
          {:ok, body, conn} <- read_json(conn),
+         :ok <- streams_overrides_unsupported(body),
          {:ok, display_name} <- required_string(body["displayName"]),
          {:ok, idempotency_key} <- required_string(body["idempotencyKey"]) do
       picker =
-        for {k, atom} <- [{"harness", :harness}, {"model", :model}, {"host", :host}, {"archetype", :archetype}],
+        for {k, atom} <- [
+              {"harness", :harness},
+              {"model", :model},
+              {"host", :host},
+              {"archetype", :archetype}
+            ],
             is_binary(body[k]) and body[k] != "",
             into: %{},
             do: {atom, body[k]}
@@ -524,6 +530,15 @@ defmodule Tightbeam.Wire.Router do
 
   defp required_string(value) when is_binary(value) and value != "", do: {:ok, value}
   defp required_string(_), do: {:error, 400, "invalid_message", nil}
+
+  defp streams_overrides_unsupported(body) do
+    if Map.has_key?(body, "overrides") do
+      {:error, 400, "invalid_overrides",
+       "overrides are unsupported on /api/streams; use /agent/dispatch"}
+    else
+      :ok
+    end
+  end
 
   defp atomize_params(params) when is_map(params) do
     Map.new(params, fn {key, value} -> {key |> Macro.underscore() |> String.to_atom(), value} end)

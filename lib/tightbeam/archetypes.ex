@@ -91,7 +91,8 @@ defmodule Tightbeam.Archetypes do
               env: %{optional(String.t()) => String.t()}
             }
           ],
-          guidance: String.t() | nil
+          guidance: String.t() | nil,
+          source: %{file: String.t(), sha256: String.t()} | nil
         }
 
   @builtin_orientation """
@@ -376,8 +377,17 @@ defmodule Tightbeam.Archetypes do
       |> Path.wildcard()
       |> Enum.sort()
       |> Enum.reduce(%{"default" => builtin_default()}, fn path, loaded ->
-        manifest = path |> File.read!() |> Toml.decode!()
-        archetype = validate!(manifest, path)
+        bytes = File.read!(path)
+        manifest = Toml.decode!(bytes)
+
+        archetype =
+          manifest
+          |> validate!(path)
+          |> Map.put(:source, %{
+            file: Path.relative_to(path, base_dir),
+            sha256: bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+          })
+
         Map.put(loaded, archetype.name, archetype)
       end)
 
@@ -442,6 +452,64 @@ defmodule Tightbeam.Archetypes do
     end)
   end
 
+  @doc "Validate and normalize spawn-time session overrides."
+  @spec normalize_overrides(String.t(), t(), term()) ::
+          {:ok, map() | nil} | {:error, %{code: String.t(), message: String.t()}}
+  def normalize_overrides(base_dir, archetype, raw) do
+    with :ok <- override_object(raw),
+         {:ok, values} <- override_keys(raw),
+         {:ok, skills} <- override_skills(base_dir, archetype, values),
+         {:ok, guidance} <- override_guidance(values) do
+      normalized =
+        %{}
+        |> maybe_put_override("skills_add", skills)
+        |> maybe_put_override("guidance_extra", guidance)
+
+      {:ok, if(map_size(normalized) == 0, do: nil, else: normalized)}
+    end
+  end
+
+  @doc "Compose a base archetype with normalized session overrides."
+  @spec effective(t(), map() | nil, keyword()) :: t()
+  def effective(archetype, overrides, opts \\ [])
+  def effective(archetype, nil, _opts), do: archetype
+
+  def effective(archetype, overrides, opts) do
+    identity_name = Keyword.get(opts, :identity_name)
+    base_dir = Keyword.get(opts, :base_dir)
+
+    {added_skills, skill_discrepancies} =
+      overrides
+      |> Map.get("skills_add", [])
+      |> Enum.reduce({[], []}, fn name, {present, discrepancies} ->
+        if is_nil(base_dir) or skill_available?(base_dir, identity_name, name) do
+          {[name | present], discrepancies}
+        else
+          {present, ["missing override skill #{name}" | discrepancies]}
+        end
+      end)
+
+    {extra, guidance_discrepancies} =
+      overrides
+      |> Map.get("guidance_extra")
+      |> resolve_override_guidance_lenient(fragments())
+
+    discrepancies = Enum.reverse(skill_discrepancies) ++ guidance_discrepancies
+    record_override_discrepancies(opts, discrepancies)
+
+    composed =
+      case extra do
+        nil -> guidance(archetype)
+        "" -> guidance(archetype)
+        text -> guidance(archetype) <> "\n\n" <> text
+      end
+
+    archetype
+    |> Map.put(:skills, Enum.sort(Enum.uniq(archetype.skills ++ added_skills)))
+    |> Map.put(:override_skills, Enum.sort(added_skills))
+    |> Map.put(:composed_guidance, composed)
+  end
+
   @doc "The loaded archetype map (name => archetype)."
   @spec all() :: %{optional(String.t()) => t()}
   def all do
@@ -461,6 +529,7 @@ defmodule Tightbeam.Archetypes do
   for the section order). Pure: identical manifest → identical bytes.
   """
   @spec guidance(t()) :: String.t()
+  def guidance(%{composed_guidance: guidance}), do: guidance
   def guidance(archetype), do: guidance_with(archetype, fragments())
 
   defp guidance_with(archetype, fragments) do
@@ -525,7 +594,9 @@ defmodule Tightbeam.Archetypes do
             true ->
               case Map.fetch(fragments, name) do
                 {:ok, content} ->
-                  content |> String.trim_trailing("\n") |> resolve_includes(fragments, [name | stack])
+                  content
+                  |> String.trim_trailing("\n")
+                  |> resolve_includes(fragments, [name | stack])
 
                 :error ->
                   raise ArgumentError,
@@ -539,6 +610,167 @@ defmodule Tightbeam.Archetypes do
       end
     end)
     |> Enum.join("\n")
+  end
+
+  defp override_object(raw) when is_map(raw), do: :ok
+
+  defp override_object(_raw),
+    do: {:error, %{code: "invalid_overrides", message: "overrides must be an object"}}
+
+  defp override_keys(raw) do
+    values =
+      Map.new(raw, fn {key, value} ->
+        normalized_key = if is_atom(key), do: Atom.to_string(key), else: key
+        {normalized_key, value}
+      end)
+
+    unknown = Map.keys(values) -- ["skills_add", "guidance_extra"]
+
+    if unknown == [] do
+      {:ok, values}
+    else
+      {:error,
+       %{
+         code: "invalid_overrides",
+         message:
+           "unknown override keys: #{unknown |> Enum.map(&inspect/1) |> Enum.sort() |> Enum.join(", ")}"
+       }}
+    end
+  end
+
+  defp override_skills(base_dir, archetype, values) do
+    case Map.get(values, "skills_add", []) do
+      skills when is_list(skills) ->
+        if Enum.all?(skills, &is_binary/1) do
+          roots =
+            skills_dir(base_dir)
+            |> Path.join("*/SKILL.md")
+            |> Path.wildcard()
+            |> Enum.map(&(&1 |> Path.dirname() |> Path.basename()))
+            |> MapSet.new()
+
+          unknown =
+            skills |> Enum.uniq() |> Enum.reject(&MapSet.member?(roots, &1)) |> Enum.sort()
+
+          if unknown == [] do
+            normalized =
+              skills |> Enum.uniq() |> Enum.reject(&(&1 in archetype.skills)) |> Enum.sort()
+
+            {:ok, normalized}
+          else
+            {:error,
+             %{
+               code: "invalid_overrides",
+               message: "unknown override skill names: #{Enum.join(unknown, ", ")}"
+             }}
+          end
+        else
+          {:error,
+           %{code: "invalid_overrides", message: "overrides.skills_add must be a list of strings"}}
+        end
+
+      _ ->
+        {:error,
+         %{code: "invalid_overrides", message: "overrides.skills_add must be a list of strings"}}
+    end
+  end
+
+  defp override_guidance(values) do
+    case Map.fetch(values, "guidance_extra") do
+      :error ->
+        {:ok, nil}
+
+      {:ok, guidance} when is_binary(guidance) ->
+        guidance = String.trim(guidance)
+
+        if guidance == "" do
+          {:ok, nil}
+        else
+          try do
+            resolve_includes(guidance, fragments(), [])
+            {:ok, guidance}
+          rescue
+            error in ArgumentError ->
+              {:error,
+               %{
+                 code: "invalid_overrides",
+                 message: "overrides.guidance_extra #{Exception.message(error)}"
+               }}
+          end
+        end
+
+      {:ok, _other} ->
+        {:error,
+         %{code: "invalid_overrides", message: "overrides.guidance_extra must be a string"}}
+    end
+  end
+
+  defp maybe_put_override(map, _key, nil), do: map
+  defp maybe_put_override(map, _key, []), do: map
+  defp maybe_put_override(map, key, value), do: Map.put(map, key, value)
+
+  defp resolve_override_guidance_lenient(nil, _fragments), do: {nil, []}
+
+  defp resolve_override_guidance_lenient(text, fragments) do
+    resolve_includes_lenient(text, fragments, [])
+  end
+
+  defp resolve_includes_lenient(text, fragments, stack) do
+    {lines, discrepancies} =
+      text
+      |> String.split("\n")
+      |> Enum.map_reduce([], fn line, discrepancies ->
+        case Regex.run(~r/^#include "([^"]+)"\s*$/, line) do
+          [_, name] ->
+            cond do
+              name in stack ->
+                {"",
+                 discrepancies ++
+                   ["guidance include cycle: #{Enum.join(Enum.reverse([name | stack]), " -> ")}"]}
+
+              length(stack) >= 10 ->
+                {"", discrepancies ++ ["guidance include depth exceeded at #{name}"]}
+
+              true ->
+                case Map.fetch(fragments, name) do
+                  {:ok, content} ->
+                    {resolved, nested} =
+                      content
+                      |> String.trim_trailing("\n")
+                      |> resolve_includes_lenient(fragments, [name | stack])
+
+                    {resolved, discrepancies ++ nested}
+
+                  :error ->
+                    {"", discrepancies ++ ["unknown guidance fragment #{inspect(name)}"]}
+                end
+            end
+
+          nil ->
+            {line, discrepancies}
+        end
+      end)
+
+    {Enum.join(lines, "\n"), discrepancies}
+  end
+
+  defp skill_available?(base_dir, identity_name, name) do
+    File.exists?(Path.join([skills_dir(base_dir), name, "SKILL.md"])) or
+      (is_binary(identity_name) and
+         File.exists?(
+           Path.join([base_dir, "identity", "pinned", identity_name, name, "SKILL.md"])
+         ))
+  end
+
+  defp record_override_discrepancies(opts, discrepancies) do
+    with db when not is_nil(db) <- Keyword.get(opts, :db),
+         identity_name when is_binary(identity_name) <- Keyword.get(opts, :identity_name) do
+      Enum.each(discrepancies, fn detail ->
+        Tightbeam.EventLog.lifecycle(db, "override_discrepancy", identity_name, detail)
+      end)
+    else
+      _ -> :ok
+    end
   end
 
   defp builtin_fragments do
@@ -589,12 +821,14 @@ defmodule Tightbeam.Archetypes do
   end
 
   @doc """
-  Remove a skill (or tree node). Refused when `name` is a top-level root
-  some archetype elects — election is a live dependency, and law fails
-  closed; retire the election first. Pruning INSIDE an elected tree is a
-  content edit and allowed.
+  Remove a skill (or tree node). Removing an elected root is a transform:
+  the library content is deleted and the current manifest electors and
+  restart warnings are returned to the caller. Boot validation remains
+  fail-closed until those manifests are edited. Pruning inside a tree is a
+  content edit and has no electors.
   """
-  @spec rm_skill(String.t(), String.t()) :: :ok | {:error, %{code: String.t(), message: String.t()}}
+  @spec rm_skill(String.t(), String.t()) ::
+          {:ok, %{archetype_electors: [String.t()], manifest_warnings: [String.t()]}}
   def rm_skill(base_dir, name) do
     relative = validate_skill_path!(name)
 
@@ -605,23 +839,25 @@ defmodule Tightbeam.Archetypes do
         for {arch_name, archetype} <- all(), relative in archetype.skills, do: arch_name
       end
 
-    case electors do
-      [] ->
-        File.rm_rf!(Path.join(skills_dir(base_dir), relative))
-        :ok
+    electors = Enum.sort(electors)
 
-      names ->
-        {:error,
-         %{
-           code: "skill_elected",
-           message:
-             "skill #{relative} is elected by: #{names |> Enum.sort() |> Enum.join(", ")} — retire the election first"
-         }}
-    end
+    warnings =
+      Enum.map(electors, fn archetype_name ->
+        archetype = Map.fetch!(all(), archetype_name)
+        file = if archetype.source, do: archetype.source.file, else: "builtin default"
+
+        "archetype #{archetype_name} still elects #{relative} in #{file} — " <>
+          "edit it before the next restart (boot validation is fail-closed)"
+      end)
+
+    File.rm_rf!(Path.join(skills_dir(base_dir), relative))
+    {:ok, %{archetype_electors: electors, manifest_warnings: warnings}}
   end
 
   @doc "Walk the library: every SKILL.md as %{name, root, elected_by (roots only)}."
-  @spec list_skills(String.t()) :: [%{name: String.t(), root: boolean(), elected_by: [String.t()]}]
+  @spec list_skills(String.t()) :: [
+          %{name: String.t(), root: boolean(), elected_by: [String.t()]}
+        ]
   def list_skills(base_dir) do
     dir = skills_dir(base_dir)
     archetypes = all()
@@ -674,7 +910,8 @@ defmodule Tightbeam.Archetypes do
       references: [],
       fallback_models: [],
       mcp: [],
-      guidance: nil
+      guidance: nil,
+      source: nil
     }
   end
 
@@ -700,6 +937,11 @@ defmodule Tightbeam.Archetypes do
     end
 
     name = Map.get(manifest, "name", Path.basename(path, ".toml"))
+
+    unless is_binary(name) and name != "" and not String.contains?(name, "--") do
+      raise ArgumentError, "archetype name must be non-empty and may not contain --: #{path}"
+    end
+
     where = Map.get(manifest, "where", [Tightbeam.Placement.local_host_name()])
     skills = Map.get(manifest, "skills", builtin_skill_names())
 
@@ -745,6 +987,7 @@ defmodule Tightbeam.Archetypes do
 
         %{name: reference_name, location: location, access: reference["access"]}
       end)
+
     fallback_models = Map.get(manifest, "fallback_models", [])
 
     unless is_list(fallback_models) and Enum.all?(fallback_models, &is_binary/1) do
@@ -809,7 +1052,6 @@ defmodule Tightbeam.Archetypes do
       %{name: name, command: command, args: args, env: env}
     end)
   end
-
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

@@ -11,6 +11,7 @@ defmodule Tightbeam.GatewayTest do
     Idempotency,
     Ledger,
     Org,
+    Placement,
     Projection,
     Roles,
     Wakes
@@ -31,18 +32,23 @@ defmodule Tightbeam.GatewayTest do
   defmodule CoordinatorStub do
     use GenServer
 
+    def start_link({adapter, parent}),
+      do: GenServer.start_link(__MODULE__, {adapter, parent}, name: Tightbeam.AdapterCoordinator)
+
     def start_link(adapter),
-      do: GenServer.start_link(__MODULE__, adapter, name: Tightbeam.AdapterCoordinator)
+      do: GenServer.start_link(__MODULE__, {adapter, nil}, name: Tightbeam.AdapterCoordinator)
 
-    def init(adapter), do: {:ok, adapter}
+    def init({adapter, parent}), do: {:ok, {adapter, parent}}
 
-    def handle_call({:adapter_for, _key}, _from, adapter),
-      do: {:reply, {:ok, adapter, 1}, adapter}
+    def handle_call({:adapter_for, key}, _from, {adapter, parent} = state) do
+      if is_pid(parent), do: send(parent, {:adapter_key, key})
+      {:reply, {:ok, adapter, 1}, state}
+    end
 
-    def handle_call({:acquire_load_slot, _borrower}, _from, adapter),
-      do: {:reply, make_ref(), adapter}
+    def handle_call({:acquire_load_slot, _borrower}, _from, state),
+      do: {:reply, make_ref(), state}
 
-    def handle_cast({:release_load_slot, _slot}, adapter), do: {:noreply, adapter}
+    def handle_cast({:release_load_slot, _slot}, state), do: {:noreply, state}
   end
 
   defmodule AdapterStub do
@@ -55,13 +61,18 @@ defmodule Tightbeam.GatewayTest do
       {:reply, {:ok, "harness-1"}, parent}
     end
 
+    def handle_call(:conn, _from, parent), do: {:reply, parent, parent}
+
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
 
     def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers}, _from, parent),
       do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
 
     def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
-      do: {:reply, {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}}, parent}
+      do:
+        {:reply,
+         {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
+         parent}
 
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
@@ -139,7 +150,14 @@ defmodule Tightbeam.GatewayTest do
       model: "fable"
     })
 
-    handlers = Gateway.handlers(%{db: ctx.db, base_dir: System.tmp_dir!(), default_harness: :claude, default_model: "fable", max_live_sessions_per_user: 5})
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: System.tmp_dir!(),
+        default_harness: :claude,
+        default_model: "fable",
+        max_live_sessions_per_user: 5
+      })
 
     assert %{code: "denied", message: message} =
              handlers["retire"].(%{
@@ -177,6 +195,24 @@ defmodule Tightbeam.GatewayTest do
              base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
 
     assert token != ""
+  end
+
+  test "children sweeps newer credentials from abandoned identity homes before adapters", ctx do
+    base_dir = Path.join(System.tmp_dir!(), "gateway_sweep_#{System.unique_integer([:positive])}")
+    auth_dir = Path.join([base_dir, "auth", "codex"])
+    abandoned = Path.join([base_dir, "homes", "default--abandoned", "codex"])
+    File.mkdir_p!(auth_dir)
+    File.mkdir_p!(abandoned)
+    store = Path.join(auth_dir, "auth.json")
+    rotated = Path.join(abandoned, "auth.json")
+    File.write!(store, "stale")
+    File.write!(rotated, "rotated")
+    File.touch!(store, {{2026, 1, 1}, {0, 0, 0}})
+    File.touch!(rotated, {{2026, 1, 2}, {0, 0, 0}})
+
+    Gateway.children(gateway_config(base_dir, ctx.db, 0))
+
+    assert File.read!(store) == "rotated"
   end
 
   test "children mints a cli token when gateway.json is corrupt", ctx do
@@ -452,6 +488,371 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:spinup_command, ["ssh" | _]}
   end
 
+  test "skill-rm removes elected roots, warns, and notifies only active electing sessions", ctx do
+    base_dir = role_test_base("skill-rm")
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+    skill_dir = Path.join([base_dir, "identity", "skills", "swift"])
+    File.mkdir_p!(skill_dir)
+    File.write!(Path.join(skill_dir, "SKILL.md"), "# Swift")
+
+    File.write!(Path.join(manifests, "coder.toml"), """
+    name = "coder"
+    skills = ["swift"]
+    """)
+
+    Archetypes.load!(base_dir)
+
+    active =
+      Org.create(ctx.db, %{
+        session_key: "agent:coder-active",
+        display_name: "Coder active",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    retired =
+      Org.create(ctx.db, %{
+        session_key: "agent:coder-retired",
+        display_name: "Coder retired",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    Org.retire(ctx.db, retired.session_key)
+
+    remove =
+      Gateway.handlers(
+        gateway_config(base_dir, ctx.db, 0)
+        |> Map.put(:conn_registry, ctx.registry)
+        |> Map.put(:lane_manager, ctx.lane)
+      )["skill-rm"]
+
+    result = remove.(%{origin: "user:flynn", params: %{name: "swift"}})
+
+    assert result.notified == [active.session_key]
+
+    assert result.manifest_warnings == [
+             "archetype coder still elects swift in identity/archetypes/coder.toml — " <>
+               "edit it before the next restart (boot validation is fail-closed)"
+           ]
+
+    expected =
+      "The skill \"swift\" has been removed from this org's library. " <>
+        "Disregard it, including anything from it already in your context."
+
+    assert {:ok, [["process:tightbeam", "[from process:tightbeam]\n\n" <> ^expected]]} =
+             DB.query(
+               ctx.db,
+               "SELECT origin, prompt FROM turns WHERE sessionKey = ?1",
+               [active.session_key]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey = ?1",
+               [retired.session_key]
+             )
+  end
+
+  test "invalid spawn overrides fail before spinup or any session side effect", ctx do
+    base_dir = role_test_base("invalid-overrides")
+    Archetypes.load!(base_dir)
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:spinup_command, command})
+      {"", 0}
+    end
+
+    spawn =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+
+    invalid = [
+      nil,
+      %{"unknown" => true},
+      %{"skills_add" => "not-a-list"},
+      %{"skills_add" => [1]},
+      %{"skills_add" => ["missing"]},
+      %{"guidance_extra" => 1},
+      %{"guidance_extra" => ~s(#include "missing.md")}
+    ]
+
+    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+
+    for {overrides, index} <- Enum.with_index(invalid) do
+      result =
+        spawn.(%{
+          origin: "user:flynn",
+          session_key: nil,
+          params: %{
+            display_name: "Invalid",
+            idempotency_key: "invalid-overrides-#{index}",
+            overrides: overrides
+          }
+        })
+
+      assert result.code == "invalid_overrides"
+      assert is_binary(result.message)
+    end
+
+    assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    refute_received {:spinup_command, _}
+  end
+
+  test "semantically empty spawn overrides store NULL and the bare identity name", ctx do
+    base_dir = role_test_base("empty-overrides")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :empty_override_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    created =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{
+          display_name: "No effective override",
+          idempotency_key: "empty-overrides",
+          overrides: %{
+            "skills_add" => ["tightbeam-skills", "tightbeam-skills"],
+            "guidance_extra" => "   "
+          }
+        }
+      })
+
+    session = Org.get(ctx.db, created.session_key)
+    assert session.overrides == nil
+    assert session.identity_name == "default"
+
+    assert {:ok, [[nil, "default"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT overrides, identityName FROM sessions WHERE sessionKey = ?1",
+               [session.session_key]
+             )
+  end
+
+  test "override skills pin before library removal and tune removal changes identity with notice",
+       ctx do
+    base_dir = role_test_base("override-pin")
+    Archetypes.put_skill!(base_dir, "review", "# Preserved review content")
+    base = Archetypes.load!(base_dir)["default"]
+
+    {:ok, overrides} =
+      Archetypes.normalize_overrides(base_dir, base, %{"skills_add" => ["review"]})
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    start_supervised!(%{
+      id: :override_pin_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    identity_name = Placement.identity_name(config, base, overrides, :claude)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:override-pin",
+        display_name: "Pinned",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        overrides: overrides,
+        identity_name: identity_name,
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    handlers = Gateway.handlers(config)
+    removed = handlers["skill-rm"].(%{origin: "user:flynn", params: %{name: "review"}})
+    assert removed.notified == [session.session_key]
+
+    pinned = Path.join([base_dir, "identity", "pinned", identity_name, "review", "SKILL.md"])
+    assert File.read!(pinned) == "# Preserved review content"
+    refute File.exists?(Path.join([Archetypes.skills_dir(base_dir), "review"]))
+
+    home = Placement.deliver_home(config, {:claude, identity_name, "testhost"})
+    assert File.read_link!(Path.join(home, "skills/review")) == Path.dirname(pinned)
+
+    manifest = home |> Path.join(".tightbeam-manifest") |> File.read!() |> JSON.decode!()
+
+    assert %{
+             "name" => "review",
+             "provenance" => "override",
+             "linkage" => "pinned"
+           } in manifest["skills"]
+
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: "/remote/tb/bin"}
+    })
+
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:pinned_command, command})
+      if "cat" in command, do: {"", 1}, else: {"", 0}
+    end
+
+    assert Placement.deliver_home(
+             Map.put(config, :sh, sh),
+             {:claude, identity_name, "worker"},
+             sh: sh
+           ) == "/remote/tb/homes/#{identity_name}/claude"
+
+    assert Enum.any?(collect_tagged_commands(:pinned_command, []), fn command ->
+             Enum.any?(command, &String.contains?(&1, "/identity/pinned/#{identity_name}/review"))
+           end)
+
+    preserved_prompt =
+      "The skill \"review\" was removed from the library, but your session elected it at " <>
+        "spawn, so your copy is preserved. Use \"tune\" override removal if you no longer want it."
+
+    assert {:ok, [["[from process:tightbeam]\n\n" <> ^preserved_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT prompt FROM turns WHERE sessionKey = ?1 ORDER BY seq LIMIT 1",
+               [session.session_key]
+             )
+
+    assert %{code: "denied"} =
+             handlers["tune"].(%{
+               origin: "user:other",
+               session_key: session.session_key,
+               params: %{setting: "remove_override", skill: "review"}
+             })
+
+    assert %{ok: true, identity_name: "default", overrides: nil} =
+             handlers["tune"].(%{
+               origin: "user:flynn",
+               session_key: session.session_key,
+               params: %{setting: "remove_override", skill: "review"}
+             })
+
+    updated = Org.get(ctx.db, session.session_key)
+    assert updated.overrides == nil
+    assert updated.identity_name == "default"
+    refute File.exists?(Path.join([base_dir, "identity", "pinned", identity_name]))
+
+    assert Enum.any?(Projection.list_after(ctx.db, session.session_key, nil, 100), fn message ->
+             String.starts_with?(message.content, "[context reset]")
+           end)
+
+    assert {:ok, [[tune_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT prompt FROM turns WHERE sessionKey = ?1 ORDER BY seq DESC LIMIT 1",
+               [session.session_key]
+             )
+
+    assert tune_prompt ==
+             "[from process:tightbeam]\n\nYour override \"review\" was removed by the operator; disregard it."
+  end
+
+  test "set_model reload checks out the overridden adapter key", ctx do
+    base_dir = role_test_base("override-set-model")
+    Archetypes.put_skill!(base_dir, "review", "# Review")
+    base = Archetypes.load!(base_dir)["default"]
+
+    {:ok, overrides} =
+      Archetypes.normalize_overrides(base_dir, base, %{"skills_add" => ["review"]})
+
+    config = gateway_config(base_dir, ctx.db, 0)
+    identity_name = Placement.identity_name(config, base, overrides, :claude)
+    Org.set_identity(ctx.db, "k1", overrides, identity_name)
+    Org.append_pointer(ctx.db, "k1", "existing-session", "created")
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "sonnet"}
+             })
+
+    assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
+  end
+
+  test "cancel addresses the overridden adapter key", ctx do
+    base_dir = role_test_base("override-cancel")
+    Archetypes.put_skill!(base_dir, "review", "# Review")
+    base = Archetypes.load!(base_dir)["default"]
+
+    {:ok, overrides} =
+      Archetypes.normalize_overrides(base_dir, base, %{"skills_add" => ["review"]})
+
+    config = gateway_config(base_dir, ctx.db, 0)
+    identity_name = Placement.identity_name(config, base, overrides, :claude)
+    Org.set_identity(ctx.db, "k1", overrides, identity_name)
+    Org.append_pointer(ctx.db, "k1", "cancel-session", "created")
+
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    task_sup = start_supervised!({Task.Supervisor, name: :override_cancel_tasks})
+
+    start_supervised!(%{
+      id: :override_cancel_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "cancel me",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    parent = self()
+
+    start_supervised!(
+      {Tightbeam.SessionLane,
+       session_key: "k1",
+       db: ctx.db,
+       task_sup: task_sup,
+       runner: fn _turn ->
+         send(parent, :cancel_runner_started)
+         receive do: (:never -> {:ok, %{}})
+       end}
+    )
+
+    assert_receive :cancel_runner_started
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["cancel"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{}
+             })
+
+    assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
+  end
+
   test "boot migration turns legacy handles into roles idempotently", ctx do
     legacy =
       Org.create(ctx.db, %{
@@ -691,7 +1092,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
 
     {:ok, _ref, nil} =
       ConnRegistry.register(exact_registry, %{
@@ -712,6 +1113,8 @@ defmodule Tightbeam.GatewayTest do
     env = { XCODEBUILD_MCP_MODE = "cli" }
     """)
 
+    Archetypes.put_skill!(base, "review", "# Review")
+
     config = %{
       base_dir: base,
       cwd: "/tmp",
@@ -724,6 +1127,13 @@ defmodule Tightbeam.GatewayTest do
     }
 
     children = Gateway.children(config)
+    archetype = Archetypes.get("default")
+
+    {:ok, overrides} =
+      Archetypes.normalize_overrides(base, archetype, %{"skills_add" => ["review"]})
+
+    identity_name = Placement.identity_name(config, archetype, overrides, :claude)
+    Org.set_identity(ctx.db, "k1", overrides, identity_name)
 
     {Tightbeam.LaneManager, lane_opts} =
       Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
@@ -742,6 +1152,8 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
     task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
+
+    assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
 
     assert_receive {:new_session_mcp_servers,
                     [
@@ -930,6 +1342,14 @@ defmodule Tightbeam.GatewayTest do
                &1
              )
            )
+  end
+
+  defp collect_tagged_commands(tag, acc) do
+    receive do
+      {^tag, command} -> collect_tagged_commands(tag, [command | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   defp gateway_config(base_dir, db, port) do

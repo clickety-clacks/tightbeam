@@ -51,9 +51,34 @@ defmodule Tightbeam.Wire.RouterTest do
     assert conn.status == 401
     assert JSON.decode!(conn.resp_body) == %{"error" => %{"code" => "auth_failed"}}
 
-    conn = conn(:get, "/api/streams") |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+    conn =
+      conn(:get, "/api/streams") |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+
     conn = Router.call(conn, Router.init(ctx.opts))
     assert conn.status == 200
+  end
+
+  test "/api/streams refuses overrides as an unsupported transport", ctx do
+    body =
+      JSON.encode!(%{
+        displayName: "Overridden",
+        idempotencyKey: "unsupported-overrides",
+        overrides: %{skills_add: ["review"]}
+      })
+
+    response =
+      conn(:post, "/api/streams", body)
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert response.status == 400
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "invalid_overrides",
+               "message" => "overrides are unsupported on /api/streams; use /agent/dispatch"
+             }
+           }
   end
 
   test "agent dispatch enforces cli bearer, allowlist, and identity/target resolution", ctx do
@@ -142,7 +167,9 @@ defmodule Tightbeam.Wire.RouterTest do
 
     union = dispatch_wake(ctx, %{"role" => "x", "userId" => "mike"})
     assert union.status == 400
-    assert JSON.decode!(union.resp_body)["error"]["message"] == "exactly one of sessionKey, role, userId"
+
+    assert JSON.decode!(union.resp_body)["error"]["message"] ==
+             "exactly one of sessionKey, role, userId"
 
     key =
       Org.create(ctx.db, %{

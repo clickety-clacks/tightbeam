@@ -13,7 +13,7 @@ defmodule Tightbeam.Homes do
   this shipped once). So regeneration first copies any regular-file auth
   entry back over its store source, then wipes, then relinks.
 
-  Projection is IDEMPOTENT, gated on a manifest hash stamped into the home
+  Projection is IDEMPOTENT, gated on a readable projection manifest stamped into the home
   (spec: homes are regenerated on IDENTITY CHANGE, never on process restart).
   This gate is load-bearing: harnesses nest their session state (transcripts,
   session files) INSIDE the config dir we project, so an unconditional
@@ -33,11 +33,19 @@ defmodule Tightbeam.Homes do
   mode everywhere: content updates flow through the replica, never through
   home regeneration.
   """
-  @type skill_ref :: %{name: String.t(), link_to: String.t()}
+  @type skill_ref :: %{
+          name: String.t(),
+          link_to: String.t(),
+          provenance: String.t(),
+          linkage: String.t()
+        }
   @type spec :: %{
           required(:harness) => :claude | :codex,
           required(:archetype) => String.t(),
+          required(:base_archetype) => String.t(),
+          required(:parent_source) => %{file: String.t(), sha256: String.t()} | nil,
           required(:guidance) => String.t(),
+          optional(:identity_sha256) => String.t(),
           optional(:skills) => [skill_ref()],
           optional(:extra_files) => %{optional(String.t()) => String.t()}
         }
@@ -53,7 +61,7 @@ defmodule Tightbeam.Homes do
 
   @doc """
   Projects one home from its spec: the harness instruction file, extra files,
-  and symlinks for every harness auth entry. Idempotent via the manifest-hash
+  and symlinks for every harness auth entry. Idempotent via the projection manifest
   stamp (see moduledoc): an unchanged spec never deletes the home — nested
   harness session state survives restarts — and only missing auth symlinks
   are topped up. A wipe harvests rotated credentials back to the auth store
@@ -65,12 +73,13 @@ defmodule Tightbeam.Homes do
     home_path = Path.join([base_dir, "homes", spec.archetype, Atom.to_string(harness)])
     auth_dir = Path.join([base_dir, "auth", Atom.to_string(harness)])
     stamp_path = Path.join(home_path, @stamp_file)
-    hash = manifest_hash(spec)
+    manifest = manifest_bytes(spec)
+    guard_identity_collision!(stamp_path, spec.archetype, Map.get(spec, :identity_sha256))
 
     instructions_file = if harness == :claude, do: "CLAUDE.md", else: "AGENTS.md"
     instructions_path = Path.join(home_path, instructions_file)
 
-    unless File.exists?(stamp_path) and File.read!(stamp_path) == hash do
+    unless File.read(stamp_path) == {:ok, manifest} do
       harvest_auth_back(auth_dir, home_path)
       File.rm_rf!(home_path)
       File.mkdir_p!(home_path)
@@ -82,7 +91,7 @@ defmodule Tightbeam.Homes do
         File.write!(absolute_path, content)
       end
 
-      File.write!(stamp_path, hash)
+      File.write!(stamp_path, manifest)
     end
 
     project_skills(home_path, Map.get(spec, :skills, []))
@@ -92,6 +101,94 @@ defmodule Tightbeam.Homes do
       instructions_file: instructions_path,
       linked_auth_files: link_auth(auth_dir, home_path)
     }
+  end
+
+  @doc "Canonical projection-manifest bytes. Pure for a given projection spec."
+  @spec manifest_bytes(spec()) :: binary()
+  def manifest_bytes(spec) do
+    parent =
+      case spec.parent_source do
+        nil -> %{"file" => nil, "sha256" => nil}
+        source -> %{"file" => source.file, "sha256" => source.sha256}
+      end
+
+    skills =
+      spec
+      |> Map.get(:skills, [])
+      |> Enum.map(fn skill ->
+        %{
+          "name" => skill.name,
+          "provenance" => skill.provenance,
+          "linkage" => skill.linkage
+        }
+      end)
+      |> Enum.sort_by(&{&1["name"], &1["provenance"], &1["linkage"]})
+
+    extra_files =
+      spec
+      |> Map.get(:extra_files, %{})
+      |> Map.new(fn {path, content} -> {path, sha256(content)} end)
+
+    manifest = %{
+      "base_archetype" => spec.base_archetype,
+      "parent_manifest" => parent,
+      "harness" => Atom.to_string(spec.harness),
+      "guidance_sha256" => sha256(spec.guidance),
+      "skills" => skills,
+      "extra_files" => extra_files
+    }
+
+    manifest
+    |> maybe_put_identity_sha256(Map.get(spec, :identity_sha256))
+    |> canonical_json()
+  end
+
+  @doc "Full digest used to derive an overridden identity name."
+  @spec identity_fingerprint(spec()) :: String.t()
+  def identity_fingerprint(spec) do
+    spec
+    |> Map.delete(:identity_sha256)
+    |> manifest_bytes()
+    |> sha256()
+  end
+
+  @doc "Recover newer regular-file credentials from every projected home for one harness."
+  @spec sweep_auth(String.t(), :claude | :codex) :: :ok
+  def sweep_auth(base_dir, harness) do
+    auth_dir = Path.join([base_dir, "auth", Atom.to_string(harness)])
+    home_dirs = Path.wildcard(Path.join([base_dir, "homes", "*", Atom.to_string(harness)]))
+
+    case File.ls(auth_dir) do
+      {:ok, files} ->
+        for file <- files do
+          store_path = Path.join(auth_dir, file)
+          store_mtime = regular_mtime(store_path)
+
+          newest =
+            home_dirs
+            |> Enum.map(&Path.join(&1, file))
+            |> Enum.flat_map(fn path ->
+              case regular_mtime(path) do
+                nil -> []
+                mtime -> [{mtime, path}]
+              end
+            end)
+            |> Enum.max_by(&elem(&1, 0), fn -> nil end)
+
+          case newest do
+            {mtime, path} when is_nil(store_mtime) or mtime > store_mtime ->
+              File.cp!(path, store_path)
+
+            _ ->
+              :ok
+          end
+        end
+
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+    end
   end
 
   # Skills project OUTSIDE the hash gate on every call: idempotent symlinks
@@ -165,20 +262,56 @@ defmodule Tightbeam.Homes do
     end
   end
 
-  defp manifest_hash(spec) do
-    extra =
-      spec |> Map.get(:extra_files, %{}) |> Enum.sort() |> Enum.map(fn {k, v} -> [k, 0, v, 0] end)
+  defp regular_mtime(path) do
+    case File.lstat(path, time: :posix) do
+      {:ok, %File.Stat{type: :regular, mtime: mtime}} -> mtime
+      _ -> nil
+    end
+  end
 
-    # Election only — a skill's CONTENT is reachable through the projection
-    # (symlink/copy) and updating it must never cost a home its nested
-    # harness state.
-    skills =
-      spec
-      |> Map.get(:skills, [])
-      |> Enum.map(&[&1.name, 0])
-      |> Enum.sort()
+  defp guard_identity_collision!(_stamp_path, _identity_name, nil), do: :ok
 
-    :crypto.hash(:sha256, [Atom.to_string(spec.harness), 0, spec.guidance, 0, extra, 0, skills])
+  defp guard_identity_collision!(stamp_path, identity_name, identity_sha256) do
+    suffix = identity_name |> String.split("--") |> List.last()
+
+    with {:ok, bytes} <- File.read(stamp_path),
+         {:ok, manifest} <- JSON.decode(bytes),
+         existing when is_binary(existing) <- manifest["identity_sha256"],
+         false <- existing == identity_sha256,
+         ^suffix <- binary_part(existing, 0, 16),
+         ^suffix <- binary_part(identity_sha256, 0, 16) do
+      raise ArgumentError,
+            "identity name collision: existing fingerprint #{existing} differs from #{identity_sha256}"
+    else
+      _ -> :ok
+    end
+  end
+
+  defp maybe_put_identity_sha256(manifest, nil), do: manifest
+
+  defp maybe_put_identity_sha256(manifest, identity_sha256),
+    do: Map.put(manifest, "identity_sha256", identity_sha256)
+
+  defp sha256(content) do
+    :crypto.hash(:sha256, content)
     |> Base.encode16(case: :lower)
   end
+
+  defp canonical_json(value) when is_map(value) do
+    members =
+      value
+      |> Enum.map(fn {key, item} -> {to_string(key), item} end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {key, item} -> [JSON.encode!(key), ?:, canonical_json(item)] end)
+      |> Enum.intersperse(?,)
+
+    IO.iodata_to_binary([?{, members, ?}])
+  end
+
+  defp canonical_json(value) when is_list(value) do
+    items = value |> Enum.map(&canonical_json/1) |> Enum.intersperse(?,)
+    IO.iodata_to_binary([?[, items, ?]])
+  end
+
+  defp canonical_json(value), do: JSON.encode!(value)
 end
