@@ -89,6 +89,32 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule ContainmentAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:knows_session?, sid}, _from, parent) do
+      send(parent, {:knows_session, sid})
+      {:reply, false, parent}
+    end
+
+    def handle_call({:load_session, sid, _model, _cwd, _mcp_servers}, _from, parent) do
+      send(parent, {:contained_load_session, sid})
+      {:reply, {:error, :contained_sandbox_disable_failed}, parent}
+    end
+
+    def handle_call({:new_session, _model, _cwd, _mcp_servers}, _from, parent) do
+      send(parent, :unexpected_new_session)
+      {:reply, {:ok, "unexpected"}, parent}
+    end
+
+    def handle_call({:prompt, _sid, _prompt, _opts}, _from, parent) do
+      send(parent, :unexpected_prompt)
+      {:reply, {:ok, %{text: "unexpected", stop_reason: "end_turn"}}, parent}
+    end
+  end
+
   setup do
     db = :"gateway_db_#{System.unique_integer([:positive])}"
     registry = :"gateway_registry_#{System.unique_integer([:positive])}"
@@ -928,6 +954,24 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
   end
 
+  test "set_model propagates contained sandbox-disable load failure", ctx do
+    base_dir = role_test_base("contained-set-model")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    Org.append_pointer(ctx.db, "k1", "existing-session", "created")
+    adapter = start_supervised!({ContainmentAdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    assert %{ok: false, reason: :contained_sandbox_disable_failed} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "sonnet"}
+             })
+
+    assert_receive {:contained_load_session, "existing-session"}
+  end
+
   test "cancel addresses the overridden adapter key", ctx do
     base_dir = role_test_base("override-cancel")
     Archetypes.put_skill!(base_dir, "review", "# Review")
@@ -1610,6 +1654,73 @@ defmodule Tightbeam.GatewayTest do
 
     assert [%{kind: "pointer_fallback", subject: "k1"}] =
              EventLog.lifecycle_events(ctx.db) |> Enum.filter(&(&1.kind == "pointer_fallback"))
+  end
+
+  test "contained sandbox-disable load failure preserves pointer and skips fallback", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :contained_failure_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    adapter = start_supervised!({ContainmentAdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "contained-failure",
+        is_admin: false
+      })
+
+    base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: "fable",
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+    Org.append_pointer(ctx.db, "k1", "contained-session", "created")
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "ping",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "contained-failure",
+               client_message_id: "c_contained_failure"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error,
+            %{reason: :contained_sandbox_disable_failed, terminal_publish: failure_publish}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    failure_publish.("failed")
+    assert_receive {:contained_load_session, "contained-session"}
+    refute_receive :unexpected_new_session
+    refute_receive :unexpected_prompt
+    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created"]
+
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "pointer_fallback"))
+
+    refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
+             String.starts_with?(message.content, "[context reset]")
+           end)
   end
 
   test "a failed turn appends the [turn failed] marker with the human reason", ctx do

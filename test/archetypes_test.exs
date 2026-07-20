@@ -44,6 +44,7 @@ defmodule Tightbeam.ArchetypesTest do
              skills: ["tightbeam-assimilate", "tightbeam-harnesses", "tightbeam-skills"],
              where: ["work-1", "work-2"],
              fallback_models: [],
+             containment: %{fs: :off, network: :open},
              defaults: %{harness: :codex, model: "gpt-5.6-sol[medium]"},
              references: [
                %{name: "brief", location: "work-1:~/brief.md", access: nil},
@@ -89,6 +90,35 @@ defmodule Tightbeam.ArchetypesTest do
     second = Archetypes.load!(ctx.base_dir)
 
     refute second["coder"].source.sha256 == first["coder"].source.sha256
+  end
+
+  test "containment posture is deny-only, defaulted, and boot-validated", ctx do
+    assert Archetypes.builtin_default().containment == %{fs: :off, network: :open}
+
+    File.write!(Path.join(ctx.manifests, "contained.toml"), """
+    name = "contained"
+
+    [containment]
+    fs = "workdir"
+    network = "open"
+    """)
+
+    loaded = Archetypes.load!(ctx.base_dir)
+    assert loaded["contained"].containment == %{fs: :workdir, network: :open}
+
+    File.write!(Path.join(ctx.manifests, "contained.toml"), "name = \"contained\"\n")
+    assert Archetypes.load!(ctx.base_dir)["contained"].containment == %{fs: :off, network: :open}
+
+    invalid = [
+      "[containment]\nunknown = true\n",
+      "[containment]\nfs = \"offf\"\n",
+      "[containment]\nnetwork = \"loopback\"\n"
+    ]
+
+    for body <- invalid do
+      File.write!(Path.join(ctx.manifests, "contained.toml"), "name = \"contained\"\n" <> body)
+      assert_raise ArgumentError, fn -> Archetypes.load!(ctx.base_dir) end
+    end
   end
 
   test "session overrides validate in order and normalize to one canonical shape", ctx do

@@ -31,7 +31,15 @@ defmodule Tightbeam.Acp.Adapter do
     }
   }
 
-  defstruct [:conn, :preset, :cwd, chunks: %{}, progress: %{}, known: MapSet.new()]
+  defstruct [
+    :conn,
+    :preset,
+    :cwd,
+    contained: false,
+    chunks: %{},
+    progress: %{},
+    known: MapSet.new()
+  ]
 
   ## Client
 
@@ -156,7 +164,13 @@ defmodule Tightbeam.Acp.Adapter do
     # (spawn success means nothing). The coordinator closes its circuit here.
     with ready when is_function(ready, 0) <- Keyword.get(opts, :on_ready), do: ready.()
 
-    {:noreply, %__MODULE__{conn: conn, preset: preset, cwd: Keyword.fetch!(opts, :cwd)}}
+    {:noreply,
+     %__MODULE__{
+       conn: conn,
+       preset: preset,
+       cwd: Keyword.fetch!(opts, :cwd),
+       contained: Keyword.get(opts, :contained, false)
+     }}
   end
 
   @impl true
@@ -164,8 +178,8 @@ defmodule Tightbeam.Acp.Adapter do
     with {:ok, result} <-
            Conn.request(state.conn, "session/new", %{cwd: cwd, mcpServers: mcp_servers}),
          sid = result["sessionId"],
-         :ok <- apply_model(state, sid, model) do
-      _ = Conn.request(state.conn, "session/set_mode", %{sessionId: sid, modeId: state.preset.yolo_mode})
+         :ok <- apply_model(state, sid, model),
+         :ok <- set_mode(state, sid) do
       state = %{state | known: MapSet.put(state.known, sid)}
       {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
     else
@@ -187,8 +201,16 @@ defmodule Tightbeam.Acp.Adapter do
         # adapter boot, so a refused re-assert here must never cost the
         # session's memory — continuity outranks the config option.
         _ = apply_model(state, sid, model)
-        state = %{state | known: MapSet.put(state.known, sid)}
-        {:reply, :ok, put_in(state.chunks[sid], [])}
+
+        case set_mode_after_load(state, sid) do
+          :ok ->
+            state = %{state | known: MapSet.put(state.known, sid)}
+            {:reply, :ok, put_in(state.chunks[sid], [])}
+
+          {:error, :contained_sandbox_disable_failed} = error ->
+            state = %{state | known: MapSet.delete(state.known, sid)}
+            {:reply, error, state}
+        end
 
       {:error, error} ->
         # The harness no longer has this session (lost files, other host…).
@@ -307,6 +329,29 @@ defmodule Tightbeam.Acp.Adapter do
       :ok
     end
   end
+
+  defp set_mode(%{contained: false} = state, sid) do
+    _ =
+      Conn.request(state.conn, "session/set_mode", %{
+        sessionId: sid,
+        modeId: state.preset.yolo_mode
+      })
+
+    :ok
+  end
+
+  defp set_mode(%{contained: true} = state, sid) do
+    case Conn.request(state.conn, "session/set_mode", %{
+           sessionId: sid,
+           modeId: state.preset.yolo_mode
+         }) do
+      {:ok, _} -> :ok
+      {:error, _} -> {:error, :contained_sandbox_disable_failed}
+    end
+  end
+
+  defp set_mode_after_load(%{contained: false}, _sid), do: :ok
+  defp set_mode_after_load(state, sid), do: set_mode(state, sid)
 
   @doc """
   Split a model ref into `{model, effort}`; effort is nil when absent.

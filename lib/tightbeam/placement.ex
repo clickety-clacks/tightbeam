@@ -77,7 +77,7 @@ defmodule Tightbeam.Placement do
   an unreachable host degrades exactly like a dead adapter, per spec.
   """
 
-  alias Tightbeam.{Archetypes, Homes, Org, Rails}
+  alias Tightbeam.{Archetypes, Containment, Homes, Org, Rails}
   import Bitwise
 
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
@@ -430,16 +430,23 @@ defmodule Tightbeam.Placement do
     lineage =
       "tb1-" <> Base.url_encode64("#{identity_name}@#{host}", padding: false)
 
-    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
-    home = deliver_home(config, key, deliver_opts)
+    resolved = resolve_identity!(config, identity_name)
     host_config = Map.fetch!(hosts(config.base_dir), host)
+    contained? = elem(resolved, 0).containment.fs == :workdir
+
+    if contained? and host_config.ssh == nil and host != local_host_name() do
+      containment_refused!(config, key, "contained_noncanonical_local_host")
+    end
+
+    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+    home = deliver_home_resolved(config, key, resolved, deliver_opts)
     binary = adapter_binary_path(harness, host_config)
 
     stderr_path =
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
 
     if host_config.ssh == nil do
-      [
+      opts = [
         harness: harness,
         cmd: [binary],
         home: home,
@@ -452,6 +459,71 @@ defmodule Tightbeam.Placement do
             {"TIGHTBEAM_LINEAGE", lineage}
           ] ++ harness_token_env(config.base_dir, harness)
       ]
+
+      if contained? do
+        write_roots = [
+          Path.join(host_config.base_dir, "work"),
+          home,
+          Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
+        ]
+
+        try do
+          :ok = Containment.validate_roots!(write_roots)
+        rescue
+          error in [ArgumentError] ->
+            containment_refused!(config, key, Exception.message(error))
+        end
+
+        sh = Map.get(config, :sh, &system_cmd/1)
+
+        probe_result =
+          try do
+            sh.([
+              "/usr/bin/sandbox-exec",
+              "-p",
+              "(version 1)(allow default)",
+              "/usr/bin/true"
+            ])
+          rescue
+            error -> {:raised, error}
+          end
+
+        case probe_result do
+          {:raised, error} ->
+            containment_refused!(
+              config,
+              key,
+              "sandbox-exec probe failed: #{Exception.message(error)}"
+            )
+
+          {_output, 0} ->
+            :ok
+
+          {_output, exit} ->
+            containment_refused!(config, key, "sandbox-exec probe failed with exit #{exit}")
+        end
+
+        profile =
+          try do
+            Containment.profile(write_roots)
+          rescue
+            error in [ArgumentError] ->
+              containment_refused!(config, key, Exception.message(error))
+          end
+
+        Tightbeam.EventLog.lifecycle(
+          config.db,
+          "containment",
+          adapter_key_name(key),
+          "assembled; fs=workdir network=open; write-roots=#{Enum.join(write_roots, ",")}"
+        )
+
+        opts
+        |> Keyword.put(:cmd, ["/usr/bin/sandbox-exec", "-p", profile, binary])
+        |> Keyword.put(:contained, true)
+      else
+        opts
+      end
     else
       cli_bin = host_config[:cli_bin] || ""
       home_env = if harness == :codex, do: "CODEX_HOME", else: "CLAUDE_CONFIG_DIR"
@@ -656,8 +728,21 @@ defmodule Tightbeam.Placement do
   """
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
   def deliver_home(config, {harness, identity_name, host}, opts \\ []) do
-    {base_archetype, effective_archetype, overrides} = resolve_identity!(config, identity_name)
+    resolved = resolve_identity!(config, identity_name)
+    deliver_home_resolved(config, {harness, identity_name, host}, resolved, opts)
+  end
+
+  defp deliver_home_resolved(
+         config,
+         {harness, identity_name, host} = key,
+         {base_archetype, effective_archetype, overrides},
+         opts
+       ) do
     host_config = Map.fetch!(hosts(config.base_dir), host)
+
+    if base_archetype.containment.fs == :workdir and host_config.ssh != nil do
+      containment_refused!(config, key, "contained_remote_unsupported")
+    end
 
     if host_config.ssh == nil do
       refs =
@@ -804,6 +889,21 @@ defmodule Tightbeam.Placement do
       remote_home
     end
   end
+
+  defp containment_refused!(config, key, reason) do
+    Tightbeam.EventLog.lifecycle(
+      config.db,
+      "containment",
+      adapter_key_name(key),
+      "DENIED: #{reason}"
+    )
+
+    raise ArgumentError,
+          "containment refused for host #{elem(key, 2)} adapter #{adapter_key_name(key)}: #{reason}"
+  end
+
+  defp adapter_key_name({harness, identity_name, host}),
+    do: "#{harness}:#{identity_name}@#{host}"
 
   defp projection_spec(config, harness, identity_name, base, effective, refs) do
     spec = %{

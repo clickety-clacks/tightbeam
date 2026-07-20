@@ -37,7 +37,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # Async boot: the first checkout hands out a pid whose boot then fails;
     # crashes count via :DOWN on the (fast) backoff clock until the circuit
     # opens and checkout fails fast.
-    assert {:ok, _pid, _gen} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+    assert {:ok, _pid, _gen} =
+             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
 
     assert wait_until(fn ->
              match?(
@@ -55,10 +56,40 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert failures >= 5
   end
 
+  test "containment refusal in adapter_opts takes the uniform degraded path", ctx do
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         backoff_base_ms: 1,
+         adapter_opts: fn _ -> raise ArgumentError, "contained_remote_unsupported" end,
+         db: ctx.db,
+         name: :"containment_coord_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:codex, "contained", "worker"}
+    assert {:ok, _pid, _generation} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(fn ->
+             match?(
+               %{"codex:contained@worker" => %{circuit: :open}},
+               AdapterCoordinator.health(coordinator)
+             )
+           end)
+
+    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "adapter_down")) >= 5
+  end
+
   defp wait_until(fun, tries \\ 200) do
     cond do
-      fun.() -> true
-      tries == 0 -> false
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
       true ->
         Process.sleep(10)
         wait_until(fun, tries - 1)
@@ -67,7 +98,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
   test "harness OS-process death (acp_exit) kills the adapter — no silent wedge", ctx do
     path =
-      Path.join(System.tmp_dir!(), "coordinator_acp_exit_#{System.unique_integer([:positive])}.js")
+      Path.join(
+        System.tmp_dir!(),
+        "coordinator_acp_exit_#{System.unique_integer([:positive])}.js"
+      )
 
     File.write!(path, @fake)
 
@@ -125,7 +159,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          name: :"coordinator_#{System.unique_integer([:positive])}"}
       )
 
-    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+    assert {:ok, adapter, 1} =
+             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+
     Process.exit(adapter, :kill)
 
     assert eventually(fn ->
