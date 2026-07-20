@@ -222,6 +222,13 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "attest",
+               attest_call({:session, "other-session"}, assignment.id, "bogus")
+             )
+
+    assert %{code: "missing_verdict_kind"} =
+             handle(
+               ctx,
+               "attest",
                attest_call({:session, "other-session"}, assignment.id, "verdict")
              )
 
@@ -229,6 +236,9 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", attest_call({:user, "flynn"}, assignment.id, "progress"))
 
     assert %{code: "invalid_kind"} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "bogus"))
+
+    assert %{code: "missing_verdict_kind"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "verdict"))
 
     assert %{code: "invalid_note"} =

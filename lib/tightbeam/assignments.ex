@@ -1,5 +1,5 @@
 defmodule Tightbeam.Assignments do
-  @moduledoc "Assignments and their holder-filed attests."
+  @moduledoc "Assignments and their attests."
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
@@ -52,12 +52,23 @@ defmodule Tightbeam.Assignments do
   CREATE TABLE IF NOT EXISTS attests (
     id TEXT PRIMARY KEY,
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
-    kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender')),
+    kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
+    verdictKind TEXT NULL,
     note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
-    bySession TEXT NOT NULL REFERENCES sessions(sessionKey),
-    ts INTEGER NOT NULL
+    bySession TEXT NULL REFERENCES sessions(sessionKey),
+    byUser TEXT NULL REFERENCES users(userId),
+    ts INTEGER NOT NULL,
+    CHECK(
+      (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
+       byUser IS NULL AND verdictKind IS NULL)
+      OR
+      (kind = 'verdict' AND verdictKind IS NOT NULL AND
+       ((bySession IS NOT NULL) != (byUser IS NOT NULL)))
+    )
   )
   """
+
+  @attests_rebuild_ddl String.replace(@attests_ddl, "IF NOT EXISTS attests", "attests_new")
 
   @doc "Create the assignment/attest schema."
   @spec ensure_schema(DB.server()) :: :ok
@@ -66,6 +77,7 @@ defmodule Tightbeam.Assignments do
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
+    ensure_attests_shape(db)
     ensure_work_item_column(db)
   end
 
@@ -106,6 +118,32 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &assignment/1)
   end
 
+  @doc "Return distinct verdict kinds filed against an assignment."
+  @spec verdict_kinds(DB.server(), String.t()) :: [String.t()]
+  def verdict_kinds(db, assignment_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT DISTINCT verdictKind FROM attests WHERE assignmentId = ?1 AND kind = 'verdict' ORDER BY verdictKind",
+        [assignment_id]
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
+  @doc "List every attest filed against an assignment in deterministic order."
+  @spec list_attests(DB.server(), String.t()) :: [map()]
+  def list_attests(db, assignment_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+        [assignment_id]
+      )
+
+    Enum.map(rows, &attest/1)
+  end
+
   @doc false
   def __for_work_item__(db, work_item_id) do
     {:ok, rows} =
@@ -121,6 +159,7 @@ defmodule Tightbeam.Assignments do
   @doc false
   def __handle__(db, "assign", call), do: assign_result(db, call)
   def __handle__(db, "attest", call), do: attest_result(db, call)
+  def __handle__(db, "attests", call), do: attests_result(db, call)
   def __handle__(db, "revoke-assignment", call), do: revoke_result(db, call)
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
@@ -165,6 +204,17 @@ defmodule Tightbeam.Assignments do
         assignments:
           list(db, %{holder_key: call.session_key, state: call.params[:state] || "open"})
       }
+    end
+  end
+
+  defp attests_result(db, call) do
+    assignment_id = call.params[:assignment_id]
+
+    with :ok <- principal_allowed(call.principal) do
+      case DB.query(db, "SELECT 1 FROM assignments WHERE id = ?1", [assignment_id]) do
+        {:ok, [[1]]} -> %{attests: list_attests(db, assignment_id)}
+        {:ok, []} -> error("unknown_assignment", "unknown assignment: #{assignment_id}")
+      end
     end
   end
 
@@ -226,6 +276,12 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_in_txn(txn, call) do
+    if call.params[:kind] == "verdict",
+      do: verdict_in_txn(txn, call),
+      else: lifecycle_attest_in_txn(txn, call)
+  end
+
+  defp lifecycle_attest_in_txn(txn, call) do
     assignment_id = call.params[:assignment_id]
 
     case fetch_assignment(txn, assignment_id) do
@@ -242,7 +298,8 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_kind(call.params[:kind]),
-                 :ok <- valid_note(call.params[:note]) do
+                 :ok <- valid_note(call.params[:note]),
+                 :ok <- absent_verdict_kind(call.params[:verdict_kind]) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -269,6 +326,33 @@ defmodule Tightbeam.Assignments do
                 if Txn.changes(txn) != 1, do: raise(TransitionRace)
                 %{assignment: fetch_assignment!(txn, assignment_id), attest: attest}
               end
+            end
+        end
+    end
+  end
+
+  defp verdict_in_txn(txn, call) do
+    assignment_id = call.params[:assignment_id]
+
+    case fetch_assignment(txn, assignment_id) do
+      nil ->
+        error("unknown_assignment", "unknown assignment: #{assignment_id}")
+
+      assignment ->
+        cond do
+          assignment.state != "open" ->
+            assignment_closed()
+
+          true ->
+            with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
+                 :ok <- valid_note(call.params[:note]) do
+              if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
+                   assignment_id
+                 ]) != [[1]],
+                 do: raise(TransitionRace)
+
+              attest = insert_attest(txn, call, assignment_id)
+              %{assignment: assignment, attest: attest}
             end
         end
     end
@@ -319,22 +403,33 @@ defmodule Tightbeam.Assignments do
   defp insert_attest(txn, call, assignment_id) do
     id = id("att_")
     ts = now()
-    {:session, by_session} = call.principal
+    {by_user, by_session} = opener(call.principal)
 
     Txn.q(
       txn,
-      "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-      [id, assignment_id, call.params.kind, call.params[:note], by_session, ts]
+      "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+      [
+        id,
+        assignment_id,
+        call.params.kind,
+        call.params[:verdict_kind],
+        call.params[:note],
+        by_session,
+        by_user,
+        ts
+      ]
     )
 
-    %{
-      id: id,
-      assignmentId: assignment_id,
-      kind: call.params.kind,
-      note: call.params[:note],
-      bySession: by_session,
-      ts: ts
-    }
+    attest([
+      id,
+      assignment_id,
+      call.params.kind,
+      call.params[:verdict_kind],
+      call.params[:note],
+      by_session,
+      by_user,
+      ts
+    ])
   end
 
   defp idempotency_assignment(txn, owner, key) do
@@ -390,6 +485,27 @@ defmodule Tightbeam.Assignments do
 
   defp valid_kind(kind) when kind in ["progress", "completion", "surrender"], do: :ok
   defp valid_kind(_), do: error("invalid_kind", "kind must be progress, completion, or surrender")
+
+  defp absent_verdict_kind(nil), do: :ok
+
+  defp absent_verdict_kind(_),
+    do: error("invalid_verdict_kind", "verdictKind is only valid when kind is verdict")
+
+  defp valid_verdict_kind(nil),
+    do: error("missing_verdict_kind", "verdictKind is required when kind is verdict")
+
+  defp valid_verdict_kind(kind) when is_binary(kind) do
+    if String.length(kind) in 1..64 and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, kind),
+      do: :ok,
+      else:
+        error(
+          "invalid_verdict_kind",
+          "verdictKind must be 1..64 lowercase letters, digits, or hyphens"
+        )
+  end
+
+  defp valid_verdict_kind(_),
+    do: error("invalid_verdict_kind", "verdictKind must be text")
 
   defp valid_state(nil), do: :ok
   defp valid_state(state) when state in ["open", "closed", "all"], do: :ok
@@ -469,6 +585,52 @@ defmodule Tightbeam.Assignments do
       closingAttestId: closing_attest_id,
       workItemId: work_item_id
     }
+  end
+
+  defp attest([id, assignment_id, kind, verdict_kind, note, by_session, by_user, ts]) do
+    %{
+      id: id,
+      assignmentId: assignment_id,
+      kind: kind,
+      verdictKind: verdict_kind,
+      note: note,
+      bySession: by_session,
+      byUser: by_user,
+      ts: ts
+    }
+  end
+
+  defp ensure_attests_shape(db) do
+    {:ok, [[sql]]} =
+      DB.query(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attests'")
+
+    unless String.contains?(sql, "'verdict'") do
+      :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+      try do
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            Txn.exec(txn, @attests_rebuild_ddl)
+
+            Txn.q(
+              txn,
+              "INSERT INTO attests_new (id, assignmentId, kind, note, bySession, ts) SELECT id, assignmentId, kind, note, bySession, ts FROM attests"
+            )
+
+            Txn.exec(txn, "DROP TABLE attests")
+            Txn.exec(txn, "ALTER TABLE attests_new RENAME TO attests")
+
+            case Txn.q(txn, "PRAGMA foreign_key_check") do
+              [] -> :ok
+              rows -> raise DB.Error, message: "foreign key check failed: #{inspect(rows)}"
+            end
+          end)
+      after
+        :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+      end
+    end
+
+    :ok
   end
 
   defp ensure_work_item_column(db) do

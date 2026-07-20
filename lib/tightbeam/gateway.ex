@@ -409,6 +409,7 @@ defmodule Tightbeam.Gateway do
       "work-item-update" => fn call -> WorkItems.__handle__(db, "work-item-update", call) end,
       "assign" => fn call -> Assignments.__handle__(db, "assign", call) end,
       "attest" => fn call -> Assignments.__handle__(db, "attest", call) end,
+      "attests" => fn call -> Assignments.__handle__(db, "attests", call) end,
       "revoke-assignment" => fn call -> Assignments.__handle__(db, "revoke-assignment", call) end,
       "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
       "inspect" => fn call -> inspect_result(config, db, call) end,

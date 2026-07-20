@@ -87,7 +87,12 @@ pub enum Command {
         identity: Identity,
         assignment_id: String,
         kind: String,
+        verdict: Option<String>,
         note: Option<String>,
+    },
+    Attests {
+        identity: Identity,
+        assignment_id: String,
     },
     RevokeAssignment {
         identity: Identity,
@@ -241,8 +246,12 @@ COMMANDS:
          [--idempotency-key <key>] [--work-item <workItemId>]
       Open an obligation held by a session; a work item is the durable thread
       across assignments.
-  attest <assignmentId> --kind progress|completion|surrender [--note "..."]
-      File against an assignment held by this session.
+  attest <assignmentId> --kind progress|completion|surrender|verdict
+         [--verdict <kind>] [--note "..."]
+      File against an assignment. Verdicts require --verdict and may be filed
+      by any session or user; lifecycle attests remain holder-filed.
+  attests <assignmentId>
+      List every attest filed against an assignment.
   revoke-assignment <assignmentId>
       Revoke an open assignment (admin or its opener).
   assignments [--session <key> | --role <name>] [--state open|closed|all]
@@ -674,11 +683,28 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                     "usage: tightbeam attest <assignmentId> --kind <kind>".to_owned()
                 })?;
             let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
+            let verdict = nonempty(flags, "verdict");
+            if kind == "verdict" && verdict.is_none() {
+                return Err("--verdict is required when --kind is verdict".to_owned());
+            }
+            if kind != "verdict" && verdict.is_some() {
+                return Err("--verdict is only valid when --kind is verdict".to_owned());
+            }
             Ok(Command::Attest {
                 identity: identity(flags)?,
                 assignment_id,
                 kind,
+                verdict,
                 note: nonempty(flags, "note"),
+            })
+        }
+        "attests" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam attests <assignmentId>".to_owned());
+            }
+            Ok(Command::Attests {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
             })
         }
         "revoke-assignment" => {
@@ -790,7 +816,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe"
         )),
     }
 }
@@ -981,7 +1007,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -1019,6 +1045,25 @@ mod tests {
         ] {
             assert!(parse(args).is_ok());
         }
+    }
+
+    #[test]
+    fn verdict_flag_is_required_iff_kind_is_verdict() {
+        assert_eq!(
+            parse(strings(&["attest", "asg_1", "--kind", "verdict"])),
+            Err("--verdict is required when --kind is verdict".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "progress",
+                "--verdict",
+                "reviewed"
+            ])),
+            Err("--verdict is only valid when --kind is verdict".to_owned())
+        );
     }
 
     #[test]
