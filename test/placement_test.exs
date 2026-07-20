@@ -472,7 +472,8 @@ defmodule Tightbeam.PlacementTest do
              stderr_path: Path.join(base_dir, "adapter-codex:default@testhost.stderr.log"),
              env: [
                {"TIGHTBEAM_HOME", base_dir},
-               {"PATH", "/local/bin:" <> (System.get_env("PATH") || "")}
+               {"PATH", "/local/bin:" <> (System.get_env("PATH") || "")},
+               {"TIGHTBEAM_LINEAGE", "tb1-ZGVmYXVsdEB0ZXN0aG9zdA"}
              ]
            ]
   end
@@ -533,12 +534,17 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "TIGHTBEAM_TOKEN=tbc_test",
              "PATH=/srv/tb/bin:$PATH",
+             "TIGHTBEAM_LINEAGE=tb1-ZGVmYXVsdEB3b3JrZXI",
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]
 
     assert opts[:home] == remote_home
     assert opts[:stderr_path] == Path.join(base_dir, "adapter-codex:default@worker.stderr.log")
-    assert opts[:env] == []
+    assert opts[:env] == [{"TIGHTBEAM_LINEAGE", "tb1-ZGVmYXVsdEB3b3JrZXI"}]
+
+    lineage_assignment = Enum.find(opts[:cmd], &String.starts_with?(&1, "TIGHTBEAM_LINEAGE="))
+    assert lineage_assignment == "TIGHTBEAM_LINEAGE=tb1-ZGVmYXVsdEB3b3JrZXI"
+    refute Enum.any?(opts[:cmd], &String.contains?(&1, "'TIGHTBEAM_LINEAGE="))
 
     claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
 
@@ -548,6 +554,22 @@ defmodule Tightbeam.PlacementTest do
 
     # Harness-scoped: codex remote env never carries claude's token expansion.
     refute Enum.any?(opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
+  end
+
+  test "adapter lineage marker roundtrips arbitrary identity text", %{base_dir: base_dir} do
+    archetypes_dir = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(archetypes_dir)
+    identity_name = "name with space:/@$('<é"
+    File.write!(Path.join(archetypes_dir, "spaced.toml"), ~s(name = "#{identity_name}"\n))
+    Archetypes.load!(base_dir)
+
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    opts = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+
+    {"TIGHTBEAM_LINEAGE", "tb1-" <> encoded} =
+      Enum.find(opts[:env], fn {key, _value} -> key == "TIGHTBEAM_LINEAGE" end)
+
+    assert Base.url_decode64!(encoded, padding: false) == "#{identity_name}@testhost"
   end
 
   test "deliver_home stages without auth and performs the remote flow in order", %{

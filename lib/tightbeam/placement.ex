@@ -349,6 +349,9 @@ defmodule Tightbeam.Placement do
   """
   @spec adapter_opts(map(), adapter_key()) :: keyword()
   def adapter_opts(config, {harness, identity_name, host} = key) do
+    lineage =
+      "tb1-" <> Base.url_encode64("#{identity_name}@#{host}", padding: false)
+
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
     home = deliver_home(config, key, deliver_opts)
     host_config = Map.fetch!(hosts(config.base_dir), host)
@@ -367,7 +370,8 @@ defmodule Tightbeam.Placement do
         env:
           [
             {"TIGHTBEAM_HOME", config.base_dir},
-            {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")}
+            {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
+            {"TIGHTBEAM_LINEAGE", lineage}
           ] ++ harness_token_env(config.base_dir, harness)
       ]
     else
@@ -396,7 +400,8 @@ defmodule Tightbeam.Placement do
             "TIGHTBEAM_HOME=#{host_config.base_dir}",
             "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
             "TIGHTBEAM_TOKEN=#{Map.fetch!(gateway, "cliToken")}",
-            "PATH=#{cli_bin}:$PATH"
+            "PATH=#{cli_bin}:$PATH",
+            "TIGHTBEAM_LINEAGE=#{lineage}"
           ]
 
       [
@@ -405,7 +410,7 @@ defmodule Tightbeam.Placement do
         home: home,
         cwd: config.cwd,
         stderr_path: stderr_path,
-        env: []
+        env: [{"TIGHTBEAM_LINEAGE", lineage}]
       ]
     end
   end

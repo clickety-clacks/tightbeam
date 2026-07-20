@@ -24,6 +24,10 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
+    Probe {
+        json: bool,
+        base_dir: Option<String>,
+    },
     Wake {
         identity: Identity,
         target: Target,
@@ -227,6 +231,9 @@ COMMANDS:
       After: add the host to an archetype's `where`.
         tightbeam assimilate work-1.local --as-user flynn
 
+  probe [--json] [--base-dir DIR]
+      Report local lineage claims, adapter candidates, and machine facts.
+
 DISCOVERY: the CLI finds the gateway via TIGHTBEAM_URL + TIGHTBEAM_TOKEN, else
   <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json. In an agent shell this is already
   set for you.
@@ -240,6 +247,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "dry-run",
     "force",
     "help",
+    "json",
     "no-onboard",
     "push-credentials",
 ];
@@ -439,6 +447,20 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
 
     let flags = &parsed.flags;
     match command.expect("checked above") {
+        "probe" => {
+            if parsed.positional.len() != 1
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "json" | "base-dir"))
+                || flags.get("base-dir").is_some_and(String::is_empty)
+            {
+                return Err("usage: tightbeam probe [--json] [--base-dir DIR]".to_owned());
+            }
+            Ok(Command::Probe {
+                json: flags.contains_key("json"),
+                base_dir: nonempty(flags, "base-dir"),
+            })
+        }
         "wake" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -579,7 +601,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe"
         )),
     }
 }
@@ -769,7 +791,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -803,6 +825,8 @@ mod tests {
             strings(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
             strings(&["setup"]),
             strings(&["assimilate", "host", "--as-user", "flynn"]),
+            strings(&["probe"]),
+            strings(&["probe", "--json", "--base-dir", "/tmp/tb"]),
         ];
         for args in commands {
             assert!(parse(args).is_ok());
@@ -827,6 +851,21 @@ mod tests {
         ]);
         fs::remove_file(skill_path).unwrap();
         assert!(matches!(skill_put, Ok(Command::SkillPut { .. })));
+    }
+
+    #[test]
+    fn probe_rejects_positionals_unknown_flags_and_missing_base_dir() {
+        for values in [
+            strings(&["probe", "extra"]),
+            strings(&["probe", "--bogus"]),
+            strings(&["probe", "--base-dir"]),
+        ] {
+            assert_eq!(
+                parse(values),
+                Err("usage: tightbeam probe [--json] [--base-dir DIR]".to_owned())
+            );
+        }
+        assert!(HELP.contains("probe [--json] [--base-dir DIR]"));
     }
 
     #[test]

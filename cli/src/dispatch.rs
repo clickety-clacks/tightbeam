@@ -68,7 +68,7 @@ fn request(
 /// Build the dispatch request without performing discovery or network I/O.
 pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
-        Command::Help | Command::Setup(_) | Command::Assimilate(_) => {
+        Command::Help | Command::Probe { .. } | Command::Setup(_) | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
         Command::Wake {
@@ -355,6 +355,7 @@ fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
 pub fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Help => unreachable!("help is handled before dispatch"),
+        Command::Probe { json, base_dir } => crate::probe::run(json, base_dir),
         Command::Setup(args) => crate::ceremonies::setup(args),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         command => {
