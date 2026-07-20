@@ -102,6 +102,49 @@ defmodule Tightbeam.OrgTest do
     assert session.session_key =~ ~r/^agent:main:clawline:flynn:main s_[0-9a-f]{8}$/
   end
 
+  test "session CLI tokens are unique, active-only, and indexed", %{db: db} do
+    first = Org.create(db, base(%{session_key: "token-1"}))
+    second = Org.create(db, base(%{session_key: "token-2"}))
+
+    assert first.cli_token =~ ~r/^tbs_[A-Za-z0-9_-]{32}$/
+    assert second.cli_token =~ ~r/^tbs_[A-Za-z0-9_-]{32}$/
+    refute first.cli_token == second.cli_token
+    assert Org.by_cli_token(db, first.cli_token).session_key == first.session_key
+    assert Org.by_cli_token(db, "tbs_unknown") == nil
+
+    Org.retire(db, first.session_key)
+    assert Org.by_cli_token(db, first.cli_token) == nil
+
+    {:ok, [[index_sql]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'sessions_cli_token'"
+      )
+
+    assert index_sql =~ "UNIQUE INDEX"
+  end
+
+  test "pre-existing session schema gains the token column before its index" do
+    db = :"old_org_db_#{System.unique_integer([:positive])}"
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
+
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE sessions (
+        sessionKey TEXT PRIMARY KEY, displayName TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'custom',
+        orderIndex INTEGER NOT NULL DEFAULT 0, isBuiltIn INTEGER NOT NULL DEFAULT 0,
+        adopted INTEGER NOT NULL DEFAULT 0, ownerUserId TEXT NOT NULL, origin TEXT NOT NULL,
+        spawnedBy TEXT, handle TEXT UNIQUE, archetype TEXT NOT NULL, harness TEXT NOT NULL,
+        provider TEXT NOT NULL, model TEXT NOT NULL, thinkingLevel TEXT, state TEXT NOT NULL DEFAULT 'active',
+        createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+      )
+      """)
+
+    assert :ok = Org.ensure_schema(db)
+    {:ok, columns} = DB.query(db, "PRAGMA table_info(sessions)")
+    assert Enum.any?(columns, fn [_cid, name | _] -> name == "cliToken" end)
+  end
+
   test "list scopes active sessions by owner unless admin and preserves ordering", %{db: db} do
     Org.create(db, base(%{session_key: "k2", order_index: 2}))
     Org.create(db, base(%{session_key: "k1", order_index: 1}))

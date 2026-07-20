@@ -1,7 +1,8 @@
 //! Hand-parsed CLI arguments.
 //!
-//! Unlike the TypeScript seam, multiple identity flags are rejected as required
-//! by the port specification's conflict ruling.
+//! Unlike the TypeScript reference CLI, this shipped Rust CLI rejects multiple
+//! identity flags and permits omission when session-file discovery proves the
+//! caller; the gateway remains the identity authority.
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,6 +13,7 @@ pub enum Identity {
     Role(String),
     User(String),
     Process(String),
+    Omitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +135,7 @@ Every command is one of the substrate's verbs; you invoke them exactly as the
 human operator does. Output is JSON on stdout; a nonzero exit means failure
 (the message is on stderr).
 
-IDENTITY (required on every command — this is the #1 thing to get right):
+IDENTITY (optional inside a session workdir; otherwise required):
   --as <role>          act as a role you currently hold. Use this when YOU (an
                        agent) run the command. The role must be bound to your
                        active session.
@@ -145,8 +147,9 @@ IDENTITY (required on every command — this is the #1 thing to get right):
   --as-process <name>  act as automation (cron, CI, a webhook — e.g.
                        "cron"). Processes may wake and cancel-wake ONLY —
                        they cannot spawn, retire, or administer.
-  Pass exactly ONE identity. It is who the call is attributed to, NOT the
-  target of the call.
+  Pass at most ONE identity. It is who the call is attributed to, NOT the
+  target of the call. Inside a session workdir, omission lets the gateway
+  derive the session's identity from its credential.
 
 TARGET (for commands that take one — pass exactly one):
   --session <key>      this exact session incarnation
@@ -234,9 +237,8 @@ COMMANDS:
   probe [--json] [--base-dir DIR]
       Report local lineage claims, adapter candidates, and machine facts.
 
-DISCOVERY: the CLI finds the gateway via TIGHTBEAM_URL + TIGHTBEAM_TOKEN, else
-  <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json. In an agent shell this is already
-  set for you.
+DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
+  TIGHTBEAM_URL + TIGHTBEAM_TOKEN, else <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
 
 DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
 
@@ -296,9 +298,7 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
 
     match identities.as_slice() {
         [identity] => Ok(identity.clone()),
-        [] => Err(
-            "identity required: pass --as <your-agent-handle> (when an agent runs this) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'.".to_owned(),
-        ),
+        [] => Ok(Identity::Omitted),
         _ => Err(
             "identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process"
                 .to_owned(),
@@ -745,11 +745,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_and_multiple_identity() {
-        assert!(
-            parse(strings(&["list"]))
-                .unwrap_err()
-                .starts_with("identity required:")
+    fn permits_missing_and_rejects_multiple_identity() {
+        assert_eq!(
+            parse(strings(&["list"])),
+            Ok(Command::List {
+                identity: Identity::Omitted
+            })
         );
         assert_eq!(
             parse(strings(&["list", "--as", "coder", "--as-user", "flynn"])),

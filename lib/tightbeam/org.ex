@@ -29,6 +29,7 @@ defmodule Tightbeam.Org do
           archetype: String.t(),
           overrides: map() | nil,
           identity_name: String.t(),
+          cli_token: String.t() | nil,
           harness: String.t(),
           provider: String.t(),
           model: String.t(),
@@ -63,6 +64,7 @@ defmodule Tightbeam.Org do
     archetype     TEXT NOT NULL,
     overrides     TEXT,
     identityName  TEXT,
+    cliToken      TEXT,
     harness       TEXT NOT NULL CHECK (harness IN ('claude','codex')),
     provider      TEXT NOT NULL CHECK (provider IN ('anthropic','openai')),
     model         TEXT NOT NULL,
@@ -94,13 +96,17 @@ defmodule Tightbeam.Org do
           "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT 'local'",
           "ALTER TABLE sessions ADD COLUMN clearedThroughSeq INTEGER NOT NULL DEFAULT 0",
           "ALTER TABLE sessions ADD COLUMN overrides TEXT",
-          "ALTER TABLE sessions ADD COLUMN identityName TEXT"
+          "ALTER TABLE sessions ADD COLUMN identityName TEXT",
+          "ALTER TABLE sessions ADD COLUMN cliToken TEXT"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
         {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
       end
     end
+
+    {:ok, _} =
+      DB.query(db, "CREATE UNIQUE INDEX IF NOT EXISTS sessions_cli_token ON sessions(cliToken)")
 
     {:ok, _} =
       DB.query(db, "UPDATE sessions SET identityName = archetype WHERE identityName IS NULL")
@@ -126,15 +132,16 @@ defmodule Tightbeam.Org do
       Map.get(input, :session_key) || custom_session_key(Map.fetch!(input, :owner_user_id))
 
     now = now()
+    cli_token = session_token()
 
     Txn.q(
       txn,
       """
         INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-          ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
+          ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName, cliToken,
           harness, provider, model, thinkingLevel, host, state, createdAt, updatedAt)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-          ?15, ?16, ?17, ?18, 'active', ?19, ?19)
+          ?15, ?16, ?17, ?18, ?19, 'active', ?20, ?20)
       """,
       [
         session_key,
@@ -150,6 +157,7 @@ defmodule Tightbeam.Org do
         Map.fetch!(input, :archetype),
         encode_overrides(Map.get(input, :overrides)),
         Map.get(input, :identity_name, Map.fetch!(input, :archetype)),
+        cli_token,
         Map.fetch!(input, :harness),
         Map.fetch!(input, :provider),
         Map.fetch!(input, :model),
@@ -160,6 +168,18 @@ defmodule Tightbeam.Org do
     )
 
     must_get(txn, session_key)
+  end
+
+  @doc "Fetch an active session by its CLI token, or nil."
+  @spec by_cli_token(db(), String.t()) :: session() | nil
+  def by_cli_token(db \\ Tightbeam.DB, token) do
+    {:ok, rows} =
+      DB.query(db, select_session_sql() <> " WHERE cliToken = ?1 AND state = 'active'", [token])
+
+    case rows do
+      [row] -> to_session(row)
+      [] -> nil
+    end
   end
 
   @doc "Fetch a session by key, or nil."
@@ -415,7 +435,7 @@ defmodule Tightbeam.Org do
   defp select_session_sql do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName, harness, provider,
+           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName, cliToken, harness, provider,
            model, thinkingLevel, host, clearedThroughSeq, state, createdAt, updatedAt
     FROM sessions
     """
@@ -435,6 +455,7 @@ defmodule Tightbeam.Org do
          archetype,
          overrides,
          identity_name,
+         cli_token,
          harness,
          provider,
          model,
@@ -459,6 +480,7 @@ defmodule Tightbeam.Org do
       archetype: archetype,
       overrides: decode_overrides(overrides),
       identity_name: identity_name || archetype,
+      cli_token: cli_token,
       harness: harness,
       provider: provider,
       model: model,
@@ -479,6 +501,10 @@ defmodule Tightbeam.Org do
   end
 
   defp now, do: System.system_time(:millisecond)
+
+  defp session_token do
+    "tbs_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
+  end
 
   defp encode_overrides(nil), do: nil
   defp encode_overrides(overrides), do: JSON.encode!(overrides)
