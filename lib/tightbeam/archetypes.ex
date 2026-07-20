@@ -152,6 +152,8 @@ defmodule Tightbeam.Archetypes do
     catalog does not exist here — say so plainly.
   - `wake` — how the org corresponds; mechanics, stamps, origin classes,
     and reply semantics live in the Comms section below.
+  - `assign` opens work held by a session, `attest` files progress/completion/
+    surrender against it, and `assignments` lists the open obligations.
   - `tune` changes a session (rename, set_model, set_host — set_host moves
     it to another allowed machine); `retire` ends one (its history
     survives); `cancel-wake <id>` cancels a scheduled wake.

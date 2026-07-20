@@ -43,7 +43,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles}
   alias Tightbeam.Wire.{Payloads, Socket}
 
-  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list)
+  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest revoke-assignment assignments)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -440,13 +440,26 @@ defmodule Tightbeam.Wire.Router do
       verb == "retire" and (given == ["role"] or given == ["userId"]) ->
         {:error, 400, "invalid_message", "retire takes sessionKey only"}
 
+      verb in ["assign", "assignments"] and given == ["userId"] ->
+        {:error, 400, "invalid_target_kind",
+         "assignments are held by sessions; target a sessionKey or role"}
+
+      verb == "assign" and given == [] ->
+        {:error, 400, "missing_target", "assign requires a sessionKey or role target"}
+
       given == [] ->
         {:ok, nil, %{role: nil, fallback: false}}
 
       given == ["sessionKey"] ->
         case Org.get(db(conn), body["sessionKey"]) do
-          nil -> {:error, 404, "not_found", "unknown sessionKey: #{body["sessionKey"]}"}
-          session -> {:ok, session.session_key, %{role: nil, fallback: false}}
+          nil ->
+            {:error, 404, "not_found", "unknown sessionKey: #{body["sessionKey"]}"}
+
+          %{state: "retired"} when verb == "assign" ->
+            {:error, 400, "session_retired", "assignments require an active holder session"}
+
+          session ->
+            {:ok, session.session_key, %{role: nil, fallback: false}}
         end
 
       given == ["userId"] ->
@@ -587,7 +600,13 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp error_status("forbidden"), do: 403
+
+  defp error_status(code)
+       when code in ["not_holder", "not_authorized", "process_denied", "principal_required"],
+       do: 403
+
   defp error_status("not_found"), do: 404
+  defp error_status("unknown_assignment"), do: 404
   defp error_status("server_error"), do: 500
   defp error_status(_), do: 400
 

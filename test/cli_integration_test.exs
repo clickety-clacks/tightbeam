@@ -51,6 +51,22 @@ defmodule Tightbeam.CliIntegrationTest do
       "wake" => fn call ->
         send(test_pid, {:cli_call, call})
         %{wake_id: "w_cli"}
+      end,
+      "assign" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{id: "asg_cli", subject: call.params.subject}
+      end,
+      "attest" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{assignment: %{id: call.params.assignment_id}, attest: %{kind: call.params.kind}}
+      end,
+      "revoke-assignment" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{id: call.params.assignment_id, outcome: "revoked"}
+      end,
+      "assignments" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{assignments: [%{id: "asg_cli"}]}
       end
     }
 
@@ -109,5 +125,63 @@ defmodule Tightbeam.CliIntegrationTest do
     Org.retire(ctx.db, ctx.session.session_key)
     {refused, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert refused =~ "auth_failed"
+  end
+
+  test "real CLI dispatches every assignment subcommand with pinned wire shapes", ctx do
+    {assigned, 0} =
+      System.cmd(
+        ctx.binary,
+        ["assign", "--subject", "ship", "--session", "cli-holder", "--idempotency-key", "idem"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert assigned =~ "asg_cli"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "assign",
+                      session_key: "cli-holder",
+                      params: %{subject: "ship", idempotency_key: "idem"}
+                    }}
+
+    {attested, 0} =
+      System.cmd(ctx.binary, ["attest", "asg_cli", "--kind", "completion", "--note", "ready"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert attested =~ "completion"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "attest",
+                      params: %{assignment_id: "asg_cli", kind: "completion", note: "ready"}
+                    }}
+
+    {revoked, 0} =
+      System.cmd(ctx.binary, ["revoke-assignment", "asg_cli"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert revoked =~ "revoked"
+    assert_receive {:cli_call, %{verb: "revoke-assignment", params: %{assignment_id: "asg_cli"}}}
+
+    {listed, 0} =
+      System.cmd(ctx.binary, ["assignments", "--role", "cli-holder", "--state", "all"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert listed =~ "asg_cli"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "assignments",
+                      session_key: "cli-holder",
+                      target_role: "cli-holder",
+                      params: %{state: "all"}
+                    }}
   end
 end

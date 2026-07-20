@@ -1,6 +1,6 @@
 defmodule Tightbeam.Idempotency do
   @moduledoc """
-  Durable idempotency ledger for spawn/retire (TS reference:
+  Durable idempotency ledger for spawn/retire/wake/assign (TS reference:
   src/wire/idempotency.ts). Same key + same operation + same owner → the
   original session, forever. Scope is (owner_user_id, operation, key) — a
   spawn key never collides with a retire key.
@@ -21,7 +21,7 @@ defmodule Tightbeam.Idempotency do
   @ddl """
   CREATE TABLE IF NOT EXISTS wire_idempotency (
     ownerUserId    TEXT NOT NULL,
-    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake')),
+    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign')),
     idempotencyKey TEXT NOT NULL,
     sessionKey     TEXT NOT NULL,
     PRIMARY KEY (ownerUserId, operation, idempotencyKey)
@@ -39,11 +39,15 @@ defmodule Tightbeam.Idempotency do
   # copy, drop). Detected via the stored DDL; idempotent.
   defp widen_operation_check(db) do
     {:ok, rows} =
-      DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wire_idempotency'", [])
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wire_idempotency'",
+        []
+      )
 
     case rows do
       [[sql]] ->
-        if String.contains?(sql, "'wake'") do
+        if String.contains?(sql, "'assign'") do
           :ok
         else
           :ok = DB.execute(db, "ALTER TABLE wire_idempotency RENAME TO wire_idempotency_old;")

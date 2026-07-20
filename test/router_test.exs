@@ -29,6 +29,22 @@ defmodule Tightbeam.Wire.RouterTest do
       "inspect" => fn call ->
         send(parent, {:call, call})
         %{sessions: [], wakes: []}
+      end,
+      "assign" => fn call ->
+        send(parent, {:call, call})
+        %{id: "asg_test"}
+      end,
+      "attest" => fn call ->
+        send(parent, {:call, call})
+        %{code: call.params[:return_code] || "not_holder"}
+      end,
+      "revoke-assignment" => fn call ->
+        send(parent, {:call, call})
+        %{code: call.params[:return_code] || "not_authorized"}
+      end,
+      "assignments" => fn call ->
+        send(parent, {:call, call})
+        %{assignments: []}
       end
     }
 
@@ -231,6 +247,119 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(unknown.resp_body) == %{
              "error" => %{"code" => "not_found", "message" => "unknown role: unknown-role"}
            }
+  end
+
+  test "assignment typed-target teaching errors precede Dispatch and status classes are pinned",
+       ctx do
+    create_session(ctx.db, "holder-target", "flynn")
+
+    missing =
+      dispatch_cli(ctx, "tbc_test", %{verb: "assign", asProcess: "cron", params: %{subject: "x"}})
+
+    assert missing.status == 400
+    assert JSON.decode!(missing.resp_body)["error"]["code"] == "missing_target"
+
+    wrong =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "assign",
+        asProcess: "cron",
+        userId: "flynn",
+        params: %{subject: "x"}
+      })
+
+    assert wrong.status == 400
+    assert JSON.decode!(wrong.resp_body)["error"]["code"] == "invalid_target_kind"
+
+    union =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "assign",
+        asProcess: "cron",
+        sessionKey: "holder-target",
+        role: "x",
+        params: %{subject: "x"}
+      })
+
+    assert union.status == 400
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM events")
+
+    forbidden =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "attest",
+        asUser: "flynn",
+        params: %{returnCode: "not_holder"}
+      })
+
+    assert forbidden.status == 403
+
+    missing_assignment =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "attest",
+        asUser: "flynn",
+        params: %{returnCode: "unknown_assignment"}
+      })
+
+    assert missing_assignment.status == 404
+  end
+
+  test "assign resolves bound and fallback roles and refuses unusable references", ctx do
+    main = create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+    holder = create_session(ctx.db, "assign-holder", "flynn")
+    retired = create_session(ctx.db, "assign-retired", "flynn")
+    Roles.create!(ctx.db, "bound-assignment", "flynn", holder.session_key)
+    Roles.create!(ctx.db, "fallback-assignment", "flynn", nil)
+    Org.retire(ctx.db, retired.session_key)
+
+    assert dispatch_cli(ctx, "tbc_test", %{
+             verb: "assign",
+             asUser: "flynn",
+             role: "bound-assignment",
+             params: %{subject: "x"}
+           }).status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "assign",
+                      session_key: "assign-holder",
+                      target_role: "bound-assignment",
+                      role_fallback: false
+                    }}
+
+    assert dispatch_cli(ctx, "tbc_test", %{
+             verb: "assign",
+             asUser: "flynn",
+             role: "fallback-assignment",
+             params: %{subject: "x"}
+           }).status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "assign",
+                      session_key: key,
+                      target_role: "fallback-assignment",
+                      role_fallback: true
+                    }}
+
+    assert key == main.session_key
+
+    for body <- [
+          %{verb: "assign", asUser: "flynn", role: "missing-assignment", params: %{subject: "x"}},
+          %{verb: "assign", asUser: "flynn", sessionKey: "missing", params: %{subject: "x"}}
+        ] do
+      response = dispatch_cli(ctx, "tbc_test", body)
+      assert response.status == 404
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "not_found"
+    end
+
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "assign",
+        asUser: "flynn",
+        sessionKey: retired.session_key,
+        params: %{subject: "x"}
+      })
+
+    assert response.status == 400
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "session_retired"
   end
 
   test "acting as a role requires its active binding", ctx do

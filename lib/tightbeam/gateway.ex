@@ -60,6 +60,7 @@ defmodule Tightbeam.Gateway do
   alias Tightbeam.{
     AdapterCoordinator,
     Archetypes,
+    Assignments,
     Placement,
     DB,
     Devices,
@@ -118,7 +119,16 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     File.mkdir_p!(config.base_dir)
 
-    for module <- [Tightbeam.Assets, Devices, Idempotency, Wakes, Projection, Org, Roles] do
+    for module <- [
+          Tightbeam.Assets,
+          Devices,
+          Idempotency,
+          Wakes,
+          Projection,
+          Org,
+          Roles,
+          Assignments
+        ] do
       :ok = module.ensure_schema(db)
     end
 
@@ -391,6 +401,10 @@ defmodule Tightbeam.Gateway do
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
       "role-list" => fn _call -> role_list_result(db) end,
+      "assign" => fn call -> Assignments.__handle__(db, "assign", call) end,
+      "attest" => fn call -> Assignments.__handle__(db, "attest", call) end,
+      "revoke-assignment" => fn call -> Assignments.__handle__(db, "revoke-assignment", call) end,
+      "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,

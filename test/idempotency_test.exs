@@ -41,4 +41,40 @@ defmodule Tightbeam.IdempotencyTest do
       Idempotency.put(db, %{row | operation: "other", idempotency_key: "request-2"})
     end
   end
+
+  test "fresh DDL accepts assign and a pre-assign database is rename-rebuilt", %{db: db} do
+    assert :ok =
+             Idempotency.put(db, %{
+               owner_user_id: "user:flynn",
+               operation: "assign",
+               idempotency_key: "new",
+               session_key: "asg_new"
+             })
+
+    legacy = :"legacy_idempotency_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: legacy}, id: legacy)
+
+    :ok =
+      DB.execute(legacy, """
+      CREATE TABLE wire_idempotency (
+        ownerUserId TEXT NOT NULL,
+        operation TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake')),
+        idempotencyKey TEXT NOT NULL,
+        sessionKey TEXT NOT NULL,
+        PRIMARY KEY (ownerUserId, operation, idempotencyKey)
+      );
+      INSERT INTO wire_idempotency VALUES ('flynn','spawn','old','session-old');
+      """)
+
+    assert :ok = Idempotency.ensure_schema(legacy)
+    assert Idempotency.get(legacy, "flynn", "spawn", "old").session_key == "session-old"
+
+    assert :ok =
+             Idempotency.put(legacy, %{
+               owner_user_id: "session:holder",
+               operation: "assign",
+               idempotency_key: "new",
+               session_key: "asg_new"
+             })
+  end
 end

@@ -55,6 +55,27 @@ pub enum Command {
         session_key: String,
         idempotency_key: Option<String>,
     },
+    Assign {
+        identity: Identity,
+        subject: String,
+        target: Target,
+        idempotency_key: Option<String>,
+    },
+    Attest {
+        identity: Identity,
+        assignment_id: String,
+        kind: String,
+        note: Option<String>,
+    },
+    RevokeAssignment {
+        identity: Identity,
+        assignment_id: String,
+    },
+    Assignments {
+        identity: Identity,
+        target: Option<Target>,
+        state: Option<String>,
+    },
     CancelWake {
         identity: Identity,
         wake_id: String,
@@ -188,6 +209,16 @@ COMMANDS:
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
+
+  assign --subject "<work>" (--session <key> | --role <name>)
+         [--idempotency-key <key>]
+      Open an obligation held by a session.
+  attest <assignmentId> --kind progress|completion|surrender [--note "..."]
+      File against an assignment held by this session.
+  revoke-assignment <assignmentId>
+      Revoke an open assignment (admin or its opener).
+  assignments [--session <key> | --role <name>] [--state open|closed|all]
+      List assignments (open by default).
 
   cancel-wake <wakeId>
       Cancel a pending (scheduled) wake by its id (from the wake command's
@@ -519,6 +550,66 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "assign" => {
+            let targets = [
+                nonempty(flags, "session").map(Target::Session),
+                nonempty(flags, "role").map(Target::Role),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if parsed.positional.get(1).is_some() || targets.len() != 1 {
+                return Err("usage: tightbeam assign --subject <text> exactly one of --session <key>, --role <name>".to_owned());
+            }
+            let subject =
+                nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
+            Ok(Command::Assign {
+                identity: identity(flags)?,
+                subject,
+                target: targets.into_iter().next().expect("exactly one target"),
+                idempotency_key: nonempty(flags, "idempotency-key"),
+            })
+        }
+        "attest" => {
+            let assignment_id =
+                parsed.positional.get(1).cloned().ok_or_else(|| {
+                    "usage: tightbeam attest <assignmentId> --kind <kind>".to_owned()
+                })?;
+            let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
+            Ok(Command::Attest {
+                identity: identity(flags)?,
+                assignment_id,
+                kind,
+                note: nonempty(flags, "note"),
+            })
+        }
+        "revoke-assignment" => {
+            let assignment_id =
+                parsed.positional.get(1).cloned().ok_or_else(|| {
+                    "usage: tightbeam revoke-assignment <assignmentId>".to_owned()
+                })?;
+            Ok(Command::RevokeAssignment {
+                identity: identity(flags)?,
+                assignment_id,
+            })
+        }
+        "assignments" => {
+            let targets = [
+                nonempty(flags, "session").map(Target::Session),
+                nonempty(flags, "role").map(Target::Role),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if parsed.positional.get(1).is_some() || targets.len() > 1 {
+                return Err("usage: tightbeam assignments [--session <key> | --role <name>] [--state <state>]".to_owned());
+            }
+            Ok(Command::Assignments {
+                identity: identity(flags)?,
+                target: targets.into_iter().next(),
+                state: nonempty(flags, "state"),
+            })
+        }
         "cancel-wake" => {
             let wake_id = parsed
                 .positional
@@ -601,7 +692,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, assign, attest, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe"
         )),
     }
 }
@@ -792,7 +883,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, assign, attest, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe".to_owned())
         );
     }
 

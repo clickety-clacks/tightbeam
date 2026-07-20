@@ -142,6 +142,67 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::Assign {
+            identity,
+            subject,
+            target,
+            idempotency_key,
+        } => {
+            let target = match target {
+                Target::Session(value) => string_field("sessionKey", value),
+                Target::Role(value) => string_field("role", value),
+                Target::User(_) => unreachable!("assign has no user target"),
+            };
+            let mut params = vec![string_field("subject", subject)];
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(identity, "assign", vec![target], params))
+        }
+        Command::Attest {
+            identity,
+            assignment_id,
+            kind,
+            note,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("kind", kind),
+            ];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            Ok(request(identity, "attest", vec![], params))
+        }
+        Command::RevokeAssignment {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "revoke-assignment",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::Assignments {
+            identity,
+            target,
+            state,
+        } => {
+            let fields = target
+                .as_ref()
+                .map(|target| match target {
+                    Target::Session(value) => string_field("sessionKey", value),
+                    Target::Role(value) => string_field("role", value),
+                    Target::User(_) => unreachable!("assignments has no user target"),
+                })
+                .into_iter()
+                .collect();
+            let params = state
+                .as_ref()
+                .map(|value| vec![string_field("state", value)])
+                .unwrap_or_default();
+            Ok(request(identity, "assignments", fields, params))
+        }
         Command::CancelWake { identity, wake_id } => Ok(request(
             identity,
             "wake",
@@ -426,6 +487,10 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
+        | Command::Assign { identity, .. }
+        | Command::Attest { identity, .. }
+        | Command::RevokeAssignment { identity, .. }
+        | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
         | Command::RoleCreate { identity, .. }
         | Command::RoleBind { identity, .. }
@@ -438,10 +503,9 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::DenyDevice { identity, .. }
         | Command::RevokeDevice { identity, .. }
         | Command::PromoteUser { identity, .. } => identity,
-        Command::Help
-        | Command::Probe { .. }
-        | Command::Setup(_)
-        | Command::Assimilate(_) => return false,
+        Command::Help | Command::Probe { .. } | Command::Setup(_) | Command::Assimilate(_) => {
+            return false;
+        }
     };
     matches!(identity, Identity::Omitted)
 }
@@ -581,6 +645,53 @@ mod tests {
         assert_eq!(
             body(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"promote-user","params":{"userId":"mike","isAdmin":false}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_assignment_bodies() {
+        assert_eq!(
+            body(&[
+                "assign",
+                "--subject",
+                "ship",
+                "--role",
+                "builder",
+                "--idempotency-key",
+                "idem",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "completion",
+                "--note",
+                "ready",
+                "--as",
+                "builder"
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","note":"ready"}}"#
+        );
+        assert_eq!(
+            body(&["revoke-assignment", "asg_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assignments",
+                "--session",
+                "s1",
+                "--state",
+                "all",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
         );
     }
 
