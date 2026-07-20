@@ -167,7 +167,8 @@ defmodule Tightbeam.Archetypes do
     Before promising a feature on a specific harness, consult the
     `tightbeam-harnesses` skill in your home — facts, not guesses.
   - Every action is attributed: --as <role> (a role currently bound to you)
-    or --as-user <human>. You cannot act as a role you do not hold.
+    or --as-user <human>. You cannot act as a role you do not hold. On a session token,
+    --as-user is verified: a session may act only as its own owner.
   """
 
   @builtin_preamble """

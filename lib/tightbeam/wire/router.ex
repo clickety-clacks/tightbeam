@@ -91,15 +91,16 @@ defmodule Tightbeam.Wire.Router do
   end
 
   post "/agent/dispatch" do
-    with :ok <- cli_auth(conn),
+    with {:ok, auth} <- cli_auth(conn),
          {:ok, body, conn} <- read_json(conn),
          {:ok, verb} <- required_string(body["verb"]),
          :ok <- allowed_agent_verb(verb),
-         {:ok, origin} <- agent_origin(body, conn),
+         {:ok, origin, principal} <- agent_identity(body, auth, conn),
          {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
       call = %{
         verb: verb,
         origin: origin,
+        principal: principal,
         session_key: session_key,
         target_role: target_meta.role,
         role_fallback: target_meta.fallback,
@@ -286,10 +287,16 @@ defmodule Tightbeam.Wire.Router do
     do: deps(conn)[:session_status] || (&Tightbeam.Gateway.session_status/1)
 
   defp cli_auth(conn) do
-    if Plug.Conn.get_req_header(conn, "authorization") == ["Bearer #{deps(conn).cli_token}"] do
-      :ok
-    else
-      {:error, 401, "auth_failed", nil}
+    token =
+      case Plug.Conn.get_req_header(conn, "authorization") do
+        ["Bearer " <> token] -> token
+        _ -> nil
+      end
+
+    cond do
+      token == deps(conn).cli_token -> {:ok, :org}
+      session = token && Org.by_cli_token(db(conn), token) -> {:ok, {:session, session}}
+      true -> {:error, 401, "auth_failed", nil}
     end
   end
 
@@ -310,6 +317,78 @@ defmodule Tightbeam.Wire.Router do
     if verb in @agent_verbs,
       do: :ok,
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
+  end
+
+  defp agent_identity(body, :org, conn) do
+    with {:ok, origin} <- agent_origin(body, conn) do
+      principal =
+        cond do
+          is_binary(body["as"]) and body["as"] != "" ->
+            nil
+
+          is_binary(body["asUser"]) and body["asUser"] != "" ->
+            {:user, body["asUser"]}
+
+          is_binary(body["asProcess"]) and body["asProcess"] != "" ->
+            {:process, body["asProcess"]}
+
+          true ->
+            nil
+        end
+
+      {:ok, origin, principal}
+    end
+  end
+
+  defp agent_identity(body, {:session, session}, conn) do
+    roles = Roles.for_session(db(conn), session.session_key)
+
+    result =
+      cond do
+        is_binary(body["as"]) and body["as"] != "" ->
+          role = body["as"]
+
+          case Roles.resolve(db(conn), role) do
+            {:ok, key, false} when key == session.session_key ->
+              {:ok, "agent:#{role}"}
+
+            _ ->
+              held = if roles == [], do: "none", else: Enum.join(roles, ", ")
+
+              {:error, 403, "role_not_held",
+               "role #{role} is not held by this session; held roles: #{held}"}
+          end
+
+        is_binary(body["asUser"]) and body["asUser"] != "" ->
+          if body["asUser"] == session.owner_user_id do
+            {:ok, "user:#{session.owner_user_id}"}
+          else
+            {:error, 403, "identity_not_yours",
+             "this session belongs to #{session.owner_user_id}"}
+          end
+
+        is_binary(body["asProcess"]) and body["asProcess"] != "" ->
+          {:error, 403, "identity_not_yours", "a session token cannot act as a process"}
+
+        length(roles) == 1 ->
+          {:ok, "agent:#{hd(roles)}"}
+
+        roles == [] and session.is_built_in ->
+          {:ok, "user:#{session.owner_user_id}"}
+
+        roles == [] ->
+          {:error, 403, "no_role",
+           "this session holds no role; its owner must bind one, or pass --as-user #{session.owner_user_id}"}
+
+        true ->
+          {:error, 400, "ambiguous_identity",
+           "this session holds several roles (#{Enum.join(roles, ", ")}); pass --as <role>"}
+      end
+
+    case result do
+      {:ok, origin} -> {:ok, origin, {:session, session.session_key}}
+      error -> error
+    end
   end
 
   defp agent_origin(body, conn) do

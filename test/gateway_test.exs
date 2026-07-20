@@ -197,6 +197,49 @@ defmodule Tightbeam.GatewayTest do
     assert token != ""
   end
 
+  test "children backfills distinct tokens for active NULL rows only", ctx do
+    second =
+      Org.create(ctx.db, %{
+        session_key: "backfill-active",
+        display_name: "Active",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    retired =
+      Org.create(ctx.db, %{
+        session_key: "backfill-retired",
+        display_name: "Retired",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+      |> then(&Org.retire(ctx.db, &1.session_key))
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET cliToken = NULL")
+
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_backfill_#{System.unique_integer([:positive])}")
+
+    Gateway.children(gateway_config(base_dir, ctx.db, 0))
+
+    first_token = Org.get(ctx.db, "k1").cli_token
+    second_token = Org.get(ctx.db, second.session_key).cli_token
+    assert first_token =~ ~r/^tbs_/
+    assert second_token =~ ~r/^tbs_/
+    refute first_token == second_token
+    assert Org.get(ctx.db, retired.session_key).cli_token == nil
+  end
+
   test "children sweeps newer credentials from abandoned identity homes before adapters", ctx do
     base_dir = Path.join(System.tmp_dir!(), "gateway_sweep_#{System.unique_integer([:positive])}")
     auth_dir = Path.join([base_dir, "auth", "codex"])
@@ -1301,6 +1344,22 @@ defmodule Tightbeam.GatewayTest do
                     ]}
 
     assert_receive {:prompt_started, ^adapter}
+
+    digest =
+      :crypto.hash(:sha256, "k1")
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    session_file = Path.join([base, "work", digest, ".tightbeam-session"])
+
+    assert File.read!(session_file) ==
+             JSON.encode!(%{
+               url: "http://127.0.0.1:0",
+               token: Org.get(ctx.db, "k1").cli_token,
+               sessionKey: "k1"
+             })
+
+    assert Bitwise.band(File.stat!(session_file).mode, 0o777) == 0o600
     send(self(), {:push, Tightbeam.Wire.Payloads.ack("c_gold")})
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)

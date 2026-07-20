@@ -32,10 +32,12 @@ defmodule Tightbeam.Dispatch do
   identity. `session_key` is the TARGET (nil for verbs without one).
   """
   @type call :: %{
-          verb: String.t(),
-          origin: String.t(),
-          session_key: String.t() | nil,
-          params: map()
+          required(:verb) => String.t(),
+          required(:origin) => String.t(),
+          required(:session_key) => String.t() | nil,
+          required(:params) => map(),
+          optional(:principal) =>
+            {:session, String.t()} | {:user, String.t()} | {:process, String.t()} | nil
         }
 
   @typedoc "A handler: pure-ish fun; returns a result map, or %{code: _} to deny."
@@ -54,46 +56,47 @@ defmodule Tightbeam.Dispatch do
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
     verb = Map.fetch!(call, :verb)
     origin = Map.fetch!(call, :origin)
+    principal = Map.get(call, :principal)
     session_key = Map.get(call, :session_key)
 
     case Rules.evaluate(db, call) do
       {:deny, error} ->
-        best_effort_denial(db, verb, origin, session_key, error)
+        best_effort_denial(db, verb, origin, principal, session_key, error)
         {:error, error}
 
       :ok ->
-        dispatch_to_handler(db, handlers, call, verb, origin, session_key)
+        dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key)
     end
   end
 
-  defp dispatch_to_handler(db, handlers, call, verb, origin, session_key) do
+  defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
     case Map.fetch(handlers, verb) do
       :error ->
         error = %{code: "unknown_verb"}
-        :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error)
+        :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
         {:error, error}
 
       {:ok, handler} ->
         case invoke(handler, call) do
           {:returned, %{code: _} = error} ->
-            :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error)
+            :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
             {:error, error}
 
           {:returned, result} ->
-            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, result)
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, result, principal)
             {:ok, result}
 
           {:raised, exception} ->
             error = %{code: "server_error", message: Exception.message(exception)}
-            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, error)
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, error, principal)
             {:error, error}
         end
     end
   end
 
-  defp best_effort_denial(db, verb, origin, session_key, error) do
+  defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do
-      EventLog.append_event(db, "denied", verb, origin, session_key, error)
+      EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
     catch
       _kind, _reason -> :ok
     end

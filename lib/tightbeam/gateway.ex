@@ -131,6 +131,21 @@ defmodule Tightbeam.Gateway do
         Placement.local_host_name()
       ])
 
+    {:ok, rows} =
+      DB.query(db, "SELECT sessionKey FROM sessions WHERE state = 'active' AND cliToken IS NULL")
+
+    Enum.each(rows, fn [session_key] ->
+      token = "tbs_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
+
+      {:ok, _} =
+        DB.query(db, "UPDATE sessions SET cliToken = ?2 WHERE sessionKey = ?1", [
+          session_key,
+          token
+        ])
+    end)
+
+    warn_cli_target_mismatches(db, config.base_dir)
+
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
     cli_token =
@@ -865,8 +880,77 @@ defmodule Tightbeam.Gateway do
       |> binary_part(0, 12)
 
     path = Path.join([host.base_dir, "work", digest])
-    Placement.ensure_dir(host, path)
+
+    url =
+      if host.ssh == nil,
+        do: "http://127.0.0.1:#{config.port}",
+        else: Application.fetch_env!(:tightbeam, :advertised_url)
+
+    content =
+      JSON.encode!(%{url: url, token: session.cli_token, sessionKey: session.session_key})
+
+    ensure_opts = [base_dir: config.base_dir]
+    ensure_opts = if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
+
+    ensure_opts =
+      if config[:sh_out], do: Keyword.put(ensure_opts, :sh_out, config.sh_out), else: ensure_opts
+
+    Placement.ensure_workdir(host, path, content, ensure_opts)
     path
+  end
+
+  defp warn_cli_target_mismatches(db, base_dir) do
+    local = local_target_triple()
+
+    base_dir
+    |> Placement.hosts()
+    |> Enum.each(fn
+      {_name, %{ssh: nil}} ->
+        :ok
+
+      {name, %{ssh: dest}} ->
+        case System.cmd(
+               "ssh",
+               ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", dest, "uname", "-sm"],
+               stderr_to_stdout: true
+             ) do
+          {output, 0} ->
+            case target_from_probe(output) do
+              target when is_binary(target) and target != local ->
+                EventLog.lifecycle(
+                  db,
+                  "cli_target_mismatch",
+                  name,
+                  "gateway #{local}; host #{target}"
+                )
+
+              _ ->
+                :ok
+            end
+
+          _ ->
+            :ok
+        end
+    end)
+  end
+
+  defp local_target_triple do
+    case {:os.type(), :erlang.system_info(:system_architecture) |> to_string()} do
+      {{:unix, :darwin}, "aarch64" <> _} -> "aarch64-apple-darwin"
+      {{:unix, :darwin}, "x86_64" <> _} -> "x86_64-apple-darwin"
+      {{:unix, :linux}, "aarch64" <> _} -> "aarch64-unknown-linux-gnu"
+      {{:unix, :linux}, "x86_64" <> _} -> "x86_64-unknown-linux-gnu"
+    end
+  end
+
+  defp target_from_probe(output) do
+    case String.split(String.trim(output)) do
+      ["Darwin", arch] when arch in ["arm64", "aarch64"] -> "aarch64-apple-darwin"
+      ["Darwin", "x86_64"] -> "x86_64-apple-darwin"
+      ["Linux", arch] when arch in ["arm64", "aarch64"] -> "aarch64-unknown-linux-gnu"
+      ["Linux", arch] when arch in ["x86_64", "amd64"] -> "x86_64-unknown-linux-gnu"
+      _ -> nil
+    end
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do

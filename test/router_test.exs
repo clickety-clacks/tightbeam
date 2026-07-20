@@ -3,7 +3,7 @@ defmodule Tightbeam.Wire.RouterTest do
   import Plug.Test
   import Plug.Conn
 
-  alias Tightbeam.{Assets, DB, Devices, EventLog, Org, Roles}
+  alias Tightbeam.{Assets, DB, Devices, EventLog, Gateway, Org, Roles}
   alias Tightbeam.Wire.Router
 
   setup do
@@ -259,6 +259,130 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(vacant.resp_body)["error"]["message"] =~ "vacant"
   end
 
+  test "session bearer enforces the identity ladder and threads the normative principal seam",
+       ctx do
+    holder = create_session(ctx.db, "holder-token", "flynn")
+    sibling = create_session(ctx.db, "sibling-token", "mike")
+    main = create_session(ctx.db, "main-token", "flynn", is_built_in: true, kind: "main")
+    roleless = create_session(ctx.db, "roleless-token", "flynn")
+    several = create_session(ctx.db, "several-token", "flynn")
+
+    Roles.create!(ctx.db, "held", "flynn", holder.session_key)
+    Roles.create!(ctx.db, "sibling", "mike", sibling.session_key)
+    Roles.create!(ctx.db, "fallback", "mike", nil)
+    Roles.create!(ctx.db, "alpha", "flynn", several.session_key)
+    Roles.create!(ctx.db, "beta", "flynn", several.session_key)
+
+    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", as: "held"}).status == 200
+    assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
+
+    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 200
+    assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
+
+    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "flynn"}).status == 200
+    assert_receive {:call, %{origin: "user:flynn", principal: {:session, "holder-token"}}}
+
+    register_host =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        default_harness: :claude,
+        default_model: "fable",
+        max_live_sessions_per_user: 50
+      })["register-host"]
+
+    File.mkdir_p!(ctx.base_dir)
+
+    admin_ctx = %{
+      ctx
+      | opts: Keyword.update!(ctx.opts, :handlers, &Map.put(&1, "register-host", register_host))
+    }
+
+    admin =
+      dispatch_cli(admin_ctx, holder.cli_token, %{
+        verb: "register-host",
+        asUser: "flynn",
+        params: %{
+          name: "worker",
+          ssh: "worker",
+          baseDir: "/srv/tightbeam",
+          cliBin: "/srv/tightbeam/bin",
+          adapterBinDir: "/srv/tightbeam/adapters"
+        }
+      })
+
+    assert admin.status == 200, admin.resp_body
+
+    assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
+    assert_receive {:call, %{origin: "user:flynn", principal: {:session, "main-token"}}}
+
+    Roles.create!(ctx.db, "main-role", "flynn", main.session_key)
+    assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
+    assert_receive {:call, %{origin: "agent:main-role", principal: {:session, "main-token"}}}
+
+    assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asUser: "flynn"}).status == 200
+    assert_receive {:call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+
+    assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asProcess: "cron"}).status == 200
+    assert_receive {:call, %{origin: "process:cron", principal: {:process, "cron"}}}
+
+    assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", as: "held"}).status == 200
+    assert_receive {:call, %{origin: "agent:held", principal: nil}}
+
+    for role <- ["sibling", "fallback", "missing"] do
+      response = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", as: role})
+      assert response.status == 403
+      error = JSON.decode!(response.resp_body)["error"]
+      assert error["code"] == "role_not_held"
+      assert error["message"] =~ role
+      assert error["message"] =~ "held"
+    end
+
+    wrong_user =
+      dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
+
+    assert wrong_user.status == 403
+
+    assert JSON.decode!(wrong_user.resp_body)["error"] == %{
+             "code" => "identity_not_yours",
+             "message" => "this session belongs to flynn"
+           }
+
+    process = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"})
+    assert process.status == 403
+    assert JSON.decode!(process.resp_body)["error"]["code"] == "identity_not_yours"
+
+    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
+    no_role = dispatch_cli(ctx, roleless.cli_token, %{verb: "inspect"})
+    assert no_role.status == 403
+    assert JSON.decode!(no_role.resp_body)["error"]["code"] == "no_role"
+    {:ok, [[after_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
+    assert after_count == before_count
+
+    ambiguous = dispatch_cli(ctx, several.cli_token, %{verb: "inspect"})
+    assert ambiguous.status == 400
+    assert JSON.decode!(ambiguous.resp_body)["error"]["code"] == "ambiguous_identity"
+    assert ambiguous.resp_body =~ "alpha"
+    assert ambiguous.resp_body =~ "beta"
+
+    assert dispatch_cli(ctx, "tbs_unknown", %{verb: "inspect"}).status == 401
+    Org.retire(ctx.db, holder.session_key)
+    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 401
+
+    {:ok, principals} =
+      DB.query(ctx.db, "SELECT principal FROM events ORDER BY id")
+
+    assert ["session:holder-token"] in principals
+    assert ["session:main-token"] in principals
+    assert ["user:flynn"] in principals
+    assert ["process:cron"] in principals
+    assert [nil] in principals
+
+    refute Enum.any?(principals, fn [value] ->
+             is_binary(value) and String.contains?(value, "tbs_")
+           end)
+  end
+
   test "multipart upload returns asset metadata", ctx do
     response =
       ctx
@@ -377,5 +501,27 @@ defmodule Tightbeam.Wire.RouterTest do
     conn(:post, "/agent/dispatch", body)
     |> put_req_header("authorization", "Bearer tbc_test")
     |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp dispatch_cli(ctx, bearer, body) do
+    conn(:post, "/agent/dispatch", JSON.encode!(Map.put_new(body, :params, %{})))
+    |> put_req_header("authorization", "Bearer #{bearer}")
+    |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp create_session(db, key, owner, extra \\ []) do
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable",
+      is_built_in: Keyword.get(extra, :is_built_in, false),
+      kind: Keyword.get(extra, :kind, "custom")
+    })
   end
 end

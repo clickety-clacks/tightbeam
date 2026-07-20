@@ -293,11 +293,158 @@ defmodule Tightbeam.PlacementTest do
     source = test_workdir(old_base, "session-1")
     File.mkdir_p!(source)
     File.write!(Path.join(source, "memory.md"), "remember")
+    File.write!(Path.join(source, ".tightbeam-session"), "secret")
 
     assert :ok =
              Placement.move_workdir(%{base_dir: base_dir}, "session-1", "old-local", "new-local")
 
     assert File.read!(Path.join(test_workdir(new_base, "session-1"), "memory.md")) == "remember"
+    refute File.exists?(Path.join(source, ".tightbeam-session"))
+
+    assert File.read!(Path.join(test_workdir(new_base, "session-1"), ".tightbeam-session")) ==
+             "secret"
+  end
+
+  test "ensure_workdir converges local content, mode, and git exclude", %{base_dir: base_dir} do
+    path = Path.join(base_dir, "local-work")
+    content = JSON.encode!(%{url: "http://127.0.0.1:4321", token: "tbs_secret", sessionKey: "s1"})
+
+    assert :ok = Placement.ensure_workdir(%{ssh: nil, base_dir: base_dir}, path, content, [])
+    file = Path.join(path, ".tightbeam-session")
+    assert File.read!(file) == content
+    assert Bitwise.band(File.stat!(file).mode, 0o777) == 0o600
+    refute File.exists?(Path.join(path, ".git"))
+
+    File.mkdir_p!(Path.join([path, ".git", "info"]))
+    exclude = Path.join([path, ".git", "info", "exclude"])
+    File.write!(exclude, "*.beam")
+    assert :ok = Placement.ensure_workdir(%{ssh: nil, base_dir: base_dir}, path, content, [])
+    assert File.read!(exclude) == "*.beam\n.tightbeam-session\n"
+
+    assert :ok = Placement.ensure_workdir(%{ssh: nil, base_dir: base_dir}, path, content, [])
+    assert length(Regex.scan(~r/^\.tightbeam-session$/m, File.read!(exclude))) == 1
+
+    File.write!(file, "tampered")
+    assert :ok = Placement.ensure_workdir(%{ssh: nil, base_dir: base_dir}, path, content, [])
+    assert File.read!(file) == content
+
+    File.chmod!(file, 0o644)
+    assert :ok = Placement.ensure_workdir(%{ssh: nil, base_dir: base_dir}, path, content, [])
+    assert Bitwise.band(File.stat!(file).mode, 0o777) == 0o600
+  end
+
+  test "ensure_workdir remote compare uses stdout-only pinned probe and stages on mismatch", %{
+    base_dir: base_dir
+  } do
+    path = "/remote/tb/work/digest"
+    content = ~s({"url":"https://gateway","token":"tbs_secret","sessionKey":"s1"})
+    parent = self()
+
+    sh_out = fn command ->
+      send(parent, {:sh_out, command})
+      {"", 0}
+    end
+
+    sh = fn command ->
+      stage_file = Enum.at(command, -2)
+
+      send(
+        parent,
+        {:stage, File.read!(stage_file), Bitwise.band(File.stat!(stage_file).mode, 0o777)}
+      )
+
+      send(parent, {:sh, command})
+      {"", 0}
+    end
+
+    assert :ok =
+             Placement.ensure_workdir(
+               %{ssh: "worker", base_dir: "/remote/tb"},
+               path,
+               content,
+               base_dir: base_dir,
+               sh: sh,
+               sh_out: sh_out
+             )
+
+    assert_receive {:sh_out, compare}
+    command = List.last(compare)
+    assert command =~ "mkdir -p #{path} &&"
+    assert command =~ "find #{path}/.tightbeam-session -maxdepth 0 -perm 600 -print"
+    assert command =~ "| grep -q . && cat #{path}/.tightbeam-session"
+    assert command =~ ~s(printf "\\n%s\\n" .tightbeam-session)
+    assert_receive {:stage, ^content, 0o600}
+    assert_receive {:sh, rsync}
+    assert List.last(rsync) == "worker:#{path}/"
+    refute Enum.any?(compare ++ rsync, &String.contains?(&1, "tbs_secret"))
+    refute File.exists?(Path.join([base_dir, "staging", "session-files", "digest"]))
+
+    converged_out = fn command ->
+      send(parent, {:converged, command})
+      {content, 0}
+    end
+
+    assert :ok =
+             Placement.ensure_workdir(
+               %{ssh: "worker", base_dir: "/remote/tb"},
+               path,
+               content,
+               base_dir: base_dir,
+               sh: fn command -> flunk("unexpected command: #{inspect(command)}") end,
+               sh_out: converged_out
+             )
+
+    assert_receive {:converged, _}
+  end
+
+  test "ensure_workdir remote failures raise and always remove staging", %{base_dir: base_dir} do
+    path = "/remote/tb/work/failure"
+
+    assert_raise RuntimeError, ~r/remote workdir ensure failed/, fn ->
+      Placement.ensure_workdir(
+        %{ssh: "worker", base_dir: "/remote/tb"},
+        path,
+        "tbs_content",
+        base_dir: base_dir,
+        sh_out: fn _ -> {"", 255} end
+      )
+    end
+
+    assert_raise RuntimeError, ~r/command failed/, fn ->
+      Placement.ensure_workdir(
+        %{ssh: "worker", base_dir: "/remote/tb"},
+        path,
+        "tbs_content",
+        base_dir: base_dir,
+        sh_out: fn _ -> {"", 0} end,
+        sh: fn _ -> {"", 1} end
+      )
+    end
+
+    refute File.exists?(Path.join([base_dir, "staging", "session-files", "failure"]))
+  end
+
+  test "move_workdir fails on a real local token removal error", %{base_dir: base_dir} do
+    old_base = Path.join(base_dir, "old-remove-error")
+    new_base = Path.join(base_dir, "new-remove-error")
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "old-remove-error" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
+      "new-remove-error" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
+    })
+
+    source = test_workdir(old_base, "remove-error")
+    File.mkdir_p!(Path.join(source, ".tightbeam-session"))
+
+    assert {:error, message} =
+             Placement.move_workdir(
+               %{base_dir: base_dir},
+               "remove-error",
+               "old-remove-error",
+               "new-remove-error"
+             )
+
+    assert message =~ "source session token removal failed"
   end
 
   test "move_workdir rsyncs local to remote", %{base_dir: base_dir} do
@@ -375,7 +522,7 @@ defmodule Tightbeam.PlacementTest do
                "new-local"
              )
 
-    assert [probe, rsync] = collect_commands([])
+    assert [probe, rsync, cleanup] = collect_commands([])
 
     assert probe == [
              "ssh",
@@ -396,6 +543,18 @@ defmodule Tightbeam.PlacementTest do
              "ssh -o BatchMode=yes -o ConnectTimeout=5",
              "remote:#{source}/",
              destination <> "/"
+           ]
+
+    assert cleanup == [
+             "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
+             "remote",
+             "rm",
+             "-f",
+             Path.join(source, ".tightbeam-session")
            ]
   end
 
@@ -423,7 +582,7 @@ defmodule Tightbeam.PlacementTest do
                "new-remote"
              )
 
-    assert [probe, pull, mkdir, push] = collect_commands([])
+    assert [probe, pull, mkdir, push, cleanup] = collect_commands([])
 
     assert probe == [
              "ssh",
@@ -454,6 +613,9 @@ defmodule Tightbeam.PlacementTest do
 
     assert Enum.at(push, -2) == stage <> "/"
     assert List.last(push) == "new-remote:#{destination}/"
+    assert List.last(cleanup) == Path.join(source, ".tightbeam-session")
+    assert Enum.at(cleanup, -3) == "rm"
+    assert Enum.at(cleanup, -2) == "-f"
     refute File.exists?(stage)
   end
 
@@ -531,7 +693,6 @@ defmodule Tightbeam.PlacementTest do
              "CODEX_HOME=#{remote_home}",
              "TIGHTBEAM_HOME=/srv/tb",
              "TIGHTBEAM_URL=http://gateway.example:4000",
-             "TIGHTBEAM_TOKEN=tbc_test",
              "PATH=/srv/tb/bin:$PATH",
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]

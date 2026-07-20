@@ -31,14 +31,14 @@ defmodule Tightbeam.Placement do
        from Homes.project, env in the local Port).
      - remote: cmd is SSH-WRAPPED — ["ssh", dest, "exec", "env", "K=V"...,
        binary] — because a remote process ignores the local Port env, ALL
-       agent env (harness home var, TIGHTBEAM_URL/TOKEN, PATH with the
+       agent env (harness home var, TIGHTBEAM_URL, PATH with the
        remote cli_bin) is embedded in the remote command line. The home var
        points at the REMOTE home path (remote base_dir). stderr_path stays
        LOCAL and unchanged: the Conn's `sh -c '... 2>>log'` wraps the ssh
        client, so remote stderr rides the ssh connection into the local log.
        The advertised URL (config :tightbeam, :advertised_url) is used for
-       TIGHTBEAM_URL — never 127.0.0.1 — so the remote agent's CLI reaches
-       the gateway over the network.
+       TIGHTBEAM_URL — never 127.0.0.1 — so the session-file-aware CLI reaches
+       the gateway over the network; the org token is never placed in remote env.
 
   3. `deliver_home/3` — materialize the projected home on the session's host:
      Claude homes pin their session-facing default model in settings.json;
@@ -78,6 +78,7 @@ defmodule Tightbeam.Placement do
   """
 
   alias Tightbeam.{Archetypes, Homes, Org, Rails}
+  import Bitwise
 
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
   # misconfigured host must fail in seconds with a reason, never hang on TCP
@@ -169,23 +170,80 @@ defmodule Tightbeam.Placement do
     end
   end
 
-  @doc """
-  Ensure a directory exists on a host (local mkdir_p; remote ssh mkdir -p).
-  Used for per-session workdirs. Raises on failure — an unmakeable workdir
-  fails the turn visibly, same posture as home delivery.
-  """
-  @spec ensure_dir(host_config(), String.t()) :: :ok
-  def ensure_dir(%{ssh: nil}, path) do
+  @doc "Ensure a session workdir and its converged credential file."
+  @spec ensure_workdir(host_config(), String.t(), String.t(), keyword()) :: :ok
+  def ensure_workdir(%{ssh: nil}, path, content, _opts) do
     File.mkdir_p!(path)
+    file = Path.join(path, ".tightbeam-session")
+
+    current = if File.exists?(file), do: File.read!(file), else: nil
+    mode = if File.exists?(file), do: File.stat!(file).mode &&& 0o777, else: nil
+
+    if current != content or mode != 0o600 do
+      File.write!(file, content)
+      File.chmod!(file, 0o600)
+    end
+
+    heal_git_exclude(path)
     :ok
   end
 
-  def ensure_dir(%{ssh: dest}, path) do
-    {_out, code} =
-      System.cmd("ssh", @ssh_opts ++ [dest, "mkdir", "-p", path], stderr_to_stdout: true)
+  def ensure_workdir(%{ssh: dest}, path, content, opts) do
+    sh = Keyword.get(opts, :sh, &system_cmd/1)
+    sh_out = Keyword.get(opts, :sh_out, &system_cmd_out/1)
+    file = Path.join(path, ".tightbeam-session")
 
-    if code != 0, do: raise("remote workdir mkdir failed (#{dest}): #{path}")
+    script =
+      "mkdir -p #{path} && " <>
+        "{ find #{file} -maxdepth 0 -perm 600 -print 2>/dev/null | grep -q . && cat #{file} 2>/dev/null; true; } && " <>
+        "if [ -d #{path}/.git/info ]; then " <>
+        "grep -qxF .tightbeam-session #{path}/.git/info/exclude 2>/dev/null || " <>
+        ~s(printf "\\n%s\\n" .tightbeam-session >> #{path}/.git/info/exclude; fi)
+
+    {current, code} =
+      sh_out.(["ssh" | @ssh_opts] ++ [dest, "sh", "-c", shell_quote(script)])
+
+    if code != 0, do: raise("remote workdir ensure failed (#{dest}): #{path}")
+
+    if current != content do
+      digest = Path.basename(path)
+      stage = Path.join([Keyword.fetch!(opts, :base_dir), "staging", "session-files", digest])
+      stage_file = Path.join(stage, ".tightbeam-session")
+      File.mkdir_p!(stage)
+
+      try do
+        File.write!(stage_file, content)
+        File.chmod!(stage_file, 0o600)
+
+        run!(sh, [
+          "rsync",
+          "-a",
+          "-e",
+          Enum.join(["ssh" | @ssh_opts], " "),
+          stage_file,
+          "#{dest}:#{path}/"
+        ])
+      after
+        File.rm_rf!(stage)
+      end
+    end
+
     :ok
+  end
+
+  defp heal_git_exclude(path) do
+    info = Path.join([path, ".git", "info"])
+
+    if File.dir?(info) do
+      exclude = Path.join(info, "exclude")
+      existing = if File.exists?(exclude), do: File.read!(exclude), else: ""
+      lines = String.split(existing, "\n")
+
+      if ".tightbeam-session" not in lines do
+        separator = if existing == "" or String.ends_with?(existing, "\n"), do: "", else: "\n"
+        File.write!(exclude, existing <> separator <> ".tightbeam-session\n")
+      end
+    end
   end
 
   @doc """
@@ -220,6 +278,8 @@ defmodule Tightbeam.Placement do
       File.mkdir_p!(Path.dirname(destination))
       File.cp_r!(source, destination)
     end
+
+    ensure_local_token_absent!(source)
   end
 
   defp move_workdir(sh, _base_dir, %{ssh: nil}, source, %{ssh: destination_host}, destination) do
@@ -235,6 +295,8 @@ defmodule Tightbeam.Placement do
         "#{destination_host}:#{destination}/"
       ])
     end
+
+    ensure_local_token_absent!(source)
   end
 
   defp move_workdir(sh, _base_dir, %{ssh: source_host}, source, %{ssh: nil}, destination) do
@@ -250,6 +312,8 @@ defmodule Tightbeam.Placement do
         destination <> "/"
       ])
     end
+
+    ensure_remote_token_absent!(sh, source_host, source)
   end
 
   defp move_workdir(
@@ -289,6 +353,20 @@ defmodule Tightbeam.Placement do
         File.rm_rf!(stage)
       end
     end
+
+    ensure_remote_token_absent!(sh, source_host, source)
+  end
+
+  defp ensure_local_token_absent!(source) do
+    case File.rm(Path.join(source, ".tightbeam-session")) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> raise "source session token removal failed: #{inspect(reason)}"
+    end
+  end
+
+  defp ensure_remote_token_absent!(sh, host, source) do
+    run!(sh, ["ssh" | @ssh_opts] ++ [host, "rm", "-f", Path.join(source, ".tightbeam-session")])
   end
 
   defp remote_dir?(sh, host, path) do
@@ -371,7 +449,6 @@ defmodule Tightbeam.Placement do
           ] ++ harness_token_env(config.base_dir, harness)
       ]
     else
-      gateway = config.base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
       cli_bin = host_config[:cli_bin] || ""
       home_env = if harness == :codex, do: "CODEX_HOME", else: "CLAUDE_CONFIG_DIR"
 
@@ -395,7 +472,6 @@ defmodule Tightbeam.Placement do
             "#{home_env}=#{home}",
             "TIGHTBEAM_HOME=#{host_config.base_dir}",
             "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
-            "TIGHTBEAM_TOKEN=#{Map.fetch!(gateway, "cliToken")}",
             "PATH=#{cli_bin}:$PATH"
           ]
 
@@ -812,6 +888,7 @@ defmodule Tightbeam.Placement do
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
 
   defp system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
+  defp system_cmd_out([command | args]), do: System.cmd(command, args)
 
   defp run!(sh, command) do
     case sh.(command) do

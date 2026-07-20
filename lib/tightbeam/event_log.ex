@@ -22,6 +22,7 @@ defmodule Tightbeam.EventLog do
           kind: String.t(),
           verb: String.t(),
           origin: String.t(),
+          principal: String.t() | nil,
           session_key: String.t() | nil
         }
 
@@ -41,6 +42,7 @@ defmodule Tightbeam.EventLog do
     kind       TEXT    NOT NULL CHECK (kind IN ('verb','denied')),
     verb       TEXT    NOT NULL,
     origin     TEXT    NOT NULL,
+    principal  TEXT,
     sessionKey TEXT,
     payload    TEXT    NOT NULL DEFAULT 'null'
   );
@@ -62,7 +64,16 @@ defmodule Tightbeam.EventLog do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    result = DB.execute(db, @ddl)
+
+    case DB.query(db, "ALTER TABLE events ADD COLUMN principal TEXT") do
+      {:ok, _} -> :ok
+      {:error, error} -> if inspect(error) =~ "duplicate column", do: :ok, else: raise(error)
+    end
+
+    result
+  end
 
   ## Verb events (dispatch appends these)
 
@@ -70,14 +81,14 @@ defmodule Tightbeam.EventLog do
   Append a verb event (`kind` is `"verb"` for an accepted call, `"denied"` for
   a refused one). Every dispatch outcome gets a row — including the denials.
   """
-  @spec append_event(db(), String.t(), String.t(), String.t(), String.t() | nil, term()) :: :ok
-  def append_event(db \\ Tightbeam.DB, kind, verb, origin, session_key \\ nil, payload \\ nil)
+  @spec append_event(db(), String.t(), String.t(), String.t(), String.t() | nil, term(), term()) :: :ok
+  def append_event(db \\ Tightbeam.DB, kind, verb, origin, session_key \\ nil, payload \\ nil, principal \\ nil)
       when kind in ~w(verb denied) do
     {:ok, _} =
       DB.query(db, """
-        INSERT INTO events (ts, kind, verb, origin, sessionKey, payload)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-      """, [now(), kind, verb, origin, session_key, encode(payload)])
+        INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      """, [now(), kind, verb, origin, serialize_principal(principal), session_key, encode(payload)])
 
     :ok
   end
@@ -86,15 +97,18 @@ defmodule Tightbeam.EventLog do
   @spec events_after(db(), integer(), pos_integer()) :: [verb_event()]
   def events_after(db \\ Tightbeam.DB, after_id, limit) do
     {:ok, rows} =
-      DB.query(db, "SELECT id, ts, kind, verb, origin, sessionKey FROM events WHERE id > ?1 ORDER BY id LIMIT ?2", [
+      DB.query(db, "SELECT id, ts, kind, verb, origin, principal, sessionKey FROM events WHERE id > ?1 ORDER BY id LIMIT ?2", [
         after_id,
         limit
       ])
 
-    Enum.map(rows, fn [id, ts, kind, verb, origin, sk] ->
-      %{id: id, ts: ts, kind: kind, verb: verb, origin: origin, session_key: sk}
+    Enum.map(rows, fn [id, ts, kind, verb, origin, principal, sk] ->
+      %{id: id, ts: ts, kind: kind, verb: verb, origin: origin, principal: principal, session_key: sk}
     end)
   end
+
+  defp serialize_principal(nil), do: nil
+  defp serialize_principal({kind, value}), do: "#{kind}:#{value}"
 
   @doc "Count verb attempts by exact origin and verb strictly after `since_ms`."
   @spec verb_count(db(), String.t(), String.t(), integer()) :: non_neg_integer()

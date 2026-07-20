@@ -16,17 +16,19 @@ pub struct RequestSpec {
 pub struct Endpoint {
     pub base: String,
     pub token: String,
+    pub session_file: bool,
 }
 
 fn quoted(value: &str) -> String {
     serde_json::to_string(value).expect("strings are always JSON serializable")
 }
 
-fn identity_field(identity: &Identity) -> String {
+fn identity_field(identity: &Identity) -> Option<String> {
     match identity {
-        Identity::Role(value) => format!("\"as\":{}", quoted(value)),
-        Identity::User(value) => format!("\"asUser\":{}", quoted(value)),
-        Identity::Process(value) => format!("\"asProcess\":{}", quoted(value)),
+        Identity::Role(value) => Some(format!("\"as\":{}", quoted(value))),
+        Identity::User(value) => Some(format!("\"asUser\":{}", quoted(value))),
+        Identity::Process(value) => Some(format!("\"asProcess\":{}", quoted(value))),
+        Identity::Omitted => None,
     }
 }
 
@@ -52,7 +54,11 @@ fn request(
     mut fields: Vec<String>,
     params: Vec<String>,
 ) -> RequestSpec {
-    let mut body = vec![identity_field(identity), string_field("verb", verb)];
+    let mut body = Vec::new();
+    if let Some(identity) = identity_field(identity) {
+        body.push(identity);
+    }
+    body.push(string_field("verb", verb));
     body.append(&mut fields);
     body.push(params_field(params));
     RequestSpec {
@@ -260,7 +266,8 @@ pub fn build_register_host_request(
 pub fn discover() -> Result<Endpoint, String> {
     #[allow(deprecated)]
     let home = std::env::home_dir().unwrap_or_default();
-    discover_with(|name| std::env::var(name).ok(), &home)
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    discover_with(|name| std::env::var(name).ok(), &cwd, &home)
 }
 
 fn gateway_config_path<F>(get_env: &F, home_dir: &Path) -> PathBuf
@@ -273,14 +280,43 @@ where
         .join("gateway.json")
 }
 
-fn discover_with<F>(get_env: F, home_dir: &Path) -> Result<Endpoint, String>
+fn discover_with<F>(get_env: F, cwd: &Path, home_dir: &Path) -> Result<Endpoint, String>
 where
     F: Fn(&str) -> Option<String>,
 {
+    for directory in cwd.ancestors() {
+        let path = directory.join(".tightbeam-session");
+        if !path.exists() {
+            continue;
+        }
+
+        let encoded = fs::read_to_string(&path)
+            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+        let config: Value = serde_json::from_str(&encoded)
+            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+        let base = config
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("malformed session file '{}': missing url", path.display()))?;
+        let token = config
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("malformed session file '{}': missing token", path.display()))?;
+        return Ok(Endpoint {
+            base: base.to_owned(),
+            token: token.to_owned(),
+            session_file: true,
+        });
+    }
+
     let url = get_env("TIGHTBEAM_URL").filter(|value| !value.is_empty());
     let token = get_env("TIGHTBEAM_TOKEN").filter(|value| !value.is_empty());
     if let (Some(base), Some(token)) = (url, token) {
-        return Ok(Endpoint { base, token });
+        return Ok(Endpoint {
+            base,
+            token,
+            session_file: false,
+        });
     }
 
     let path = gateway_config_path(&get_env, home_dir);
@@ -307,6 +343,7 @@ where
     Ok(Endpoint {
         base: format!("http://127.0.0.1:{port}"),
         token,
+        session_file: false,
     })
 }
 
@@ -358,8 +395,12 @@ pub fn run(command: Command) -> Result<(), String> {
         Command::Setup(args) => crate::ceremonies::setup(args),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         command => {
+            let endpoint = discover()?;
+            if identity_omitted(&command) && !endpoint.session_file {
+                return Err("identity required: pass --as <your-agent-handle> (when an agent runs this) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'.".to_owned());
+            }
             let request = build_request(&command)?;
-            if let Some(result) = send(&request)? {
+            if let Some(result) = send_to(&endpoint, &request)? {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
@@ -368,6 +409,29 @@ pub fn run(command: Command) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn identity_omitted(command: &Command) -> bool {
+    let identity = match command {
+        Command::Wake { identity, .. }
+        | Command::Spawn { identity, .. }
+        | Command::List { identity }
+        | Command::Retire { identity, .. }
+        | Command::CancelWake { identity, .. }
+        | Command::RoleCreate { identity, .. }
+        | Command::RoleBind { identity, .. }
+        | Command::RoleRemove { identity, .. }
+        | Command::RoleList { identity }
+        | Command::SkillList { identity }
+        | Command::SkillPut { identity, .. }
+        | Command::SkillRemove { identity, .. }
+        | Command::ApproveDevice { identity, .. }
+        | Command::DenyDevice { identity, .. }
+        | Command::RevokeDevice { identity, .. }
+        | Command::PromoteUser { identity, .. } => identity,
+        Command::Help | Command::Setup(_) | Command::Assimilate(_) => return false,
+    };
+    matches!(identity, Identity::Omitted)
 }
 
 #[cfg(test)]
@@ -539,10 +603,11 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            discover_with(|name| env.get(name).cloned(), &root),
+            discover_with(|name| env.get(name).cloned(), &root, &root),
             Ok(Endpoint {
                 base: "https://gateway".to_owned(),
-                token: "env-token".to_owned()
+                token: "env-token".to_owned(),
+                session_file: false,
             })
         );
 
@@ -551,17 +616,19 @@ mod tests {
             configured.display().to_string(),
         )]);
         assert_eq!(
-            discover_with(|name| env.get(name).cloned(), &root),
+            discover_with(|name| env.get(name).cloned(), &root, &root),
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
-                token: "configured".to_owned()
+                token: "configured".to_owned(),
+                session_file: false,
             })
         );
         assert_eq!(
-            discover_with(|_| None, &root),
+            discover_with(|_| None, &root, &root),
             Ok(Endpoint {
                 base: "http://127.0.0.1:9876".to_owned(),
-                token: "default".to_owned()
+                token: "default".to_owned(),
+                session_file: false,
             })
         );
         let env = HashMap::from([("TIGHTBEAM_HOME".to_owned(), String::new())]);
@@ -569,6 +636,48 @@ mod tests {
             gateway_config_path(&|name| env.get(name).cloned(), &root),
             PathBuf::from("gateway.json")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_walks_up_and_session_file_wins() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_session_{unique}"));
+        let nested = root.join("one/two");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"url":"https://session","token":"tbs_test","sessionKey":"s1","future":true}"#,
+        )
+        .unwrap();
+        let env = HashMap::from([
+            ("TIGHTBEAM_URL".to_owned(), "https://env".to_owned()),
+            ("TIGHTBEAM_TOKEN".to_owned(), "env-token".to_owned()),
+        ]);
+
+        assert_eq!(
+            discover_with(|name| env.get(name).cloned(), &nested, &root),
+            Ok(Endpoint {
+                base: "https://session".to_owned(),
+                token: "tbs_test".to_owned(),
+                session_file: true,
+            })
+        );
+        assert_eq!(
+            build_request(&Command::List {
+                identity: Identity::Omitted
+            })
+            .unwrap()
+            .body_json,
+            r#"{"verb":"inspect","params":{}}"#
+        );
+
+        fs::write(root.join(".tightbeam-session"), "{").unwrap();
+        let error = discover_with(|_| None, &nested, &root).unwrap_err();
+        assert!(error.contains(&root.join(".tightbeam-session").display().to_string()));
         fs::remove_dir_all(root).unwrap();
     }
 

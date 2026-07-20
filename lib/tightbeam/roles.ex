@@ -119,6 +119,17 @@ defmodule Tightbeam.Roles do
     end)
   end
 
+  @doc "Names of roles currently bound to an active session, in deterministic order."
+  @spec for_session(db(), String.t()) :: [String.t()]
+  def for_session(db \\ Tightbeam.DB, session_key) do
+    {:ok, rows} =
+      DB.query(db, "SELECT name FROM roles WHERE boundSessionKey = ?1 ORDER BY name", [
+        session_key
+      ])
+
+    Enum.map(rows, fn [name] -> name end)
+  end
+
   @doc "Remove a role name."
   @spec rm(db(), String.t()) :: :ok | {:error, %{code: String.t(), message: String.t()}}
   def rm(db \\ Tightbeam.DB, name) do
