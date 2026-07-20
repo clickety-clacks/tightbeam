@@ -64,6 +64,7 @@ defmodule Tightbeam.Gateway do
     DB,
     Devices,
     EventLog,
+    Homes,
     Idempotency,
     LaneManager,
     Ledger,
@@ -153,8 +154,11 @@ defmodule Tightbeam.Gateway do
     # boot (bad law stops the boot). Placement owns every host mechanic.
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)
+    Homes.sweep_auth(config.base_dir, :claude)
+    Homes.sweep_auth(config.base_dir, :codex)
 
-    adapter_opts = fn key -> Placement.adapter_opts(Map.put(config, :cli_bin, cli_bin), key) end
+    adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
+    adapter_opts = fn key -> Placement.adapter_opts(adapter_config, key) end
 
     socket_deps = %{
       db: db,
@@ -308,14 +312,56 @@ defmodule Tightbeam.Gateway do
         end),
       "skill-rm" =>
         admin_handler(db, fn p ->
-          case Archetypes.rm_skill(config.base_dir, p.name) do
-            :ok ->
-              root = p.name |> String.split("/") |> hd()
-              action = if p.name == root, do: :rm, else: :put
-              %{removed: p.name, pushed: Placement.push_skill(config, root, action)}
+          root = p.name |> String.split("/") |> hd()
 
-            {:error, denial} ->
-              denial
+          if Enum.any?(Archetypes.list_skills(config.base_dir), &(&1.name == p.name)) do
+            {pinned_sessions, staged_pins} =
+              if p.name == root,
+                do: stage_override_sessions(config.base_dir, db, root),
+                else: {[], []}
+
+            {:ok, removal} = Archetypes.rm_skill(config.base_dir, p.name)
+            commit_pinned_sessions(staged_pins)
+            reproject_pinned_sessions(config, pinned_sessions)
+            action = if p.name == root, do: :rm, else: :put
+            pushed = Placement.push_skill(config, root, action)
+
+            notified =
+              db
+              |> Org.list_for_user("", true)
+              |> Enum.flat_map(fn session ->
+                cond do
+                  Enum.any?(pinned_sessions, &(&1.session_key == session.session_key)) ->
+                    prompt =
+                      "The skill \"#{p.name}\" was removed from the library, but your session " <>
+                        "elected it at spawn, so your copy is preserved. Use \"tune\" override " <>
+                        "removal if you no longer want it."
+
+                    notify_session(config, db, session.session_key, prompt)
+                    [session.session_key]
+
+                  session.archetype in removal.archetype_electors ->
+                    prompt =
+                      "The skill \"#{p.name}\" has been removed from this org's library. " <>
+                        "Disregard it, including anything from it already in your context."
+
+                    notify_session(config, db, session.session_key, prompt)
+                    [session.session_key]
+
+                  true ->
+                    []
+                end
+              end)
+
+            %{
+              removed: p.name,
+              pushed: pushed,
+              notified: notified,
+              manifest_warnings: removal.manifest_warnings
+            }
+          else
+            {:error, error} = Archetypes.rm_skill(config.base_dir, p.name)
+            error
           end
         end),
       "skill-list" =>
@@ -437,14 +483,17 @@ defmodule Tightbeam.Gateway do
   """
   @spec org_options() :: map()
   def org_options do
-    base_dir = Application.get_env(:tightbeam, :base_dir, Path.join(System.user_home!(), ".tightbeam"))
+    base_dir =
+      Application.get_env(:tightbeam, :base_dir, Path.join(System.user_home!(), ".tightbeam"))
 
     %{
       harnesses: ["claude", "codex"],
       models:
         Map.new(@model_catalog, fn {harness, models} ->
           provider = if harness == "codex", do: "openai", else: "anthropic"
-          {harness, Enum.map(models, &%{id: &1.ref, ref: &1.ref, name: &1.name, provider: provider})}
+
+          {harness,
+           Enum.map(models, &%{id: &1.ref, ref: &1.ref, name: &1.name, provider: provider})}
         end),
       hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
       archetypes:
@@ -753,7 +802,7 @@ defmodule Tightbeam.Gateway do
             })
           )
 
-          harness_cancel(session)
+          harness_cancel(db, session)
         end
 
         Ledger.mark_published(db, seq)
@@ -766,11 +815,13 @@ defmodule Tightbeam.Gateway do
 
   # Best-effort: the model should stop burning tokens, but a failure here
   # changes nothing durable (the ledger row is already terminal).
-  defp harness_cancel(session) do
-    with %{harness_session_id: sid} <- Org.current_pointer(Tightbeam.DB, session.session_key),
-         key = {String.to_existing_atom(session.harness), session.archetype, session.host},
+  defp harness_cancel(db, session) do
+    with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
+         key = {String.to_existing_atom(session.harness), session.identity_name, session.host},
          {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
-      Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{sessionId: sid})
+      Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
+        sessionId: sid
+      })
     end
   rescue
     _ -> :ok
@@ -779,7 +830,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp checkout_adapter(session) do
-    key = {String.to_existing_atom(session.harness), session.archetype, session.host}
+    key = {String.to_existing_atom(session.harness), session.identity_name, session.host}
 
     case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
       {:ok, adapter, generation} ->
@@ -787,7 +838,7 @@ defmodule Tightbeam.Gateway do
 
       {:error, :degraded} ->
         {:error,
-         "adapter for #{session.harness}/#{session.archetype} on host #{session.host} is degraded " <>
+         "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
            "(host unreachable or adapter failing); see /version"}
     end
   end
@@ -798,10 +849,13 @@ defmodule Tightbeam.Gateway do
   # (and files) into the agent. The workdir is also the agent's durable
   # scratch across engine swaps (artifact continuity).
   defp session_workdir(config, session) do
-    host = Placement.hosts(config.base_dir)[session.host] || %{ssh: nil, base_dir: config.base_dir}
+    host =
+      Placement.hosts(config.base_dir)[session.host] || %{ssh: nil, base_dir: config.base_dir}
 
     digest =
-      :crypto.hash(:sha256, session.session_key) |> Base.encode16(case: :lower) |> binary_part(0, 12)
+      :crypto.hash(:sha256, session.session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
 
     path = Path.join([host.base_dir, "work", digest])
     Placement.ensure_dir(host, path)
@@ -835,7 +889,13 @@ defmodule Tightbeam.Gateway do
                      mcp_servers
                    ) do
                 :ok ->
-                  Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
+                  Org.append_pointer(
+                    db,
+                    session.session_key,
+                    pointer.harness_session_id,
+                    "loaded"
+                  )
+
                   {:ok, pointer.harness_session_id}
 
                 {:error, lost} ->
@@ -1021,6 +1081,114 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp notify_session(config, db, session_key, prompt) do
+    deliver_prompt(session_key, "process:tightbeam", prompt,
+      db: db,
+      sender: "process:tightbeam",
+      conn_registry: config[:conn_registry] || Tightbeam.ConnRegistry,
+      lane_manager: config[:lane_manager] || Tightbeam.LaneManager
+    )
+  end
+
+  defp stage_override_sessions(base_dir, db, skill) do
+    source = Path.join(Archetypes.skills_dir(base_dir), skill)
+
+    staging_root =
+      Path.join([
+        base_dir,
+        "identity",
+        "staging",
+        "pins-#{System.unique_integer([:positive])}"
+      ])
+
+    sessions =
+      db
+      |> Org.list_all()
+      |> Enum.filter(&(skill in override_skill_names(&1.overrides)))
+
+    staged_pins =
+      sessions
+      |> Enum.uniq_by(& &1.identity_name)
+      |> Enum.map(fn session ->
+        staged = Path.join([staging_root, session.identity_name, skill])
+
+        destination =
+          Path.join([base_dir, "identity", "pinned", session.identity_name, skill])
+
+        if File.exists?(source) do
+          File.mkdir_p!(Path.dirname(staged))
+          File.cp_r!(source, staged)
+        end
+
+        {staged, destination}
+      end)
+
+    {sessions, staged_pins}
+  end
+
+  defp commit_pinned_sessions(staged_pins) do
+    Enum.each(staged_pins, fn {staged, destination} ->
+      File.rm_rf!(destination)
+      File.mkdir_p!(Path.dirname(destination))
+      File.cp_r!(staged, destination)
+    end)
+
+    staged_pins
+    |> List.first()
+    |> case do
+      nil -> :ok
+      {staged, _destination} -> File.rm_rf!(staged |> Path.dirname() |> Path.dirname())
+    end
+  end
+
+  defp reproject_pinned_sessions(config, sessions) do
+    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+
+    sessions
+    |> Enum.filter(&(&1.state == "active"))
+    |> Enum.map(fn session ->
+      {String.to_existing_atom(session.harness), session.identity_name, session.host}
+    end)
+    |> Enum.uniq()
+    |> Enum.each(&Placement.deliver_home(config, &1, deliver_opts))
+  end
+
+  defp override_skill_names(nil), do: []
+  defp override_skill_names(overrides), do: Map.get(overrides, "skills_add", [])
+
+  defp carry_pinned_overrides(_base_dir, identity_name, identity_name, _overrides), do: :ok
+  defp carry_pinned_overrides(_base_dir, _old_identity, _new_identity, nil), do: :ok
+
+  defp carry_pinned_overrides(base_dir, old_identity, new_identity, overrides) do
+    Enum.each(override_skill_names(overrides), fn skill ->
+      source = Path.join([base_dir, "identity", "pinned", old_identity, skill])
+
+      if File.exists?(source) do
+        destination = Path.join([base_dir, "identity", "pinned", new_identity, skill])
+        File.rm_rf!(destination)
+        File.mkdir_p!(Path.dirname(destination))
+        File.cp_r!(source, destination)
+      end
+    end)
+
+    :ok
+  end
+
+  defp session_mutation_allowed(db, origin, session) do
+    case resolve_caller(db, origin) do
+      %{owner_user_id: owner} when owner == session.owner_user_id ->
+        :ok
+
+      %{} ->
+        if admin_origin?(db, origin),
+          do: :ok,
+          else: {:error, %{code: "denied", message: "session owner or admin required"}}
+
+      nil ->
+        {:error, %{code: "unknown_caller", message: "unknown caller"}}
+    end
+  end
+
   defp inspect_result(config, db, call) do
     case resolve_caller(db, call.origin) do
       nil ->
@@ -1047,7 +1215,13 @@ defmodule Tightbeam.Gateway do
           archetypes:
             Enum.map(Archetypes.names(), fn name ->
               a = Archetypes.get(name)
-              %{name: a.name, where: a.where, defaults: a.defaults, fallback_models: a.fallback_models}
+
+              %{
+                name: a.name,
+                where: a.where,
+                defaults: a.defaults,
+                fallback_models: a.fallback_models
+              }
             end),
           hosts: config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
           models: @model_catalog
@@ -1179,14 +1353,24 @@ defmodule Tightbeam.Gateway do
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
 
       archetype ->
-        case Placement.resolve(archetype, p[:host], Placement.hosts(config.base_dir)) do
+        override_result =
+          if Map.has_key?(p, :overrides) do
+            Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
+          else
+            {:ok, nil}
+          end
+
+        with {:ok, overrides} <- override_result,
+             {:ok, host} <-
+               Placement.resolve(archetype, p[:host], Placement.hosts(config.base_dir)) do
+          create_spawn(config, db, call, caller, archetype, host, overrides)
+        else
           {:error, denial} -> denial
-          {:ok, host} -> create_spawn(config, db, call, caller, archetype, host)
         end
     end
   end
 
-  defp create_spawn(config, db, call, caller, archetype, host) do
+  defp create_spawn(config, db, call, caller, archetype, host, overrides) do
     p = call.params
     defaults = defaults(config)
     harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
@@ -1202,6 +1386,8 @@ defmodule Tightbeam.Gateway do
             if(harness == :codex or harness == "codex", do: "gpt-5.6-sol[medium]", else: "haiku")
         )
 
+    identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
+
     case Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
       {:error, denial} ->
         denial
@@ -1216,6 +1402,8 @@ defmodule Tightbeam.Gateway do
           handle: p[:handle],
           order_index: length(sessions),
           archetype: archetype.name,
+          overrides: overrides,
+          identity_name: identity_name,
           host: host,
           harness: harness_string,
           provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
@@ -1302,6 +1490,14 @@ defmodule Tightbeam.Gateway do
                 denial
 
               :ok ->
+                deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+
+                Placement.deliver_home(
+                  config,
+                  {harness_atom, session.identity_name, session.host},
+                  deliver_opts
+                )
+
                 Org.set_harness(db, call.session_key, harness, provider, model)
 
                 # History barrier (product ruling): a new engine gets a fresh
@@ -1365,6 +1561,9 @@ defmodule Tightbeam.Gateway do
             end
         end
 
+      p[:setting] == "remove_override" ->
+        remove_override_result(config, db, call)
+
       p[:setting] != "set_model" or not is_binary(p[:model]) ->
         %{ok: false, code: "unsupported", message: "tune does not support #{p[:setting]} yet"}
 
@@ -1382,7 +1581,8 @@ defmodule Tightbeam.Gateway do
                  {:ok, adapter, _generation} <-
                    AdapterCoordinator.adapter_for(
                      coordinator,
-                     {String.to_existing_atom(session.harness), session.archetype, session.host}
+                     {String.to_existing_atom(session.harness), session.identity_name,
+                      session.host}
                    ) do
               AdapterCoordinator.with_load_slot(coordinator, fn ->
                 Adapter.load_session(
@@ -1401,6 +1601,81 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  defp remove_override_result(config, db, call) do
+    p = call.params
+
+    with %{} = session <- Org.get(db, call.session_key),
+         :ok <- session_mutation_allowed(db, call.origin, session),
+         {:ok, overrides, removed} <- remove_override_value(session.overrides, p) do
+      base = Archetypes.get(session.archetype) || Archetypes.builtin_default()
+      harness = String.to_existing_atom(session.harness)
+
+      identity_name =
+        Placement.identity_name(
+          config,
+          base,
+          overrides,
+          harness,
+          session.identity_name
+        )
+
+      carry_pinned_overrides(config.base_dir, session.identity_name, identity_name, overrides)
+      updated = Org.set_identity(db, session.session_key, overrides, identity_name)
+
+      if identity_name != session.identity_name and
+           not Org.identity_name_exists?(db, session.identity_name) do
+        File.rm_rf!(Path.join([config.base_dir, "identity", "pinned", session.identity_name]))
+      end
+
+      append_context_reset_marker(db, updated)
+
+      prompt = "Your override \"#{removed}\" was removed by the operator; disregard it."
+      notify_session(config, db, session.session_key, prompt)
+
+      %{ok: true, identity_name: identity_name, overrides: overrides}
+    else
+      nil -> %{ok: false, code: "not_found"}
+      {:error, error} -> error
+    end
+  end
+
+  defp remove_override_value(nil, _params) do
+    {:error, %{code: "invalid_overrides", message: "session has no overrides"}}
+  end
+
+  defp remove_override_value(overrides, %{skill: skill}) when is_binary(skill) do
+    skills = Map.get(overrides, "skills_add", [])
+
+    if skill in skills do
+      updated = put_or_drop(overrides, "skills_add", List.delete(skills, skill))
+      {:ok, empty_override_to_nil(updated), skill}
+    else
+      {:error,
+       %{code: "invalid_overrides", message: "session override does not elect skill #{skill}"}}
+    end
+  end
+
+  defp remove_override_value(overrides, %{guidance: true}) do
+    if Map.has_key?(overrides, "guidance_extra") do
+      {:ok, overrides |> Map.delete("guidance_extra") |> empty_override_to_nil(), "guidance"}
+    else
+      {:error, %{code: "invalid_overrides", message: "session override has no guidance_extra"}}
+    end
+  end
+
+  defp remove_override_value(_overrides, _params) do
+    {:error,
+     %{
+       code: "invalid_overrides",
+       message: "remove_override requires skill: <name> or guidance: true"
+     }}
+  end
+
+  defp put_or_drop(map, key, []), do: Map.delete(map, key)
+  defp put_or_drop(map, key, value), do: Map.put(map, key, value)
+  defp empty_override_to_nil(map) when map_size(map) == 0, do: nil
+  defp empty_override_to_nil(map), do: map
 
   defp spinup_opts(config, db) do
     if config[:sh], do: [db: db, sh: config.sh], else: [db: db]
@@ -1423,7 +1698,8 @@ defmodule Tightbeam.Gateway do
           %{owner_user_id: ^owner, is_built_in: true} ->
             %{
               code: "denied",
-              message: "main sessions are permanent — they are the fallback for roles and user references"
+              message:
+                "main sessions are permanent — they are the fallback for roles and user references"
             }
 
           %{owner_user_id: ^owner} = session ->

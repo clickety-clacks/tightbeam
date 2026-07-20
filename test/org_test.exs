@@ -38,7 +38,9 @@ defmodule Tightbeam.OrgTest do
 
     assert %{
              archetype: "default",
-        host: "testhost",
+             identity_name: "default",
+             overrides: nil,
+             host: "testhost",
              provider: "anthropic",
              state: "active",
              is_built_in: true,
@@ -51,6 +53,48 @@ defmodule Tightbeam.OrgTest do
       DB.query(db, "SELECT isBuiltIn, adopted, state FROM sessions WHERE sessionKey = ?1", [key])
 
     assert rows == [[1, 1, "active"]]
+  end
+
+  test "overrides and derived identity names round-trip and active reconstruction ignores retired rows",
+       %{
+         db: db
+       } do
+    overrides = %{"skills_add" => ["review"], "guidance_extra" => "Be concise."}
+
+    session =
+      Org.create(
+        db,
+        base(%{
+          session_key: "overridden",
+          overrides: overrides,
+          identity_name: "default--0123456789abcdef"
+        })
+      )
+
+    assert session.overrides == overrides
+    assert session.identity_name == "default--0123456789abcdef"
+    assert Org.active_by_identity_name(db, session.identity_name).session_key == "overridden"
+
+    {:ok, [[stored]]} =
+      DB.query(db, "SELECT overrides FROM sessions WHERE sessionKey = 'overridden'")
+
+    assert JSON.decode!(stored) == overrides
+
+    updated = Org.set_identity(db, "overridden", nil, "default")
+    assert updated.overrides == nil
+    assert updated.identity_name == "default"
+    refute Org.identity_name_exists?(db, "default--0123456789abcdef")
+
+    retired =
+      Org.create(
+        db,
+        base(%{session_key: "retired-id", identity_name: "default--fedcba9876543210"})
+      )
+      |> then(&Org.retire(db, &1.session_key))
+
+    assert retired.state == "retired"
+    assert Org.active_by_identity_name(db, retired.identity_name) == nil
+    assert Org.identity_name_exists?(db, retired.identity_name)
   end
 
   test "custom keys use the TypeScript s_ suffix format", %{db: db} do

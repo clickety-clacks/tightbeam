@@ -27,6 +27,8 @@ defmodule Tightbeam.Org do
           spawned_by: String.t() | nil,
           handle: String.t() | nil,
           archetype: String.t(),
+          overrides: map() | nil,
+          identity_name: String.t(),
           harness: String.t(),
           provider: String.t(),
           model: String.t(),
@@ -59,6 +61,8 @@ defmodule Tightbeam.Org do
     spawnedBy     TEXT,
     handle        TEXT UNIQUE,
     archetype     TEXT NOT NULL,
+    overrides     TEXT,
+    identityName  TEXT,
     harness       TEXT NOT NULL CHECK (harness IN ('claude','codex')),
     provider      TEXT NOT NULL CHECK (provider IN ('anthropic','openai')),
     model         TEXT NOT NULL,
@@ -88,13 +92,18 @@ defmodule Tightbeam.Org do
     # their columns. Duplicate-column error means already migrated.
     for ddl <- [
           "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT 'local'",
-          "ALTER TABLE sessions ADD COLUMN clearedThroughSeq INTEGER NOT NULL DEFAULT 0"
+          "ALTER TABLE sessions ADD COLUMN clearedThroughSeq INTEGER NOT NULL DEFAULT 0",
+          "ALTER TABLE sessions ADD COLUMN overrides TEXT",
+          "ALTER TABLE sessions ADD COLUMN identityName TEXT"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
         {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
       end
     end
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET identityName = archetype WHERE identityName IS NULL")
 
     result
   end
@@ -122,10 +131,10 @@ defmodule Tightbeam.Org do
       txn,
       """
         INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-          ownerUserId, origin, spawnedBy, handle, archetype, harness, provider, model,
-          thinkingLevel, host, state, createdAt, updatedAt)
+          ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
+          harness, provider, model, thinkingLevel, host, state, createdAt, updatedAt)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-          ?15, ?16, 'active', ?17, ?17)
+          ?15, ?16, ?17, ?18, 'active', ?19, ?19)
       """,
       [
         session_key,
@@ -139,6 +148,8 @@ defmodule Tightbeam.Org do
         Map.get(input, :spawned_by),
         Map.get(input, :handle),
         Map.fetch!(input, :archetype),
+        encode_overrides(Map.get(input, :overrides)),
+        Map.get(input, :identity_name, Map.fetch!(input, :archetype)),
         Map.fetch!(input, :harness),
         Map.fetch!(input, :provider),
         Map.fetch!(input, :model),
@@ -183,6 +194,58 @@ defmodule Tightbeam.Org do
     Enum.map(rows, &to_session/1)
   end
 
+  @doc "Every session, including retired rows, in deterministic creation order."
+  @spec list_all(db()) :: [session()]
+  def list_all(db \\ Tightbeam.DB) do
+    {:ok, rows} = DB.query(db, select_session_sql() <> " ORDER BY createdAt, sessionKey")
+    Enum.map(rows, &to_session/1)
+  end
+
+  @doc "An active session carrying an effective identity name, or nil."
+  @spec active_by_identity_name(db(), String.t()) :: session() | nil
+  def active_by_identity_name(db \\ Tightbeam.DB, identity_name) do
+    case active_all_by_identity_name(db, identity_name) do
+      [session | _] -> session
+      [] -> nil
+    end
+  end
+
+  @doc "All active sessions carrying an effective identity name."
+  @spec active_all_by_identity_name(db(), String.t()) :: [session()]
+  def active_all_by_identity_name(db \\ Tightbeam.DB, identity_name) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        select_session_sql() <>
+          " WHERE identityName = ?1 AND state = 'active' ORDER BY createdAt, sessionKey",
+        [identity_name]
+      )
+
+    Enum.map(rows, &to_session/1)
+  end
+
+  @doc "Every session carrying an identity name, including retired rows."
+  @spec all_by_identity_name(db(), String.t()) :: [session()]
+  def all_by_identity_name(db \\ Tightbeam.DB, identity_name) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        select_session_sql() <> " WHERE identityName = ?1 ORDER BY createdAt, sessionKey",
+        [identity_name]
+      )
+
+    Enum.map(rows, &to_session/1)
+  end
+
+  @doc "Whether any session row still references an effective identity name."
+  @spec identity_name_exists?(db(), String.t()) :: boolean()
+  def identity_name_exists?(db \\ Tightbeam.DB, identity_name) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT COUNT(*) FROM sessions WHERE identityName = ?1", [identity_name])
+
+    count > 0
+  end
+
   @doc "Rename a session (raises if unknown). Returns the updated session."
   @spec rename(db(), String.t(), String.t()) :: session()
   def rename(db \\ Tightbeam.DB, session_key, display_name) do
@@ -218,6 +281,15 @@ defmodule Tightbeam.Org do
   @spec set_host(db(), String.t(), String.t()) :: session()
   def set_host(db \\ Tightbeam.DB, session_key, host) do
     update(db, session_key, "host = ?2", [host])
+  end
+
+  @doc "Replace the normalized overrides and their derived identity name together."
+  @spec set_identity(db(), String.t(), map() | nil, String.t()) :: session()
+  def set_identity(db \\ Tightbeam.DB, session_key, overrides, identity_name) do
+    update(db, session_key, "overrides = ?2, identityName = ?3", [
+      encode_overrides(overrides),
+      identity_name
+    ])
   end
 
   @doc """
@@ -343,7 +415,7 @@ defmodule Tightbeam.Org do
   defp select_session_sql do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-           ownerUserId, origin, spawnedBy, handle, archetype, harness, provider,
+           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName, harness, provider,
            model, thinkingLevel, host, clearedThroughSeq, state, createdAt, updatedAt
     FROM sessions
     """
@@ -361,6 +433,8 @@ defmodule Tightbeam.Org do
          spawned_by,
          handle,
          archetype,
+         overrides,
+         identity_name,
          harness,
          provider,
          model,
@@ -383,6 +457,8 @@ defmodule Tightbeam.Org do
       spawned_by: spawned_by,
       handle: handle,
       archetype: archetype,
+      overrides: decode_overrides(overrides),
+      identity_name: identity_name || archetype,
       harness: harness,
       provider: provider,
       model: model,
@@ -404,4 +480,9 @@ defmodule Tightbeam.Org do
 
   defp now, do: System.system_time(:millisecond)
 
+  defp encode_overrides(nil), do: nil
+  defp encode_overrides(overrides), do: JSON.encode!(overrides)
+
+  defp decode_overrides(nil), do: nil
+  defp decode_overrides(overrides), do: JSON.decode!(overrides)
 end

@@ -1,12 +1,16 @@
 defmodule Tightbeam.PlacementTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.{Archetypes, Placement, Rails}
+  alias Tightbeam.{Archetypes, DB, EventLog, Org, Placement, Rails}
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base_dir)
     File.write!(Path.join(base_dir, "gateway.json"), JSON.encode!(%{cliToken: "tbc_test"}))
+    db = :"placement_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Org.ensure_schema(db)
+    :ok = EventLog.ensure_schema(db)
     Archetypes.load!(base_dir)
     Rails.load!(base_dir)
 
@@ -32,7 +36,215 @@ defmodule Tightbeam.PlacementTest do
         else: Application.delete_env(:tightbeam, :model_pins)
     end)
 
-    %{base_dir: base_dir}
+    %{base_dir: base_dir, db: db}
+  end
+
+  test "overridden identities normalize their name and reconstruct identical homes from session rows",
+       %{base_dir: base_dir, db: db} do
+    Archetypes.put_skill!(base_dir, "review", "# Review")
+    base = Archetypes.load!(base_dir)["default"]
+
+    {:ok, first} =
+      Archetypes.normalize_overrides(base_dir, base, %{
+        "skills_add" => ["review", "review"],
+        "guidance_extra" => "  Review carefully.  "
+      })
+
+    {:ok, reordered} =
+      Archetypes.normalize_overrides(base_dir, base, %{
+        "guidance_extra" => "Review carefully.",
+        "skills_add" => ["review"]
+      })
+
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "fable",
+      db: db
+    }
+
+    identity_name = Placement.identity_name(config, base, first, :codex)
+    assert identity_name == Placement.identity_name(config, base, reordered, :codex)
+    assert identity_name =~ ~r/^default--[0-9a-f]{16}$/
+
+    different =
+      Placement.identity_name(
+        config,
+        base,
+        %{"guidance_extra" => "Different guidance."},
+        :codex
+      )
+
+    refute different == identity_name
+
+    Org.create(db, %{
+      session_key: "overridden",
+      display_name: "Overridden",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      overrides: first,
+      identity_name: identity_name,
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol[medium]"
+    })
+
+    opts = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+    assert opts[:home] == Path.join([base_dir, "homes", identity_name, "codex"])
+    assert opts[:stderr_path] =~ "adapter-codex:#{identity_name}@testhost"
+    assert File.read!(Path.join(opts[:home], "AGENTS.md")) =~ "# Tightbeam · default"
+    assert File.read!(Path.join(opts[:home], "AGENTS.md")) =~ "Review carefully."
+
+    manifest = opts[:home] |> Path.join(".tightbeam-manifest") |> File.read!() |> JSON.decode!()
+    assert manifest["identity_sha256"] =~ ~r/^[0-9a-f]{64}$/
+
+    assert %{
+             "name" => "review",
+             "provenance" => "override",
+             "linkage" => "linked"
+           } in manifest["skills"]
+
+    bytes = File.read!(Path.join(opts[:home], "AGENTS.md"))
+    File.rm_rf!(opts[:home])
+    restarted = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+    assert File.read!(Path.join(restarted[:home], "AGENTS.md")) == bytes
+
+    Org.retire(db, "overridden")
+
+    restarted = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+    assert File.read!(Path.join(restarted[:home], "AGENTS.md")) == bytes
+  end
+
+  test "reconstruction refuses retired sessions with colliding effective content", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    base = Archetypes.load!(base_dir)["default"]
+    first = %{"guidance_extra" => "First"}
+    second = %{"guidance_extra" => "Second"}
+
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "fable",
+      db: db
+    }
+
+    identity_name = Placement.identity_name(config, base, first, :codex)
+
+    for {session_key, overrides} <- [{"first", first}, {"second", second}] do
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: session_key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        overrides: overrides,
+        identity_name: identity_name,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+    end
+
+    Org.retire(db, "second")
+
+    assert_raise ArgumentError, ~r/identity name collision/, fn ->
+      Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+    end
+  end
+
+  test "overridden adapters keep MCP and model pins on the base while all identity paths use --",
+       %{base_dir: base_dir, db: db} do
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "coder.toml"), """
+    name = "coder"
+
+    [defaults]
+    model = "base-model"
+
+    [mcp.files]
+    command = "files-mcp"
+    """)
+
+    Archetypes.put_skill!(base_dir, "review", "# Review")
+    base = Archetypes.load!(base_dir)["coder"]
+
+    {:ok, overrides} =
+      Archetypes.normalize_overrides(base_dir, base, %{"skills_add" => ["review"]})
+
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "org-model",
+      db: db
+    }
+
+    identity_name = Placement.identity_name(config, base, overrides, :claude)
+
+    Org.create(db, %{
+      session_key: "dual-accessor",
+      display_name: "Dual accessor",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "coder",
+      overrides: overrides,
+      identity_name: identity_name,
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "session-model"
+    })
+
+    {resolved_base, effective, ^overrides} = Placement.resolve_identity!(config, identity_name)
+
+    assert Archetypes.acp_mcp_servers(resolved_base) == [
+             %{"name" => "files", "command" => "files-mcp", "args" => [], "env" => []}
+           ]
+
+    assert "review" in effective.skills
+
+    opts = Placement.adapter_opts(config, {:claude, identity_name, "testhost"})
+    assert opts[:home] =~ "/homes/#{identity_name}/claude"
+    assert opts[:stderr_path] =~ identity_name
+
+    assert opts[:home]
+           |> Path.join("settings.json")
+           |> File.read!()
+           |> JSON.decode!() == %{"model" => "base-model"}
+
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: "/remote/tb/bin"}
+    })
+
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+      if "cat" in command, do: {"", 1}, else: {"", 0}
+    end
+
+    remote_opts =
+      config
+      |> Map.put(:sh, sh)
+      |> Placement.adapter_opts({:claude, identity_name, "worker"})
+
+    assert remote_opts[:home] == "/remote/tb/homes/#{identity_name}/claude"
+    assert Enum.any?(remote_opts[:cmd], &String.contains?(&1, identity_name))
+
+    assert Enum.any?(collect_commands([]), fn command ->
+             Enum.any?(command, &String.contains?(&1, "/staging/worker/homes/#{identity_name}/"))
+           end)
   end
 
   test "hosts registers the gateway machine under its real name; nothing redefines it", %{
@@ -295,7 +507,15 @@ defmodule Tightbeam.PlacementTest do
     })
 
     sh = fn _command -> {"", 0} end
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable", sh: sh}
+
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "fable",
+      sh: sh
+    }
+
     opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
     remote_home = "/srv/tb/homes/default/codex"
 
@@ -322,7 +542,9 @@ defmodule Tightbeam.PlacementTest do
 
     claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
 
-    assert "CLAUDE_CODE_OAUTH_TOKEN=$(cat /srv/tb/auth/claude/oauth-token 2>/dev/null)" in claude_opts[:cmd]
+    assert "CLAUDE_CODE_OAUTH_TOKEN=$(cat /srv/tb/auth/claude/oauth-token 2>/dev/null)" in claude_opts[
+             :cmd
+           ]
 
     # Harness-scoped: codex remote env never carries claude's token expansion.
     refute Enum.any?(opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
@@ -352,7 +574,17 @@ defmodule Tightbeam.PlacementTest do
 
     commands = collect_commands([])
     assert [stamp, wipe, rsync, lib_mkdir, lib_rsync, lib_rsync_h, lib_rsync_2, auth] = commands
-    assert stamp == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "cat", "/remote/tb/homes/default/codex/.tightbeam-manifest"]
+
+    assert stamp == [
+             "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
+             "worker",
+             "cat",
+             "/remote/tb/homes/default/codex/.tightbeam-manifest"
+           ]
 
     assert wipe == [
              "ssh",
@@ -408,7 +640,17 @@ defmodule Tightbeam.PlacementTest do
     assert List.last(lib_rsync_2) == "worker:/remote/tb/identity/skills/"
     assert Enum.at(lib_rsync_2, -2) =~ "tightbeam-skills"
 
-    assert Enum.take(auth, 8) == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker", "sh", "-c"]
+    assert Enum.take(auth, 8) == [
+             "ssh",
+             "-o",
+             "BatchMode=yes",
+             "-o",
+             "ConnectTimeout=5",
+             "worker",
+             "sh",
+             "-c"
+           ]
+
     assert List.last(auth) =~ "/remote/tb/auth/codex\"/*"
     assert List.last(auth) =~ "ln -s"
 
@@ -501,8 +743,13 @@ defmodule Tightbeam.PlacementTest do
     # instruction files are byte-identical to a lawless org's, and no
     # statute text exists anywhere a model reads standing context.
     archetype = Tightbeam.Archetypes.get("default")
-    assert claude_home |> Path.join("CLAUDE.md") |> File.read!() == Tightbeam.Archetypes.guidance(archetype)
-    assert codex_home |> Path.join("AGENTS.md") |> File.read!() == Tightbeam.Archetypes.guidance(archetype)
+
+    assert claude_home |> Path.join("CLAUDE.md") |> File.read!() ==
+             Tightbeam.Archetypes.guidance(archetype)
+
+    assert codex_home |> Path.join("AGENTS.md") |> File.read!() ==
+             Tightbeam.Archetypes.guidance(archetype)
+
     refute claude_home |> Path.join("CLAUDE.md") |> File.read!() =~ "no-history-rewrites"
     refute File.exists?(Path.join(codex_home, "settings.json"))
   end
@@ -522,6 +769,30 @@ defmodule Tightbeam.PlacementTest do
     assert File.read!(stamp_path) == stamp_before
     assert File.read!(marker) == "keep"
     refute File.exists?(Path.join(home, "settings.json"))
+  end
+
+  test "parent manifest file-byte changes are recorded and regenerate the home", %{
+    base_dir: base_dir
+  } do
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+    path = Path.join(manifests, "coder.toml")
+    File.write!(path, "name = \"coder\"\n")
+    Archetypes.load!(base_dir)
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    home = Placement.deliver_home(config, {:codex, "coder", "testhost"})
+    first = home |> Path.join(".tightbeam-manifest") |> File.read!() |> JSON.decode!()
+    marker = Path.join(home, "nested-marker")
+    File.write!(marker, "old body")
+
+    File.write!(path, "name = \"coder\"\n# changed bytes\n")
+    Archetypes.load!(base_dir)
+    Placement.deliver_home(config, {:codex, "coder", "testhost"})
+    second = home |> Path.join(".tightbeam-manifest") |> File.read!() |> JSON.decode!()
+
+    assert first["parent_manifest"]["file"] == "identity/archetypes/coder.toml"
+    refute first["parent_manifest"]["sha256"] == second["parent_manifest"]["sha256"]
+    refute File.exists?(marker)
   end
 
   defp collect_commands(acc) do
@@ -551,6 +822,7 @@ defmodule Tightbeam.PlacementTest do
 
     sh = fn command ->
       send(parent, {:command, command})
+
       if Enum.at(command, 5) == "flaky" or List.last(command) =~ "flaky:",
         do: {"boom", 255},
         else: {"", 0}
@@ -581,7 +853,10 @@ defmodule Tightbeam.PlacementTest do
     on_exit(fn -> File.rm_rf!(base) end)
 
     assert {:ok, entry} =
-             Placement.register_host(base, "work-1", %{ssh: "work-1.example", base_dir: "/home/u/.tightbeam"})
+             Placement.register_host(base, "work-1", %{
+               ssh: "work-1.example",
+               base_dir: "/home/u/.tightbeam"
+             })
 
     assert entry.ssh == "work-1.example"
 
@@ -590,7 +865,10 @@ defmodule Tightbeam.PlacementTest do
     assert hosts["testhost"].ssh == nil
 
     # env config overrides the registry entry-for-entry
-    Application.put_env(:tightbeam, :hosts, %{"work-1" => %{ssh: "override", base_dir: "/o", cli_bin: nil}})
+    Application.put_env(:tightbeam, :hosts, %{
+      "work-1" => %{ssh: "override", base_dir: "/o", cli_bin: nil}
+    })
+
     on_exit(fn -> Application.delete_env(:tightbeam, :hosts) end)
     assert Placement.hosts(base)["work-1"].ssh == "override"
 
@@ -602,7 +880,11 @@ defmodule Tightbeam.PlacementTest do
 
   test "where [\"*\"] grants any configured host; empty stays an error upstream" do
     anywhere = %{name: "roamer", where: ["*"], defaults: %{}, references: [], guidance: nil}
-    hosts = %{"testhost" => %{ssh: nil, base_dir: "/b", cli_bin: nil}, "work-1" => %{ssh: "w", base_dir: "/b", cli_bin: nil}}
+
+    hosts = %{
+      "testhost" => %{ssh: nil, base_dir: "/b", cli_bin: nil},
+      "work-1" => %{ssh: "w", base_dir: "/b", cli_bin: nil}
+    }
 
     assert {:ok, "testhost"} = Placement.resolve(anywhere, nil, hosts)
     assert {:ok, "work-1"} = Placement.resolve(anywhere, "work-1", hosts)

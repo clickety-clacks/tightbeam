@@ -77,7 +77,7 @@ defmodule Tightbeam.Placement do
   an unreachable host degrades exactly like a dead adapter, per spec.
   """
 
-  alias Tightbeam.{Archetypes, Homes, Rails}
+  alias Tightbeam.{Archetypes, Homes, Org, Rails}
 
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
   # misconfigured host must fail in seconds with a reason, never hang on TCP
@@ -348,13 +348,14 @@ defmodule Tightbeam.Placement do
   produce exactly the pre-placement behavior. Calls deliver_home/3.
   """
   @spec adapter_opts(map(), adapter_key()) :: keyword()
-  def adapter_opts(config, {harness, archetype, host} = key) do
+  def adapter_opts(config, {harness, identity_name, host} = key) do
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
     home = deliver_home(config, key, deliver_opts)
     host_config = Map.fetch!(hosts(config.base_dir), host)
     binary = adapter_binary_path(harness, host_config)
 
-    stderr_path = Path.join(config.base_dir, "adapter-#{harness}:#{archetype}@#{host}.stderr.log")
+    stderr_path =
+      Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
 
     if host_config.ssh == nil do
       [
@@ -406,6 +407,72 @@ defmodule Tightbeam.Placement do
         stderr_path: stderr_path,
         env: []
       ]
+    end
+  end
+
+  @doc "Derive the stored name for a normalized overridden identity."
+  @spec identity_name(map(), Archetypes.t(), map() | nil, :claude | :codex) :: String.t()
+  def identity_name(_config, archetype, nil, _harness), do: archetype.name
+
+  def identity_name(config, archetype, overrides, harness) do
+    identity_name(config, archetype, overrides, harness, archetype.name)
+  end
+
+  @doc false
+  @spec identity_name(map(), Archetypes.t(), map(), :claude | :codex, String.t()) :: String.t()
+  def identity_name(_config, archetype, nil, _harness, _source_identity_name), do: archetype.name
+
+  def identity_name(config, archetype, overrides, _harness, source_identity_name) do
+    effective =
+      Archetypes.effective(archetype, overrides,
+        base_dir: config.base_dir,
+        identity_name: source_identity_name
+      )
+
+    digest = effective_identity_fingerprint(effective)
+    archetype.name <> "--" <> binary_part(digest, 0, 16)
+  end
+
+  @doc "Resolve an adapter identity name back to its base and effective archetypes."
+  @spec resolve_identity!(map(), String.t()) :: {Archetypes.t(), Archetypes.t(), map() | nil}
+  def resolve_identity!(config, identity_name) do
+    if String.contains?(identity_name, "--") do
+      db = Map.get(config, :db, Tightbeam.DB)
+
+      case Org.all_by_identity_name(db, identity_name) do
+        [] ->
+          raise ArgumentError, "no session carries identity #{identity_name}"
+
+        sessions ->
+          resolved =
+            Enum.map(sessions, fn session ->
+              base =
+                Archetypes.get(session.archetype) ||
+                  raise "unknown archetype: #{session.archetype}"
+
+              effective =
+                Archetypes.effective(base, session.overrides,
+                  base_dir: config.base_dir,
+                  db: db,
+                  identity_name: identity_name
+                )
+
+              {effective_identity_fingerprint(effective), base, effective, session.overrides}
+            end)
+
+          case resolved |> Enum.map(&elem(&1, 0)) |> Enum.uniq() do
+            [_fingerprint] ->
+              [{_fingerprint, base, effective, overrides} | _] = resolved
+              {base, effective, overrides}
+
+            _fingerprints ->
+              raise ArgumentError,
+                    "identity name collision: sessions carry distinct effective content for #{identity_name}"
+          end
+      end
+    else
+      base = Archetypes.get(identity_name) || raise "unknown archetype: #{identity_name}"
+      {base, base, nil}
     end
   end
 
@@ -479,12 +546,16 @@ defmodule Tightbeam.Placement do
               ])
 
             :rm ->
-              run!(sh, ["ssh" | @ssh_opts] ++ [
-                host_config.ssh,
-                "rm",
-                "-rf",
-                Path.join(remote_library, root)
-              ])
+              run!(
+                sh,
+                ["ssh" | @ssh_opts] ++
+                  [
+                    host_config.ssh,
+                    "rm",
+                    "-rf",
+                    Path.join(remote_library, root)
+                  ]
+              )
           end
 
           "ok"
@@ -503,65 +574,86 @@ defmodule Tightbeam.Placement do
   `(cmd :: [String.t()]) -> {output :: String.t(), exit :: integer()}`).
   """
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
-  def deliver_home(config, {harness, archetype_name, host}, opts \\ []) do
-    archetype = Archetypes.get(archetype_name)
-
+  def deliver_home(config, {harness, identity_name, host}, opts \\ []) do
+    {base_archetype, effective_archetype, overrides} = resolve_identity!(config, identity_name)
     host_config = Map.fetch!(hosts(config.base_dir), host)
 
-    # Homes symlink into their HOST's library replica — the gateway's
-    # library locally, the satellite's replica remotely (the staged link
-    # dangles here and resolves there; delivery syncs the replica below).
-    skills = fn library_dir ->
-      Enum.map(archetype.skills, fn name -> %{name: name, link_to: Path.join(library_dir, name)} end)
-    end
-
-    spec = %{
-      harness: harness,
-      archetype: archetype_name,
-      guidance: Archetypes.guidance(archetype)
-    }
-
-    rails_settings = if harness == :claude, do: Rails.claude_settings()
-    settings = merge_settings(rails_settings, model_settings(harness, archetype, config))
-
-    spec =
-      if settings,
-        do: Map.put(spec, :extra_files, %{"settings.json" => JSON.encode!(settings)}),
-        else: spec
-
     if host_config.ssh == nil do
-      local_skills = skills.(Archetypes.skills_dir(config.base_dir))
-      Homes.project(config.base_dir, Map.put(spec, :skills, local_skills)).home_path
+      refs =
+        skill_refs(config.base_dir, base_archetype, effective_archetype, overrides, identity_name)
+
+      spec =
+        projection_spec(
+          config,
+          harness,
+          identity_name,
+          base_archetype,
+          effective_archetype,
+          refs
+        )
+        |> with_identity_fingerprint(overrides)
+
+      Homes.project(config.base_dir, spec).home_path
     else
       stage_base = Path.join([config.base_dir, "staging", host])
       remote_library = Archetypes.skills_dir(host_config.base_dir)
+      remote_pinned = Path.join([host_config.base_dir, "identity", "pinned", identity_name])
+
+      refs =
+        skill_refs(
+          config.base_dir,
+          base_archetype,
+          effective_archetype,
+          overrides,
+          identity_name,
+          remote_library,
+          remote_pinned
+        )
+
+      spec =
+        projection_spec(
+          config,
+          harness,
+          identity_name,
+          base_archetype,
+          effective_archetype,
+          refs
+        )
+        |> with_identity_fingerprint(overrides)
 
       staged_home =
-        Homes.project(stage_base, Map.put(spec, :skills, skills.(remote_library))).home_path
+        Homes.project(stage_base, spec).home_path
 
       remote_home =
-        Path.join([host_config.base_dir, "homes", archetype_name, Atom.to_string(harness)])
+        Path.join([host_config.base_dir, "homes", identity_name, Atom.to_string(harness)])
 
       sh = Keyword.get(opts, :sh, &system_cmd/1)
 
       {remote_stamp, stamp_exit} =
-        sh.(["ssh" | @ssh_opts] ++ [host_config.ssh, "cat", Path.join(remote_home, ".tightbeam-manifest")])
+        sh.(
+          ["ssh" | @ssh_opts] ++
+            [host_config.ssh, "cat", Path.join(remote_home, ".tightbeam-manifest")]
+        )
 
       if stamp_exit not in [0, 1], do: raise("remote stamp check failed with exit #{stamp_exit}")
 
       staged_stamp = File.read!(Path.join(staged_home, ".tightbeam-manifest"))
 
       if remote_stamp != staged_stamp do
-        run!(sh, ["ssh" | @ssh_opts] ++ [
-          host_config.ssh,
-          "rm",
-          "-rf",
-          remote_home,
-          "&&",
-          "mkdir",
-          "-p",
-          remote_home
-        ])
+        run!(
+          sh,
+          ["ssh" | @ssh_opts] ++
+            [
+              host_config.ssh,
+              "rm",
+              "-rf",
+              remote_home,
+              "&&",
+              "mkdir",
+              "-p",
+              remote_home
+            ]
+        )
       end
 
       run!(sh, [
@@ -576,17 +668,35 @@ defmodule Tightbeam.Placement do
       # Library replica catch-up: the staged home's skill links point into
       # the satellite's replica; delivery makes them resolve even for a
       # host that missed a skill-put push (degrade heals at next delivery).
-      if archetype.skills != [] do
+      linked = Enum.filter(refs, &(&1.linkage == "linked"))
+      pinned = Enum.filter(refs, &(&1.linkage == "pinned"))
+
+      if linked != [] do
         run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "mkdir", "-p", remote_library])
 
-        for name <- archetype.skills do
+        for skill <- linked do
           run!(sh, [
             "rsync",
             "-a",
             "-e",
             Enum.join(["ssh" | @ssh_opts], " "),
-            Path.join(Archetypes.skills_dir(config.base_dir), name),
+            Path.join(Archetypes.skills_dir(config.base_dir), skill.name),
             "#{host_config.ssh}:#{remote_library}/"
+          ])
+        end
+      end
+
+      if pinned != [] do
+        run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "mkdir", "-p", remote_pinned])
+
+        for skill <- pinned do
+          run!(sh, [
+            "rsync",
+            "-a",
+            "-e",
+            Enum.join(["ssh" | @ssh_opts], " "),
+            Path.join([config.base_dir, "identity", "pinned", identity_name, skill.name]),
+            "#{host_config.ssh}:#{remote_pinned}/"
           ])
         end
       end
@@ -612,6 +722,74 @@ defmodule Tightbeam.Placement do
 
       remote_home
     end
+  end
+
+  defp projection_spec(config, harness, identity_name, base, effective, refs) do
+    spec = %{
+      harness: harness,
+      archetype: identity_name,
+      base_archetype: base.name,
+      parent_source: base.source,
+      guidance: Archetypes.guidance(effective),
+      skills: refs
+    }
+
+    rails_settings = if harness == :claude, do: Rails.claude_settings()
+    settings = merge_settings(rails_settings, model_settings(harness, base, config))
+
+    if settings,
+      do: Map.put(spec, :extra_files, %{"settings.json" => JSON.encode!(settings)}),
+      else: spec
+  end
+
+  defp with_identity_fingerprint(spec, nil), do: spec
+
+  defp with_identity_fingerprint(spec, _overrides),
+    do: Map.put(spec, :identity_sha256, Homes.identity_fingerprint(spec))
+
+  defp effective_identity_fingerprint(effective) do
+    Homes.identity_fingerprint(%{
+      guidance: Archetypes.guidance(effective),
+      skills: Enum.map(effective.skills, &%{name: &1})
+    })
+  end
+
+  defp skill_refs(base_dir, base, effective, overrides, identity_name) do
+    skill_refs(
+      base_dir,
+      base,
+      effective,
+      overrides,
+      identity_name,
+      Archetypes.skills_dir(base_dir),
+      Path.join([base_dir, "identity", "pinned", identity_name])
+    )
+  end
+
+  defp skill_refs(
+         base_dir,
+         _base,
+         effective,
+         overrides,
+         identity_name,
+         library_dir,
+         pinned_dir
+       ) do
+    override_names = if overrides, do: Map.get(overrides, "skills_add", []), else: []
+
+    Enum.map(effective.skills, fn name ->
+      provenance = if name in override_names, do: "override", else: "template"
+      local_pinned = Path.join([base_dir, "identity", "pinned", identity_name, name])
+
+      {linkage, link_to} =
+        if provenance == "override" and File.exists?(local_pinned) do
+          {"pinned", Path.join(pinned_dir, name)}
+        else
+          {"linked", Path.join(library_dir, name)}
+        end
+
+      %{name: name, link_to: link_to, provenance: provenance, linkage: linkage}
+    end)
   end
 
   defp merge_settings(nil, nil), do: nil
