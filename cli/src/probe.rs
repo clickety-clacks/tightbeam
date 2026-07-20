@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde_json::{Map, Value};
 
 const LINEAGE_KEY: &[u8] = b"TIGHTBEAM_LINEAGE=";
 const CANONICAL_ENTRIES: [&str; 11] = [
@@ -164,32 +164,29 @@ struct RawFacts {
     notes: Vec<String>,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Host {
     hostname: String,
     platform: &'static str,
     probe_version: &'static str,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Entries {
     adapters: &'static str,
     assets: &'static str,
     auth: &'static str,
     bin: &'static str,
-    #[serde(rename = "gateway.json")]
     gateway_json: &'static str,
     homes: &'static str,
-    #[serde(rename = "hosts.json")]
     hosts_json: &'static str,
     identity: &'static str,
     staging: &'static str,
-    #[serde(rename = "state.db")]
     state_db: &'static str,
     work: &'static str,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BaseDir {
     path: String,
     status: &'static str,
@@ -197,7 +194,7 @@ struct BaseDir {
     adapter_stderr_log_count: Option<usize>,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {
     pid: u32,
     ppid: Option<u32>,
@@ -212,7 +209,7 @@ struct Candidate {
     cwd: Option<String>,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AdapterCandidate {
     pid: u32,
     harness: &'static str,
@@ -228,7 +225,7 @@ struct AdapterCandidate {
     cwd: Option<String>,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Epistemics {
     census_grade: &'static str,
     absence_means: &'static str,
@@ -239,7 +236,7 @@ struct Epistemics {
     notes: Vec<String>,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Report {
     schema: &'static str,
     probed_at_ms: u64,
@@ -1008,6 +1005,326 @@ fn human(report: &Report) -> String {
     lines.join("\n")
 }
 
+fn object(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    Value::Object(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect::<Map<_, _>>(),
+    )
+}
+
+fn optional_u32(value: Option<u32>) -> Value {
+    value.map_or(Value::Null, |value| Value::from(u64::from(value)))
+}
+
+fn optional_u64(value: Option<u64>) -> Value {
+    value.map_or(Value::Null, Value::from)
+}
+
+fn optional_string(value: &Option<String>) -> Value {
+    value
+        .as_ref()
+        .map_or(Value::Null, |value| Value::from(value.clone()))
+}
+
+fn candidate_value(candidate: &Candidate) -> Value {
+    object([
+        ("pid", Value::from(u64::from(candidate.pid))),
+        ("ppid", optional_u32(candidate.ppid)),
+        ("pgid", optional_u32(candidate.pgid)),
+        ("lineage", optional_string(&candidate.lineage)),
+        ("lineage_raw", optional_string(&candidate.lineage_raw)),
+        (
+            "lineage_raw_b64",
+            optional_string(&candidate.lineage_raw_b64),
+        ),
+        ("evidence", Value::from(candidate.evidence)),
+        ("executable", optional_string(&candidate.executable)),
+        ("elapsed_s", optional_u64(candidate.elapsed_s)),
+        ("started_at_s", optional_u64(candidate.started_at_s)),
+        ("cwd", optional_string(&candidate.cwd)),
+    ])
+}
+
+fn adapter_candidate_value(candidate: &AdapterCandidate) -> Value {
+    object([
+        ("pid", Value::from(u64::from(candidate.pid))),
+        ("harness", Value::from(candidate.harness)),
+        ("ppid", optional_u32(candidate.ppid)),
+        ("pgid", optional_u32(candidate.pgid)),
+        ("lineage", optional_string(&candidate.lineage)),
+        ("lineage_raw", optional_string(&candidate.lineage_raw)),
+        (
+            "lineage_raw_b64",
+            optional_string(&candidate.lineage_raw_b64),
+        ),
+        ("evidence", Value::from(candidate.evidence)),
+        ("executable", optional_string(&candidate.executable)),
+        ("elapsed_s", optional_u64(candidate.elapsed_s)),
+        ("started_at_s", optional_u64(candidate.started_at_s)),
+        ("cwd", optional_string(&candidate.cwd)),
+    ])
+}
+
+fn entries_value(entries: &Entries) -> Value {
+    object([
+        ("adapters", Value::from(entries.adapters)),
+        ("assets", Value::from(entries.assets)),
+        ("auth", Value::from(entries.auth)),
+        ("bin", Value::from(entries.bin)),
+        ("gateway.json", Value::from(entries.gateway_json)),
+        ("homes", Value::from(entries.homes)),
+        ("hosts.json", Value::from(entries.hosts_json)),
+        ("identity", Value::from(entries.identity)),
+        ("staging", Value::from(entries.staging)),
+        ("state.db", Value::from(entries.state_db)),
+        ("work", Value::from(entries.work)),
+    ])
+}
+
+fn report_value(report: &Report) -> Value {
+    let entries = &report.base_dir.entries;
+    let identity_candidates = report
+        .identity_candidates
+        .iter()
+        .map(|(identity, pids)| {
+            (
+                identity.clone(),
+                Value::Array(
+                    pids.iter()
+                        .map(|pid| Value::from(u64::from(*pid)))
+                        .collect(),
+                ),
+            )
+        })
+        .collect::<Map<_, _>>();
+    object([
+        ("schema", Value::from(report.schema)),
+        ("probed_at_ms", Value::from(report.probed_at_ms)),
+        ("collection_ms", Value::from(report.collection_ms)),
+        (
+            "host",
+            object([
+                ("hostname", Value::from(report.host.hostname.clone())),
+                ("platform", Value::from(report.host.platform)),
+                ("probe_version", Value::from(report.host.probe_version)),
+            ]),
+        ),
+        (
+            "base_dir",
+            object([
+                ("path", Value::from(report.base_dir.path.clone())),
+                ("status", Value::from(report.base_dir.status)),
+                ("entries", entries_value(entries)),
+                (
+                    "adapter_stderr_log_count",
+                    report
+                        .base_dir
+                        .adapter_stderr_log_count
+                        .map_or(Value::Null, |count| Value::from(count as u64)),
+                ),
+            ]),
+        ),
+        (
+            "marked_candidates",
+            Value::Array(
+                report
+                    .marked_candidates
+                    .iter()
+                    .map(candidate_value)
+                    .collect(),
+            ),
+        ),
+        ("identity_candidates", Value::Object(identity_candidates)),
+        (
+            "adapter_candidates",
+            Value::Array(
+                report
+                    .adapter_candidates
+                    .iter()
+                    .map(adapter_candidate_value)
+                    .collect(),
+            ),
+        ),
+        (
+            "epistemics",
+            object([
+                ("census_grade", Value::from(report.epistemics.census_grade)),
+                (
+                    "absence_means",
+                    Value::from(report.epistemics.absence_means),
+                ),
+                (
+                    "lineage_is_claim",
+                    Value::from(report.epistemics.lineage_is_claim),
+                ),
+                (
+                    "pids_scanned",
+                    Value::from(report.epistemics.pids_scanned as u64),
+                ),
+                (
+                    "pids_env_unreadable",
+                    report
+                        .epistemics
+                        .pids_env_unreadable
+                        .map_or(Value::Null, |count| Value::from(count as u64)),
+                ),
+                (
+                    "platform_limits",
+                    Value::Array(
+                        report
+                            .epistemics
+                            .platform_limits
+                            .iter()
+                            .map(|limit| Value::from(*limit))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "notes",
+                    Value::Array(
+                        report
+                            .epistemics
+                            .notes
+                            .iter()
+                            .cloned()
+                            .map(Value::from)
+                            .collect(),
+                    ),
+                ),
+            ]),
+        ),
+    ])
+}
+
+#[derive(Clone, Copy)]
+enum JsonOrder {
+    Report,
+    Host,
+    BaseDir,
+    Entries,
+    Candidate,
+    AdapterCandidate,
+    Epistemics,
+    Natural,
+}
+
+fn object_key_order(order: JsonOrder) -> Option<&'static [&'static str]> {
+    match order {
+        JsonOrder::Report => Some(&[
+            "schema",
+            "probed_at_ms",
+            "collection_ms",
+            "host",
+            "base_dir",
+            "marked_candidates",
+            "identity_candidates",
+            "adapter_candidates",
+            "epistemics",
+        ]),
+        JsonOrder::Host => Some(&["hostname", "platform", "probe_version"]),
+        JsonOrder::BaseDir => Some(&["path", "status", "entries", "adapter_stderr_log_count"]),
+        JsonOrder::Entries => Some(&CANONICAL_ENTRIES),
+        JsonOrder::Candidate => Some(&[
+            "pid",
+            "ppid",
+            "pgid",
+            "lineage",
+            "lineage_raw",
+            "lineage_raw_b64",
+            "evidence",
+            "executable",
+            "elapsed_s",
+            "started_at_s",
+            "cwd",
+        ]),
+        JsonOrder::AdapterCandidate => Some(&[
+            "pid",
+            "harness",
+            "ppid",
+            "pgid",
+            "lineage",
+            "lineage_raw",
+            "lineage_raw_b64",
+            "evidence",
+            "executable",
+            "elapsed_s",
+            "started_at_s",
+            "cwd",
+        ]),
+        JsonOrder::Epistemics => Some(&[
+            "census_grade",
+            "absence_means",
+            "lineage_is_claim",
+            "pids_scanned",
+            "pids_env_unreadable",
+            "platform_limits",
+            "notes",
+        ]),
+        JsonOrder::Natural => None,
+    }
+}
+
+fn child_order(order: JsonOrder, key: &str) -> JsonOrder {
+    match (order, key) {
+        (JsonOrder::Report, "host") => JsonOrder::Host,
+        (JsonOrder::Report, "base_dir") => JsonOrder::BaseDir,
+        (JsonOrder::Report, "marked_candidates") => JsonOrder::Candidate,
+        (JsonOrder::Report, "adapter_candidates") => JsonOrder::AdapterCandidate,
+        (JsonOrder::Report, "epistemics") => JsonOrder::Epistemics,
+        (JsonOrder::BaseDir, "entries") => JsonOrder::Entries,
+        _ => JsonOrder::Natural,
+    }
+}
+
+fn write_pretty_value(value: &Value, indent: usize, output: &mut String, order: JsonOrder) {
+    match value {
+        Value::Array(values) if values.is_empty() => output.push_str("[]"),
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                output.push('\n');
+                output.push_str(&" ".repeat(indent + 2));
+                write_pretty_value(value, indent + 2, output, order);
+                if index + 1 != values.len() {
+                    output.push(',');
+                }
+            }
+            output.push('\n');
+            output.push_str(&" ".repeat(indent));
+            output.push(']');
+        }
+        Value::Object(map) if map.is_empty() => output.push_str("{}"),
+        Value::Object(map) => {
+            output.push('{');
+            let keys = object_key_order(order)
+                .map(|keys| keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>())
+                .unwrap_or_else(|| map.keys().cloned().collect());
+            for (index, key) in keys.iter().enumerate() {
+                output.push('\n');
+                output.push_str(&" ".repeat(indent + 2));
+                output.push_str(&serde_json::to_string_pretty(key).expect("JSON key serializes"));
+                output.push_str(": ");
+                write_pretty_value(&map[key], indent + 2, output, child_order(order, key));
+                if index + 1 != keys.len() {
+                    output.push(',');
+                }
+            }
+            output.push('\n');
+            output.push_str(&" ".repeat(indent));
+            output.push('}');
+        }
+        _ => output.push_str(&serde_json::to_string_pretty(value).expect("JSON value serializes")),
+    }
+}
+
+fn report_json(report: &Report) -> String {
+    let mut output = String::new();
+    write_pretty_value(&report_value(report), 0, &mut output, JsonOrder::Report);
+    output
+}
+
 pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1026,11 +1343,7 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let mut report = assemble(raw, probed_at_ms, 0, hostname, base_dir);
     report.collection_ms = u64::try_from(monotonic.elapsed().as_millis()).unwrap_or(u64::MAX);
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report)
-                .map_err(|_| "probe: report serialization failed".to_owned())?
-        );
+        println!("{}", report_json(&report));
     } else {
         println!("{}", human(&report));
     }
@@ -1052,6 +1365,8 @@ mod tests {
     struct FakeIo {
         pids: Vec<u32>,
         reads: BTreeMap<(u32, String), Result<Vec<u8>, io::ErrorKind>>,
+        read_sequences:
+            std::cell::RefCell<BTreeMap<(u32, String), Vec<Result<Vec<u8>, io::ErrorKind>>>>,
         links: BTreeMap<(u32, String), Result<Vec<u8>, io::ErrorKind>>,
         commands: std::cell::RefCell<Vec<Result<Vec<u8>, CommandFailure>>>,
         metadata_error: Option<io::ErrorKind>,
@@ -1063,6 +1378,14 @@ mod tests {
             Ok(self.pids.clone())
         }
         fn proc_read(&self, pid: u32, name: &str) -> io::Result<Vec<u8>> {
+            if let Some(sequence) = self
+                .read_sequences
+                .borrow_mut()
+                .get_mut(&(pid, name.to_owned()))
+                && !sequence.is_empty()
+            {
+                return sequence.remove(0).map_err(io::Error::from);
+            }
             self.reads
                 .get(&(pid, name.to_owned()))
                 .cloned()
@@ -1128,6 +1451,14 @@ mod tests {
             preferred_token(b"TIGHTBEAM_LINEAGE=first TIGHTBEAM_LINEAGE=second"),
             Some(b"first".to_vec())
         );
+    }
+
+    #[test]
+    fn darwin_rows_distinguish_spoofable_marker_and_unmarked_adapter_evidence() {
+        let rows = parse_darwin_pass1(b"7 node TIGHTBEAM_LINEAGE=tb1-YUBi\n8 codex-acp\n", 999);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].evidence, "argv_or_env_indistinguishable");
+        assert_eq!(rows[1].evidence, "none_observed");
     }
 
     #[test]
@@ -1215,6 +1546,64 @@ mod tests {
     }
 
     #[test]
+    fn linux_drops_candidate_when_restat_starttime_changes() {
+        let mut io = FakeIo {
+            pids: vec![30],
+            ..FakeIo::default()
+        };
+        io.read_sequences.borrow_mut().insert(
+            (30, "stat".into()),
+            vec![Ok(stat(1, 30, 9)), Ok(stat(1, 30, 10))],
+        );
+        io.reads.insert(
+            (30, "environ".into()),
+            Ok(b"TIGHTBEAM_LINEAGE=tb1-YUBi\0".to_vec()),
+        );
+        io.reads.insert((30, "cmdline".into()), Ok(Vec::new()));
+        assert!(collect_linux(&io, 999).unwrap().processes.is_empty());
+    }
+
+    #[test]
+    fn linux_drops_candidate_when_restat_errors() {
+        let mut io = FakeIo {
+            pids: vec![31],
+            ..FakeIo::default()
+        };
+        io.read_sequences.borrow_mut().insert(
+            (31, "stat".into()),
+            vec![Ok(stat(1, 31, 9)), Err(io::ErrorKind::PermissionDenied)],
+        );
+        io.reads.insert(
+            (31, "environ".into()),
+            Ok(b"TIGHTBEAM_LINEAGE=tb1-YUBi\0".to_vec()),
+        );
+        io.reads.insert((31, "cmdline".into()), Ok(Vec::new()));
+        assert!(collect_linux(&io, 999).unwrap().processes.is_empty());
+    }
+
+    #[test]
+    fn linux_excludes_own_pid_from_candidate_set() {
+        let mut io = FakeIo {
+            pids: vec![40, 41],
+            ..FakeIo::default()
+        };
+        for pid in [40, 41] {
+            io.reads.insert((pid, "stat".into()), Ok(stat(1, pid, 9)));
+            io.reads.insert(
+                (pid, "environ".into()),
+                Ok(b"TIGHTBEAM_LINEAGE=tb1-YUBi\0".to_vec()),
+            );
+            io.reads.insert((pid, "cmdline".into()), Ok(Vec::new()));
+        }
+        let raw = collect_linux(&io, 40).unwrap();
+        assert_eq!(raw.pids_scanned, 2);
+        assert_eq!(
+            raw.processes.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            vec![41]
+        );
+    }
+
+    #[test]
     fn darwin_deadline_degradation_retains_rows_and_successful_absence_drops() {
         let pass1 = b"7 node codex-acp TIGHTBEAM_LINEAGE=tb1-YUBi\n".to_vec();
         let io = FakeIo {
@@ -1240,6 +1629,20 @@ mod tests {
     }
 
     #[test]
+    fn darwin_pass1_timeout_and_failure_are_fatal() {
+        for (failure, expected) in [
+            (CommandFailure::Timeout, "probe: ps enumeration timed out"),
+            (CommandFailure::Failed, "probe: ps enumeration failed"),
+        ] {
+            let io = FakeIo {
+                commands: std::cell::RefCell::new(vec![Err(failure)]),
+                ..FakeIo::default()
+            };
+            assert_eq!(collect_darwin(&io, 999).unwrap_err(), expected);
+        }
+    }
+
+    #[test]
     fn privacy_discards_full_command_buffers() {
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![
@@ -1258,7 +1661,7 @@ mod tests {
             inspect_base_dir(&SystemIo, Path::new("/missing"), &mut Vec::new()),
         );
         assert!(
-            !serde_json::to_string(&report)
+            !serde_json::to_string(&report_value(&report))
                 .unwrap()
                 .contains("SECRETXYZ")
         );
@@ -1323,14 +1726,7 @@ mod tests {
         assert_eq!(base.status, "present");
         assert_eq!(base.adapter_stderr_log_count, Some(1));
         assert_eq!(base.entries.state_db, "absent");
-        assert_eq!(
-            serde_json::to_value(&base.entries)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .len(),
-            11
-        );
+        assert_eq!(entries_value(&base.entries).as_object().unwrap().len(), 11);
         fs::remove_dir_all(root).unwrap();
 
         let unreadable = FakeIo {
@@ -1361,7 +1757,7 @@ mod tests {
             "host".into(),
             inspect_base_dir(&SystemIo, Path::new("/missing"), &mut Vec::new()),
         );
-        let encoded = serde_json::to_string(&report).unwrap();
+        let encoded = serde_json::to_string(&report_value(&report)).unwrap();
         assert!(!encoded.contains("SECRETXYZ"));
         assert!(encoded.contains("lsof timed out"));
     }
@@ -1387,7 +1783,7 @@ mod tests {
                 adapter_stderr_log_count: None,
             },
         );
-        let encoded = format!("{}\n", serde_json::to_string_pretty(&report).unwrap());
+        let encoded = format!("{}\n", report_json(&report));
         assert_eq!(
             encoded,
             r#"{
@@ -1432,6 +1828,180 @@ mod tests {
       "markers are spoofable env content"
     ],
     "notes": []
+  }
+}
+"#
+        );
+    }
+
+    #[test]
+    fn populated_report_schema_is_byte_stable() {
+        let raw = RawFacts {
+            platform: "linux",
+            pids_scanned: 3,
+            pids_env_unreadable: Some(1),
+            processes: vec![
+                RawProcess {
+                    pid: 9,
+                    ppid: Some(2),
+                    pgid: Some(9),
+                    token: Some(b"raw\xff".to_vec()),
+                    evidence: "env_unreadable",
+                    executable: Some(b"/bin/codex".to_vec()),
+                    cwd: Some(b"/tmp/codex".to_vec()),
+                    elapsed_s: Some(5),
+                    harnesses: vec!["codex"],
+                },
+                RawProcess {
+                    pid: 4,
+                    ppid: Some(1),
+                    pgid: Some(4),
+                    token: Some(b"tb1-YUBi".to_vec()),
+                    evidence: "environ_exact",
+                    executable: Some(b"/bin/node".to_vec()),
+                    cwd: Some(b"/work".to_vec()),
+                    elapsed_s: Some(3),
+                    harnesses: vec!["claude", "codex"],
+                },
+            ],
+            notes: vec!["ps etime timed out".to_owned()],
+        };
+        let report = assemble(
+            raw,
+            10_000,
+            7,
+            "eezo".into(),
+            BaseDir {
+                path: "/srv/tightbeam".into(),
+                status: "present",
+                entries: entries_with("present"),
+                adapter_stderr_log_count: Some(2),
+            },
+        );
+        let encoded = format!("{}\n", report_json(&report));
+        assert_eq!(
+            encoded,
+            r#"{
+  "schema": "tightbeam.probe.v1",
+  "probed_at_ms": 10000,
+  "collection_ms": 7,
+  "host": {
+    "hostname": "eezo",
+    "platform": "linux",
+    "probe_version": "0.1.0"
+  },
+  "base_dir": {
+    "path": "/srv/tightbeam",
+    "status": "present",
+    "entries": {
+      "adapters": "present",
+      "assets": "present",
+      "auth": "present",
+      "bin": "present",
+      "gateway.json": "present",
+      "homes": "present",
+      "hosts.json": "present",
+      "identity": "present",
+      "staging": "present",
+      "state.db": "present",
+      "work": "present"
+    },
+    "adapter_stderr_log_count": 2
+  },
+  "marked_candidates": [
+    {
+      "pid": 4,
+      "ppid": 1,
+      "pgid": 4,
+      "lineage": "a@b",
+      "lineage_raw": "tb1-YUBi",
+      "lineage_raw_b64": null,
+      "evidence": "environ_exact",
+      "executable": "/bin/node",
+      "elapsed_s": 3,
+      "started_at_s": 7,
+      "cwd": "/work"
+    },
+    {
+      "pid": 9,
+      "ppid": 2,
+      "pgid": 9,
+      "lineage": null,
+      "lineage_raw": "raw�",
+      "lineage_raw_b64": "cmF3/w==",
+      "evidence": "env_unreadable",
+      "executable": "/bin/codex",
+      "elapsed_s": 5,
+      "started_at_s": 5,
+      "cwd": "/tmp/codex"
+    }
+  ],
+  "identity_candidates": {
+    "a@b": [
+      4
+    ],
+    "raw�": [
+      9
+    ]
+  },
+  "adapter_candidates": [
+    {
+      "pid": 4,
+      "harness": "claude",
+      "ppid": 1,
+      "pgid": 4,
+      "lineage": "a@b",
+      "lineage_raw": "tb1-YUBi",
+      "lineage_raw_b64": null,
+      "evidence": "environ_exact",
+      "executable": "/bin/node",
+      "elapsed_s": 3,
+      "started_at_s": 7,
+      "cwd": "/work"
+    },
+    {
+      "pid": 4,
+      "harness": "codex",
+      "ppid": 1,
+      "pgid": 4,
+      "lineage": "a@b",
+      "lineage_raw": "tb1-YUBi",
+      "lineage_raw_b64": null,
+      "evidence": "environ_exact",
+      "executable": "/bin/node",
+      "elapsed_s": 3,
+      "started_at_s": 7,
+      "cwd": "/work"
+    },
+    {
+      "pid": 9,
+      "harness": "codex",
+      "ppid": 2,
+      "pgid": 9,
+      "lineage": null,
+      "lineage_raw": "raw�",
+      "lineage_raw_b64": "cmF3/w==",
+      "evidence": "env_unreadable",
+      "executable": "/bin/codex",
+      "elapsed_s": 5,
+      "started_at_s": 5,
+      "cwd": "/tmp/codex"
+    }
+  ],
+  "epistemics": {
+    "census_grade": "accident",
+    "absence_means": "possibly_laundered",
+    "lineage_is_claim": true,
+    "pids_scanned": 3,
+    "pids_env_unreadable": 1,
+    "platform_limits": [
+      "environ is ptrace-gated; other-user and protected processes are unreadable",
+      "procfs may hide processes entirely",
+      "markers are spoofable env content"
+    ],
+    "notes": [
+      "ps etime timed out"
+    ]
   }
 }
 "#
