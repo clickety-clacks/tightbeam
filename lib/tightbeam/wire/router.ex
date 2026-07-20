@@ -319,6 +319,10 @@ defmodule Tightbeam.Wire.Router do
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
   end
 
+  defp agent_identity(%{"asProcess" => "tightbeam"}, :org, _conn) do
+    {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
+  end
+
   defp agent_identity(body, :org, conn) do
     with {:ok, origin} <- agent_origin(body, conn) do
       principal =
@@ -389,6 +393,10 @@ defmodule Tightbeam.Wire.Router do
       {:ok, origin} -> {:ok, origin, {:session, session.session_key}}
       error -> error
     end
+  end
+
+  defp agent_origin(%{"asProcess" => "tightbeam"}, _conn) do
+    {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
   end
 
   defp agent_origin(body, conn) do

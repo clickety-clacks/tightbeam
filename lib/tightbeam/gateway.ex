@@ -246,7 +246,8 @@ defmodule Tightbeam.Gateway do
             db: db,
             wake_id: wake.wake_id,
             sender: wake.origin,
-            target_gate: wake
+            target_gate: wake,
+            fire_wake_in_txn: wake.origin == "process:tightbeam"
           )
       end
     end
@@ -489,6 +490,14 @@ defmodule Tightbeam.Gateway do
                   role_ref: opts[:role_ref],
                   role_fallback: opts[:role_fallback] || false
                 })
+
+              if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
+                Tightbeam.DB.Txn.q(
+                  txn,
+                  "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+                  [opts[:wake_id], System.system_time(:millisecond)]
+                )
+              end
 
               {:appended, target, message}
 

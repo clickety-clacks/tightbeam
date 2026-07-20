@@ -26,6 +26,17 @@ defmodule Tightbeam.SupervisionTest do
     def handle_call({:ensure_lane, _key}, _from, state), do: {:reply, :ok, state}
   end
 
+  defmodule RaceLane do
+    use GenServer
+    def start_link({name, callback}), do: GenServer.start_link(__MODULE__, callback, name: name)
+    def init(callback), do: {:ok, callback}
+
+    def handle_call({:ensure_lane, key}, _from, callback) do
+      callback.(key)
+      {:reply, :ok, callback}
+    end
+  end
+
   setup do
     db = :"supervision_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -170,19 +181,29 @@ defmodule Tightbeam.SupervisionTest do
     lane = start_supervised!({LaneDoorbell, :supervision_lane_manager})
     Org.retire(ctx.db, "supervisor")
 
-    plain = %{reresolve: nil, reresolve_seed: nil, reresolve_rung: nil}
+    plain =
+      Wakes.schedule(ctx.db, %{
+        session_key: "supervisor",
+        target_role: nil,
+        origin: "process:tightbeam",
+        prompt: "plain",
+        due_at: 0
+      })
 
     assert :skipped =
              Gateway.deliver_prompt("supervisor", "process:tightbeam", "plain",
                db: ctx.db,
-               wake_id: "w_plain",
+               wake_id: plain.wake_id,
                sender: "process:tightbeam",
                target_gate: plain,
+               fire_wake_in_txn: true,
                conn_registry: registry,
                lane_manager: lane
              )
 
     assert Ledger.pending_count(ctx.db, "supervisor") == 0
+    assert Wakes.get(ctx.db, plain.wake_id).state == "pending"
+    assert Wakes.cancel(ctx.db, plain.wake_id, plain.origin)
 
     gate = %{reresolve: "lineage", reresolve_seed: "holder", reresolve_rung: 1}
 
@@ -198,6 +219,192 @@ defmodule Tightbeam.SupervisionTest do
 
     assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 1
     assert Ledger.pending_count(ctx.db, "holder") == 0
+  end
+
+  test "supervision wake is fired in the enqueue transaction before its provoked terminal", ctx do
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+    [originating] = Wakes.list_pending(ctx.db)
+
+    parent = self()
+    registry = start_supervised!({ConnRegistry, name: :atomic_fire_registry})
+
+    lane =
+      start_supervised!(
+        {RaceLane,
+         {:atomic_fire_lane,
+          fn "holder" ->
+            state_at_nudge = Wakes.get(ctx.db, originating.wake_id).state
+            assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "atomic-fire-race")
+            assert turn.wake_id == originating.wake_id
+            assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+            result = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", turn.seq)
+            send(parent, {:race_result, state_at_nudge, result})
+          end}}
+      )
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         deliver: delivery_fun(ctx.db, registry, lane),
+         tick_ms: 60_000,
+         name: :atomic_fire_scheduler}
+      )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:race_result, "fired", {:prodded, 2}}
+    assert Wakes.get(ctx.db, originating.wake_id).state == "fired"
+    assert [%{prompt: next_prompt}] = Wakes.list_pending(ctx.db)
+    assert next_prompt =~ "prod 2 of 2"
+  end
+
+  test "external direct wake keeps deliver-then-mark ordering", ctx do
+    external =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "process:ci",
+        prompt: "external",
+        due_at: 0
+      })
+
+    parent = self()
+    registry = start_supervised!({ConnRegistry, name: :external_order_registry})
+
+    lane =
+      start_supervised!(
+        {RaceLane,
+         {:external_order_lane,
+          fn "holder" ->
+            send(parent, {:external_state_at_nudge, Wakes.get(ctx.db, external.wake_id).state})
+          end}}
+      )
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         deliver: delivery_fun(ctx.db, registry, lane),
+         tick_ms: 60_000,
+         name: :external_order_scheduler}
+      )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:external_state_at_nudge, "pending"}
+    assert Wakes.get(ctx.db, external.wake_id).state == "fired"
+  end
+
+  test "repeated synchronous delivery racer advances every prod and quiesces only at Main terminus",
+       ctx do
+    n = 12
+    assignment(ctx.db, "asg_main", ctx.main.session_key, "main work", 2)
+    seq = terminal!(ctx.db, ctx.main.session_key)
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(ctx.db, ctx.handlers, n, ctx.main.session_key, seq)
+
+    parent = self()
+    registry = start_supervised!({ConnRegistry, name: :repeated_race_registry})
+
+    lane =
+      start_supervised!(
+        {RaceLane,
+         {:repeated_race_lane,
+          fn session_key ->
+            assert {:ok, turn} = Ledger.claim_next(ctx.db, session_key, "repeated-race")
+            state_at_nudge = Wakes.get(ctx.db, turn.wake_id).state
+            assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+            result = Supervision.evaluate(ctx.db, ctx.handlers, n, session_key, turn.seq)
+            send(parent, {:iteration_result, turn.wake_id, state_at_nudge, result})
+          end}}
+      )
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         deliver: delivery_fun(ctx.db, registry, lane),
+         tick_ms: 60_000,
+         name: :repeated_race_scheduler}
+      )
+
+    for iteration <- 1..n do
+      assert :ok = Wakes.fire_due(scheduler)
+      assert_receive {:iteration_result, wake_id, "fired", result}
+      assert Wakes.get(ctx.db, wake_id).state == "fired"
+
+      if iteration < n do
+        assert result == {:prodded, iteration + 1}
+      else
+        assert result == :terminus
+      end
+    end
+
+    assert Wakes.pending_count(ctx.db, ctx.main.session_key) == 0
+    assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 0
+    assert %{pendingBranch: nil} = Supervision.watermark(ctx.db, ctx.main.session_key)
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "supervision_terminus")) ==
+             1
+  end
+
+  test "delivered prod and escalation prompts match the stamped templates byte for byte", ctx do
+    registry = start_supervised!({ConnRegistry, name: :template_registry})
+    lane = start_supervised!({LaneDoorbell, :template_lane})
+
+    prod_seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", prod_seq)
+    [prod] = Wakes.list_pending(ctx.db)
+
+    assert :appended =
+             Gateway.deliver_prompt(prod.session_key, prod.origin, prod.prompt,
+               db: ctx.db,
+               wake_id: prod.wake_id,
+               sender: prod.origin,
+               target_gate: prod,
+               fire_wake_in_txn: true,
+               conn_registry: registry,
+               lane_manager: lane
+             )
+
+    expected_prod =
+      "[from process:tightbeam]\n\n" <>
+        "Your turn ended with no filing and no continuation scheduled for assignment asg_1 — \"ship it\". " <>
+        "File completion, schedule your continuation, or file surrender. This is prod 1 of 3; " <>
+        "a reply without a row escalates to your spawner."
+
+    assert {:ok, [[^expected_prod]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId = ?1", [prod.wake_id])
+
+    session(ctx.db, "escalating-holder", ctx.supervisor.session_key)
+    assignment(ctx.db, "asg_escalation", "escalating-holder", "investigate", 3)
+    escalation_seq = terminal!(ctx.db, "escalating-holder")
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "escalating-holder", escalation_seq)
+
+    [escalation] = Wakes.list_pending(ctx.db)
+
+    assert :appended =
+             Gateway.deliver_prompt(escalation.session_key, escalation.origin, escalation.prompt,
+               db: ctx.db,
+               wake_id: escalation.wake_id,
+               sender: escalation.origin,
+               target_gate: escalation,
+               fire_wake_in_txn: true,
+               conn_registry: registry,
+               lane_manager: lane
+             )
+
+    expected_escalation =
+      "[from process:tightbeam]\n\n" <>
+        "Assignment asg_escalation — \"investigate\" — held by escalating-holder is stalled: " <>
+        "0 prods produced no filing and no continuation. This is escalation 1 for this assignment. " <>
+        "Why, and what happens next, is your judgment — the substrate only reports the rows."
+
+    assert {:ok, [[^expected_escalation]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId = ?1", [escalation.wake_id])
   end
 
   test "wake validation requires the complete re-resolution triple and nudge false leaves due work pending",
@@ -509,6 +716,20 @@ defmodule Tightbeam.SupervisionTest do
       ])
 
     :ok
+  end
+
+  defp delivery_fun(db, registry, lane) do
+    fn wake ->
+      Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+        db: db,
+        wake_id: wake.wake_id,
+        sender: wake.origin,
+        target_gate: wake,
+        fire_wake_in_txn: wake.origin == "process:tightbeam",
+        conn_registry: registry,
+        lane_manager: lane
+      )
+    end
   end
 
   defp eventually(fun, tries \\ 100) do
