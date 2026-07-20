@@ -50,13 +50,19 @@ defmodule Tightbeam.Acp.AdapterTest do
   """
 
   defp start_adapter do
-    path = Path.join(System.tmp_dir!(), "fake_harness_#{System.unique_integer([:positive])}.js")
-
-    capture_path =
+    # Per-run private dir: unique_integer resets across VM restarts, so
+    # bare /tmp names collide with stale files from prior/concurrent runs.
+    run_dir =
       Path.join(
         System.tmp_dir!(),
-        "fake_harness_capture_#{System.unique_integer([:positive])}.jsonl"
+        "tb-acp-#{:os.getpid()}-#{System.unique_integer([:positive])}"
       )
+
+    File.mkdir_p!(run_dir)
+    on_exit(fn -> File.rm_rf!(run_dir) end)
+
+    path = Path.join(run_dir, "fake_harness.js")
+    capture_path = Path.join(run_dir, "capture.jsonl")
 
     File.write!(path, @fake)
 
