@@ -441,6 +441,36 @@ defmodule Tightbeam.Placement do
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
     home = deliver_home_resolved(config, key, resolved, deliver_opts)
     binary = adapter_binary_path(harness, host_config)
+    rails? = harness == :codex and Rails.hook_settings() != nil
+
+    probe_opts =
+      if rails? do
+        probe_cwd = Path.join(host_config.base_dir, "work/gate-probe")
+        sh = Map.get(config, :sh, &system_cmd/1)
+
+        if host_config.ssh == nil do
+          File.rm_rf!(probe_cwd)
+        else
+          run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "rm", "-rf", probe_cwd])
+        end
+
+        ensure_opts = [base_dir: config.base_dir]
+
+        ensure_opts =
+          if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
+
+        ensure_opts =
+          cond do
+            config[:sh_out] -> Keyword.put(ensure_opts, :sh_out, config.sh_out)
+            config[:sh] -> Keyword.put(ensure_opts, :sh_out, config.sh)
+            true -> ensure_opts
+          end
+
+        ensure_workdir(host_config, probe_cwd, "", ensure_opts)
+        [probe_cwd: probe_cwd, probe_model: "gpt-5.6-sol[medium]"]
+      else
+        []
+      end
 
     stderr_path =
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
@@ -457,7 +487,9 @@ defmodule Tightbeam.Placement do
             {"TIGHTBEAM_HOME", config.base_dir},
             {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
             {"TIGHTBEAM_LINEAGE", lineage}
-          ] ++ harness_token_env(config.base_dir, harness)
+          ] ++
+            harness_token_env(config.base_dir, harness) ++
+            if(rails?, do: [{"CODEX_CONFIG", ~s({"bypass_hook_trust":true})}], else: [])
       ]
 
       if contained? do
@@ -519,10 +551,11 @@ defmodule Tightbeam.Placement do
         )
 
         opts
+        |> Keyword.merge(probe_opts)
         |> Keyword.put(:cmd, ["/usr/bin/sandbox-exec", "-p", profile, binary])
         |> Keyword.put(:contained, true)
       else
-        opts
+        Keyword.merge(opts, probe_opts)
       end
     else
       cli_bin = host_config[:cli_bin] || ""
@@ -543,23 +576,30 @@ defmodule Tightbeam.Placement do
         end
 
       remote_env =
-        token_env ++
-          [
-            "#{home_env}=#{home}",
-            "TIGHTBEAM_HOME=#{host_config.base_dir}",
-            "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
-            "PATH=#{cli_bin}:$PATH",
-            "TIGHTBEAM_LINEAGE=#{lineage}"
-          ]
+        (token_env ++
+           [
+             "#{home_env}=#{home}",
+             if(rails?, do: ~s(CODEX_CONFIG='{"bypass_hook_trust":true}')),
+             "TIGHTBEAM_HOME=#{host_config.base_dir}",
+             "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
+             "PATH=#{cli_bin}:$PATH",
+             "TIGHTBEAM_LINEAGE=#{lineage}"
+           ])
+        |> Enum.reject(&is_nil/1)
 
-      [
-        harness: harness,
-        cmd: ["ssh" | @ssh_opts] ++ [host_config.ssh, "exec", "env" | remote_env] ++ [binary],
-        home: home,
-        cwd: config.cwd,
-        stderr_path: stderr_path,
-        env: [{"TIGHTBEAM_LINEAGE", lineage}]
-      ]
+      Keyword.merge(
+        [
+          harness: harness,
+          cmd:
+            ["ssh" | @ssh_opts] ++
+              [host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+          home: home,
+          cwd: config.cwd,
+          stderr_path: stderr_path,
+          env: [{"TIGHTBEAM_LINEAGE", lineage}]
+        ],
+        probe_opts
+      )
     end
   end
 
@@ -915,11 +955,24 @@ defmodule Tightbeam.Placement do
       skills: refs
     }
 
-    rails_settings = if harness == :claude, do: Rails.claude_settings()
-    settings = merge_settings(rails_settings, model_settings(harness, base, config))
+    rails_settings = Rails.hook_settings()
+
+    settings =
+      case harness do
+        :claude ->
+          merge_settings(rails_settings, model_settings(harness, base, config))
+
+        :codex when not is_nil(rails_settings) ->
+          update_in(rails_settings, ["hooks", "PreToolUse"], &(&1 ++ [Rails.probe_entry()]))
+
+        :codex ->
+          nil
+      end
+
+    filename = if harness == :claude, do: "settings.json", else: "hooks.json"
 
     if settings,
-      do: Map.put(spec, :extra_files, %{"settings.json" => JSON.encode!(settings)}),
+      do: Map.put(spec, :extra_files, %{filename => JSON.encode!(settings)}),
       else: spec
   end
 

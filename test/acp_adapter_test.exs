@@ -18,8 +18,10 @@ defmodule Tightbeam.Acp.AdapterTest do
   const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
   const capturePath = process.argv[2];
   const failMode = process.argv[3] || "none";
+  const gateMode = process.argv[4] || "none";
   let modeCalls = 0;
-  const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, mcpServers: m.params.mcpServers, modeId: m.params.modeId }) + "\n");
+  let newCalls = 0;
+  const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, mcpServers: m.params.mcpServers, modeId: m.params.modeId, cwd: m.params.cwd, sessionId: m.params.sessionId, prompt: m.params.prompt }) + "\n");
   let pendingPrompt = null;
   rl.on("line", (line) => {
     if (!line.trim()) return;
@@ -35,7 +37,12 @@ defmodule Tightbeam.Acp.AdapterTest do
     }
     switch (m.method) {
       case "initialize": return send({ id: m.id, result: { protocolVersion: 1 } });
-      case "session/new": capture(m); return send({ id: m.id, result: { sessionId: "sess-1" } });
+      case "session/new": {
+        newCalls += 1;
+        capture(m);
+        const sid = gateMode !== "none" && newCalls === 1 ? "probe-sess" : "sess-1";
+        return send({ id: m.id, result: { sessionId: sid } });
+      }
       case "session/load": capture(m); return send({ id: m.id, result: {} });
       case "session/set_config_option": return send({ id: m.id, result: { configOptions: [] } });
       case "session/set_mode": {
@@ -48,6 +55,25 @@ defmodule Tightbeam.Acp.AdapterTest do
       }
       case "session/prompt": {
         const sid = m.params.sessionId;
+        capture(m);
+        if (sid === "probe-sess") {
+          if (gateMode === "pass-message") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } } } });
+            return send({ id: m.id, result: { stopReason: "end_turn" } });
+          }
+          if (gateMode === "pass-tool") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call", content: [{ type: "content", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } }] } } });
+            return send({ id: m.id, result: { stopReason: "end_turn" } });
+          }
+          if (gateMode === "no-marker") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "command not found" } } } });
+            return send({ id: m.id, result: { stopReason: "end_turn" } });
+          }
+          if (gateMode === "turn-error") {
+            return send({ id: m.id, error: { code: -32000, message: "probe turn failed" } });
+          }
+          if (gateMode === "stall") return;
+        }
         send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "po" } } } });
         send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ng" } } } });
         pendingPrompt = m.id;
@@ -78,33 +104,61 @@ defmodule Tightbeam.Acp.AdapterTest do
     harness = Keyword.get(opts, :harness, :claude)
     contained = Keyword.get(opts, :contained, false)
     fail_mode = Keyword.get(opts, :fail_mode, "none")
+    gate_mode = Keyword.get(opts, :gate_mode, "none")
+    probe? = Keyword.get(opts, :probe, gate_mode != "none")
+    stderr_path = Path.join(run_dir, "stderr.log")
 
     adapter_opts =
       [
         harness: harness,
-        cmd: [System.find_executable("node"), path, capture_path, fail_mode],
+        cmd: [System.find_executable("node"), path, capture_path, fail_mode, gate_mode],
         home: "/tmp",
         cwd: "/tmp",
+        stderr_path: stderr_path,
         name: :"adapter_#{System.unique_integer([:positive])}"
       ]
       |> then(fn adapter_opts ->
         if contained, do: Keyword.put(adapter_opts, :contained, true), else: adapter_opts
       end)
+      |> then(fn adapter_opts ->
+        if probe? do
+          adapter_opts
+          |> Keyword.put(:probe_cwd, Keyword.get(opts, :probe_cwd, "/tmp/gate-probe"))
+          |> Keyword.put(:probe_model, Keyword.get(opts, :probe_model, "gpt-5.6-sol[medium]"))
+          |> Keyword.put(
+            :gate_attestation_timeout,
+            Keyword.get(opts, :gate_attestation_timeout, 2_000)
+          )
+        else
+          adapter_opts
+        end
+      end)
+      |> then(fn adapter_opts ->
+        case Keyword.get(opts, :on_ready) do
+          nil -> adapter_opts
+          ready -> Keyword.put(adapter_opts, :on_ready, ready)
+        end
+      end)
 
     adapter =
       start_supervised!(%{
         id: {:adapter, System.unique_integer([:positive])},
-        start: {Adapter, :start_link, [adapter_opts]}
+        start: {Adapter, :start_link, [adapter_opts]},
+        restart: :temporary
       })
 
     {adapter, capture_path}
   end
 
   defp captured_requests(path) do
-    path
-    |> File.read!()
-    |> String.split("\n", trim: true)
-    |> Enum.map(&JSON.decode!/1)
+    if File.exists?(path) do
+      path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&JSON.decode!/1)
+    else
+      []
+    end
   end
 
   defp session_requests(path) do
@@ -214,5 +268,106 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.load_session(adapter, "sess-1", "haiku", "/tmp", [])
 
     refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "gate wiring-check passes on message or tool content and discards the probe session" do
+    for gate_mode <- ["pass-message", "pass-tool"] do
+      parent = self()
+
+      {adapter, capture_path} =
+        start_adapter(
+          harness: :codex,
+          gate_mode: gate_mode,
+          probe_cwd: "/tmp/gate-probe",
+          on_ready: fn -> send(parent, {:gate_ready, gate_mode}) end
+        )
+
+      assert_receive {:gate_ready, ^gate_mode}
+      refute Adapter.knows_session?(adapter, "probe-sess")
+
+      assert [probe_new] =
+               captured_requests(capture_path)
+               |> Enum.filter(&(&1["method"] == "session/new"))
+
+      assert probe_new["cwd"] == "/tmp/gate-probe"
+      assert probe_new["mcpServers"] == []
+
+      assert [probe_prompt] =
+               captured_requests(capture_path)
+               |> Enum.filter(&(&1["method"] == "session/prompt"))
+
+      assert probe_prompt["sessionId"] == "probe-sess"
+
+      assert probe_prompt["prompt"] == [
+               %{
+                 "type" => "text",
+                 "text" =>
+                   "Run exactly this command with your shell tool, then stop: tightbeam-gate-probe"
+               }
+             ]
+
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [])
+      refute Adapter.knows_session?(adapter, "probe-sess")
+
+      assert capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+               "gate wiring-check PASS [gate: tightbeam-probe]"
+    end
+  end
+
+  test "gate wiring-check fails closed without the marker or on a probe turn error" do
+    for {gate_mode, detail} <- [{"no-marker", :no_marker}, {"turn-error", :turn_error}] do
+      {adapter, capture_path} = start_adapter(harness: :codex, gate_mode: gate_mode)
+      monitor = Process.monitor(adapter)
+
+      queued =
+        Task.async(fn ->
+          catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", []))
+        end)
+
+      assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, ^detail}}
+      refute match?({:ok, _sid}, Task.await(queued))
+
+      assert capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+               "gate wiring-check FAIL detail=#{detail}"
+    end
+  end
+
+  test "gate wiring-check enforces one absolute deadline and serves no queued session" do
+    started = System.monotonic_time(:millisecond)
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        gate_mode: "stall",
+        gate_attestation_timeout: 75
+      )
+
+    monitor = Process.monitor(adapter)
+
+    queued =
+      Task.async(fn ->
+        catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", []))
+      end)
+
+    assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, :deadline}},
+                   1_000
+
+    assert System.monotonic_time(:millisecond) - started < 1_000
+    refute match?({:ok, _sid}, Task.await(queued))
+  end
+
+  test "boot without probe opts sends no probe request" do
+    parent = self()
+
+    {_adapter, capture_path} =
+      start_adapter(
+        harness: :codex,
+        gate_mode: "stall",
+        probe: false,
+        on_ready: fn -> send(parent, :plain_ready) end
+      )
+
+    assert_receive :plain_ready
+    assert captured_requests(capture_path) == []
   end
 end

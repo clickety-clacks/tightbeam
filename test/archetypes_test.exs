@@ -272,6 +272,20 @@ defmodule Tightbeam.ArchetypesTest do
     assert Archetypes.load!(ctx.base_dir)["coder"].skills == ["deploy"]
   end
 
+  test "tightbeam-harnesses states codex rails are wiring-checked for non-malicious agents",
+       ctx do
+    Archetypes.load!(ctx.base_dir)
+
+    text =
+      ctx.base_dir
+      |> Path.join("identity/skills/tightbeam-harnesses/SKILL.md")
+      |> File.read!()
+
+    assert text =~ "Rails gates: ENFORCED FOR NON-MALICIOUS AGENTS"
+    assert text =~ "WIRING-CHECKED\n  at adapter spawn"
+    refute text =~ "NOT YET WIRED"
+  end
+
   test "skill CRUD: trees nest, roots are electable units, elected roots transform on removal",
        ctx do
     Archetypes.load!(ctx.base_dir)

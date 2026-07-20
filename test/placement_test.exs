@@ -1,7 +1,7 @@
 defmodule Tightbeam.PlacementTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.{Archetypes, DB, EventLog, Org, Placement, Rails}
+  alias Tightbeam.{Archetypes, DB, EventLog, Homes, Org, Placement, Rails}
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
@@ -627,7 +627,10 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: "fable",
-      sh: fn command -> send(parent, {:unexpected_sh, command}); {"", 0} end
+      sh: fn command ->
+        send(parent, {:unexpected_sh, command})
+        {"", 0}
+      end
     }
 
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
@@ -649,7 +652,36 @@ defmodule Tightbeam.PlacementTest do
            ]
 
     refute Keyword.has_key?(opts, :contained)
+    refute Keyword.has_key?(opts, :probe_cwd)
+    refute Keyword.has_key?(opts, :probe_model)
+    refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
     refute_receive {:unexpected_sh, _}
+  end
+
+  test "adapter_opts seeds and prepares a local codex gate probe only when statutes exist", %{
+    base_dir: base_dir
+  } do
+    install_statute(base_dir)
+    Rails.load!(base_dir)
+
+    probe_cwd = Path.join(base_dir, "work/gate-probe")
+    File.mkdir_p!(probe_cwd)
+    File.write!(Path.join(probe_cwd, "stale"), "remove me")
+
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
+
+    assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
+    assert Enum.count(opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end) == 1
+    assert opts[:probe_cwd] == probe_cwd
+    assert opts[:probe_model] == "gpt-5.6-sol[medium]"
+    refute opts[:probe_model] == config.default_model
+    refute File.exists?(Path.join(probe_cwd, "stale"))
+
+    claude_opts = Placement.adapter_opts(config, {:claude, "default", "testhost"})
+    refute Keyword.has_key?(claude_opts, :probe_cwd)
+    refute Keyword.has_key?(claude_opts, :probe_model)
+    refute Enum.any?(claude_opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
   end
 
   test "adapter_opts injects the org's claude token env when the store holds one", %{
@@ -727,6 +759,54 @@ defmodule Tightbeam.PlacementTest do
 
     # Harness-scoped: codex remote env never carries claude's token expansion.
     refute Enum.any?(opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
+  end
+
+  test "adapter_opts quotes the remote codex trust seed and prepares the remote probe", %{
+    base_dir: base_dir
+  } do
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "worker" => %{ssh: "codex@worker", base_dir: "/srv/tb", cli_bin: "/srv/tb/bin"}
+    })
+
+    install_statute(base_dir)
+    Rails.load!(base_dir)
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:remote_gate_command, command})
+      {"", 0}
+    end
+
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "fable",
+      sh: sh
+    }
+
+    opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
+    assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
+    assert opts[:probe_model] == "gpt-5.6-sol[medium]"
+
+    assert Enum.any?(collect_remote_gate_commands([]), fn command ->
+             List.last(command) == "/srv/tb/work/gate-probe" and "rm" in command and
+               "-rf" in command
+           end)
+
+    claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
+    refute Enum.any?(claude_opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
+    refute Keyword.has_key?(claude_opts, :probe_cwd)
+
+    File.rm_rf!(Path.join([base_dir, "identity", "rails"]))
+    Rails.load!(base_dir)
+    lawless_opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    refute Enum.any?(lawless_opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
+    refute Keyword.has_key?(lawless_opts, :probe_cwd)
+    refute Keyword.has_key?(lawless_opts, :probe_model)
   end
 
   test "contained local adapter validates, probes once, wraps argv, and records exact grants", %{
@@ -1173,23 +1253,18 @@ defmodule Tightbeam.PlacementTest do
     assert settings == %{"model" => "claude-sonnet-4-6"}
   end
 
-  test "deliver_home projects gate hooks for local Claude only and guidance stays law-free", %{
-    base_dir: base_dir
-  } do
-    rails_dir = Path.join([base_dir, "identity", "rails"])
-    File.mkdir_p!(rails_dir)
-
-    File.write!(Path.join(rails_dir, "law.toml"), """
-    [[statute]]
-    name = "no-history-rewrites"
-    on = "tool-call"
-    tool = "Bash"
-    pattern = "git (reset|stash|rebase)"
-    text = "History-rewriting git commands are forbidden here."
-    """)
-
-    Rails.load!(base_dir)
+  test "deliver_home projects shared gate hooks for claude and codex while guidance stays law-free",
+       %{
+         base_dir: base_dir
+       } do
     config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    lawless_codex_home = Placement.deliver_home(config, {:codex, "default", "testhost"})
+    lawless_agents = File.read!(Path.join(lawless_codex_home, "AGENTS.md"))
+    lawless_manifest = File.read!(Path.join(lawless_codex_home, ".tightbeam-manifest"))
+    refute File.exists?(Path.join(lawless_codex_home, "hooks.json"))
+
+    install_statute(base_dir)
+    Rails.load!(base_dir)
 
     claude_home = Placement.deliver_home(config, {:claude, "default", "testhost"})
     codex_home = Placement.deliver_home(config, {:codex, "default", "testhost"})
@@ -1198,7 +1273,21 @@ defmodule Tightbeam.PlacementTest do
            |> Path.join("settings.json")
            |> File.read!()
            |> JSON.decode!() ==
-             Map.merge(Rails.claude_settings(), %{"model" => "claude-fable-5[1m]"})
+             Map.merge(Rails.hook_settings(), %{"model" => "claude-fable-5[1m]"})
+
+    refute claude_home |> Path.join("settings.json") |> File.read!() =~ "tightbeam-probe"
+
+    expected_codex =
+      update_in(Rails.hook_settings(), ["hooks", "PreToolUse"], &(&1 ++ [Rails.probe_entry()]))
+
+    assert codex_home |> Path.join("hooks.json") |> File.read!() == JSON.encode!(expected_codex)
+
+    assert %{"hooks" => %{"PreToolUse" => [org_entry, probe_entry]}} =
+             codex_home |> Path.join("hooks.json") |> File.read!() |> JSON.decode!()
+
+    assert org_entry["matcher"] == "Bash"
+    assert probe_entry == Rails.probe_entry()
+    refute File.exists?(Path.join(codex_home, "settings.json"))
 
     # THE INVARIANT (bible §rails): rails never add guidance — the
     # instruction files are byte-identical to a lawless org's, and no
@@ -1211,8 +1300,15 @@ defmodule Tightbeam.PlacementTest do
     assert codex_home |> Path.join("AGENTS.md") |> File.read!() ==
              Tightbeam.Archetypes.guidance(archetype)
 
+    assert codex_home |> Path.join("AGENTS.md") |> File.read!() == lawless_agents
+
     refute claude_home |> Path.join("CLAUDE.md") |> File.read!() =~ "no-history-rewrites"
-    refute File.exists?(Path.join(codex_home, "settings.json"))
+
+    File.rm_rf!(Path.join([base_dir, "identity", "rails"]))
+    Rails.load!(base_dir)
+    Placement.deliver_home(config, {:codex, "default", "testhost"})
+    assert File.read!(Path.join(codex_home, ".tightbeam-manifest")) == lawless_manifest
+    refute File.exists?(Path.join(codex_home, "hooks.json"))
   end
 
   test "deliver_home preserves the manifest and nested state with zero statutes", %{
@@ -1230,6 +1326,29 @@ defmodule Tightbeam.PlacementTest do
     assert File.read!(stamp_path) == stamp_before
     assert File.read!(marker) == "keep"
     refute File.exists?(Path.join(home, "settings.json"))
+    refute File.exists?(Path.join(home, "hooks.json"))
+  end
+
+  test "statute content changes codex projection manifest bytes", %{base_dir: base_dir} do
+    install_statute(base_dir, "First refusal text.")
+    Rails.load!(base_dir)
+    first_hooks = codex_hooks_bytes()
+
+    install_statute(base_dir, "Changed refusal text.")
+    Rails.load!(base_dir)
+    second_hooks = codex_hooks_bytes()
+
+    spec = %{
+      harness: :codex,
+      archetype: "default",
+      base_archetype: "default",
+      parent_source: nil,
+      guidance: "guidance",
+      skills: []
+    }
+
+    refute Homes.manifest_bytes(Map.put(spec, :extra_files, %{"hooks.json" => first_hooks})) ==
+             Homes.manifest_bytes(Map.put(spec, :extra_files, %{"hooks.json" => second_hooks}))
   end
 
   test "parent manifest file-byte changes are recorded and regenerate the home", %{
@@ -1259,6 +1378,14 @@ defmodule Tightbeam.PlacementTest do
   defp collect_commands(acc) do
     receive do
       {:command, command} -> collect_commands([command | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp collect_remote_gate_commands(acc) do
+    receive do
+      {:remote_gate_command, command} -> collect_remote_gate_commands([command | acc])
     after
       0 -> Enum.reverse(acc)
     end
@@ -1350,6 +1477,26 @@ defmodule Tightbeam.PlacementTest do
     assert {:ok, "testhost"} = Placement.resolve(anywhere, nil, hosts)
     assert {:ok, "work-1"} = Placement.resolve(anywhere, "work-1", hosts)
     assert {:error, %{code: "unknown_host"}} = Placement.resolve(anywhere, "nope", hosts)
+  end
+
+  defp install_statute(base_dir, text \\ "History-rewriting git commands are forbidden here.") do
+    rails_dir = Path.join([base_dir, "identity", "rails"])
+    File.mkdir_p!(rails_dir)
+
+    File.write!(Path.join(rails_dir, "law.toml"), """
+    [[statute]]
+    name = "no-history-rewrites"
+    on = "tool-call"
+    tool = "Bash"
+    pattern = "git (reset|stash|rebase)"
+    text = "#{text}"
+    """)
+  end
+
+  defp codex_hooks_bytes do
+    Rails.hook_settings()
+    |> update_in(["hooks", "PreToolUse"], &(&1 ++ [Rails.probe_entry()]))
+    |> JSON.encode!()
   end
 
   defp write_containment_manifest(base_dir, name, fs) do

@@ -25,7 +25,11 @@ Steps behave identically across harnesses unless annotated:
 - **[claude-only]** — the mechanism exists only on claude per
   `shared/specs/tightbeam/harness-support.md` (the canonical matrix). On
   codex the step becomes its NEGATIVE check where one is stated.
+- **[codex-only]** — the mechanism exists only on codex; claude does not run
+  that step.
 - **[divergent]** — both harnesses run it, PASS conditions differ as noted.
+
+Every `codex exec` invocation redirects `</dev/null`; an open stdin hangs it.
 
 The matrix document is the authority on which rows diverge; a smoke step
 verifying a matrix row cites it, and a matrix claim with no verifying smoke
@@ -38,10 +42,10 @@ Per-harness annotations for the existing sections:
   differ; PASS is still "progress label during turn, output reported".
 - §6 step 13 (model picker/footer): [divergent] — codex refs are
   `gpt-5.6-sol[low..xhigh]`, `gpt-5.6-luna[medium]`.
-- §9 rails (17–23): [claude-only]. Codex negative check: with statutes
-  installed, the codex home has NO settings.json, its AGENTS.md contains no
-  statute text, and the step-19 forbidden command is NOT refused by any
-  hook (matrix: gates do not exist on codex).
+- §9 rails (17–24): [divergent]. Claude asserts hooks in `settings.json`;
+  codex asserts `hooks.json` with the org entries plus the trailing
+  `tightbeam-probe` entry, still NO `settings.json` in the codex home and no
+  statute text in `AGENTS.md`.
 - Skills verification (when a step exercises one): [divergent] — claude
   invokes via its native Skill tool; codex must READ the skill file by the
   path the Operations pointer names. PASS for codex is the agent quoting
@@ -182,8 +186,8 @@ once: a `/new` that died pre-model with `Session not found`).
 
 Every run produces a SCORECARD: copy `docs/smoke-runs/TEMPLATE.md` to
 `docs/smoke-runs/<date>-<short-sha>.md` and fill it in — one column per
-{harness x host} leg, one row per step (P1..P3, 1..23), each cell
-PASS / FAIL(note) / WAIVED(blocker) / N/A[claude-only]. The scorecard also
+{harness x host} leg, one row per step (P1..P3, 1..33), each cell
+PASS / FAIL(note) / WAIVED(blocker) / N/A[harness-only]. The scorecard also
 carries a copy of the harness-support matrix's rows with a verified?
 column — a run is how matrix claims EARN their checkmarks, and a filled
 scorecard is the evidence the matrix cites. Gateway commit hash, client
@@ -199,82 +203,97 @@ the tool call, with the statute text delivered only as the denial reason.
 
 17. Install law: copy `docs/statutes.toml.example` to
     `<base_dir>/identity/rails/statutes.toml`; restart the gateway.
-    PASS: gateway boots; after the next claude adapter boot the home's
+    PASS [divergent]: gateway boots. After adapter boot, the claude home's
     `settings.json` decodes with one `hooks.PreToolUse` entry per statute
-    (matcher "Bash"). EXPECTED COST: the statute change is an identity
-    change — affected sessions show the `[context reset]` marker once.
-18. The invariant: `grep` the projected `CLAUDE.md` (and a codex
-    `AGENTS.md` if one is instanced) for any statute name or text.
+    (matcher "Bash"). The codex home's `hooks.json` decodes with one entry
+    per statute plus `tightbeam-probe` LAST; the codex home still has NO
+    `settings.json`. EXPECTED COST: the statute change is an identity change
+    — affected sessions show the `[context reset]` marker once.
+18. The invariant: `grep` the projected `CLAUDE.md` and `AGENTS.md` for any
+    statute name or text.
     PASS: zero matches — instruction files are byte-identical to a
     lawless org's.
-19. Live refusal: in a scratch git repo, tell a session (or ⌥ `claude -p
-    --dangerously-skip-permissions` inside the projected home) to run
-    exactly `git reset --hard HEAD`, then `git status`, and to report
-    what happened.
-    PASS: the reset is refused BEFORE execution — the reply quotes
-    `[gate: no-history-rewrites]` as a hook refusal (the agent must
-    report the runtime refused it, not that it declined); `git status`
-    runs normally; the repo is untouched. Repeat with
-    `git push origin main` → `[gate: no-push-main]` refusal.
-20. Negative control: an adjacent, allowed command of the same tool
+19. Live refusal [divergent]: in a scratch git repo, tell a real session to
+    run exactly `git reset --hard HEAD`, then `git status`, and report what
+    happened. The claude fallback is `claude -p
+    --dangerously-skip-permissions` inside the projected home.
+    PASS: the reset is refused BEFORE execution. Claude's reply quotes
+    `[gate: no-history-rewrites]`; codex quotes `Command blocked by
+    PreToolUse hook: [gate: no-history-rewrites] …`. In both, the agent must
+    report that the runtime refused it, not that it declined; `git status`
+    runs normally and the repo is untouched. Repeat with `git push origin
+    main` → `[gate: no-push-main]` refusal.
+20. Boot wiring-check evidence [codex-only]: confirm the codex adapter boot
+    log contains `gate wiring-check PASS [gate: tightbeam-probe]`. Delete the
+    projected home's `hooks.json` and restart the adapter.
+    PASS: the adapter REFUSES to boot with `gate_attestation_failed`, and no
+    codex session is served. Restore by changing MANIFEST BYTES: edit a
+    statute, or delete the home's `.tightbeam-manifest` stamp, then restart so
+    the full delete-and-reproject rewrites `hooks.json`. Merely touching a
+    file is a no-op because `Homes.project/2` regenerates only when stamp
+    bytes differ from manifest bytes. This demonstrates silent-misconfig
+    detection, NOT tamper resistance.
+21. Negative control: an adjacent, allowed command of the same tool
     (`git log`, `git diff`) runs without any refusal text appearing.
     PASS: normal output, no `[gate: ...]` anywhere.
-21. Bad law stops the boot: append a statute with `mode = "remind"` to
+22. Bad law stops the boot: append a statute with `mode = "remind"` to
     the statutes file and restart.
     PASS: the gateway REFUSES to start; the log names the law error
     verbatim ("rails never add guidance; put prose in guidance or a
     skill"). Same check with `pattern = "("` → "invalid gate pattern".
     Restore the file; gateway boots.
-22. Law removal: delete the statutes file, restart, re-run step 19's
+23. Law removal: delete the statutes file, restart, re-run step 19's
     forbidden command.
     PASS: no refusal (the gate is gone, not lingering in a stale home —
     the home regenerated on the law change); step 18 still passes.
-23. ⌥ Satellite propagation (needs an assimilated host with claude
-    creds): after step 17, deliver a home to the satellite (adapter boot
-    there) and repeat steps 18–19 on the satellite's projected home.
-    PASS: identical behavior — the staged `settings.json` rode rsync.
+24. ⌥ Satellite propagation (needs an assimilated host with credentials for
+    the harness leg): after step 17, deliver a home to the satellite (adapter
+    boot there) and repeat steps 18–20 on the satellite's projected home.
+    PASS [divergent]: identical enforcement behavior; claude's staged
+    `settings.json` or codex's staged `hooks.json` rode rsync, and the codex
+    adapter emitted its boot wiring-check PASS line.
 
 ## 10. Roles (offices: typed targets, binding, fallback, late binding)
 
 Roles are substrate-level — run once per harness leg (bind to that leg's
 session where a binding is called for). ⌥ all steps are CLI/dispatch.
 
-24. Typed target seam: `wake --user <admin>` lands in the admin's Main;
+25. Typed target seam: `wake --user <admin>` lands in the admin's Main;
     `wake --role <admin-id>` FAILS with "unknown role" (the field is the
     type — a user id in the role field is a role lookup, period);
     `wake --session agent:garbage` fails "unknown sessionKey"; sending
     BOTH --role and --user fails "exactly one of"; the retired single
     `target` param fails naming the three fields.
     PASS: all five behave exactly so.
-25. Unstaffed office: `role create probe-office`, then `wake --role probe-office`.
+26. Unstaffed office: `role create probe-office`, then `wake --role probe-office`.
     PASS: message lands in the role OWNER's Main; the turn row has
     roleRef='probe-office' AND roleFallback=1. DB is the check — fallback
     is recorded, never disguised.
-26. Staffed office: `role bind probe-office <sessionKey of this leg's
+27. Staffed office: `role bind probe-office <sessionKey of this leg's
     smoke session>`, wake again.
     PASS: delivered to the bound session; turn row roleFallback=0.
-27. Late binding: `wake probe-office --after 30s`, then IMMEDIATELY
+28. Late binding: `wake probe-office --after 30s`, then IMMEDIATELY
     `role bind probe-office <a different session>`. Wait for fire.
     PASS: delivered to the NEW binding (the one at fire time, not at
     schedule time); turn row records the role and the new key.
-28. Reply spelling round trip: from the bound session, have the agent
+29. Reply spelling round trip: from the bound session, have the agent
     reply to a role-stamped message per its Comms guidance.
     PASS: for `[from agent:X]` the agent runs `wake --role X`; for
     `[from user:Y]` it runs `wake --user Y` — typed flags, no 404s.
-29. Deleted office: `role rm probe-office`, then `wake --role probe-office`.
+30. Deleted office: `role rm probe-office`, then `wake --role probe-office`.
     PASS: named error ("unknown role: probe-office") — the name errors by
     name, never silently reroutes. A wake SCHEDULED before the rm and
     firing after it produces a `wake_unresolved` lifecycle row and no
     delivery.
-30. Permanence of Mains: attempt `retire <admin's Main key>`.
+31. Permanence of Mains: attempt `retire <admin's Main key>`.
     PASS: refused with "main sessions are permanent" — the fallback
     target cannot be destroyed; Main remains active.
-31. Spawn sugar atomicity: `spawn --display X --name probe-office` while
+32. Spawn sugar atomicity: `spawn --display X --name probe-office` while
     that role still exists.
     PASS: the spawn FAILS with role_exists and NO session row was
     created. Then with a fresh name: session + role both exist, role
     bound to the new session.
-32. Acting-as requires the office: `wake <target> --as probe-office` from
+33. Acting-as requires the office: `wake <target> --as probe-office` from
     a context where the role is unbound.
     PASS: refused ("unknown or unbound role"); after binding, the same
     call succeeds and the delivered stamp reads `[from agent:probe-office]`.

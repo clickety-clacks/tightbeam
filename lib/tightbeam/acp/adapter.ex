@@ -18,6 +18,10 @@ defmodule Tightbeam.Acp.Adapter do
   use GenServer
   alias Tightbeam.Acp.Conn
 
+  @gate_attestation_timeout 120_000
+  @gate_marker "[gate: tightbeam-probe]"
+  @gate_prompt "Run exactly this command with your shell tool, then stop: tightbeam-gate-probe"
+
   @presets %{
     claude: %{
       home_env: "CLAUDE_CONFIG_DIR",
@@ -160,17 +164,42 @@ defmodule Tightbeam.Acp.Adapter do
         clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
       })
 
-    # Boot completed — the only trustworthy health signal under lazy boot
-    # (spawn success means nothing). The coordinator closes its circuit here.
-    with ready when is_function(ready, 0) <- Keyword.get(opts, :on_ready), do: ready.()
+    state = %__MODULE__{
+      conn: conn,
+      preset: preset,
+      cwd: Keyword.fetch!(opts, :cwd),
+      contained: Keyword.get(opts, :contained, false)
+    }
 
-    {:noreply,
-     %__MODULE__{
-       conn: conn,
-       preset: preset,
-       cwd: Keyword.fetch!(opts, :cwd),
-       contained: Keyword.get(opts, :contained, false)
-     }}
+    case Keyword.fetch(opts, :probe_cwd) do
+      {:ok, probe_cwd} ->
+        deadline =
+          System.monotonic_time(:millisecond) +
+            Keyword.get(opts, :gate_attestation_timeout, @gate_attestation_timeout)
+
+        case gate_attestation(state, probe_cwd, Keyword.fetch!(opts, :probe_model), deadline) do
+          {:ok, output} ->
+            gate_log(
+              Keyword.get(opts, :stderr_path, "/dev/null"),
+              "gate wiring-check PASS #{@gate_marker} output=#{inspect(output)}"
+            )
+
+            adapter_ready(opts)
+            {:noreply, state}
+
+          {:error, detail, output} ->
+            gate_log(
+              Keyword.get(opts, :stderr_path, "/dev/null"),
+              "gate wiring-check FAIL detail=#{detail} output=#{inspect(output)}"
+            )
+
+            {:stop, {:gate_attestation_failed, detail}, state}
+        end
+
+      :error ->
+        adapter_ready(opts)
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -308,17 +337,23 @@ defmodule Tightbeam.Acp.Adapter do
   ## Model application (the fable-trap rule)
 
   defp apply_model(state, sid, model_ref) do
+    apply_model(state, sid, model_ref, fn method, params ->
+      Conn.request(state.conn, method, params)
+    end)
+  end
+
+  defp apply_model(state, sid, model_ref, request) do
     {model, effort} = parse_model_ref(model_ref)
 
     with {:ok, _} <-
-           Conn.request(state.conn, "session/set_config_option", %{
+           request.("session/set_config_option", %{
              sessionId: sid,
              configId: "model",
              value: model
            }),
          {:ok, _} <-
            (if effort do
-              Conn.request(state.conn, "session/set_config_option", %{
+              request.("session/set_config_option", %{
                 sessionId: sid,
                 configId: state.preset.effort_config,
                 value: effort
@@ -352,6 +387,129 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp set_mode_after_load(%{contained: false}, _sid), do: :ok
   defp set_mode_after_load(state, sid), do: set_mode(state, sid)
+
+  defp adapter_ready(opts) do
+    # Boot completed — the only trustworthy health signal under lazy boot
+    # (spawn success means nothing). The coordinator closes its circuit here.
+    with ready when is_function(ready, 0) <- Keyword.get(opts, :on_ready), do: ready.()
+  end
+
+  defp gate_attestation(state, probe_cwd, probe_model, deadline) do
+    request = fn method, params -> gate_request(state.conn, method, params, deadline) end
+
+    with {:ok, result} <- request.("session/new", %{cwd: probe_cwd, mcpServers: []}),
+         sid = result["sessionId"],
+         :ok <- apply_model(state, sid, probe_model, request),
+         {:ok, _} <-
+           request.("session/set_mode", %{
+             sessionId: sid,
+             modeId: state.preset.yolo_mode
+           }) do
+      gate_prompt(state.conn, sid, deadline)
+    else
+      {:error, :deadline} -> {:error, :deadline, ""}
+      {:error, _error} -> {:error, :turn_error, ""}
+    end
+  end
+
+  defp gate_request(conn, method, params, deadline) do
+    case gate_remaining(deadline) do
+      remaining when remaining <= 0 ->
+        {:error, :deadline}
+
+      remaining ->
+        case Conn.request(conn, method, params, timeout: remaining) do
+          {:error, :timeout} -> {:error, :deadline}
+          result -> result
+        end
+    end
+  end
+
+  defp gate_prompt(conn, sid, deadline) do
+    case gate_remaining(deadline) do
+      remaining when remaining <= 0 ->
+        {:error, :deadline, ""}
+
+      remaining ->
+        parent = self()
+
+        Task.start(fn ->
+          result =
+            gate_request(
+              conn,
+              "session/prompt",
+              %{sessionId: sid, prompt: [%{type: "text", text: @gate_prompt}]},
+              deadline
+            )
+
+          send(parent, {:gate_attestation_prompt_done, sid, result})
+        end)
+
+        timer = Process.send_after(self(), :gate_attestation_deadline, remaining)
+        gate_prompt_wait(sid, timer, [])
+    end
+  end
+
+  defp gate_prompt_wait(sid, timer, output) do
+    receive do
+      {:acp_notification, "session/update", %{"sessionId" => ^sid, "update" => update}} ->
+        gate_prompt_wait(sid, timer, gate_update_output(update) ++ output)
+
+      {:acp_notification, _method, _params} ->
+        gate_prompt_wait(sid, timer, output)
+
+      {:gate_attestation_prompt_done, ^sid, result} ->
+        cancel_gate_timer(timer)
+        collected = output |> Enum.reverse() |> Enum.join()
+
+        case result do
+          {:ok, _} ->
+            if String.contains?(collected, @gate_marker),
+              do: {:ok, collected},
+              else: {:error, :no_marker, collected}
+
+          {:error, :deadline} ->
+            {:error, :deadline, collected}
+
+          {:error, _error} ->
+            {:error, :turn_error, collected}
+        end
+
+      :gate_attestation_deadline ->
+        {:error, :deadline, output |> Enum.reverse() |> Enum.join()}
+
+      {:acp_exit, _status} ->
+        cancel_gate_timer(timer)
+        {:error, :turn_error, output |> Enum.reverse() |> Enum.join()}
+    end
+  end
+
+  defp gate_update_output(%{
+         "sessionUpdate" => "agent_message_chunk",
+         "content" => %{"text" => text}
+       })
+       when is_binary(text),
+       do: [text]
+
+  defp gate_update_output(%{"sessionUpdate" => kind, "content" => content})
+       when kind in ["tool_call", "tool_call_update"],
+       do: [JSON.encode!(content)]
+
+  defp gate_update_output(_update), do: []
+
+  defp gate_remaining(deadline), do: deadline - System.monotonic_time(:millisecond)
+
+  defp cancel_gate_timer(timer) do
+    Process.cancel_timer(timer)
+
+    receive do
+      :gate_attestation_deadline -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  defp gate_log(path, line), do: File.write!(path, line <> "\n", [:append])
 
   @doc """
   Split a model ref into `{model, effort}`; effort is nil when absent.

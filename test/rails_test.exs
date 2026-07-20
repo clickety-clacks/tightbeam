@@ -37,7 +37,7 @@ defmodule Tightbeam.RailsTest do
 
   test "empty and missing rails dirs are a valid empty set", ctx do
     assert Rails.load!(ctx.base_dir) == []
-    assert Rails.claude_settings() == nil
+    assert Rails.hook_settings() == nil
 
     File.rm_rf!(ctx.rails_dir)
     assert Rails.load!(ctx.base_dir) == []
@@ -101,11 +101,11 @@ defmodule Tightbeam.RailsTest do
     end
   end
 
-  test "claude_settings compiles the byte-pinned PreToolUse entry", ctx do
+  test "hook_settings compiles the byte-pinned PreToolUse entry", ctx do
     write_statute(ctx, %{})
     Rails.load!(ctx.base_dir)
 
-    assert %{"hooks" => %{"PreToolUse" => [entry]}} = Rails.claude_settings()
+    assert %{"hooks" => %{"PreToolUse" => [entry]}} = Rails.hook_settings()
     assert entry["matcher"] == "Bash"
     assert [%{"type" => "command", "command" => command}] = entry["hooks"]
 
@@ -123,11 +123,23 @@ defmodule Tightbeam.RailsTest do
     })
 
     Rails.load!(ctx.base_dir)
-    %{"hooks" => %{"PreToolUse" => [entry]}} = Rails.claude_settings()
+    %{"hooks" => %{"PreToolUse" => [entry]}} = Rails.hook_settings()
     [%{"command" => command}] = entry["hooks"]
 
     assert command ==
              "sh -c 'grep -qE \"echo (\\\\\\$HOME|\\\\\\$PATH)\\\\.\" - || exit 0; " <>
                "echo \"[gate: no-env-dollars] Don'\\''t expand env here.\" >&2; exit 2'"
+  end
+
+  test "probe_entry compiles the byte-pinned reserved wiring-check gate" do
+    assert %{
+             "matcher" => "Bash",
+             "hooks" => [%{"type" => "command", "command" => command}]
+           } = Rails.probe_entry()
+
+    assert command ==
+             "sh -c 'grep -qE \"tightbeam-gate-probe\" - || exit 0; " <>
+               "echo \"[gate: tightbeam-probe] Spawn wiring-check probe command; " <>
+               "always refused by design.\" >&2; exit 2'"
   end
 end

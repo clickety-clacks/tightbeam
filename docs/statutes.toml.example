@@ -1,4 +1,4 @@
-# Gate statutes: deterministic tool-call refusal (claude harness today).
+# Gate statutes: deterministic tool-call refusal on both harnesses for non-malicious agents — claude via settings.json hooks; codex via projected hooks.json, wiring-checked at adapter boot (hooks exist since codex 0.124, tested floor 0.144.x on the codex-acp-bundled binary; a codex that fails the boot wiring-check refuses to serve rather than running ungated).
 # Copy into <base_dir>/identity/rails/ and restart the substrate to apply.
 # A statute change regenerates homes — sessions there lose model memory,
 # visibly (the context-reset marker shows where).

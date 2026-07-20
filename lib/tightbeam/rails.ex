@@ -13,19 +13,32 @@ defmodule Tightbeam.Rails do
   never by reading it. `mode = "remind"` is refused at load for this
   reason, not treated as unknown.
 
-  V1 is the GATE tier: a statute compiles to a Claude Code `PreToolUse`
-  hook. The harness presents every proposed tool call to the hook BEFORE
-  execution; on pattern match the hook exits 2 and the call is REFUSED —
-  the action never happens, no inference in the loop, and the statute's
-  text reaches the model as the denial reason. Honest limit: pattern
-  matching over command strings is accident-grade enforcement — a
-  determined agent can evade patterns; adversarial containment belongs to
-  sandboxes and credentials. Gates stop mistakes deterministically.
+  V1 is the GATE tier: a statute compiles to a `PreToolUse` hook. The harness
+  presents every proposed tool call to the hook BEFORE execution; on pattern
+  match the hook exits 2 and the call is REFUSED — the action never happens,
+  no inference in the loop, and the statute's text reaches the model as the
+  denial reason. Honest limit: pattern matching over command strings is
+  accident-grade enforcement — a determined agent can evade patterns;
+  adversarial containment belongs to sandboxes and credentials. Gates stop
+  mistakes deterministically.
 
-  Codex has no hook surface, so a gate simply does not exist on codex
-  homes — no settings file and, per the invariant, no advisory text
-  (advisory text would be guidance). Reserved for later stages, refused by
-  name at load: `mode = "block"` and `check` predicates.
+  Codex hooks exist since 0.124.0; 0.144.x is the tested floor, applied to the
+  executable selected by codex-acp. Codex receives the identical hook map as
+  `hooks.json`, while claude embeds it in `settings.json`: the stdin wire and
+  `tool_name: "Bash"` coincide, Bash-statute parity is exact, exit 2 refuses on
+  both, and hooks fire under `agent-full-access` / `bypassPermissions`.
+  Distinct from permission bypass, codex has a hook-trust layer with no claude
+  analog: untrusted hooks are silently skipped headless, so placement seeds
+  `CODEX_CONFIG={"bypass_hook_trust":true}` whenever statutes exist. Because
+  the home is substrate-projected and `hooks.json` is substrate-written, this
+  is the already-vetted automation the bypass exists for. Both the seed and
+  hook file can silently fail to bind, so codex enforcement is wiring-checked
+  at adapter boot through the reserved probe gate; the adapter does not come
+  up unless it observes the refusal. This is rails-tier denial for a
+  cooperative agent, wired and proven at boot — not a sandbox or tamper proof;
+  malicious and config-hostile actors are out of scope exactly as for claude
+  rails. Reserved for later stages, refused by name at load: `mode = "block"`
+  and `check` predicates.
 
   Loading is boot-time and fail-closed: `<base_dir>/identity/rails/*.toml`
   in filename order, every statute validated before the set is stored in
@@ -42,6 +55,14 @@ defmodule Tightbeam.Rails do
 
   @persist_key __MODULE__
   @statute_keys MapSet.new(["name", "on", "mode", "text", "check", "tool", "pattern"])
+  @probe_statute %{
+    name: "tightbeam-probe",
+    on: :tool_call,
+    mode: :gate,
+    tool: "Bash",
+    pattern: "tightbeam-gate-probe",
+    text: "Spawn wiring-check probe command; always refused by design."
+  }
 
   @typedoc "A validated gate statute."
   @type statute :: %{
@@ -88,9 +109,9 @@ defmodule Tightbeam.Rails do
     statutes
   end
 
-  @doc "The Claude settings hook map, or nil for an empty statute set."
-  @spec claude_settings() :: map() | nil
-  def claude_settings do
+  @doc "The compiled PreToolUse hook map embedded in claude settings.json and codex hooks.json, or nil for an empty statute set."
+  @spec hook_settings() :: map() | nil
+  def hook_settings do
     case :persistent_term.get(@persist_key) do
       [] ->
         nil
@@ -99,6 +120,10 @@ defmodule Tightbeam.Rails do
         %{"hooks" => %{"PreToolUse" => Enum.map(statutes, &pre_tool_use_entry/1)}}
     end
   end
+
+  @doc "The compiled PreToolUse entry for the substrate-reserved codex spawn wiring-check."
+  @spec probe_entry() :: map()
+  def probe_entry, do: pre_tool_use_entry(@probe_statute)
 
   defp validate!(statute) when is_map(statute) do
     keys = Map.keys(statute) |> MapSet.new()
