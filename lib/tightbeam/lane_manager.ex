@@ -16,7 +16,7 @@ defmodule Tightbeam.LaneManager do
   use GenServer
   alias Tightbeam.{Ledger, SessionLane}
 
-  defstruct [:db, :lane_sup, :task_sup, :runner, :interval, :terminal_publisher]
+  defstruct [:db, :lane_sup, :task_sup, :runner, :interval, :terminal_publisher, :on_terminal]
 
   @doc """
   Start the reconciler. Required opts: `:lane_sup` (the lane
@@ -25,7 +25,8 @@ defmodule Tightbeam.LaneManager do
   before the first scan.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+  def start_link(opts),
+    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc "Force a reconcile pass now (also used by tests)."
   @spec reconcile(GenServer.server()) :: :ok
@@ -33,7 +34,8 @@ defmodule Tightbeam.LaneManager do
 
   @doc "Ensure a lane exists for a session (idempotent) and nudge it."
   @spec ensure_lane(GenServer.server(), String.t()) :: :ok
-  def ensure_lane(server \\ __MODULE__, session_key), do: GenServer.call(server, {:ensure_lane, session_key})
+  def ensure_lane(server \\ __MODULE__, session_key),
+    do: GenServer.call(server, {:ensure_lane, session_key})
 
   @impl true
   def init(opts) do
@@ -43,6 +45,7 @@ defmodule Tightbeam.LaneManager do
       task_sup: Keyword.fetch!(opts, :task_sup),
       runner: Keyword.fetch!(opts, :runner),
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
+      on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
       interval: Keyword.get(opts, :interval, 5_000)
     }
 
@@ -74,6 +77,7 @@ defmodule Tightbeam.LaneManager do
     for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db) do
       state.terminal_publisher.(row)
       Ledger.mark_published(state.db, seq)
+      state.on_terminal.(row.session_key, seq)
     end
 
     for session_key <- Ledger.pending_sessions(state.db) do
@@ -97,7 +101,8 @@ defmodule Tightbeam.LaneManager do
            db: state.db,
            task_sup: state.task_sup,
            runner: state.runner,
-           terminal_publisher: state.terminal_publisher}
+           terminal_publisher: state.terminal_publisher,
+           on_terminal: state.on_terminal}
         )
     end
   end

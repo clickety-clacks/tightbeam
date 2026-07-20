@@ -118,7 +118,8 @@ defmodule Tightbeam.LaneTest do
     {:ok, _mgr} =
       LaneManager.start_link(
         db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
-        runner: runner, interval: 60_000, name: mgr_name
+        runner: runner, interval: 60_000, name: mgr_name,
+        on_terminal: fn session_key, seq -> send(test_pid, {:terminal, session_key, seq}) end
       )
 
     {:ok, seq1} =
@@ -131,6 +132,7 @@ defmodule Tightbeam.LaneTest do
     assert_receive {:started, "hang"}
 
     assert {:ok, %{seq: ^seq1, message_id: "m_hang"}} = SessionLane.cancel_current("k1")
+    assert_receive {:terminal, "k1", ^seq1}
 
     # canceled is terminal and the lane drains to the next queued turn
     # IMMEDIATELY (a second cancel in that window legitimately targets it).
@@ -139,5 +141,26 @@ defmodule Tightbeam.LaneTest do
     assert SessionLane.cancel_current("k1") == :not_running
     {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq = ?1", [seq1])
     assert status == "canceled"
+  end
+
+  test "reconcile republishes recovered terminals through the same on_terminal closure", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "interrupted")
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, "k1", "dead-owner")
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
+        runner: fn _ -> {:ok, %{}} end, interval: 60_000,
+        terminal_publisher: fn _ -> :ok end,
+        on_terminal: fn session_key, terminal_seq ->
+          send(parent, {:recovered_terminal, session_key, terminal_seq})
+        end,
+        name: :"mgr_#{System.unique_integer([:positive])}"
+      )
+
+    assert_receive {:recovered_terminal, "k1", ^seq}
+    {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+    assert status == "failed_unknown"
   end
 end

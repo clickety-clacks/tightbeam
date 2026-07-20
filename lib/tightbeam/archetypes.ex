@@ -329,7 +329,31 @@ defmodule Tightbeam.Archetypes do
       description: Onboard a machine as a tightbeam host — the complete assimilation ceremony (probe, credentials, archetype WHERE, restart, verify). Use when the operator asks to assimilate a machine.
       ---
 
-      """ <> @builtin_assimilation
+      """ <> @builtin_assimilation,
+    "tightbeam-dispatching" => """
+    ---
+    name: tightbeam-dispatching
+    description: Assignment and attest hygiene when dispatching work to another session or holding an assignment yourself. Use when hiring, delegating, or working under an open assignment.
+    ---
+
+    Dispatching work: spawn (or pick) the worker, then open the
+    obligation as a row — `tightbeam assign --subject "..."
+    (--session K | --role R)` — and wake the worker with the brief.
+    Done is rows, not prose: the assignment closes only by the holder's
+    completion or surrender attest, or the operator's revoke.
+
+    Holding an assignment: every turn you end must leave a filing
+    (`tightbeam attest <id> --kind progress|completion|surrender
+    [--note "..."]`) or a continuation wake on the clock. Progress rows
+    reset the prod countdown; scheduled wakes pause it; words do
+    neither. If you stall, prods arrive from process:tightbeam and
+    escalate up your spawner chain after N misses.
+
+    Supervising: an escalation wake means your hire's assignment
+    stalled — N prods, no rows. Judgment is yours: read their stream,
+    wake them, re-staff, or ask the operator to revoke the assignment.
+    The substrate will not conclude why and will not act for you.
+    """
   }
 
   @builtin_comms """
@@ -364,6 +388,12 @@ defmodule Tightbeam.Archetypes do
     messages, your visible reply and your ACTIONS are the response. A stamp
     bearing your own role is your earlier self following up: act, don't
     reply.
+  - NEVER end a turn with outstanding work and nothing on the clock:
+    while you hold an open assignment, end every turn with a filing
+    (`tightbeam attest <id> --kind progress|completion|surrender`) or a
+    scheduled continuation wake to yourself. A turn that ends with
+    neither draws a prod; prods answered without rows escalate to your
+    spawner.
   """
 
   @doc """

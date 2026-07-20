@@ -3,13 +3,15 @@ defmodule Tightbeam.Wire.RouterTest do
   import Plug.Test
   import Plug.Conn
 
-  alias Tightbeam.{Assets, DB, Devices, EventLog, Gateway, Org, Roles}
+  alias Tightbeam.{Assets, DB, Devices, EventLog, Gateway, Org, Roles, Wakes}
   alias Tightbeam.Wire.Router
 
   setup do
     db = :"router_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    for module <- [Assets, Devices, EventLog, Org, Roles], do: :ok = module.ensure_schema(db)
+
+    for module <- [Assets, Devices, EventLog, Org, Roles, Wakes],
+        do: :ok = module.ensure_schema(db)
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-router-#{System.unique_integer([:positive])}")
@@ -350,6 +352,61 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     assert missing_assignment.status == 404
+  end
+
+  test "org CLI reserves process:tightbeam while other process origins still attribute", ctx do
+    target = create_session(ctx.db, "reserved-origin-target", "flynn")
+
+    wake_handler = fn call ->
+      wake =
+        Wakes.schedule(ctx.db, %{
+          session_key: call.session_key,
+          target_role: nil,
+          origin: call.origin,
+          prompt: call.params.prompt,
+          due_at: 0
+        })
+
+      send(self(), {:persisted_wake, wake})
+      wake
+    end
+
+    handlers = ctx.opts |> Keyword.fetch!(:handlers) |> Map.put("wake", wake_handler)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    rejected =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "wake",
+        asProcess: "tightbeam",
+        sessionKey: target.session_key,
+        params: %{prompt: "forged"}
+      })
+
+    assert rejected.status == 403
+
+    assert JSON.decode!(rejected.resp_body) == %{
+             "error" => %{
+               "code" => "reserved_origin",
+               "message" => "process:tightbeam is reserved to the substrate"
+             }
+           }
+
+    refute_received {:persisted_wake, _}
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+
+    accepted =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "wake",
+        asProcess: "ci",
+        sessionKey: target.session_key,
+        params: %{prompt: "build finished"}
+      })
+
+    assert accepted.status == 200
+    assert_receive {:persisted_wake, %{origin: "process:ci", state: "pending"}}
+
+    assert {:ok, [["process:ci", "pending"]]} =
+             DB.query(ctx.db, "SELECT origin, state FROM wakes")
   end
 
   test "assign resolves bound and fallback roles and refuses unusable references", ctx do

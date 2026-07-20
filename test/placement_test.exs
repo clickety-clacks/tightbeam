@@ -1114,7 +1114,18 @@ defmodule Tightbeam.PlacementTest do
              "/remote/tb/homes/default/codex"
 
     commands = collect_commands([])
-    assert [stamp, wipe, rsync, lib_mkdir, lib_rsync, lib_rsync_h, lib_rsync_2, auth] = commands
+
+    assert [
+             stamp,
+             wipe,
+             rsync,
+             lib_mkdir,
+             lib_rsync,
+             lib_rsync_d,
+             lib_rsync_h,
+             lib_rsync_2,
+             auth
+           ] = commands
 
     assert stamp == [
              "ssh",
@@ -1177,6 +1188,7 @@ defmodule Tightbeam.PlacementTest do
              "worker:/remote/tb/identity/skills/"
            ]
 
+    assert Enum.at(lib_rsync_d, -2) =~ "tightbeam-dispatching"
     assert Enum.at(lib_rsync_h, -2) =~ "tightbeam-harnesses"
     assert List.last(lib_rsync_2) == "worker:/remote/tb/identity/skills/"
     assert Enum.at(lib_rsync_2, -2) =~ "tightbeam-skills"

@@ -75,6 +75,7 @@ defmodule Tightbeam.Gateway do
     Rules,
     Roles,
     Spinup,
+    Supervision,
     Wakes,
     WorkItems
   }
@@ -106,7 +107,8 @@ defmodule Tightbeam.Gateway do
           default_harness: atom(),
           default_model: String.t(),
           max_live_sessions_per_user: pos_integer(),
-          wake_tick_ms: pos_integer()
+          wake_tick_ms: pos_integer(),
+          prod_limit: non_neg_integer()
         }
 
   @doc """
@@ -118,6 +120,12 @@ defmodule Tightbeam.Gateway do
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
     db = Map.get(config, :db, Tightbeam.DB)
+    prod_limit = Map.get(config, :prod_limit, 3)
+
+    unless is_integer(prod_limit) and prod_limit >= 0 do
+      raise ArgumentError, "prod_limit must be an integer >= 0"
+    end
+
     File.mkdir_p!(config.base_dir)
 
     for module <- [
@@ -129,7 +137,8 @@ defmodule Tightbeam.Gateway do
           Org,
           Roles,
           WorkItems,
-          Assignments
+          Assignments,
+          Supervision
         ] do
       :ok = module.ensure_schema(db)
     end
@@ -173,7 +182,15 @@ defmodule Tightbeam.Gateway do
     File.chmod!(gateway_path, 0o600)
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config)
-    handler_table = handlers(Map.put(config, :db, db))
+    on_terminal = fn session_key, seq -> Supervision.notify_terminal(session_key, seq) end
+    on_retired = fn session_key -> Supervision.notify_retired(session_key) end
+
+    handler_table =
+      config
+      |> Map.put(:db, db)
+      |> Map.put(:on_retired, on_retired)
+      |> handlers()
+
     Rules.load!(config.base_dir, Map.keys(handler_table))
     runner = turn_runner(Map.put(config, :db, db))
 
@@ -225,17 +242,13 @@ defmodule Tightbeam.Gateway do
           end
 
         nil ->
-          case Org.get(db, wake.session_key) do
-            %{state: "active"} ->
-              deliver_prompt(wake.session_key, wake.origin, wake.prompt,
-                db: db,
-                wake_id: wake.wake_id,
-                sender: wake.origin
-              )
-
-            _ ->
-              :ok
-          end
+          deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+            db: db,
+            wake_id: wake.wake_id,
+            sender: wake.origin,
+            target_gate: wake,
+            fire_wake_in_txn: wake.origin == "process:tightbeam"
+          )
       end
     end
 
@@ -243,6 +256,8 @@ defmodule Tightbeam.Gateway do
       {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
       {Tightbeam.Wakes,
        db: db, deliver: deliver, tick_ms: config.wake_tick_ms, name: Tightbeam.WakeScheduler},
+      {Tightbeam.Supervision,
+       db: db, handlers: handler_table, prod_limit: prod_limit, name: Tightbeam.Supervision},
       {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
       {Tightbeam.AdapterCoordinator,
        adapter_sup: Tightbeam.AdapterSupervisor,
@@ -255,6 +270,7 @@ defmodule Tightbeam.Gateway do
        task_sup: Tightbeam.TurnTaskSupervisor,
        runner: runner,
        terminal_publisher: terminal_publisher(db),
+       on_terminal: on_terminal,
        name: Tightbeam.LaneManager},
       {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
     ]
@@ -290,6 +306,9 @@ defmodule Tightbeam.Gateway do
 
           not (is_binary(p[:prompt]) and p.prompt != "") ->
             %{code: "invalid", message: "a wake must carry a prompt"}
+
+          not valid_reresolve?(p) ->
+            %{code: "invalid", message: "reresolve lineage requires seed and rung"}
 
           is_nil(resolve_caller(db, call.origin)) ->
             %{code: "unknown_caller"}
@@ -416,7 +435,7 @@ defmodule Tightbeam.Gateway do
       "cancel" => fn call -> cancel_result(db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
       "tune" => fn call -> tune_result(config, db, call) end,
-      "retire" => fn call -> retire_result(db, call) end
+      "retire" => fn call -> retire_result(config, db, call) end
     }
   end
 
@@ -426,7 +445,7 @@ defmodule Tightbeam.Gateway do
   then broadcasts the echo and nudges the lane. Returns the dedupe outcome.
   """
   @spec deliver_prompt(String.t(), String.t(), String.t(), keyword()) ::
-          :appended | :duplicate | :conflict
+          :appended | :duplicate | :conflict | :skipped
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -442,46 +461,60 @@ defmodule Tightbeam.Gateway do
         _ -> prompt
       end
 
-    input = %{
-      session_key: session_key,
-      role: "user",
-      content: stamped,
-      device_id: opts[:device_id],
-      client_message_id: opts[:client_message_id],
-      attachments: opts[:attachments] || [],
-      sender: opts[:sender]
-    }
-
     result =
       DB.transaction(db, fn txn ->
-        case Projection.append_in_txn(txn, input) do
-          {:appended, message} ->
-            _seq =
-              Ledger.enqueue_in_txn(txn, %{
-                session_key: session_key,
-                message_id: message.id,
-                wake_id: opts[:wake_id],
-                origin: origin,
-                prompt: stamped,
-                role_ref: opts[:role_ref],
-                role_fallback: opts[:role_fallback] || false
-              })
+        target = delivery_target(txn, session_key, opts[:target_gate])
 
-            {:appended, message}
+        input = %{
+          session_key: target,
+          role: "user",
+          content: stamped,
+          device_id: opts[:device_id],
+          client_message_id: opts[:client_message_id],
+          attachments: opts[:attachments] || [],
+          sender: opts[:sender]
+        }
 
-          other ->
-            other
+        if is_nil(target) do
+          :skipped
+        else
+          case Projection.append_in_txn(txn, input) do
+            {:appended, message} ->
+              _seq =
+                Ledger.enqueue_in_txn(txn, %{
+                  session_key: target,
+                  message_id: message.id,
+                  wake_id: opts[:wake_id],
+                  origin: origin,
+                  prompt: stamped,
+                  role_ref: opts[:role_ref],
+                  role_fallback: opts[:role_fallback] || false
+                })
+
+              if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
+                Tightbeam.DB.Txn.q(
+                  txn,
+                  "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+                  [opts[:wake_id], System.system_time(:millisecond)]
+                )
+              end
+
+              {:appended, target, message}
+
+            other ->
+              other
+          end
         end
       end)
 
     case result do
-      {:ok, {:appended, message}} ->
+      {:ok, {:appended, actual_session_key, message}} ->
         registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
-        publish_message(db, session_key, message, registry)
+        publish_message(db, actual_session_key, message, registry)
 
         publish_turn_state(
           db,
-          session_key,
+          actual_session_key,
           message.client_message_id || message.id,
           "accepted",
           nil,
@@ -490,10 +523,13 @@ defmodule Tightbeam.Gateway do
 
         LaneManager.ensure_lane(
           Keyword.get(opts, :lane_manager, Tightbeam.LaneManager),
-          session_key
+          actual_session_key
         )
 
         :appended
+
+      {:ok, :skipped} ->
+        :skipped
 
       {:ok, {:duplicate, _message}} ->
         :duplicate
@@ -508,6 +544,21 @@ defmodule Tightbeam.Gateway do
 
       {:error, error} ->
         raise error
+    end
+  end
+
+  defp delivery_target(_txn, session_key, nil), do: session_key
+
+  defp delivery_target(txn, session_key, gate) do
+    case Tightbeam.DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
+      [["active"]] ->
+        session_key
+
+      _ when gate.reresolve == "lineage" ->
+        Supervision.ladder_target(txn, gate.reresolve_seed, gate.reresolve_rung)
+
+      _ ->
+        nil
     end
   end
 
@@ -1418,7 +1469,10 @@ defmodule Tightbeam.Gateway do
               target_role: Map.get(call, :target_role),
               origin: call.origin,
               prompt: p.prompt,
-              due_at: due_at
+              due_at: due_at,
+              reresolve: p[:reresolve],
+              reresolve_seed: p[:reresolve_seed],
+              reresolve_rung: p[:reresolve_rung]
             })
 
           if p[:idempotency_key] do
@@ -1430,7 +1484,7 @@ defmodule Tightbeam.Gateway do
             })
           end
 
-          if due_at <= System.system_time(:millisecond),
+          if due_at <= System.system_time(:millisecond) and p[:nudge] != false,
             do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
 
           db |> Wakes.get(wake.wake_id) |> wake_response()
@@ -1443,6 +1497,14 @@ defmodule Tightbeam.Gateway do
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
+  end
+
+  defp valid_reresolve?(p) do
+    case {p[:reresolve], p[:reresolve_seed], p[:reresolve_rung]} do
+      {nil, nil, nil} -> true
+      {"lineage", seed, rung} -> not is_nil(seed) and not is_nil(rung)
+      _ -> false
+    end
   end
 
   defp spawn_result(config, db, call) do
@@ -1823,7 +1885,7 @@ defmodule Tightbeam.Gateway do
     if config[:sh], do: [db: db, sh: config.sh], else: [db: db]
   end
 
-  defp retire_result(db, call) do
+  defp retire_result(config, db, call) do
     p = call.params
     owner = String.replace_prefix(call.origin, "user:", "")
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
@@ -1848,6 +1910,7 @@ defmodule Tightbeam.Gateway do
             if session.state == "active" do
               Org.retire(db, session.session_key)
               broadcast(db, owner, Payloads.stream_deleted(session.session_key))
+              Map.get(config, :on_retired, fn _ -> :ok end).(session.session_key)
             end
 
             if p[:idempotency_key] do

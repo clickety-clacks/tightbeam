@@ -29,6 +29,7 @@ defmodule Tightbeam.SessionLane do
     :runner,
     :task_sup,
     terminal_publisher: nil,
+    on_terminal: nil,
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
@@ -72,7 +73,8 @@ defmodule Tightbeam.SessionLane do
   {:ok, %{seq, message_id}} when this call won the transition; :not_running
   when no turn is in flight or the turn just finished.
   """
-  @spec cancel_current(String.t()) :: {:ok, %{seq: integer(), message_id: String.t()}} | :not_running | :no_lane
+  @spec cancel_current(String.t()) ::
+          {:ok, %{seq: integer(), message_id: String.t()}} | :not_running | :no_lane
   def cancel_current(session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
       [{pid, _}] -> GenServer.call(pid, :cancel_current)
@@ -93,7 +95,8 @@ defmodule Tightbeam.SessionLane do
       # Wire-notifies terminals that have NO runner closure (task crash,
       # cancel races) — without it a crashed turn leaves the client's typing
       # indicator stuck forever. No-op default keeps unit tests standalone.
-      terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end)
+      terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
+      on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end)
     }
 
     send(self(), :nudge)
@@ -107,6 +110,7 @@ defmodule Tightbeam.SessionLane do
   def handle_call(:cancel_current, _from, state) do
     case Ledger.finish(state.db, state.current_seq, "canceled") do
       :ok ->
+        state.on_terminal.(state.session_key, state.current_seq)
         reply = {:ok, %{seq: state.current_seq, message_id: state.current_message_id}}
         if is_pid(state.task_pid), do: Process.exit(state.task_pid, :kill)
         # The :DOWN for the killed task clears task_ref and drains; its
@@ -132,7 +136,10 @@ defmodule Tightbeam.SessionLane do
   end
 
   # TurnTask crashed.
-  def handle_info({:DOWN, ref, :process, _pid, reason}, %{task_ref: ref, current_seq: seq} = state)
+  def handle_info(
+        {:DOWN, ref, :process, _pid, reason},
+        %{task_ref: ref, current_seq: seq} = state
+      )
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
     finalize(state, seq, {:error, :task_crash})
@@ -188,10 +195,17 @@ defmodule Tightbeam.SessionLane do
   defp finalize(state, seq, outcome) do
     {terminal, error, publish} =
       case outcome do
-        {:ok, %{terminal_publish: fun}} when is_function(fun, 1) -> {"delivered", nil, fun}
-        {:ok, _} -> {"delivered", nil, nil}
-        {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) -> {"failed", inspect(reason), fun}
-        {:error, reason} -> {"failed", inspect(reason), nil}
+        {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
+          {"delivered", nil, fun}
+
+        {:ok, _} ->
+          {"delivered", nil, nil}
+
+        {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
+          {"failed", inspect(reason), fun}
+
+        {:error, reason} ->
+          {"failed", inspect(reason), nil}
       end
 
     case Ledger.finish(state.db, seq, terminal, error) do
@@ -208,6 +222,7 @@ defmodule Tightbeam.SessionLane do
         end
 
         publish_terminal(state, seq)
+        state.on_terminal.(state.session_key, seq)
 
       :already_terminal ->
         :ok

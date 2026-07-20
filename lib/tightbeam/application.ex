@@ -30,8 +30,10 @@ defmodule Tightbeam.Application do
           port: Application.get_env(:tightbeam, :port, 4_321),
           default_harness: Application.get_env(:tightbeam, :default_harness, :claude),
           default_model: Application.get_env(:tightbeam, :default_model, "fable"),
-          max_live_sessions_per_user: Application.get_env(:tightbeam, :max_live_sessions_per_user, 50),
-          wake_tick_ms: Application.get_env(:tightbeam, :wake_tick_ms, 1_000)
+          max_live_sessions_per_user:
+            Application.get_env(:tightbeam, :max_live_sessions_per_user, 50),
+          wake_tick_ms: Application.get_env(:tightbeam, :wake_tick_ms, 1_000),
+          prod_limit: Application.get_env(:tightbeam, :prod_limit, 3)
         }
 
         Enum.each(Tightbeam.Gateway.children(config), fn child ->
@@ -62,7 +64,8 @@ defmodule Tightbeam.Application do
       {Registry, keys: :unique, name: Tightbeam.LaneRegistry},
       {Task.Supervisor, name: Tightbeam.TurnTaskSupervisor},
       # Lanes: many cheap independent children -> generous restart intensity.
-      {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.LaneSupervisor, max_restarts: 50, max_seconds: 10}
+      {DynamicSupervisor,
+       strategy: :one_for_one, name: Tightbeam.LaneSupervisor, max_restarts: 50, max_seconds: 10}
       # LaneManager (reconciler) is started once a runner is composed by the
       # gateway composition root; see Tightbeam.Gateway (E2).
     ]
@@ -70,7 +73,8 @@ defmodule Tightbeam.Application do
 
   @doc "Root supervisor options — rest_for_one with a tight restart budget."
   @spec root_opts() :: keyword()
-  def root_opts, do: [strategy: :rest_for_one, name: Tightbeam.Supervisor, max_restarts: 3, max_seconds: 30]
+  def root_opts,
+    do: [strategy: :rest_for_one, name: Tightbeam.Supervisor, max_restarts: 3, max_seconds: 30]
 
   @doc "True while the gateway is shutting down — lanes refuse new claims."
   @spec draining?() :: boolean()
@@ -117,8 +121,12 @@ defmodule Tightbeam.Application do
       end
 
     cond do
-      running == 0 -> :ok
-      System.monotonic_time(:millisecond) >= deadline -> :ok
+      running == 0 ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        :ok
+
       true ->
         Process.sleep(250)
         drain_until(deadline)

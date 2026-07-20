@@ -117,14 +117,18 @@ defmodule Tightbeam.Ledger do
   @spec enqueue(db(), map()) :: {:ok, integer()} | {:error, :duplicate_wake | term()}
   def enqueue(db \\ Tightbeam.DB, attrs) do
     case DB.transaction(db, fn txn -> enqueue_in_txn(txn, attrs) end) do
-      {:ok, seq} -> {:ok, seq}
+      {:ok, seq} ->
+        {:ok, seq}
+
       {:error, %{message: msg} = e} ->
         if is_binary(msg) and String.contains?(msg, "UNIQUE") do
           {:error, :duplicate_wake}
         else
           {:error, e}
         end
-      {:error, e} -> {:error, e}
+
+      {:error, e} ->
+        {:error, e}
     end
   end
 
@@ -140,29 +144,48 @@ defmodule Tightbeam.Ledger do
     {:ok, result} =
       DB.transaction(db, fn txn ->
         running =
-          Txn.q(txn, "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1", [session_key])
+          Txn.q(
+            txn,
+            "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+            [session_key]
+          )
 
         case running do
           [_ | _] ->
             :busy
 
           [] ->
-            Txn.q(txn, """
-              UPDATE turns SET status = 'running', owner = ?2, startedAt = ?3
-              WHERE seq = (SELECT seq FROM turns
-                           WHERE sessionKey = ?1 AND status = 'queued'
-                           ORDER BY seq LIMIT 1)
-                AND status = 'queued'
-            """, [session_key, owner, now])
+            Txn.q(
+              txn,
+              """
+                UPDATE turns SET status = 'running', owner = ?2, startedAt = ?3
+                WHERE seq = (SELECT seq FROM turns
+                             WHERE sessionKey = ?1 AND status = 'queued'
+                             ORDER BY seq LIMIT 1)
+                  AND status = 'queued'
+              """,
+              [session_key, owner, now]
+            )
 
             if Txn.changes(txn) == 1 do
               [[seq, message_id, origin, prompt, wake_id]] =
-                Txn.q(txn, """
-                  SELECT seq, messageId, origin, prompt, wakeId FROM turns
-                  WHERE sessionKey = ?1 AND status = 'running'
-                """, [session_key])
+                Txn.q(
+                  txn,
+                  """
+                    SELECT seq, messageId, origin, prompt, wakeId FROM turns
+                    WHERE sessionKey = ?1 AND status = 'running'
+                  """,
+                  [session_key]
+                )
 
-              {:ok, %{seq: seq, message_id: message_id, origin: origin, prompt: prompt, wake_id: wake_id}}
+              {:ok,
+               %{
+                 seq: seq,
+                 message_id: message_id,
+                 origin: origin,
+                 prompt: prompt,
+                 wake_id: wake_id
+               }}
             else
               :none
             end
@@ -183,10 +206,14 @@ defmodule Tightbeam.Ledger do
 
     {:ok, won} =
       DB.transaction(db, fn txn ->
-        Txn.q(txn, """
-          UPDATE turns SET status = ?2, endedAt = ?3, error = ?4
-          WHERE seq = ?1 AND status = 'running'
-        """, [seq, terminal, now, error])
+        Txn.q(
+          txn,
+          """
+            UPDATE turns SET status = ?2, endedAt = ?3, error = ?4
+            WHERE seq = ?1 AND status = 'running'
+          """,
+          [seq, terminal, now, error]
+        )
 
         Txn.changes(txn) == 1
       end)
@@ -207,11 +234,15 @@ defmodule Tightbeam.Ledger do
       DB.transaction(db, fn txn ->
         rows = Txn.q(txn, "SELECT seq FROM turns WHERE status = 'running'")
 
-        Txn.q(txn, """
-          UPDATE turns SET status = 'failed_unknown', endedAt = ?1,
-                           error = COALESCE(error, 'interrupted: outcome unknown')
-          WHERE status = 'running'
-        """, [now])
+        Txn.q(
+          txn,
+          """
+            UPDATE turns SET status = 'failed_unknown', endedAt = ?1,
+                             error = COALESCE(error, 'interrupted: outcome unknown')
+            WHERE status = 'running'
+          """,
+          [now]
+        )
 
         Enum.map(rows, fn [seq] -> seq end)
       end)
@@ -226,6 +257,32 @@ defmodule Tightbeam.Ledger do
       DB.query(db, "SELECT DISTINCT sessionKey FROM turns WHERE status IN ('queued','running')")
 
     Enum.map(rows, fn [k] -> k end)
+  end
+
+  @doc "Count queued or running turns for a session."
+  @spec pending_count(db(), String.t()) :: non_neg_integer()
+  def pending_count(db \\ Tightbeam.DB, session_key) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT count(*) FROM turns WHERE sessionKey = ?1 AND status IN ('queued','running')",
+        [session_key]
+      )
+
+    count
+  end
+
+  @doc "Newest terminal turn sequence for a session, or nil."
+  @spec last_terminal_seq(db(), String.t()) :: integer() | nil
+  def last_terminal_seq(db \\ Tightbeam.DB, session_key) do
+    {:ok, [[seq]]} =
+      DB.query(
+        db,
+        "SELECT max(seq) FROM turns WHERE sessionKey = ?1 AND status IN ('delivered','canceled','failed','failed_unknown')",
+        [session_key]
+      )
+
+    seq
   end
 
   @doc "Terminal rows not yet published (at-least-once publication feed)."
@@ -252,7 +309,12 @@ defmodule Tightbeam.Ledger do
   @doc "Stamp the adapter generation selected for a running turn."
   @spec stamp_adapter(db(), integer(), non_neg_integer()) :: :ok
   def stamp_adapter(db \\ Tightbeam.DB, seq, generation) do
-    {:ok, _} = DB.query(db, "UPDATE turns SET adapterGen = ?2 WHERE seq = ?1 AND status = 'running'", [seq, generation])
+    {:ok, _} =
+      DB.query(db, "UPDATE turns SET adapterGen = ?2 WHERE seq = ?1 AND status = 'running'", [
+        seq,
+        generation
+      ])
+
     :ok
   end
 
@@ -260,11 +322,15 @@ defmodule Tightbeam.Ledger do
   @spec prior_adapter_generation(db(), String.t(), integer()) :: non_neg_integer() | nil
   def prior_adapter_generation(db \\ Tightbeam.DB, session_key, before_seq) do
     {:ok, rows} =
-      DB.query(db, """
-        SELECT adapterGen FROM turns
-        WHERE sessionKey = ?1 AND seq < ?2 AND adapterGen IS NOT NULL
-        ORDER BY seq DESC LIMIT 1
-      """, [session_key, before_seq])
+      DB.query(
+        db,
+        """
+          SELECT adapterGen FROM turns
+          WHERE sessionKey = ?1 AND seq < ?2 AND adapterGen IS NOT NULL
+          ORDER BY seq DESC LIMIT 1
+        """,
+        [session_key, before_seq]
+      )
 
     case rows do
       [[generation]] -> generation
@@ -278,10 +344,14 @@ defmodule Tightbeam.Ledger do
     cutoff = System.system_time(:millisecond) - max_age_ms
 
     {:ok, rows} =
-      DB.query(db, """
-        SELECT seq FROM turns
-        WHERE status IN ('queued','running') AND createdAt < ?1
-      """, [cutoff])
+      DB.query(
+        db,
+        """
+          SELECT seq FROM turns
+          WHERE status IN ('queued','running') AND createdAt < ?1
+        """,
+        [cutoff]
+      )
 
     Enum.map(rows, fn [seq] -> seq end)
   end
