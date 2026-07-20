@@ -17,6 +17,8 @@ defmodule Tightbeam.GatewayTest do
     Wakes
   }
 
+  alias Tightbeam.Wire.Payloads
+
   defmodule LaneDoorbell do
     use GenServer
     def start_link({parent, name}), do: GenServer.start_link(__MODULE__, parent, name: name)
@@ -238,6 +240,42 @@ defmodule Tightbeam.GatewayTest do
     assert second_token =~ ~r/^tbs_/
     refute first_token == second_token
     assert Org.get(ctx.db, retired.session_key).cli_token == nil
+  end
+
+  test "session projections never expose cli tokens", ctx do
+    session = Org.get(ctx.db, "k1")
+    base_dir = role_test_base("projection-leak")
+    Archetypes.load!(base_dir)
+
+    inspect =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["inspect"].(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{}
+      })
+
+    projections = [
+      inspect,
+      Payloads.stream_session(session),
+      Gateway.session_status(session.session_key, ctx.db)
+    ]
+
+    Enum.each(projections, fn projection ->
+      encoded = JSON.encode!(projection)
+      refute encoded =~ "cliToken"
+      refute encoded =~ "cli_token"
+      refute encoded =~ session.cli_token
+    end)
+  end
+
+  test "unknown local CLI target records a warning and returns without blocking boot", ctx do
+    assert Gateway.local_target_triple({:unix, :freebsd}, "riscv64") == nil
+    assert :ok = Gateway.warn_cli_target_mismatches(ctx.db, "/unused", nil)
+
+    assert %{kind: "cli_target_mismatch", detail: detail} =
+             ctx.db |> EventLog.lifecycle_events() |> List.last()
+
+    assert detail == "gateway target unknown; remote CLI compatibility not checked"
   end
 
   test "children sweeps newer credentials from abandoned identity homes before adapters", ctx do
@@ -1380,6 +1418,114 @@ defmodule Tightbeam.GatewayTest do
              "typing:false",
              "activity:false"
            ]
+  end
+
+  test "next turn after set_host delivers the advertised remote URL", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :remote_url_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "remote-url",
+        is_admin: false
+      })
+
+    base =
+      Path.join(System.tmp_dir!(), "gateway_remote_url_#{System.unique_integer([:positive])}")
+
+    manifests = Path.join([base, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "default.toml"), """
+    name = "default"
+    where = ["testhost", "worker"]
+    """)
+
+    old_url = Application.get_env(:tightbeam, :advertised_url)
+
+    on_exit(fn ->
+      File.rm_rf!(base)
+      :persistent_term.erase(Archetypes)
+
+      if old_url,
+        do: Application.put_env(:tightbeam, :advertised_url, old_url),
+        else: Application.delete_env(:tightbeam, :advertised_url)
+    end)
+
+    parent = self()
+
+    sh = fn command ->
+      if hd(command) == "rsync" do
+        stage_file = Enum.at(command, -2)
+
+        if String.contains?(stage_file, "/staging/session-files/") do
+          send(parent, {:delivered_session_file, File.read!(stage_file)})
+        end
+      end
+
+      {"", 0}
+    end
+
+    config =
+      gateway_config(base, ctx.db, 4_321)
+      |> Map.put(:sh, sh)
+      |> Map.put(:sh_out, fn _ -> {"", 0} end)
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    Application.put_env(:tightbeam, :advertised_url, "https://new-gateway.example")
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
+    })
+
+    assert %{ok: true, host: "worker"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_host", host: "worker"}
+             })
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "remote ping",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "d1",
+               client_message_id: "c_remote_url"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
+
+    token = Org.get(ctx.db, "k1").cli_token
+
+    assert_receive {:delivered_session_file, content}
+
+    assert JSON.decode!(content) == %{
+             "url" => "https://new-gateway.example",
+             "token" => token,
+             "sessionKey" => "k1"
+           }
+
+    assert_receive {:prompt_started, ^adapter}
+    send(adapter, :continue_prompt)
+    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    publish.("delivered")
   end
 
   test "a fallback turn appends the context-reset marker between echo and reply", ctx do

@@ -390,17 +390,25 @@ fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
 }
 
 pub fn run(command: Command) -> Result<(), String> {
+    run_with(command, discover, send_to)
+}
+
+fn run_with<D, S>(command: Command, discover_endpoint: D, send_request: S) -> Result<(), String>
+where
+    D: FnOnce() -> Result<Endpoint, String>,
+    S: FnOnce(&Endpoint, &RequestSpec) -> Result<Option<Value>, String>,
+{
     match command {
         Command::Help => unreachable!("help is handled before dispatch"),
         Command::Setup(args) => crate::ceremonies::setup(args),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         command => {
-            let endpoint = discover()?;
+            let endpoint = discover_endpoint()?;
             if identity_omitted(&command) && !endpoint.session_file {
                 return Err("identity required: pass --as <your-agent-handle> (when an agent runs this) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'.".to_owned());
             }
             let request = build_request(&command)?;
-            if let Some(result) = send_to(&endpoint, &request)? {
+            if let Some(result) = send_request(&endpoint, &request)? {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
@@ -679,6 +687,28 @@ mod tests {
         let error = discover_with(|_| None, &nested, &root).unwrap_err();
         assert!(error.contains(&root.join(".tightbeam-session").display().to_string()));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_without_session_file_requires_identity_before_network() {
+        let endpoint = Endpoint {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: false,
+        };
+        let error = run_with(
+            Command::List {
+                identity: Identity::Omitted,
+            },
+            || Ok(endpoint),
+            |_, _| panic!("network sender must not be called"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "identity required: pass --as <your-agent-handle> (when an agent runs this) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'."
+        );
     }
 
     #[test]

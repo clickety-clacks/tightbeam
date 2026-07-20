@@ -525,16 +525,16 @@ defmodule Tightbeam.Gateway do
   pending turns) + per-harness capability advertisement from the model
   catalog. Nil for unknown sessions.
   """
-  @spec session_status(String.t()) :: map() | nil
-  def session_status(session_key) do
-    case Org.get(Tightbeam.DB, session_key) do
+  @spec session_status(String.t(), DB.server()) :: map() | nil
+  def session_status(session_key, db \\ Tightbeam.DB) do
+    case Org.get(db, session_key) do
       nil ->
         nil
 
       session ->
         {:ok, [[depth]]} =
           DB.query(
-            Tightbeam.DB,
+            db,
             "SELECT COUNT(*) FROM turns WHERE sessionKey = ?1 AND status IN ('queued','running')",
             [session_key]
           )
@@ -900,8 +900,22 @@ defmodule Tightbeam.Gateway do
   end
 
   defp warn_cli_target_mismatches(db, base_dir) do
-    local = local_target_triple()
+    warn_cli_target_mismatches(db, base_dir, local_target_triple())
+  end
 
+  @doc false
+  def warn_cli_target_mismatches(db, _base_dir, nil) do
+    EventLog.lifecycle(
+      db,
+      "cli_target_mismatch",
+      Placement.local_host_name(),
+      "gateway target unknown; remote CLI compatibility not checked"
+    )
+
+    :ok
+  end
+
+  def warn_cli_target_mismatches(db, base_dir, local) do
     base_dir
     |> Placement.hosts()
     |> Enum.each(fn
@@ -935,11 +949,17 @@ defmodule Tightbeam.Gateway do
   end
 
   defp local_target_triple do
-    case {:os.type(), :erlang.system_info(:system_architecture) |> to_string()} do
+    local_target_triple(:os.type(), :erlang.system_info(:system_architecture) |> to_string())
+  end
+
+  @doc false
+  def local_target_triple(os_type, architecture) do
+    case {os_type, architecture} do
       {{:unix, :darwin}, "aarch64" <> _} -> "aarch64-apple-darwin"
       {{:unix, :darwin}, "x86_64" <> _} -> "x86_64-apple-darwin"
       {{:unix, :linux}, "aarch64" <> _} -> "aarch64-unknown-linux-gnu"
       {{:unix, :linux}, "x86_64" <> _} -> "x86_64-unknown-linux-gnu"
+      _ -> nil
     end
   end
 
