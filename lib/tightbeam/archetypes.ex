@@ -83,6 +83,7 @@ defmodule Tightbeam.Archetypes do
           defaults: %{optional(:harness) => :claude | :codex, optional(:model) => String.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           fallback_models: [String.t()],
+          containment: %{fs: :off | :workdir, network: :open},
           mcp: [
             %{
               name: String.t(),
@@ -966,6 +967,7 @@ defmodule Tightbeam.Archetypes do
       defaults: %{},
       references: [],
       fallback_models: [],
+      containment: %{fs: :off, network: :open},
       mcp: [],
       guidance: nil,
       source: nil
@@ -982,7 +984,8 @@ defmodule Tightbeam.Archetypes do
         "references",
         "fallback_models",
         "guidance",
-        "mcp"
+        "mcp",
+        "containment"
       ])
 
     unknown =
@@ -1052,17 +1055,46 @@ defmodule Tightbeam.Archetypes do
     end
 
     mcp = validate_mcp!(Map.get(manifest, "mcp", %{}))
+    containment = validate_containment!(Map.get(manifest, "containment", %{}), path)
 
     %{
       name: name,
       skills: skills,
       where: where,
       fallback_models: fallback_models,
+      containment: containment,
       defaults: defaults,
       references: references,
       mcp: mcp,
       guidance: get_in(manifest, ["guidance", "text"])
     }
+  end
+
+  defp validate_containment!(raw, path) do
+    unknown =
+      raw
+      |> Map.keys()
+      |> MapSet.new()
+      |> MapSet.difference(MapSet.new(["fs", "network"]))
+      |> MapSet.to_list()
+
+    if unknown != [] do
+      raise ArgumentError,
+            "unknown containment keys in #{path}: #{unknown |> Enum.sort() |> Enum.join(", ")}"
+    end
+
+    fs = Map.get(raw, "fs", "off")
+    network = Map.get(raw, "network", "open")
+
+    unless fs in ["off", "workdir"] do
+      raise ArgumentError, "archetype containment.fs must be off or workdir: #{path}"
+    end
+
+    unless network == "open" do
+      raise ArgumentError, "archetype containment.network must be open: #{path}"
+    end
+
+    %{fs: String.to_existing_atom(fs), network: :open}
   end
 
   defp validate_mcp!(servers) do

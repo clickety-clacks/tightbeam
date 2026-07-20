@@ -1072,6 +1072,9 @@ defmodule Tightbeam.Gateway do
 
                   {:ok, pointer.harness_session_id}
 
+                {:error, :contained_sandbox_disable_failed} = error ->
+                  error
+
                 {:error, lost} ->
                   # Spec §pointer chain: reason "fallback" — the harness lost
                   # the session; start fresh, on the record, model context
@@ -1760,29 +1763,36 @@ defmodule Tightbeam.Gateway do
           session ->
             Org.set_model(db, call.session_key, p.model, session.provider)
 
-            with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
-                 coordinator when is_pid(coordinator) <-
-                   Process.whereis(Tightbeam.AdapterCoordinator),
-                 {:ok, adapter, _generation} <-
-                   AdapterCoordinator.adapter_for(
-                     coordinator,
-                     {String.to_existing_atom(session.harness), session.identity_name,
-                      session.host}
-                   ) do
-              AdapterCoordinator.with_load_slot(coordinator, fn ->
-                Adapter.load_session(
-                  adapter,
-                  pointer.harness_session_id,
-                  p.model,
-                  session_workdir(config, session),
-                  session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
-                )
-              end)
-            else
-              _ -> :ok
-            end
+            load_result =
+              with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
+                   coordinator when is_pid(coordinator) <-
+                     Process.whereis(Tightbeam.AdapterCoordinator),
+                   {:ok, adapter, _generation} <-
+                     AdapterCoordinator.adapter_for(
+                       coordinator,
+                       {String.to_existing_atom(session.harness), session.identity_name,
+                        session.host}
+                     ) do
+                AdapterCoordinator.with_load_slot(coordinator, fn ->
+                  Adapter.load_session(
+                    adapter,
+                    pointer.harness_session_id,
+                    p.model,
+                    session_workdir(config, session),
+                    session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
+                  )
+                end)
+              else
+                _ -> :ok
+              end
 
-            %{ok: true}
+            case load_result do
+              {:error, :contained_sandbox_disable_failed} ->
+                %{ok: false, reason: :contained_sandbox_disable_failed}
+
+              _ ->
+                %{ok: true}
+            end
         end
     end
   end

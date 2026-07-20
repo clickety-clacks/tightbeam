@@ -17,7 +17,9 @@ defmodule Tightbeam.Acp.AdapterTest do
   const rl = require("node:readline").createInterface({ input: process.stdin });
   const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
   const capturePath = process.argv[2];
-  const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, mcpServers: m.params.mcpServers }) + "\n");
+  const failMode = process.argv[3] || "none";
+  let modeCalls = 0;
+  const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, mcpServers: m.params.mcpServers, modeId: m.params.modeId }) + "\n");
   let pendingPrompt = null;
   rl.on("line", (line) => {
     if (!line.trim()) return;
@@ -36,7 +38,14 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/new": capture(m); return send({ id: m.id, result: { sessionId: "sess-1" } });
       case "session/load": capture(m); return send({ id: m.id, result: {} });
       case "session/set_config_option": return send({ id: m.id, result: { configOptions: [] } });
-      case "session/set_mode": return send({ id: m.id, result: {} });
+      case "session/set_mode": {
+        capture(m);
+        modeCalls += 1;
+        if (failMode === "fail" || (failMode === "fail-second" && modeCalls === 2)) {
+          return send({ id: m.id, error: { code: -32000, message: "mode refused" } });
+        }
+        return send({ id: m.id, result: {} });
+      }
       case "session/prompt": {
         const sid = m.params.sessionId;
         send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "po" } } } });
@@ -49,7 +58,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   });
   """
 
-  defp start_adapter do
+  defp start_adapter(opts \\ []) do
     # Per-run private dir: unique_integer resets across VM restarts, so
     # bare /tmp names collide with stale files from prior/concurrent runs.
     run_dir =
@@ -66,15 +75,27 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     File.write!(path, @fake)
 
+    harness = Keyword.get(opts, :harness, :claude)
+    contained = Keyword.get(opts, :contained, false)
+    fail_mode = Keyword.get(opts, :fail_mode, "none")
+
+    adapter_opts =
+      [
+        harness: harness,
+        cmd: [System.find_executable("node"), path, capture_path, fail_mode],
+        home: "/tmp",
+        cwd: "/tmp",
+        name: :"adapter_#{System.unique_integer([:positive])}"
+      ]
+      |> then(fn adapter_opts ->
+        if contained, do: Keyword.put(adapter_opts, :contained, true), else: adapter_opts
+      end)
+
     adapter =
-      start_supervised!(
-        {Adapter,
-         harness: :claude,
-         cmd: [System.find_executable("node"), path, capture_path],
-         home: "/tmp",
-         cwd: "/tmp",
-         name: :"adapter_#{System.unique_integer([:positive])}"}
-      )
+      start_supervised!(%{
+        id: {:adapter, System.unique_integer([:positive])},
+        start: {Adapter, :start_link, [adapter_opts]}
+      })
 
     {adapter, capture_path}
   end
@@ -84,6 +105,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     |> File.read!()
     |> String.split("\n", trim: true)
     |> Enum.map(&JSON.decode!/1)
+  end
+
+  defp session_requests(path) do
+    Enum.filter(captured_requests(path), &(&1["method"] in ["session/new", "session/load"]))
   end
 
   test "new_session applies model then prompt streams+accumulates, permission auto-allowed" do
@@ -96,9 +121,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, "sess-1"} = Adapter.new_session(a, "haiku", "/tmp", mcp_servers)
 
     assert [%{"method" => "session/new", "mcpServers" => ^mcp_servers}] =
-             captured_requests(capture_path)
+             session_requests(capture_path)
 
-    assert {:ok, %{stop_reason: "end_turn", text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "say pong")
+    assert {:ok, %{stop_reason: "end_turn", text: "pong[allow-once]"}} =
+             Adapter.prompt(a, "sess-1", "say pong")
   end
 
   test "load_session then prompt (rule #1 re-apply path)" do
@@ -111,7 +137,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert :ok = Adapter.load_session(a, "sess-1", "haiku", "/tmp", mcp_servers)
 
     assert [%{"method" => "session/load", "mcpServers" => ^mcp_servers}] =
-             captured_requests(capture_path)
+             session_requests(capture_path)
 
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
   end
@@ -124,7 +150,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert [
              %{"method" => "session/new", "mcpServers" => []},
              %{"method" => "session/load", "mcpServers" => []}
-           ] = captured_requests(capture_path)
+           ] = session_requests(capture_path)
   end
 
   test "consecutive prompts reset the accumulator" do
@@ -132,5 +158,61 @@ defmodule Tightbeam.Acp.AdapterTest do
     {:ok, _} = Adapter.new_session(a, "haiku", "/tmp", [])
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "one")
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "two")
+  end
+
+  test "preset modes are pinned for both harnesses" do
+    for {harness, expected} <- [claude: "bypassPermissions", codex: "agent-full-access"] do
+      {adapter, capture_path} = start_adapter(harness: harness)
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [])
+
+      assert [%{"method" => "session/set_mode", "modeId" => ^expected}] =
+               Enum.filter(captured_requests(capture_path), &(&1["method"] == "session/set_mode"))
+    end
+  end
+
+  test "load asserts mode only when contained" do
+    {plain, plain_capture} = start_adapter()
+    assert :ok = Adapter.load_session(plain, "sess-1", "haiku", "/tmp", [])
+    refute Enum.any?(captured_requests(plain_capture), &(&1["method"] == "session/set_mode"))
+
+    {contained, contained_capture} = start_adapter(contained: true)
+    assert :ok = Adapter.load_session(contained, "sess-1", "haiku", "/tmp", [])
+    assert Adapter.knows_session?(contained, "sess-1")
+
+    assert [%{"method" => "session/set_mode", "modeId" => "bypassPermissions"}] =
+             Enum.filter(
+               captured_requests(contained_capture),
+               &(&1["method"] == "session/set_mode")
+             )
+  end
+
+  test "contained mode failures are structured while uncontained new remains best effort" do
+    {plain, _capture} = start_adapter(fail_mode: "fail")
+    assert {:ok, "sess-1"} = Adapter.new_session(plain, "haiku", "/tmp", [])
+
+    {contained_new, _capture} = start_adapter(contained: true, fail_mode: "fail")
+
+    assert {:error, :contained_sandbox_disable_failed} =
+             Adapter.new_session(contained_new, "haiku", "/tmp", [])
+
+    refute Adapter.knows_session?(contained_new, "sess-1")
+
+    {contained_load, _capture} = start_adapter(contained: true, fail_mode: "fail")
+
+    assert {:error, :contained_sandbox_disable_failed} =
+             Adapter.load_session(contained_load, "sess-1", "haiku", "/tmp", [])
+
+    refute Adapter.knows_session?(contained_load, "sess-1")
+  end
+
+  test "contained load mode failure evicts prior known residency" do
+    {adapter, _capture} = start_adapter(contained: true, fail_mode: "fail-second")
+    assert :ok = Adapter.load_session(adapter, "sess-1", "haiku", "/tmp", [])
+    assert Adapter.knows_session?(adapter, "sess-1")
+
+    assert {:error, :contained_sandbox_disable_failed} =
+             Adapter.load_session(adapter, "sess-1", "haiku", "/tmp", [])
+
+    refute Adapter.knows_session?(adapter, "sess-1")
   end
 end
