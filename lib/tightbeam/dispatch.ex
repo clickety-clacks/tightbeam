@@ -14,14 +14,17 @@ defmodule Tightbeam.Dispatch do
   the CALLER's process (a socket, an HTTP request task, the scheduler), and
   anything long-running goes through the Ledger/lane pipeline, never inline.
 
-  Every dispatch appends exactly one event row: kind "verb" on acceptance,
-  kind "denied" when the verb is unknown or the handler returns a denial
-  (`%{code: _}`). The event is appended AFTER the handler so the row can
-  carry the outcome — but a handler crash still appends a "verb" row with the
-  error (a failure has a row and a reason, T5).
+  Before a known handler runs, the deny-only `Tightbeam.Rules` tier evaluates
+  the raw call. A statute denial or fact error appends kind "denied" and
+  returns immediately; that audit append is best-effort so an unavailable
+  sink cannot fail open. All calls that pass statutes retain the existing
+  behavior: kind "verb" on acceptance, kind "denied" when the verb is unknown
+  or the handler returns a denial (`%{code: _}`). Handler outcome rows are
+  appended AFTER the handler so they can carry the result; a handler crash
+  still appends a "verb" row with the error.
   """
 
-  alias Tightbeam.EventLog
+  alias Tightbeam.{EventLog, Rules}
 
   @typedoc """
   A verb call. `origin` is WHO (\"user:flynn\" | \"agent:<handle>\") — never
@@ -53,6 +56,17 @@ defmodule Tightbeam.Dispatch do
     origin = Map.fetch!(call, :origin)
     session_key = Map.get(call, :session_key)
 
+    case Rules.evaluate(db, call) do
+      {:deny, error} ->
+        best_effort_denial(db, verb, origin, session_key, error)
+        {:error, error}
+
+      :ok ->
+        dispatch_to_handler(db, handlers, call, verb, origin, session_key)
+    end
+  end
+
+  defp dispatch_to_handler(db, handlers, call, verb, origin, session_key) do
     case Map.fetch(handlers, verb) do
       :error ->
         error = %{code: "unknown_verb"}
@@ -74,6 +88,14 @@ defmodule Tightbeam.Dispatch do
             :ok = EventLog.append_event(db, "verb", verb, origin, session_key, error)
             {:error, error}
         end
+    end
+  end
+
+  defp best_effort_denial(db, verb, origin, session_key, error) do
+    try do
+      EventLog.append_event(db, "denied", verb, origin, session_key, error)
+    catch
+      _kind, _reason -> :ok
     end
   end
 

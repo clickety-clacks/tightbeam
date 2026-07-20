@@ -1,12 +1,13 @@
 defmodule Tightbeam.ArchetypesTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.Archetypes
+  alias Tightbeam.{Archetypes, DB, EventLog}
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-archetypes-#{System.unique_integer([:positive])}")
     manifests = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
+
     on_exit(fn ->
       File.rm_rf!(base_dir)
       :persistent_term.erase(Tightbeam.Archetypes)
@@ -36,6 +37,8 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert loaded["default"] == Archetypes.builtin_default()
 
+    source_path = Path.join(ctx.manifests, "coder.toml")
+
     assert loaded["coder"] == %{
              name: "coder",
              skills: ["tightbeam-assimilate", "tightbeam-harnesses", "tightbeam-skills"],
@@ -51,7 +54,15 @@ defmodule Tightbeam.ArchetypesTest do
                }
              ],
              mcp: [],
-             guidance: "Ship the requested change."
+             guidance: "Ship the requested change.",
+             source: %{
+               file: "identity/archetypes/coder.toml",
+               sha256:
+                 source_path
+                 |> File.read!()
+                 |> then(&:crypto.hash(:sha256, &1))
+                 |> Base.encode16(case: :lower)
+             }
            }
 
     assert Archetypes.get("coder") == loaded["coder"]
@@ -65,10 +76,139 @@ defmodule Tightbeam.ArchetypesTest do
     assert Archetypes.load!(ctx.base_dir)["default"].where == ["work-1"]
   end
 
-  test "skills: builtins materialize into the library; operator edits win; unknown elections fail", ctx do
+  test "source fingerprint changes when manifest file bytes change and builtin source is nil",
+       ctx do
+    path = Path.join(ctx.manifests, "coder.toml")
+    File.write!(path, "name = \"coder\"\n")
+    first = Archetypes.load!(ctx.base_dir)
+
+    assert first["default"].source == nil
+    assert first["coder"].source.file == "identity/archetypes/coder.toml"
+
+    File.write!(path, "name = \"coder\"\n# byte change\n")
+    second = Archetypes.load!(ctx.base_dir)
+
+    refute second["coder"].source.sha256 == first["coder"].source.sha256
+  end
+
+  test "session overrides validate in order and normalize to one canonical shape", ctx do
+    for name <- ["alpha", "zeta"] do
+      Archetypes.put_skill!(ctx.base_dir, name, "# #{name}")
+    end
+
+    archetype = Archetypes.load!(ctx.base_dir)["default"]
+
+    invalid = [
+      {nil, "must be an object"},
+      {%{"other" => true}, "unknown override keys"},
+      {%{"skills_add" => "alpha"}, "must be a list of strings"},
+      {%{"skills_add" => ["alpha", 1]}, "must be a list of strings"},
+      {%{"skills_add" => ["missing"]}, "unknown override skill names: missing"},
+      {%{"guidance_extra" => 42}, "must be a string"},
+      {%{"guidance_extra" => ~s(#include "missing.md")},
+       "unknown guidance fragment \"missing.md\""}
+    ]
+
+    for {raw, message} <- invalid do
+      assert {:error, %{code: "invalid_overrides", message: detail}} =
+               Archetypes.normalize_overrides(ctx.base_dir, archetype, raw)
+
+      assert detail =~ message
+    end
+
+    assert {:ok,
+            %{
+              "skills_add" => ["alpha", "zeta"],
+              "guidance_extra" => "Additional guidance."
+            }} =
+             Archetypes.normalize_overrides(ctx.base_dir, archetype, %{
+               "skills_add" => ["zeta", "tightbeam-skills", "alpha", "zeta"],
+               "guidance_extra" => "  Additional guidance.  "
+             })
+
+    for empty <- [
+          %{},
+          %{"skills_add" => []},
+          %{"skills_add" => ["tightbeam-skills", "tightbeam-skills"]},
+          %{"guidance_extra" => "   \n"}
+        ] do
+      assert {:ok, nil} = Archetypes.normalize_overrides(ctx.base_dir, archetype, empty)
+    end
+
+    guidance_dir = Path.join([ctx.base_dir, "identity", "guidance"])
+    File.mkdir_p!(guidance_dir)
+    File.write!(Path.join(guidance_dir, "a.md"), ~s(#include "b.md"))
+    File.write!(Path.join(guidance_dir, "b.md"), ~s(#include "a.md"))
+    archetype = Archetypes.load!(ctx.base_dir)["default"]
+
+    assert {:error, %{code: "invalid_overrides", message: cycle}} =
+             Archetypes.normalize_overrides(ctx.base_dir, archetype, %{
+               "guidance_extra" => ~s(#include "a.md")
+             })
+
+    assert cycle =~ "guidance include cycle"
+  end
+
+  test "effective identity retains the base header and logs post-spawn missing dependencies",
+       ctx do
+    Archetypes.put_skill!(ctx.base_dir, "review", "# Review")
+    guidance_dir = Path.join([ctx.base_dir, "identity", "guidance"])
+    File.mkdir_p!(guidance_dir)
+    File.write!(Path.join(guidance_dir, "extra.md"), "Resolve carefully.")
+    base = Archetypes.load!(ctx.base_dir)["default"]
+
+    {:ok, overrides} =
+      Archetypes.normalize_overrides(ctx.base_dir, base, %{
+        "skills_add" => ["review"],
+        "guidance_extra" => "Before.\n#include \"extra.md\"\nAfter."
+      })
+
+    composed = Archetypes.effective(base, overrides)
+    assert "review" in composed.skills
+    assert Archetypes.guidance(composed) =~ "# Tightbeam · default"
+    assert Archetypes.guidance(composed) =~ "Before.\nResolve carefully.\nAfter."
+
+    File.rm_rf!(Path.join(Archetypes.skills_dir(ctx.base_dir), "review"))
+    File.rm!(Path.join(guidance_dir, "extra.md"))
+    base = Archetypes.load!(ctx.base_dir)["default"]
+
+    db = :"override_events_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = EventLog.ensure_schema(db)
+
+    drifted =
+      Archetypes.effective(base, overrides,
+        base_dir: ctx.base_dir,
+        db: db,
+        identity_name: "default--0123456789abcdef"
+      )
+
+    refute "review" in drifted.skills
+    assert Archetypes.guidance(drifted) =~ "Before.\n\nAfter."
+
+    assert Enum.map(EventLog.lifecycle_events(db), &{&1.kind, &1.subject, &1.detail}) == [
+             {"override_discrepancy", "default--0123456789abcdef",
+              "missing override skill review"},
+             {"override_discrepancy", "default--0123456789abcdef",
+              "unknown guidance fragment \"extra.md\""}
+           ]
+  end
+
+  test "archetype names may not contain the effective-identity separator", ctx do
+    File.write!(Path.join(ctx.manifests, "bad.toml"), "name = \"bad--name\"\n")
+
+    assert_raise ArgumentError, ~r/may not contain --/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end
+  end
+
+  test "skills: builtins materialize into the library; operator edits win; unknown elections fail",
+       ctx do
     Archetypes.load!(ctx.base_dir)
 
-    skill_path = Path.join([Archetypes.skills_dir(ctx.base_dir), "tightbeam-assimilate", "SKILL.md"])
+    skill_path =
+      Path.join([Archetypes.skills_dir(ctx.base_dir), "tightbeam-assimilate", "SKILL.md"])
+
     assert File.read!(skill_path) =~ "name: tightbeam-assimilate"
 
     # Operator's edit survives reload (materialization only fills absence).
@@ -88,7 +228,12 @@ defmodule Tightbeam.ArchetypesTest do
 
     # An operator-authored library skill is electable.
     File.mkdir_p!(Path.join(Archetypes.skills_dir(ctx.base_dir), "deploy"))
-    File.write!(Path.join([Archetypes.skills_dir(ctx.base_dir), "deploy", "SKILL.md"]), "# deploy")
+
+    File.write!(
+      Path.join([Archetypes.skills_dir(ctx.base_dir), "deploy", "SKILL.md"]),
+      "# deploy"
+    )
+
     File.write!(Path.join(ctx.manifests, "coder.toml"), """
     name = "coder"
     skills = ["deploy"]
@@ -97,7 +242,8 @@ defmodule Tightbeam.ArchetypesTest do
     assert Archetypes.load!(ctx.base_dir)["coder"].skills == ["deploy"]
   end
 
-  test "skill CRUD: trees nest, roots are electable units, elected roots refuse removal", ctx do
+  test "skill CRUD: trees nest, roots are electable units, elected roots transform on removal",
+       ctx do
     Archetypes.load!(ctx.base_dir)
 
     # A subject tree: parent manifest + nested technique.
@@ -125,13 +271,33 @@ defmodule Tightbeam.ArchetypesTest do
 
     Archetypes.load!(ctx.base_dir)
 
-    # An elected root refuses removal; pruning inside its tree is an edit.
-    assert {:error, %{code: "skill_elected", message: message}} =
-             Archetypes.rm_skill(ctx.base_dir, "swift")
+    assert {:ok,
+            %{
+              archetype_electors: ["coder"],
+              manifest_warnings: [warning]
+            }} = Archetypes.rm_skill(ctx.base_dir, "swift")
 
-    assert message =~ "coder"
-    assert :ok = Archetypes.rm_skill(ctx.base_dir, "swift/concurrency")
+    assert warning ==
+             "archetype coder still elects swift in identity/archetypes/coder.toml — " <>
+               "edit it before the next restart (boot validation is fail-closed)"
+
+    refute File.exists?(Path.join(Archetypes.skills_dir(ctx.base_dir), "swift"))
+
+    assert_raise ArgumentError, ~r/coder elects unknown skills: swift/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end
+
+    Archetypes.put_skill!(ctx.base_dir, "swift", "# Swift")
+    Archetypes.put_skill!(ctx.base_dir, "swift/concurrency", "# Concurrency")
+    Archetypes.load!(ctx.base_dir)
+
+    assert {:ok, %{archetype_electors: [], manifest_warnings: []}} =
+             Archetypes.rm_skill(ctx.base_dir, "swift/concurrency")
+
     refute File.exists?(Path.join(Archetypes.skills_dir(ctx.base_dir), "swift/concurrency"))
+
+    assert {:error, %{code: "unknown_skill", message: "unknown skill: missing"}} =
+             Archetypes.rm_skill(ctx.base_dir, "missing")
 
     # Traversal never escapes the library.
     assert_raise ArgumentError, ~r/invalid skill name/, fn ->
@@ -290,6 +456,17 @@ defmodule Tightbeam.ArchetypesTest do
       - The machine you run on is a workplace chosen from your archetype's
         WHERE. Your identity, mailbox, and chat history live in the substrate
         and survive any machine — including a move.
+      - Your WORKDIR is your formal artifact space, and the guarantee is
+        asymmetric: your home is identity — the substrate may regenerate it at
+        any time and anything loose there is forfeit — but the workdir is work:
+        it survives every regeneration and moves with you to a new machine.
+        Everything durable you produce belongs inside it — repo checkouts,
+        worktrees, drafts, evidence — not in your home and not in system temp
+        dirs.
+      - Never end a turn with outstanding work and nothing on the clock: file
+        completion, schedule your own continuation wake, or surrender the
+        assignment. Going silent with open work is a stall, and stalls are
+        visible.
       - The OPERATOR is the human whose org this is. Anything the substrate
         refuses, it refuses with a reason naming the rule.
 
@@ -427,6 +604,7 @@ defmodule Tightbeam.ArchetypesTest do
     File.mkdir_p!(gdir)
     File.write!(Path.join(gdir, "a.md"), ~s(#include "b.md"))
     File.write!(Path.join(gdir, "b.md"), ~s(#include "a.md"))
+
     File.write!(Path.join(adir, "broken.toml"), """
     name = "broken"
     [guidance]
@@ -449,7 +627,9 @@ defmodule Tightbeam.ArchetypesTest do
     where = ["*", "work-1"]
     """)
 
-    assert_raise ArgumentError, ~r/must be the only element/, fn -> Archetypes.load!(ctx.base_dir) end
+    assert_raise ArgumentError, ~r/must be the only element/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end
 
     File.write!(Path.join(adir, "bad.toml"), """
     name = "bad"
