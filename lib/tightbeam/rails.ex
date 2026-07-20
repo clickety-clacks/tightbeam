@@ -112,7 +112,7 @@ defmodule Tightbeam.Rails do
   @doc "The compiled PreToolUse hook map embedded in claude settings.json and codex hooks.json, or nil for an empty statute set."
   @spec hook_settings() :: map() | nil
   def hook_settings do
-    case :persistent_term.get(@persist_key) do
+    case :persistent_term.get(@persist_key, []) do
       [] ->
         nil
 
