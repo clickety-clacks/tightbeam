@@ -70,6 +70,7 @@ defmodule Tightbeam.Gateway do
     Org,
     Projection,
     Rails,
+    Rules,
     Roles,
     Spinup,
     Wakes
@@ -145,6 +146,7 @@ defmodule Tightbeam.Gateway do
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config)
     handler_table = handlers(Map.put(config, :db, db))
+    Rules.load!(config.base_dir, Map.keys(handler_table))
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the

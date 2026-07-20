@@ -96,6 +96,19 @@ defmodule Tightbeam.EventLog do
     end)
   end
 
+  @doc "Count verb attempts by exact origin and verb strictly after `since_ms`."
+  @spec verb_count(db(), String.t(), String.t(), integer()) :: non_neg_integer()
+  def verb_count(db \\ Tightbeam.DB, origin, verb, since_ms) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM events WHERE kind = 'verb' AND origin = ?1 AND verb = ?2 AND ts > ?3",
+        [origin, verb, since_ms]
+      )
+
+    count
+  end
+
   ## Lifecycle
 
   @doc """
