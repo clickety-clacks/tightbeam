@@ -219,6 +219,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             assignment_id,
             kind,
+            verdict,
             note,
         } => {
             let mut params = vec![
@@ -228,8 +229,20 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = note {
                 params.push(string_field("note", value));
             }
+            if let Some(value) = verdict {
+                params.push(string_field("verdictKind", value));
+            }
             Ok(request(identity, "attest", vec![], params))
         }
+        Command::Attests {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "attests",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -549,6 +562,7 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemList { identity }
         | Command::Attest { identity, .. }
+        | Command::Attests { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
@@ -738,6 +752,23 @@ mod tests {
                 "builder"
             ]),
             r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","note":"ready"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "tests-passed",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"tests-passed"}}"#
+        );
+        assert_eq!(
+            body(&["attests", "asg_1", "--as", "reviewer"]),
+            r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
         );
         assert_eq!(
             body(&["revoke-assignment", "asg_1", "--as-user", "flynn"]),

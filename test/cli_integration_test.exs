@@ -60,6 +60,10 @@ defmodule Tightbeam.CliIntegrationTest do
         send(test_pid, {:cli_call, call})
         %{assignment: %{id: call.params.assignment_id}, attest: %{kind: call.params.kind}}
       end,
+      "attests" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{attests: [%{id: "att_cli", assignmentId: call.params.assignment_id}]}
+      end,
       "revoke-assignment" => fn call ->
         send(test_pid, {:cli_call, call})
         %{id: call.params.assignment_id, outcome: "revoked"}
@@ -184,6 +188,35 @@ defmodule Tightbeam.CliIntegrationTest do
                       verb: "attest",
                       params: %{assignment_id: "asg_cli", kind: "completion", note: "ready"}
                     }}
+
+    {verdicted, 0} =
+      System.cmd(
+        ctx.binary,
+        ["attest", "asg_cli", "--kind", "verdict", "--verdict", "tests-passed"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert verdicted =~ "verdict"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "attest",
+                      params: %{
+                        assignment_id: "asg_cli",
+                        kind: "verdict",
+                        verdict_kind: "tests-passed"
+                      }
+                    }}
+
+    {attests, 0} =
+      System.cmd(ctx.binary, ["attests", "asg_cli"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert attests =~ "att_cli"
+    assert_receive {:cli_call, %{verb: "attests", params: %{assignment_id: "asg_cli"}}}
 
     {revoked, 0} =
       System.cmd(ctx.binary, ["revoke-assignment", "asg_cli"],

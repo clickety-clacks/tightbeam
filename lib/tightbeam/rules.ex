@@ -11,14 +11,23 @@ defmodule Tightbeam.Rules do
 
   A nil fact never satisfies any operator, including `ne` and `not_in`.
   An empty list is present, however: `caller.roles not_in ["admin"]` fires
-  for a caller holding no roles.
+  for a caller holding no roles, and `assignment.verdicts not_in
+  ["tests-passed"]` fires for an assignment with no verdicts. List facts are
+  `caller.roles` and `assignment.verdicts`. Assignment caller identity comes
+  from the optional dispatch principal rather than the origin string.
+
+  Check-tier facts are `attest.kind` (raw string on attest calls),
+  `assignment.verdicts` (distinct filed verdict kinds),
+  `assignment.holder_archetype`, and `assignment.caller_is_holder`. The three
+  assignment facts resolve from the call's assignmentId and are nil when that
+  assignment cannot be resolved.
 
   Rule denials and fact errors are written as `kind = "denied"` events by
   dispatch. That audit write is best-effort: an unavailable event sink never
   turns a denial into an allowed call.
   """
 
-  alias Tightbeam.{Devices, EventLog, Org, Roles}
+  alias Tightbeam.{Assignments, DB, Devices, EventLog, Org, Roles}
 
   @persist_key __MODULE__
   @rule_keys MapSet.new(["name", "verb", "deny_when", "text"])
@@ -35,7 +44,11 @@ defmodule Tightbeam.Rules do
     "target.kind" => :string,
     "target.state" => :string,
     "org.live_sessions_owned_by_caller" => :int,
-    "caller.verb_count_24h" => :int
+    "caller.verb_count_24h" => :int,
+    "attest.kind" => :string,
+    "assignment.verdicts" => {:list, :string},
+    "assignment.holder_archetype" => :string,
+    "assignment.caller_is_holder" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
 
@@ -352,6 +365,39 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  defp compute_fact("attest.kind", _db, call, cache) do
+    value =
+      case {call.verb, Map.get(call.params, :kind)} do
+        {"attest", kind} when is_binary(kind) -> kind
+        _ -> nil
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("assignment.verdicts", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache -> {Assignments.verdict_kinds(db, assignment.id), cache}
+    end)
+  end
+
+  defp compute_fact("assignment.holder_archetype", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache -> {assignment.holder_archetype, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.caller_is_holder", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      _assignment, cache when not is_map_key(call, :principal) -> {nil, cache}
+      _assignment, cache when is_nil(call.principal) -> {nil, cache}
+      assignment, cache -> {call.principal == {:session, assignment.holder_key}, cache}
+    end)
+  end
+
   defp compute_fact("$target", db, call, cache) do
     target =
       case Map.get(call, :session_key) do
@@ -360,6 +406,29 @@ defmodule Tightbeam.Rules do
       end
 
     {target, cache}
+  end
+
+  defp compute_fact("$assignment", db, call, cache) do
+    assignment =
+      case Map.get(call.params, :assignment_id) do
+        id when is_binary(id) ->
+          case DB.query(
+                 db,
+                 "SELECT a.id, a.holderKey, s.archetype FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
+                 [id]
+               ) do
+            {:ok, [[assignment_id, holder_key, holder_archetype]]} ->
+              %{id: assignment_id, holder_key: holder_key, holder_archetype: holder_archetype}
+
+            {:ok, []} ->
+              nil
+          end
+
+        _ ->
+          nil
+      end
+
+    {assignment, cache}
   end
 
   defp with_dependency(fact, db, call, cache, fun) do

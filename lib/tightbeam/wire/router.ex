@@ -43,7 +43,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles}
   alias Tightbeam.Wire.{Payloads, Socket}
 
-  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update)
+  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
