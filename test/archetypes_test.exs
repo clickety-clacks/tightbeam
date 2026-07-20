@@ -456,6 +456,17 @@ defmodule Tightbeam.ArchetypesTest do
       - The machine you run on is a workplace chosen from your archetype's
         WHERE. Your identity, mailbox, and chat history live in the substrate
         and survive any machine — including a move.
+      - Your WORKDIR is your formal artifact space, and the guarantee is
+        asymmetric: your home is identity — the substrate may regenerate it at
+        any time and anything loose there is forfeit — but the workdir is work:
+        it survives every regeneration and moves with you to a new machine.
+        Everything durable you produce belongs inside it — repo checkouts,
+        worktrees, drafts, evidence — not in your home and not in system temp
+        dirs.
+      - Never end a turn with outstanding work and nothing on the clock: file
+        completion, schedule your own continuation wake, or surrender the
+        assignment. Going silent with open work is a stall, and stalls are
+        visible.
       - The OPERATOR is the human whose org this is. Anything the substrate
         refuses, it refuses with a reason naming the rule.
 

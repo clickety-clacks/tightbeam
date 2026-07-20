@@ -120,6 +120,17 @@ defmodule Tightbeam.Archetypes do
   - The machine you run on is a workplace chosen from your archetype's
     WHERE. Your identity, mailbox, and chat history live in the substrate
     and survive any machine — including a move.
+  - Your WORKDIR is your formal artifact space, and the guarantee is
+    asymmetric: your home is identity — the substrate may regenerate it at
+    any time and anything loose there is forfeit — but the workdir is work:
+    it survives every regeneration and moves with you to a new machine.
+    Everything durable you produce belongs inside it — repo checkouts,
+    worktrees, drafts, evidence — not in your home and not in system temp
+    dirs.
+  - Never end a turn with outstanding work and nothing on the clock: file
+    completion, schedule your own continuation wake, or surrender the
+    assignment. Going silent with open work is a stall, and stalls are
+    visible.
   - The OPERATOR is the human whose org this is. Anything the substrate
     refuses, it refuses with a reason naming the rule.
   """
@@ -263,8 +274,10 @@ defmodule Tightbeam.Archetypes do
   - Skills: NO native discovery — the same skill files exist at the same
     paths in your home; READ them when the operator asks (the Operations
     pointer names the path).
-  - Rails gates: DO NOT EXIST here — codex has no hook surface. Never
-    claim a gate protects a codex session.
+  - Rails gates: NOT YET WIRED here. Codex 0.144+ DOES have a hook
+    surface (Claude-compatible), but tightbeam does not compile gates for
+    it yet — so today, never claim a gate protects a codex session; the
+    gap is tightbeam projection work, no longer the vendor.
   - Credentials: auth.json via codex login only; no token-env equivalent,
     so the rotation caveat applies to shared logins.
   - Slash-command vocabulary differs from claude and is unverified — do
