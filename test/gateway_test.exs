@@ -717,6 +717,16 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
+  test "skill-list is readable by a non-admin member", ctx do
+    base_dir = role_test_base("skill-list-member")
+    Archetypes.put_skill!(base_dir, "review", "# Review")
+    Archetypes.load!(base_dir)
+    list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["skill-list"]
+
+    assert %{skills: skills} = list.(%{origin: "user:flynn", params: %{}})
+    assert Enum.any?(skills, &(&1.name == "review"))
+  end
+
   test "invalid spawn overrides fail before spinup or any session side effect", ctx do
     base_dir = role_test_base("invalid-overrides")
     Archetypes.load!(base_dir)

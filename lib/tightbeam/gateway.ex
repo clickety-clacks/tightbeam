@@ -419,7 +419,7 @@ defmodule Tightbeam.Gateway do
           end
         end),
       "skill-list" =>
-        admin_handler(db, fn _p ->
+        member_handler(db, fn _p ->
           %{skills: Archetypes.list_skills(config.base_dir)}
         end),
       "promote-user" =>
@@ -1297,6 +1297,15 @@ defmodule Tightbeam.Gateway do
       if admin_origin?(db, call.origin),
         do: fun.(call.params),
         else: %{code: "forbidden", message: "admin required"}
+    end
+  end
+
+  defp member_handler(db, fun) do
+    fn call ->
+      case resolve_caller(db, call.origin) do
+        %{owner_user_id: user_id} when not is_nil(user_id) -> fun.(call.params)
+        _ -> %{code: "forbidden", message: "member required"}
+      end
     end
   end
 

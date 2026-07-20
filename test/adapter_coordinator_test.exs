@@ -82,6 +82,41 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "adapter_down")) >= 5
   end
 
+  test "failure circuit threshold uses application config", ctx do
+    old_value = Application.get_env(:tightbeam, :adapter_failure_circuit)
+
+    on_exit(fn ->
+      if old_value,
+        do: Application.put_env(:tightbeam, :adapter_failure_circuit, old_value),
+        else: Application.delete_env(:tightbeam, :adapter_failure_circuit)
+    end)
+
+    Application.put_env(:tightbeam, :adapter_failure_circuit, 1)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         backoff_base_ms: 1_000,
+         adapter_opts: fn _ ->
+           [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+         end,
+         db: ctx.db,
+         name: :configured_failure_circuit}
+      )
+
+    assert {:ok, _pid, _generation} =
+             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+
+    assert wait_until(fn ->
+             match?(
+               %{"claude:default@testhost" =>
+                   %{circuit: :open, consecutive_failures: 1}},
+               AdapterCoordinator.health(coordinator)
+             )
+           end)
+  end
+
   defp wait_until(fun, tries \\ 200) do
     cond do
       fun.() ->
@@ -200,6 +235,50 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     Enum.each(tasks, &Task.await(&1, 2_000))
     assert Agent.get(counts, & &1.max) == 3
+  end
+
+  test "load soft cap uses application config", ctx do
+    old_value = Application.get_env(:tightbeam, :adapter_load_soft_cap)
+
+    on_exit(fn ->
+      if old_value,
+        do: Application.put_env(:tightbeam, :adapter_load_soft_cap, old_value),
+        else: Application.delete_env(:tightbeam, :adapter_load_soft_cap)
+    end)
+
+    Application.put_env(:tightbeam, :adapter_load_soft_cap, 1)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_opts: fn _ -> [] end,
+         db: ctx.db,
+         name: :configured_load_cap}
+      )
+
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        AdapterCoordinator.with_load_slot(coordinator, fn ->
+          send(parent, :first_entered)
+          receive do: (:release_first -> :ok)
+        end)
+      end)
+
+    assert_receive :first_entered
+
+    second =
+      Task.async(fn ->
+        AdapterCoordinator.with_load_slot(coordinator, fn -> send(parent, :second_entered) end)
+      end)
+
+    refute_receive :second_entered, 50
+    send(first.pid, :release_first)
+    assert_receive :second_entered
+    Task.await(first)
+    Task.await(second)
   end
 
   defp eventually(fun, tries \\ 40) do

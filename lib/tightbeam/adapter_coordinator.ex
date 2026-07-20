@@ -15,13 +15,13 @@ defmodule Tightbeam.AdapterCoordinator do
     death/restart. Lanes stamp the generation they ran a turn against; a lane
     seeing a stale generation at next turn start performs session/load LAZILY
     (parent-spec rule: no eager mass re-adoption).
-  - Backoff: restart with exponential backoff 1s → 60s cap. After 5
+  - Backoff: restart with exponential backoff 1s → 60s cap. After the configured
     consecutive failures the circuit OPENS: the key is marked degraded,
     `adapter_for/2` returns {:error, :degraded} so affected turns fail fast
     with a clear reason, /version|/health reflects it, the gateway stays up.
     A successful restart closes the circuit and resets the count.
-  - Re-adoption semaphore: at most 3 concurrent session/load calls per
-    coordinator (no thundering herd after an adapter bounce). session/load
+  - Re-adoption semaphore: at most the configured number of concurrent session/load
+    calls per coordinator (no thundering herd after an adapter bounce). session/load
     failure → that session degraded + turn failed with reason.
   - Planned idle-reap is a coordinator action and its lifecycle event is
     flagged as planned — distinguishable from crashes in lifecycle_events.
@@ -92,6 +92,8 @@ defmodule Tightbeam.AdapterCoordinator do
        adapter_opts: Keyword.fetch!(opts, :adapter_opts),
        db: Keyword.get(opts, :db, Tightbeam.DB),
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
+       load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
+       failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
        adapters: %{},
        monitors: %{},
        load_active: %{},
@@ -121,7 +123,7 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   def handle_call({:acquire_load_slot, borrower}, from, state) do
-    if map_size(state.load_active) < 3 do
+    if map_size(state.load_active) < state.load_soft_cap do
       {slot, state} = grant_slot(borrower, state)
       {:reply, slot, state}
     else
@@ -166,7 +168,7 @@ defmodule Tightbeam.AdapterCoordinator do
             Tightbeam.EventLog.lifecycle(state.db, "adapter_down", key_name(key), inspect(reason))
 
           failures = entry.failures + 1
-          circuit = if failures >= 5, do: :open, else: :closed
+          circuit = if failures >= state.failure_circuit, do: :open, else: :closed
           generation = entry.generation + 1
           delay = backoff(state, failures)
           timer = Process.send_after(self(), {:restart_adapter, key, generation}, delay)
@@ -254,7 +256,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
       {:error, _reason} ->
         failures = entry.failures + 1
-        circuit = if failures >= 5, do: :open, else: :closed
+        circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
         timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(state, failures))
 

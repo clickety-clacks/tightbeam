@@ -546,7 +546,7 @@ defmodule Tightbeam.ArchetypesTest do
         full ceremony is the `tightbeam-assimilate` skill in your home
         (`skills/tightbeam-assimilate/SKILL.md`) — load it WHEN the operator
         asks for an assimilation, not before, and follow it exactly.
-      - `skill list|put|rm` (admin) manages the org's skill library. The full
+      - `skill list` reads the org's skill library; `skill put|rm` (admin) manages it. The full
         procedure — shapes, trees, election, propagation — is the
         `tightbeam-skills` skill in your home; load it when the operator asks
         to add or change skills.

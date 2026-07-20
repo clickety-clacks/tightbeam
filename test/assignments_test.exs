@@ -60,13 +60,57 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:error, %DB.Error{}} =
              DB.query(
                db,
-               "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('blank','   ','holder','flynn',1)"
+               "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('bad','missing','verdict',NULL,'holder',1)"
+             )
+  end
+
+  test "assignment text limits use application config", ctx do
+    old_values =
+      for key <- [:max_subject_len, :max_note_len, :max_verdict_kind_len, :max_idem_key_len],
+          into: %{} do
+        {key, Application.get_env(:tightbeam, key)}
+      end
+
+    on_exit(fn ->
+      Enum.each(old_values, fn
+        {key, nil} -> Application.delete_env(:tightbeam, key)
+        {key, value} -> Application.put_env(:tightbeam, key, value)
+      end)
+    end)
+
+    Application.put_env(:tightbeam, :max_subject_len, 3)
+    Application.put_env(:tightbeam, :max_note_len, 3)
+    Application.put_env(:tightbeam, :max_verdict_kind_len, 3)
+    Application.put_env(:tightbeam, :max_idem_key_len, 3)
+
+    assert %{code: "invalid_subject"} =
+             handle(ctx, "assign", assign_call({:user, "flynn"}, "four"))
+
+    assert %{code: "invalid_idempotency_key"} =
+             handle(ctx, "assign", assign_call({:user, "flynn"}, "ok", "four"))
+
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "ok"))
+
+    assert %{code: "invalid_note"} =
+             ctx
+             |> handle(
+               "attest",
+               put_in(
+                 attest_call({:session, "holder"}, assignment.id, "progress"),
+                 [:params, :note],
+                 "four"
+               )
              )
 
-    assert {:error, %DB.Error{}} =
-             DB.query(
-               db,
-               "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('bad','missing','verdict',NULL,'holder',1)"
+    assert %{code: "invalid_verdict_kind"} =
+             ctx
+             |> handle(
+               "attest",
+               put_in(
+                 attest_call({:user, "flynn"}, assignment.id, "verdict"),
+                 [:params, :verdict_kind],
+                 "four"
+               )
              )
   end
 

@@ -20,7 +20,7 @@ defmodule Tightbeam.Assignments do
   @assignments_ddl """
   CREATE TABLE IF NOT EXISTS assignments (
     id TEXT PRIMARY KEY,
-    subject TEXT NOT NULL CHECK(length(trim(subject)) BETWEEN 1 AND 2000),
+    subject TEXT NOT NULL,
     holderKey TEXT NOT NULL REFERENCES sessions(sessionKey),
     holderRole TEXT NULL,
     holderFallback INTEGER NOT NULL DEFAULT 0 CHECK(holderFallback IN (0, 1)),
@@ -54,7 +54,7 @@ defmodule Tightbeam.Assignments do
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
     kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
     verdictKind TEXT NULL,
-    note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
+    note TEXT NULL,
     bySession TEXT NULL REFERENCES sessions(sessionKey),
     byUser TEXT NULL REFERENCES users(userId),
     ts INTEGER NOT NULL,
@@ -534,20 +534,26 @@ defmodule Tightbeam.Assignments do
   defp principal_allowed({kind, _}) when kind in [:session, :user], do: :ok
 
   defp valid_subject(subject) when is_binary(subject) do
-    if String.length(String.trim(subject)) in 1..2000,
+    max = Application.get_env(:tightbeam, :max_subject_len, 2000)
+
+    if String.length(String.trim(subject)) in 1..max,
       do: :ok,
-      else: error("invalid_subject", "subject must be 1..2000 non-blank characters")
+      else: error("invalid_subject", "subject must be 1..#{max} non-blank characters")
   end
 
-  defp valid_subject(_),
-    do: error("invalid_subject", "subject must be 1..2000 non-blank characters")
+  defp valid_subject(_) do
+    max = Application.get_env(:tightbeam, :max_subject_len, 2000)
+    error("invalid_subject", "subject must be 1..#{max} non-blank characters")
+  end
 
   defp valid_note(nil), do: :ok
 
   defp valid_note(note) when is_binary(note) do
-    if String.length(String.trim(note)) in 1..2000,
+    max = Application.get_env(:tightbeam, :max_note_len, 2000)
+
+    if String.length(String.trim(note)) in 1..max,
       do: :ok,
-      else: error("invalid_note", "note must be 1..2000 non-blank characters")
+      else: error("invalid_note", "note must be 1..#{max} non-blank characters")
   end
 
   defp valid_note(_), do: error("invalid_note", "note must be text")
@@ -564,12 +570,14 @@ defmodule Tightbeam.Assignments do
     do: error("missing_verdict_kind", "verdictKind is required when kind is verdict")
 
   defp valid_verdict_kind(kind) when is_binary(kind) do
-    if String.length(kind) in 1..64 and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, kind),
+    max = Application.get_env(:tightbeam, :max_verdict_kind_len, 64)
+
+    if String.length(kind) in 1..max and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, kind),
       do: :ok,
       else:
         error(
           "invalid_verdict_kind",
-          "verdictKind must be 1..64 lowercase letters, digits, or hyphens"
+          "verdictKind must be 1..#{max} lowercase letters, digits, or hyphens"
         )
   end
 
@@ -583,11 +591,13 @@ defmodule Tightbeam.Assignments do
   defp valid_idempotency_key(nil), do: :ok
 
   defp valid_idempotency_key(key) when is_binary(key) do
-    if String.trim(key) == "" or String.length(key) > 200,
+    max = Application.get_env(:tightbeam, :max_idem_key_len, 200)
+
+    if String.trim(key) == "" or String.length(key) > max,
       do:
         error(
           "invalid_idempotency_key",
-          "idempotencyKey must be non-blank and at most 200 characters"
+          "idempotencyKey must be non-blank and at most #{max} characters"
         ),
       else: :ok
   end
