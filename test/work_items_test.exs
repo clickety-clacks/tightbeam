@@ -12,7 +12,8 @@ defmodule Tightbeam.WorkItemsTest do
     Org,
     Roles,
     Rules,
-    WorkItems
+    WorkItems,
+    WorkState
   }
 
   @sha String.duplicate("a", 64)
@@ -22,7 +23,7 @@ defmodule Tightbeam.WorkItemsTest do
     db = :work_items_db
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Devices, Idempotency, Org, Roles, WorkItems, Assignments, EventLog] do
+    for module <- [Devices, Idempotency, Org, Roles, WorkItems, Assignments, WorkState, EventLog] do
       :ok = module.ensure_schema(db)
     end
 

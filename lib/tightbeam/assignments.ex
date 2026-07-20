@@ -195,12 +195,38 @@ defmodule Tightbeam.Assignments do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
 
-      transaction(db, fn txn ->
-        case key && idempotency_assignment(txn, owner, key) do
-          nil -> create_assignment(txn, call, owner, key)
-          id -> fetch_assignment!(txn, id)
-        end
-      end)
+      result =
+        transaction(db, fn txn ->
+          case key && idempotency_assignment(txn, owner, key) do
+            nil ->
+              case create_assignment(txn, call, owner, key) do
+                %{code: _} = error -> error
+                assignment -> {:created, assignment}
+              end
+
+            id ->
+              {:replayed, fetch_assignment!(txn, id)}
+          end
+        end)
+
+      case result do
+        {:created, assignment} ->
+          best_effort(fn -> notify(call, :on_assignment_change, assignment.id, nil) end)
+
+          if assignment.workItemId do
+            best_effort(fn ->
+              notify(call, :on_work_item_change, assignment.workItemId, "composition")
+            end)
+          end
+
+          assignment
+
+        {:replayed, assignment} ->
+          assignment
+
+        error ->
+          error
+      end
     end
   rescue
     error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
@@ -208,7 +234,16 @@ defmodule Tightbeam.Assignments do
 
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
-      transaction(db, fn txn -> attest_in_txn(txn, call) end)
+      assignment_id = call.params[:assignment_id]
+      from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
+      result = transaction(db, fn txn -> attest_in_txn(txn, call) end)
+
+      if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
+        {:ok, from} = from
+        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
+      end
+
+      result
     end
   rescue
     TransitionRace -> assignment_closed()
@@ -216,7 +251,16 @@ defmodule Tightbeam.Assignments do
 
   defp revoke_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
-      transaction(db, fn txn -> revoke_in_txn(txn, call) end)
+      assignment_id = call.params[:assignment_id]
+      from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
+      result = transaction(db, fn txn -> revoke_in_txn(txn, call) end)
+
+      if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
+        {:ok, from} = from
+        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
+      end
+
+      result
     end
   rescue
     TransitionRace -> assignment_closed()
@@ -558,6 +602,30 @@ defmodule Tightbeam.Assignments do
 
   defp assignment_closed, do: error("assignment_closed", "assignment is already closed")
   defp error(code, message), do: %{code: code, message: message}
+
+  defp notify(call, key, first, second) do
+    Map.get(call, key, fn _, _ -> :ok end).(first, second)
+  end
+
+  defp best_effort(fun) do
+    try do
+      fun.()
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
+
+  defp best_effort_value(fun) do
+    try do
+      {:ok, fun.()}
+    rescue
+      _ -> :error
+    catch
+      _, _ -> :error
+    end
+  end
 
   defp transaction(db, fun) do
     case DB.transaction(db, fun) do

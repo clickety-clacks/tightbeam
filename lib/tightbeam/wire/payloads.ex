@@ -211,6 +211,30 @@ defmodule Tightbeam.Wire.Payloads do
   @spec sync_complete() :: payload()
   def sync_complete, do: %{"type" => "sync_complete"}
 
+  @spec work_state_event(map()) :: payload()
+  def work_state_event(event) do
+    %{
+      "type" => "work_state_event",
+      "ref" => Map.fetch!(event, :assignmentId),
+      "sessionKey" => Map.fetch!(event, :sessionKey),
+      "from" => Map.fetch!(event, :fromState),
+      "to" => Map.fetch!(event, :toState),
+      "cursor" => Map.fetch!(event, :cursor),
+      "ts" => Map.fetch!(event, :ts)
+    }
+  end
+
+  @spec work_item_event(map()) :: payload()
+  def work_item_event(event) do
+    %{
+      "type" => "work_item_event",
+      "ref" => Map.fetch!(event, :workItemId),
+      "kind" => Map.fetch!(event, :kind),
+      "cursor" => Map.fetch!(event, :cursor),
+      "ts" => Map.fetch!(event, :ts)
+    }
+  end
+
   @doc """
   Live turn progress for the typing indicator's label (client contract:
   AgentProgressEvent — first non-empty of progressText/title/summary/name is

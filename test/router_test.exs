@@ -3,7 +3,21 @@ defmodule Tightbeam.Wire.RouterTest do
   import Plug.Test
   import Plug.Conn
 
-  alias Tightbeam.{Assets, DB, Devices, EventLog, Gateway, Org, Roles, Wakes}
+  alias Tightbeam.{
+    Assets,
+    Assignments,
+    DB,
+    Devices,
+    EventLog,
+    Gateway,
+    Org,
+    Roles,
+    Supervision,
+    Wakes,
+    WorkItems,
+    WorkState
+  }
+
   alias Tightbeam.Wire.Router
 
   setup do
@@ -81,6 +95,68 @@ defmodule Tightbeam.Wire.RouterTest do
         session_status: fn _ -> nil end
       ]
     }
+  end
+
+  test "work and work-item device routes expose owner-scoped random-access snapshots", ctx do
+    for module <- [WorkItems, Assignments, Supervision, WorkState],
+        do: :ok = module.ensure_schema(ctx.db)
+
+    create_session(ctx.db, "holder", ctx.device.user_id)
+
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, ctx.device.user_id},
+        params: %{title: "Observed"}
+      })
+
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        principal: {:user, ctx.device.user_id},
+        session_key: "holder",
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "Build it", work_item_id: item.id}
+      })
+
+    WorkState.emit(ctx.db, assignment.id, nil)
+    WorkState.emit_item(ctx.db, item.id, "composition")
+
+    work = get_device(ctx, ctx.device, "/api/work?state=all&status=open&sessionKey=holder")
+    assert work.status == 200
+
+    assert %{"work" => [%{"id" => id, "status" => "open", "workItemId" => item_id}]} =
+             JSON.decode!(work.resp_body)
+
+    assert id == assignment.id
+    assert item_id == item.id
+
+    detail = get_device(ctx, ctx.device, "/api/work/#{assignment.id}")
+    assert detail.status == 200
+    assert JSON.decode!(detail.resp_body)["holder"]["sessionKey"] == "holder"
+
+    items = get_device(ctx, ctx.device, "/api/work-items")
+    assert items.status == 200
+
+    assert %{
+             "items" => [
+               %{"workItem" => %{"id" => item_id}, "assignments" => [%{"id" => assignment_id}]}
+             ],
+             "cursor" => %{"assignment" => _, "workItem" => _}
+           } = JSON.decode!(items.resp_body)
+
+    assert item_id == item.id
+    assert assignment_id == assignment.id
+
+    item_detail = get_device(ctx, ctx.device, "/api/work-items/#{item.id}")
+    assert item_detail.status == 200
+
+    invalid = get_device(ctx, ctx.device, "/api/work?status=blocked")
+    assert invalid.status == 400
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_status"
+
+    other = approved_device(ctx.db, "other-device", "Other")
+    assert get_device(ctx, other, "/api/work/#{assignment.id}").status == 404
+    assert get_device(ctx, other, "/api/work-items/#{item.id}").status == 404
   end
 
   test "all work-item verbs route, preserve generic target behavior, and map unknown ids", ctx do
@@ -709,6 +785,12 @@ defmodule Tightbeam.Wire.RouterTest do
 
   defp download(ctx, device, asset_id) do
     conn(:get, "/download/#{asset_id}")
+    |> put_req_header("authorization", "Bearer #{device.token}")
+    |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp get_device(ctx, device, path) do
+    conn(:get, path)
     |> put_req_header("authorization", "Bearer #{device.token}")
     |> Router.call(Router.init(ctx.opts))
   end

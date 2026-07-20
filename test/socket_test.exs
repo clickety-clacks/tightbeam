@@ -15,8 +15,13 @@ defmodule Tightbeam.Wire.SocketTest do
       db: db,
       conn_registry: registry,
       handlers: %{},
-      defaults: %{archetype: "default",
-        host: "testhost", harness: :claude, provider: :anthropic, model: "fable"},
+      defaults: %{
+        archetype: "default",
+        host: "testhost",
+        harness: :claude,
+        provider: :anthropic,
+        model: "fable"
+      },
       ping_interval_ms: 60_000,
       pong_timeout_ms: 60_000
     }
@@ -87,7 +92,7 @@ defmodule Tightbeam.Wire.SocketTest do
       owner_user_id: device.user_id,
       origin: "user:#{device.user_id}",
       archetype: "default",
-        host: "testhost",
+      host: "testhost",
       harness: "claude",
       provider: "anthropic",
       model: "fable"
@@ -128,7 +133,7 @@ defmodule Tightbeam.Wire.SocketTest do
       owner_user_id: device.user_id,
       origin: "user:#{device.user_id}",
       archetype: "default",
-        host: "testhost",
+      host: "testhost",
       harness: "claude",
       provider: "anthropic",
       model: "fable"
@@ -162,5 +167,146 @@ defmodule Tightbeam.Wire.SocketTest do
 
     # Once live, message pushes flow straight through (registry filters).
     assert {:push, {:text, _}, _} = Socket.handle_info(fresh, live)
+  end
+
+  test "work-state-only auth skips chat material, gates inbound chat, and preserves class on re-auth",
+       ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{device_id: "state", claimed_name: "State", platform: nil, model: nil})
+
+    {:ok, state} = Socket.init(ctx.deps)
+
+    auth = %{
+      "type" => "auth",
+      "token" => device.token,
+      "deviceId" => device.device_id,
+      "subscriptions" => ["work_state"]
+    }
+
+    {:push, [{:text, auth_frame}], replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+
+    decoded = JSON.decode!(auth_frame)
+    assert decoded["type"] == "auth_result"
+    assert decoded["sessionKeys"] == []
+    assert decoded["streamReadStates"] == %{}
+    assert decoded["streamTailStates"] == %{}
+    assert decoded["replayCount"] == 0
+    assert Org.list_for_user(ctx.db, device.user_id, false) == []
+
+    {:push, [{:text, sync}], live} = Socket.handle_info(:finish_replay, replaying)
+    assert JSON.decode!(sync) == %{"type" => "sync_complete"}
+
+    for frame <- [
+          %{"type" => "message", "id" => "c_x", "content" => "no"},
+          %{"type" => "stream_read", "sessionKey" => "missing", "lastReadMessageId" => "s_1"},
+          %{"type" => "typing"}
+        ] do
+      {:push, {:text, error}, kept} =
+        Socket.handle_in({JSON.encode!(frame), opcode: :text}, live)
+
+      assert JSON.decode!(error)["code"] == "invalid_message"
+      assert kept.phase == :live
+    end
+
+    reauth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    {:push, [{:text, _}], reauthing} =
+      Socket.handle_in({JSON.encode!(reauth), opcode: :text}, live)
+
+    assert reauthing.conn_ref == live.conn_ref
+    assert reauthing.subscriptions == MapSet.new(["work_state"])
+    assert Org.list_for_user(ctx.db, device.user_id, false) == []
+
+    {:push, [{:text, _}], live_again} = Socket.handle_info(:finish_replay, reauthing)
+
+    :ok =
+      ConnRegistry.publish_work_state(
+        ctx.registry,
+        device.user_id,
+        %{"type" => "work_state_event"},
+        fn pid, payload -> send(pid, {:push, payload}) end
+      )
+
+    assert_receive {:push, %{"type" => "work_state_event"} = payload}
+    assert {:push, {:text, event}, _} = Socket.handle_info({:push, payload}, live_again)
+
+    assert JSON.decode!(event)["type"] == "work_state_event"
+
+    differing = Map.put(reauth, "subscriptions", ["chat"])
+
+    assert {:stop, :normal, 1000, {:text, error}, _} =
+             Socket.handle_in({JSON.encode!(differing), opcode: :text}, live_again)
+
+    assert JSON.decode!(error)["code"] == "invalid_message"
+  end
+
+  test "default connection re-auth preserves its lifetime class without re-registration", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "default-reauth",
+        claimed_name: "Default",
+        platform: nil,
+        model: nil
+      })
+
+    {:ok, state} = Socket.init(ctx.deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    {:push, initial_frames, replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+
+    assert Enum.map(initial_frames, fn {:text, frame} -> JSON.decode!(frame)["type"] end) == [
+             "auth_result",
+             "stream_snapshot"
+           ]
+
+    {:push, [{:text, sync}], live} = Socket.handle_info(:finish_replay, replaying)
+    assert JSON.decode!(sync) == %{"type" => "sync_complete"}
+    assert live.subscriptions == MapSet.new(["chat"])
+    assert ConnRegistry.count(ctx.registry) == 1
+
+    {:push, reauth_frames, reauthing} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, live)
+
+    assert Enum.map(reauth_frames, fn {:text, frame} -> JSON.decode!(frame)["type"] end) == [
+             "auth_result",
+             "stream_snapshot"
+           ]
+
+    assert reauthing.conn_ref == live.conn_ref
+    assert reauthing.subscriptions == MapSet.new(["chat"])
+    assert ConnRegistry.count(ctx.registry) == 1
+    refute_receive {:takeover_close}
+
+    {:push, [{:text, second_sync}], live_again} =
+      Socket.handle_info(:finish_replay, reauthing)
+
+    assert JSON.decode!(second_sync) == %{"type" => "sync_complete"}
+    assert live_again.conn_ref == live.conn_ref
+    assert live_again.subscriptions == MapSet.new(["chat"])
+  end
+
+  test "invalid subscription sets fail before seeding or registration", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{device_id: "bad", claimed_name: "Bad", platform: nil, model: nil})
+
+    for subscriptions <- [[], ["unknown"]] do
+      {:ok, state} = Socket.init(ctx.deps)
+
+      auth = %{
+        "type" => "auth",
+        "token" => device.token,
+        "deviceId" => device.device_id,
+        "subscriptions" => subscriptions
+      }
+
+      assert {:stop, :normal, 1000, {:text, error}, _} =
+               Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+
+      assert JSON.decode!(error)["code"] == "invalid_message"
+      assert ConnRegistry.count(ctx.registry) == 0
+      assert Org.list_for_user(ctx.db, device.user_id, false) == []
+    end
   end
 end

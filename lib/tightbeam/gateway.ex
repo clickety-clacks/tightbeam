@@ -77,7 +77,8 @@ defmodule Tightbeam.Gateway do
     Spinup,
     Supervision,
     Wakes,
-    WorkItems
+    WorkItems,
+    WorkState
   }
 
   alias Tightbeam.Acp.Adapter
@@ -138,7 +139,8 @@ defmodule Tightbeam.Gateway do
           Roles,
           WorkItems,
           Assignments,
-          Supervision
+          Supervision,
+          WorkState
         ] do
       :ok = module.ensure_schema(db)
     end
@@ -280,6 +282,12 @@ defmodule Tightbeam.Gateway do
   @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
   def handlers(config) do
     db = Map.get(config, :db, Tightbeam.DB)
+
+    assignment_change = fn assignment_id, from ->
+      emit_assignment_change(db, assignment_id, from)
+    end
+
+    item_change = fn work_item_id, kind -> emit_item_change(db, work_item_id, kind) end
 
     %{
       "post" => fn call ->
@@ -425,11 +433,36 @@ defmodule Tightbeam.Gateway do
       "work-item-create" => fn call -> WorkItems.__handle__(db, "work-item-create", call) end,
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
-      "work-item-update" => fn call -> WorkItems.__handle__(db, "work-item-update", call) end,
-      "assign" => fn call -> Assignments.__handle__(db, "assign", call) end,
-      "attest" => fn call -> Assignments.__handle__(db, "attest", call) end,
+      "work-item-update" => fn call ->
+        WorkItems.__handle__(
+          db,
+          "work-item-update",
+          Map.put(call, :on_work_item_change, item_change)
+        )
+      end,
+      "assign" => fn call ->
+        call =
+          call
+          |> Map.put(:on_assignment_change, assignment_change)
+          |> Map.put(:on_work_item_change, item_change)
+
+        Assignments.__handle__(db, "assign", call)
+      end,
+      "attest" => fn call ->
+        Assignments.__handle__(
+          db,
+          "attest",
+          Map.put(call, :on_assignment_change, assignment_change)
+        )
+      end,
       "attests" => fn call -> Assignments.__handle__(db, "attests", call) end,
-      "revoke-assignment" => fn call -> Assignments.__handle__(db, "revoke-assignment", call) end,
+      "revoke-assignment" => fn call ->
+        Assignments.__handle__(
+          db,
+          "revoke-assignment",
+          Map.put(call, :on_assignment_change, assignment_change)
+        )
+      end,
       "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
@@ -1908,9 +1941,21 @@ defmodule Tightbeam.Gateway do
 
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
+              assignments =
+                best_effort_value([], fn ->
+                  Assignments.list(db, %{holder_key: session.session_key, state: "open"})
+                  |> Enum.map(fn assignment ->
+                    {assignment.id, WorkState.status(db, assignment.id)}
+                  end)
+                end)
+
               Org.retire(db, session.session_key)
               broadcast(db, owner, Payloads.stream_deleted(session.session_key))
               Map.get(config, :on_retired, fn _ -> :ok end).(session.session_key)
+
+              Enum.each(assignments, fn {assignment_id, from} ->
+                emit_assignment_change(db, assignment_id, from)
+              end)
             end
 
             if p[:idempotency_key] do
@@ -2037,6 +2082,67 @@ defmodule Tightbeam.Gateway do
 
   defp broadcast(_db, owner, payload),
     do: Tightbeam.ConnRegistry.broadcast(Tightbeam.ConnRegistry, owner, payload, &deliver/2)
+
+  defp emit_assignment_change(db, assignment_id, from) do
+    best_effort(fn ->
+      case WorkState.emit(db, assignment_id, from) do
+        nil ->
+          :ok
+
+        event ->
+          %{owner_user_id: owner} = Org.get(db, event.sessionKey)
+
+          Tightbeam.ConnRegistry.publish_work_state(
+            Tightbeam.ConnRegistry,
+            owner,
+            Payloads.work_state_event(event),
+            &deliver/2
+          )
+      end
+    end)
+  end
+
+  defp emit_item_change(db, work_item_id, kind) do
+    best_effort(fn ->
+      event = WorkState.emit_item(db, work_item_id, kind)
+
+      {:ok, rows} =
+        DB.query(
+          db,
+          "SELECT DISTINCT s.ownerUserId FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.workItemId = ?1",
+          [work_item_id]
+        )
+
+      owners = rows |> Enum.map(&hd/1) |> MapSet.new()
+
+      Tightbeam.ConnRegistry.publish_work_item(
+        Tightbeam.ConnRegistry,
+        owners,
+        Payloads.work_item_event(event),
+        &deliver/2
+      )
+    end)
+  end
+
+  defp best_effort(fun) do
+    try do
+      fun.()
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
+
+  defp best_effort_value(fallback, fun) do
+    try do
+      fun.()
+    rescue
+      _ -> fallback
+    catch
+      _, _ -> fallback
+    end
+  end
 
   defp deliver(pid, payload), do: send(pid, {:push, payload})
 end

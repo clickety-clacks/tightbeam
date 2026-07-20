@@ -15,8 +15,23 @@ defmodule Tightbeam.ConnRegistryTest do
     reg: reg,
     deliver: d
   } do
-    {:ok, _, _} = ConnRegistry.register(reg, %{pid: :flynn, user_id: "flynn", device_id: "d1", is_admin: true})
-    {:ok, _, _} = ConnRegistry.register(reg, %{pid: :mike, user_id: "mike", device_id: "d2", is_admin: false})
+    {:ok, _, _} =
+      ConnRegistry.register(reg, %{
+        pid: :flynn,
+        user_id: "flynn",
+        device_id: "d1",
+        is_admin: true,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    {:ok, _, _} =
+      ConnRegistry.register(reg, %{
+        pid: :mike,
+        user_id: "mike",
+        device_id: "d2",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
 
     :ok = ConnRegistry.broadcast(reg, "mike", %{t: "typing"}, d)
     # mike (owner) gets it; flynn (admin) gets NOTHING — not one byte of
@@ -29,8 +44,18 @@ defmodule Tightbeam.ConnRegistryTest do
     refute_received {:sent, :flynn, _}
   end
 
-  test "per-connection seq filter drops already-delivered (late pre-watermark) messages", %{reg: reg, deliver: d} do
-    {:ok, ref, _} = ConnRegistry.register(reg, %{pid: :c, user_id: "u", device_id: "d", is_admin: false})
+  test "per-connection seq filter drops already-delivered (late pre-watermark) messages", %{
+    reg: reg,
+    deliver: d
+  } do
+    {:ok, ref, _} =
+      ConnRegistry.register(reg, %{
+        pid: :c,
+        user_id: "u",
+        device_id: "d",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
 
     # replay advanced this connection's watermark to seq 11 for k1
     ConnRegistry.note_replayed(reg, ref, "k1", 11)
@@ -50,10 +75,25 @@ defmodule Tightbeam.ConnRegistryTest do
 
   test "generation-tagged takeover: new registration owns the slot; slow old unregister cannot evict it",
        %{reg: reg, test_pid: test_pid} do
-    {:ok, _old_ref, nil} = ConnRegistry.register(reg, %{pid: :old, user_id: "u", device_id: "dev", is_admin: false})
+    {:ok, _old_ref, nil} =
+      ConnRegistry.register(reg, %{
+        pid: :old,
+        user_id: "u",
+        device_id: "dev",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
 
     # takeover: same device, new socket
-    {:ok, new_ref, replaced} = ConnRegistry.register(reg, %{pid: :new, user_id: "u", device_id: "dev", is_admin: false})
+    {:ok, new_ref, replaced} =
+      ConnRegistry.register(reg, %{
+        pid: :new,
+        user_id: "u",
+        device_id: "dev",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
     assert replaced != nil
 
     # the OLD connection now closes and unregisters LATE — must NOT evict :new
@@ -69,9 +109,52 @@ defmodule Tightbeam.ConnRegistryTest do
   end
 
   test "unregister is generation-guarded and idempotent", %{reg: reg} do
-    {:ok, ref, _} = ConnRegistry.register(reg, %{pid: :a, user_id: "u", device_id: "d", is_admin: false})
+    {:ok, ref, _} =
+      ConnRegistry.register(reg, %{
+        pid: :a,
+        user_id: "u",
+        device_id: "d",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
     ConnRegistry.unregister(reg, ref)
     ConnRegistry.unregister(reg, ref)
     assert ConnRegistry.count(reg) == 0
+  end
+
+  test "chat and both work grains fan out only to their subscribed owner sets", %{
+    reg: reg,
+    deliver: d
+  } do
+    for {pid, user, subscriptions} <- [
+          {:chat, "u", ["chat"]},
+          {:work, "u", ["work_state"]},
+          {:both, "v", ["chat", "work_state"]},
+          {:admin, "admin", ["work_state"]}
+        ] do
+      {:ok, _, _} =
+        ConnRegistry.register(reg, %{
+          pid: pid,
+          user_id: user,
+          device_id: to_string(pid),
+          is_admin: pid == :admin,
+          subscriptions: MapSet.new(subscriptions)
+        })
+    end
+
+    :ok = ConnRegistry.broadcast(reg, "u", %{type: :chat}, d)
+    assert_received {:sent, :chat, %{type: :chat}}
+    refute_received {:sent, :work, _}
+
+    :ok = ConnRegistry.publish_work_state(reg, "u", %{type: :assignment}, d)
+    assert_received {:sent, :work, %{type: :assignment}}
+    refute_received {:sent, :chat, _}
+    refute_received {:sent, :admin, _}
+
+    :ok = ConnRegistry.publish_work_item(reg, MapSet.new(["u", "v"]), %{type: :item}, d)
+    assert_received {:sent, :work, %{type: :item}}
+    assert_received {:sent, :both, %{type: :item}}
+    refute_received {:sent, :admin, _}
   end
 end

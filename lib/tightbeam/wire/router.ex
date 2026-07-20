@@ -40,7 +40,7 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
-  alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles}
+  alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles, WorkState}
   alias Tightbeam.Wire.{Payloads, Socket}
 
   @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update)
@@ -220,6 +220,64 @@ defmodule Tightbeam.Wire.Router do
       json(conn, 200, status)
     else
       nil -> error(conn, 404, "not_found")
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  get "/api/work" do
+    conn = Plug.Conn.fetch_query_params(conn)
+
+    with {:ok, device} <- device_auth(conn),
+         {:ok, statuses} <- work_status_filter(conn.query_params["status"]),
+         {:ok, state} <- work_state_filter(conn.query_params["state"]) do
+      filters = %{
+        status: statuses,
+        state: state,
+        session_key: conn.query_params["sessionKey"],
+        owner_user_id: if(device.is_admin, do: nil, else: device.user_id)
+      }
+
+      json(conn, 200, WorkState.list(db(conn), filters))
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  get "/api/work/:id" do
+    with {:ok, device} <- device_auth(conn),
+         detail when not is_nil(detail) <- WorkState.detail(db(conn), id),
+         true <- visible_assignment_detail?(detail, device, conn) do
+      json(conn, 200, detail)
+    else
+      nil -> error(conn, 404, "unknown_assignment")
+      false -> error(conn, 404, "unknown_assignment")
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  get "/api/work-items" do
+    conn = Plug.Conn.fetch_query_params(conn)
+
+    with {:ok, device} <- device_auth(conn) do
+      filters = %{
+        session_key: conn.query_params["sessionKey"],
+        owner_user_id: if(device.is_admin, do: nil, else: device.user_id)
+      }
+
+      json(conn, 200, WorkState.list_items(db(conn), filters))
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  get "/api/work-items/:id" do
+    with {:ok, device} <- device_auth(conn),
+         detail when not is_nil(detail) <- WorkState.item_detail(db(conn), id),
+         true <- visible_item_detail?(detail, device, conn) do
+      json(conn, 200, detail)
+    else
+      nil -> error(conn, 404, "unknown_work_item")
+      false -> error(conn, 404, "unknown_work_item")
       {:error, status, code, message} -> error(conn, status, code, message)
     end
   end
@@ -502,6 +560,34 @@ defmodule Tightbeam.Wire.Router do
         {:error, 404, "not_found", nil}
     end
   end
+
+  defp visible_assignment_detail?(_detail, %{is_admin: true}, _conn), do: true
+
+  defp visible_assignment_detail?(detail, device, conn) do
+    Org.get(db(conn), detail.assignment.holderKey).owner_user_id == device.user_id
+  end
+
+  defp visible_item_detail?(_detail, %{is_admin: true}, _conn), do: true
+
+  defp visible_item_detail?(detail, device, conn) do
+    Enum.any?(detail.assignments, fn assignment ->
+      Org.get(db(conn), assignment.holderKey).owner_user_id == device.user_id
+    end)
+  end
+
+  defp work_status_filter(nil), do: {:ok, nil}
+
+  defp work_status_filter(value) do
+    statuses = String.split(value, ",")
+
+    if Enum.all?(statuses, &(&1 in ~w(open active stranded claims-done verified abandoned))),
+      do: {:ok, statuses},
+      else: {:error, 400, "invalid_status", nil}
+  end
+
+  defp work_state_filter(nil), do: {:ok, "all"}
+  defp work_state_filter(value) when value in ~w(open closed all), do: {:ok, value}
+  defp work_state_filter(_), do: {:error, 400, "invalid_state_filter", nil}
 
   defp visible_asset(asset_id, device, conn) do
     case Assets.get(db(conn), asset_id) do

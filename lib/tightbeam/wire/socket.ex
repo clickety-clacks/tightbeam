@@ -67,6 +67,7 @@ defmodule Tightbeam.Wire.Socket do
           device_id: String.t() | nil,
           is_admin: boolean(),
           phase: :unauthed | :replaying | :live,
+          subscriptions: MapSet.t(String.t()) | nil,
           buffer: [tuple()],
           watermarks: %{optional(String.t()) => integer()},
           deps: map()
@@ -77,6 +78,7 @@ defmodule Tightbeam.Wire.Socket do
             device_id: nil,
             is_admin: false,
             phase: :unauthed,
+            subscriptions: nil,
             buffer: [],
             watermarks: %{},
             deps: %{}
@@ -176,16 +178,32 @@ defmodule Tightbeam.Wire.Socket do
     push(Payloads.wire_error("auth_failed", "not authenticated"), state)
   end
 
-  defp route(%{"type" => "message"} = msg, state), do: client_message(msg, state)
+  defp route(%{"type" => type} = msg, state)
+       when type in ["message", "stream_read", "typing"] do
+    if MapSet.member?(state.subscriptions, "chat") do
+      route_chat(msg, state)
+    else
+      push(Payloads.wire_error("invalid_message", "unsupported type: #{type}"), state)
+    end
+  end
 
-  defp route(%{"type" => "stream_read"} = msg, state) do
+  defp route(msg, state) do
+    push(
+      Payloads.wire_error("invalid_message", "unsupported type: #{string(msg["type"])}"),
+      state
+    )
+  end
+
+  defp route_chat(%{"type" => "message"} = msg, state), do: client_message(msg, state)
+
+  defp route_chat(%{"type" => "stream_read"} = msg, state) do
     session_key = string(msg["sessionKey"])
     last = string(msg["lastReadMessageId"])
     :ok = Projection.set_read_state(db(state), state.user_id, session_key, last)
     push(Payloads.stream_read_state(session_key, last), state)
   end
 
-  defp route(%{"type" => "typing"}, state) do
+  defp route_chat(%{"type" => "typing"}, state) do
     _ =
       ConnRegistry.within_rate_limit(
         conn_registry(state),
@@ -196,13 +214,6 @@ defmodule Tightbeam.Wire.Socket do
       )
 
     {:ok, state}
-  end
-
-  defp route(msg, state) do
-    push(
-      Payloads.wire_error("invalid_message", "unsupported type: #{string(msg["type"])}"),
-      state
-    )
   end
 
   defp pair(msg, state) do
@@ -260,84 +271,133 @@ defmodule Tightbeam.Wire.Socket do
         stop_with(Payloads.auth_result_failure(reason), state)
 
       device ->
-        seed_main_stream(device.user_id, state)
+        auth_success(msg, device, state)
+    end
+  end
+
+  defp auth_success(msg, device, %{conn_ref: nil} = state) do
+    case parse_subscriptions(msg, MapSet.new(["chat"])) do
+      {:ok, subscriptions} ->
+        if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
 
         {:ok, conn_ref, _replaced} =
           ConnRegistry.register(conn_registry(state), %{
             pid: self(),
             user_id: device.user_id,
             device_id: device.device_id,
-            is_admin: device.is_admin
+            is_admin: device.is_admin,
+            subscriptions: subscriptions
           })
 
-        sessions = Org.list_for_user(db(state), device.user_id, false)
-        keys = Enum.map(sessions, & &1.session_key)
-        cursors = replay_cursors(msg, device.user_id, state)
+        auth_replay(msg, device, conn_ref, subscriptions, state)
 
-        {replay, truncated?, watermarks} =
-          Enum.reduce(keys, {[], false, %{}}, fn key, {messages, truncated, marks} ->
-            barrier = Enum.find_value(sessions, 0, &(&1.session_key == key && &1.cleared_through_seq))
-            rows = Projection.list_after(db(state), key, cursors[key], 501, barrier || 0)
-            selected = Enum.take(rows, 500)
+      :error ->
+        stop_with(Payloads.wire_error("invalid_message"), state)
+    end
+  end
 
-            Enum.each(selected, fn message ->
-              ConnRegistry.note_replayed(conn_registry(state), conn_ref, key, message.seq)
-            end)
+  defp auth_success(msg, device, state) do
+    case parse_subscriptions(msg, state.subscriptions) do
+      {:ok, subscriptions} when subscriptions == state.subscriptions ->
+        if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
+        auth_replay(msg, device, state.conn_ref, subscriptions, state)
 
-            marks =
-              case List.last(selected) do
-                %{seq: seq} -> Map.put(marks, key, seq)
-                nil -> marks
-              end
+      _ ->
+        stop_with(Payloads.wire_error("invalid_message"), state)
+    end
+  end
 
-            {messages ++ selected, truncated or length(rows) == 501, marks}
-          end)
+  defp auth_replay(msg, device, conn_ref, subscriptions, state) do
+    chat? = MapSet.member?(subscriptions, "chat")
+    sessions = if chat?, do: Org.list_for_user(db(state), device.user_id, false), else: []
+    keys = Enum.map(sessions, & &1.session_key)
+    cursors = replay_cursors(msg, device.user_id, state)
 
-        read_states = Projection.read_states(db(state), device.user_id)
+    {replay, truncated?, watermarks} =
+      Enum.reduce(keys, {[], false, %{}}, fn key, {messages, truncated, marks} ->
+        barrier = Enum.find_value(sessions, 0, &(&1.session_key == key && &1.cleared_through_seq))
+        rows = Projection.list_after(db(state), key, cursors[key], 501, barrier || 0)
+        selected = Enum.take(rows, 500)
 
-        tail_states =
-          Map.new(keys, fn key -> {key, Projection.tail(db(state), key)} end)
-          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-          |> Map.new()
-          |> Map.new(fn {key, tail} ->
-            {key,
-             %{
-               "lastMessageId" => tail.last_message_id,
-               "lastMessageRole" => tail.last_message_role
-             }}
-          end)
+        Enum.each(selected, fn message ->
+          ConnRegistry.note_replayed(conn_registry(state), conn_ref, key, message.seq)
+        end)
 
-        auth_payload =
-          Payloads.auth_result_success(%{
-            user_id: device.user_id,
-            session_id: "conn_#{device.device_id}",
-            is_admin: device.is_admin,
-            replay_count: length(replay),
-            replay_truncated: truncated?,
-            history_reset: false,
-            session_keys: keys,
-            stream_read_states: read_states,
-            stream_tail_states: tail_states,
-            features: ["tightbeam"],
-            dm_scope: if(device.is_admin, do: "admin", else: nil)
-          })
+        marks =
+          case List.last(selected) do
+            %{seq: seq} -> Map.put(marks, key, seq)
+            nil -> marks
+          end
 
-        snapshot =
-          Payloads.stream_snapshot(Enum.map(sessions, &(&1 |> Payloads.stream_session())))
+        {messages ++ selected, truncated or length(rows) == 501, marks}
+      end)
 
-        state = %{
-          state
-          | conn_ref: conn_ref,
-            user_id: device.user_id,
-            device_id: device.device_id,
-            is_admin: device.is_admin,
-            phase: :replaying,
-            watermarks: watermarks
-        }
+    read_states = if chat?, do: Projection.read_states(db(state), device.user_id), else: %{}
 
-        state = state |> schedule_ping() |> arm_pong_deadline()
-        send(self(), :finish_replay)
-        push_many([auth_payload, snapshot | Enum.map(replay, &Payloads.server_message/1)], state)
+    tail_states =
+      Map.new(keys, fn key -> {key, Projection.tail(db(state), key)} end)
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Map.new()
+      |> Map.new(fn {key, tail} ->
+        {key,
+         %{
+           "lastMessageId" => tail.last_message_id,
+           "lastMessageRole" => tail.last_message_role
+         }}
+      end)
+
+    auth_payload =
+      Payloads.auth_result_success(%{
+        user_id: device.user_id,
+        session_id: "conn_#{device.device_id}",
+        is_admin: device.is_admin,
+        replay_count: length(replay),
+        replay_truncated: truncated?,
+        history_reset: false,
+        session_keys: keys,
+        stream_read_states: read_states,
+        stream_tail_states: tail_states,
+        features: ["tightbeam"],
+        dm_scope: if(device.is_admin, do: "admin", else: nil)
+      })
+
+    snapshot =
+      Payloads.stream_snapshot(Enum.map(sessions, &(&1 |> Payloads.stream_session())))
+
+    state = %{
+      state
+      | conn_ref: conn_ref,
+        user_id: device.user_id,
+        device_id: device.device_id,
+        is_admin: device.is_admin,
+        subscriptions: subscriptions,
+        phase: :replaying,
+        watermarks: watermarks
+    }
+
+    state = state |> schedule_ping() |> arm_pong_deadline()
+    send(self(), :finish_replay)
+
+    frames =
+      if chat?,
+        do: [auth_payload, snapshot | Enum.map(replay, &Payloads.server_message/1)],
+        else: [auth_payload]
+
+    push_many(frames, state)
+  end
+
+  defp parse_subscriptions(msg, default) do
+    case Map.fetch(msg, "subscriptions") do
+      :error ->
+        {:ok, default}
+
+      {:ok, subscriptions} when is_list(subscriptions) and subscriptions != [] ->
+        if Enum.all?(subscriptions, &(&1 in ["chat", "work_state"])),
+          do: {:ok, MapSet.new(subscriptions)},
+          else: :error
+
+      _ ->
+        :error
     end
   end
 

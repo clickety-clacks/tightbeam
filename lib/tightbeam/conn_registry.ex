@@ -34,11 +34,13 @@ defmodule Tightbeam.ConnRegistry do
   @type deliver :: (pid(), term() -> any())
 
   defstruct conns: %{}, devices: %{}, rate_windows: %{}
-  # conns:   ref => %{pid, user_id, device_id, is_admin, gen, delivered: %{session_key => seq}}
+
+  # conns:   ref => %{pid, user_id, device_id, is_admin, subscriptions, gen, delivered: %{session_key => seq}}
   # devices: device_id => %{ref, gen}
 
   @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, :ok, name: Keyword.get(opts, :name, __MODULE__))
+  def start_link(opts \\ []),
+    do: GenServer.start_link(__MODULE__, :ok, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc """
   Register/authenticate a connection for a device. Returns
@@ -46,9 +48,18 @@ defmodule Tightbeam.ConnRegistry do
   (or nil). The caller sends session_replaced+close to `replaced` — AFTER this
   returns, so the new registration already owns the slot.
   """
-  @spec register(server(), %{pid: pid(), user_id: String.t(), device_id: String.t(), is_admin: boolean()}) ::
+  @spec register(server(), %{
+          pid: pid(),
+          user_id: String.t(),
+          device_id: String.t(),
+          is_admin: boolean(),
+          subscriptions: MapSet.t(String.t())
+        }) ::
           {:ok, reference(), reference() | nil}
-  def register(server \\ __MODULE__, %{pid: _, user_id: _, device_id: _, is_admin: _} = conn) do
+  def register(
+        server \\ __MODULE__,
+        %{pid: _, user_id: _, device_id: _, is_admin: _, subscriptions: %MapSet{}} = conn
+      ) do
     GenServer.call(server, {:register, conn})
   end
 
@@ -74,6 +85,18 @@ defmodule Tightbeam.ConnRegistry do
   @spec broadcast(server(), String.t(), term(), deliver()) :: :ok
   def broadcast(server \\ __MODULE__, owner_user_id, payload, deliver) do
     GenServer.call(server, {:broadcast, owner_user_id, payload, deliver})
+  end
+
+  @doc "Publish an assignment-grain doorbell to the holder owner's work-state subscribers."
+  @spec publish_work_state(server(), String.t(), term(), deliver()) :: :ok
+  def publish_work_state(server \\ __MODULE__, owner_user_id, payload, deliver) do
+    GenServer.call(server, {:publish_work_state, owner_user_id, payload, deliver})
+  end
+
+  @doc "Publish a work-item-grain doorbell to its owners' work-state subscribers."
+  @spec publish_work_item(server(), MapSet.t(String.t()), term(), deliver()) :: :ok
+  def publish_work_item(server \\ __MODULE__, owner_user_ids, payload, deliver) do
+    GenServer.call(server, {:publish_work_item, owner_user_ids, payload, deliver})
   end
 
   @doc "Advance a connection's delivered watermark during replay (per session)."
@@ -109,6 +132,7 @@ defmodule Tightbeam.ConnRegistry do
       user_id: conn.user_id,
       device_id: device_id,
       is_admin: conn.is_admin,
+      subscriptions: conn.subscriptions,
       gen: gen,
       delivered: %{}
     }
@@ -135,7 +159,7 @@ defmodule Tightbeam.ConnRegistry do
     conns =
       Enum.reduce(state.conns, state.conns, fn {ref, e}, acc ->
         cond do
-          e.user_id != owner ->
+          e.user_id != owner or not MapSet.member?(e.subscriptions, "chat") ->
             acc
 
           Map.get(e.delivered, session_key, 0) >= seq ->
@@ -152,7 +176,26 @@ defmodule Tightbeam.ConnRegistry do
   end
 
   def handle_call({:broadcast, owner, payload, deliver}, _from, state) do
-    for {_ref, e} <- state.conns, e.user_id == owner, do: deliver.(e.pid, payload)
+    for {_ref, e} <- state.conns,
+        e.user_id == owner and MapSet.member?(e.subscriptions, "chat"),
+        do: deliver.(e.pid, payload)
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:publish_work_state, owner, payload, deliver}, _from, state) do
+    for {_ref, e} <- state.conns,
+        e.user_id == owner and MapSet.member?(e.subscriptions, "work_state"),
+        do: deliver.(e.pid, payload)
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:publish_work_item, owners, payload, deliver}, _from, state) do
+    for {_ref, e} <- state.conns,
+        MapSet.member?(owners, e.user_id) and MapSet.member?(e.subscriptions, "work_state"),
+        do: deliver.(e.pid, payload)
+
     {:reply, :ok, state}
   end
 
@@ -191,7 +234,8 @@ defmodule Tightbeam.ConnRegistry do
         {:noreply, state}
 
       _ ->
-        {:noreply, update_in(state.conns[ref].delivered[session_key], fn cur -> max(cur || 0, seq) end)}
+        {:noreply,
+         update_in(state.conns[ref].delivered[session_key], fn cur -> max(cur || 0, seq) end)}
     end
   end
 

@@ -16,7 +16,8 @@ defmodule Tightbeam.SupervisionTest do
     Rules,
     Supervision,
     Wakes,
-    WorkItems
+    WorkItems,
+    WorkState
   }
 
   defmodule LaneDoorbell do
@@ -52,7 +53,8 @@ defmodule Tightbeam.SupervisionTest do
           Assignments,
           Ledger,
           Wakes,
-          Supervision
+          Supervision,
+          WorkState
         ] do
       :ok = module.ensure_schema(db)
     end

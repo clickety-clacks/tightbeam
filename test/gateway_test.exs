@@ -157,7 +157,8 @@ defmodule Tightbeam.GatewayTest do
         pid: self(),
         user_id: "flynn",
         device_id: "d1",
-        is_admin: false
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
       })
 
     %{db: db, registry: registry, lane: lane}
@@ -1357,7 +1358,8 @@ defmodule Tightbeam.GatewayTest do
         pid: self(),
         user_id: "flynn",
         device_id: "golden",
-        is_admin: false
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
       })
 
     base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
@@ -1479,7 +1481,8 @@ defmodule Tightbeam.GatewayTest do
         pid: self(),
         user_id: "flynn",
         device_id: "remote-url",
-        is_admin: false
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
       })
 
     base =
@@ -1587,7 +1590,8 @@ defmodule Tightbeam.GatewayTest do
         pid: self(),
         user_id: "flynn",
         device_id: "marker",
-        is_admin: false
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
       })
 
     base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
@@ -1671,7 +1675,8 @@ defmodule Tightbeam.GatewayTest do
         pid: self(),
         user_id: "flynn",
         device_id: "contained-failure",
-        is_admin: false
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
       })
 
     base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
@@ -1738,7 +1743,8 @@ defmodule Tightbeam.GatewayTest do
         pid: self(),
         user_id: "flynn",
         device_id: "failed",
-        is_admin: false
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
       })
 
     base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")

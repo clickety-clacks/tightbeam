@@ -12,14 +12,15 @@ defmodule Tightbeam.AssignmentsTest do
     Org,
     Roles,
     Rules,
-    WorkItems
+    WorkItems,
+    WorkState
   }
 
   setup do
     db = :"assignments_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Devices, Idempotency, Org, Roles, WorkItems, Assignments, EventLog] do
+    for module <- [Devices, Idempotency, Org, Roles, WorkItems, Assignments, WorkState, EventLog] do
       :ok = module.ensure_schema(db)
     end
 

@@ -60,7 +60,21 @@ defmodule Tightbeam.WorkItems do
 
   defp update_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
-      transaction(db, fn txn -> update_in_txn(txn, call.params) end)
+      result = transaction(db, fn txn -> update_in_txn(txn, call.params) end)
+
+      case result do
+        {:updated, item, changed?} ->
+          if changed? do
+            best_effort(fn ->
+              Map.get(call, :on_work_item_change, fn _, _ -> :ok end).(item.id, "metadata")
+            end)
+          end
+
+          item
+
+        error ->
+          error
+      end
     end
   end
 
@@ -77,7 +91,8 @@ defmodule Tightbeam.WorkItems do
 
         with :ok <- valid_title(title),
              :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256) do
-          apply_updates(txn, item, updates)
+          updated = apply_updates(txn, item, updates)
+          {:updated, updated, metadata(item) != metadata(updated)}
         end
     end
   end
@@ -216,6 +231,18 @@ defmodule Tightbeam.WorkItems do
   defp creator({:session, session}), do: {nil, session}
   defp unknown(id), do: error("unknown_work_item", "unknown work item: #{id}")
   defp error(code, message), do: %{code: code, message: message}
+
+  defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256}
+
+  defp best_effort(fun) do
+    try do
+      fun.()
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
 
   defp transaction(db, fun) do
     case DB.transaction(db, fun) do
