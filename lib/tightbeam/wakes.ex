@@ -35,7 +35,10 @@ defmodule Tightbeam.Wakes do
           due_at: integer(),
           state: String.t(),
           created_at: integer(),
-          fired_at: integer() | nil
+          fired_at: integer() | nil,
+          reresolve: String.t() | nil,
+          reresolve_seed: String.t() | nil,
+          reresolve_rung: integer() | nil
         }
 
   @typedoc "Delivery fun injected by the composition root: fires the prompt into the turn pipeline."
@@ -51,7 +54,10 @@ defmodule Tightbeam.Wakes do
     dueAt      INTEGER NOT NULL,
     state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
     createdAt  INTEGER NOT NULL,
-    firedAt    INTEGER
+    firedAt    INTEGER,
+    reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
+    reresolveSeed TEXT NULL,
+    reresolveRung INTEGER NULL
   );
   CREATE INDEX IF NOT EXISTS wakes_due ON wakes (state, dueAt);
   """
@@ -60,9 +66,16 @@ defmodule Tightbeam.Wakes do
   def ensure_schema(db \\ Tightbeam.DB) do
     result = DB.execute(db, @ddl)
 
-    case DB.query(db, "ALTER TABLE wakes ADD COLUMN targetRole TEXT") do
-      {:ok, _} -> :ok
-      {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+    for ddl <- [
+          "ALTER TABLE wakes ADD COLUMN targetRole TEXT",
+          "ALTER TABLE wakes ADD COLUMN reresolve TEXT NULL CHECK (reresolve IN ('lineage'))",
+          "ALTER TABLE wakes ADD COLUMN reresolveSeed TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN reresolveRung INTEGER NULL"
+        ] do
+      case DB.query(db, ddl) do
+        {:ok, _} -> :ok
+        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+      end
     end
 
     result
@@ -88,7 +101,10 @@ defmodule Tightbeam.Wakes do
       due_at: Map.fetch!(input, :due_at),
       state: "pending",
       created_at: now(),
-      fired_at: nil
+      fired_at: nil,
+      reresolve: Map.get(input, :reresolve),
+      reresolve_seed: Map.get(input, :reresolve_seed),
+      reresolve_rung: Map.get(input, :reresolve_rung)
     }
 
     transaction!(db, fn txn ->
@@ -96,8 +112,9 @@ defmodule Tightbeam.Wakes do
         txn,
         """
           INSERT INTO wakes
-            (wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL)
+            (wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt,
+             reresolve, reresolveSeed, reresolveRung)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, ?8, ?9, ?10)
         """,
         [
           wake.wake_id,
@@ -106,7 +123,10 @@ defmodule Tightbeam.Wakes do
           wake.origin,
           wake.prompt,
           wake.due_at,
-          wake.created_at
+          wake.created_at,
+          wake.reresolve,
+          wake.reresolve_seed,
+          wake.reresolve_rung
         ]
       )
 
@@ -148,6 +168,17 @@ defmodule Tightbeam.Wakes do
       DB.query(db, select_wake_sql() <> " WHERE state = 'pending' ORDER BY dueAt ASC")
 
     Enum.map(rows, &to_wake/1)
+  end
+
+  @doc "Count pending wakes resolved to a session key."
+  @spec pending_count(db(), String.t()) :: non_neg_integer()
+  def pending_count(db \\ Tightbeam.DB, session_key) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT count(*) FROM wakes WHERE state = 'pending' AND sessionKey = ?1", [
+        session_key
+      ])
+
+    count
   end
 
   ## Scheduler process
@@ -203,7 +234,11 @@ defmodule Tightbeam.Wakes do
   # mark redelivers, deduped by turns.wakeId.
   defp deliver_due(%{db: db, deliver: deliver}) do
     {:ok, rows} =
-      DB.query(db, select_wake_sql() <> " WHERE state = 'pending' AND dueAt <= ?1 ORDER BY dueAt ASC", [now()])
+      DB.query(
+        db,
+        select_wake_sql() <> " WHERE state = 'pending' AND dueAt <= ?1 ORDER BY dueAt ASC",
+        [now()]
+      )
 
     for row <- rows do
       wake = to_wake(row)
@@ -233,7 +268,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung FROM wakes"
   end
 
   defp to_wake([
@@ -245,7 +280,10 @@ defmodule Tightbeam.Wakes do
          due_at,
          state,
          created_at,
-         fired_at
+         fired_at,
+         reresolve,
+         reresolve_seed,
+         reresolve_rung
        ]) do
     %{
       wake_id: wake_id,
@@ -256,7 +294,10 @@ defmodule Tightbeam.Wakes do
       due_at: due_at,
       state: state,
       created_at: created_at,
-      fired_at: fired_at
+      fired_at: fired_at,
+      reresolve: reresolve,
+      reresolve_seed: reresolve_seed,
+      reresolve_rung: reresolve_rung
     }
   end
 

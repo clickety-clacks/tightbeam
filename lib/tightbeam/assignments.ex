@@ -92,6 +92,31 @@ defmodule Tightbeam.Assignments do
     count
   end
 
+  @doc "Return the oldest open assignment held by a session."
+  @spec oldest_open(DB.server(), String.t()) :: map() | nil
+  def oldest_open(db, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT #{columns()} FROM assignments WHERE holderKey = ?1 AND state = 'open' ORDER BY openedAt ASC, id ASC LIMIT 1",
+        [session_key]
+      )
+
+    case rows do
+      [row] -> assignment(row)
+      [] -> nil
+    end
+  end
+
+  @doc "Count attest rows for an assignment."
+  @spec attest_count(DB.server(), String.t()) :: non_neg_integer()
+  def attest_count(db, assignment_id) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT count(*) FROM attests WHERE assignmentId = ?1", [assignment_id])
+
+    count
+  end
+
   @doc "List assignments using optional holder_key and state filters."
   @spec list(DB.server(), map()) :: [map()]
   def list(db, filters) do

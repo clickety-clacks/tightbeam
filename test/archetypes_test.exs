@@ -41,7 +41,12 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert loaded["coder"] == %{
              name: "coder",
-             skills: ["tightbeam-assimilate", "tightbeam-harnesses", "tightbeam-skills"],
+             skills: [
+               "tightbeam-assimilate",
+               "tightbeam-dispatching",
+               "tightbeam-harnesses",
+               "tightbeam-skills"
+             ],
              where: ["work-1", "work-2"],
              fallback_models: [],
              defaults: %{harness: :codex, model: "gpt-5.6-sol[medium]"},
@@ -540,6 +545,12 @@ defmodule Tightbeam.ArchetypesTest do
         messages, your visible reply and your ACTIONS are the response. A stamp
         bearing your own role is your earlier self following up: act, don't
         reply.
+      - NEVER end a turn with outstanding work and nothing on the clock:
+        while you hold an open assignment, end every turn with a filing
+        (`tightbeam attest <id> --kind progress|completion|surrender`) or a
+        scheduled continuation wake to yourself. A turn that ends with
+        neither draws a prod; prods answered without rows escalate to your
+        spawner.
 
       ## Your materials
       - repo: work-1:~/src/example-repo
@@ -558,7 +569,11 @@ defmodule Tightbeam.ArchetypesTest do
     without_references = %{archetype | references: [], guidance: "Additional law."}
     compiled = Archetypes.guidance(without_references)
     refute compiled =~ "## Your materials"
-    assert String.ends_with?(compiled, "act, don't\n  reply.\n\nAdditional law.")
+
+    assert String.ends_with?(
+             compiled,
+             "without rows escalate to your\n  spawner.\n\nAdditional law."
+           )
   end
 
   test "fragments: operator files override built-ins and #include composes", ctx do
