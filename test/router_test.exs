@@ -45,6 +45,25 @@ defmodule Tightbeam.Wire.RouterTest do
       "assignments" => fn call ->
         send(parent, {:call, call})
         %{assignments: []}
+      end,
+      "work-item-create" => fn call ->
+        send(parent, {:call, call})
+        %{id: "wi_test", title: call.params.title}
+      end,
+      "work-item-get" => fn call ->
+        send(parent, {:call, call})
+
+        if call.params[:return_code],
+          do: %{code: call.params.return_code},
+          else: %{workItem: %{id: call.params.work_item_id}, assignments: []}
+      end,
+      "work-item-list" => fn call ->
+        send(parent, {:call, call})
+        %{workItems: []}
+      end,
+      "work-item-update" => fn call ->
+        send(parent, {:call, call})
+        %{id: call.params.work_item_id, title: call.params[:title]}
       end
     }
 
@@ -60,6 +79,38 @@ defmodule Tightbeam.Wire.RouterTest do
         session_status: fn _ -> nil end
       ]
     }
+  end
+
+  test "all work-item verbs route, preserve generic target behavior, and map unknown ids", ctx do
+    target = create_session(ctx.db, "work-item-target", "flynn")
+
+    for {verb, params} <- [
+          {"work-item-create", %{title: "Create"}},
+          {"work-item-get", %{workItemId: "wi_test"}},
+          {"work-item-list", %{}},
+          {"work-item-update", %{workItemId: "wi_test", title: "Update"}}
+        ] do
+      response =
+        dispatch_cli(ctx, "tbc_test", %{
+          verb: verb,
+          asUser: "flynn",
+          sessionKey: target.session_key,
+          params: params
+        })
+
+      assert response.status == 200
+      assert_receive {:call, %{verb: ^verb, session_key: "work-item-target"}}
+    end
+
+    missing =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "work-item-get",
+        asUser: "flynn",
+        params: %{workItemId: "missing", returnCode: "unknown_work_item"}
+      })
+
+    assert missing.status == 404
+    assert JSON.decode!(missing.resp_body)["error"]["code"] == "unknown_work_item"
   end
 
   test "device routes require a device bearer", ctx do

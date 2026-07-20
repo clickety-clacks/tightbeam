@@ -67,6 +67,22 @@ defmodule Tightbeam.CliIntegrationTest do
       "assignments" => fn call ->
         send(test_pid, {:cli_call, call})
         %{assignments: [%{id: "asg_cli"}]}
+      end,
+      "work-item-create" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{id: "wi_cli", title: call.params.title}
+      end,
+      "work-item-update" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{id: call.params.work_item_id, title: call.params[:title]}
+      end,
+      "work-item-get" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{workItem: %{id: call.params.work_item_id}, assignments: []}
+      end,
+      "work-item-list" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{workItems: [%{id: "wi_cli"}]}
       end
     }
 
@@ -131,7 +147,17 @@ defmodule Tightbeam.CliIntegrationTest do
     {assigned, 0} =
       System.cmd(
         ctx.binary,
-        ["assign", "--subject", "ship", "--session", "cli-holder", "--idempotency-key", "idem"],
+        [
+          "assign",
+          "--subject",
+          "ship",
+          "--session",
+          "cli-holder",
+          "--idempotency-key",
+          "idem",
+          "--work-item",
+          "wi_cli"
+        ],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -142,7 +168,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     %{
                       verb: "assign",
                       session_key: "cli-holder",
-                      params: %{subject: "ship", idempotency_key: "idem"}
+                      params: %{subject: "ship", idempotency_key: "idem", work_item_id: "wi_cli"}
                     }}
 
     {attested, 0} =
@@ -183,5 +209,84 @@ defmodule Tightbeam.CliIntegrationTest do
                       target_role: "cli-holder",
                       params: %{state: "all"}
                     }}
+  end
+
+  test "real CLI dispatches every work-item subcommand and enforces usage pairing", ctx do
+    sha = String.duplicate("a", 64)
+
+    {created, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-create",
+          "--title",
+          "Ship",
+          "--spec-ref",
+          "spec.md",
+          "--spec-sha256",
+          sha
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert created =~ "wi_cli"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-create",
+                      params: %{title: "Ship", spec_ref_name: "spec.md", spec_ref_sha256: ^sha}
+                    }}
+
+    {updated, 0} =
+      System.cmd(ctx.binary, ["work-item-update", "wi_cli", "--clear-spec-ref"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert updated =~ "wi_cli"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: "wi_cli",
+                        spec_ref_name: nil,
+                        spec_ref_sha256: nil
+                      }
+                    }}
+
+    {got, 0} =
+      System.cmd(ctx.binary, ["work-item-get", "wi_cli"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert got =~ "wi_cli"
+    assert_receive {:cli_call, %{verb: "work-item-get", params: %{work_item_id: "wi_cli"}}}
+
+    {listed, 0} =
+      System.cmd(ctx.binary, ["work-item-list"], cd: ctx.workdir, stderr_to_stdout: true)
+
+    assert listed =~ "wi_cli"
+    assert_receive {:cli_call, %{verb: "work-item-list", params: %{}}}
+
+    {pairing, 1} =
+      System.cmd(ctx.binary, ["work-item-create", "--title", "x", "--spec-ref", "spec.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert pairing =~ "supplied together"
+
+    {conflict, 1} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", "wi_cli", "--clear-spec-ref", "--spec-ref", "spec.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert conflict =~ "conflicts"
   end
 end

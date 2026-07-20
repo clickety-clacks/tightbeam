@@ -75,7 +75,8 @@ defmodule Tightbeam.Gateway do
     Rules,
     Roles,
     Spinup,
-    Wakes
+    Wakes,
+    WorkItems
   }
 
   alias Tightbeam.Acp.Adapter
@@ -127,6 +128,7 @@ defmodule Tightbeam.Gateway do
           Projection,
           Org,
           Roles,
+          WorkItems,
           Assignments
         ] do
       :ok = module.ensure_schema(db)
@@ -401,6 +403,10 @@ defmodule Tightbeam.Gateway do
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
       "role-list" => fn _call -> role_list_result(db) end,
+      "work-item-create" => fn call -> WorkItems.__handle__(db, "work-item-create", call) end,
+      "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
+      "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
+      "work-item-update" => fn call -> WorkItems.__handle__(db, "work-item-update", call) end,
       "assign" => fn call -> Assignments.__handle__(db, "assign", call) end,
       "attest" => fn call -> Assignments.__handle__(db, "attest", call) end,
       "revoke-assignment" => fn call -> Assignments.__handle__(db, "revoke-assignment", call) end,

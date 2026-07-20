@@ -147,6 +147,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             subject,
             target,
             idempotency_key,
+            work_item_id,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -157,7 +158,62 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
             }
+            if let Some(value) = work_item_id {
+                params.push(string_field("workItemId", value));
+            }
             Ok(request(identity, "assign", vec![target], params))
+        }
+        Command::WorkItemCreate {
+            identity,
+            title,
+            spec_ref_name,
+            spec_ref_sha256,
+        } => {
+            let mut params = vec![string_field("title", title)];
+            if let Some(value) = spec_ref_name {
+                params.push(string_field("specRefName", value));
+            }
+            if let Some(value) = spec_ref_sha256 {
+                params.push(string_field("specRefSha256", value));
+            }
+            Ok(request(identity, "work-item-create", vec![], params))
+        }
+        Command::WorkItemUpdate {
+            identity,
+            work_item_id,
+            title,
+            spec_ref_name,
+            spec_ref_sha256,
+            clear_spec_ref,
+        } => {
+            let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = title {
+                params.push(string_field("title", value));
+            }
+            if *clear_spec_ref {
+                params.push("\"specRefName\":null".to_owned());
+                params.push("\"specRefSha256\":null".to_owned());
+            } else {
+                if let Some(value) = spec_ref_name {
+                    params.push(string_field("specRefName", value));
+                }
+                if let Some(value) = spec_ref_sha256 {
+                    params.push(string_field("specRefSha256", value));
+                }
+            }
+            Ok(request(identity, "work-item-update", vec![], params))
+        }
+        Command::WorkItemGet {
+            identity,
+            work_item_id,
+        } => Ok(request(
+            identity,
+            "work-item-get",
+            vec![],
+            vec![string_field("workItemId", work_item_id)],
+        )),
+        Command::WorkItemList { identity } => {
+            Ok(request(identity, "work-item-list", vec![], vec![]))
         }
         Command::Attest {
             identity,
@@ -488,6 +544,10 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::List { identity }
         | Command::Retire { identity, .. }
         | Command::Assign { identity, .. }
+        | Command::WorkItemCreate { identity, .. }
+        | Command::WorkItemUpdate { identity, .. }
+        | Command::WorkItemGet { identity, .. }
+        | Command::WorkItemList { identity }
         | Command::Attest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::Assignments { identity, .. }
@@ -659,10 +719,12 @@ mod tests {
                 "builder",
                 "--idempotency-key",
                 "idem",
+                "--work-item",
+                "wi_1",
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem"}}"#
+            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -692,6 +754,45 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_work_item_bodies() {
+        let sha = "a".repeat(64);
+        assert_eq!(
+            body(&[
+                "work-item-create",
+                "--title",
+                "Ship",
+                "--spec-ref",
+                "spec.md",
+                "--spec-sha256",
+                &sha,
+                "--as-user",
+                "flynn"
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-create","params":{{"title":"Ship","specRefName":"spec.md","specRefSha256":"{sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
+        );
+        assert_eq!(
+            body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-list", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-list","params":{}}"#
         );
     }
 

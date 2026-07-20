@@ -60,6 +60,28 @@ pub enum Command {
         subject: String,
         target: Target,
         idempotency_key: Option<String>,
+        work_item_id: Option<String>,
+    },
+    WorkItemCreate {
+        identity: Identity,
+        title: String,
+        spec_ref_name: Option<String>,
+        spec_ref_sha256: Option<String>,
+    },
+    WorkItemUpdate {
+        identity: Identity,
+        work_item_id: String,
+        title: Option<String>,
+        spec_ref_name: Option<String>,
+        spec_ref_sha256: Option<String>,
+        clear_spec_ref: bool,
+    },
+    WorkItemGet {
+        identity: Identity,
+        work_item_id: String,
+    },
+    WorkItemList {
+        identity: Identity,
     },
     Attest {
         identity: Identity,
@@ -210,9 +232,15 @@ COMMANDS:
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
 
+  work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
+  work-item-update <workItemId> [--title "<title>"] [--spec-ref <name>]
+                   [--spec-sha256 <hex>] [--clear-spec-ref]
+  work-item-get <workItemId>
+  work-item-list
   assign --subject "<work>" (--session <key> | --role <name>)
-         [--idempotency-key <key>]
-      Open an obligation held by a session.
+         [--idempotency-key <key>] [--work-item <workItemId>]
+      Open an obligation held by a session; a work item is the durable thread
+      across assignments.
   attest <assignmentId> --kind progress|completion|surrender [--note "..."]
       File against an assignment held by this session.
   revoke-assignment <assignmentId>
@@ -276,6 +304,7 @@ DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
   tightbeam help | --help | -h    show this text."#;
 
 const BOOLEAN_FLAGS: &[&str] = &[
+    "clear-spec-ref",
     "demote",
     "dry-run",
     "force",
@@ -568,6 +597,75 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 subject,
                 target: targets.into_iter().next().expect("exactly one target"),
                 idempotency_key: nonempty(flags, "idempotency-key"),
+                work_item_id: nonempty(flags, "work-item"),
+            })
+        }
+        "work-item-create" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
+            }
+            let spec_ref_name = nonempty(flags, "spec-ref");
+            let spec_ref_sha256 = nonempty(flags, "spec-sha256");
+            let spec_ref_present = flags.contains_key("spec-ref");
+            let spec_sha_present = flags.contains_key("spec-sha256");
+            if spec_ref_present != spec_sha_present
+                || (spec_ref_present && (spec_ref_name.is_none() || spec_ref_sha256.is_none()))
+            {
+                return Err(
+                    "usage: --spec-ref and --spec-sha256 must be supplied together".to_owned(),
+                );
+            }
+            Ok(Command::WorkItemCreate {
+                identity: identity(flags)?,
+                title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
+                spec_ref_name,
+                spec_ref_sha256,
+            })
+        }
+        "work-item-update" => {
+            let work_item_id = parsed.positional.get(1).cloned().ok_or_else(|| {
+                "usage: tightbeam work-item-update <workItemId> [patch flags]".to_owned()
+            })?;
+            if parsed.positional.len() != 2 {
+                return Err(
+                    "usage: tightbeam work-item-update <workItemId> [patch flags]".to_owned(),
+                );
+            }
+            let clear_spec_ref = flags.contains_key("clear-spec-ref");
+            let spec_ref_name = nonempty(flags, "spec-ref");
+            let spec_ref_sha256 = nonempty(flags, "spec-sha256");
+            if clear_spec_ref
+                && (flags.contains_key("spec-ref") || flags.contains_key("spec-sha256"))
+            {
+                return Err(
+                    "usage: --clear-spec-ref conflicts with --spec-ref and --spec-sha256"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::WorkItemUpdate {
+                identity: identity(flags)?,
+                work_item_id,
+                title: nonempty(flags, "title"),
+                spec_ref_name,
+                spec_ref_sha256,
+                clear_spec_ref,
+            })
+        }
+        "work-item-get" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-get <workItemId>".to_owned());
+            }
+            Ok(Command::WorkItemGet {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+            })
+        }
+        "work-item-list" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam work-item-list".to_owned());
+            }
+            Ok(Command::WorkItemList {
+                identity: identity(flags)?,
             })
         }
         "attest" => {
@@ -692,7 +790,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, assign, attest, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe"
         )),
     }
 }
@@ -883,8 +981,44 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, assign, attest, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe".to_owned())
         );
+    }
+
+    #[test]
+    fn work_item_cli_usage_rules_are_pinned() {
+        assert!(
+            parse(strings(&[
+                "work-item-create",
+                "--title",
+                "x",
+                "--spec-ref",
+                "spec.md"
+            ]))
+            .unwrap_err()
+            .contains("supplied together")
+        );
+
+        assert!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--spec-ref",
+                "spec.md"
+            ]))
+            .unwrap_err()
+            .contains("conflicts")
+        );
+
+        for args in [
+            strings(&["work-item-create", "--title", "x"]),
+            strings(&["work-item-update", "wi_1", "--title", "y"]),
+            strings(&["work-item-get", "wi_1"]),
+            strings(&["work-item-list"]),
+        ] {
+            assert!(parse(args).is_ok());
+        }
     }
 
     #[test]

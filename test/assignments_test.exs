@@ -11,14 +11,15 @@ defmodule Tightbeam.AssignmentsTest do
     Idempotency,
     Org,
     Roles,
-    Rules
+    Rules,
+    WorkItems
   }
 
   setup do
     db = :"assignments_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Devices, Idempotency, Org, Roles, Assignments, EventLog] do
+    for module <- [Devices, Idempotency, Org, Roles, WorkItems, Assignments, EventLog] do
       :ok = module.ensure_schema(db)
     end
 
@@ -89,6 +90,7 @@ defmodule Tightbeam.AssignmentsTest do
     user_opened = handle(ctx, "assign", assign_call({:user, "flynn"}, "user work"))
     assert user_opened.openedByUser == "flynn"
     assert user_opened.openedBySession == nil
+    assert user_opened.workItemId == nil
 
     session_opened = handle(ctx, "assign", assign_call({:session, "holder"}, "session work"))
     assert session_opened.openedBySession == "holder"
@@ -114,6 +116,78 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'once'")
+  end
+
+  test "work-item links validate on create but idempotent replay returns the original link",
+       ctx do
+    first =
+      handle(
+        ctx,
+        "work-item-create",
+        work_item_call("work-item-create", {:user, "flynn"}, %{title: "First"})
+      )
+
+    second =
+      handle(
+        ctx,
+        "work-item-create",
+        work_item_call("work-item-create", {:user, "flynn"}, %{title: "Second"})
+      )
+
+    linked =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", first.id))
+
+    assert linked.workItemId == first.id
+
+    for work_item_id <- [second.id, nil, "wi_missing"] do
+      replay =
+        handle(ctx, "assign", assign_call({:user, "flynn"}, "ignored", "work-key", work_item_id))
+
+      assert replay.id == linked.id
+      assert replay.workItemId == first.id
+    end
+
+    assert %{code: "unknown_work_item"} =
+             handle(
+               ctx,
+               "assign",
+               assign_call({:user, "flynn"}, "not inserted", nil, "wi_missing")
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'not inserted'")
+  end
+
+  test "attest-era database gains nullable workItemId additively and idempotently" do
+    db = :"assignment_migration_db_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: db,
+      start: {DB, :start_link, [[path: ":memory:", name: db]]}
+    })
+
+    :ok = WorkItems.ensure_schema(db)
+
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE assignments (
+        id TEXT PRIMARY KEY, subject TEXT NOT NULL, holderKey TEXT NOT NULL,
+        holderRole TEXT NULL, holderFallback INTEGER NOT NULL DEFAULT 0,
+        openedByUser TEXT NULL, openedBySession TEXT NULL, openedAt INTEGER NOT NULL,
+        state TEXT NOT NULL DEFAULT 'open', outcome TEXT NULL, closedAt INTEGER NULL,
+        closedByUser TEXT NULL, closedBySession TEXT NULL, closingAttestId TEXT NULL
+      )
+      """)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_old', 'old', 'holder', 'flynn', 1)"
+      )
+
+    :ok = Assignments.ensure_schema(db)
+    :ok = Assignments.ensure_schema(db)
+    assert [%{id: "asg_old", workItemId: nil}] = Assignments.list(db, %{state: "all"})
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
@@ -313,17 +387,27 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'committed'")
   end
 
-  defp handle(ctx, verb, call), do: Assignments.__handle__(ctx.db, verb, %{call | verb: verb})
+  defp handle(ctx, verb, call)
+       when verb in ["assign", "attest", "revoke-assignment", "assignments"],
+       do: Assignments.__handle__(ctx.db, verb, %{call | verb: verb})
+
+  defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
 
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
     result
   end
 
-  defp assign_call(principal, subject \\ "work", key \\ nil) do
-    call("assign", principal, "holder", %{subject: subject, idempotency_key: key})
+  defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do
+    call("assign", principal, "holder", %{
+      subject: subject,
+      idempotency_key: key,
+      work_item_id: work_item_id
+    })
     |> Map.merge(%{target_role: nil, role_fallback: false})
   end
+
+  defp work_item_call(verb, principal, params), do: call(verb, principal, nil, params)
 
   defp attest_call(principal, id, kind),
     do: call("attest", principal, nil, %{assignment_id: id, kind: kind})

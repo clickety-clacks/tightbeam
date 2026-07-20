@@ -9,6 +9,14 @@ defmodule Tightbeam.Assignments do
     defexception message: "assignment closed"
   end
 
+  defmodule UnknownWorkItem do
+    @moduledoc false
+    defexception [:work_item_id]
+
+    @impl true
+    def message(%__MODULE__{work_item_id: id}), do: "unknown work item: #{id}"
+  end
+
   @assignments_ddl """
   CREATE TABLE IF NOT EXISTS assignments (
     id TEXT PRIMARY KEY,
@@ -25,6 +33,7 @@ defmodule Tightbeam.Assignments do
     closedByUser TEXT NULL,
     closedBySession TEXT NULL,
     closingAttestId TEXT NULL REFERENCES attests(id),
+    workItemId TEXT NULL REFERENCES work_items(id),
     CHECK(holderRole IS NOT NULL OR holderFallback = 0),
     CHECK((openedByUser IS NOT NULL) != (openedBySession IS NOT NULL)),
     CHECK(
@@ -57,6 +66,7 @@ defmodule Tightbeam.Assignments do
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
+    ensure_work_item_column(db)
   end
 
   @doc "Count open assignments pinned to a holder session."
@@ -97,6 +107,18 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc false
+  def __for_work_item__(db, work_item_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT #{columns()} FROM assignments WHERE workItemId = ?1 ORDER BY openedAt DESC, id DESC",
+        [work_item_id]
+      )
+
+    Enum.map(rows, &assignment/1)
+  end
+
+  @doc false
   def __handle__(db, "assign", call), do: assign_result(db, call)
   def __handle__(db, "attest", call), do: attest_result(db, call)
   def __handle__(db, "revoke-assignment", call), do: revoke_result(db, call)
@@ -116,6 +138,8 @@ defmodule Tightbeam.Assignments do
         end
       end)
     end
+  rescue
+    error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
   end
 
   defp attest_result(db, call) do
@@ -150,6 +174,15 @@ defmodule Tightbeam.Assignments do
         error("session_retired", "assignments require an active holder session")
 
       [["active"]] ->
+        case call.params[:work_item_id] do
+          nil ->
+            :ok
+
+          work_item_id ->
+            if Txn.q(txn, "SELECT 1 FROM work_items WHERE id = ?1", [work_item_id]) == [],
+              do: raise(UnknownWorkItem, work_item_id: work_item_id)
+        end
+
         id = id("asg_")
         now = now()
         {opened_user, opened_session} = opener(call.principal)
@@ -159,8 +192,8 @@ defmodule Tightbeam.Assignments do
           """
           INSERT INTO assignments
             (id, subject, holderKey, holderRole, holderFallback, openedByUser,
-             openedBySession, openedAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             openedBySession, openedAt, workItemId)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
           """,
           [
             id,
@@ -170,7 +203,8 @@ defmodule Tightbeam.Assignments do
             if(call.role_fallback, do: 1, else: 0),
             opened_user,
             opened_session,
-            now
+            now,
+            call.params[:work_item_id]
           ]
         )
 
@@ -397,7 +431,8 @@ defmodule Tightbeam.Assignments do
 
   defp columns do
     "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
-      "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId"
+      "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
+      ", workItemId"
   end
 
   defp assignment([
@@ -414,7 +449,8 @@ defmodule Tightbeam.Assignments do
          closed_at,
          closed_by_user,
          closed_by_session,
-         closing_attest_id
+         closing_attest_id,
+         work_item_id
        ]) do
     %{
       id: id,
@@ -430,7 +466,23 @@ defmodule Tightbeam.Assignments do
       closedAt: closed_at,
       closedByUser: closed_by_user,
       closedBySession: closed_by_session,
-      closingAttestId: closing_attest_id
+      closingAttestId: closing_attest_id,
+      workItemId: work_item_id
     }
+  end
+
+  defp ensure_work_item_column(db) do
+    case DB.query(
+           db,
+           "ALTER TABLE assignments ADD COLUMN workItemId TEXT REFERENCES work_items(id)"
+         ) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        if inspect(reason) =~ "duplicate column",
+          do: :ok,
+          else: raise(reason)
+    end
   end
 end
