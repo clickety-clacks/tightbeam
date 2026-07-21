@@ -17,6 +17,14 @@ defmodule Tightbeam.Assignments do
     def message(%__MODULE__{work_item_id: id}), do: "unknown work item: #{id}"
   end
 
+  defmodule UnknownReviewTarget do
+    @moduledoc false
+    defexception [:assignment_id]
+
+    @impl true
+    def message(%__MODULE__{assignment_id: id}), do: "unknown review target: #{id}"
+  end
+
   @assignments_ddl """
   CREATE TABLE IF NOT EXISTS assignments (
     id TEXT PRIMARY KEY,
@@ -34,6 +42,9 @@ defmodule Tightbeam.Assignments do
     closedBySession TEXT NULL,
     closingAttestId TEXT NULL REFERENCES attests(id),
     workItemId TEXT NULL REFERENCES work_items(id),
+    reviewsAssignmentId TEXT NULL REFERENCES assignments(id),
+    holderHarness TEXT NULL,
+    holderProvider TEXT NULL,
     CHECK(holderRole IS NOT NULL OR holderFallback = 0),
     CHECK((openedByUser IS NOT NULL) != (openedBySession IS NOT NULL)),
     CHECK(
@@ -57,6 +68,10 @@ defmodule Tightbeam.Assignments do
     note TEXT NULL,
     bySession TEXT NULL REFERENCES sessions(sessionKey),
     byUser TEXT NULL REFERENCES users(userId),
+    producer TEXT NULL,
+    producerCommand TEXT NULL,
+    byHarness TEXT NULL,
+    byProvider TEXT NULL,
     ts INTEGER NOT NULL,
     CHECK(
       (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
@@ -64,11 +79,24 @@ defmodule Tightbeam.Assignments do
       OR
       (kind = 'verdict' AND verdictKind IS NOT NULL AND
        ((bySession IS NOT NULL) != (byUser IS NOT NULL)))
-    )
+    ),
+    CHECK(producer IS NULL OR kind = 'verdict'),
+    CHECK(producerCommand IS NULL OR producer IS NOT NULL),
+    CHECK(byHarness IS NULL OR kind = 'verdict'),
+    CHECK(byProvider IS NULL OR kind = 'verdict')
   )
   """
 
   @attests_rebuild_ddl String.replace(@attests_ddl, "IF NOT EXISTS attests", "attests_new")
+
+  @assignment_files_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_files (
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    path TEXT NOT NULL,
+    PRIMARY KEY (assignmentId, path)
+  );
+  CREATE INDEX IF NOT EXISTS assignment_files_path ON assignment_files(path)
+  """
 
   @doc "Create the assignment/attest schema."
   @spec ensure_schema(DB.server()) :: :ok
@@ -79,6 +107,8 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @attests_ddl)
     ensure_attests_shape(db)
     ensure_work_item_column(db)
+    ensure_assignment_columns(db)
+    :ok = DB.execute(db, @assignment_files_ddl)
   end
 
   @doc "Count open assignments pinned to a holder session."
@@ -156,13 +186,111 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &hd/1)
   end
 
+  @doc "Return commissioned independent review verdict authors for an assignment."
+  @spec commissioned_review_authors(DB.server(), String.t(), String.t()) :: [map()]
+  def commissioned_review_authors(db, assignment_id, a_holder_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT v.verdictKind, v.byHarness, v.byProvider
+        FROM attests AS v
+        JOIN assignments AS r ON r.id = v.assignmentId
+        WHERE r.reviewsAssignmentId = ?1
+          AND v.kind = 'verdict'
+          AND v.bySession = r.holderKey
+          AND (r.openedBySession IS NULL OR r.openedBySession != ?2)
+          AND v.bySession != ?2
+        ORDER BY v.ts ASC, v.id ASC
+        """,
+        [assignment_id, a_holder_key]
+      )
+
+    Enum.map(rows, fn [verdict_kind, by_harness, by_provider] ->
+      %{verdict_kind: verdict_kind, by_harness: by_harness, by_provider: by_provider}
+    end)
+  end
+
+  @doc "Return distinct producer-stamped verdict kinds filed directly on an assignment."
+  @spec produced_verdict_kinds(DB.server(), String.t()) :: [String.t()]
+  def produced_verdict_kinds(db, assignment_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT DISTINCT verdictKind FROM attests WHERE assignmentId = ?1 AND kind = 'verdict' AND producer IS NOT NULL ORDER BY verdictKind",
+        [assignment_id]
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
+  @doc "Return the declared file paths for an assignment."
+  @spec declared_files(DB.server(), String.t()) :: [String.t()]
+  def declared_files(db, assignment_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT path FROM assignment_files WHERE assignmentId = ?1 ORDER BY path",
+        [assignment_id]
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
+  @doc "Return open assignment ids declaring any of the given paths."
+  @spec open_assignments_touching(DB.server(), [String.t()], String.t() | nil) :: [String.t()]
+  def open_assignments_touching(db, paths, exclude_id \\ nil)
+  def open_assignments_touching(_db, [], _exclude_id), do: []
+
+  def open_assignments_touching(db, paths, exclude_id) do
+    {sql, params} = open_assignments_touching_query(paths, exclude_id)
+    {:ok, rows} = DB.query(db, sql, params)
+    Enum.map(rows, &hd/1)
+  end
+
+  @doc "Insert a producer-stamped verdict inside the caller's open transaction."
+  @spec insert_producer_verdict_in_txn(Txn.t(), map()) :: {:ok, map()} | {:error, map()}
+  def insert_producer_verdict_in_txn(%Txn{} = txn, input) do
+    assignment_id = input.assignment_id
+
+    case fetch_assignment(txn, assignment_id) do
+      nil ->
+        {:error, error("unknown_assignment", "unknown assignment: #{assignment_id}")}
+
+      %{state: state} when state != "open" ->
+        {:error, assignment_closed()}
+
+      _assignment ->
+        with :ok <- valid_verdict_kind(input.verdict_kind),
+             :ok <- valid_producer(input.producer) do
+          attest =
+            insert_attest_row(txn, %{
+              assignment_id: assignment_id,
+              kind: "verdict",
+              verdict_kind: input.verdict_kind,
+              note: nil,
+              by_session: input.by_session,
+              by_user: input.by_user,
+              producer: input.producer,
+              producer_command: input.producer_command,
+              by_harness: input.by_harness,
+              by_provider: input.by_provider
+            })
+
+          {:ok, attest}
+        else
+          %{code: _} = failure -> {:error, failure}
+        end
+    end
+  end
+
   @doc "List every attest filed against an assignment in deterministic order."
   @spec list_attests(DB.server(), String.t()) :: [map()]
   def list_attests(db, assignment_id) do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
         [assignment_id]
       )
 
@@ -191,7 +319,8 @@ defmodule Tightbeam.Assignments do
   defp assign_result(db, call) do
     with :ok <- principal_allowed(call.principal),
          :ok <- valid_subject(call.params[:subject]),
-         :ok <- valid_idempotency_key(call.params[:idempotency_key]) do
+         :ok <- valid_idempotency_key(call.params[:idempotency_key]),
+         {:ok, files} <- valid_files(call.params[:files]) do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
 
@@ -199,7 +328,7 @@ defmodule Tightbeam.Assignments do
         transaction(db, fn txn ->
           case key && idempotency_assignment(txn, owner, key) do
             nil ->
-              case create_assignment(txn, call, owner, key) do
+              case create_assignment(txn, call, owner, key, files) do
                 %{code: _} = error -> error
                 assignment -> {:created, assignment}
               end
@@ -230,6 +359,7 @@ defmodule Tightbeam.Assignments do
     end
   rescue
     error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
+    error in UnknownReviewTarget -> error("unknown_review_target", Exception.message(error))
   end
 
   defp attest_result(db, call) do
@@ -287,12 +417,14 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp create_assignment(txn, call, owner, key) do
-    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [call.session_key]) do
-      [["retired"]] ->
+  defp create_assignment(txn, call, owner, key, files) do
+    case Txn.q(txn, "SELECT state, harness, provider FROM sessions WHERE sessionKey = ?1", [
+           call.session_key
+         ]) do
+      [["retired", _harness, _provider]] ->
         error("session_retired", "assignments require an active holder session")
 
-      [["active"]] ->
+      [["active", harness, provider]] ->
         case call.params[:work_item_id] do
           nil ->
             :ok
@@ -300,6 +432,17 @@ defmodule Tightbeam.Assignments do
           work_item_id ->
             if Txn.q(txn, "SELECT 1 FROM work_items WHERE id = ?1", [work_item_id]) == [],
               do: raise(UnknownWorkItem, work_item_id: work_item_id)
+        end
+
+        reviews_assignment_id = call.params[:reviews_assignment_id]
+
+        if reviews_assignment_id &&
+             Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1", [reviews_assignment_id]) == [],
+           do: raise(UnknownReviewTarget, assignment_id: reviews_assignment_id)
+
+        case open_assignments_touching_in_txn(txn, files, nil) do
+          [] -> :ok
+          [colliding_id | _] -> throw({:files_overlap, colliding_id})
         end
 
         id = id("asg_")
@@ -311,8 +454,9 @@ defmodule Tightbeam.Assignments do
           """
           INSERT INTO assignments
             (id, subject, holderKey, holderRole, holderFallback, openedByUser,
-             openedBySession, openedAt, workItemId)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             openedBySession, openedAt, workItemId, reviewsAssignmentId,
+             holderHarness, holderProvider)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
           """,
           [
             id,
@@ -323,9 +467,20 @@ defmodule Tightbeam.Assignments do
             opened_user,
             opened_session,
             now,
-            call.params[:work_item_id]
+            call.params[:work_item_id],
+            reviews_assignment_id,
+            harness,
+            provider
           ]
         )
+
+        Enum.each(files, fn path ->
+          Txn.q(
+            txn,
+            "INSERT INTO assignment_files (assignmentId, path) VALUES (?1, ?2)",
+            [id, path]
+          )
+        end)
 
         if key do
           # ownerUserId and sessionKey are historical column names: for assign
@@ -342,6 +497,12 @@ defmodule Tightbeam.Assignments do
       [] ->
         error("not_found", "unknown sessionKey: #{call.session_key}")
     end
+  catch
+    {:files_overlap, colliding_id} ->
+      error(
+        "files_overlap",
+        "declared files overlap open assignment #{colliding_id}"
+      )
   end
 
   defp attest_in_txn(txn, call) do
@@ -470,35 +631,77 @@ defmodule Tightbeam.Assignments do
     do: assignment.openedBySession == session
 
   defp insert_attest(txn, call, assignment_id) do
+    {by_user, by_session} = opener(call.principal)
+    {by_harness, by_provider} = verdict_author_family(txn, call.params.kind, by_session)
+
+    insert_attest_row(txn, %{
+      assignment_id: assignment_id,
+      kind: call.params.kind,
+      verdict_kind: call.params[:verdict_kind],
+      note: call.params[:note],
+      by_session: by_session,
+      by_user: by_user,
+      producer: nil,
+      producer_command: nil,
+      by_harness: by_harness,
+      by_provider: by_provider
+    })
+  end
+
+  defp insert_attest_row(txn, attrs) do
     id = id("att_")
     ts = now()
-    {by_user, by_session} = opener(call.principal)
 
     Txn.q(
       txn,
-      "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+      """
+      INSERT INTO attests
+        (id, assignmentId, kind, verdictKind, note, bySession, byUser, producer,
+         producerCommand, byHarness, byProvider, ts)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+      WHERE EXISTS (SELECT 1 FROM assignments WHERE id = ?2 AND state = 'open')
+      """,
       [
         id,
-        assignment_id,
-        call.params.kind,
-        call.params[:verdict_kind],
-        call.params[:note],
-        by_session,
-        by_user,
+        attrs.assignment_id,
+        attrs.kind,
+        attrs.verdict_kind,
+        attrs.note,
+        attrs.by_session,
+        attrs.by_user,
+        attrs.producer,
+        attrs.producer_command,
+        attrs.by_harness,
+        attrs.by_provider,
         ts
       ]
     )
 
+    if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
     attest([
       id,
-      assignment_id,
-      call.params.kind,
-      call.params[:verdict_kind],
-      call.params[:note],
-      by_session,
-      by_user,
+      attrs.assignment_id,
+      attrs.kind,
+      attrs.verdict_kind,
+      attrs.note,
+      attrs.by_session,
+      attrs.by_user,
+      attrs.producer,
+      attrs.producer_command,
+      attrs.by_harness,
+      attrs.by_provider,
       ts
     ])
+  end
+
+  defp verdict_author_family(_txn, kind, _by_session) when kind != "verdict", do: {nil, nil}
+  defp verdict_author_family(_txn, "verdict", nil), do: {nil, nil}
+
+  defp verdict_author_family(txn, "verdict", by_session) do
+    case Txn.q(txn, "SELECT harness, provider FROM sessions WHERE sessionKey = ?1", [by_session]) do
+      [[harness, provider]] -> {harness, provider}
+    end
   end
 
   defp idempotency_assignment(txn, owner, key) do
@@ -605,6 +808,63 @@ defmodule Tightbeam.Assignments do
   defp valid_idempotency_key(_),
     do: error("invalid_idempotency_key", "idempotencyKey must be text")
 
+  defp valid_files(nil), do: {:ok, []}
+
+  defp valid_files(files) when is_list(files) do
+    if Enum.all?(files, fn
+         path when is_binary(path) -> String.length(String.trim(path)) in 1..2000
+         _ -> false
+       end) do
+      {:ok, Enum.uniq(files)}
+    else
+      error("invalid_files", "files must contain non-blank paths of at most 2000 characters")
+    end
+  end
+
+  defp valid_files(_),
+    do: error("invalid_files", "files must be an array of paths")
+
+  defp valid_producer(producer) when is_binary(producer) do
+    if String.length(producer) in 1..64 and
+         Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, producer),
+       do: :ok,
+       else:
+         error(
+           "invalid_producer",
+           "producer must be 1..64 lowercase letters, digits, or hyphens"
+         )
+  end
+
+  defp valid_producer(_), do: error("invalid_producer", "producer must be text")
+
+  defp open_assignments_touching_in_txn(_txn, [], _exclude_id), do: []
+
+  defp open_assignments_touching_in_txn(txn, paths, exclude_id) do
+    {sql, params} = open_assignments_touching_query(paths, exclude_id)
+    Txn.q(txn, sql, params) |> Enum.map(&hd/1)
+  end
+
+  defp open_assignments_touching_query(paths, exclude_id) do
+    placeholders =
+      paths
+      |> Enum.with_index(1)
+      |> Enum.map_join(", ", fn {_path, index} -> "?#{index}" end)
+
+    exclude_clause =
+      if exclude_id do
+        " AND a.id != ?#{length(paths) + 1}"
+      else
+        ""
+      end
+
+    params = if exclude_id, do: paths ++ [exclude_id], else: paths
+
+    {
+      "SELECT DISTINCT a.id FROM assignments AS a JOIN assignment_files AS f ON f.assignmentId = a.id WHERE a.state = 'open' AND f.path IN (#{placeholders})#{exclude_clause} ORDER BY a.id",
+      params
+    }
+  end
+
   defp principal_id({:user, user}), do: "user:" <> user
   defp principal_id({:session, session}), do: "session:" <> session
   defp opener({:user, user}), do: {user, nil}
@@ -651,7 +911,7 @@ defmodule Tightbeam.Assignments do
   defp columns do
     "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
       "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
-      ", workItemId"
+      ", workItemId, reviewsAssignmentId, holderHarness, holderProvider"
   end
 
   defp assignment([
@@ -669,7 +929,10 @@ defmodule Tightbeam.Assignments do
          closed_by_user,
          closed_by_session,
          closing_attest_id,
-         work_item_id
+         work_item_id,
+         reviews_assignment_id,
+         holder_harness,
+         holder_provider
        ]) do
     %{
       id: id,
@@ -686,11 +949,27 @@ defmodule Tightbeam.Assignments do
       closedByUser: closed_by_user,
       closedBySession: closed_by_session,
       closingAttestId: closing_attest_id,
-      workItemId: work_item_id
+      workItemId: work_item_id,
+      reviewsAssignmentId: reviews_assignment_id,
+      holderHarness: holder_harness,
+      holderProvider: holder_provider
     }
   end
 
-  defp attest([id, assignment_id, kind, verdict_kind, note, by_session, by_user, ts]) do
+  defp attest([
+         id,
+         assignment_id,
+         kind,
+         verdict_kind,
+         note,
+         by_session,
+         by_user,
+         producer,
+         producer_command,
+         by_harness,
+         by_provider,
+         ts
+       ]) do
     %{
       id: id,
       assignmentId: assignment_id,
@@ -699,6 +978,10 @@ defmodule Tightbeam.Assignments do
       note: note,
       bySession: by_session,
       byUser: by_user,
+      producer: producer,
+      producerCommand: producer_command,
+      byHarness: by_harness,
+      byProvider: by_provider,
       ts: ts
     }
   end
@@ -707,7 +990,39 @@ defmodule Tightbeam.Assignments do
     {:ok, [[sql]]} =
       DB.query(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attests'")
 
-    unless String.contains?(sql, "'verdict'") do
+    target_fragments = [
+      "producer TEXT NULL",
+      "producerCommand TEXT NULL",
+      "byHarness TEXT NULL",
+      "byProvider TEXT NULL",
+      "CHECK(producer IS NULL OR kind = 'verdict')",
+      "CHECK(producerCommand IS NULL OR producer IS NOT NULL)",
+      "CHECK(byHarness IS NULL OR kind = 'verdict')",
+      "CHECK(byProvider IS NULL OR kind = 'verdict')"
+    ]
+
+    unless Enum.all?(target_fragments, &String.contains?(sql, &1)) do
+      {:ok, table_info} = DB.query(db, "PRAGMA table_info(attests)")
+      existing = MapSet.new(table_info, &Enum.at(&1, 1))
+
+      final_columns = [
+        "id",
+        "assignmentId",
+        "kind",
+        "verdictKind",
+        "note",
+        "bySession",
+        "byUser",
+        "producer",
+        "producerCommand",
+        "byHarness",
+        "byProvider",
+        "ts"
+      ]
+
+      copied_columns = Enum.filter(final_columns, &MapSet.member?(existing, &1))
+      copied = Enum.join(copied_columns, ", ")
+
       :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
 
       try do
@@ -717,7 +1032,7 @@ defmodule Tightbeam.Assignments do
 
             Txn.q(
               txn,
-              "INSERT INTO attests_new (id, assignmentId, kind, note, bySession, ts) SELECT id, assignmentId, kind, note, bySession, ts FROM attests"
+              "INSERT INTO attests_new (#{copied}) SELECT #{copied} FROM attests"
             )
 
             Txn.exec(txn, "DROP TABLE attests")
@@ -749,5 +1064,20 @@ defmodule Tightbeam.Assignments do
           do: :ok,
           else: raise(reason)
     end
+  end
+
+  defp ensure_assignment_columns(db) do
+    for ddl <- [
+          "ALTER TABLE assignments ADD COLUMN reviewsAssignmentId TEXT REFERENCES assignments(id)",
+          "ALTER TABLE assignments ADD COLUMN holderHarness TEXT",
+          "ALTER TABLE assignments ADD COLUMN holderProvider TEXT"
+        ] do
+      case DB.query(db, ddl) do
+        {:ok, _} -> :ok
+        {:error, reason} -> if inspect(reason) =~ "duplicate column", do: :ok, else: raise(reason)
+      end
+    end
+
+    :ok
   end
 end
