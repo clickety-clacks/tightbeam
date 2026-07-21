@@ -411,7 +411,7 @@ defmodule Tightbeam.RulesTest do
       db: ctx.db,
       base_dir: ctx.base_dir,
       default_harness: :claude,
-      default_model: "claude-opus-4-8[high]",
+      default_model: "fable",
       max_live_sessions_per_user: 5
     }
 

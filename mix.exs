@@ -15,7 +15,7 @@ defmodule Tightbeam.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :inets, :ssl],
+      extra_applications: [:logger],
       mod: {Tightbeam.Application, []}
     ]
   end

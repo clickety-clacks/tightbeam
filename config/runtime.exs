@@ -59,6 +59,10 @@ if value = System.get_env("TIGHTBEAM_HOSTS") do
   config :tightbeam, :hosts, hosts
 end
 
+if value = System.get_env("TIGHTBEAM_MODEL_PINS") do
+  config :tightbeam, :model_pins, JSON.decode!(value)
+end
+
 if value = System.get_env("TIGHTBEAM_DRAIN_TIMEOUT_MS") do
   config :tightbeam, :drain_timeout_ms, String.to_integer(value)
 end
