@@ -6,13 +6,26 @@
       "max_input_tokens": 1000000,
       "capabilities": {
         "effort": {
-          "low": {"supported": true},
-          "medium": {"supported": false},
-          "high": {"supported": true},
-          "xhigh": {"supported": false},
-          "max": {"supported": true}
+          "supported": true,
+          "low": {
+            "supported": true
+          },
+          "medium": {
+            "supported": false
+          },
+          "high": {
+            "supported": true
+          },
+          "xhigh": {
+            "supported": false
+          },
+          "max": {
+            "supported": true
+          }
         },
-        "thinking": {"supported": true}
+        "thinking": {
+          "supported": true
+        }
       }
     },
     {

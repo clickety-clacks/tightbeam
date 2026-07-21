@@ -77,7 +77,9 @@ defmodule Tightbeam.ModelCatalog do
       efforts =
         capabilities
         |> Map.get("effort", %{})
-        |> Enum.filter(fn {_effort, support} -> Map.get(support, "supported") == true end)
+        |> Enum.filter(fn {_effort, support} ->
+          is_map(support) and Map.get(support, "supported") == true
+        end)
         |> Enum.map(&elem(&1, 0))
         |> sort_efforts()
 
@@ -97,7 +99,7 @@ defmodule Tightbeam.ModelCatalog do
 
     state = %{
       catalog: empty(),
-      codex_home: Keyword.get(opts, :codex_home, Path.join(opts[:base_dir], "auth/codex")),
+      codex_home: Keyword.get(opts, :codex_home, default_codex_home()),
       claude_token_path:
         Keyword.get(
           opts,
@@ -164,6 +166,13 @@ defmodule Tightbeam.ModelCatalog do
     ]
   rescue
     error -> [{"codex", {:error, error}}, {"claude", {:error, error}}]
+  end
+
+  # Codex's models_cache.json lives in the codex user home ($CODEX_HOME or ~/.codex),
+  # not the org's auth/codex dir (which holds only credentials). The model list is
+  # OpenAI's, not org-specific, so read it from the actual codex home.
+  defp default_codex_home do
+    System.get_env("CODEX_HOME") || Path.expand("~/.codex")
   end
 
   defp load_codex(codex_home) do

@@ -82,6 +82,7 @@ defmodule Tightbeam.ModelCatalogTest do
                [
                  [
                    base_dir: base_dir,
+                   codex_home: Path.join([base_dir, "auth", "codex"]),
                    name: name,
                    claude_fetch: fetch,
                    ttl_ms: :timer.hours(1)
@@ -111,7 +112,12 @@ defmodule Tightbeam.ModelCatalogTest do
     end
 
     start_supervised!(
-      {ModelCatalog, base_dir: base_dir, name: name, claude_fetch: fetch, ttl_ms: :timer.hours(1)}
+      {ModelCatalog,
+       base_dir: base_dir,
+       codex_home: Path.join([base_dir, "auth", "codex"]),
+       name: name,
+       claude_fetch: fetch,
+       ttl_ms: :timer.hours(1)}
     )
 
     assert_receive :claude_fetch
@@ -138,7 +144,12 @@ defmodule Tightbeam.ModelCatalogTest do
     end
 
     start_supervised!(
-      {ModelCatalog, base_dir: base_dir, name: name, claude_fetch: fetch, ttl_ms: :timer.hours(1)}
+      {ModelCatalog,
+       base_dir: base_dir,
+       codex_home: Path.join([base_dir, "auth", "codex"]),
+       name: name,
+       claude_fetch: fetch,
+       ttl_ms: :timer.hours(1)}
     )
 
     await_refresh_finished(name)
@@ -176,7 +187,11 @@ defmodule Tightbeam.ModelCatalogTest do
 
     start_supervised!(
       {ModelCatalog,
-       base_dir: base_dir, name: name, request_fun: request, ttl_ms: :timer.hours(1)}
+       base_dir: base_dir,
+       codex_home: Path.join([base_dir, "auth", "codex"]),
+       name: name,
+       request_fun: request,
+       ttl_ms: :timer.hours(1)}
     )
 
     catalog = await_catalog(name)
@@ -208,7 +223,12 @@ defmodule Tightbeam.ModelCatalogTest do
     end
 
     start_supervised!(
-      {ModelCatalog, base_dir: base_dir, name: name, claude_fetch: fetch, ttl_ms: :timer.hours(1)}
+      {ModelCatalog,
+       base_dir: base_dir,
+       codex_home: Path.join([base_dir, "auth", "codex"]),
+       name: name,
+       claude_fetch: fetch,
+       ttl_ms: :timer.hours(1)}
     )
 
     assert_receive {:fetch_started, task}
@@ -228,7 +248,12 @@ defmodule Tightbeam.ModelCatalogTest do
     name = unique_name()
 
     start_supervised!(
-      {ModelCatalog, base_dir: base_dir, name: name, claude_fetch: fetch, ttl_ms: :timer.hours(1)}
+      {ModelCatalog,
+       base_dir: base_dir,
+       codex_home: Path.join([base_dir, "auth", "codex"]),
+       name: name,
+       claude_fetch: fetch,
+       ttl_ms: :timer.hours(1)}
     )
 
     await_catalog(name)
