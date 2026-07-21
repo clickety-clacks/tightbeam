@@ -407,14 +407,7 @@ defmodule Tightbeam.Archetypes do
   def load!(base_dir) do
     manifest_dir = Path.join([base_dir, "identity", "archetypes"])
 
-    for {name, content} <- @builtin_skills do
-      path = Path.join([skills_dir(base_dir), name, "SKILL.md"])
-
-      unless File.exists?(path) do
-        File.mkdir_p!(Path.dirname(path))
-        File.write!(path, content)
-      end
-    end
+    materialize_builtin_skills!(base_dir)
 
     library =
       base_dir
@@ -472,6 +465,17 @@ defmodule Tightbeam.Archetypes do
 
     :persistent_term.put(@persist_key, {archetypes, fragments})
     archetypes
+  end
+
+  defp materialize_builtin_skills!(base_dir) do
+    for {name, content} <- @builtin_skills do
+      path = Path.join([skills_dir(base_dir), name, "SKILL.md"])
+
+      unless File.exists?(path) do
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, content)
+      end
+    end
   end
 
   @doc "The loaded fragment library — built-ins overridden by identity/guidance files."
@@ -826,7 +830,9 @@ defmodule Tightbeam.Archetypes do
     end
   end
 
-  defp builtin_fragments do
+  @doc "The built-in guidance fragment library."
+  @spec builtin_fragments() :: %{optional(String.t()) => String.t()}
+  def builtin_fragments do
     %{
       "preamble.md" => @builtin_preamble,
       "orientation.md" => @builtin_orientation,
@@ -852,6 +858,40 @@ defmodule Tightbeam.Archetypes do
   @spec skills_dir(String.t()) :: String.t()
   def skills_dir(base_dir), do: Path.join([base_dir, "identity", "skills"])
 
+  @doc "Seed the identity working tree and create its initial git commit."
+  @spec init_identity!(String.t()) :: :initialized | :noop
+  def init_identity!(base_dir) do
+    identity_dir = Path.join(base_dir, "identity")
+
+    if File.exists?(Path.join(identity_dir, ".git")) do
+      :noop
+    else
+      for directory <- ["archetypes", "guidance", "skills", "rails", "rules"] do
+        File.mkdir_p!(Path.join(identity_dir, directory))
+      end
+
+      materialize_builtin_skills!(base_dir)
+
+      write_unless_exists!(
+        Path.join([identity_dir, "archetypes", "default.toml"]),
+        builtin_default_toml()
+      )
+
+      for {name, content} <- builtin_fragments() do
+        write_unless_exists!(Path.join([identity_dir, "guidance", name]), content)
+      end
+
+      for directory <- ["rails", "rules"] do
+        write_unless_exists!(Path.join([identity_dir, directory, ".gitkeep"]), "")
+      end
+
+      git!(identity_dir, ["init"])
+      git!(identity_dir, ["add", "-A"])
+      git!(identity_dir, ["commit", "-m", "seed: tightbeam defaults"], "tightbeam")
+      :initialized
+    end
+  end
+
   @doc "Built-in skill names — the default election when a manifest names none."
   @spec builtin_skill_names() :: [String.t()]
   def builtin_skill_names, do: @builtin_skills |> Map.keys() |> Enum.sort()
@@ -867,9 +907,16 @@ defmodule Tightbeam.Archetypes do
   """
   @spec put_skill!(String.t(), String.t(), String.t()) :: String.t()
   def put_skill!(base_dir, name, content) do
+    put_skill!(base_dir, name, content, "tightbeam")
+  end
+
+  @spec put_skill!(String.t(), String.t(), String.t(), String.t()) :: String.t()
+  def put_skill!(base_dir, name, content, author) do
+    init_identity!(base_dir)
     path = Path.join([skills_dir(base_dir), validate_skill_path!(name), "SKILL.md"])
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, content)
+    commit_identity!(base_dir, [path], "skill-put: #{name}", author)
     path
   end
 
@@ -884,13 +931,23 @@ defmodule Tightbeam.Archetypes do
           {:ok, %{archetype_electors: [String.t()], manifest_warnings: [String.t()]}}
           | {:error, %{code: String.t(), message: String.t()}}
   def rm_skill(base_dir, name) do
+    rm_skill(base_dir, name, "tightbeam", [])
+  end
+
+  @spec rm_skill(String.t(), String.t(), String.t(), [String.t()]) ::
+          {:ok, %{archetype_electors: [String.t()], manifest_warnings: [String.t()]}}
+          | {:error, %{code: String.t(), message: String.t()}}
+  def rm_skill(base_dir, name, author, additional_paths) do
+    init_identity!(base_dir)
     relative = validate_skill_path!(name)
     path = Path.join(skills_dir(base_dir), relative)
 
     if not File.exists?(path) do
       {:error, %{code: "unknown_skill", message: "unknown skill: #{relative}"}}
     else
-      remove_skill(path, relative)
+      {:ok, removal} = remove_skill(path, relative)
+      commit_identity!(base_dir, [path | additional_paths], "skill-rm: #{name}", author)
+      {:ok, removal}
     end
   end
 
@@ -977,6 +1034,64 @@ defmodule Tightbeam.Archetypes do
       guidance: nil,
       source: nil
     }
+  end
+
+  defp builtin_default_toml do
+    archetype = builtin_default()
+
+    [
+      "name = #{JSON.encode!(archetype.name)}",
+      "skills = [#{Enum.map_join(archetype.skills, ", ", &JSON.encode!/1)}]",
+      "where = [#{Enum.map_join(archetype.where, ", ", &JSON.encode!/1)}]",
+      "fallback_models = [#{Enum.map_join(archetype.fallback_models, ", ", &JSON.encode!/1)}]",
+      "",
+      "[defaults]",
+      "",
+      "[references]",
+      "",
+      "[guidance]",
+      "",
+      "[mcp]",
+      "",
+      "[containment]",
+      "fs = #{JSON.encode!(Atom.to_string(archetype.containment.fs))}",
+      "network = #{JSON.encode!(Atom.to_string(archetype.containment.network))}",
+      ""
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp write_unless_exists!(path, content) do
+    unless File.exists?(path), do: File.write!(path, content)
+  end
+
+  defp commit_identity!(base_dir, paths, message, author) do
+    identity_dir = Path.join(base_dir, "identity")
+
+    relative_paths = Enum.map(paths, &Path.relative_to(&1, identity_dir))
+    git!(identity_dir, ["add", "-A", "--" | relative_paths])
+    git!(identity_dir, ["commit", "--allow-empty", "-m", message], author)
+  end
+
+  defp git!(identity_dir, args, author \\ nil) do
+    env =
+      if author do
+        email_local = String.replace(author, ~r/[^A-Za-z0-9_.+-]/, "-")
+
+        [
+          {"GIT_AUTHOR_NAME", author},
+          {"GIT_AUTHOR_EMAIL", "#{email_local}@tightbeam.local"},
+          {"GIT_COMMITTER_NAME", author},
+          {"GIT_COMMITTER_EMAIL", "#{email_local}@tightbeam.local"}
+        ]
+      else
+        []
+      end
+
+    case System.cmd("git", args, cd: identity_dir, stderr_to_stdout: true, env: env) do
+      {_output, 0} -> :ok
+      {output, status} -> raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
+    end
   end
 
   defp validate!(manifest, path) do

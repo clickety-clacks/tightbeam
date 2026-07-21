@@ -154,8 +154,14 @@ pub enum Command {
         user_id: String,
         is_admin: bool,
     },
+    Init(InitArgs),
     Setup(SetupArgs),
     Assimilate(AssimilateArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitArgs {
+    pub base_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +294,10 @@ COMMANDS:
       personal login. Copies share a grant, and shared grants revoke each
       other on refresh. Needs an interactive terminal.
         tightbeam setup --base-dir ~/.tightbeam-beam
+
+  init [--base-dir p]
+      Seed the identity working tree and create its git repository. Re-running
+      against an initialized identity repository is a no-op.
 
   assimilate <ssh-dest> [--name n] [--base-dir p] [--harness claude,codex]
              [--push-credentials] [--no-onboard] [--dry-run]
@@ -782,6 +792,17 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 is_admin: !flags.contains_key("demote"),
             })
         }
+        "init" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| flag != "base-dir")
+                || flags.get("base-dir").is_some_and(String::is_empty)
+            {
+                return Err("usage: tightbeam init [--base-dir DIR]".to_owned());
+            }
+            Ok(Command::Init(InitArgs {
+                base_dir: nonempty(flags, "base-dir"),
+            }))
+        }
         "setup" => Ok(Command::Setup(SetupArgs {
             base_dir: nonempty(flags, "base-dir"),
             harnesses: nonempty(flags, "harness")
@@ -816,7 +837,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
         )),
     }
 }
@@ -1007,7 +1028,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -1094,6 +1115,8 @@ mod tests {
             strings(&["deny-device", "d1", "--as-user", "flynn"]),
             strings(&["revoke-device", "d1", "--as-user", "flynn"]),
             strings(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
+            strings(&["init"]),
+            strings(&["init", "--base-dir", "/tmp/tb"]),
             strings(&["setup"]),
             strings(&["assimilate", "host", "--as-user", "flynn"]),
             strings(&["probe"]),
@@ -1137,6 +1160,20 @@ mod tests {
             );
         }
         assert!(HELP.contains("probe [--json] [--base-dir DIR]"));
+    }
+
+    #[test]
+    fn init_rejects_positionals_unknown_flags_and_missing_base_dir() {
+        for values in [
+            strings(&["init", "extra"]),
+            strings(&["init", "--bogus"]),
+            strings(&["init", "--base-dir"]),
+        ] {
+            assert_eq!(
+                parse(values),
+                Err("usage: tightbeam init [--base-dir DIR]".to_owned())
+            );
+        }
     }
 
     #[test]

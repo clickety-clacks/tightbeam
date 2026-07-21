@@ -681,6 +681,13 @@ defmodule Tightbeam.GatewayTest do
 
     assert result.notified == [active.session_key]
 
+    assert {"skill-rm: swift|user:flynn|user-flynn@tightbeam.local\n", 0} =
+             System.cmd(
+               "git",
+               ["log", "-1", "--format=%s|%an|%ae"],
+               cd: Path.join(base_dir, "identity")
+             )
+
     assert result.manifest_warnings == [
              "archetype coder still elects swift in identity/archetypes/coder.toml — " <>
                "edit it before the next restart (boot validation is fail-closed)"

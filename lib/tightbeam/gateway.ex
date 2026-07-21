@@ -356,16 +356,25 @@ defmodule Tightbeam.Gateway do
           %{host: p.name, config: entry}
         end),
       "skill-put" =>
-        admin_handler(db, fn p ->
+        admin_call_handler(db, fn call ->
+          p = call.params
           # Library mutation through the chokepoint (identity is law; law
           # changes are audited verb rows). Push-on-write: every remote
           # replica syncs now; a host that misses it heals at delivery.
-          path = Archetypes.put_skill!(config.base_dir, p.name, Map.fetch!(p, :content))
+          path =
+            Archetypes.put_skill!(
+              config.base_dir,
+              p.name,
+              Map.fetch!(p, :content),
+              call.origin
+            )
+
           root = p.name |> String.split("/") |> hd()
           %{skill: p.name, path: path, pushed: Placement.push_skill(config, root, :put)}
         end),
       "skill-rm" =>
-        admin_handler(db, fn p ->
+        admin_call_handler(db, fn call ->
+          p = call.params
           root = p.name |> String.split("/") |> hd()
 
           if Enum.any?(Archetypes.list_skills(config.base_dir), &(&1.name == p.name)) do
@@ -374,8 +383,11 @@ defmodule Tightbeam.Gateway do
                 do: stage_override_sessions(config.base_dir, db, root),
                 else: {[], []}
 
-            {:ok, removal} = Archetypes.rm_skill(config.base_dir, p.name)
-            commit_pinned_sessions(staged_pins)
+            pinned_paths = commit_pinned_sessions(staged_pins)
+
+            {:ok, removal} =
+              Archetypes.rm_skill(config.base_dir, p.name, call.origin, pinned_paths)
+
             reproject_pinned_sessions(config, pinned_sessions)
             action = if p.name == root, do: :rm, else: :put
             pushed = Placement.push_skill(config, root, action)
@@ -1300,6 +1312,14 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp admin_call_handler(db, fun) do
+    fn call ->
+      if admin_origin?(db, call.origin),
+        do: fun.(call),
+        else: %{code: "forbidden", message: "admin required"}
+    end
+  end
+
   defp member_handler(db, fun) do
     fn call ->
       case resolve_caller(db, call.origin) do
@@ -1322,12 +1342,7 @@ defmodule Tightbeam.Gateway do
     source = Path.join(Archetypes.skills_dir(base_dir), skill)
 
     staging_root =
-      Path.join([
-        base_dir,
-        "identity",
-        "staging",
-        "pins-#{System.unique_integer([:positive])}"
-      ])
+      Path.join([base_dir, "staging", "pins-#{System.unique_integer([:positive])}"])
 
     sessions =
       db
@@ -1361,12 +1376,12 @@ defmodule Tightbeam.Gateway do
       File.cp_r!(staged, destination)
     end)
 
-    staged_pins
-    |> List.first()
-    |> case do
+    case List.first(staged_pins) do
       nil -> :ok
       {staged, _destination} -> File.rm_rf!(staged |> Path.dirname() |> Path.dirname())
     end
+
+    Enum.map(staged_pins, fn {_staged, destination} -> destination end)
   end
 
   defp reproject_pinned_sessions(config, sessions) do

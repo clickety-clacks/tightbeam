@@ -16,6 +16,58 @@ defmodule Tightbeam.ArchetypesTest do
     %{base_dir: base_dir, manifests: manifests}
   end
 
+  test "identity init seeds one clean commit and is idempotent", ctx do
+    assert Archetypes.init_identity!(ctx.base_dir) == :initialized
+
+    identity_dir = Path.join(ctx.base_dir, "identity")
+
+    assert File.regular?(Path.join([identity_dir, "archetypes", "default.toml"]))
+
+    for name <- Map.keys(Archetypes.builtin_fragments()) do
+      assert File.regular?(Path.join([identity_dir, "guidance", name]))
+    end
+
+    for name <- Archetypes.builtin_skill_names() do
+      assert File.regular?(Path.join([identity_dir, "skills", name, "SKILL.md"]))
+    end
+
+    assert File.regular?(Path.join([identity_dir, "rails", ".gitkeep"]))
+    assert File.regular?(Path.join([identity_dir, "rules", ".gitkeep"]))
+    assert {"1\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
+
+    assert {"seed: tightbeam defaults\n", 0} =
+             System.cmd("git", ["log", "-1", "--format=%s"], cd: identity_dir)
+
+    assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+
+    seeded_default = Archetypes.load!(ctx.base_dir)["default"]
+    assert Map.put(seeded_default, :source, nil) == Archetypes.builtin_default()
+
+    assert Archetypes.init_identity!(ctx.base_dir) == :noop
+    assert {"1\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
+    assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+  end
+
+  test "skill mutations auto-init and commit with the caller identity", ctx do
+    path = Archetypes.put_skill!(ctx.base_dir, "review", "# Review", "agent:coder")
+    identity_dir = Path.join(ctx.base_dir, "identity")
+
+    assert File.read!(path) == "# Review"
+
+    assert {"skill-put: review|agent:coder|agent-coder@tightbeam.local\n", 0} =
+             System.cmd("git", ["log", "-1", "--format=%s|%an|%ae"], cd: identity_dir)
+
+    Archetypes.load!(ctx.base_dir)
+    assert {:ok, _removal} = Archetypes.rm_skill(ctx.base_dir, "review", "agent:coder", [])
+    refute File.exists?(path)
+
+    assert {"skill-rm: review|agent:coder|agent-coder@tightbeam.local\n", 0} =
+             System.cmd("git", ["log", "-1", "--format=%s|%an|%ae"], cd: identity_dir)
+
+    assert {"3\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
+    assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+  end
+
   test "loads all fields, merges the built-in default, and permits default override", ctx do
     File.write!(Path.join(ctx.manifests, "coder.toml"), """
     name = "coder"

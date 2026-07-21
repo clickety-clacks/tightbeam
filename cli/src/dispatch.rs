@@ -74,7 +74,11 @@ fn request(
 /// Build the dispatch request without performing discovery or network I/O.
 pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
-        Command::Help | Command::Probe { .. } | Command::Setup(_) | Command::Assimilate(_) => {
+        Command::Help
+        | Command::Probe { .. }
+        | Command::Init(_)
+        | Command::Setup(_)
+        | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
         Command::Wake {
@@ -531,6 +535,7 @@ where
     match command {
         Command::Help => unreachable!("help is handled before dispatch"),
         Command::Probe { json, base_dir } => crate::probe::run(json, base_dir),
+        Command::Init(args) => crate::ceremonies::init(args),
         Command::Setup(args) => crate::ceremonies::setup(args),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         command => {
@@ -577,7 +582,11 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::DenyDevice { identity, .. }
         | Command::RevokeDevice { identity, .. }
         | Command::PromoteUser { identity, .. } => identity,
-        Command::Help | Command::Probe { .. } | Command::Setup(_) | Command::Assimilate(_) => {
+        Command::Help
+        | Command::Probe { .. }
+        | Command::Init(_)
+        | Command::Setup(_)
+        | Command::Assimilate(_) => {
             return false;
         }
     };

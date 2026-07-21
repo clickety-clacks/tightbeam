@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
-use crate::args::{AssimilateArgs, SetupArgs};
+use crate::args::{AssimilateArgs, InitArgs, SetupArgs};
 use crate::dispatch::{self, RequestSpec};
 
 #[derive(Clone, Copy)]
@@ -55,6 +55,15 @@ trait CeremonyIo {
     fn warn(&mut self, message: &str);
     fn terminal(&self) -> bool;
     fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure>;
+    fn exec_at(
+        &mut self,
+        directory: &Path,
+        file: &str,
+        args: &[String],
+    ) -> Result<String, ExecFailure> {
+        let _ = directory;
+        self.exec(file, args)
+    }
     fn exec_interactive(
         &mut self,
         file: &str,
@@ -83,6 +92,35 @@ impl CeremonyIo for SystemIo {
     fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure> {
         let result = ProcessCommand::new(file)
             .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| ExecFailure {
+                message: error.to_string(),
+                stdout: String::new(),
+                stderr: String::new(),
+            })?;
+        if result.status.success() {
+            Ok(String::from_utf8_lossy(&result.stdout).into_owned())
+        } else {
+            Err(ExecFailure {
+                message: format!("process exited with status {}", result.status),
+                stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+            })
+        }
+    }
+
+    fn exec_at(
+        &mut self,
+        directory: &Path,
+        file: &str,
+        args: &[String],
+    ) -> Result<String, ExecFailure> {
+        let result = ProcessCommand::new(file)
+            .args(args)
+            .current_dir(directory)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -144,6 +182,31 @@ impl CeremonyIo for SystemIo {
 pub fn setup(args: SetupArgs) -> Result<(), String> {
     let mut io = SystemIo;
     setup_with(&mut io, args)
+}
+
+pub fn init(args: InitArgs) -> Result<(), String> {
+    let mut io = SystemIo;
+    init_with(&mut io, args)
+}
+
+fn init_with(io: &mut dyn CeremonyIo, args: InitArgs) -> Result<(), String> {
+    let base_dir = args.base_dir.unwrap_or_else(default_base_dir);
+    let project_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the CLI crate lives inside the Tightbeam project");
+    let command_args = vec![
+        "tightbeam.init".to_owned(),
+        "--base-dir".to_owned(),
+        base_dir,
+    ];
+    let output = io
+        .exec_at(project_dir, "mix", &command_args)
+        .map_err(|error| command_failure(&error))?;
+
+    if !output.trim().is_empty() {
+        io.log(output.trim());
+    }
+    Ok(())
 }
 
 fn setup_with(io: &mut dyn CeremonyIo, args: SetupArgs) -> Result<(), String> {
@@ -708,6 +771,35 @@ mod tests {
             validate_harnesses(&["other".to_owned()]),
             Err("unsupported harness: other".to_owned())
         );
+    }
+
+    #[test]
+    fn init_invokes_the_elixir_seed_task() {
+        let mut io = FakeIo::default();
+        io.responses
+            .push(Ok("Initialized /org/identity\n".to_owned()));
+
+        assert_eq!(
+            init_with(
+                &mut io,
+                InitArgs {
+                    base_dir: Some("/org".to_owned()),
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            io.commands,
+            vec![(
+                "mix".to_owned(),
+                vec![
+                    "tightbeam.init".to_owned(),
+                    "--base-dir".to_owned(),
+                    "/org".to_owned(),
+                ],
+            )]
+        );
+        assert_eq!(io.logs, vec!["Initialized /org/identity"]);
     }
 
     #[test]
