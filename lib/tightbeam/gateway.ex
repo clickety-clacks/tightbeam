@@ -244,7 +244,8 @@ defmodule Tightbeam.Gateway do
     [
       {Tightbeam.ModelCatalog,
        base_dir: config.base_dir,
-       codex_home: Map.get(config, :codex_home, Path.join(config.base_dir, "auth/codex")),
+       codex_home:
+         Map.get(config, :codex_home, System.get_env("CODEX_HOME") || Path.expand("~/.codex")),
        claude_fetch: Map.get(config, :claude_fetch, &Tightbeam.ModelCatalog.fetch_claude/1),
        ttl_ms: Map.get(config, :model_catalog_ttl_ms, :timer.minutes(15)),
        name: Map.get(config, :model_catalog_server, Tightbeam.ModelCatalog)},
