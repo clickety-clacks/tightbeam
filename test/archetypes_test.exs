@@ -72,6 +72,7 @@ defmodule Tightbeam.ArchetypesTest do
     File.write!(Path.join(ctx.manifests, "coder.toml"), """
     name = "coder"
     where = ["work-1", "work-2"]
+    model_preferences = ["claude-opus-4-8"]
 
     [defaults]
     harness = "codex"
@@ -100,7 +101,7 @@ defmodule Tightbeam.ArchetypesTest do
                "tightbeam-skills"
              ],
              where: ["work-1", "work-2"],
-             fallback_models: [],
+             model_preferences: ["claude-opus-4-8"],
              containment: %{fs: :off, network: :open},
              defaults: %{harness: :codex, model: "gpt-5.6-sol[medium]"},
              references: [

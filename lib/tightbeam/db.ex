@@ -10,6 +10,11 @@ defmodule Tightbeam.DB do
   busy_timeout=5000 (deliberate addition over the TS reference — recorded in
   the port spec). Reads share the same serialized connection in E1; a read
   pool is a later, additive concern.
+
+  A function running inside a caller's transaction must never re-enter the DB
+  owner by opening another connection or transaction. By convention,
+  `*_in_txn(txn, ...)` helpers write only through the supplied transaction and
+  never open their own; the five CAS tables remain separate modules by design.
   """
 
   use GenServer

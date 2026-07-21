@@ -69,6 +69,7 @@ defmodule Tightbeam.Gateway do
     Idempotency,
     LaneManager,
     Ledger,
+    ModelCatalog,
     Org,
     Projection,
     Rails,
@@ -83,22 +84,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.Wire.Payloads
-
-  @model_catalog %{
-    "claude" => [
-      %{ref: "fable", name: "Fable 5"},
-      %{ref: "opus[1m]", name: "Opus 4.8 (1M)"},
-      %{ref: "sonnet", name: "Sonnet"},
-      %{ref: "haiku", name: "Haiku"}
-    ],
-    "codex" => [
-      %{ref: "gpt-5.6-sol[low]", name: "Sol (low)"},
-      %{ref: "gpt-5.6-sol[medium]", name: "Sol (medium)"},
-      %{ref: "gpt-5.6-sol[high]", name: "Sol (high)"},
-      %{ref: "gpt-5.6-sol[xhigh]", name: "Sol (xhigh)"},
-      %{ref: "gpt-5.6-luna[medium]", name: "Luna (medium)"}
-    ]
-  }
+  require Logger
 
   @typedoc "Gateway config (gateway.ts GatewayConfig)."
   @type config :: %{
@@ -255,6 +241,7 @@ defmodule Tightbeam.Gateway do
     end
 
     [
+      {ModelCatalog, base_dir: config.base_dir},
       {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
       {Tightbeam.Wakes,
        db: db, deliver: deliver, tick_ms: config.wake_tick_ms, name: Tightbeam.WakeScheduler},
@@ -621,11 +608,16 @@ defmodule Tightbeam.Gateway do
     %{
       harnesses: ["claude", "codex"],
       models:
-        Map.new(@model_catalog, fn {harness, models} ->
+        Map.new(ModelCatalog.get(), fn {harness, models} ->
           provider = if harness == "codex", do: "openai", else: "anthropic"
 
           {harness,
-           Enum.map(models, &%{id: &1.ref, ref: &1.ref, name: &1.name, provider: provider})}
+           Enum.map(models, fn model ->
+             model
+             |> Map.put(:id, model.ref)
+             |> Map.put(:name, model.display_name)
+             |> Map.put(:provider, provider)
+           end)}
         end),
       hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
       archetypes:
@@ -658,14 +650,14 @@ defmodule Tightbeam.Gateway do
 
         archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
-        fallback_models =
-          case archetype.fallback_models do
+        model_preferences =
+          case archetype.model_preferences do
             [] -> nil
-            chain -> chain
+            preferences -> preferences
           end
 
         {_model, effort} = Adapter.parse_model_ref(session.model)
-        catalog = Map.fetch!(@model_catalog, session.harness)
+        {catalog, _health} = ModelCatalog.get(session.harness, ModelCatalog)
         unsupported = fn reason -> %{supported: false, reason: reason} end
 
         %{
@@ -675,7 +667,7 @@ defmodule Tightbeam.Gateway do
           sessionKey: session_key,
           display: %{
             model: session.model,
-            fallbackModels: fallback_models,
+            modelPreferences: model_preferences,
             provider: session.provider,
             harness: session.harness,
             host: session.host,
@@ -1463,11 +1455,11 @@ defmodule Tightbeam.Gateway do
                 name: a.name,
                 where: a.where,
                 defaults: a.defaults,
-                fallback_models: a.fallback_models
+                modelPreferences: a.model_preferences
               }
             end),
           hosts: config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
-          models: @model_catalog
+          models: ModelCatalog.get()
         }
 
         result = %{
@@ -1634,62 +1626,58 @@ defmodule Tightbeam.Gateway do
 
     model =
       p[:model] || archetype.defaults[:model] ||
-        if(harness == defaults.harness,
-          do: defaults.model,
-          else:
-            if(harness == :codex or harness == "codex", do: "gpt-5.6-sol[medium]", else: "haiku")
-        )
+        defaults.model
 
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
 
-    case Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
+    with :ok <- validate_catalog_model(harness_string, model, is_nil(p[:model])),
+         :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
+      input = %{
+        display_name: p.display_name,
+        kind: "custom",
+        owner_user_id: caller.owner_user_id,
+        origin: call.origin,
+        spawned_by: caller.caller_session && caller.caller_session.session_key,
+        handle: p[:handle],
+        order_index: length(sessions),
+        archetype: archetype.name,
+        overrides: overrides,
+        identity_name: identity_name,
+        host: host,
+        harness: harness_string,
+        provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
+        model: model
+      }
+
+      session_result =
+        DB.transaction(db, fn txn ->
+          session = Org.create_in_txn(txn, input)
+
+          if p[:handle] do
+            Roles.create_in_txn!(
+              txn,
+              p.handle,
+              caller.owner_user_id,
+              session.session_key
+            )
+          end
+
+          session
+        end)
+
+      case session_result do
+        {:error, %Roles.TransactionError{error: error}} ->
+          error
+
+        {:error, error} ->
+          raise error
+
+        {:ok, session} ->
+          finish_spawn(db, call, caller, session)
+      end
+    else
       {:error, denial} ->
         denial
-
-      :ok ->
-        input = %{
-          display_name: p.display_name,
-          kind: "custom",
-          owner_user_id: caller.owner_user_id,
-          origin: call.origin,
-          spawned_by: caller.caller_session && caller.caller_session.session_key,
-          handle: p[:handle],
-          order_index: length(sessions),
-          archetype: archetype.name,
-          overrides: overrides,
-          identity_name: identity_name,
-          host: host,
-          harness: harness_string,
-          provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
-          model: model
-        }
-
-        session_result =
-          DB.transaction(db, fn txn ->
-            session = Org.create_in_txn(txn, input)
-
-            if p[:handle] do
-              Roles.create_in_txn!(
-                txn,
-                p.handle,
-                caller.owner_user_id,
-                session.session_key
-              )
-            end
-
-            session
-          end)
-
-        case session_result do
-          {:error, %Roles.TransactionError{error: error}} ->
-            error
-
-          {:error, error} ->
-            raise error
-
-          {:ok, session} ->
-            finish_spawn(db, call, caller, session)
-        end
     end
   end
 
@@ -1728,58 +1716,55 @@ defmodule Tightbeam.Gateway do
             harness_atom = if harness == "codex", do: :codex, else: :claude
             provider = if harness == "codex", do: "openai", else: "anthropic"
 
-            model =
-              p[:model] ||
-                case Map.fetch!(@model_catalog, harness) do
-                  [first | _] -> first.ref
-                end
+            model = p[:model] || config.default_model
 
-            case Spinup.ensure_ready(
-                   config,
-                   harness_atom,
-                   session.host,
-                   spinup_opts(config, db)
-                 ) do
+            with :ok <- validate_catalog_model(harness, model, is_nil(p[:model])),
+                 :ok <-
+                   Spinup.ensure_ready(
+                     config,
+                     harness_atom,
+                     session.host,
+                     spinup_opts(config, db)
+                   ) do
+              deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+
+              Placement.deliver_home(
+                config,
+                {harness_atom, session.identity_name, session.host},
+                deliver_opts
+              )
+
+              Org.set_harness(db, call.session_key, harness, provider, model)
+
+              # History barrier (product ruling): a new engine gets a fresh
+              # visible slate. Rows are RETAINED (never deleted) but replay
+              # stops at the barrier, and live clients are told to drop their
+              # local view. No pointer surgery: the old harness session can't
+              # load on the new engine → fallback pointer, fresh context.
+              {:ok, [[max_seq]]} =
+                DB.query(
+                  db,
+                  "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+                  [call.session_key]
+                )
+
+              Org.set_cleared_through(db, call.session_key, max_seq)
+
+              broadcast(
+                db,
+                session.owner_user_id,
+                Payloads.stream_history_cleared(call.session_key)
+              )
+
+              %{
+                ok: true,
+                harness: harness,
+                model: model,
+                note: "engine swapped; chat cleared (rows retained); model context starts fresh"
+              }
+            else
               {:error, denial} ->
                 denial
-
-              :ok ->
-                deliver_opts = if config[:sh], do: [sh: config.sh], else: []
-
-                Placement.deliver_home(
-                  config,
-                  {harness_atom, session.identity_name, session.host},
-                  deliver_opts
-                )
-
-                Org.set_harness(db, call.session_key, harness, provider, model)
-
-                # History barrier (product ruling): a new engine gets a fresh
-                # visible slate. Rows are RETAINED (never deleted) but replay
-                # stops at the barrier, and live clients are told to drop their
-                # local view. No pointer surgery: the old harness session can't
-                # load on the new engine → fallback pointer, fresh context.
-                {:ok, [[max_seq]]} =
-                  DB.query(
-                    db,
-                    "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
-                    [call.session_key]
-                  )
-
-                Org.set_cleared_through(db, call.session_key, max_seq)
-
-                broadcast(
-                  db,
-                  session.owner_user_id,
-                  Payloads.stream_history_cleared(call.session_key)
-                )
-
-                %{
-                  ok: true,
-                  harness: harness,
-                  model: model,
-                  note: "engine swapped; chat cleared (rows retained); model context starts fresh"
-                }
             end
         end
 
@@ -1827,40 +1812,78 @@ defmodule Tightbeam.Gateway do
             %{ok: false, code: "not_found"}
 
           session ->
-            Org.set_model(db, call.session_key, p.model, session.provider)
+            with :ok <- validate_catalog_model(session.harness, p.model, false) do
+              Org.set_model(db, call.session_key, p.model, session.provider)
 
-            load_result =
-              with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
-                   coordinator when is_pid(coordinator) <-
-                     Process.whereis(Tightbeam.AdapterCoordinator),
-                   {:ok, adapter, _generation} <-
-                     AdapterCoordinator.adapter_for(
-                       coordinator,
-                       {String.to_existing_atom(session.harness), session.identity_name,
-                        session.host}
-                     ) do
-                AdapterCoordinator.with_load_slot(coordinator, fn ->
-                  Adapter.load_session(
-                    adapter,
-                    pointer.harness_session_id,
-                    p.model,
-                    session_workdir(config, session),
-                    session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
-                  )
-                end)
-              else
-                _ -> :ok
+              load_result =
+                with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
+                     coordinator when is_pid(coordinator) <-
+                       Process.whereis(Tightbeam.AdapterCoordinator),
+                     {:ok, adapter, _generation} <-
+                       AdapterCoordinator.adapter_for(
+                         coordinator,
+                         {String.to_existing_atom(session.harness), session.identity_name,
+                          session.host}
+                       ) do
+                  AdapterCoordinator.with_load_slot(coordinator, fn ->
+                    Adapter.load_session(
+                      adapter,
+                      pointer.harness_session_id,
+                      p.model,
+                      session_workdir(config, session),
+                      session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
+                    )
+                  end)
+                else
+                  _ -> :ok
+                end
+
+              case load_result do
+                {:error, :contained_sandbox_disable_failed} ->
+                  %{ok: false, reason: :contained_sandbox_disable_failed}
+
+                _ ->
+                  %{ok: true}
               end
-
-            case load_result do
-              {:error, :contained_sandbox_disable_failed} ->
-                %{ok: false, reason: :contained_sandbox_disable_failed}
-
-              _ ->
-                %{ok: true}
+            else
+              {:error, denial} -> denial
             end
         end
     end
+  end
+
+  defp validate_catalog_model(harness, model, configured_default?) do
+    case is_binary(model) && ModelCatalog.member?(harness, model) do
+      %{present?: true, health: :fresh} ->
+        :ok
+
+      %{health: :fresh} ->
+        warn_dead_default(harness, model, configured_default?)
+
+        {:error,
+         %{code: "model_unavailable", message: "model #{inspect(model)} is not offered by #{harness}"}}
+
+      %{health: health} ->
+        warn_dead_default(harness, model, configured_default?)
+
+        {:error,
+         %{
+           code: "catalog_unavailable",
+           message: "cannot validate model #{inspect(model)} for #{harness}: #{inspect(health)}"
+         }}
+
+      false ->
+        warn_dead_default(harness, model, configured_default?)
+        {:error, %{code: "model_unavailable", message: "model must be specified"}}
+    end
+  end
+
+  defp warn_dead_default(_harness, _model, false), do: :ok
+
+  defp warn_dead_default(harness, model, true) do
+    Logger.warning(
+      "configured default model #{inspect(model)} is not currently offered by #{harness}"
+    )
   end
 
   defp remove_override_result(config, db, call) do

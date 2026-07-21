@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "id": "claude-opus-4-8",
+      "display_name": "Claude Opus 4.8",
+      "max_input_tokens": 1000000,
+      "capabilities": {
+        "effort": {
+          "low": {"supported": true},
+          "medium": {"supported": true},
+          "high": {"supported": true},
+          "xhigh": {"supported": false},
+          "max": {"supported": true}
+        }
+      }
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "display_name": "Claude Haiku 4.5",
+      "max_input_tokens": 200000
+    }
+  ]
+}

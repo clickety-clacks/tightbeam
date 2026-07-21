@@ -20,15 +20,13 @@ defmodule Tightbeam.Archetypes do
                                         # ["*"] alone = any configured host.
                                         # Empty = error, never a grant.
 
+      model_preferences = ["claude-opus-4-8"] # ordered preference data read
+                                               # by adjudicators; the substrate
+                                               # never walks this list.
+
       [defaults]                        # optional spawn defaults
       harness = "codex"                 # "claude" | "codex"
       model   = "gpt-5.6-sol[medium]"
-
-      fallback_models = ["fable"]       # optional PREFERENCE chain (may cross
-                                        # harnesses). Data only: surfaced to
-                                        # clients; SWITCHING is a reaction
-                                        # rail (deliberate, audited), never
-                                        # silent substrate retry.
 
       [references]                      # optional — named pointers to work
                                         # materials; compile into guidance
@@ -81,7 +79,7 @@ defmodule Tightbeam.Archetypes do
           where: [String.t()],
           defaults: %{optional(:harness) => :claude | :codex, optional(:model) => String.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
-          fallback_models: [String.t()],
+          model_preferences: [String.t()],
           containment: %{fs: :off | :workdir, network: :open},
           mcp: [
             %{
@@ -1024,7 +1022,7 @@ defmodule Tightbeam.Archetypes do
       where: [Tightbeam.Placement.local_host_name()],
       defaults: %{},
       references: [],
-      fallback_models: [],
+      model_preferences: [],
       containment: %{fs: :off, network: :open},
       mcp: [],
       guidance: nil,
@@ -1039,7 +1037,7 @@ defmodule Tightbeam.Archetypes do
       "name = #{JSON.encode!(archetype.name)}",
       "skills = [#{Enum.map_join(archetype.skills, ", ", &JSON.encode!/1)}]",
       "where = [#{Enum.map_join(archetype.where, ", ", &JSON.encode!/1)}]",
-      "fallback_models = [#{Enum.map_join(archetype.fallback_models, ", ", &JSON.encode!/1)}]",
+      "model_preferences = [#{Enum.map_join(archetype.model_preferences, ", ", &JSON.encode!/1)}]",
       "",
       "[defaults]",
       "",
@@ -1098,7 +1096,7 @@ defmodule Tightbeam.Archetypes do
         "where",
         "defaults",
         "references",
-        "fallback_models",
+        "model_preferences",
         "guidance",
         "mcp",
         "containment"
@@ -1164,10 +1162,10 @@ defmodule Tightbeam.Archetypes do
         %{name: reference_name, location: location, access: reference["access"]}
       end)
 
-    fallback_models = Map.get(manifest, "fallback_models", [])
+    model_preferences = Map.get(manifest, "model_preferences", [])
 
-    unless is_list(fallback_models) and Enum.all?(fallback_models, &is_binary/1) do
-      raise ArgumentError, "archetype fallback_models must be a list of strings: #{path}"
+    unless is_list(model_preferences) and Enum.all?(model_preferences, &is_binary/1) do
+      raise ArgumentError, "archetype model_preferences must be a list of strings: #{path}"
     end
 
     mcp = validate_mcp!(Map.get(manifest, "mcp", %{}))
@@ -1177,7 +1175,7 @@ defmodule Tightbeam.Archetypes do
       name: name,
       skills: skills,
       where: where,
-      fallback_models: fallback_models,
+      model_preferences: model_preferences,
       containment: containment,
       defaults: defaults,
       references: references,

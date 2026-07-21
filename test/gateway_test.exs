@@ -10,6 +10,7 @@ defmodule Tightbeam.GatewayTest do
     Gateway,
     Idempotency,
     Ledger,
+    ModelCatalog,
     Org,
     Placement,
     Projection,
@@ -121,12 +122,65 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: registry})
     lane = start_supervised!({LaneDoorbell, self()})
+
+    catalog_base =
+      Path.join(System.tmp_dir!(), "gateway-catalog-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join([catalog_base, "auth", "claude"]))
+    File.write!(Path.join([catalog_base, "auth", "claude", "oauth-token"]), "test-token")
+
+    claude_models =
+      JSON.encode!(%{
+        data: [
+          %{
+            id: "claude-fable-5",
+            display_name: "Claude Fable 5",
+            capabilities: %{effort: %{}}
+          },
+          %{
+            id: "claude-sonnet-4-6",
+            display_name: "Claude Sonnet 4.6",
+            capabilities: %{effort: %{}}
+          }
+        ]
+      })
+
+    start_supervised!(
+      {ModelCatalog,
+       base_dir: catalog_base,
+       codex_home: Path.join(catalog_base, "codex"),
+       claude_fetch: fn _, _ -> {:ok, claude_models} end,
+       codex_read: fn _ ->
+         {:ok,
+          JSON.encode!(%{
+            models: [
+              %{
+                slug: "gpt-5.6-sol",
+                display_name: "GPT-5.6 Sol",
+                supported_reasoning_levels: [
+                  %{effort: "low"},
+                  %{effort: "medium"},
+                  %{effort: "high"},
+                  %{effort: "xhigh"},
+                  %{effort: "max"},
+                  %{effort: "ultra"}
+                ]
+              }
+            ]
+          })}
+       end}
+    )
+
+    await_catalog("claude")
+    await_catalog("codex")
     old_hosts = Application.get_env(:tightbeam, :hosts)
 
     on_exit(fn ->
       if old_hosts,
         do: Application.put_env(:tightbeam, :hosts, old_hosts),
         else: Application.delete_env(:tightbeam, :hosts)
+
+      File.rm_rf!(catalog_base)
     end)
 
     for module <- [Devices, EventLog, Idempotency, Ledger, Org, Projection, Roles, Wakes],
@@ -184,7 +238,7 @@ defmodule Tightbeam.GatewayTest do
         db: ctx.db,
         base_dir: System.tmp_dir!(),
         default_harness: :claude,
-        default_model: "fable",
+        default_model: "claude-fable-5",
         max_live_sessions_per_user: 5
       })
 
@@ -552,6 +606,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert key == created.session_key
     assert Org.get(ctx.db, key).handle == "builder"
+    assert Org.get(ctx.db, key).model == "claude-fable-5"
 
     Roles.create!(ctx.db, "taken", "flynn", nil)
     {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
@@ -966,7 +1021,7 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_model", model: "sonnet"}
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
     assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
@@ -984,7 +1039,7 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_model", model: "sonnet"}
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
     assert_receive {:contained_load_session, "existing-session"}
@@ -1234,7 +1289,11 @@ defmodule Tightbeam.GatewayTest do
              tune.(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_harness", harness: "codex"}
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol[medium]"
+               }
              })
 
     assert message =~ "no codex credentials"
@@ -1270,7 +1329,11 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_harness", harness: "codex"}
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol[medium]"
+               }
              })
 
     assert Org.get(ctx.db, "k1").identity_name == identity_name
@@ -1317,7 +1380,11 @@ defmodule Tightbeam.GatewayTest do
       Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"].(%{
         origin: "user:flynn",
         session_key: "k1",
-        params: %{setting: "set_harness", harness: "codex"}
+        params: %{
+          setting: "set_harness",
+          harness: "codex",
+          model: "gpt-5.6-sol[medium]"
+        }
       })
     end
 
@@ -1397,7 +1464,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: ctx.db
@@ -1482,6 +1549,21 @@ defmodule Tightbeam.GatewayTest do
              "activity:false"
            ]
   end
+
+  defp await_catalog(harness, attempts \\ 100)
+
+  defp await_catalog(harness, attempts) when attempts > 0 do
+    case ModelCatalog.get(harness, ModelCatalog) do
+      {_entries, :fresh} ->
+        :ok
+
+      _ ->
+        Process.sleep(5)
+        await_catalog(harness, attempts - 1)
+    end
+  end
+
+  defp await_catalog(harness, 0), do: flunk("catalog did not become fresh: #{harness}")
 
   test "next turn after set_host delivers the advertised remote URL", ctx do
     exact_registry =
@@ -1618,7 +1700,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: ctx.db
@@ -1703,7 +1785,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: ctx.db
@@ -1771,7 +1853,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: ctx.db
@@ -1830,7 +1912,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: port,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: db
