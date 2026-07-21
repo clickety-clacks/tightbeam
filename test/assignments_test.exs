@@ -235,6 +235,302 @@ defmodule Tightbeam.AssignmentsTest do
     assert [%{id: "asg_old", workItemId: nil}] = Assignments.list(db, %{state: "all"})
   end
 
+  test "assign captures review links and immutable holder family stamps", ctx do
+    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "producer"))
+
+    assert reviewed.reviewsAssignmentId == nil
+    assert reviewed.holderHarness == "claude"
+    assert reviewed.holderProvider == "anthropic"
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET harness = 'codex', provider = 'openai' WHERE sessionKey = 'holder'"
+      )
+
+    assert %{holderHarness: "claude", holderProvider: "anthropic"} =
+             Assignments.list(ctx.db, %{state: "all"})
+             |> Enum.find(&(&1.id == reviewed.id))
+
+    review_call =
+      assign_call({:user, "flynn"}, "review")
+      |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> Map.put(:session_key, "other-session")
+
+    review = handle(ctx, "assign", review_call)
+    assert review.reviewsAssignmentId == reviewed.id
+    assert review.holderHarness == "claude"
+    assert review.holderProvider == "anthropic"
+
+    unknown =
+      assign_call({:user, "flynn"}, "unknown review")
+      |> put_in([:params, :reviews_assignment_id], "asg_missing")
+
+    assert %{code: "unknown_review_target"} = handle(ctx, "assign", unknown)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'unknown review'")
+  end
+
+  test "attests rebuild reaches the full checked shape from every prior version" do
+    for starting_shape <- [:bare, :check_tier, :partial_p3] do
+      db = :"attests_#{starting_shape}_#{System.unique_integer([:positive])}"
+
+      start_supervised!(%{
+        id: db,
+        start: {DB, :start_link, [[path: ":memory:", name: db]]}
+      })
+
+      :ok = DB.execute(db, migration_base_ddl())
+      :ok = DB.execute(db, prior_attests_ddl(starting_shape))
+
+      {:ok, _} =
+        DB.query(
+          db,
+          prior_attest_insert(starting_shape)
+        )
+
+      :ok = Assignments.ensure_schema(db)
+      :ok = Assignments.ensure_schema(db)
+
+      assert [%{id: "att_old"} = old] = Assignments.list_attests(db, "asg_old")
+      assert old.byHarness == nil
+      assert old.byProvider == nil
+      assert old.producer == nil
+      assert old.producerCommand == nil
+      assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+
+      {:ok, [[sql]]} =
+        DB.query(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attests'")
+
+      for fragment <- [
+            "producer TEXT NULL",
+            "producerCommand TEXT NULL",
+            "byHarness TEXT NULL",
+            "byProvider TEXT NULL",
+            "CHECK(producer IS NULL OR kind = 'verdict')",
+            "CHECK(producerCommand IS NULL OR producer IS NOT NULL)",
+            "CHECK(byHarness IS NULL OR kind = 'verdict')",
+            "CHECK(byProvider IS NULL OR kind = 'verdict')"
+          ] do
+        assert sql =~ fragment
+      end
+
+      for {id, columns, values} <- [
+            {"bad_producer", "producer", "'build'"},
+            {"bad_harness", "byHarness", "'claude'"},
+            {"bad_provider", "byProvider", "'anthropic'"}
+          ] do
+        assert {:error, %DB.Error{message: message}} =
+                 DB.query(
+                   db,
+                   "INSERT INTO attests (id, assignmentId, kind, note, bySession, #{columns}, ts) VALUES ('#{id}', 'asg_old', 'progress', NULL, 'holder', #{values}, 2)"
+                 )
+
+        assert message =~ "CHECK constraint"
+      end
+
+      assert {:error, %DB.Error{message: message}} =
+               DB.query(
+                 db,
+                 "INSERT INTO attests (id, assignmentId, kind, verdictKind, bySession, producerCommand, ts) VALUES ('bad_command', 'asg_old', 'verdict', 'tests-passed', 'holder', 'mix test', 2)"
+               )
+
+      assert message =~ "CHECK constraint"
+    end
+  end
+
+  test "declared files dedupe silently and overlap is transactionally serialized", ctx do
+    paths = ["lib/a.ex", "lib/b.ex", "lib/a.ex", "../kept", "/absolute/kept"]
+
+    first =
+      assign_call({:user, "flynn"}, "files")
+      |> put_in([:params, :files], paths)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert Assignments.declared_files(ctx.db, first.id) ==
+             Enum.sort(["lib/a.ex", "lib/b.ex", "../kept", "/absolute/kept"])
+
+    assert Assignments.open_assignments_touching(ctx.db, ["lib/a.ex"]) == [first.id]
+    assert Assignments.open_assignments_touching(ctx.db, ["lib/a.ex"], first.id) == []
+    assert Assignments.open_assignments_touching(ctx.db, ["not-declared"]) == []
+    assert Assignments.open_assignments_touching(ctx.db, []) == []
+
+    overlapping =
+      assign_call({:user, "flynn"}, "overlap")
+      |> put_in([:params, :files], ["lib/a.ex"])
+
+    assert %{code: "files_overlap", message: message} = handle(ctx, "assign", overlapping)
+    assert message =~ first.id
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'overlap'")
+
+    malformed =
+      assign_call({:user, "flynn"}, "malformed")
+      |> put_in([:params, :files], ["ok", " "])
+
+    assert %{code: "invalid_files"} = handle(ctx, "assign", malformed)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'malformed'")
+
+    no_files = handle(ctx, "assign", assign_call({:user, "flynn"}, "no files"))
+    assert Assignments.declared_files(ctx.db, no_files.id) == []
+
+    disjoint =
+      for {subject, path} <- [{"disjoint one", "one"}, {"disjoint two", "two"}] do
+        assign_call({:user, "flynn"}, subject)
+        |> put_in([:params, :files], [path])
+        |> then(&handle(ctx, "assign", &1))
+      end
+
+    assert Enum.all?(disjoint, &is_binary(&1.id))
+
+    concurrent =
+      for subject <- ["race one", "race two"] do
+        Task.async(fn ->
+          assign_call({:user, "flynn"}, subject)
+          |> put_in([:params, :files], ["same-race-path"])
+          |> then(&handle(ctx, "assign", &1))
+        end)
+      end
+      |> Task.await_many()
+
+    assert Enum.count(concurrent, &(&1[:code] == "files_overlap")) == 1
+    assert Enum.count(concurrent, &is_binary(&1[:id])) == 1
+
+    _closed = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
+
+    after_close =
+      assign_call({:user, "flynn"}, "after close")
+      |> put_in([:params, :files], ["lib/a.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    assert is_binary(after_close.id)
+  end
+
+  test "ordinary and producer verdicts freeze provenance and expose produced reads", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "verdict stamps"))
+
+    ordinary =
+      handle(ctx, "attest", %{
+        attest_call({:session, "holder"}, assignment.id, "verdict")
+        | params: %{assignment_id: assignment.id, kind: "verdict", verdict_kind: "reviewed-clean"}
+      })
+
+    assert ordinary.attest.byHarness == "claude"
+    assert ordinary.attest.byProvider == "anthropic"
+    assert ordinary.attest.producer == nil
+    assert ordinary.attest.producerCommand == nil
+
+    user_verdict =
+      handle(ctx, "attest", %{
+        attest_call({:user, "flynn"}, assignment.id, "verdict")
+        | params: %{assignment_id: assignment.id, kind: "verdict", verdict_kind: "user-ruling"}
+      })
+
+    assert user_verdict.attest.byHarness == nil
+    assert user_verdict.attest.byProvider == nil
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET harness = 'codex', provider = 'openai' WHERE sessionKey = 'holder'"
+      )
+
+    assert {:ok, {:ok, produced}} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.insert_producer_verdict_in_txn(txn, %{
+                 assignment_id: assignment.id,
+                 verdict_kind: "tests-passed",
+                 producer: "build",
+                 producer_command: "mix test --seed 0",
+                 by_session: "holder",
+                 by_user: nil,
+                 by_harness: "claude",
+                 by_provider: "anthropic"
+               })
+             end)
+
+    assert produced.producer == "build"
+    assert produced.producerCommand == "mix test --seed 0"
+    assert produced.byHarness == "claude"
+    assert produced.byProvider == "anthropic"
+    assert Assignments.produced_verdict_kinds(ctx.db, assignment.id) == ["tests-passed"]
+
+    rows = Assignments.list_attests(ctx.db, assignment.id)
+    assert Enum.find(rows, &(&1.id == ordinary.attest.id)).byHarness == "claude"
+    assert Enum.find(rows, &(&1.id == produced.id)).producerCommand == "mix test --seed 0"
+
+    closed = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+    assert closed.assignment.state == "closed"
+
+    assert {:ok, {:error, %{code: "assignment_closed"}}} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.insert_producer_verdict_in_txn(txn, producer_input(assignment.id))
+             end)
+
+    assert {:ok, {:error, %{code: "unknown_assignment"}}} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.insert_producer_verdict_in_txn(txn, producer_input("missing"))
+             end)
+  end
+
+  test "commissioned review authors enforce the full review-link predicate", ctx do
+    third = session(ctx.db, "third-session", "other", %{harness: "codex", provider: "openai"})
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "producer assignment"))
+
+    valid_review =
+      assign_call({:user, "flynn"}, "valid review")
+      |> Map.put(:session_key, third.session_key)
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    valid =
+      attest_call({:session, third.session_key}, valid_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    direct =
+      attest_call({:session, third.session_key}, producer.id, "verdict")
+      |> put_in([:params, :verdict_kind], "direct-does-not-count")
+
+    _ = handle(ctx, "attest", direct)
+
+    third_party =
+      attest_call({:session, "other-session"}, valid_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "third-party")
+
+    _ = handle(ctx, "attest", third_party)
+
+    user =
+      attest_call({:user, "flynn"}, valid_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "user-verdict")
+
+    _ = handle(ctx, "attest", user)
+
+    self_commissioned =
+      assign_call({:session, "holder"}, "self commissioned")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    self_verdict =
+      attest_call({:session, "other-session"}, self_commissioned.id, "verdict")
+      |> put_in([:params, :verdict_kind], "self-commissioned")
+
+    _ = handle(ctx, "attest", self_verdict)
+
+    assert Assignments.commissioned_review_authors(ctx.db, producer.id, "holder") == [
+             %{
+               verdict_kind: valid.attest.verdictKind,
+               by_harness: "codex",
+               by_provider: "openai"
+             }
+           ]
+  end
+
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
     user = handle(ctx, "assign", assign_call({:user, "holder"}, "user", "collision"))
     session = handle(ctx, "assign", assign_call({:session, "holder"}, "session", "collision"))
@@ -488,8 +784,94 @@ defmodule Tightbeam.AssignmentsTest do
   defp origin({:process, process}), do: "process:#{process}"
   defp origin(nil), do: "agent:declared"
 
-  defp session(db, key, owner) do
-    Org.create(db, %{
+  defp producer_input(assignment_id) do
+    %{
+      assignment_id: assignment_id,
+      verdict_kind: "tests-passed",
+      producer: "build",
+      producer_command: "mix test",
+      by_session: "holder",
+      by_user: nil,
+      by_harness: "claude",
+      by_provider: "anthropic"
+    }
+  end
+
+  defp migration_base_ddl do
+    """
+    CREATE TABLE users (userId TEXT PRIMARY KEY);
+    CREATE TABLE sessions (
+      sessionKey TEXT PRIMARY KEY, harness TEXT NOT NULL, provider TEXT NOT NULL,
+      state TEXT NOT NULL
+    );
+    CREATE TABLE work_items (id TEXT PRIMARY KEY);
+    INSERT INTO users (userId) VALUES ('flynn');
+    INSERT INTO sessions (sessionKey, harness, provider, state)
+      VALUES ('holder', 'claude', 'anthropic', 'active');
+    CREATE TABLE assignments (
+      id TEXT PRIMARY KEY, subject TEXT NOT NULL, holderKey TEXT NOT NULL,
+      holderRole TEXT NULL, holderFallback INTEGER NOT NULL DEFAULT 0,
+      openedByUser TEXT NULL, openedBySession TEXT NULL, openedAt INTEGER NOT NULL,
+      state TEXT NOT NULL DEFAULT 'open', outcome TEXT NULL, closedAt INTEGER NULL,
+      closedByUser TEXT NULL, closedBySession TEXT NULL, closingAttestId TEXT NULL
+    );
+    INSERT INTO assignments
+      (id, subject, holderKey, openedByUser, openedAt, state)
+      VALUES ('asg_old', 'old', 'holder', 'flynn', 1, 'open')
+    """
+  end
+
+  defp prior_attests_ddl(:bare) do
+    """
+    CREATE TABLE attests (
+      id TEXT PRIMARY KEY, assignmentId TEXT NOT NULL REFERENCES assignments(id),
+      kind TEXT NOT NULL, note TEXT NULL,
+      bySession TEXT NULL REFERENCES sessions(sessionKey), ts INTEGER NOT NULL
+    )
+    """
+  end
+
+  defp prior_attests_ddl(:check_tier) do
+    """
+    CREATE TABLE attests (
+      id TEXT PRIMARY KEY, assignmentId TEXT NOT NULL REFERENCES assignments(id),
+      kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
+      verdictKind TEXT NULL, note TEXT NULL,
+      bySession TEXT NULL REFERENCES sessions(sessionKey),
+      byUser TEXT NULL REFERENCES users(userId), ts INTEGER NOT NULL
+    )
+    """
+  end
+
+  defp prior_attests_ddl(:partial_p3) do
+    """
+    CREATE TABLE attests (
+      id TEXT PRIMARY KEY, assignmentId TEXT NOT NULL REFERENCES assignments(id),
+      kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
+      verdictKind TEXT NULL, note TEXT NULL,
+      bySession TEXT NULL REFERENCES sessions(sessionKey),
+      byUser TEXT NULL REFERENCES users(userId), producer TEXT NULL,
+      producerCommand TEXT NULL, ts INTEGER NOT NULL,
+      CHECK(producer IS NULL OR kind = 'verdict'),
+      CHECK(producerCommand IS NULL OR producer IS NOT NULL)
+    )
+    """
+  end
+
+  defp prior_attest_insert(:bare) do
+    "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_old', 'asg_old', 'progress', 'old', 'holder', 1)"
+  end
+
+  defp prior_attest_insert(:check_tier) do
+    "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts) VALUES ('att_old', 'asg_old', 'progress', NULL, 'old', 'holder', NULL, 1)"
+  end
+
+  defp prior_attest_insert(:partial_p3) do
+    "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, ts) VALUES ('att_old', 'asg_old', 'progress', NULL, 'old', 'holder', NULL, NULL, NULL, 1)"
+  end
+
+  defp session(db, key, owner, overrides \\ %{}) do
+    input = %{
       session_key: key,
       display_name: key,
       owner_user_id: owner,
@@ -499,6 +881,8 @@ defmodule Tightbeam.AssignmentsTest do
       provider: "anthropic",
       model: "fable",
       host: "eezo"
-    })
+    }
+
+    Org.create(db, Map.merge(input, overrides))
   end
 end
