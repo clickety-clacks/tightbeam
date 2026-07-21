@@ -1,0 +1,25 @@
+{
+  "data": [
+    {
+      "id": "claude-opus-4-8",
+      "display_name": "Claude Opus 4.8",
+      "max_input_tokens": 1000000,
+      "capabilities": {
+        "effort": {
+          "low": {"supported": true},
+          "medium": {"supported": false},
+          "high": {"supported": true},
+          "xhigh": {"supported": false},
+          "max": {"supported": true}
+        },
+        "thinking": {"supported": true}
+      }
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "display_name": "Claude Sonnet 4.6",
+      "max_input_tokens": 200000,
+      "capabilities": {}
+    }
+  ]
+}

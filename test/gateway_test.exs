@@ -10,6 +10,7 @@ defmodule Tightbeam.GatewayTest do
     Gateway,
     Idempotency,
     Ledger,
+    ModelCatalog,
     Org,
     Placement,
     Projection,
@@ -184,7 +185,7 @@ defmodule Tightbeam.GatewayTest do
         db: ctx.db,
         base_dir: System.tmp_dir!(),
         default_harness: :claude,
-        default_model: "fable",
+        default_model: "claude-opus-4-8[high]",
         max_live_sessions_per_user: 5
       })
 
@@ -293,6 +294,131 @@ defmodule Tightbeam.GatewayTest do
       refute encoded =~ "cli_token"
       refute encoded =~ session.cli_token
     end)
+  end
+
+  test "derived refs gate set_model and an absent ref is rejected without mutation", ctx do
+    codex =
+      __DIR__
+      |> Path.join("fixtures/models_cache.json")
+      |> File.read!()
+      |> JSON.decode!()
+      |> ModelCatalog.derive_codex()
+
+    claude =
+      __DIR__
+      |> Path.join("fixtures/anthropic_models.json")
+      |> File.read!()
+      |> JSON.decode!()
+      |> ModelCatalog.derive_claude()
+
+    catalog = %{"claude" => claude, "codex" => codex}
+    config = gateway_config(System.tmp_dir!(), ctx.db, 0) |> Map.put(:model_catalog, catalog)
+    tune = Gateway.handlers(config)["tune"]
+
+    assert Gateway.valid_model_ref?(catalog, "claude", config.default_model)
+
+    for model <- claude do
+      assert %{ok: true} =
+               tune.(%{
+                 origin: "user:flynn",
+                 session_key: "k1",
+                 params: %{setting: "set_model", model: model.ref}
+               })
+    end
+
+    Org.set_harness(ctx.db, "k1", "codex", "openai", hd(codex).ref)
+
+    for model <- codex do
+      assert %{ok: true} =
+               tune.(%{
+                 origin: "user:flynn",
+                 session_key: "k1",
+                 params: %{setting: "set_model", model: model.ref}
+               })
+    end
+
+    before = Org.get(ctx.db, "k1").model
+
+    assert %{ok: false, code: "invalid_model"} =
+             tune.(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "missing[high]"}
+             })
+
+    assert Org.get(ctx.db, "k1").model == before
+  end
+
+  test "unavailable catalog sources do not crash org options or inspect", ctx do
+    base_dir = role_test_base("missing-catalog-list")
+    Archetypes.load!(base_dir)
+
+    missing_base =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_missing_catalog_#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(missing_base)
+    on_exit(fn -> File.rm_rf!(missing_base) end)
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      start_supervised!(
+        {ModelCatalog,
+         base_dir: missing_base,
+         claude_fetch: fn _token -> {:error, :unreachable} end,
+         ttl_ms: :timer.hours(1)}
+      )
+    end)
+
+    assert Gateway.org_options().models == %{"claude" => [], "codex" => []}
+
+    config = gateway_config(base_dir, ctx.db, 0) |> Map.delete(:model_catalog)
+
+    assert %{models: %{"claude" => [], "codex" => []}} =
+             Gateway.handlers(config)["inspect"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{}
+             })
+  end
+
+  test "a concurrent list returns immediately while the Claude refresh is slow", ctx do
+    base_dir = role_test_base("slow-catalog-list")
+    Archetypes.load!(base_dir)
+    test_pid = self()
+    name = :"slow_catalog_#{System.unique_integer([:positive])}"
+
+    fetch = fn _token ->
+      send(test_pid, {:catalog_fetch_started, self()})
+
+      receive do
+        :release -> {:ok, File.read!(Path.join(__DIR__, "fixtures/anthropic_models.json"))}
+      end
+    end
+
+    start_supervised!(
+      {ModelCatalog, base_dir: base_dir, name: name, claude_fetch: fetch, ttl_ms: :timer.hours(1)}
+    )
+
+    assert_receive {:catalog_fetch_started, task}
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.delete(:model_catalog)
+      |> Map.put(:model_catalog_server, name)
+
+    started = System.monotonic_time(:millisecond)
+
+    assert %{models: %{"claude" => [], "codex" => []}} =
+             Gateway.handlers(config)["inspect"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{}
+             })
+
+    assert System.monotonic_time(:millisecond) - started < 100
+    send(task, :release)
   end
 
   test "unknown local CLI target records a warning and returns without blocking boot", ctx do
@@ -959,7 +1085,7 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_model", model: "sonnet"}
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
     assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
@@ -977,7 +1103,7 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_model", model: "sonnet"}
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
     assert_receive {:contained_load_session, "existing-session"}
@@ -1390,7 +1516,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: ctx.db
@@ -1611,7 +1737,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: ctx.db
@@ -1696,7 +1822,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: ctx.db
@@ -1764,7 +1890,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: ctx.db
@@ -1823,10 +1949,18 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: port,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
-      db: db
+      db: db,
+      model_catalog: %{
+        "claude" => [
+          %{ref: "claude-opus-4-8[high]", name: "Claude Opus 4.8 (high)"},
+          %{ref: "claude-sonnet-4-6", name: "Claude Sonnet 4.6"},
+          %{ref: "claude-haiku-4-5", name: "Claude Haiku 4.5"}
+        ],
+        "codex" => [%{ref: "gpt-5.6-sol[medium]", name: "Sol (medium)"}]
+      }
     }
   end
 

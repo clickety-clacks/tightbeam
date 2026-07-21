@@ -1032,13 +1032,7 @@ defmodule Tightbeam.Placement do
   defp merge_settings(settings, additions), do: Map.merge(settings, additions)
 
   defp model_settings(:claude, archetype, config) do
-    default_ref = archetype.defaults[:model] || config.default_model
-
-    pinned_model =
-      Application.get_env(:tightbeam, :model_pins, %{"fable" => "claude-fable-5[1m]"})
-      |> Map.get(default_ref, default_ref)
-
-    %{"model" => pinned_model}
+    %{"model" => archetype.defaults[:model] || config.default_model}
   end
 
   defp model_settings(_harness, _archetype, _config), do: nil

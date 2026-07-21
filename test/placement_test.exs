@@ -16,8 +16,6 @@ defmodule Tightbeam.PlacementTest do
 
     old_hosts = Application.get_env(:tightbeam, :hosts)
     old_url = Application.get_env(:tightbeam, :advertised_url)
-    old_model_pins = Application.get_env(:tightbeam, :model_pins)
-    Application.delete_env(:tightbeam, :model_pins)
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -30,10 +28,6 @@ defmodule Tightbeam.PlacementTest do
       if old_url,
         do: Application.put_env(:tightbeam, :advertised_url, old_url),
         else: Application.delete_env(:tightbeam, :advertised_url)
-
-      if old_model_pins,
-        do: Application.put_env(:tightbeam, :model_pins, old_model_pins),
-        else: Application.delete_env(:tightbeam, :model_pins)
     end)
 
     %{base_dir: base_dir, db: db}
@@ -60,7 +54,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: base_dir,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       db: db
     }
 
@@ -130,7 +124,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: base_dir,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       db: db
     }
 
@@ -626,7 +620,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: base_dir,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       sh: fn command ->
         send(parent, {:unexpected_sh, command})
         {"", 0}
@@ -668,7 +662,13 @@ defmodule Tightbeam.PlacementTest do
     File.mkdir_p!(probe_cwd)
     File.write!(Path.join(probe_cwd, "stale"), "remove me")
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
+
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
@@ -691,7 +691,12 @@ defmodule Tightbeam.PlacementTest do
     File.mkdir_p!(token_dir)
     File.write!(Path.join(token_dir, "oauth-token"), "sk-ant-oat01-test\n")
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
 
     claude_env = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
     assert {"CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test"} in claude_env
@@ -719,7 +724,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: base_dir,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       sh: sh
     }
 
@@ -783,7 +788,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: base_dir,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       sh: sh
     }
 
@@ -830,7 +835,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: canonical_base,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       db: db,
       sh: sh
     }
@@ -874,7 +879,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: canonical_base,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       db: db,
       sh: fn _ -> {"no", 1} end
     }
@@ -899,7 +904,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: canonical_base,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       db: db,
       sh: fn _ -> raise ErlangError, original: :enoent end
     }
@@ -929,7 +934,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: canonical_base,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       db: db,
       sh: fn command ->
         send(parent, {:command, command})
@@ -976,7 +981,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: base_dir,
       cwd: "/work",
       cli_bin: "/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       db: db,
       sh: sh
     }
@@ -1009,7 +1014,7 @@ defmodule Tightbeam.PlacementTest do
       base_dir: canonical_base,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: "claude-opus-4-8[high]",
       db: db,
       sh: fn _ -> {"", 0} end
     }
@@ -1048,7 +1053,14 @@ defmodule Tightbeam.PlacementTest do
     File.mkdir_p!(auth_dir)
     auth_path = Path.join(auth_dir, "auth.json")
     File.write!(auth_path, "old")
-    config = %{base_dir: canonical_base, cwd: "/work", cli_bin: "/bin", default_model: "fable", db: db}
+
+    config = %{
+      base_dir: canonical_base,
+      cwd: "/work",
+      cli_bin: "/bin",
+      default_model: "claude-opus-4-8[high]",
+      db: db
+    }
 
     home = Placement.deliver_home(config, {:codex, "default", "testhost"})
     nested = Path.join(home, "sessions/state.json")
@@ -1082,7 +1094,13 @@ defmodule Tightbeam.PlacementTest do
     File.write!(Path.join(archetypes_dir, "spaced.toml"), ~s(name = "#{identity_name}"\n))
     Archetypes.load!(base_dir)
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
+
     opts = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
 
     {"TIGHTBEAM_LINEAGE", "tb1-" <> encoded} =
@@ -1108,7 +1126,12 @@ defmodule Tightbeam.PlacementTest do
       if "cat" in command, do: {"", 1}, else: {"", 0}
     end
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
 
     assert Placement.deliver_home(config, {:codex, "default", "worker"}, sh: sh) ==
              "/remote/tb/homes/default/codex"
@@ -1219,8 +1242,15 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join(staged_home, "auth.json"))
   end
 
-  test "deliver_home pins the default Claude model without statutes", %{base_dir: base_dir} do
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+  test "deliver_home writes the provider-id default Claude model without statutes", %{
+    base_dir: base_dir
+  } do
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
 
     settings =
       config
@@ -1229,7 +1259,7 @@ defmodule Tightbeam.PlacementTest do
       |> File.read!()
       |> JSON.decode!()
 
-    assert settings == %{"model" => "claude-fable-5[1m]"}
+    assert settings == %{"model" => "claude-opus-4-8[high]"}
   end
 
   test "deliver_home lets the archetype default model override the org default", %{
@@ -1243,17 +1273,17 @@ defmodule Tightbeam.PlacementTest do
     where = ["testhost"]
 
     [defaults]
-    model = "sonnet"
+    model = "claude-sonnet-4-6"
     """)
 
     Archetypes.load!(base_dir)
 
-    Application.put_env(:tightbeam, :model_pins, %{
-      "fable" => "claude-fable-5[1m]",
-      "sonnet" => "claude-sonnet-4-6"
-    })
-
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
 
     settings =
       config
@@ -1269,7 +1299,13 @@ defmodule Tightbeam.PlacementTest do
        %{
          base_dir: base_dir
        } do
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
+
     lawless_codex_home = Placement.deliver_home(config, {:codex, "default", "testhost"})
     lawless_agents = File.read!(Path.join(lawless_codex_home, "AGENTS.md"))
     lawless_manifest = File.read!(Path.join(lawless_codex_home, ".tightbeam-manifest"))
@@ -1285,7 +1321,7 @@ defmodule Tightbeam.PlacementTest do
            |> Path.join("settings.json")
            |> File.read!()
            |> JSON.decode!() ==
-             Map.merge(Rails.hook_settings(), %{"model" => "claude-fable-5[1m]"})
+             Map.merge(Rails.hook_settings(), %{"model" => "claude-opus-4-8[high]"})
 
     refute claude_home |> Path.join("settings.json") |> File.read!() =~ "tightbeam-probe"
 
@@ -1326,7 +1362,13 @@ defmodule Tightbeam.PlacementTest do
   test "deliver_home preserves the manifest and nested state with zero statutes", %{
     base_dir: base_dir
   } do
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
+
     home = Placement.deliver_home(config, {:codex, "default", "testhost"})
     stamp_path = Path.join(home, ".tightbeam-manifest")
     stamp_before = File.read!(stamp_path)
@@ -1371,7 +1413,14 @@ defmodule Tightbeam.PlacementTest do
     path = Path.join(manifests, "coder.toml")
     File.write!(path, "name = \"coder\"\n")
     Archetypes.load!(base_dir)
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+
+    config = %{
+      base_dir: base_dir,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "claude-opus-4-8[high]"
+    }
+
     home = Placement.deliver_home(config, {:codex, "coder", "testhost"})
     first = home |> Path.join(".tightbeam-manifest") |> File.read!() |> JSON.decode!()
     marker = Path.join(home, "nested-marker")
