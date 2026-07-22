@@ -1,0 +1,71 @@
+[[class]]
+id = "C1"
+dir = "c1_harness_gates"
+title = "Harness tool-gates"
+kind = "harness-gate"
+phase = "green"
+blocking_phase = ""
+runners = ["compiled_hook_grep"]
+
+[[class]]
+id = "C2"
+dir = "c2_dispatch_predicates"
+title = "Dispatch deny-predicates"
+kind = "dispatch-rule"
+phase = "green"
+blocking_phase = ""
+runners = ["rules_evaluate"]
+
+[[class]]
+id = "C3"
+dir = "c3_fact_existence"
+title = "Fact-existence gates"
+kind = "dispatch-rule"
+phase = "green"
+blocking_phase = ""
+runners = ["rules_evaluate"]
+
+[[class]]
+id = "C4"
+dir = "c4_provenance_independence"
+title = "Provenance / independence"
+kind = "dispatch-rule + handler-refusal"
+phase = "pending"
+blocking_phase = "P3"
+runners = ["rules_evaluate", "handler_refusal"]
+
+[[class]]
+id = "C5"
+dir = "c5_script_guards"
+title = "Script guards"
+kind = "script-guard"
+phase = "pending"
+blocking_phase = "P4"
+runners = ["rules_evaluate"]
+
+[[class]]
+id = "C6"
+dir = "c6_remedies"
+title = "Remedies / active gates"
+kind = "remedy + load-rejection"
+phase = "pending"
+blocking_phase = "P5"
+runners = ["rules_decide", "acting_layer", "load_assert"]
+
+[[class]]
+id = "C7"
+dir = "c7_turn_end_sweep"
+title = "Turn-end sweep"
+kind = "sweep"
+phase = "pending"
+blocking_phase = "P6"
+runners = ["rules_decide", "acting_layer"]
+
+[[class]]
+id = "Cap"
+dir = "capstone"
+title = "Reviewer-loop ensemble"
+kind = "capstone"
+phase = "pending"
+blocking_phase = "P7"
+runners = ["rules_decide", "acting_layer"]

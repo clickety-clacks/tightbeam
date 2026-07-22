@@ -1,0 +1,14 @@
+[fixture]
+class = "C2"
+name = "handoff-assign"
+phase = "pending-unhomed"
+blocking_phase = "§6 arg-presence row"
+kind = "dispatch-rule"
+source = "Tenet hand-off; §6 arg-presence row"
+legibility = "event:denied(rule=handoff-assign)"
+
+[[fixture.rule]]
+name = "handoff-assign"
+verb = "assign"
+text = "handoff assignments name what passed, what is expected back, and whom to wake"
+deny_when = [{ fact = "call.handoff_complete", op = "eq", value = false }]

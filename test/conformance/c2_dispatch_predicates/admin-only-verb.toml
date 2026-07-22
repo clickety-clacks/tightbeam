@@ -1,0 +1,14 @@
+[fixture]
+class = "C2"
+name = "admin-only-verb"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "Substrate manual §identity; §6 admin-only"
+legibility = "event:denied(rule=admin-only-verb)"
+
+[[fixture.rule]]
+name = "admin-only-verb"
+verb = "spawn"
+text = "spawn is restricted to administrators"
+deny_when = [{ fact = "caller.is_admin", op = "eq", value = false }]

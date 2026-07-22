@@ -1,0 +1,17 @@
+[fixture]
+class = "C3"
+name = "verdict-present-tests"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "§6 tests-pass presence; check_tier_test"
+legibility = "event:denied(rule=verdict-present-tests)"
+
+[[fixture.rule]]
+name = "verdict-present-tests"
+verb = "attest"
+text = "completion requires a tests-passed verdict"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["tests-passed"] },
+]

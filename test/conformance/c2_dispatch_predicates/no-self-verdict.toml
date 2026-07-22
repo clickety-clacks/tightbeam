@@ -1,0 +1,14 @@
+[fixture]
+class = "C2"
+name = "no-self-verdict"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "Orchestrator independence; check_tier_test"
+legibility = "event:denied(rule=no-self-verdict)"
+
+[[fixture.rule]]
+name = "no-self-verdict"
+verb = "attest"
+text = "an assignment holder cannot file its own verdict"
+deny_when = [{ fact = "assignment.caller_is_holder", op = "eq", value = true }]

@@ -1,0 +1,17 @@
+[fixture]
+class = "C3"
+name = "two-changes-requested-revert"
+phase = "pending-unhomed"
+blocking_phase = "§6 count row"
+kind = "dispatch-rule"
+source = "Tenet/orchestrator revert; §6 count row"
+legibility = "event:denied(rule=two-changes-requested-revert)"
+
+[[fixture.rule]]
+name = "two-changes-requested-revert"
+verb = "attest"
+text = "a third completion after two changes-requested verdicts is refused"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.changes_requested_count", op = "gte", value = 2 },
+]

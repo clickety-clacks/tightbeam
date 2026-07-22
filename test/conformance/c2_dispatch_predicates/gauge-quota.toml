@@ -1,0 +1,14 @@
+[fixture]
+class = "C2"
+name = "gauge-quota"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "Substrate manual §identity; §6 gauge exemption"
+legibility = "event:denied(rule=gauge-quota)"
+
+[[fixture.rule]]
+name = "gauge-quota"
+verb = "spawn"
+text = "the caller has reached the live-session gauge"
+deny_when = [{ fact = "org.live_sessions_owned_by_caller", op = "gte", value = 2 }]

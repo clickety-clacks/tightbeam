@@ -1,0 +1,18 @@
+[fixture]
+class = "C3"
+name = "verdict-and-archetype"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "§6 tests-pass / independent-review presence; check_tier_test"
+legibility = "event:denied(rule=verdict-and-archetype)"
+
+[[fixture.rule]]
+name = "verdict-and-archetype"
+verb = "attest"
+text = "coder completion requires a tests-passed verdict"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["tests-passed"] },
+]

@@ -1,0 +1,41 @@
+[[statute]]
+name = "no-git-stash"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+pattern = "git[[:space:]]+stash([[:space:]]+(push|pop|drop|clear|apply|save)|[[:space:]]*([^[:alnum:][:space:]]|$))"
+text = "You ran a mutating git stash; destructive git is forbidden on any worktree because it silently hides another agent's uncommitted work."
+
+[[statute]]
+name = "no-git-reset-hard"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+pattern = "git[[:space:]]+reset[[:space:]]+--hard"
+text = "You ran git reset --hard; destructive git is forbidden on any worktree because it discards another agent's uncommitted work."
+
+[[statute]]
+name = "no-git-clean-force"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+pattern = "git[[:space:]]+clean[[:space:]]+(--force|-[^[:space:]]*f)"
+text = "You ran a forced git clean; destructive git is forbidden on any worktree because it deletes another agent's untracked work."
+
+[[statute]]
+name = "no-git-checkout-discard"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+pattern = "git[[:space:]]+checkout[[:space:]]+--([[:space:]]|$)"
+text = "You ran git checkout -- to discard paths; destructive git is forbidden on any worktree because it overwrites another agent's uncommitted work."
+
+# Known deliberate over-match: also refuses the non-destructive "git restore --staged" (unstage only).
+# Kept broad — narrowing safely needs a portable POSIX-class exclusion; accident-grade by design.
+[[statute]]
+name = "no-git-restore"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+pattern = "git[[:space:]]+restore"
+text = "You ran git restore; destructive git is forbidden on any worktree because it discards another agent's uncommitted work."

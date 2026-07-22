@@ -1,0 +1,17 @@
+[fixture]
+class = "C3"
+name = "verdict-present-review"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "§6 independent-review presence; check_tier_test"
+legibility = "event:denied(rule=verdict-present-review)"
+
+[[fixture.rule]]
+name = "verdict-present-review"
+verb = "attest"
+text = "completion requires a reviewed-clean verdict"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] },
+]
