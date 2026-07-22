@@ -546,7 +546,37 @@ defmodule Tightbeam.Wire.Router do
 
   # Plug decodes %20 in path segments but leaves '+' literal (that's a query-string
   # convention, not a path one) — session keys carry a space, never a literal '+'.
-  defp decode_session_key_param(key), do: String.replace(key, "+", " ")
+  #
+  # The clawline iOS client sometimes double-percent-encodes the :key segment (a
+  # space becomes %2520 instead of %20); since Plug's router already decodes the
+  # segment once before we see it, a double-encoded key arrives still encoded
+  # (e.g. "%20"). Peel off up to @session_key_decode_passes more layers, stopping
+  # at the first fixed point so an already-decoded (single-encoded) key is left
+  # untouched. The "+" -> " " replacement runs first so an explicitly-escaped
+  # literal plus (%2B, which only becomes "+" via the decode loop) survives
+  # instead of being swept into the space heuristic meant for raw '+' characters.
+  @session_key_decode_passes 4
+
+  defp decode_session_key_param(key) do
+    key
+    |> String.replace("+", " ")
+    |> decode_session_key_percent(@session_key_decode_passes)
+  end
+
+  defp decode_session_key_percent(key, 0), do: key
+
+  defp decode_session_key_percent(key, passes_left) do
+    case safe_uri_decode(key) do
+      ^key -> key
+      decoded -> decode_session_key_percent(decoded, passes_left - 1)
+    end
+  end
+
+  defp safe_uri_decode(key) do
+    URI.decode(key)
+  rescue
+    ArgumentError -> key
+  end
 
   defp owned_session(key, device, conn) do
     case Org.get(db(conn), key) do

@@ -278,6 +278,105 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body) == %{"deletedSessionKey" => key}
   end
 
+  test "PATCH /api/streams/:key still accepts a single-encoded %20 space in the key", ctx do
+    key = "agent:main:clawline:mike:main s_test0020"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", &send_call/1)
+
+    percent_encoded_key = String.replace(key, " ", "%20")
+
+    response =
+      conn(
+        :patch,
+        "/api/streams/#{percent_encoded_key}",
+        JSON.encode!(%{"displayName" => "Renamed"})
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_receive {:call, %{verb: "tune", session_key: ^key}}
+  end
+
+  test "PATCH /api/streams/:key decodes a double-encoded '%2520' path key as a space", ctx do
+    key = "agent:main:clawline:mike:main s_test2520"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", &send_call/1)
+
+    double_encoded_key = String.replace(key, " ", "%2520")
+
+    response =
+      conn(
+        :patch,
+        "/api/streams/#{double_encoded_key}",
+        JSON.encode!(%{"displayName" => "Renamed"})
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_receive {:call, %{verb: "tune", session_key: ^key}}
+  end
+
+  test "DELETE /api/streams/:key decodes a double-encoded '%2520' path key as a space", ctx do
+    key = "agent:main:clawline:mike:main s_test2521"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts =
+      with_handler(ctx.opts, "retire", fn call ->
+        send_call(call)
+        %{deleted_session_key: call.session_key}
+      end)
+
+    double_encoded_key = String.replace(key, " ", "%2520")
+
+    response =
+      conn(:delete, "/api/streams/#{double_encoded_key}", JSON.encode!(%{}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_receive {:call, %{verb: "retire", session_key: ^key}}
+    assert JSON.decode!(response.resp_body) == %{"deletedSessionKey" => key}
+  end
+
+  test "PATCH /api/streams/:key resolves a double-encoded '%252B' path key as a literal plus",
+       ctx do
+    key = "agent:main:clawline:mike:main+plus_test2b"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", &send_call/1)
+
+    double_encoded_key = String.replace(key, "+", "%252B")
+
+    response =
+      conn(
+        :patch,
+        "/api/streams/#{double_encoded_key}",
+        JSON.encode!(%{"displayName" => "Renamed"})
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_receive {:call, %{verb: "tune", session_key: ^key}}
+  end
+
+  test "PATCH /api/streams/:key 404s cleanly on a malformed percent escape in the key", ctx do
+    opts = with_handler(ctx.opts, "tune", &send_call/1)
+
+    response =
+      conn(
+        :patch,
+        "/api/streams/agent:main:clawline:mike:main%zzmalformed",
+        JSON.encode!(%{"displayName" => "Renamed"})
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 404
+    refute_received {:call, _}
+  end
+
   test "agent dispatch enforces cli bearer, allowlist, and identity/target resolution", ctx do
     actor =
       Org.create(ctx.db, %{
