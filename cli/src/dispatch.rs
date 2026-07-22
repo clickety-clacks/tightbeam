@@ -94,6 +94,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             prompt,
             after_ms,
             at,
+            condition_kind,
+            condition_scope,
+            idempotency_key,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -107,7 +110,31 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = at {
                 params.push(format!("\"at\":{value}"));
             }
+            for (name, value) in [
+                ("conditionKind", condition_kind),
+                ("conditionScope", condition_scope),
+                ("idempotencyKey", idempotency_key),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
             Ok(request(identity, "wake", vec![target], params))
+        }
+        Command::Condition {
+            identity,
+            kind,
+            scope,
+            idempotency_key,
+        } => {
+            let mut params = vec![string_field("kind", kind)];
+            if let Some(value) = scope {
+                params.push(string_field("scope", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(identity, "condition", vec![], params))
         }
         Command::Spawn {
             identity,
@@ -597,6 +624,7 @@ where
 fn identity_omitted(command: &Command) -> bool {
     let identity = match command {
         Command::Wake { identity, .. }
+        | Command::Condition { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
@@ -719,6 +747,42 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "wake",
+                "--session",
+                "agent:r",
+                "--prompt",
+                "retry",
+                "--when-fact",
+                "quota-recovered",
+                "--when-scope",
+                "codex:sol",
+                "--fallback-after",
+                "30m",
+                "--key",
+                "wake-1",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","sessionKey":"agent:r","params":{"prompt":"retry","afterMs":1800000,"conditionKind":"quota-recovered","conditionScope":"codex:sol","idempotencyKey":"wake-1"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "condition",
+                "--kind",
+                "deploy-succeeded",
+                "--scope",
+                "prod",
+                "--key",
+                "deploy-1",
+                "--as-process",
+                "ci",
+            ]),
+            r#"{"asProcess":"ci","verb":"condition","params":{"kind":"deploy-succeeded","scope":"prod","idempotencyKey":"deploy-1"}}"#
         );
     }
 

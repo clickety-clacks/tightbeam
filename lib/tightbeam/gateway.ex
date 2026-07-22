@@ -47,7 +47,8 @@ defmodule Tightbeam.Gateway do
   Verb handlers (all built by `handlers/1`, dispatched via Tightbeam.Dispatch;
   port each from gateway.ts's dispatcher.register blocks, including):
   - post (echo+enqueue; dedupe contract), wake (schedule/cancel/immediate
-    fire; a wake MUST carry a prompt), spawn (idempotency, headcount cap,
+    fire; a wake MUST carry a prompt), condition (file a literal wake fact),
+    spawn (idempotency, headcount cap,
     role-name uniqueness, owner inherited from spawn tree), retire (idempotent,
     owner-only), tune (rename | set_model; live-session apply), cancel,
     inspect (owned sessions + owned pending wakes + admin: pending devices),
@@ -61,6 +62,7 @@ defmodule Tightbeam.Gateway do
     AdapterCoordinator,
     Archetypes,
     Assignments,
+    ConditionFacts,
     Placement,
     DB,
     Devices,
@@ -120,6 +122,7 @@ defmodule Tightbeam.Gateway do
           Tightbeam.Assets,
           Devices,
           Idempotency,
+          ConditionFacts,
           Wakes,
           Projection,
           Org,
@@ -323,11 +326,39 @@ defmodule Tightbeam.Gateway do
           not valid_reresolve?(p) ->
             %{code: "invalid", message: "reresolve lineage requires seed and rung"}
 
+          is_binary(p[:condition_scope]) and not is_binary(p[:condition_kind]) ->
+            %{code: "invalid", message: "--when-scope requires --when-fact"}
+
+          is_binary(p[:condition_kind]) and is_nil(p[:after_ms]) and is_nil(p[:at]) ->
+            %{
+              code: "invalid",
+              message: "a condition wake requires a fallback (--fallback-after / --at)"
+            }
+
           is_nil(resolve_caller(db, call.origin)) ->
             %{code: "unknown_caller"}
 
           true ->
             wake_result(config, db, call)
+        end
+      end,
+      "condition" => fn call ->
+        p = call.params
+
+        if is_binary(p[:kind]) and p.kind != "" do
+          scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+
+          case ConditionFacts.file_idempotent(db, scheduler, %{
+                 kind: p.kind,
+                 scope: p[:scope],
+                 origin: call.origin,
+                 idempotency_key: p[:idempotency_key]
+               }) do
+            {:error, error} -> error
+            fact -> fact
+          end
+        else
+          %{code: "invalid", message: "a condition fact requires a kind"}
         end
       end,
       "approve-device" =>
@@ -516,93 +547,14 @@ defmodule Tightbeam.Gateway do
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
-    # Return address, one representation for three audiences: wake-delivered
-    # messages carry a first-line `[from <origin>]` stamp in BOTH the stored
-    # content and the model prompt. Humans read it as text in any client;
-    # aware clients strip it and render a chip (validating it against the
-    # sender field — the anti-forgery cross-check); the model reads it as
-    # the address to wake back. Fact-stamping, never content authorship.
-    stamped =
-      case opts[:sender] do
-        sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
-        _ -> prompt
-      end
-
     result =
       DB.transaction(db, fn txn ->
-        target = delivery_target(txn, session_key, opts[:target_gate])
-
-        input = %{
-          session_key: target,
-          role: "user",
-          content: stamped,
-          device_id: opts[:device_id],
-          client_message_id: opts[:client_message_id],
-          attachments: opts[:attachments] || [],
-          sender: opts[:sender]
-        }
-
-        if is_nil(target) do
-          :skipped
-        else
-          case Projection.append_in_txn(txn, input) do
-            {:appended, message} ->
-              _seq =
-                Ledger.enqueue_in_txn(txn, %{
-                  session_key: target,
-                  message_id: message.id,
-                  wake_id: opts[:wake_id],
-                  origin: origin,
-                  prompt: stamped,
-                  role_ref: opts[:role_ref],
-                  role_fallback: opts[:role_fallback] || false
-                })
-
-              if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
-                Tightbeam.DB.Txn.q(
-                  txn,
-                  "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-                  [opts[:wake_id], System.system_time(:millisecond)]
-                )
-              end
-
-              {:appended, target, message}
-
-            other ->
-              other
-          end
-        end
+        deliver_prompt_in_txn(txn, session_key, origin, prompt, opts)
       end)
 
     case result do
-      {:ok, {:appended, actual_session_key, message}} ->
-        registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
-        publish_message(db, actual_session_key, message, registry)
-
-        publish_turn_state(
-          db,
-          actual_session_key,
-          message.client_message_id || message.id,
-          "accepted",
-          nil,
-          registry
-        )
-
-        LaneManager.ensure_lane(
-          Keyword.get(opts, :lane_manager, Tightbeam.LaneManager),
-          actual_session_key
-        )
-
-        :appended
-
-      {:ok, :skipped} ->
-        :skipped
-
-      {:ok, {:duplicate, _message}} ->
-        :duplicate
-
-      {:ok, {:conflict, _message}} ->
-        :conflict
+      {:ok, delivery} ->
+        complete_delivery(db, delivery)
 
       {:error, %{message: message}} when is_binary(message) ->
         if String.contains?(message, "UNIQUE"),
@@ -614,19 +566,132 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp delivery_target(_txn, session_key, nil), do: session_key
+  @doc "Delivery's DB-only core for callers already inside the DB owner transaction."
+  @spec deliver_prompt_in_txn(DB.Txn.t(), String.t(), String.t(), String.t(), keyword()) ::
+          {:appended, String.t(), map(), keyword()}
+          | {:duplicate, map()}
+          | {:conflict, map()}
+          | :skipped
+  def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
+    stamped =
+      case opts[:sender] do
+        sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
+        _ -> prompt
+      end
 
-  defp delivery_target(txn, session_key, gate) do
-    case Tightbeam.DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
+    case delivery_target(txn, session_key, opts[:target_gate]) do
+      nil ->
+        :skipped
+
+      {target, role_ref, role_fallback} ->
+        input = %{
+          session_key: target,
+          role: "user",
+          content: stamped,
+          device_id: opts[:device_id],
+          client_message_id: opts[:client_message_id],
+          attachments: opts[:attachments] || [],
+          sender: opts[:sender]
+        }
+
+        case Projection.append_in_txn(txn, input) do
+          {:appended, message} ->
+            Ledger.enqueue_in_txn(txn, %{
+              session_key: target,
+              message_id: message.id,
+              wake_id: opts[:wake_id],
+              origin: origin,
+              prompt: stamped,
+              role_ref: role_ref || opts[:role_ref],
+              role_fallback: role_fallback || opts[:role_fallback] || false
+            })
+
+            if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
+              DB.Txn.q(
+                txn,
+                "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+                [opts[:wake_id], System.system_time(:millisecond)]
+              )
+            end
+
+            {:appended, target, message, opts}
+
+          other ->
+            other
+        end
+    end
+  end
+
+  @doc "Publish and lane-nudge a delivery after its transaction commits."
+  @spec complete_delivery(DB.server(), term()) :: :appended | :duplicate | :conflict | :skipped
+  def complete_delivery(db, {:appended, actual_session_key, message, opts}) do
+    registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
+    publish_message(db, actual_session_key, message, registry)
+
+    publish_turn_state(
+      db,
+      actual_session_key,
+      message.client_message_id || message.id,
+      "accepted",
+      nil,
+      registry
+    )
+
+    LaneManager.ensure_lane(
+      Keyword.get(opts, :lane_manager, Tightbeam.LaneManager),
+      actual_session_key
+    )
+
+    :appended
+  end
+
+  def complete_delivery(_db, :skipped), do: :skipped
+  def complete_delivery(_db, {:duplicate, _message}), do: :duplicate
+  def complete_delivery(_db, {:conflict, _message}), do: :conflict
+
+  @doc false
+  def delivery_target(_txn, session_key, nil), do: {session_key, nil, false}
+
+  def delivery_target(txn, _session_key, %{target_role: role}) when is_binary(role) do
+    case DB.Txn.q(txn, "SELECT boundSessionKey, ownerUserId FROM roles WHERE name = ?1", [role]) do
+      [[bound, owner]] ->
+        case active_session?(txn, bound) do
+          true -> {bound, role, false}
+          false -> active_personal_target(txn, owner, role)
+        end
+
+      [] ->
+        nil
+    end
+  end
+
+  def delivery_target(txn, session_key, gate) do
+    case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
       [["active"]] ->
-        session_key
+        {session_key, nil, false}
 
       _ when gate.reresolve == "lineage" ->
-        Supervision.ladder_target(txn, gate.reresolve_seed, gate.reresolve_rung)
+        case Supervision.ladder_target(txn, gate.reresolve_seed, gate.reresolve_rung) do
+          nil -> nil
+          target -> {target, nil, false}
+        end
 
       _ ->
         nil
     end
+  end
+
+  defp active_session?(_txn, nil), do: false
+
+  defp active_session?(txn, session_key) do
+    DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) == [
+      ["active"]
+    ]
+  end
+
+  defp active_personal_target(txn, owner, role) do
+    target = Org.personal_session_key(owner)
+    if active_session?(txn, target), do: {target, role, true}, else: nil
   end
 
   @doc """
@@ -1252,7 +1317,8 @@ defmodule Tightbeam.Gateway do
   end
 
   # Processes (cron/CI/automation) resolve as callers with NO owner and NO
-  # session: enough standing to wake and cancel their own wakes; every
+  # session: enough standing to wake, cancel their own wakes, and file
+  # org-owned condition facts; every
   # owner- or admin-gated path falls through to denial naturally.
   defp resolve_caller(_db, "user:" <> user_id), do: %{owner_user_id: user_id, caller_session: nil}
 
@@ -1502,48 +1568,75 @@ defmodule Tightbeam.Gateway do
   defp wake_result(config, db, call) do
     p = call.params
 
-    prior =
-      if p[:idempotency_key],
-        do: Idempotency.get(db, call.origin, "wake", p.idempotency_key)
+    case call.session_key do
+      session_key when is_binary(session_key) ->
+        due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
 
-    if prior do
-      db |> Wakes.get(prior.session_key) |> wake_response()
-    else
-      case call.session_key do
-        session_key when is_binary(session_key) ->
-          due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
+        result =
+          DB.transaction(db, fn txn ->
+            prior =
+              if p[:idempotency_key],
+                do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
-          wake =
-            Wakes.schedule(db, %{
-              session_key: session_key,
-              target_role: Map.get(call, :target_role),
-              origin: call.origin,
-              prompt: p.prompt,
-              due_at: due_at,
-              reresolve: p[:reresolve],
-              reresolve_seed: p[:reresolve_seed],
-              reresolve_rung: p[:reresolve_rung]
-            })
+            if prior do
+              case DB.Txn.q(txn, select_wake_in_txn_sql(), [prior.session_key]) do
+                [row] -> wake_from_in_txn_row(row)
+                [] -> nil
+              end
+            else
+              wake =
+                Wakes.schedule_in_txn(txn, %{
+                  session_key: session_key,
+                  target_role: Map.get(call, :target_role),
+                  origin: call.origin,
+                  prompt: p.prompt,
+                  due_at: due_at,
+                  condition_kind: p[:condition_kind],
+                  condition_scope: p[:condition_scope],
+                  creator_session_key: creator_session_key(call[:principal]),
+                  reresolve: p[:reresolve],
+                  reresolve_seed: p[:reresolve_seed],
+                  reresolve_rung: p[:reresolve_rung]
+                })
 
-          if p[:idempotency_key] do
-            Idempotency.put(db, %{
-              owner_user_id: call.origin,
-              operation: "wake",
-              idempotency_key: p.idempotency_key,
-              session_key: wake.wake_id
-            })
+              if p[:idempotency_key] do
+                Idempotency.put_in_txn(txn, %{
+                  owner_user_id: call.origin,
+                  operation: "wake",
+                  idempotency_key: p.idempotency_key,
+                  session_key: wake.wake_id
+                })
+              end
+
+              wake
+            end
+          end)
+
+        wake =
+          case result do
+            {:ok, wake} -> wake
+            {:error, error} -> raise error
           end
 
-          if due_at <= System.system_time(:millisecond) and p[:nudge] != false,
-            do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
+        if due_at <= System.system_time(:millisecond) and p[:nudge] != false,
+          do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
 
-          db |> Wakes.get(wake.wake_id) |> wake_response()
+        wake_response(wake)
 
-        _ ->
-          %{code: "not_found"}
-      end
+      _ ->
+        %{code: "not_found"}
     end
   end
+
+  defp creator_session_key({:session, key}), do: key
+  defp creator_session_key(_principal), do: nil
+
+  defp select_wake_in_txn_sql do
+    "SELECT wakeId, dueAt, state FROM wakes WHERE wakeId = ?1"
+  end
+
+  defp wake_from_in_txn_row([wake_id, due_at, state]),
+    do: %{wake_id: wake_id, due_at: due_at, state: state}
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
@@ -1862,7 +1955,10 @@ defmodule Tightbeam.Gateway do
         warn_dead_default(harness, model, configured_default?)
 
         {:error,
-         %{code: "model_unavailable", message: "model #{inspect(model)} is not offered by #{harness}"}}
+         %{
+           code: "model_unavailable",
+           message: "model #{inspect(model)} is not offered by #{harness}"
+         }}
 
       %{health: health} ->
         warn_dead_default(harness, model, configured_default?)

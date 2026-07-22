@@ -1,12 +1,13 @@
 defmodule Tightbeam.WakesTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.{DB, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     scheduler = :"wake_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
+    :ok = ConditionFacts.ensure_schema(name)
     :ok = Wakes.ensure_schema(name)
     %{db: name, scheduler: scheduler}
   end
