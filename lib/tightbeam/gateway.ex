@@ -2382,6 +2382,8 @@ defmodule Tightbeam.Gateway do
                 end)
               end)
 
+              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+
               %{
                 deleted_session_key: session.session_key,
                 retired_session_keys: Enum.map(result.retired, & &1.session_key),
@@ -2622,6 +2624,8 @@ defmodule Tightbeam.Gateway do
       end)
     end)
 
+    reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+
     %{
       ok: true,
       action: "stop",
@@ -2795,7 +2799,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp adjudicate_respawn(_config, db, call, episode) do
+  defp adjudicate_respawn(config, db, call, episode) do
     with {:ok, harness, provider} <- harness_for_ref(call.params.model) do
       old = Org.get(db, episode.session_key)
 
@@ -2930,6 +2934,8 @@ defmodule Tightbeam.Gateway do
         Payloads.stream_created(Payloads.stream_session(new_session))
       )
 
+      reap_retired_sessions(config, db, [old.session_key])
+
       %{
         ok: true,
         action: "respawn",
@@ -2948,6 +2954,75 @@ defmodule Tightbeam.Gateway do
       wake_id,
       System.system_time(:millisecond)
     ])
+  end
+
+  # Retire durability owns the ordering: every DB transition commits before
+  # this seam touches a harness. Adapters are shared by key, so each retired
+  # harness SID is closed independently and the adapter itself is closed only
+  # when no active session still shares that key. Every operation is guarded:
+  # an absent/dead adapter can never turn a committed retire into a failure.
+  defp reap_retired_sessions(_config, _db, []), do: :ok
+
+  defp reap_retired_sessions(config, db, session_keys) do
+    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+
+    session_keys
+    |> Enum.flat_map(fn session_key ->
+      with session when not is_nil(session) <- Org.get(db, session_key),
+           %{harness_session_id: sid} <- Org.current_pointer(db, session_key) do
+        [
+          %{
+            session_key: session_key,
+            sid: sid,
+            key: {String.to_existing_atom(session.harness), session.identity_name, session.host}
+          }
+        ]
+      else
+        _ -> []
+      end
+    end)
+    |> Enum.group_by(& &1.key)
+    |> Enum.each(fn {key, retired} -> reap_adapter_sessions(db, coordinator, key, retired) end)
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp reap_adapter_sessions(db, coordinator, key, retired) do
+    with {:ok, adapter, _generation} <- AdapterCoordinator.adapter_for(coordinator, key) do
+      Enum.each(retired, fn %{sid: sid} -> _ = Adapter.close_session(adapter, sid) end)
+
+      if live_session_on_adapter?(db, key) do
+        Enum.each(retired, fn %{session_key: session_key} ->
+          EventLog.lifecycle(
+            db,
+            "harness_context_resident",
+            session_key,
+            "harness context resident until adapter recycle"
+          )
+        end)
+      else
+        AdapterCoordinator.close_adapter(coordinator, key)
+      end
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp live_session_on_adapter?(db, {harness, identity_name, host}) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sessions WHERE state='active' AND harness=?1 AND identityName=?2 AND host=?3",
+        [Atom.to_string(harness), identity_name, host]
+      )
+
+    count > 0
   end
 
   defp harness_for_ref(ref) do

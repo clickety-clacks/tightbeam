@@ -44,6 +44,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         return send({ id: m.id, result: { sessionId: sid } });
       }
       case "session/load": capture(m); return send({ id: m.id, result: {} });
+      case "session/close": capture(m); return send({ id: m.id, result: {} });
       case "session/set_config_option": return send({ id: m.id, result: { configOptions: [] } });
       case "session/set_mode": {
         capture(m);
@@ -199,6 +200,18 @@ defmodule Tightbeam.Acp.AdapterTest do
              session_requests(capture_path)
 
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
+  end
+
+  test "close_session sends ACP session/close with the harness session id" do
+    {adapter, capture_path} = start_adapter()
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [])
+    assert Adapter.knows_session?(adapter, "sess-1")
+
+    assert :ok = Adapter.close_session(adapter, "sess-1")
+    refute Adapter.knows_session?(adapter, "sess-1")
+
+    assert [%{"method" => "session/close", "sessionId" => "sess-1"}] =
+             Enum.filter(captured_requests(capture_path), &(&1["method"] == "session/close"))
   end
 
   test "new_session and load_session still send an empty mcpServers list" do

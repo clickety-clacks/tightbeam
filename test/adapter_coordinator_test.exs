@@ -207,6 +207,38 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              EventLog.lifecycle_events(ctx.db)
   end
 
+  test "planned close tears down the adapter without crash restart bookkeeping", ctx do
+    path =
+      Path.join(System.tmp_dir!(), "coordinator_close_#{System.unique_integer([:positive])}.js")
+
+    File.write!(path, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_opts: fn _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: "/tmp",
+             cwd: "/tmp"
+           ]
+         end,
+         db: ctx.db,
+         name: :planned_close_coordinator}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    ref = Process.monitor(adapter)
+
+    assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
+    assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
+    assert AdapterCoordinator.generation(coordinator, key) == 1
+    assert EventLog.lifecycle_events(ctx.db) == []
+  end
+
   test "load-slot queue caps concurrency at three and releases on borrower exit", ctx do
     coordinator =
       start_supervised!(

@@ -88,6 +88,16 @@ defmodule Tightbeam.Acp.Adapter do
   def load_session(adapter, session_id, model, cwd, mcp_servers),
     do: GenServer.call(adapter, {:load_session, session_id, model, cwd, mcp_servers}, 30_000)
 
+  @doc "Best-effort ACP teardown for one harness session; adapter failures never escape the caller."
+  @spec close_session(adapter(), String.t()) :: :ok | {:error, term()}
+  def close_session(adapter, session_id) do
+    GenServer.call(adapter, {:close_session, session_id}, 65_000)
+  rescue
+    reason -> {:error, {:adapter_unavailable, reason}}
+  catch
+    :exit, reason -> {:error, {:adapter_unavailable, reason}}
+  end
+
   @doc "Strict adjudication-only model apply: base, effort, then response read-back."
   @spec apply_model_strict(adapter(), String.t(), model_ref(), model_ref()) ::
           :ok | {:error, :model_unavailable | :partial_apply}
@@ -266,6 +276,23 @@ defmodule Tightbeam.Acp.Adapter do
         # The caller falls back to a fresh session (pointer reason
         # "fallback") — never a crash, never a silent retry.
         {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:close_session, sid}, _from, state) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid}) do
+      {:ok, _result} ->
+        state = %{
+          state
+          | known: MapSet.delete(state.known, sid),
+            chunks: Map.delete(state.chunks, sid),
+            progress: Map.delete(state.progress, sid)
+        }
+
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
     end
   end
 

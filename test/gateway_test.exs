@@ -55,6 +55,12 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:acquire_load_slot, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
+    def handle_call({:close_adapter, key}, _from, {adapter, parent} = state) do
+      if is_pid(parent), do: send(parent, {:close_adapter, key})
+      GenServer.stop(adapter)
+      {:reply, :ok, state}
+    end
+
     def handle_cast({:release_load_slot, _slot}, state), do: {:noreply, state}
   end
 
@@ -75,6 +81,11 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers}, _from, parent),
       do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
 
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:close_session, sid})
+      {:reply, :ok, parent}
+    end
+
     def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
       do:
         {:reply,
@@ -91,6 +102,17 @@ defmodule Tightbeam.GatewayTest do
                      ))
 
       {:noreply, parent}
+    end
+  end
+
+  defmodule CloseErrorAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:close_session_failed, sid})
+      {:reply, {:error, :closed}, parent}
     end
   end
 
@@ -354,6 +376,99 @@ defmodule Tightbeam.GatewayTest do
                ctx.db,
                "SELECT sessionKey, reason FROM assignment_interruptions WHERE assignmentId='asg_retire'"
              )
+  end
+
+  test "retiring the last live session closes its harness session and shared adapter", ctx do
+    ensure_global_registry()
+    session = create_session(ctx.db, "reap-last", "flynn")
+    session = Org.set_identity(ctx.db, session.session_key, nil, "reap-last-identity")
+    Org.append_pointer(ctx.db, session.session_key, "harness-last", "created")
+
+    adapter =
+      start_supervised!(%{
+        id: {:reap_adapter, System.unique_integer([:positive])},
+        start: {AdapterStub, :start_link, [self()]},
+        restart: :temporary
+      })
+
+    coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
+    monitor = Process.monitor(adapter)
+
+    result =
+      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [session.session_key]
+    assert_receive {:close_session, "harness-last"}
+    assert_receive {:close_adapter, {:claude, "reap-last-identity", "testhost"}}
+    assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
+  end
+
+  test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
+    ensure_global_registry()
+    retired = create_session(ctx.db, "reap-sibling-retired", "flynn")
+    retired = Org.set_identity(ctx.db, retired.session_key, nil, "reap-sibling-identity")
+    sibling = create_session(ctx.db, "reap-sibling-live", "flynn")
+    _sibling = Org.set_identity(ctx.db, sibling.session_key, nil, "reap-sibling-identity")
+    Org.append_pointer(ctx.db, retired.session_key, "harness-retired", "created")
+
+    adapter =
+      start_supervised!(%{
+        id: {:reap_adapter, System.unique_integer([:positive])},
+        start: {AdapterStub, :start_link, [self()]},
+        restart: :temporary
+      })
+
+    coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    result =
+      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+        origin: "user:flynn",
+        session_key: retired.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [retired.session_key]
+    assert_receive {:close_session, "harness-retired"}
+    refute_receive {:close_adapter, _key}
+    assert Process.alive?(adapter)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_context_resident" and
+               event.subject == retired.session_key and
+               event.detail == "harness context resident until adapter recycle"
+           end)
+  end
+
+  test "a harness session close error cannot fail the committed retire", ctx do
+    ensure_global_registry()
+    session = create_session(ctx.db, "reap-close-error", "flynn")
+    session = Org.set_identity(ctx.db, session.session_key, nil, "reap-error-identity")
+    Org.append_pointer(ctx.db, session.session_key, "harness-close-error", "created")
+
+    adapter =
+      start_supervised!(%{
+        id: {:reap_error_adapter, System.unique_integer([:positive])},
+        start: {CloseErrorAdapterStub, :start_link, [self()]},
+        restart: :temporary
+      })
+
+    coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    result =
+      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [session.session_key]
+    assert Org.get(ctx.db, session.session_key).state == "retired"
+    assert_receive {:close_session_failed, "harness-close-error"}
+    assert_receive {:close_adapter, {:claude, "reap-error-identity", "testhost"}}
   end
 
   test "critical lease renewal is hard-capped and defers the entire cascade idempotently", ctx do
@@ -2484,6 +2599,13 @@ defmodule Tightbeam.GatewayTest do
       provider: "anthropic",
       model: "fable"
     })
+  end
+
+  defp ensure_global_registry do
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
   end
 
   defp move_test_base(suffix) do
