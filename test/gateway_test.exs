@@ -165,6 +165,23 @@ defmodule Tightbeam.GatewayTest do
                   %{effort: "max"},
                   %{effort: "ultra"}
                 ]
+              },
+              %{
+                slug: "gpt-5.6-terra",
+                display_name: "GPT-5.6 Terra",
+                supported_reasoning_levels: [
+                  %{effort: "low"},
+                  %{effort: "high"}
+                ]
+              },
+              %{
+                slug: "gpt-5.6-nano",
+                display_name: "GPT-5.6 Nano",
+                supported_reasoning_levels: [%{effort: "turbo"}]
+              },
+              %{
+                slug: "gpt-5.6-classic",
+                display_name: "GPT-5.6 Classic"
               }
             ]
           })}
@@ -1025,6 +1042,312 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
+  end
+
+  test "session_status splits setModel (one row per model) from setReasoning (current model's tiers)",
+       ctx do
+    Archetypes.load!(role_test_base("session-status-reasoning"))
+
+    Org.create(ctx.db, %{
+      session_key: "k-reasoning",
+      display_name: "Reasoning",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol[medium]"
+    })
+
+    status = Gateway.session_status("k-reasoning", ctx.db)
+
+    assert %{supported: true, options: options} = status.capabilities.setReasoning
+    assert Enum.map(options, & &1.value) |> Enum.sort() == Enum.sort(~w(low medium high xhigh max ultra))
+    assert Enum.all?(options, &(&1.title == &1.value))
+    assert status.capabilities.canChangeReasoning == true
+
+    assert %{supported: true, options: model_options} = status.capabilities.setModel
+    refute Enum.any?(model_options, fn o -> String.contains?(o.value, "[") end)
+    sol = Enum.find(model_options, &(&1.value == "gpt-5.6-sol"))
+    assert sol.title == "GPT-5.6 Sol"
+    assert length(Enum.filter(model_options, &(&1.value == "gpt-5.6-sol"))) == 1
+
+    # modelCatalog.models is the client picker's PRIMARY data source
+    # (SessionStatusFooter falls back to setModel.options only when the
+    # catalog is unavailable) — same one-row-per-model collapse, base refs.
+    catalog_models = status.modelCatalog.models
+    refute Enum.any?(catalog_models, &String.contains?(&1.ref, "["))
+    refute Enum.any?(catalog_models, &String.contains?(&1.id, "["))
+    assert Enum.map(catalog_models, & &1.ref) == Enum.uniq(Enum.map(catalog_models, & &1.ref))
+    assert Enum.map(catalog_models, & &1.name) == Enum.uniq(Enum.map(catalog_models, & &1.name))
+    assert %{name: "GPT-5.6 Sol"} = Enum.find(catalog_models, &(&1.ref == "gpt-5.6-sol"))
+
+    # display.model must match a catalog row (the footer shows it verbatim
+    # otherwise, leaking the machine ref) and reasoningLevel carries the tier.
+    assert status.display.model == "gpt-5.6-sol"
+    assert status.display.reasoningLevel == "medium"
+  end
+
+  test "session_status marks setReasoning unsupported for a model with no effort tiers", ctx do
+    Archetypes.load!(role_test_base("session-status-untiered"))
+
+    Org.create(ctx.db, %{
+      session_key: "k-untiered",
+      display_name: "Untiered",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6"
+    })
+
+    status = Gateway.session_status("k-untiered", ctx.db)
+
+    assert %{supported: false, reason: reason} = status.capabilities.setReasoning
+    assert reason =~ "no effort tiers"
+    assert status.capabilities.canChangeReasoning == false
+  end
+
+  test "a ref emitted by modelCatalog.models round-trips through set_model", ctx do
+    base_dir = role_test_base("catalog-ref-round-trip")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    Org.create(ctx.db, %{
+      session_key: "k-round-trip",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol[medium]"
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    # The client sends modelCatalog.models[].ref back as the set_model value.
+    emitted = Gateway.session_status("k-round-trip", ctx.db).modelCatalog.models
+    terra_ref = Enum.find(emitted, &(&1.name == "GPT-5.6 Terra")).ref
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-round-trip",
+               params: %{setting: "set_model", model: terra_ref}
+             })
+
+    assert Org.get(ctx.db, "k-round-trip").model =~ ~r/^gpt-5\.6-terra\[(low|high)\]$/
+  end
+
+  test "set_model with a bare model id keeps the current effort tier", ctx do
+    base_dir = role_test_base("set-model-bare-keeps-effort")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    Org.create(ctx.db, %{
+      session_key: "k-codex",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol[xhigh]"
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-codex",
+               params: %{setting: "set_model", model: "gpt-5.6-sol"}
+             })
+
+    assert Org.get(ctx.db, "k-codex").model == "gpt-5.6-sol[xhigh]"
+  end
+
+  test "set_model with a bare model id falls back to the new model's first tier when the current effort doesn't apply",
+       ctx do
+    base_dir = role_test_base("set-model-bare-falls-back")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    Org.create(ctx.db, %{
+      session_key: "k-codex-fallback",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol[xhigh]"
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-codex-fallback",
+               params: %{setting: "set_model", model: "gpt-5.6-terra"}
+             })
+
+    # gpt-5.6-terra only offers low/high (in that catalog order); xhigh
+    # doesn't carry over and terra has no "medium" either, so this lands on
+    # its first listed tier.
+    assert Org.get(ctx.db, "k-codex-fallback").model == "gpt-5.6-terra[low]"
+  end
+
+  test "set_model with a bare model id prefers 'medium' when the current effort doesn't apply but medium does",
+       ctx do
+    base_dir = role_test_base("set-model-bare-prefers-medium")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    Org.create(ctx.db, %{
+      session_key: "k-codex-medium",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-nano[turbo]"
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-codex-medium",
+               params: %{setting: "set_model", model: "gpt-5.6-sol"}
+             })
+
+    # "turbo" doesn't exist on sol, but sol does offer "medium", so that's
+    # preferred over just taking the first listed tier.
+    assert Org.get(ctx.db, "k-codex-medium").model == "gpt-5.6-sol[medium]"
+  end
+
+  test "set_model with a bare model id switching to an untiered model drops the effort qualifier",
+       ctx do
+    base_dir = role_test_base("set-model-bare-to-untiered")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    Org.create(ctx.db, %{
+      session_key: "k-codex-untiered",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol[high]"
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-codex-untiered",
+               params: %{setting: "set_model", model: "gpt-5.6-classic"}
+             })
+
+    assert Org.get(ctx.db, "k-codex-untiered").model == "gpt-5.6-classic"
+  end
+
+  test "set_model still accepts a full bracketed ref directly (back-compat)", ctx do
+    base_dir = role_test_base("set-model-full-ref-back-compat")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    Org.create(ctx.db, %{
+      session_key: "k-codex-full-ref",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol[medium]"
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-codex-full-ref",
+               params: %{setting: "set_model", model: "gpt-5.6-sol[low]"}
+             })
+
+    assert Org.get(ctx.db, "k-codex-full-ref").model == "gpt-5.6-sol[low]"
+  end
+
+  test "set_reasoning composes the current model with the newly selected effort tier", ctx do
+    base_dir = role_test_base("set-reasoning")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    Org.create(ctx.db, %{
+      session_key: "k-codex-reasoning",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol[medium]"
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-codex-reasoning",
+               params: %{setting: "set_reasoning", reasoningLevel: "xhigh"}
+             })
+
+    assert Org.get(ctx.db, "k-codex-reasoning").model == "gpt-5.6-sol[xhigh]"
+  end
+
+  test "set_reasoning rejects a level the current model does not offer", ctx do
+    base_dir = role_test_base("set-reasoning-invalid")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    before = Org.get(ctx.db, "k1")
+
+    assert %{code: code} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_reasoning", reasoningLevel: "nonexistent"}
+             })
+
+    assert code in ["model_unavailable", "catalog_unavailable"]
+    assert Org.get(ctx.db, "k1") == before
   end
 
   test "set_model propagates contained sandbox-disable load failure", ctx do

@@ -1,0 +1,871 @@
+defmodule Tightbeam.Escalation do
+  @moduledoc """
+  Durable decision requests and raiser-scoped escalation waivers.
+
+  `resolve/3` is an effect-free gate read. `escalate/4` owns request opening,
+  while `consume/2` is the per-ruling verb-edge CAS. A caller consuming a
+  batch must fail closed if any CAS loses; earlier winners stay consumed.
+  """
+
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
+  alias Tightbeam.DB.Txn
+
+  @default_decision_deadline_ms 86_400_000
+
+  @ddl """
+  CREATE TABLE IF NOT EXISTS decision_requests (
+    id                TEXT PRIMARY KEY,
+    raiserId          TEXT NOT NULL,
+    raiserSessionKey  TEXT,
+    ownerUserId       TEXT NOT NULL,
+    assignmentId      TEXT,
+    raisedAt          INTEGER NOT NULL,
+    deadlineAt        INTEGER NOT NULL,
+    statuteName       TEXT NOT NULL,
+    actionKey         TEXT NOT NULL,
+    question          TEXT NOT NULL,
+    options           TEXT,
+    context           TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn')),
+    decision          TEXT CHECK (decision IN ('allow','deny','waived')),
+    rationale         TEXT,
+    ruledBy           TEXT,
+    ruledAt           INTEGER,
+    rulingFactId      INTEGER,
+    consumedAt        INTEGER,
+    parkWakeId        TEXT,
+    withdrawnBy       TEXT,
+    withdrawnReason   TEXT,
+    withdrawnAt       INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS decision_requests_owner
+    ON decision_requests (ownerUserId, status);
+  CREATE INDEX IF NOT EXISTS decision_requests_key
+    ON decision_requests (raiserId, statuteName, actionKey);
+  CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_one_open
+    ON decision_requests (raiserId, statuteName, actionKey) WHERE status = 'open';
+
+  CREATE TABLE IF NOT EXISTS escalation_waivers (
+    id                TEXT PRIMARY KEY,
+    raiserId          TEXT NOT NULL,
+    statuteName       TEXT NOT NULL,
+    grantedBy         TEXT NOT NULL,
+    grantedAt         INTEGER NOT NULL,
+    reason            TEXT,
+    revokedBy         TEXT,
+    revokedAt         INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS escalation_waivers_lookup
+    ON escalation_waivers (raiserId, statuteName, revokedAt);
+  """
+
+  @request_columns """
+  id, raiserId, raiserSessionKey, ownerUserId, assignmentId, raisedAt, deadlineAt,
+  statuteName, actionKey, question, options, context, status, decision, rationale,
+  ruledBy, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
+  withdrawnReason, withdrawnAt
+  """
+
+  @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
+  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+
+  @doc "Effect-free consultation of waiver and current decision request."
+  @spec resolve(DB.server(), map(), map()) ::
+          :allow | {:allow, String.t()} | {:deny, map()} | {:needs_request, String.t() | nil}
+  def resolve(db, call, statute) do
+    raiser_id = raiser_id(call)
+    statute_name = statute_name(statute)
+
+    if live_waiver?(db, raiser_id, statute_name) do
+      :allow
+    else
+      case current_request(db, raiser_id, statute_name, digest(call)) do
+        %{status: "ruled", decision: "allow", id: id} -> {:allow, id}
+        %{status: "ruled", decision: "deny"} -> {:deny, deny_error(statute)}
+        %{status: "ruled", decision: "waived"} -> {:needs_request, nil}
+        %{status: "open", id: id} -> {:needs_request, id}
+        _ -> {:needs_request, nil}
+      end
+    end
+  end
+
+  @doc "Open or re-return the one current open request for this action."
+  @spec escalate(DB.server(), map(), map(), map()) :: {:decision_pending, String.t()}
+  def escalate(db, call, statute, ctx) do
+    case Map.get(ctx, :dr_id) || Map.get(ctx, "dr_id") do
+      id when is_binary(id) ->
+        {:decision_pending, id}
+
+      nil ->
+        now = now()
+        raiser_id = raiser_id(call)
+        raiser_session_key = raiser_session_key(call)
+        owner_user_id = owner_user_id!(db, call)
+        statute_name = statute_name(statute)
+        action_key = digest(call)
+        assignment_id = assignment_id(call)
+        request_id = "dr_" <> Tightbeam.Id.uuid4()
+        question = fetch_string!(ctx, :question)
+        options = encode_optional(Map.get(ctx, :options) || Map.get(ctx, "options"))
+
+        context =
+          JSON.encode!(%{verb: Map.fetch!(call, :verb), params: Map.fetch!(call, :params)})
+
+        deadline_at = now + decision_deadline_ms()
+
+        {:ok, {request, inserted?}} =
+          DB.transaction(db, fn txn ->
+            Txn.q(
+              txn,
+              """
+              INSERT INTO decision_requests
+                (id, raiserId, raiserSessionKey, ownerUserId, assignmentId, raisedAt,
+                 deadlineAt, statuteName, actionKey, question, options, context, status)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open')
+              ON CONFLICT DO NOTHING
+              """,
+              [
+                request_id,
+                raiser_id,
+                raiser_session_key,
+                owner_user_id,
+                assignment_id,
+                now,
+                deadline_at,
+                statute_name,
+                action_key,
+                question,
+                options,
+                context
+              ]
+            )
+
+            inserted? = Txn.changes(txn) == 1
+
+            [row] =
+              Txn.q(
+                txn,
+                "SELECT #{@request_columns} FROM decision_requests WHERE raiserId = ?1 AND statuteName = ?2 AND actionKey = ?3 AND status = 'open' ORDER BY rowid DESC LIMIT 1",
+                [raiser_id, statute_name, action_key]
+              )
+
+            request = request_from_row(row)
+
+            if inserted? do
+              EventLog.lifecycle_in_txn(
+                txn,
+                "decision_request_opened",
+                request.id,
+                "raiser=#{raiser_id} statute=#{statute_name} owner=#{owner_user_id} assignment=#{assignment_id || "nil"}"
+              )
+            end
+
+            {request, inserted?}
+          end)
+
+        if inserted?, do: deliver_owner(ctx, request)
+        {:decision_pending, request.id}
+    end
+  end
+
+  @doc "Spend one ruled authorization. Batch rollback is deliberately not provided."
+  @spec consume(DB.server(), String.t()) :: boolean()
+  def consume(db, ruling_id) do
+    {:ok, consumed?} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET status = 'consumed', consumedAt = ?2 WHERE id = ?1 AND status = 'ruled'",
+          [ruling_id, now()]
+        )
+
+        Txn.changes(txn) == 1
+      end)
+
+    consumed?
+  end
+
+  @doc "Rule one open request. `:authorized` is supplied by Gateway's admin axis."
+  @spec rule(DB.server(), map(), keyword()) :: map()
+  def rule(db, call, opts \\ []) do
+    request_id = param(call, :request_id) || param(call, :request)
+
+    with true <- Keyword.get(opts, :authorized, false),
+         request when not is_nil(request) <- get_raw(db, request_id),
+         false <- raiser_id(call) == request.raiser_id,
+         {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
+      case request.status do
+        "ruled" when request.decision == decision ->
+          request
+
+        "open" ->
+          rule_open(db, request, decision, param(call, :rationale), call.origin, opts)
+
+        _ ->
+          error("not_open", "decision request is not open")
+      end
+    else
+      false -> error("not_owner", "admin owner required")
+      true -> error("not_owner", "raiser cannot rule its own request")
+      nil -> error("not_found", "decision request not found")
+      {:error, error} -> error
+    end
+  end
+
+  @doc "Grant a request-driven or pre-emptive raiser-scoped waiver."
+  @spec waive(DB.server(), map(), keyword()) :: map()
+  def waive(db, call, opts \\ []) do
+    if Keyword.get(opts, :authorized, false) do
+      request_id = param(call, :request_id) || param(call, :request)
+
+      case request_id && get_raw(db, request_id) do
+        nil ->
+          session_key = param(call, :session_key) || param(call, :session)
+          statute_name = param(call, :statute_name) || param(call, :statute)
+          target_raiser_id = if is_binary(session_key), do: "session:" <> session_key
+
+          cond do
+            not (is_binary(session_key) and is_binary(statute_name)) ->
+              error("invalid", "waive requires --request or --session with --statute")
+
+            raiser_id(call) == target_raiser_id ->
+              error("not_owner", "raiser cannot waive its own statute")
+
+            true ->
+              grant_waiver(db, target_raiser_id, statute_name, call, "preemptive", opts)
+          end
+
+        request ->
+          if raiser_id(call) == request.raiser_id,
+            do: error("not_owner", "raiser cannot waive its own statute"),
+            else: grant_waiver(db, request.raiser_id, request.statute_name, call, "request", opts)
+      end
+    else
+      error("not_owner", "admin owner required")
+    end
+  end
+
+  @doc "Prospectively revoke one waiver."
+  @spec revoke_waiver(DB.server(), map(), keyword()) :: map()
+  def revoke_waiver(db, call, opts \\ []) do
+    if Keyword.get(opts, :authorized, false) do
+      waiver_id = param(call, :waiver_id) || param(call, :waiver)
+      revoked_at = now()
+
+      {:ok, rows} =
+        DB.query(db, "SELECT raiserId FROM escalation_waivers WHERE id = ?1", [waiver_id])
+
+      if rows == [[raiser_id(call)]] do
+        error("not_owner", "raiser cannot revoke its own waiver")
+      else
+        revoke_waiver_as_owner(db, waiver_id, call.origin, revoked_at)
+      end
+    else
+      error("not_owner", "admin owner required")
+    end
+  end
+
+  defp revoke_waiver_as_owner(db, waiver_id, origin, revoked_at) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE escalation_waivers SET revokedBy = ?2, revokedAt = ?3 WHERE id = ?1 AND revokedAt IS NULL",
+          [waiver_id, origin, revoked_at]
+        )
+
+        if Txn.changes(txn) == 1 do
+          EventLog.lifecycle_in_txn(txn, "waiver_revoked", waiver_id, "by=#{origin}")
+          waiver_in_txn(txn, waiver_id)
+        else
+          error("not_open", "waiver is not live")
+        end
+      end)
+
+    result
+  end
+
+  @doc "Withdraw an open request as its canonical raiser."
+  @spec withdraw(DB.server(), map()) :: map()
+  def withdraw(db, call) do
+    request_id = param(call, :request_id) || param(call, :request)
+    reason = param(call, :reason)
+
+    cond do
+      not (is_binary(reason) and reason != "") ->
+        error("invalid", "withdrawal reason is required")
+
+      true ->
+        caller_raiser_id = raiser_id(call)
+
+        case get_raw(db, request_id) do
+          nil ->
+            error("not_found", "decision request not found")
+
+          request when request.raiser_id != caller_raiser_id ->
+            error("not_raiser", "raiser required")
+
+          request ->
+            withdraw_open(db, request, call.origin, reason)
+        end
+    end
+  end
+
+  @doc "Withdraw open requests and revoke live waivers for one retired session raiser."
+  @spec withdraw_for_retired(DB.server(), String.t()) :: :ok
+  def withdraw_for_retired(db, session_key) do
+    raiser_id = "session:" <> session_key
+    at = now()
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        rows =
+          Txn.q(
+            txn,
+            "SELECT id FROM decision_requests WHERE raiserSessionKey = ?1 AND status = 'open'",
+            [session_key]
+          )
+
+        Enum.each(rows, fn [id] ->
+          Txn.q(
+            txn,
+            "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'raiser-retired', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
+            [id, at]
+          )
+
+          if Txn.changes(txn) == 1 do
+            EventLog.lifecycle_in_txn(
+              txn,
+              "decision_request_withdrawn",
+              id,
+              "by=process:tightbeam reason=raiser-retired"
+            )
+          end
+        end)
+
+        waivers =
+          Txn.q(
+            txn,
+            "SELECT id FROM escalation_waivers WHERE raiserId = ?1 AND revokedAt IS NULL",
+            [raiser_id]
+          )
+
+        Enum.each(waivers, fn [id] ->
+          Txn.q(
+            txn,
+            "UPDATE escalation_waivers SET revokedBy = 'process:tightbeam', revokedAt = ?2 WHERE id = ?1 AND revokedAt IS NULL",
+            [id, at]
+          )
+
+          if Txn.changes(txn) == 1 do
+            EventLog.lifecycle_in_txn(txn, "waiver_revoked", id, "by=process:tightbeam")
+          end
+        end)
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  @doc "Boot backstop for retirement casts lost across a crash."
+  @spec recover_retired(DB.server()) :: :ok
+  def recover_retired(db \\ DB) do
+    {:ok, [[sessions_table]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+      )
+
+    if sessions_table == 1 do
+      {:ok, rows} =
+        DB.query(
+          db,
+          "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
+        )
+
+      Enum.each(rows, fn [key] -> withdraw_for_retired(db, key) end)
+    end
+
+    :ok
+  end
+
+  @doc "List visible decision requests. Owner/admin and raiser visibility are disjoint filters."
+  @spec list(DB.server(), map(), String.t() | nil, keyword()) :: [map()]
+  def list(db, call, status \\ "open", opts \\ []) do
+    {where, params} = visibility(call, Keyword.get(opts, :owner_user_id))
+    status_clause = if is_binary(status), do: " AND status = ?#{length(params) + 1}", else: ""
+    params = if is_binary(status), do: params ++ [status], else: params
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT #{@request_columns} FROM decision_requests WHERE (#{where})#{status_clause} ORDER BY rowid DESC",
+        params
+      )
+
+    Enum.map(rows, &(request_from_row(&1) |> list_projection()))
+  end
+
+  @doc "Fetch one visible decision request including its halted-call context."
+  @spec get(DB.server(), map(), String.t(), keyword()) :: map() | nil
+  def get(db, call, id, opts \\ []) do
+    {where, params} = visibility(call, Keyword.get(opts, :owner_user_id))
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1 AND (#{shift_params(where)})",
+        [id | params]
+      )
+
+    case rows do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
+  @doc "Canonical SHA-256 action fingerprint."
+  @spec digest(map()) :: String.t()
+  def digest(call) do
+    params =
+      call
+      |> Map.fetch!(:params)
+      |> normalize_map()
+      |> Map.drop([
+        "assignment_id",
+        "assignmentId",
+        "idempotency_key",
+        "idempotencyKey",
+        "key",
+        "note"
+      ])
+
+    canonical = %{
+      "assignmentId" => assignment_id(call),
+      "params" => params,
+      "verb" => Map.fetch!(call, :verb)
+    }
+
+    :crypto.hash(:sha256, canonical_json(canonical)) |> Base.encode16(case: :lower)
+  end
+
+  defp rule_open(db, request, decision, rationale, origin, opts) do
+    ruled_at = now()
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledAt = ?5 WHERE id = ?1 AND status = 'open'",
+          [request.id, decision, rationale, origin, ruled_at]
+        )
+
+        if Txn.changes(txn) == 1 do
+          %{fact_id: fact_id} =
+            ConditionFacts.file_in_txn(txn, %{
+              kind: "escalation-ruled",
+              scope: request.id,
+              origin: "process:tightbeam"
+            })
+
+          Txn.q(txn, "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1", [
+            request.id,
+            fact_id
+          ])
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "decision_request_ruled",
+            request.id,
+            "by=#{origin} decision=#{decision} factId=#{fact_id}"
+          )
+
+          request_in_txn(txn, request.id)
+        else
+          current = request_in_txn(txn, request.id)
+
+          if current.status == "ruled" and current.decision == decision,
+            do: current,
+            else: error("not_open", "decision request is not open")
+        end
+      end)
+
+    if not Map.has_key?(result, :code), do: nudge(opts)
+    result
+  end
+
+  defp grant_waiver(db, raiser_id, statute_name, call, path, opts) do
+    waiver_id = "ew_" <> Tightbeam.Id.uuid4()
+    granted_at = now()
+    reason = param(call, :reason)
+
+    {:ok, {waiver, facts?}} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "INSERT INTO escalation_waivers (id, raiserId, statuteName, grantedBy, grantedAt, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+          [waiver_id, raiser_id, statute_name, call.origin, granted_at, reason]
+        )
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "waiver_granted",
+          waiver_id,
+          "raiser=#{raiser_id} statute=#{statute_name} by=#{call.origin} path=#{path}"
+        )
+
+        facts? =
+          if path == "request" do
+            open_ids =
+              Txn.q(
+                txn,
+                "SELECT id FROM decision_requests WHERE raiserId = ?1 AND statuteName = ?2 AND status = 'open' ORDER BY rowid",
+                [raiser_id, statute_name]
+              )
+
+            Enum.each(open_ids, fn [id] ->
+              Txn.q(
+                txn,
+                "UPDATE decision_requests SET status = 'ruled', decision = 'waived', rationale = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
+                [id, reason, call.origin, granted_at]
+              )
+
+              if Txn.changes(txn) == 1 do
+                %{fact_id: fact_id} =
+                  ConditionFacts.file_in_txn(txn, %{
+                    kind: "escalation-ruled",
+                    scope: id,
+                    origin: "process:tightbeam"
+                  })
+
+                Txn.q(txn, "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1", [
+                  id,
+                  fact_id
+                ])
+
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "decision_request_ruled",
+                  id,
+                  "by=#{call.origin} decision=waived factId=#{fact_id}"
+                )
+              end
+            end)
+
+            open_ids != []
+          else
+            false
+          end
+
+        {waiver_in_txn(txn, waiver_id), facts?}
+      end)
+
+    if facts?, do: nudge(opts)
+    waiver
+  end
+
+  defp withdraw_open(db, request, by, reason) do
+    withdrawn_at = now()
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = ?2, withdrawnReason = ?3, withdrawnAt = ?4 WHERE id = ?1 AND status = 'open'",
+          [request.id, by, reason, withdrawn_at]
+        )
+
+        if Txn.changes(txn) == 1 do
+          EventLog.lifecycle_in_txn(
+            txn,
+            "decision_request_withdrawn",
+            request.id,
+            "by=#{by} reason=#{reason}"
+          )
+
+          request_in_txn(txn, request.id)
+        else
+          error("not_open", "decision request is not open")
+        end
+      end)
+
+    result
+  end
+
+  defp resolve_decision(_request, decision) when decision in ["allow", "deny"],
+    do: {:ok, decision}
+
+  defp resolve_decision(request, label) when is_binary(label) do
+    request.options
+    |> List.wrap()
+    |> Enum.find_value(fn option ->
+      if option["label"] == label and option["effect"] in ["allow", "deny"],
+        do: {:ok, option["effect"]}
+    end)
+    |> case do
+      nil ->
+        {:error, error("invalid_decision", "decision must be allow, deny, or an option label")}
+
+      result ->
+        result
+    end
+  end
+
+  defp resolve_decision(_request, _decision),
+    do: {:error, error("invalid_decision", "decision must be allow, deny, or an option label")}
+
+  defp live_waiver?(db, raiser_id, statute_name) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM escalation_waivers WHERE raiserId = ?1 AND statuteName = ?2 AND revokedAt IS NULL",
+        [raiser_id, statute_name]
+      )
+
+    count > 0
+  end
+
+  defp current_request(db, raiser_id, statute_name, action_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT #{@request_columns} FROM decision_requests WHERE raiserId = ?1 AND statuteName = ?2 AND actionKey = ?3 ORDER BY rowid DESC LIMIT 1",
+        [raiser_id, statute_name, action_key]
+      )
+
+    case rows do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
+  defp get_raw(_db, nil), do: nil
+
+  defp get_raw(db, id) do
+    {:ok, rows} =
+      DB.query(db, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id])
+
+    case rows do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
+  defp request_in_txn(txn, id) do
+    [row] = Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id])
+    request_from_row(row)
+  end
+
+  defp request_from_row([
+         id,
+         raiser_id,
+         raiser_session_key,
+         owner_user_id,
+         assignment_id,
+         raised_at,
+         deadline_at,
+         statute_name,
+         action_key,
+         question,
+         options,
+         context,
+         status,
+         decision,
+         rationale,
+         ruled_by,
+         ruled_at,
+         ruling_fact_id,
+         consumed_at,
+         park_wake_id,
+         withdrawn_by,
+         withdrawn_reason,
+         withdrawn_at
+       ]) do
+    %{
+      id: id,
+      raiser_id: raiser_id,
+      raiser_session_key: raiser_session_key,
+      owner_user_id: owner_user_id,
+      assignment_id: assignment_id,
+      raised_at: raised_at,
+      deadline_at: deadline_at,
+      statute_name: statute_name,
+      action_key: action_key,
+      question: question,
+      options: decode_optional(options),
+      context: JSON.decode!(context),
+      status: status,
+      decision: decision,
+      rationale: rationale,
+      ruled_by: ruled_by,
+      ruled_at: ruled_at,
+      ruling_fact_id: ruling_fact_id,
+      consumed_at: consumed_at,
+      park_wake_id: park_wake_id,
+      withdrawn_by: withdrawn_by,
+      withdrawn_reason: withdrawn_reason,
+      withdrawn_at: withdrawn_at
+    }
+  end
+
+  defp list_projection(request),
+    do:
+      Map.drop(request, [
+        :context,
+        :action_key,
+        :owner_user_id,
+        :ruling_fact_id,
+        :consumed_at,
+        :park_wake_id,
+        :withdrawn_by
+      ])
+
+  defp waiver_in_txn(txn, id) do
+    [[id, raiser_id, statute_name, granted_by, granted_at, reason, revoked_by, revoked_at]] =
+      Txn.q(
+        txn,
+        "SELECT id, raiserId, statuteName, grantedBy, grantedAt, reason, revokedBy, revokedAt FROM escalation_waivers WHERE id = ?1",
+        [id]
+      )
+
+    %{
+      id: id,
+      raiser_id: raiser_id,
+      statute_name: statute_name,
+      granted_by: granted_by,
+      granted_at: granted_at,
+      reason: reason,
+      revoked_by: revoked_by,
+      revoked_at: revoked_at
+    }
+  end
+
+  defp visibility(call, owner_user_id) do
+    raiser = raiser_id(call)
+
+    if is_binary(owner_user_id) do
+      {"ownerUserId = ?1 OR raiserId = ?2", [owner_user_id, raiser]}
+    else
+      {"raiserId = ?1", [raiser]}
+    end
+  end
+
+  defp shift_params(where) do
+    where
+    |> String.replace("?2", "?3")
+    |> String.replace("?1", "?2")
+  end
+
+  defp raiser_id(%{principal: {:session, key}}), do: "session:" <> key
+  defp raiser_id(call), do: Map.fetch!(call, :origin)
+
+  defp raiser_session_key(%{principal: {:session, key}}), do: key
+  defp raiser_session_key(_call), do: nil
+
+  defp owner_user_id!(db, %{principal: {:session, key}}) do
+    case Org.get(db, key) do
+      %{owner_user_id: owner} -> owner
+      _ -> raise ArgumentError, "unknown raiser session: #{key}"
+    end
+  end
+
+  defp owner_user_id!(_db, %{principal: {:user, user_id}}), do: user_id
+
+  defp owner_user_id!(_db, %{origin: "user:" <> user_id}), do: user_id
+
+  defp owner_user_id!(db, %{origin: "agent:" <> role}) do
+    with {:ok, session_key, _fallback} <- Roles.resolve(db, role),
+         %{owner_user_id: owner} <- Org.get(db, session_key) do
+      owner
+    else
+      _ -> raise ArgumentError, "unknown raiser origin: agent:#{role}"
+    end
+  end
+
+  defp owner_user_id!(_db, call),
+    do: raise(ArgumentError, "raiser has no accountable owner: #{call.origin}")
+
+  defp statute_name(statute), do: Map.get(statute, :name) || Map.fetch!(statute, "name")
+
+  defp deny_error(statute) do
+    %{
+      code: "escalation_denied",
+      message: Map.get(statute, :text) || Map.get(statute, "text") || "owner denied the action"
+    }
+  end
+
+  defp assignment_id(call) do
+    params = Map.fetch!(call, :params)
+
+    Map.get(params, :assignment_id) || Map.get(params, "assignment_id") ||
+      Map.get(params, "assignmentId")
+  end
+
+  defp param(call, key),
+    do: Map.get(call.params, key) || Map.get(call.params, Atom.to_string(key))
+
+  defp decision_deadline_ms,
+    do:
+      Application.get_env(
+        :tightbeam,
+        :escalation_decision_deadline_ms,
+        @default_decision_deadline_ms
+      )
+
+  defp fetch_string!(map, key) do
+    value = Map.get(map, key) || Map.get(map, Atom.to_string(key))
+    if is_binary(value), do: value, else: raise(ArgumentError, "#{key} is required")
+  end
+
+  defp deliver_owner(ctx, request) do
+    case Map.get(ctx, :deliver_owner) || Map.get(ctx, "deliver_owner") do
+      fun when is_function(fun, 2) -> fun.(request.owner_user_id, request)
+      _ -> :ok
+    end
+  end
+
+  defp nudge(opts) do
+    case Keyword.get(opts, :scheduler) do
+      nil -> :ok
+      scheduler -> Wakes.fire_matching(scheduler)
+    end
+  end
+
+  defp normalize_map(map) do
+    Map.new(map, fn {key, value} -> {to_string(key), normalize_value(value)} end)
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp normalize_value(value) when is_map(value), do: normalize_map(value)
+  defp normalize_value(value) when is_list(value), do: Enum.map(value, &normalize_value/1)
+  defp normalize_value(value), do: value
+
+  defp canonical_json(value) when is_map(value) do
+    members =
+      value
+      |> Enum.reject(fn {_key, item} -> is_nil(item) end)
+      |> Enum.map(fn {key, item} -> {to_string(key), item} end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {key, item} -> [JSON.encode!(key), ?:, canonical_json(item)] end)
+      |> Enum.intersperse(?,)
+
+    IO.iodata_to_binary([?{, members, ?}])
+  end
+
+  defp canonical_json(value) when is_list(value) do
+    items = value |> Enum.map(&canonical_json/1) |> Enum.intersperse(?,)
+    IO.iodata_to_binary([?[, items, ?]])
+  end
+
+  defp canonical_json(value), do: JSON.encode!(value)
+
+  defp encode_optional(nil), do: nil
+  defp encode_optional(value), do: JSON.encode!(value)
+  defp decode_optional(nil), do: nil
+  defp decode_optional(value), do: JSON.decode!(value)
+
+  defp error(code, message), do: %{code: code, message: message}
+  defp now, do: System.system_time(:millisecond)
+end

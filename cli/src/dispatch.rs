@@ -136,6 +136,81 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "condition", vec![], params))
         }
+        Command::Rule {
+            identity,
+            request_id,
+            decision,
+            rationale,
+        } => {
+            let mut params = vec![
+                string_field("requestId", request_id),
+                string_field("decision", decision),
+            ];
+            if let Some(value) = rationale {
+                params.push(string_field("rationale", value));
+            }
+            Ok(request(identity, "rule", vec![], params))
+        }
+        Command::Waive {
+            identity,
+            request_id,
+            session_key,
+            statute_name,
+            reason,
+        } => {
+            let mut params = Vec::new();
+            for (name, value) in [
+                ("requestId", request_id),
+                ("sessionKey", session_key),
+                ("statuteName", statute_name),
+                ("reason", reason),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            Ok(request(identity, "waive", vec![], params))
+        }
+        Command::RevokeWaiver {
+            identity,
+            waiver_id,
+            reason,
+        } => {
+            let mut params = vec![string_field("waiverId", waiver_id)];
+            if let Some(value) = reason {
+                params.push(string_field("reason", value));
+            }
+            Ok(request(identity, "revoke-waiver", vec![], params))
+        }
+        Command::Withdraw {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "withdraw",
+            vec![],
+            vec![
+                string_field("requestId", request_id),
+                string_field("reason", reason),
+            ],
+        )),
+        Command::DecisionRequests { identity, status } => {
+            let params = status
+                .as_ref()
+                .map(|value| vec![string_field("status", value)])
+                .unwrap_or_default();
+            Ok(request(identity, "decision-requests", vec![], params))
+        }
+        Command::DecisionRequest {
+            identity,
+            request_id,
+        } => Ok(request(
+            identity,
+            "decision-request",
+            vec![],
+            vec![string_field("requestId", request_id)],
+        )),
         Command::Spawn {
             identity,
             display_name,
@@ -625,6 +700,12 @@ fn identity_omitted(command: &Command) -> bool {
     let identity = match command {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
+        | Command::Rule { identity, .. }
+        | Command::Waive { identity, .. }
+        | Command::RevokeWaiver { identity, .. }
+        | Command::Withdraw { identity, .. }
+        | Command::DecisionRequests { identity, .. }
+        | Command::DecisionRequest { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
@@ -783,6 +864,40 @@ mod tests {
                 "ci",
             ]),
             r#"{"asProcess":"ci","verb":"condition","params":{"kind":"deploy-succeeded","scope":"prod","idempotencyKey":"deploy-1"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_escalation_bodies() {
+        assert_eq!(
+            body(&[
+                "rule",
+                "--request",
+                "dr_1",
+                "--decision",
+                "allow",
+                "--rationale",
+                "safe",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"rule","params":{"requestId":"dr_1","decision":"allow","rationale":"safe"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "waive",
+                "--session",
+                "s1",
+                "--statute",
+                "review",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"waive","params":{"sessionKey":"s1","statuteName":"review"}}"#
+        );
+        assert_eq!(
+            body(&["decision-request", "dr_1", "--as", "coder"]),
+            r#"{"as":"coder","verb":"decision-request","params":{"requestId":"dr_1"}}"#
         );
     }
 

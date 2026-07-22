@@ -62,7 +62,7 @@ defmodule Tightbeam.ModelCatalogTest do
            ]
 
     opus = hd(claude)
-    assert opus.display_name == "Claude Opus 4.8 [high]"
+    assert opus.display_name == "Claude Opus 4.8"
     assert opus.max_input_tokens == 1_000_000
     assert opus.efforts == ["high", "low", "max", "medium"]
 
@@ -77,27 +77,6 @@ defmodule Tightbeam.ModelCatalogTest do
            ]
 
     refute Enum.any?(claude ++ codex, &String.contains?(&1.ref, "[1m]"))
-  end
-
-  test "effort-qualified entries for the same model get distinguishable titles", ctx do
-    catalog = start_catalog(ctx)
-    await_fresh(catalog, "claude")
-
-    {claude, :fresh} = ModelCatalog.get("claude", catalog)
-    opus = Enum.filter(claude, &(&1.efforts != []))
-
-    assert length(opus) == 4
-    assert Enum.map(opus, & &1.name) |> Enum.uniq() |> length() == 4
-
-    assert Enum.map(opus, & &1.name) == [
-             "Claude Opus 4.8 [high]",
-             "Claude Opus 4.8 [low]",
-             "Claude Opus 4.8 [max]",
-             "Claude Opus 4.8 [medium]"
-           ]
-
-    haiku = Enum.find(claude, &(&1.ref == "claude-haiku-4-5"))
-    assert haiku.name == "Claude Haiku 4.5"
   end
 
   test "membership carries fresh, stale, and unavailable health", ctx do

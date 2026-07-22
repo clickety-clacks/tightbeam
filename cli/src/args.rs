@@ -46,6 +46,37 @@ pub enum Command {
         scope: Option<String>,
         idempotency_key: Option<String>,
     },
+    Rule {
+        identity: Identity,
+        request_id: String,
+        decision: String,
+        rationale: Option<String>,
+    },
+    Waive {
+        identity: Identity,
+        request_id: Option<String>,
+        session_key: Option<String>,
+        statute_name: Option<String>,
+        reason: Option<String>,
+    },
+    RevokeWaiver {
+        identity: Identity,
+        waiver_id: String,
+        reason: Option<String>,
+    },
+    Withdraw {
+        identity: Identity,
+        request_id: String,
+        reason: String,
+    },
+    DecisionRequests {
+        identity: Identity,
+        status: Option<String>,
+    },
+    DecisionRequest {
+        identity: Identity,
+        request_id: String,
+    },
     Spawn {
         identity: Identity,
         display_name: String,
@@ -248,6 +279,19 @@ COMMANDS:
       File an org/product condition fact. Reserved substrate kinds cannot be
       filed through this command.
         tightbeam condition --kind deploy-succeeded --scope prod --key deploy-8f2a
+
+  rule --request <id> --decision <allow|deny|option> [--rationale "..."]
+      Resolve one open decision request.
+  waive (--request <id> | --session <key> --statute <name>) [--reason "..."]
+      Grant a raiser-scoped statute waiver.
+  revoke-waiver --waiver <id> [--reason "..."]
+      Revoke a waiver prospectively.
+  withdraw --request <id> --reason "..."
+      Retract your own open decision request.
+  decision-requests [--status <status>]
+      List visible decision requests (open by default).
+  decision-request <id>
+      Read one visible decision request with its halted-call context.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness claude|codex] [--model <ref>] [--host <host>]
@@ -623,6 +667,84 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "rule" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam rule --request <id> --decision <allow|deny|option> [--rationale ...]".to_owned());
+            }
+            Ok(Command::Rule {
+                identity: identity(flags)?,
+                request_id: nonempty(flags, "request")
+                    .ok_or_else(|| "--request is required".to_owned())?,
+                decision: nonempty(flags, "decision")
+                    .ok_or_else(|| "--decision is required".to_owned())?,
+                rationale: nonempty(flags, "rationale"),
+            })
+        }
+        "waive" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam waive (--request <id> | --session <key> --statute <name>) [--reason ...]".to_owned());
+            }
+            let request_id = nonempty(flags, "request");
+            let session_key = nonempty(flags, "session");
+            let statute_name = nonempty(flags, "statute");
+            let request_form =
+                request_id.is_some() && session_key.is_none() && statute_name.is_none();
+            let preemptive_form =
+                request_id.is_none() && session_key.is_some() && statute_name.is_some();
+            if !request_form && !preemptive_form {
+                return Err("usage: tightbeam waive (--request <id> | --session <key> --statute <name>) [--reason ...]".to_owned());
+            }
+            Ok(Command::Waive {
+                identity: identity(flags)?,
+                request_id,
+                session_key,
+                statute_name,
+                reason: nonempty(flags, "reason"),
+            })
+        }
+        "revoke-waiver" => {
+            if parsed.positional.len() != 1 {
+                return Err(
+                    "usage: tightbeam revoke-waiver --waiver <id> [--reason ...]".to_owned(),
+                );
+            }
+            Ok(Command::RevokeWaiver {
+                identity: identity(flags)?,
+                waiver_id: nonempty(flags, "waiver")
+                    .ok_or_else(|| "--waiver is required".to_owned())?,
+                reason: nonempty(flags, "reason"),
+            })
+        }
+        "withdraw" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam withdraw --request <id> --reason ...".to_owned());
+            }
+            Ok(Command::Withdraw {
+                identity: identity(flags)?,
+                request_id: nonempty(flags, "request")
+                    .ok_or_else(|| "--request is required".to_owned())?,
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+            })
+        }
+        "decision-requests" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam decision-requests [--status <status>]".to_owned());
+            }
+            Ok(Command::DecisionRequests {
+                identity: identity(flags)?,
+                status: nonempty(flags, "status"),
+            })
+        }
+        "decision-request" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam decision-request <id>".to_owned());
+            }
+            Ok(Command::DecisionRequest {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+            })
+        }
         "spawn" => {
             let display_name =
                 nonempty(flags, "display").ok_or_else(|| "--display is required".to_owned())?;
@@ -929,7 +1051,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
         )),
     }
 }
@@ -1120,8 +1242,40 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
         );
+    }
+
+    #[test]
+    fn escalation_command_shapes_and_required_flags_are_pinned() {
+        assert!(matches!(
+            parse(strings(&[
+                "rule",
+                "--request",
+                "dr_1",
+                "--decision",
+                "allow",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Rule { .. })
+        ));
+        assert!(matches!(
+            parse(strings(&[
+                "waive",
+                "--session",
+                "s1",
+                "--statute",
+                "review",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Waive { .. })
+        ));
+        assert!(parse(strings(&["rule", "--request", "dr_1"])).is_err());
+        assert!(parse(strings(&["withdraw", "--request", "dr_1"])).is_err());
+        assert!(parse(strings(&["waive", "--request", "dr_1", "--session", "s1"])).is_err());
+        assert!(HELP.contains("decision-requests [--status <status>]"));
     }
 
     #[test]

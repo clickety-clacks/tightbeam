@@ -40,6 +40,10 @@ if value = System.get_env("TIGHTBEAM_PROD_LIMIT") do
   config :tightbeam, :prod_limit, String.to_integer(value)
 end
 
+if value = System.get_env("TIGHTBEAM_ESCALATION_DECISION_DEADLINE_MS") do
+  config :tightbeam, :escalation_decision_deadline_ms, String.to_integer(value)
+end
+
 if value = System.get_env("TIGHTBEAM_ADVERTISED_URL") do
   config :tightbeam, :advertised_url, value
 end
