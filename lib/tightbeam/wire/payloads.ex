@@ -145,16 +145,24 @@ defmodule Tightbeam.Wire.Payloads do
   @doc "Stream (session catalog entry) payload from an Org.session."
   @spec stream_session(Tightbeam.Org.session()) :: payload()
   def stream_session(s) do
-    %{
-      "sessionKey" => Map.fetch!(s, :session_key),
-      "displayName" => Map.fetch!(s, :display_name),
-      "kind" => Map.fetch!(s, :kind),
-      "orderIndex" => Map.fetch!(s, :order_index),
-      "isBuiltIn" => Map.fetch!(s, :is_built_in),
-      "createdAt" => Map.fetch!(s, :created_at),
-      "updatedAt" => Map.fetch!(s, :updated_at),
-      "adopted" => Map.fetch!(s, :adopted)
-    }
+    Map.merge(
+      %{
+        "sessionKey" => Map.fetch!(s, :session_key),
+        "displayName" => Map.fetch!(s, :display_name),
+        "kind" => Map.fetch!(s, :kind),
+        "orderIndex" => Map.fetch!(s, :order_index),
+        "isBuiltIn" => Map.fetch!(s, :is_built_in),
+        "createdAt" => Map.fetch!(s, :created_at),
+        "updatedAt" => Map.fetch!(s, :updated_at),
+        "adopted" => Map.fetch!(s, :adopted)
+      },
+      for(
+        {key, value} <- [{"origin", s[:origin]}, {"spawnedBy", s[:spawned_by]}],
+        not is_nil(value),
+        into: %{},
+        do: {key, value}
+      )
+    )
   end
 
   @spec stream_snapshot([payload()]) :: payload()

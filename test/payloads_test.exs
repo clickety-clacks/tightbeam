@@ -125,30 +125,55 @@ defmodule Tightbeam.Wire.PayloadsTest do
   end
 
   test "stream builders preserve exact wrapper shapes" do
-    stream =
-      Payloads.stream_session(%{
-        session_key: "s1",
-        display_name: "Main",
-        kind: "main",
-        order_index: 0,
-        is_built_in: true,
-        adopted: true,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        spawned_by: nil,
-        handle: nil,
-        archetype: "default",
-        harness: "claude",
-        provider: "anthropic",
-        model: "fable",
-        thinking_level: nil,
-        state: "active",
-        created_at: 1,
-        updated_at: 2
-      })
+    session = %{
+      session_key: "s1",
+      display_name: "Main",
+      kind: "main",
+      order_index: 0,
+      is_built_in: true,
+      adopted: true,
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      spawned_by: "agent:main:clawline:flynn:main",
+      handle: nil,
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable",
+      thinking_level: nil,
+      state: "active",
+      created_at: 1,
+      updated_at: 2
+    }
 
-    assert stream["sessionKey"] == "s1"
-    assert stream["adopted"] == true
+    existing_keys = %{
+      "sessionKey" => "s1",
+      "displayName" => "Main",
+      "kind" => "main",
+      "orderIndex" => 0,
+      "isBuiltIn" => true,
+      "createdAt" => 1,
+      "updatedAt" => 2,
+      "adopted" => true
+    }
+
+    stream = Payloads.stream_session(session)
+
+    assert stream ==
+             Map.merge(existing_keys, %{
+               "origin" => "user:flynn",
+               "spawnedBy" => "agent:main:clawline:flynn:main"
+             })
+
+    stream_without_provenance =
+      session
+      |> Map.put(:origin, nil)
+      |> Map.put(:spawned_by, nil)
+      |> Payloads.stream_session()
+
+    assert stream_without_provenance == existing_keys
+    refute Map.has_key?(stream_without_provenance, "origin")
+    refute Map.has_key?(stream_without_provenance, "spawnedBy")
 
     assert Payloads.stream_snapshot([stream]) == %{
              "type" => "stream_snapshot",
