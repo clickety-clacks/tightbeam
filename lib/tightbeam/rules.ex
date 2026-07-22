@@ -13,8 +13,12 @@ defmodule Tightbeam.Rules do
   An empty list is present, however: `caller.roles not_in ["admin"]` fires
   for a caller holding no roles, and `assignment.verdicts not_in
   ["tests-passed"]` fires for an assignment with no verdicts. List facts are
-  `caller.roles` and `assignment.verdicts`. Assignment caller identity comes
-  from the optional dispatch principal rather than the origin string.
+  `caller.roles`, `assignment.verdicts`,
+  `assignment.independent_verdict_kinds`,
+  `assignment.cross_harness_verdict_kinds`,
+  `assignment.cross_provider_verdict_kinds`, and
+  `assignment.produced_verdict_kinds`. Assignment caller identity comes from
+  the optional dispatch principal rather than the origin string.
 
   Check-tier facts are `attest.kind` (raw string on attest calls),
   `assignment.verdicts` (distinct filed verdict kinds),
@@ -47,8 +51,13 @@ defmodule Tightbeam.Rules do
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
     "assignment.verdicts" => {:list, :string},
+    "assignment.independent_verdict_kinds" => {:list, :string},
+    "assignment.cross_harness_verdict_kinds" => {:list, :string},
+    "assignment.cross_provider_verdict_kinds" => {:list, :string},
+    "assignment.produced_verdict_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
-    "assignment.caller_is_holder" => :bool
+    "assignment.caller_is_holder" => :bool,
+    "assign.declared_files_overlap_open" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
 
@@ -382,6 +391,64 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("assignment.independent_verdict_kinds", db, call, cache) do
+    with_dependency("$verdict_authors", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      authors, cache -> {distinct_verdict_kinds(authors), cache}
+    end)
+  end
+
+  defp compute_fact("assignment.cross_harness_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      %{holder_harness: nil}, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        with_dependency("$verdict_authors", db, call, cache, fn authors, cache ->
+          kinds =
+            authors
+            |> Enum.filter(
+              &(not is_nil(&1.by_harness) and &1.by_harness != assignment.holder_harness)
+            )
+            |> distinct_verdict_kinds()
+
+          {kinds, cache}
+        end)
+    end)
+  end
+
+  defp compute_fact("assignment.cross_provider_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      %{holder_provider: nil}, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        with_dependency("$verdict_authors", db, call, cache, fn authors, cache ->
+          kinds =
+            authors
+            |> Enum.filter(
+              &(not is_nil(&1.by_provider) and &1.by_provider != assignment.holder_provider)
+            )
+            |> distinct_verdict_kinds()
+
+          {kinds, cache}
+        end)
+    end)
+  end
+
+  defp compute_fact("assignment.produced_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache -> {Assignments.produced_verdict_kinds(db, assignment.id), cache}
+    end)
+  end
+
   defp compute_fact("assignment.holder_archetype", db, call, cache) do
     with_dependency("$assignment", db, call, cache, fn
       nil, cache -> {nil, cache}
@@ -396,6 +463,25 @@ defmodule Tightbeam.Rules do
       _assignment, cache when is_nil(call.principal) -> {nil, cache}
       assignment, cache -> {call.principal == {:session, assignment.holder_key}, cache}
     end)
+  end
+
+  defp compute_fact("assign.declared_files_overlap_open", db, call, cache) do
+    value =
+      case {call.verb, Map.get(call.params, :files)} do
+        {"assign", files} when is_list(files) and files != [] ->
+          if Enum.all?(files, fn path ->
+               is_binary(path) and String.trim(path) != "" and byte_size(path) <= 2_000
+             end) do
+            Assignments.open_assignments_touching(db, Enum.uniq(files)) != []
+          else
+            nil
+          end
+
+        _ ->
+          nil
+      end
+
+    {value, cache}
   end
 
   defp compute_fact("$target", db, call, cache) do
@@ -414,11 +500,18 @@ defmodule Tightbeam.Rules do
         id when is_binary(id) ->
           case DB.query(
                  db,
-                 "SELECT a.id, a.holderKey, s.archetype FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
+                 "SELECT a.id, a.holderKey, s.archetype, a.holderHarness, a.holderProvider FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
                  [id]
                ) do
-            {:ok, [[assignment_id, holder_key, holder_archetype]]} ->
-              %{id: assignment_id, holder_key: holder_key, holder_archetype: holder_archetype}
+            {:ok,
+             [[assignment_id, holder_key, holder_archetype, holder_harness, holder_provider]]} ->
+              %{
+                id: assignment_id,
+                holder_key: holder_key,
+                holder_archetype: holder_archetype,
+                holder_harness: holder_harness,
+                holder_provider: holder_provider
+              }
 
             {:ok, []} ->
               nil
@@ -431,11 +524,27 @@ defmodule Tightbeam.Rules do
     {assignment, cache}
   end
 
+  defp compute_fact("$verdict_authors", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Assignments.commissioned_review_authors(db, assignment.id, assignment.holder_key), cache}
+    end)
+  end
+
   defp with_dependency(fact, db, call, cache, fun) do
     case fetch_fact(fact, db, call, cache) do
       {:ok, value, cache} -> fun.(value, cache)
       :error -> throw({:dependency_error, fact})
     end
+  end
+
+  defp distinct_verdict_kinds(authors) do
+    authors
+    |> Enum.map(& &1.verdict_kind)
+    |> Enum.uniq()
   end
 
   defp caller_user(db, call, cache) do

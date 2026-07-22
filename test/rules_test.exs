@@ -1,12 +1,27 @@
 defmodule Tightbeam.RulesTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.{DB, Devices, Dispatch, EventLog, Gateway, Org, Roles, Rules}
+  alias Tightbeam.{
+    Assignments,
+    DB,
+    Devices,
+    Dispatch,
+    EventLog,
+    Gateway,
+    Idempotency,
+    Org,
+    Roles,
+    Rules,
+    WorkItems,
+    WorkState
+  }
 
   setup do
     db = :"rules_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    for module <- [Devices, EventLog, Org, Roles], do: :ok = module.ensure_schema(db)
+
+    for module <- [Devices, Idempotency, Org, Roles, WorkItems, Assignments, WorkState, EventLog],
+        do: :ok = module.ensure_schema(db)
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-rules-#{System.unique_integer([:positive])}")
@@ -18,7 +33,7 @@ defmodule Tightbeam.RulesTest do
       Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [])
     end)
 
-    %{db: db, base_dir: base_dir}
+    %{db: db, base_dir: base_dir, handlers: Gateway.handlers(%{db: db})}
   end
 
   test "missing and empty directories load zero rules and an empty load clears prior rules",
@@ -432,8 +447,503 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
   end
 
+  test "P3 fact registry has exact names and load-time types", ctx do
+    list_facts = [
+      "assignment.independent_verdict_kinds",
+      "assignment.cross_harness_verdict_kinds",
+      "assignment.cross_provider_verdict_kinds",
+      "assignment.produced_verdict_kinds"
+    ]
+
+    for fact <- list_facts do
+      put_rule(ctx, rule("valid-list", "attest", fact, "in", ["reviewed-clean"]))
+      assert [_] = Rules.load!(ctx.base_dir, ["attest"])
+
+      put_rule(ctx, rule("bad-list-op", "attest", fact, "eq", ["reviewed-clean"]))
+
+      assert_raise ArgumentError, ~r/invalid for a list fact/, fn ->
+        Rules.load!(ctx.base_dir, ["attest"])
+      end
+
+      put_rule(ctx, rule("bad-list-value", "attest", fact, "not_in", []))
+
+      assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
+        Rules.load!(ctx.base_dir, ["attest"])
+      end
+    end
+
+    put_rule(
+      ctx,
+      rule("overlap", "assign", "assign.declared_files_overlap_open", "eq", true)
+    )
+
+    assert [_] = Rules.load!(ctx.base_dir, ["assign"])
+
+    put_rule(
+      ctx,
+      rule("overlap-ne", "assign", "assign.declared_files_overlap_open", "ne", false)
+    )
+
+    assert [_] = Rules.load!(ctx.base_dir, ["assign"])
+
+    put_rule(
+      ctx,
+      rule("bad-overlap", "assign", "assign.declared_files_overlap_open", "eq", "true")
+    )
+
+    assert_raise ArgumentError, ~r/does not match bool/, fn ->
+      Rules.load!(ctx.base_dir, ["assign"])
+    end
+
+    put_rule(ctx, rule("removed", "attest", "assignment.verdict_kinds_any", "in", ["x"]))
+    assert_raise ArgumentError, ~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end
+
+    put_rule(
+      ctx,
+      rule(
+        "bad-list-member",
+        "attest",
+        "assignment.independent_verdict_kinds",
+        "in",
+        [1]
+      )
+    )
+
+    assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
+      Rules.load!(ctx.base_dir, ["attest"])
+    end
+  end
+
+  test "P3 fact nil, empty-list, and overlap presence matrix", ctx do
+    holder = session(ctx.db, "p3-holder", "flynn", archetype: "coder")
+    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    list_facts = [
+      "assignment.independent_verdict_kinds",
+      "assignment.cross_harness_verdict_kinds",
+      "assignment.cross_provider_verdict_kinds",
+      "assignment.produced_verdict_kinds"
+    ]
+
+    for fact <- list_facts do
+      put_rule(ctx, rule("missing", "attest", fact, "not_in", ["required"]))
+      Rules.load!(ctx.base_dir, ["attest"])
+
+      assert :ok = Rules.evaluate(ctx.db, p3_call("attest", nil, %{kind: "completion"}))
+
+      assert :ok =
+               Rules.evaluate(
+                 ctx.db,
+                 p3_call("attest", nil, %{assignment_id: 123, kind: "completion"})
+               )
+
+      assert :ok =
+               Rules.evaluate(
+                 ctx.db,
+                 p3_call("attest", nil, %{assignment_id: "unknown", kind: "completion"})
+               )
+
+      assert {:deny, %{rule: "missing"}} =
+               Rules.evaluate(
+                 ctx.db,
+                 p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
+               )
+
+      assert {:deny, %{code: "rule_error", fact: ^fact}} =
+               Rules.evaluate(
+                 :missing_db,
+                 p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
+               )
+    end
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET holderHarness = NULL, holderProvider = NULL WHERE id = ?1",
+        [assignment.id]
+      )
+
+    for fact <- [
+          "assignment.cross_harness_verdict_kinds",
+          "assignment.cross_provider_verdict_kinds"
+        ] do
+      put_rule(ctx, rule("unstamped", "attest", fact, "not_in", ["required"]))
+      Rules.load!(ctx.base_dir, ["attest"])
+
+      assert :ok =
+               Rules.evaluate(
+                 ctx.db,
+                 p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
+               )
+    end
+
+    _existing = assignment(ctx, holder.session_key, {:user, "flynn"}, files: ["lib/a.ex"])
+
+    overlap_cases = [
+      {%{}, true, false},
+      {%{files: []}, true, false},
+      {%{files: "lib/a.ex"}, true, false},
+      {%{files: ["ok", " "]}, true, false},
+      {%{files: [String.duplicate("x", 2_001)]}, true, false},
+      {%{files: ["lib/other.ex"]}, false, true},
+      {%{files: ["lib/a.ex", "lib/a.ex"]}, true, true}
+    ]
+
+    for {params, expected, fires?} <- overlap_cases do
+      put_rule(
+        ctx,
+        rule("overlap", "assign", "assign.declared_files_overlap_open", "eq", expected)
+      )
+
+      Rules.load!(ctx.base_dir, ["assign"])
+      result = Rules.evaluate(ctx.db, p3_call("assign", {:user, "flynn"}, params))
+      assert match_result(result) == fires?
+    end
+
+    put_rule(
+      ctx,
+      rule("wrong-verb", "attest", "assign.declared_files_overlap_open", "eq", true)
+    )
+
+    Rules.load!(ctx.base_dir, ["attest"])
+    assert :ok = Rules.evaluate(ctx.db, p3_call("attest", nil, %{files: ["lib/a.ex"]}))
+
+    put_rule(
+      ctx,
+      rule("overlap-error", "assign", "assign.declared_files_overlap_open", "eq", true)
+    )
+
+    Rules.load!(ctx.base_dir, ["assign"])
+
+    assert {:deny, %{code: "rule_error", fact: "assign.declared_files_overlap_open"}} =
+             Rules.evaluate(
+               :missing_db,
+               p3_call("assign", {:user, "flynn"}, %{files: ["lib/a.ex"]})
+             )
+  end
+
+  test "independence facts enforce commissioned-review provenance and frozen stamps", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+
+    holder = session(ctx.db, "producer", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "reviewer", "other", harness: "codex", provider: "openai")
+    same = session(ctx.db, "same-reviewer", "other")
+    third = session(ctx.db, "third", "other", harness: "codex", provider: "openai")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    verdict(ctx, reviewer.session_key, producer.id, "direct")
+
+    valid_review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    verdict(ctx, third.session_key, valid_review.id, "third-session")
+    user_verdict(ctx, "flynn", valid_review.id, "user-on-review")
+    verdict(ctx, reviewer.session_key, valid_review.id, "reviewed-clean")
+    verdict(ctx, reviewer.session_key, valid_review.id, "reviewed-clean")
+
+    same_review = assignment(ctx, same.session_key, {:user, "flynn"}, reviews: producer.id)
+    verdict(ctx, same.session_key, same_review.id, "same-harness")
+
+    self_review =
+      assignment(ctx, third.session_key, {:session, holder.session_key}, reviews: producer.id)
+
+    verdict(ctx, third.session_key, self_review.id, "self-commissioned")
+
+    assertions = [
+      {"assignment.independent_verdict_kinds", "direct", false},
+      {"assignment.independent_verdict_kinds", "third-session", false},
+      {"assignment.independent_verdict_kinds", "user-on-review", false},
+      {"assignment.independent_verdict_kinds", "self-commissioned", false},
+      {"assignment.independent_verdict_kinds", "reviewed-clean", true},
+      {"assignment.independent_verdict_kinds", "same-harness", true},
+      {"assignment.cross_harness_verdict_kinds", "direct", false},
+      {"assignment.cross_harness_verdict_kinds", "third-session", false},
+      {"assignment.cross_harness_verdict_kinds", "user-on-review", false},
+      {"assignment.cross_harness_verdict_kinds", "self-commissioned", false},
+      {"assignment.cross_harness_verdict_kinds", "reviewed-clean", true},
+      {"assignment.cross_harness_verdict_kinds", "same-harness", false},
+      {"assignment.cross_provider_verdict_kinds", "reviewed-clean", true},
+      {"assignment.cross_provider_verdict_kinds", "same-harness", false}
+    ]
+
+    for {fact, kind, fires?} <- assertions do
+      put_rule(ctx, rule("matrix", "attest", fact, "in", [kind]))
+      Rules.load!(ctx.base_dir, ["attest"])
+
+      result =
+        Rules.evaluate(
+          ctx.db,
+          p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
+        )
+
+      assert match_result(result) == fires?
+    end
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "cached-authors"
+    verb = "attest"
+    text = "all projections derive from one cached author list"
+    deny_when = [
+      { fact = "assignment.independent_verdict_kinds", op = "in", value = ["reviewed-clean"] },
+      { fact = "assignment.cross_harness_verdict_kinds", op = "in", value = ["reviewed-clean"] },
+      { fact = "assignment.cross_provider_verdict_kinds", op = "in", value = ["reviewed-clean"] }
+    ]
+    """)
+
+    Rules.load!(ctx.base_dir, ["attest"])
+
+    assert {:deny, %{rule: "cached-authors"}} =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
+             )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET harness = 'codex', provider = 'openai' WHERE sessionKey = ?1",
+        [holder.session_key]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET harness = 'claude', provider = 'anthropic' WHERE sessionKey = ?1",
+        [reviewer.session_key]
+      )
+
+    put_rule(
+      ctx,
+      rule(
+        "frozen",
+        "attest",
+        "assignment.cross_harness_verdict_kinds",
+        "in",
+        ["reviewed-clean"]
+      )
+    )
+
+    Rules.load!(ctx.base_dir, ["attest"])
+
+    assert {:deny, %{rule: "frozen"}} =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
+             )
+  end
+
+  test "produced verdict fact requires a direct producer stamp", ctx do
+    holder = session(ctx.db, "produced-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "produced-reviewer", "other")
+    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: assignment.id)
+
+    verdict(ctx, holder.session_key, assignment.id, "tests-passed")
+    producer_verdict(ctx, review.id, reviewer.session_key, "review-only-produced")
+
+    for kind <- ["tests-passed", "review-only-produced"] do
+      put_rule(
+        ctx,
+        rule("absent", "attest", "assignment.produced_verdict_kinds", "in", [kind])
+      )
+
+      Rules.load!(ctx.base_dir, ["attest"])
+
+      assert :ok =
+               Rules.evaluate(
+                 ctx.db,
+                 p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
+               )
+    end
+
+    producer_verdict(ctx, assignment.id, holder.session_key, "tests-passed")
+
+    put_rule(
+      ctx,
+      rule(
+        "present",
+        "attest",
+        "assignment.produced_verdict_kinds",
+        "in",
+        ["tests-passed"]
+      )
+    )
+
+    Rules.load!(ctx.base_dir, ["attest"])
+
+    assert {:deny, %{rule: "present"}} =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
+             )
+  end
+
+  test "P3 review and producer statutes deny before attest and allow after proof", ctx do
+    holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "gate-reviewer", "other", harness: "codex", provider: "openai")
+    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    parent = self()
+    actual_attest = ctx.handlers["attest"]
+
+    handlers =
+      Map.put(ctx.handlers, "attest", fn call ->
+        send(parent, :attest_handler_invoked)
+        actual_attest.(call)
+      end)
+
+    put_raw(ctx, review_gate_rule())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: assignment.id,
+        kind: "completion"
+      })
+
+    assert {:error, %{code: "rule_denied", rule: "needs-cross-review"}} =
+             Dispatch.dispatch(ctx.db, handlers, completion)
+
+    refute_received :attest_handler_invoked
+    assert Assignments.attest_count(ctx.db, assignment.id) == 0
+    assert Assignments.open_count(ctx.db, holder.session_key) == 1
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM events WHERE kind = 'denied'")
+
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: assignment.id)
+    verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
+
+    assert {:ok, %{assignment: %{state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, handlers, completion)
+
+    assert_received :attest_handler_invoked
+
+    tests_assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    put_raw(ctx, producer_gate_rule())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    tests_completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: tests_assignment.id,
+        kind: "completion"
+      })
+
+    verdict(ctx, holder.session_key, tests_assignment.id, "tests-passed")
+
+    assert {:error, %{code: "rule_denied", rule: "needs-produced-tests"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, tests_completion)
+
+    producer_verdict(ctx, tests_assignment.id, holder.session_key, "tests-passed")
+
+    assert {:ok, %{assignment: %{state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, tests_completion)
+  end
+
   defp call(origin \\ "user:flynn") do
     %{verb: "post", origin: origin, session_key: nil, params: %{}}
+  end
+
+  defp p3_call(verb, principal, params) do
+    origin =
+      case principal do
+        {:session, key} -> "agent:#{key}"
+        {:user, user} -> "user:#{user}"
+        nil -> "process:test"
+      end
+
+    %{
+      verb: verb,
+      origin: origin,
+      principal: principal,
+      session_key: nil,
+      params: params,
+      target_role: nil,
+      role_fallback: false
+    }
+  end
+
+  defp assignment(ctx, holder_key, opener, opts \\ []) do
+    call =
+      p3_call("assign", opener, %{
+        subject: "P3 assignment #{System.unique_integer([:positive])}",
+        idempotency_key: nil,
+        reviews_assignment_id: opts[:reviews],
+        files: opts[:files]
+      })
+
+    Assignments.__handle__(ctx.db, "assign", %{call | session_key: holder_key})
+  end
+
+  defp verdict(ctx, session_key, assignment_id, verdict_kind) do
+    Assignments.__handle__(
+      ctx.db,
+      "attest",
+      p3_call("attest", {:session, session_key}, %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: verdict_kind
+      })
+    )
+  end
+
+  defp user_verdict(ctx, user, assignment_id, verdict_kind) do
+    Assignments.__handle__(
+      ctx.db,
+      "attest",
+      p3_call("attest", {:user, user}, %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: verdict_kind
+      })
+    )
+  end
+
+  defp producer_verdict(ctx, assignment_id, session_key, verdict_kind) do
+    session = Org.get(ctx.db, session_key)
+
+    assert {:ok, {:ok, attest}} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.insert_producer_verdict_in_txn(txn, %{
+                 assignment_id: assignment_id,
+                 verdict_kind: verdict_kind,
+                 producer: "build",
+                 producer_command: "mix test",
+                 by_session: session_key,
+                 by_user: nil,
+                 by_harness: session.harness,
+                 by_provider: session.provider
+               })
+             end)
+
+    attest
+  end
+
+  defp review_gate_rule do
+    """
+    [[rule]]
+    name = "needs-cross-review"
+    verb = "attest"
+    text = "completion requires cross-harness review"
+    deny_when = [
+      { fact = "attest.kind", op = "eq", value = "completion" },
+      { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
+      { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+    ]
+    """
+  end
+
+  defp producer_gate_rule do
+    """
+    [[rule]]
+    name = "needs-produced-tests"
+    verb = "attest"
+    text = "completion requires produced tests"
+    deny_when = [
+      { fact = "attest.kind", op = "eq", value = "completion" },
+      { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
+      { fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["tests-passed"] }
+    ]
+    """
   end
 
   defp match_result({:deny, %{code: "rule_denied"}}), do: true
@@ -472,10 +982,10 @@ defmodule Tightbeam.RulesTest do
       kind: Keyword.get(opts, :kind, "custom"),
       owner_user_id: owner,
       origin: "user:#{owner}",
-      archetype: "default",
+      archetype: Keyword.get(opts, :archetype, "default"),
       host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
+      harness: Keyword.get(opts, :harness, "claude"),
+      provider: Keyword.get(opts, :provider, "anthropic"),
       model: "fable"
     })
   end
