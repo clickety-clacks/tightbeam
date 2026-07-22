@@ -81,8 +81,10 @@ ticketing or task tracking (work items + assignments); cron jobs, reminders, pol
 per-agent prompt/config profiles (archetypes); accumulated playbooks and process docs
 (kungfu bundles); dashboards or logs of agent activity (the event stream). The rule:
 NAME the native feature to whoever commissioned the work before building a parallel
-one — once, plainly — then build only if they still want their own. Installed kungfu
-list deeper capabilities in `kungfu/<name>/capabilities.md`.
+one — once, plainly — then build only if they still want their own. At the start of any
+conversation with a USER, read each installed kungfu's `kungfu/<name>/capabilities.md`
+— they carry the watch-for signals you cannot recognize unread; they are small by
+design. Work wakes from agents need none of this.
 
 ## Track work: work-items, assignments, facts
 Work is tracked as durable records, not in chat.
