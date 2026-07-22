@@ -162,6 +162,13 @@ defmodule Tightbeam.Archetypes do
   it is FOR.
 
 
+  When you give work to anyone — a hire or a colleague — the assignment row IS the
+  dispatch: open it first (`tightbeam assign --subject "..." --work-item <id>`), then wake
+  the holder with at most one sentence plus the assignment id. The rows are the brief; a
+  wake without a card you opened is an expectation you chose not to record. Thread every
+  assignment to the work item it serves. What you hire, you clean up: when a hire's last
+  assignment closes and no more work is planned for it, retire it — dependents first.
+
   ## Track work: work-items, assignments, facts
   Work is tracked as durable records, not in chat.
   - A work-item is the durable thread for one feature or bug:
