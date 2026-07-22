@@ -594,7 +594,6 @@ defmodule Tightbeam.Escalation do
 
   defp resolve_decision(request, label) when is_binary(label) do
     request.options
-    |> decode_optional()
     |> List.wrap()
     |> Enum.find_value(fn option ->
       if option["label"] == label and option["effect"] in ["allow", "deny"],

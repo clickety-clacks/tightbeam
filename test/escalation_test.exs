@@ -167,6 +167,25 @@ defmodule Tightbeam.EscalationTest do
              Escalation.digest(call(ctx.raiser, %{assignment_id: "a2", kind: "progress"}))
   end
 
+  test "request deadlines use the configured escalation decision interval", ctx do
+    previous = Application.get_env(:tightbeam, :escalation_decision_deadline_ms)
+    Application.put_env(:tightbeam, :escalation_decision_deadline_ms, 12_345)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :escalation_decision_deadline_ms),
+        else: Application.put_env(:tightbeam, :escalation_decision_deadline_ms, previous)
+    end)
+
+    before_open = System.system_time(:millisecond)
+    {:decision_pending, id} = open(ctx, call(ctx.raiser, %{assignment_id: "deadline"}), statute())
+    after_open = System.system_time(:millisecond)
+
+    deadline_at = request(ctx, id).deadline_at
+    assert deadline_at >= before_open + 12_345
+    assert deadline_at <= after_open + 12_345
+  end
+
   test "rule uses admin axis, closed decisions, idempotent re-rule, and wakes on its reserved fact",
        ctx do
     call = call(ctx.raiser, %{assignment_id: "a3", kind: "completion"})
@@ -226,6 +245,9 @@ defmodule Tightbeam.EscalationTest do
     {:decision_pending, first} = open(ctx, first_call, statute)
     {:decision_pending, second} = open(ctx, second_call, statute)
 
+    first_wake = ruling_wake(ctx, first)
+    second_wake = ruling_wake(ctx, second)
+
     waiver =
       Escalation.waive(
         ctx.db,
@@ -236,6 +258,11 @@ defmodule Tightbeam.EscalationTest do
 
     assert request(ctx, first).decision == "waived"
     assert request(ctx, second).decision == "waived"
+    assert Wakes.get(ctx.db, second_wake.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, first_wake.wake_id).state == "pending"
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, first_wake.wake_id).state == "fired"
     assert :allow = Escalation.resolve(ctx.db, first_call, statute)
 
     assert %{revoked_at: revoked_at} =
@@ -252,6 +279,9 @@ defmodule Tightbeam.EscalationTest do
     assert is_integer(revoked_at)
     assert {:needs_request, nil} = Escalation.resolve(ctx.db, first_call, statute)
     assert request(ctx, first).decision == "waived"
+
+    {:decision_pending, fresh} = open(ctx, first_call, statute)
+    refute fresh in [first, second]
   end
 
   test "withdrawal is raiser-only and retirement sweeps requests and waivers", ctx do
@@ -340,8 +370,54 @@ defmodule Tightbeam.EscalationTest do
              )
 
     assert {:allow, ^id} = Escalation.resolve(ctx.db, call, statute())
+
+    withdraw_call = put_in(call, [:params, :kind], "progress")
+    {:decision_pending, withdraw_id} = open(ctx, withdraw_call, statute())
+
+    assert %{code: "not_raiser"} =
+             Escalation.withdraw(ctx.db, %{
+               origin: "user:other",
+               principal: {:user, "other"},
+               params: %{request_id: withdraw_id, reason: "wrong raiser"}
+             })
+
+    assert %{status: "withdrawn"} =
+             Escalation.withdraw(ctx.db, %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{request_id: withdraw_id, reason: "changed course"}
+             })
+
+    waiver_call = put_in(call, [:params, :kind], "verdict")
+    {:decision_pending, waiver_request_id} = open(ctx, waiver_call, statute())
+
+    waiver =
+      Escalation.waive(
+        ctx.db,
+        %{
+          origin: "user:other-admin",
+          principal: {:user, "other-admin"},
+          params: %{request_id: waiver_request_id}
+        },
+        authorized: true
+      )
+
     :ok = Escalation.withdraw_for_retired(ctx.db, ctx.raiser.session_key)
     assert Escalation.get(ctx.db, call, id).status == "ruled"
+    assert :allow = Escalation.resolve(ctx.db, waiver_call, statute())
+
+    assert %{revoked_at: revoked_at} =
+             Escalation.revoke_waiver(
+               ctx.db,
+               %{
+                 origin: "user:other-admin",
+                 principal: {:user, "other-admin"},
+                 params: %{waiver_id: waiver.id}
+               },
+               authorized: true
+             )
+
+    assert is_integer(revoked_at)
   end
 
   test "escalation-ruled remains substrate-reserved", ctx do
@@ -395,5 +471,17 @@ defmodule Tightbeam.EscalationTest do
 
   defp request(ctx, id) do
     Escalation.get(ctx.db, rule_call(id, "allow"), id, owner_user_id: "flynn")
+  end
+
+  defp ruling_wake(ctx, id) do
+    Wakes.schedule(ctx.db, %{
+      session_key: ctx.raiser.session_key,
+      origin: "agent:raiser",
+      prompt: "re-adjudicate",
+      due_at: System.system_time(:millisecond) + 60_000,
+      condition_kind: "escalation-ruled",
+      condition_scope: id,
+      creator_session_key: ctx.raiser.session_key
+    })
   end
 end
