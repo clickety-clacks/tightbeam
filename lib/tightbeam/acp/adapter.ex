@@ -92,8 +92,14 @@ defmodule Tightbeam.Acp.Adapter do
   """
   @spec prompt(adapter(), String.t(), String.t(), timeout(), keyword()) ::
           {:ok, %{stop_reason: String.t(), text: String.t()}} | {:error, term()}
-  def prompt(adapter, session_id, text, timeout \\ 600_000, opts \\ []),
-    do: GenServer.call(adapter, {:prompt, session_id, text, opts}, timeout + 5_000)
+  def prompt(
+        adapter,
+        session_id,
+        text,
+        timeout \\ Application.get_env(:tightbeam, :turn_timeout_ms, 600_000),
+        opts \\ []
+      ),
+      do: GenServer.call(adapter, {:prompt, session_id, text, opts}, timeout + 5_000)
 
   @doc """
   Map one ACP session/update to a typing-indicator status line, or :skip.
@@ -266,7 +272,14 @@ defmodule Tightbeam.Acp.Adapter do
     parent = self()
 
     Task.start(fn ->
-      result = Conn.request(state.conn, "session/prompt", %{sessionId: sid, prompt: [%{type: "text", text: text}]}, timeout: 600_000)
+      result =
+        Conn.request(
+          state.conn,
+          "session/prompt",
+          %{sessionId: sid, prompt: [%{type: "text", text: text}]},
+          timeout: Application.get_env(:tightbeam, :turn_timeout_ms, 600_000)
+        )
+
       send(parent, {:prompt_done, sid, from, result})
     end)
 

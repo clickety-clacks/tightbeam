@@ -56,6 +56,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/prompt": {
         const sid = m.params.sessionId;
         capture(m);
+        if (gateMode === "stall-turn") return;
         if (sid === "probe-sess") {
           if (gateMode === "pass-message") {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } } } });
@@ -212,6 +213,22 @@ defmodule Tightbeam.Acp.AdapterTest do
     {:ok, _} = Adapter.new_session(a, "haiku", "/tmp", [])
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "one")
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "two")
+  end
+
+  test "turn timeout config reaches the session prompt request" do
+    old_timeout = Application.get_env(:tightbeam, :turn_timeout_ms)
+
+    on_exit(fn ->
+      if old_timeout,
+        do: Application.put_env(:tightbeam, :turn_timeout_ms, old_timeout),
+        else: Application.delete_env(:tightbeam, :turn_timeout_ms)
+    end)
+
+    Application.put_env(:tightbeam, :turn_timeout_ms, 25)
+
+    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, "haiku", "/tmp", [])
+    assert {:error, :timeout} = Adapter.prompt(adapter, sid, "stall")
   end
 
   test "preset modes are pinned for both harnesses" do
