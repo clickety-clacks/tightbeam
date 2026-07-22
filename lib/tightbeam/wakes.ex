@@ -560,6 +560,27 @@ defmodule Tightbeam.Wakes do
             role_ref: wake.target_role
           )
 
+        episodes_exist? =
+          Txn.q(
+            txn,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudication_episodes'"
+          ) == [[1]]
+
+        if episodes_exist? and match?({:appended, _, _, _}, delivery) do
+          Txn.q(
+            txn,
+            """
+            UPDATE sessions SET adjudicationHold = ?1, updatedAt = ?2
+            WHERE sessionKey = ?3 AND adjudicationHold = '*'
+              AND EXISTS (
+                SELECT 1 FROM adjudication_episodes
+                WHERE sessionKey = ?3 AND recoveryWakeId = ?1
+              )
+            """,
+            [wake.wake_id, fired_at, wake.session_key]
+          )
+        end
+
         lifecycle_for_fire(txn, wake, cause, match, delivery)
         {:fired, delivery}
       else

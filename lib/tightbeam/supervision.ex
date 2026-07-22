@@ -3,7 +3,18 @@ defmodule Tightbeam.Supervision do
 
   use GenServer
 
-  alias Tightbeam.{Assignments, DB, Dispatch, Escalation, EventLog, Ledger, Org, Wakes}
+  alias Tightbeam.{
+    Adjudication,
+    Assignments,
+    DB,
+    Dispatch,
+    Escalation,
+    EventLog,
+    Ledger,
+    Org,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   @prods_ddl """
@@ -183,6 +194,7 @@ defmodule Tightbeam.Supervision do
       assignment ->
         with :new <- dedupe(watermark(db, session_key), terminal_seq),
              0 <- Ledger.pending_count(db, session_key),
+             false <- Adjudication.open_for_session?(db, session_key),
              0 <- Wakes.pending_count(db, session_key) do
           case holder_state(db, session_key) do
             :retired ->
@@ -205,6 +217,9 @@ defmodule Tightbeam.Supervision do
 
           count when is_integer(count) and count > 0 ->
             if Ledger.pending_count(db, session_key) > 0, do: :busy, else: :continuation
+
+          true ->
+            :continuation
         end
     end
   end
@@ -507,6 +522,12 @@ defmodule Tightbeam.Supervision do
   end
 
   defp sweep(state) do
+    :ok =
+      Adjudication.escalate_due(
+        state.db,
+        Application.get_env(:tightbeam, :adjudication_response_window_ms, 86_400_000)
+      )
+
     {:ok, rows} =
       DB.query(
         state.db,

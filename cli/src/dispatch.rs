@@ -255,6 +255,25 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::Adjudicate {
+            identity,
+            episode,
+            action,
+            model,
+            reason,
+        } => {
+            let mut params = vec![
+                string_field("episode", episode),
+                string_field("action", action),
+            ];
+            if let Some(value) = model {
+                params.push(string_field("model", value));
+            }
+            if let Some(value) = reason {
+                params.push(string_field("reason", value));
+            }
+            Ok(request(identity, "adjudicate", vec![], params))
+        }
         Command::Assign {
             identity,
             subject,
@@ -709,6 +728,7 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
+        | Command::Adjudicate { identity, .. }
         | Command::Assign { identity, .. }
         | Command::RunTests { identity, .. }
         | Command::RunSmoke { identity, .. }

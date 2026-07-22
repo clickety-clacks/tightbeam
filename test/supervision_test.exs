@@ -164,8 +164,8 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "a retired holder is derived-stranded and receives no claim or wake", ctx do
-    Org.retire(ctx.db, "holder")
     seq = terminal!(ctx.db, "holder")
+    Org.retire(ctx.db, "holder")
 
     assert :stranded = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
     assert Supervision.watermark(ctx.db, "holder") == nil

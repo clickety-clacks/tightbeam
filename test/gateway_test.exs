@@ -681,7 +681,7 @@ defmodule Tightbeam.GatewayTest do
     Roles.create!(ctx.db, "taken", "flynn", nil)
     {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
 
-    assert %{code: "role_exists"} =
+    assert %{code: "config_denied", detail: %{code: "role_exists"}} =
              spawn.(%{
                origin: "user:flynn",
                session_key: nil,
@@ -713,7 +713,7 @@ defmodule Tightbeam.GatewayTest do
         }
       })
 
-    assert %{code: "host_unready", message: message} = result
+    assert %{code: "placement_denied", detail: %{code: "host_unready"}, message: message} = result
     assert message =~ "no claude credentials"
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
     assert Roles.get(ctx.db, "unready") == nil
@@ -896,7 +896,8 @@ defmodule Tightbeam.GatewayTest do
           }
         })
 
-      assert result.code == "invalid_overrides"
+      assert result.code == "config_denied"
+      assert result.detail.code == "invalid_overrides"
       assert is_binary(result.message)
     end
 
@@ -1116,7 +1117,10 @@ defmodule Tightbeam.GatewayTest do
     status = Gateway.session_status("k-reasoning", ctx.db)
 
     assert %{supported: true, options: options} = status.capabilities.setReasoning
-    assert Enum.map(options, & &1.value) |> Enum.sort() == Enum.sort(~w(low medium high xhigh max ultra))
+
+    assert Enum.map(options, & &1.value) |> Enum.sort() ==
+             Enum.sort(~w(low medium high xhigh max ultra))
+
     assert Enum.all?(options, &(&1.title == &1.value))
     assert status.capabilities.canChangeReasoning == true
 
@@ -2203,7 +2207,7 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
-  test "a failed turn appends the [turn failed] marker with the human reason", ctx do
+  test "an adjudication-routed failed turn suppresses the generic failure marker", ctx do
     exact_registry =
       start_supervised!(%{
         id: :failed_conn_registry,
@@ -2253,17 +2257,34 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
-    assert {:error, %{reason: _, terminal_publish: publish}} =
+    assert {:error,
+            %{
+              reason: _,
+              terminal_publish: publish,
+              adjudicate_in_txn: adjudicate,
+              post_commit: _post_commit
+            }} =
              runner.(Map.put(turn, :session_key, "k1"))
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", "boom")
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom")
+               adjudicate.(txn)
+               true
+             end)
+
     publish.("failed")
 
-    frames = collect_pushes(10, [])
+    frames = collect_pushes(9, [])
 
-    marker = Enum.find(frames, &(&1["type"] == "message" and &1["sender"] == "process:tightbeam"))
-    assert String.starts_with?(marker["content"], "[turn failed]\n")
-    assert marker["content"] =~ "Internal error — auth expired"
+    refute Enum.any?(frames, fn frame ->
+             frame["type"] == "message" and
+               String.starts_with?(frame["content"] || "", "[turn failed]\n")
+           end)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "unclassified_harness_error" and event.subject == "k1"
+           end)
 
     assert Enum.any?(
              frames,

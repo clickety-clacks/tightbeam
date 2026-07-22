@@ -95,6 +95,13 @@ pub enum Command {
         session_key: String,
         idempotency_key: Option<String>,
     },
+    Adjudicate {
+        identity: Identity,
+        episode: String,
+        action: String,
+        model: Option<String>,
+        reason: Option<String>,
+    },
     Assign {
         identity: Identity,
         subject: String,
@@ -315,6 +322,10 @@ COMMANDS:
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
+
+  adjudicate --episode <correlationKey> --action park|swap|respawn|stop
+             [--model <ref>] [--reason <text>]
+      Rule on a model-adjudication episode currently owned by this session.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
   work-item-update <workItemId> [--title "<title>"] [--spec-ref <name>]
@@ -775,6 +786,25 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 identity: identity(flags)?,
                 session_key: session_key.expect("checked above"),
                 idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "adjudicate" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam adjudicate --episode <key> --action park|swap|respawn|stop [--model <ref>] [--reason <text>]".to_owned());
+            }
+            let episode =
+                nonempty(flags, "episode").ok_or_else(|| "--episode is required".to_owned())?;
+            let action =
+                nonempty(flags, "action").ok_or_else(|| "--action is required".to_owned())?;
+            if !matches!(action.as_str(), "park" | "swap" | "respawn" | "stop") {
+                return Err("--action must be park, swap, respawn, or stop".to_owned());
+            }
+            Ok(Command::Adjudicate {
+                identity: identity(flags)?,
+                episode,
+                action,
+                model: nonempty(flags, "model"),
+                reason: nonempty(flags, "reason"),
             })
         }
         "assign" => {
@@ -1359,6 +1389,17 @@ mod tests {
             ]),
             strings(&["list", "--as-process", "cron"]),
             strings(&["retire", "--session", "agent:x", "--as", "owner"]),
+            strings(&[
+                "adjudicate",
+                "--episode",
+                "adj_1",
+                "--action",
+                "swap",
+                "--model",
+                "gpt-5.6-sol[high]",
+                "--as",
+                "owner",
+            ]),
             strings(&["cancel-wake", "w1", "--as-process", "cron"]),
             strings(&["run-tests", "asg_1", "--as", "builder"]),
             strings(&["run-smoke", "asg_1", "--as-user", "flynn"]),

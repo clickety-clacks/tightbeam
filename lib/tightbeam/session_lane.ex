@@ -21,7 +21,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Ledger, EventLog}
+  alias Tightbeam.{DB, Ledger, EventLog}
 
   defstruct [
     :session_key,
@@ -193,23 +193,46 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp finalize(state, seq, outcome) do
-    {terminal, error, publish} =
+    {terminal, error, publish, in_txn, post_commit} =
       case outcome do
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
-          {"delivered", nil, fun}
+          {"delivered", nil, fun, nil, nil}
 
         {:ok, _} ->
-          {"delivered", nil, nil}
+          {"delivered", nil, nil, nil, nil}
+
+        {:error, %{reason: reason, terminal_publish: fun, adjudicate_in_txn: action} = attrs}
+        when is_function(fun, 1) and is_function(action, 1) ->
+          {"failed", inspect(reason), fun, action, Map.get(attrs, :post_commit)}
 
         {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
-          {"failed", inspect(reason), fun}
+          {"failed", inspect(reason), fun, nil, nil}
 
         {:error, reason} ->
-          {"failed", inspect(reason), nil}
+          {"failed", inspect(reason), nil, nil, nil}
       end
 
-    case Ledger.finish(state.db, seq, terminal, error) do
+    finish_result =
+      if in_txn do
+        {:ok, won} =
+          DB.transaction(state.db, fn txn ->
+            if Ledger.finish_in_txn(txn, seq, terminal, error) do
+              in_txn.(txn)
+              true
+            else
+              false
+            end
+          end)
+
+        if won, do: :ok, else: :already_terminal
+      else
+        Ledger.finish(state.db, seq, terminal, error)
+      end
+
+    case finish_result do
       :ok ->
+        if is_function(post_commit, 0), do: post_commit.()
+
         if publish do
           publish.(terminal)
         else

@@ -60,6 +60,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.{
     AdapterCoordinator,
+    Adjudication,
     Archetypes,
     Assignments,
     ConditionFacts,
@@ -87,6 +88,7 @@ defmodule Tightbeam.Gateway do
   }
 
   alias Tightbeam.Acp.Adapter
+  alias Tightbeam.DB.Txn
   alias Tightbeam.Wire.Payloads
   require Logger
 
@@ -100,7 +102,10 @@ defmodule Tightbeam.Gateway do
           max_live_sessions_per_user: pos_integer(),
           wake_tick_ms: pos_integer(),
           prod_limit: non_neg_integer(),
-          escalation_decision_deadline_ms: pos_integer()
+          escalation_decision_deadline_ms: pos_integer(),
+          adjudication_claim_window_ms: pos_integer(),
+          adjudication_response_window_ms: pos_integer(),
+          adjudication_park_fallback_ms: pos_integer()
         }
 
   @doc """
@@ -122,6 +127,7 @@ defmodule Tightbeam.Gateway do
 
     for module <- [
           Tightbeam.Assets,
+          Adjudication,
           Devices,
           Idempotency,
           ConditionFacts,
@@ -138,6 +144,14 @@ defmodule Tightbeam.Gateway do
         ] do
       :ok = module.ensure_schema(db)
     end
+
+    :ok = Adjudication.reconcile(db)
+
+    :ok =
+      Adjudication.escalate_due(
+        db,
+        Map.get(config, :adjudication_response_window_ms, 86_400_000)
+      )
 
     migrate_handle_roles(db)
 
@@ -571,6 +585,7 @@ defmodule Tightbeam.Gateway do
       "cancel" => fn call -> cancel_result(db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
       "tune" => fn call -> tune_result(config, db, call) end,
+      "adjudicate" => fn call -> adjudicate_result(config, db, call) end,
       "retire" => fn call -> retire_result(config, db, call) end
     }
   end
@@ -1016,13 +1031,10 @@ defmodule Tightbeam.Gateway do
           {:ok, %{terminal_publish: terminal_publish}}
         else
           {:error, reason} ->
-            failure_publish = fn _terminal ->
-              # The failure must exist IN the chat, not only as a turn-state
-              # frame — a client that ignores turn states shows a prompt that
-              # silently vanishes (this shipped: an auth failure looked like
-              # the message was never accepted).
-              append_turn_failed_marker(db, turn.session_key, humanize_reason(reason))
+            condition = Adjudication.classify(reason)
+            adjudication_prompt = adjudication_brief(session, condition)
 
+            failure_publish = fn _terminal ->
               # No assistant final will arrive to clear the indicator label —
               # clear it explicitly (client treats state "failed" as terminal).
               broadcast(
@@ -1050,11 +1062,82 @@ defmodule Tightbeam.Gateway do
               )
             end
 
-            {:error, %{reason: reason, terminal_publish: failure_publish}}
+            adjudicate_in_txn = fn txn ->
+              DB.Txn.q(
+                txn,
+                "UPDATE sessions SET adjudicationHold='*', updatedAt=?2 WHERE sessionKey=?1",
+                [turn.session_key, System.system_time(:millisecond)]
+              )
+
+              if condition == "other" do
+                Adjudication.record_unclassified_in_txn(txn, turn.session_key, reason)
+              end
+
+              episode_opts = [
+                claim_window_ms: Map.get(config, :adjudication_claim_window_ms, 300_000),
+                reresolve_seed: turn.session_key,
+                reresolve_rung: 1
+              ]
+
+              episode =
+                Adjudication.claim_in_txn(
+                  txn,
+                  turn.session_key,
+                  condition,
+                  episode_opts
+                ) ||
+                  Adjudication.reopen_in_txn(
+                    txn,
+                    turn.session_key,
+                    condition,
+                    episode_opts
+                  )
+
+              if episode do
+                Adjudication.notify_in_txn(
+                  txn,
+                  episode,
+                  adjudication_prompt,
+                  Map.get(config, :adjudication_response_window_ms, 86_400_000)
+                )
+              end
+            end
+
+            {:error,
+             %{
+               reason: reason,
+               terminal_publish: failure_publish,
+               adjudicate_in_txn: adjudicate_in_txn,
+               post_commit: fn ->
+                 Wakes.fire_due(config[:wake_scheduler] || Tightbeam.WakeScheduler)
+               end
+             }}
         end
 
       outcome
     end
+  end
+
+  defp adjudication_brief(session, condition) do
+    archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
+
+    inventories =
+      Map.new(["claude", "codex"], fn harness ->
+        {models, health} = ModelCatalog.get(harness, ModelCatalog)
+        {harness, %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
+      end)
+
+    """
+    Model adjudication required.
+    affected_session=#{session.session_key}
+    condition=#{condition}
+    current_model=#{session.model}
+    current_harness=#{session.harness}
+    model_preferences=#{JSON.encode!(archetype.model_preferences)}
+    live_catalog=#{JSON.encode!(inventories)}
+
+    Reply with: tightbeam adjudicate --episode <correlationKey> --action park|swap|respawn|stop [--model <ref>] [--reason <text>]
+    """
   end
 
   # Wire publication for terminals that lost their runner closure: turns
@@ -1814,7 +1897,7 @@ defmodule Tightbeam.Gateway do
                Placement.resolve(archetype, p[:host], Placement.hosts(config.base_dir)) do
           create_spawn(config, db, call, caller, archetype, host, overrides)
         else
-          {:error, denial} -> denial
+          {:error, denial} -> classified_spawn_denial(denial, "config_denied", "placement_denied")
         end
     end
   end
@@ -1870,7 +1953,7 @@ defmodule Tightbeam.Gateway do
 
       case session_result do
         {:error, %Roles.TransactionError{error: error}} ->
-          error
+          classified_denial("config_denied", error)
 
         {:error, error} ->
           raise error
@@ -1880,7 +1963,21 @@ defmodule Tightbeam.Gateway do
       end
     else
       {:error, denial} ->
-        denial
+        classified_denial("placement_denied", denial)
+    end
+  end
+
+  defp classified_spawn_denial(denial, config_code, placement_code) do
+    if denial[:code] in ["host_not_allowed", "unknown_host"],
+      do: classified_denial(placement_code, denial),
+      else: classified_denial(config_code, denial)
+  end
+
+  defp classified_denial(code, denial) do
+    if denial[:code] in ["model_unavailable", "catalog_unavailable"] do
+      Map.put(denial, :detail, denial)
+    else
+      %{code: code, message: denial[:message] || inspect(denial), detail: denial}
     end
   end
 
@@ -2254,7 +2351,28 @@ defmodule Tightbeam.Gateway do
                   end)
                 end)
 
-              Org.retire(db, session.session_key)
+              {:ok, _} =
+                DB.transaction(db, fn txn ->
+                  Org.retire_in_txn(txn, session.session_key)
+
+                  Ledger.drain_queued_for_retire_in_txn(
+                    txn,
+                    session.session_key,
+                    "retired: session retired before execution"
+                  )
+
+                  if p[:idempotency_key] do
+                    Idempotency.put_in_txn(txn, %{
+                      owner_user_id: owner,
+                      operation: "retire",
+                      idempotency_key: p.idempotency_key,
+                      session_key: session.session_key
+                    })
+                  end
+
+                  :ok
+                end)
+
               broadcast(db, owner, Payloads.stream_deleted(session.session_key))
               Map.get(config, :on_retired, fn _ -> :ok end).(session.session_key)
 
@@ -2263,20 +2381,442 @@ defmodule Tightbeam.Gateway do
               end)
             end
 
-            if p[:idempotency_key] do
-              Idempotency.put(db, %{
-                owner_user_id: owner,
-                operation: "retire",
-                idempotency_key: p.idempotency_key,
-                session_key: session.session_key
-              })
-            end
-
             %{deleted_session_key: session.session_key}
 
           _ ->
             %{code: "not_found"}
         end
+    end
+  end
+
+  defp adjudicate_result(config, db, call) do
+    p = call.params
+    episode = Adjudication.get_by_correlation(db, p[:episode])
+
+    caller_key =
+      case call[:principal] do
+        {:session, key} -> key
+        _ -> nil
+      end
+
+    cond do
+      is_nil(episode) or episode.status != "notified" ->
+        %{code: "denied", message: "stale or unknown adjudication episode"}
+
+      caller_key != episode.owner_target ->
+        %{code: "denied", message: "current adjudication owner required"}
+
+      p[:action] not in ~w(park swap respawn stop) ->
+        %{code: "invalid", message: "action must be park, swap, respawn, or stop"}
+
+      p[:action] in ~w(swap respawn) and not is_binary(p[:model]) ->
+        %{code: "invalid", message: "--model is required for #{p.action}"}
+
+      true ->
+        adjudicate_action(config, db, call, episode)
+    end
+  end
+
+  defp adjudicate_action(config, db, call, episode) do
+    case call.params.action do
+      "park" -> adjudicate_park(config, db, call, episode)
+      "swap" -> adjudicate_swap(config, db, call, episode)
+      "respawn" -> adjudicate_respawn(config, db, call, episode)
+      "stop" -> adjudicate_stop(config, db, call, episode)
+    end
+  end
+
+  defp adjudicate_stop(_config, db, call, episode) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
+
+        if current && Adjudication.resolve_in_txn(txn, current) do
+          Org.retire_in_txn(txn, current.session_key)
+
+          Ledger.drain_queued_for_retire_in_txn(
+            txn,
+            current.session_key,
+            "retired: adjudication stopped session before execution"
+          )
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "model_adjudication_stop",
+            current.session_key,
+            JSON.encode!(%{
+              reason: call.params[:reason],
+              condition: current.condition,
+              correlationKey: current.correlation_key
+            })
+          )
+
+          :ok
+        else
+          raise "stale adjudication episode"
+        end
+      end)
+
+    %{ok: true, action: "stop", session_key: episode.session_key}
+  end
+
+  defp adjudicate_park(config, db, call, episode) do
+    session = Org.get(db, episode.session_key)
+
+    due_at =
+      System.system_time(:millisecond) +
+        Map.get(config, :adjudication_park_fallback_ms, 14_400_000)
+
+    scope = session.harness <> ":" <> session.identity_name
+
+    {:ok, {wake_id, delivery}} =
+      DB.transaction(db, fn txn ->
+        current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
+
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: current.session_key,
+            origin: "process:tightbeam",
+            creator_session_key: current.owner_target,
+            prompt:
+              "Quota recovery check: re-derive the model block and re-adjudicate from current facts.",
+            due_at: due_at,
+            condition_kind: "quota-recovered",
+            condition_scope: scope
+          })
+
+        if Adjudication.resolve_in_txn(txn, current, wake.wake_id) do
+          EventLog.lifecycle_in_txn(
+            txn,
+            "adjudication_block",
+            current.session_key,
+            JSON.encode!(%{
+              reason: call.params[:reason],
+              condition: current.condition,
+              correlationKey: current.correlation_key,
+              by: current.owner_target
+            })
+          )
+
+          already_recovered =
+            Txn.q(
+              txn,
+              "SELECT 1 FROM condition_facts WHERE kind='quota-recovered' AND scope=?1 ORDER BY id DESC LIMIT 1",
+              [scope]
+            ) != []
+
+          delivery =
+            if already_recovered do
+              Txn.q(
+                txn,
+                "UPDATE wakes SET state='canceled' WHERE wakeId=?1 AND state='pending'",
+                [wake.wake_id]
+              )
+
+              delivered =
+                deliver_prompt_in_txn(
+                  txn,
+                  current.session_key,
+                  "process:tightbeam",
+                  "Quota is already recorded recovered. Re-derive the block and re-adjudicate.",
+                  wake_id: wake.wake_id,
+                  sender: "process:tightbeam"
+                )
+
+              arm_hold_in_txn(txn, current.session_key, wake.wake_id)
+              delivered
+            end
+
+          {wake.wake_id, delivery}
+        else
+          raise "stale adjudication episode"
+        end
+      end)
+
+    if delivery, do: complete_delivery(db, delivery)
+    %{ok: true, action: "park", recovery_wake_id: wake_id}
+  end
+
+  defp adjudicate_swap(_config, db, call, episode) do
+    with {:ok, harness, provider} <- harness_for_ref(call.params.model) do
+      session = Org.get(db, episode.session_key)
+
+      if harness != session.harness do
+        %{
+          code: "cross_harness_requires_respawn",
+          message: "use --action respawn for a cross-harness model"
+        }
+      else
+        case strict_apply_current_model(db, session, call.params.model) do
+          :ok ->
+            {:ok, {delivery, wake_id}} =
+              DB.transaction(db, fn txn ->
+                current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
+
+                recovery_prompt =
+                  "Your previous turn failed: #{current.condition}. You now run on #{call.params.model}. Re-derive state from the facts and continue."
+
+                wake_id =
+                  Adjudication.deterministic_wake_in_txn(
+                    txn,
+                    current,
+                    "recovery",
+                    current.session_key,
+                    recovery_prompt
+                  )
+
+                case Org.swap_model_in_txn(
+                       txn,
+                       current.session_key,
+                       {session.model, session.harness},
+                       {call.params.model, harness, provider}
+                     ) do
+                  {:ok, _} -> :ok
+                  {:duplicate, _} -> :ok
+                  :stale -> raise("model mutation race")
+                end
+
+                unless Adjudication.resolve_in_txn(txn, current, wake_id),
+                  do: raise("stale adjudication episode")
+
+                delivery =
+                  deliver_prompt_in_txn(
+                    txn,
+                    current.session_key,
+                    "process:tightbeam",
+                    recovery_prompt,
+                    wake_id: wake_id,
+                    sender: "process:tightbeam",
+                    fire_wake_in_txn: true
+                  )
+
+                arm_hold_in_txn(txn, current.session_key, wake_id)
+
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "model_adjudication",
+                  current.session_key,
+                  JSON.encode!(%{
+                    from_model: session.model,
+                    to_model: call.params.model,
+                    from_harness: session.harness,
+                    to_harness: harness,
+                    trigger: current.condition,
+                    adjudicated_by: current.owner_target,
+                    correlationKey: current.correlation_key,
+                    harness_crossed: false,
+                    context_discarded: false
+                  })
+                )
+
+                {delivery, wake_id}
+              end)
+
+            complete_delivery(db, delivery)
+            %{ok: true, action: "swap", model: call.params.model, recovery_wake_id: wake_id}
+
+          {:error, reason} ->
+            %{code: to_string(reason), message: "strict model apply failed: #{reason}"}
+        end
+      end
+    else
+      {:error, error} -> error
+    end
+  end
+
+  defp adjudicate_respawn(_config, db, call, episode) do
+    with {:ok, harness, provider} <- harness_for_ref(call.params.model) do
+      old = Org.get(db, episode.session_key)
+
+      {:ok, {new_session, delivery, wake_id, marker}} =
+        DB.transaction(db, fn txn ->
+          current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
+
+          new_session =
+            Org.create_in_txn(txn, %{
+              display_name: old.display_name,
+              kind: old.kind,
+              owner_user_id: old.owner_user_id,
+              origin: old.origin,
+              spawned_by: old.spawned_by,
+              archetype: old.archetype,
+              overrides: old.overrides,
+              identity_name: old.identity_name,
+              host: old.host,
+              harness: harness,
+              provider: provider,
+              model: call.params.model
+            })
+
+          recovery_prompt =
+            "Your predecessor's turn failed: #{current.condition}. Continue on #{call.params.model}; re-derive state from durable facts."
+
+          wake_id =
+            Adjudication.deterministic_wake_in_txn(
+              txn,
+              current,
+              "recovery",
+              new_session.session_key,
+              recovery_prompt
+            )
+
+          Org.retire_in_txn(txn, old.session_key)
+
+          Ledger.drain_queued_for_retire_in_txn(
+            txn,
+            old.session_key,
+            "retired: adjudication respawned session before execution"
+          )
+
+          [[failed_prompt_seq]] =
+            Txn.q(
+              txn,
+              """
+              SELECT COALESCE(m.seq, 0) FROM turns AS t
+              JOIN messages AS m ON m.id=t.messageId
+              WHERE t.sessionKey=?1 AND t.status='failed'
+              ORDER BY t.seq DESC LIMIT 1
+              """,
+              [old.session_key]
+            )
+
+          Txn.q(
+            txn,
+            "UPDATE sessions SET clearedThroughSeq=?2 WHERE sessionKey=?1",
+            [old.session_key, failed_prompt_seq]
+          )
+
+          {:appended, marker} =
+            Projection.append_in_txn(txn, %{
+              session_key: old.session_key,
+              role: "assistant",
+              content:
+                "[model recovery]\n\nThis session continues as #{new_session.session_key} on #{call.params.model}.",
+              sender: "process:tightbeam"
+            })
+
+          Txn.q(
+            txn,
+            "UPDATE roles SET boundSessionKey=?2, updatedAt=?3 WHERE boundSessionKey=?1",
+            [old.session_key, new_session.session_key, System.system_time(:millisecond)]
+          )
+
+          Txn.q(txn, "UPDATE assignments SET holderKey=?2 WHERE holderKey=?1 AND state='open'", [
+            old.session_key,
+            new_session.session_key
+          ])
+
+          unless Adjudication.resolve_in_txn(txn, current, wake_id),
+            do: raise("stale adjudication episode")
+
+          delivery =
+            deliver_prompt_in_txn(
+              txn,
+              new_session.session_key,
+              "process:tightbeam",
+              recovery_prompt,
+              wake_id: wake_id,
+              sender: "process:tightbeam",
+              fire_wake_in_txn: true
+            )
+
+          arm_hold_in_txn(txn, new_session.session_key, wake_id)
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "model_adjudication",
+            old.session_key,
+            JSON.encode!(%{
+              from_model: old.model,
+              to_model: call.params.model,
+              from_harness: old.harness,
+              to_harness: harness,
+              trigger: current.condition,
+              adjudicated_by: current.owner_target,
+              correlationKey: current.correlation_key,
+              harness_crossed: old.harness != harness,
+              context_discarded: true
+            })
+          )
+
+          {new_session, delivery, wake_id, marker}
+        end)
+
+      publish_message(db, old.session_key, marker)
+
+      broadcast(
+        db,
+        old.owner_user_id,
+        Payloads.stream_history_cleared(old.session_key)
+      )
+
+      complete_delivery(db, delivery)
+
+      broadcast(db, old.owner_user_id, Payloads.stream_deleted(old.session_key))
+
+      broadcast(
+        db,
+        new_session.owner_user_id,
+        Payloads.stream_created(Payloads.stream_session(new_session))
+      )
+
+      %{
+        ok: true,
+        action: "respawn",
+        retired_session_key: old.session_key,
+        session_key: new_session.session_key,
+        recovery_wake_id: wake_id
+      }
+    else
+      {:error, error} -> error
+    end
+  end
+
+  defp arm_hold_in_txn(txn, session_key, wake_id) do
+    Txn.q(txn, "UPDATE sessions SET adjudicationHold=?2, updatedAt=?3 WHERE sessionKey=?1", [
+      session_key,
+      wake_id,
+      System.system_time(:millisecond)
+    ])
+  end
+
+  defp harness_for_ref(ref) do
+    matches =
+      Enum.filter(["claude", "codex"], fn harness ->
+        case ModelCatalog.member?(harness, ref) do
+          %{present?: true, health: :fresh} -> true
+          _ -> false
+        end
+      end)
+
+    case matches do
+      ["claude"] ->
+        {:ok, "claude", "anthropic"}
+
+      ["codex"] ->
+        {:ok, "codex", "openai"}
+
+      [] ->
+        {:error,
+         %{code: "model_unavailable", message: "model is not in a fresh harness inventory"}}
+
+      _ ->
+        {:error,
+         %{code: "ambiguous_ref", message: "model appears in multiple harness inventories"}}
+    end
+  end
+
+  defp strict_apply_current_model(db, session, model) do
+    with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
+         coordinator when is_pid(coordinator) <- Process.whereis(Tightbeam.AdapterCoordinator),
+         {:ok, adapter, _generation} <-
+           AdapterCoordinator.adapter_for(
+             coordinator,
+             {String.to_existing_atom(session.harness), session.identity_name, session.host}
+           ) do
+      Adapter.apply_model_strict(adapter, sid, model, session.model)
+    else
+      _ -> :ok
     end
   end
 
@@ -2324,18 +2864,6 @@ defmodule Tightbeam.Gateway do
       _ -> :ok
     end
   end
-
-  # Raw JSON-RPC error maps are unreadable in a chat bubble; the contract's
-  # message/details carry the human sentence when present.
-  defp humanize_reason(%{"message" => message} = error) do
-    case get_in(error, ["data", "details"]) do
-      nil -> message
-      details -> "#{message} — #{details}"
-    end
-  end
-
-  defp humanize_reason(reason) when is_binary(reason), do: reason
-  defp humanize_reason(reason), do: inspect(reason)
 
   defp publish_message(db, session_key, message, registry \\ Tightbeam.ConnRegistry) do
     case Org.get(db, session_key) do
