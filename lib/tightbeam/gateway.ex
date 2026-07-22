@@ -72,6 +72,7 @@ defmodule Tightbeam.Gateway do
     ModelCatalog,
     Org,
     Projection,
+    Producers,
     Rails,
     Rules,
     Roles,
@@ -125,6 +126,7 @@ defmodule Tightbeam.Gateway do
           Roles,
           WorkItems,
           Assignments,
+          Producers,
           Supervision,
           WorkState
         ] do
@@ -171,12 +173,20 @@ defmodule Tightbeam.Gateway do
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config)
     on_terminal = fn session_key, seq -> Supervision.notify_terminal(session_key, seq) end
-    on_retired = fn session_key -> Supervision.notify_retired(session_key) end
+    producer_config = Producers.load!(config.base_dir)
+    producer_runner = Map.get(config, :producer_runner, Tightbeam.ProducerRunner)
+
+    on_retired = fn session_key ->
+      Supervision.notify_retired(session_key)
+      Producers.cancel_for_holder(db, session_key, runner: producer_runner)
+    end
 
     handler_table =
       config
       |> Map.put(:db, db)
       |> Map.put(:on_retired, on_retired)
+      |> Map.put(:producer_config, producer_config)
+      |> Map.put(:producer_runner, producer_runner)
       |> handlers()
 
     Rules.load!(config.base_dir, Map.keys(handler_table))
@@ -248,6 +258,14 @@ defmodule Tightbeam.Gateway do
       {Tightbeam.Supervision,
        db: db, handlers: handler_table, prod_limit: prod_limit, name: Tightbeam.Supervision},
       {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
+      %{
+        id: Tightbeam.ProducerSupervisor,
+        start:
+          {DynamicSupervisor, :start_link,
+           [[strategy: :one_for_one, name: Tightbeam.ProducerSupervisor]]}
+      },
+      {Tightbeam.ProducerRunner,
+       db: db, config: config, supervisor: Tightbeam.ProducerSupervisor, name: producer_runner},
       {Tightbeam.AdapterCoordinator,
        adapter_sup: Tightbeam.AdapterSupervisor,
        adapter_opts: adapter_opts,
@@ -463,6 +481,23 @@ defmodule Tightbeam.Gateway do
         )
       end,
       "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
+      "run-tests" => fn call ->
+        Producers.__handle__(db, "run-tests", call,
+          config: Map.get(config, :producer_config, Producers.config()),
+          runner: Map.get(config, :producer_runner)
+        )
+      end,
+      "run-smoke" => fn call ->
+        Producers.__handle__(db, "run-smoke", call,
+          config: Map.get(config, :producer_config, Producers.config()),
+          runner: Map.get(config, :producer_runner)
+        )
+      end,
+      "cancel-producer-job" => fn call ->
+        Producers.__handle__(db, "cancel-producer-job", call,
+          runner: Map.get(config, :producer_runner)
+        )
+      end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
@@ -974,40 +1009,6 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # Every session works in its OWN directory on its host — never the
-  # operator's home, never shared: harnesses load project-level instruction
-  # files walking up from cwd, so an un-isolated cwd leaks operator guidance
-  # (and files) into the agent. The workdir is also the agent's durable
-  # scratch across engine swaps (artifact continuity).
-  defp session_workdir(config, session) do
-    host =
-      Placement.hosts(config.base_dir)[session.host] || %{ssh: nil, base_dir: config.base_dir}
-
-    digest =
-      :crypto.hash(:sha256, session.session_key)
-      |> Base.encode16(case: :lower)
-      |> binary_part(0, 12)
-
-    path = Path.join([host.base_dir, "work", digest])
-
-    url =
-      if host.ssh == nil,
-        do: "http://127.0.0.1:#{config.port}",
-        else: Application.fetch_env!(:tightbeam, :advertised_url)
-
-    content =
-      JSON.encode!(%{url: url, token: session.cli_token, sessionKey: session.session_key})
-
-    ensure_opts = [base_dir: config.base_dir]
-    ensure_opts = if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
-
-    ensure_opts =
-      if config[:sh_out], do: Keyword.put(ensure_opts, :sh_out, config.sh_out), else: ensure_opts
-
-    Placement.ensure_workdir(host, path, content, ensure_opts)
-    path
-  end
-
   defp warn_cli_target_mismatches(db, base_dir) do
     warn_cli_target_mismatches(db, base_dir, local_target_triple())
   end
@@ -1083,7 +1084,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
-    cwd = session_workdir(config, session)
+    cwd = Placement.holder_workdir(config, session)
     mcp_servers = session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
 
     result =
@@ -1830,7 +1831,7 @@ defmodule Tightbeam.Gateway do
                       adapter,
                       pointer.harness_session_id,
                       p.model,
-                      session_workdir(config, session),
+                      Placement.holder_workdir(config, session),
                       session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
                     )
                   end)

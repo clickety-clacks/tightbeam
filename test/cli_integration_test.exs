@@ -72,6 +72,18 @@ defmodule Tightbeam.CliIntegrationTest do
         send(test_pid, {:cli_call, call})
         %{assignments: [%{id: "asg_cli"}]}
       end,
+      "run-tests" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{queued: "pj_tests"}
+      end,
+      "run-smoke" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{queued: "pj_smoke"}
+      end,
+      "cancel-producer-job" => fn call ->
+        send(test_pid, {:cli_call, call})
+        %{cancelled: call.params.job_id}
+      end,
       "work-item-create" => fn call ->
         send(test_pid, {:cli_call, call})
         %{id: "wi_cli", title: call.params.title}
@@ -160,7 +172,11 @@ defmodule Tightbeam.CliIntegrationTest do
           "--idempotency-key",
           "idem",
           "--work-item",
-          "wi_cli"
+          "wi_cli",
+          "--reviews",
+          "asg_reviewed",
+          "--files",
+          ~s(["lib/a.ex","test/a_test.exs"])
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -172,7 +188,13 @@ defmodule Tightbeam.CliIntegrationTest do
                     %{
                       verb: "assign",
                       session_key: "cli-holder",
-                      params: %{subject: "ship", idempotency_key: "idem", work_item_id: "wi_cli"}
+                      params: %{
+                        subject: "ship",
+                        idempotency_key: "idem",
+                        work_item_id: "wi_cli",
+                        reviews: "asg_reviewed",
+                        files: ["lib/a.ex", "test/a_test.exs"]
+                      }
                     }}
 
     {attested, 0} =
@@ -242,6 +264,36 @@ defmodule Tightbeam.CliIntegrationTest do
                       target_role: "cli-holder",
                       params: %{state: "all"}
                     }}
+  end
+
+  test "real CLI round-trips all producer subcommands", ctx do
+    {tests, 0} =
+      System.cmd(ctx.binary, ["run-tests", "asg_cli"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert tests =~ "pj_tests"
+    assert_receive {:cli_call, %{verb: "run-tests", params: %{assignment_id: "asg_cli"}}}
+
+    {smoke, 0} =
+      System.cmd(ctx.binary, ["run-smoke", "asg_cli"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert smoke =~ "pj_smoke"
+    assert_receive {:cli_call, %{verb: "run-smoke", params: %{assignment_id: "asg_cli"}}}
+
+    {cancelled, 0} =
+      System.cmd(ctx.binary, ["cancel-producer-job", "pj_tests"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert cancelled =~ "pj_tests"
+
+    assert_receive {:cli_call, %{verb: "cancel-producer-job", params: %{job_id: "pj_tests"}}}
   end
 
   test "real CLI dispatches every work-item subcommand and enforces usage pairing", ctx do
