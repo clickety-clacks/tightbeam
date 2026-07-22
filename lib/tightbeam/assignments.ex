@@ -99,6 +99,15 @@ defmodule Tightbeam.Assignments do
   CREATE INDEX IF NOT EXISTS assignment_files_path ON assignment_files(path)
   """
 
+  @interruptions_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_interruptions (
+    assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+    sessionKey   TEXT NOT NULL REFERENCES sessions(sessionKey),
+    reason       TEXT NOT NULL CHECK(reason = 'interrupted-by-retire'),
+    ts           INTEGER NOT NULL
+  );
+  """
+
   @doc "Create the assignment/attest schema."
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB) do
@@ -110,6 +119,52 @@ defmodule Tightbeam.Assignments do
     ensure_work_item_column(db)
     ensure_assignment_columns(db)
     :ok = DB.execute(db, @assignment_files_ddl)
+    :ok = DB.execute(db, @interruptions_ddl)
+  end
+
+  @doc "Close every open assignment held by a retiring session and record why."
+  @spec interrupt_for_retire_in_txn(Txn.t(), String.t(), String.t()) :: [map()]
+  def interrupt_for_retire_in_txn(%Txn{} = txn, session_key, owner_user_id) do
+    assignments =
+      Txn.q(
+        txn,
+        """
+        SELECT a.id, EXISTS(SELECT 1 FROM attests f WHERE f.assignmentId=a.id)
+        FROM assignments a
+        WHERE a.holderKey=?1 AND a.state='open'
+        ORDER BY a.openedAt, a.id
+        """,
+        [session_key]
+      )
+      |> Enum.map(fn [id, has_attests] ->
+        %{assignment_id: id, from_state: if(has_attests == 1, do: "active", else: "open")}
+      end)
+
+    Enum.each(assignments, fn %{assignment_id: assignment_id} ->
+      ts = now()
+
+      Txn.q(
+        txn,
+        """
+        UPDATE assignments SET state='closed', outcome='revoked', closedAt=?2,
+          closedByUser=?3
+        WHERE id=?1 AND state='open'
+        """,
+        [assignment_id, ts, owner_user_id]
+      )
+
+      if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
+      Txn.q(
+        txn,
+        "INSERT INTO assignment_interruptions (assignmentId, sessionKey, reason, ts) VALUES (?1, ?2, 'interrupted-by-retire', ?3)",
+        [assignment_id, session_key, ts]
+      )
+
+      append_marker(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
+    end)
+
+    assignments
   end
 
   @doc "Count open assignments pinned to a holder session."

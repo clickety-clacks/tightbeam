@@ -95,6 +95,11 @@ pub enum Command {
         session_key: String,
         idempotency_key: Option<String>,
     },
+    Critical {
+        identity: Identity,
+        for_ms: String,
+        reason: String,
+    },
     Adjudicate {
         identity: Identity,
         episode: String,
@@ -321,7 +326,10 @@ COMMANDS:
         tightbeam list --as orchestrator:news
 
   retire --session <key> [--key <idempotencyKey>]
-      End a session deliberately.
+      End a session and its spawned subtree deliberately.
+
+  critical --for <duration> --reason <text>
+      Declare or renew this session's bounded critical-section lease.
 
   adjudicate --episode <correlationKey> --action park|swap|respawn|stop
              [--model <ref>] [--reason <text>]
@@ -788,6 +796,23 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "critical" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam critical --for <duration> --reason <text>".to_owned());
+            }
+            let for_ms = nonempty(flags, "for")
+                .ok_or_else(|| "--for is required".to_owned())
+                .and_then(|value| {
+                    parse_after(&value).map_err(|error| error.replace("--after", "--for"))
+                })?;
+            let reason =
+                nonempty(flags, "reason").ok_or_else(|| "--reason is required".to_owned())?;
+            Ok(Command::Critical {
+                identity: identity(flags)?,
+                for_ms,
+                reason,
+            })
+        }
         "adjudicate" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam adjudicate --episode <key> --action park|swap|respawn|stop [--model <ref>] [--reason <text>]".to_owned());
@@ -1081,7 +1106,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
         )),
     }
 }
@@ -1204,6 +1229,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_critical_duration_and_reason() {
+        assert_eq!(
+            parse(strings(&[
+                "critical",
+                "--for",
+                "5m",
+                "--reason",
+                "main commit",
+            ])),
+            Ok(Command::Critical {
+                identity: Identity::Omitted,
+                for_ms: "300000".to_owned(),
+                reason: "main commit".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["critical", "--for", "soon", "--reason", "x"])),
+            Err("bad --for value: soon (use e.g. 30s, 5m, 2h)".to_owned())
+        );
+    }
+
+    #[test]
     fn coerces_and_serializes_numbers_like_javascript() {
         for (input, expected) in [
             ("+1", "1"),
@@ -1272,7 +1319,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
         );
     }
 

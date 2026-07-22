@@ -64,6 +64,7 @@ defmodule Tightbeam.Gateway do
     Archetypes,
     Assignments,
     ConditionFacts,
+    CriticalLeases,
     Placement,
     DB,
     Devices,
@@ -105,7 +106,8 @@ defmodule Tightbeam.Gateway do
           escalation_decision_deadline_ms: pos_integer(),
           adjudication_claim_window_ms: pos_integer(),
           adjudication_response_window_ms: pos_integer(),
-          adjudication_park_fallback_ms: pos_integer()
+          adjudication_park_fallback_ms: pos_integer(),
+          critical_lease_hard_cap_ms: pos_integer()
         }
 
   @doc """
@@ -135,6 +137,7 @@ defmodule Tightbeam.Gateway do
           Wakes,
           Projection,
           Org,
+          CriticalLeases,
           Roles,
           WorkItems,
           Assignments,
@@ -583,6 +586,7 @@ defmodule Tightbeam.Gateway do
       end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
+      "critical" => fn call -> critical_result(config, db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
       "tune" => fn call -> tune_result(config, db, call) end,
       "adjudicate" => fn call -> adjudicate_result(config, db, call) end,
@@ -2327,7 +2331,11 @@ defmodule Tightbeam.Gateway do
 
     cond do
       prior && prior.session_key == call.session_key ->
-        %{deleted_session_key: call.session_key}
+        %{
+          deleted_session_key: call.session_key,
+          retired_session_keys: retired_subtree_keys(db, call.session_key),
+          deferred: []
+        }
 
       true ->
         case Org.get(db, call.session_key) do
@@ -2343,25 +2351,17 @@ defmodule Tightbeam.Gateway do
 
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
-              assignments =
-                best_effort_value([], fn ->
-                  Assignments.list(db, %{holder_key: session.session_key, state: "open"})
-                  |> Enum.map(fn assignment ->
-                    {assignment.id, WorkState.status(db, assignment.id)}
-                  end)
-                end)
-
-              {:ok, _} =
+              {:ok, result} =
                 DB.transaction(db, fn txn ->
-                  Org.retire_in_txn(txn, session.session_key)
+                  result =
+                    retire_cascade_in_txn(
+                      txn,
+                      session.session_key,
+                      owner,
+                      "retired: session retired before execution"
+                    )
 
-                  Ledger.drain_queued_for_retire_in_txn(
-                    txn,
-                    session.session_key,
-                    "retired: session retired before execution"
-                  )
-
-                  if p[:idempotency_key] do
+                  if result.retired != [] and p[:idempotency_key] do
                     Idempotency.put_in_txn(txn, %{
                       owner_user_id: owner,
                       operation: "retire",
@@ -2370,23 +2370,177 @@ defmodule Tightbeam.Gateway do
                     })
                   end
 
-                  :ok
+                  result
                 end)
 
-              broadcast(db, owner, Payloads.stream_deleted(session.session_key))
-              Map.get(config, :on_retired, fn _ -> :ok end).(session.session_key)
+              Enum.each(result.retired, fn retired ->
+                broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+                Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
 
-              Enum.each(assignments, fn {assignment_id, from} ->
-                emit_assignment_change(db, assignment_id, from)
+                Enum.each(retired.assignments, fn assignment ->
+                  emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+                end)
               end)
-            end
 
-            %{deleted_session_key: session.session_key}
+              %{
+                deleted_session_key: session.session_key,
+                retired_session_keys: Enum.map(result.retired, & &1.session_key),
+                deferred: result.deferred
+              }
+            else
+              %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []}
+            end
 
           _ ->
             %{code: "not_found"}
         end
     end
+  end
+
+  defp critical_result(config, db, call) do
+    with {:session, session_key} <- call[:principal],
+         %{state: "active"} <- Org.get(db, session_key),
+         duration when is_integer(duration) and duration > 0 <- call.params[:for_ms],
+         reason when is_binary(reason) and reason != "" <- call.params[:reason] do
+      hard_cap = Map.get(config, :critical_lease_hard_cap_ms, 14_400_000)
+      lease = CriticalLeases.declare(db, session_key, duration, reason, hard_cap)
+
+      %{
+        session_key: session_key,
+        reason: lease.reason,
+        expires_at: lease.expires_at,
+        hard_deadline: lease.hard_deadline
+      }
+    else
+      nil -> %{code: "not_found"}
+      _ -> %{code: "invalid", message: "critical requires a session caller, --for, and --reason"}
+    end
+  end
+
+  defp retire_subtree_in_txn(txn, root_key) do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT sessionKey, spawnedBy FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
+      )
+
+    children = Enum.group_by(rows, &Enum.at(&1, 1))
+
+    walk = fn walk, key ->
+      descendants =
+        children
+        |> Map.get(key, [])
+        |> Enum.flat_map(fn [child_key, _parent] -> walk.(walk, child_key) end)
+
+      descendants ++ [%{session_key: key}]
+    end
+
+    walk.(walk, root_key)
+  end
+
+  defp retired_subtree_keys(db, root_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT sessionKey, spawnedBy, state FROM sessions ORDER BY createdAt, sessionKey"
+      )
+
+    children = Enum.group_by(rows, &Enum.at(&1, 1))
+
+    walk = fn walk, key ->
+      descendants =
+        children
+        |> Map.get(key, [])
+        |> Enum.flat_map(fn [child_key, _parent, _state] -> walk.(walk, child_key) end)
+
+      state =
+        Enum.find_value(rows, fn
+          [^key, _parent, row_state] -> row_state
+          _ -> nil
+        end)
+
+      if state == "retired", do: descendants ++ [key], else: descendants
+    end
+
+    walk.(walk, root_key)
+  end
+
+  defp retire_cascade_in_txn(txn, root_key, owner, drain_reason) do
+    # Invariant: this spawnedBy walk visits each active member of the target's
+    # transitive subtree exactly once, parent-last. This is the lifecycle
+    # seam's canonical subtree ordering; do not duplicate it.
+    subtree = retire_subtree_in_txn(txn, root_key)
+    now = System.system_time(:millisecond)
+
+    leased =
+      Enum.flat_map(subtree, fn member ->
+        case CriticalLeases.active_in_txn(txn, member.session_key, now) do
+          nil -> []
+          lease -> [lease]
+        end
+      end)
+
+    if leased == [] do
+      retired =
+        Enum.map(subtree, fn member ->
+          assignments =
+            retire_session_in_txn(txn, member.session_key, owner, drain_reason)
+
+          %{session_key: member.session_key, assignments: assignments}
+        end)
+
+      %{retired: retired, deferred: []}
+    else
+      deadline = Enum.max_by(leased, & &1.hard_deadline).hard_deadline
+
+      deferred =
+        Enum.map(subtree, fn member ->
+          direct = Enum.find(leased, &(&1.session_key == member.session_key))
+
+          if direct do
+            schedule_retire_intent_in_txn(txn, root_key, member.session_key, owner, direct)
+          end
+
+          %{
+            session_key: member.session_key,
+            until: (direct && direct.hard_deadline) || deadline,
+            reason: (direct && direct.reason) || "deferred by leased subtree"
+          }
+        end)
+
+      %{retired: [], deferred: deferred}
+    end
+  end
+
+  defp schedule_retire_intent_in_txn(txn, root_key, session_key, owner, lease) do
+    wake_id = retire_intent_wake_id(root_key, session_key)
+
+    case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) do
+      [] ->
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: wake_id,
+          session_key: session_key,
+          origin: "user:#{owner}",
+          prompt:
+            "FINAL RETIRE INSTRUCTION: clean up critical section '#{lease.reason}'; retirement is deferred only until hard deadline #{lease.hard_deadline}.",
+          due_at: lease.hard_deadline
+        })
+
+      [[1]] ->
+        :ok
+    end
+  end
+
+  defp retire_intent_wake_id(root_key, session_key) do
+    digest = :crypto.hash(:sha256, root_key <> "\0" <> session_key) |> Base.encode16(case: :lower)
+    "w_retire_" <> digest
+  end
+
+  defp retire_session_in_txn(txn, session_key, owner, drain_reason) do
+    assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner)
+    Org.retire_in_txn(txn, session_key)
+    Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
+    assignments
   end
 
   defp adjudicate_result(config, db, call) do
@@ -2426,19 +2580,21 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp adjudicate_stop(_config, db, call, episode) do
-    {:ok, :ok} =
+  defp adjudicate_stop(config, db, call, episode) do
+    session = Org.get(db, episode.session_key)
+
+    {:ok, result} =
       DB.transaction(db, fn txn ->
         current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
         if current && Adjudication.resolve_in_txn(txn, current) do
-          Org.retire_in_txn(txn, current.session_key)
-
-          Ledger.drain_queued_for_retire_in_txn(
-            txn,
-            current.session_key,
-            "retired: adjudication stopped session before execution"
-          )
+          result =
+            retire_cascade_in_txn(
+              txn,
+              current.session_key,
+              session.owner_user_id,
+              "retired: adjudication stopped session before execution"
+            )
 
           EventLog.lifecycle_in_txn(
             txn,
@@ -2451,13 +2607,28 @@ defmodule Tightbeam.Gateway do
             })
           )
 
-          :ok
+          result
         else
           raise "stale adjudication episode"
         end
       end)
 
-    %{ok: true, action: "stop", session_key: episode.session_key}
+    Enum.each(result.retired, fn retired ->
+      broadcast(db, session.owner_user_id, Payloads.stream_deleted(retired.session_key))
+      Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+
+      Enum.each(retired.assignments, fn assignment ->
+        emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+      end)
+    end)
+
+    %{
+      ok: true,
+      action: "stop",
+      session_key: episode.session_key,
+      retired_session_keys: Enum.map(result.retired, & &1.session_key),
+      deferred: result.deferred
+    }
   end
 
   defp adjudicate_park(config, db, call, episode) do
@@ -2660,14 +2831,6 @@ defmodule Tightbeam.Gateway do
               recovery_prompt
             )
 
-          Org.retire_in_txn(txn, old.session_key)
-
-          Ledger.drain_queued_for_retire_in_txn(
-            txn,
-            old.session_key,
-            "retired: adjudication respawned session before execution"
-          )
-
           [[failed_prompt_seq]] =
             Txn.q(
               txn,
@@ -2705,6 +2868,13 @@ defmodule Tightbeam.Gateway do
             old.session_key,
             new_session.session_key
           ])
+
+          retire_session_in_txn(
+            txn,
+            old.session_key,
+            old.owner_user_id,
+            "retired: adjudication respawned session before execution"
+          )
 
           unless Adjudication.resolve_in_txn(txn, current, wake_id),
             do: raise("stale adjudication episode")
@@ -2964,16 +3134,6 @@ defmodule Tightbeam.Gateway do
       _ -> :ok
     catch
       _, _ -> :ok
-    end
-  end
-
-  defp best_effort_value(fallback, fun) do
-    try do
-      fun.()
-    rescue
-      _ -> fallback
-    catch
-      _, _ -> fallback
     end
   end
 

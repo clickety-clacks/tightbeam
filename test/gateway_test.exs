@@ -3,7 +3,9 @@ defmodule Tightbeam.GatewayTest do
 
   alias Tightbeam.{
     Archetypes,
+    Assignments,
     ConnRegistry,
+    CriticalLeases,
     DB,
     Devices,
     EventLog,
@@ -15,7 +17,9 @@ defmodule Tightbeam.GatewayTest do
     Placement,
     Projection,
     Roles,
-    Wakes
+    Wakes,
+    WorkItems,
+    WorkState
   }
 
   alias Tightbeam.Wire.Payloads
@@ -200,7 +204,20 @@ defmodule Tightbeam.GatewayTest do
       File.rm_rf!(catalog_base)
     end)
 
-    for module <- [Devices, EventLog, Idempotency, Ledger, Org, Projection, Roles, Wakes],
+    for module <- [
+          Devices,
+          EventLog,
+          Idempotency,
+          Ledger,
+          Org,
+          CriticalLeases,
+          Projection,
+          Roles,
+          Wakes,
+          WorkItems,
+          Assignments,
+          WorkState
+        ],
         do: :ok = module.ensure_schema(db)
 
     {:paired, _device} =
@@ -268,6 +285,113 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "permanent"
     assert Org.get(ctx.db, Org.personal_session_key("flynn")).state == "active"
+  end
+
+  test "retire atomically cascades parent-last, interrupts assignments, and removes every wire",
+       ctx do
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "cascade-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    root = create_session(ctx.db, "cascade-root", "flynn")
+    child = create_session(ctx.db, "cascade-child", "flynn", root.session_key)
+    grandchild = create_session(ctx.db, "cascade-grandchild", "flynn", child.session_key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_retire', 'work', ?1, 'flynn', 1)",
+        [child.session_key]
+      )
+
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        on_retired: fn key -> send(parent, {:retired, key}) end
+      })
+
+    result =
+      handlers["retire"].(%{
+        origin: "user:flynn",
+        session_key: root.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [
+             grandchild.session_key,
+             child.session_key,
+             root.session_key
+           ]
+
+    assert result.deferred == []
+    assert_receive {:retired, "cascade-grandchild"}
+    assert_receive {:retired, "cascade-child"}
+    assert_receive {:retired, "cascade-root"}
+
+    for key <- result.retired_session_keys do
+      assert Org.get(ctx.db, key).state == "retired"
+      expected = Payloads.stream_deleted(key)
+      assert_receive {:push, ^expected}
+    end
+
+    assert {:ok, [["closed", "revoked"]]} =
+             DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id='asg_retire'")
+
+    assert {:ok, [["cascade-child", "interrupted-by-retire"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey, reason FROM assignment_interruptions WHERE assignmentId='asg_retire'"
+             )
+  end
+
+  test "critical lease renewal is hard-capped and defers the entire cascade idempotently", ctx do
+    root = create_session(ctx.db, "leased-root", "flynn")
+    child = create_session(ctx.db, "leased-child", "flynn", root.session_key)
+    handlers = Gateway.handlers(%{db: ctx.db, critical_lease_hard_cap_ms: 2_000})
+
+    first =
+      handlers["critical"].(%{
+        principal: {:session, child.session_key},
+        params: %{for_ms: 1_500, reason: "main commit"}
+      })
+
+    renewed =
+      handlers["critical"].(%{
+        principal: {:session, child.session_key},
+        params: %{for_ms: 1_500, reason: "finish commit"}
+      })
+
+    assert renewed.hard_deadline == first.hard_deadline
+    assert renewed.expires_at == first.hard_deadline
+
+    call = %{origin: "user:flynn", session_key: root.session_key, params: %{}}
+    deferred = handlers["retire"].(call)
+
+    assert deferred.retired_session_keys == []
+    assert Enum.map(deferred.deferred, & &1.session_key) == [child.session_key, root.session_key]
+    assert Org.get(ctx.db, root.session_key).state == "active"
+    assert Org.get(ctx.db, child.session_key).state == "active"
+    assert [wake] = Wakes.list_pending(ctx.db)
+    assert wake.session_key == child.session_key
+    assert wake.due_at == first.hard_deadline
+    assert wake.prompt =~ "FINAL RETIRE INSTRUCTION"
+
+    again = handlers["retire"].(call)
+    assert again.deferred == deferred.deferred
+    assert [same_wake] = Wakes.list_pending(ctx.db)
+    assert same_wake.wake_id == wake.wake_id
   end
 
   test "children preserves the cli token while refreshing the gateway port", ctx do
@@ -2339,12 +2463,13 @@ defmodule Tightbeam.GatewayTest do
     base_dir
   end
 
-  defp create_session(db, session_key, owner_user_id) do
+  defp create_session(db, session_key, owner_user_id, spawned_by \\ nil) do
     Org.create(db, %{
       session_key: session_key,
       display_name: session_key,
       owner_user_id: owner_user_id,
       origin: "user:#{owner_user_id}",
+      spawned_by: spawned_by,
       archetype: "default",
       host: "testhost",
       harness: "claude",

@@ -134,7 +134,7 @@ defmodule Tightbeam.Wakes do
       end
 
     wake = %{
-      wake_id: "w_" <> Tightbeam.Id.uuid4(),
+      wake_id: Map.get(input, :wake_id, "w_" <> Tightbeam.Id.uuid4()),
       session_key: Map.fetch!(input, :session_key),
       target_role: Map.get(input, :target_role),
       origin: Map.fetch!(input, :origin),

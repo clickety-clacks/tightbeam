@@ -42,7 +42,9 @@ defmodule Tightbeam.Application do
           adjudication_response_window_ms:
             Application.get_env(:tightbeam, :adjudication_response_window_ms, 86_400_000),
           adjudication_park_fallback_ms:
-            Application.get_env(:tightbeam, :adjudication_park_fallback_ms, 14_400_000)
+            Application.get_env(:tightbeam, :adjudication_park_fallback_ms, 14_400_000),
+          critical_lease_hard_cap_ms:
+            Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000)
         }
 
         Enum.each(Tightbeam.Gateway.children(config), fn child ->

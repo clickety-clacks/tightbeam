@@ -4,6 +4,7 @@ defmodule Tightbeam.WorkStateTest do
   alias Tightbeam.{
     Assignments,
     ConnRegistry,
+    CriticalLeases,
     DB,
     Devices,
     Gateway,
@@ -19,7 +20,16 @@ defmodule Tightbeam.WorkStateTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: ConnRegistry})
 
-    for module <- [Devices, Idempotency, Org, WorkItems, Assignments, Supervision, WorkState] do
+    for module <- [
+          Devices,
+          Idempotency,
+          Org,
+          CriticalLeases,
+          WorkItems,
+          Assignments,
+          Supervision,
+          WorkState
+        ] do
       :ok = module.ensure_schema(db)
     end
 
@@ -345,7 +355,7 @@ defmodule Tightbeam.WorkStateTest do
     assert healed_item.view == item_truth(ctx.db, dropped_item.id)
   end
 
-  test "retire captures every open assignment pre-state before the holder becomes stranded",
+  test "retire captures every open assignment pre-state before terminal interruption",
        ctx do
     {:ok, _, _} =
       ConnRegistry.register(ConnRegistry, %{
@@ -375,7 +385,12 @@ defmodule Tightbeam.WorkStateTest do
         params: %{}
       })
 
-    assert result == %{deleted_session_key: "retiring"}
+    assert result == %{
+             deleted_session_key: "retiring",
+             retired_session_keys: ["retiring"],
+             deferred: []
+           }
+
     assert_receive {:retired, "retiring"}
     assert_receive {:push, first}
     assert_receive {:push, second}
@@ -384,12 +399,12 @@ defmodule Tightbeam.WorkStateTest do
 
     assert observed ==
              MapSet.new([
-               {open.id, "open", "stranded"},
-               {active.id, "active", "stranded"}
+               {open.id, "open", "abandoned"},
+               {active.id, "active", "abandoned"}
              ])
 
     assert {:ok, rows} = DB.query(ctx.db, "SELECT fromState, toState FROM work_state_events")
-    assert MapSet.new(rows) == MapSet.new([["open", "stranded"], ["active", "stranded"]])
+    assert MapSet.new(rows) == MapSet.new([["open", "abandoned"], ["active", "abandoned"]])
   end
 
   defp create_item(ctx, title) do
@@ -516,7 +531,12 @@ defmodule Tightbeam.WorkStateTest do
 
   defp refetch_assignment(client, assignment_id, db) do
     detail = WorkState.detail(db, assignment_id)
-    %{client | view: Map.put(client.view, assignment_id, detail.assignment.status), cursor: detail.cursor}
+
+    %{
+      client
+      | view: Map.put(client.view, assignment_id, detail.assignment.status),
+        cursor: detail.cursor
+    }
   end
 
   defp assignment_truth(db) do

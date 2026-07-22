@@ -255,6 +255,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::Critical {
+            identity,
+            for_ms,
+            reason,
+        } => Ok(request(
+            identity,
+            "critical",
+            vec![],
+            vec![
+                format!("\"forMs\":{for_ms}"),
+                string_field("reason", reason),
+            ],
+        )),
         Command::Adjudicate {
             identity,
             episode,
@@ -728,6 +741,7 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
+        | Command::Critical { identity, .. }
         | Command::Adjudicate { identity, .. }
         | Command::Assign { identity, .. }
         | Command::RunTests { identity, .. }
@@ -768,6 +782,20 @@ fn identity_omitted(command: &Command) -> bool {
 mod tests {
     use super::*;
     use crate::args;
+
+    #[test]
+    fn builds_critical_request() {
+        assert_eq!(
+            build_request(&Command::Critical {
+                identity: Identity::Role("coder".to_owned()),
+                for_ms: "300000".to_owned(),
+                reason: "main commit".to_owned(),
+            })
+            .unwrap()
+            .body_json,
+            r#"{"as":"coder","verb":"critical","params":{"forMs":300000,"reason":"main commit"}}"#
+        );
+    }
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
