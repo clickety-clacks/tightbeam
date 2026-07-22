@@ -44,6 +44,13 @@ fn bool_field(name: &str, value: bool) -> String {
     format!("\"{name}\":{value}")
 }
 
+fn string_array_field(name: &str, value: &[String]) -> String {
+    format!(
+        "\"{name}\":{}",
+        serde_json::to_string(value).expect("string arrays are JSON serializable")
+    )
+}
+
 fn params_field(fields: Vec<String>) -> String {
     format!("\"params\":{}", object(fields))
 }
@@ -152,6 +159,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             target,
             idempotency_key,
             work_item_id,
+            reviews,
+            files,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -165,8 +174,38 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
             }
+            if let Some(value) = reviews {
+                params.push(string_field("reviews", value));
+            }
+            if let Some(value) = files {
+                params.push(string_array_field("files", value));
+            }
             Ok(request(identity, "assign", vec![target], params))
         }
+        Command::RunTests {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "run-tests",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::RunSmoke {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "run-smoke",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::CancelProducerJob { identity, job_id } => Ok(request(
+            identity,
+            "cancel-producer-job",
+            vec![],
+            vec![string_field("jobId", job_id)],
+        )),
         Command::WorkItemCreate {
             identity,
             title,
@@ -562,6 +601,9 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::List { identity }
         | Command::Retire { identity, .. }
         | Command::Assign { identity, .. }
+        | Command::RunTests { identity, .. }
+        | Command::RunSmoke { identity, .. }
+        | Command::CancelProducerJob { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
@@ -744,10 +786,14 @@ mod tests {
                 "idem",
                 "--work-item",
                 "wi_1",
+                "--reviews",
+                "asg_parent",
+                "--files",
+                "[\"lib/a.ex\",\"test/a_test.exs\"]",
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1"}}"#
+            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","files":["lib/a.ex","test/a_test.exs"]}}"#
         );
         assert_eq!(
             body(&[
@@ -794,6 +840,22 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_producer_bodies() {
+        assert_eq!(
+            body(&["run-tests", "asg_1", "--as", "builder"]),
+            r#"{"as":"builder","verb":"run-tests","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&["run-smoke", "asg_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"run-smoke","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&["cancel-producer-job", "pj_1", "--as", "builder"]),
+            r#"{"as":"builder","verb":"cancel-producer-job","params":{"jobId":"pj_1"}}"#
         );
     }
 

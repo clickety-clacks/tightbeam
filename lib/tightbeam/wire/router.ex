@@ -43,7 +43,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles, WorkState}
   alias Tightbeam.Wire.{Payloads, Socket}
 
-  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update)
+  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update run-tests run-smoke cancel-producer-job)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -701,6 +701,8 @@ defmodule Tightbeam.Wire.Router do
 
   defp error_status("not_found"), do: 404
   defp error_status("unknown_assignment"), do: 404
+  defp error_status("unknown_producer_job"), do: 404
+  defp error_status("producer_unconfigured"), do: 403
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
   defp error_status(_), do: 400

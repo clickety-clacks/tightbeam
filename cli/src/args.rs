@@ -61,6 +61,20 @@ pub enum Command {
         target: Target,
         idempotency_key: Option<String>,
         work_item_id: Option<String>,
+        reviews: Option<String>,
+        files: Option<Vec<String>>,
+    },
+    RunTests {
+        identity: Identity,
+        assignment_id: String,
+    },
+    RunSmoke {
+        identity: Identity,
+        assignment_id: String,
+    },
+    CancelProducerJob {
+        identity: Identity,
+        job_id: String,
     },
     WorkItemCreate {
         identity: Identity,
@@ -250,8 +264,14 @@ COMMANDS:
   work-item-list
   assign --subject "<work>" (--session <key> | --role <name>)
          [--idempotency-key <key>] [--work-item <workItemId>]
+         [--reviews <assignmentId>] [--files '["lib/a.ex","test/a_test.exs"]']
       Open an obligation held by a session; a work item is the durable thread
       across assignments.
+  run-tests <assignmentId>
+  run-smoke <assignmentId>
+      Queue the committed mechanical producer for an assignment.
+  cancel-producer-job <jobId>
+      Cancel a queued or running producer job.
   attest <assignmentId> --kind progress|completion|surrender|verdict
          [--verdict <kind>] [--note "..."]
       File against an assignment. Verdicts require --verdict and may be filed
@@ -611,12 +631,47 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }
             let subject =
                 nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
+            let files = nonempty(flags, "files")
+                .map(|encoded| {
+                    serde_json::from_str::<Vec<String>>(&encoded)
+                        .map_err(|_| "--files must be a JSON array of strings".to_owned())
+                })
+                .transpose()?;
             Ok(Command::Assign {
                 identity: identity(flags)?,
                 subject,
                 target: targets.into_iter().next().expect("exactly one target"),
                 idempotency_key: nonempty(flags, "idempotency-key"),
                 work_item_id: nonempty(flags, "work-item"),
+                reviews: nonempty(flags, "reviews"),
+                files,
+            })
+        }
+        "run-tests" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam run-tests <assignmentId>".to_owned());
+            }
+            Ok(Command::RunTests {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+            })
+        }
+        "run-smoke" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam run-smoke <assignmentId>".to_owned());
+            }
+            Ok(Command::RunSmoke {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+            })
+        }
+        "cancel-producer-job" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam cancel-producer-job <jobId>".to_owned());
+            }
+            Ok(Command::CancelProducerJob {
+                identity: identity(flags)?,
+                job_id: parsed.positional[1].clone(),
             })
         }
         "work-item-create" => {
@@ -837,7 +892,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
         )),
     }
 }
@@ -1028,7 +1083,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -1105,6 +1160,9 @@ mod tests {
             strings(&["list", "--as-process", "cron"]),
             strings(&["retire", "--session", "agent:x", "--as", "owner"]),
             strings(&["cancel-wake", "w1", "--as-process", "cron"]),
+            strings(&["run-tests", "asg_1", "--as", "builder"]),
+            strings(&["run-smoke", "asg_1", "--as-user", "flynn"]),
+            strings(&["cancel-producer-job", "pj_1", "--as", "builder"]),
             strings(&["role", "create", "reviewer", "--as-user", "flynn"]),
             strings(&["role", "bind", "reviewer", "agent:x", "--as-user", "flynn"]),
             strings(&["role", "rm", "reviewer", "--as-user", "flynn"]),

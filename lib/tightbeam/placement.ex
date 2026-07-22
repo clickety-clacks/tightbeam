@@ -126,6 +126,46 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
+  Resolve and ensure a holder session's workdir on its configured host.
+
+  Every session works in its own directory on its host, never the operator's
+  home and never a shared directory. The workdir also carries the session's
+  durable scratch across engine swaps.
+  """
+  @spec holder_workdir(map(), map()) :: String.t()
+  def holder_workdir(config, holder_session) do
+    host = hosts(config.base_dir)[holder_session.host] || %{ssh: nil, base_dir: config.base_dir}
+
+    digest =
+      :crypto.hash(:sha256, holder_session.session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    path = Path.join([host.base_dir, "work", digest])
+
+    url =
+      if host.ssh == nil,
+        do: "http://127.0.0.1:#{config.port}",
+        else: Application.fetch_env!(:tightbeam, :advertised_url)
+
+    content =
+      JSON.encode!(%{
+        url: url,
+        token: holder_session.cli_token,
+        sessionKey: holder_session.session_key
+      })
+
+    ensure_opts = [base_dir: config.base_dir]
+    ensure_opts = if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
+
+    ensure_opts =
+      if config[:sh_out], do: Keyword.put(ensure_opts, :sh_out, config.sh_out), else: ensure_opts
+
+    ensure_workdir(host, path, content, ensure_opts)
+    path
+  end
+
+  @doc """
   Record (or update) a host in the instance registry — the DUMB half of
   assimilation: the CLI ceremony prepares the machine; this writes the fact.
   Admin gating happens in the verb handler, not here. Returns the stored
