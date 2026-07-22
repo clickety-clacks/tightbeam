@@ -277,14 +277,18 @@ defmodule Tightbeam.ModelCatalog do
   end
 
   defp entries_for(model, id, efforts, capabilities) do
-    refs = if efforts == [], do: [id], else: Enum.map(efforts, &"#{id}[#{&1}]")
     display_name = model["display_name"] || id
 
-    Enum.map(refs, fn ref ->
+    targets =
+      if efforts == [],
+        do: [{id, display_name}],
+        else: Enum.map(efforts, &{"#{id}[#{&1}]", "#{display_name} [#{&1}]"})
+
+    Enum.map(targets, fn {ref, title} ->
       %{
         ref: ref,
-        display_name: display_name,
-        name: display_name,
+        display_name: title,
+        name: title,
         efforts: efforts,
         max_input_tokens: model["max_input_tokens"] || model["context_window"],
         capabilities: capabilities
