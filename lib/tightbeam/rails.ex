@@ -22,23 +22,37 @@ defmodule Tightbeam.Rails do
   adversarial containment belongs to sandboxes and credentials. Gates stop
   mistakes deterministically.
 
-  Codex hooks exist since 0.124.0; 0.144.x is the tested floor, applied to the
-  executable selected by codex-acp. Codex receives the identical hook map as
-  `hooks.json`, while claude embeds it in `settings.json`: the stdin wire and
-  `tool_name: "Bash"` coincide, Bash-statute parity is exact, exit 2 refuses on
-  both, and hooks fire under `agent-full-access` / `bypassPermissions`.
-  Distinct from permission bypass, codex has a hook-trust layer with no claude
-  analog: untrusted hooks are silently skipped headless, so placement seeds
-  `CODEX_CONFIG={"bypass_hook_trust":true}` whenever statutes exist. Because
-  the home is substrate-projected and `hooks.json` is substrate-written, this
-  is the already-vetted automation the bypass exists for. Both the seed and
-  hook file can silently fail to bind, so codex enforcement is wiring-checked
-  at adapter boot through the reserved probe gate; the adapter does not come
-  up unless it observes the refusal. This is rails-tier denial for a
-  cooperative agent, wired and proven at boot — not a sandbox or tamper proof;
-  malicious and config-hostile actors are out of scope exactly as for claude
-  rails. Reserved for later stages, refused by name at load: `mode = "block"`
-  and `check` predicates.
+  Codex hooks (`hooks.json`, since 0.124.0) enforce ONLY under `codex exec`. They
+  are INERT under `codex app-server` — the surface codex-acp drives — established
+  empirically 2026-07-22 against a real codex-acp adapter boot: ZERO hooks fire
+  (not PreToolUse, not SessionStart), independent of hook-trust bypass
+  (`--dangerously-bypass-hook-trust` is honored by `exec` only) and independent of
+  matcher; the app-server shell command runs through a `terminal`/`unified_exec`
+  tool the hook layer never sees. So the codex gate does not run under the adapter
+  and never has — there is no known-good version. Claude rails are unaffected
+  (claude enforces `settings.json` hooks natively).
+
+  What this module's codex path therefore does, and does not do:
+  - It PINS the codex binary. codex-acp's app-server runs a BUNDLED codex unless
+    `CODEX_PATH` names an executable, so placement projects a `codex` shim into the
+    home's bin dir and sets `CODEX_PATH` to it — codex-acp then runs the operator's
+    system codex, not a bundled copy of a drifting version. Binary-pinning is
+    doctrine independent of hooks: never inherit a bundler's default harness binary.
+  - The shim also passes `--dangerously-bypass-hook-trust` for the exec path; it is
+    a harmless no-op under app-server.
+  - The dead `CODEX_CONFIG={"bypass_hook_trust":true}` 0.144.x seed is REMOVED.
+  - The boot wiring-check still runs and codex still fails it (hooks inert): codex
+    enforcement is being moved to the SUBSTRATE — assignment-as-capability + verb
+    rails (accountability constitution §6), harness-independent — and a pending
+    hooks-inert harness declaration will let the adapter skip the unpassable
+    wiring-check for so-declared harnesses and instead stamp each session with a
+    visible "harness hooks: inert" fact (total emission). Those two pieces are a
+    separate lane; THIS module only pins the binary and removes the dead seed.
+
+  Rails-tier denial (where it runs, i.e. claude and codex exec) is for a
+  cooperative agent — not a sandbox or tamper-proof; malicious/config-hostile
+  actors are out of scope. Reserved for later stages, refused by name at load:
+  `mode = "block"` and `check` predicates.
 
   Loading is boot-time and fail-closed: `<base_dir>/identity/rails/*.toml`
   in filename order, every statute validated before the set is stored in
