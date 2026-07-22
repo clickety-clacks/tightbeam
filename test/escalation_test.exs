@@ -1,0 +1,399 @@
+defmodule Tightbeam.EscalationTest do
+  use ExUnit.Case, async: false
+
+  alias Tightbeam.{
+    ConditionFacts,
+    ConnRegistry,
+    DB,
+    Devices,
+    Escalation,
+    EventLog,
+    Gateway,
+    Ledger,
+    Org,
+    Projection,
+    Roles,
+    Wakes
+  }
+
+  defmodule LaneDoorbell do
+    use GenServer
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:ensure_lane, session_key}, _from, parent) do
+      send(parent, {:lane_nudged, session_key})
+      {:reply, :ok, parent}
+    end
+  end
+
+  setup do
+    db = :"escalation_db_#{System.unique_integer([:positive])}"
+    scheduler = :"escalation_scheduler_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+
+    for module <- [
+          EventLog,
+          Ledger,
+          Projection,
+          Org,
+          Roles,
+          Devices,
+          ConditionFacts,
+          Wakes,
+          Escalation
+        ],
+        do: :ok = module.ensure_schema(db)
+
+    raiser = session(db, "raiser", "flynn")
+
+    _admin_device =
+      Devices.pair(db, %{
+        device_id: "admin-device",
+        claimed_name: "flynn",
+        platform: nil,
+        model: nil
+      })
+
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneDoorbell, self()})
+
+    start_supervised!(
+      {Wakes, db: db, name: scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
+    )
+
+    %{db: db, scheduler: scheduler, raiser: raiser}
+  end
+
+  test "resolve exposes all four shapes without mutating, and consume wins once", ctx do
+    call = call(ctx.raiser, %{assignment_id: "a1", kind: "completion"})
+    statute = statute()
+
+    assert {:needs_request, nil} = Escalation.resolve(ctx.db, call, statute)
+    {:decision_pending, id} = open(ctx, call, statute)
+    assert {:needs_request, ^id} = Escalation.resolve(ctx.db, call, statute)
+
+    assert %{status: "ruled"} =
+             Escalation.rule(ctx.db, rule_call(id, "allow"),
+               authorized: true,
+               scheduler: ctx.scheduler
+             )
+
+    assert {:allow, ^id} = Escalation.resolve(ctx.db, call, statute)
+    assert request(ctx, id).status == "ruled"
+    assert Escalation.consume(ctx.db, id)
+    refute Escalation.consume(ctx.db, id)
+    assert {:needs_request, nil} = Escalation.resolve(ctx.db, call, statute)
+
+    {:decision_pending, denied_id} = open(ctx, call, statute)
+    Escalation.rule(ctx.db, rule_call(denied_id, "deny"), authorized: true)
+    assert {:deny, %{code: "escalation_denied"}} = Escalation.resolve(ctx.db, call, statute)
+  end
+
+  test "concurrent nil-branch racers return the one partial-index winner", ctx do
+    call = call(ctx.raiser, %{assignment_id: "a-race", kind: "completion"})
+    parent = self()
+
+    tasks =
+      for _ <- 1..8 do
+        Task.async(fn ->
+          send(parent, :started)
+          Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
+        end)
+      end
+
+    for _ <- 1..8, do: assert_receive(:started)
+    ids = tasks |> Task.await_many() |> Enum.map(fn {:decision_pending, id} -> id end)
+    assert [_] = Enum.uniq(ids)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status = 'open'")
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "decision_request_opened")) ==
+             1
+
+    id = hd(ids)
+
+    assert {:decision_pending, ^id} =
+             Escalation.escalate(ctx.db, call, statute(), Map.put(escalation_ctx(), :dr_id, id))
+  end
+
+  test "owner delivery runs once and only after the open transaction commits", ctx do
+    parent = self()
+    call = call(ctx.raiser, %{assignment_id: "a-delivery", kind: "completion"})
+
+    delivery = fn owner, row ->
+      send(parent, {:delivered, owner, row.id, request(ctx, row.id).status})
+    end
+
+    {:decision_pending, id} =
+      Escalation.escalate(
+        ctx.db,
+        call,
+        statute(),
+        Map.put(escalation_ctx(), :deliver_owner, delivery)
+      )
+
+    assert_receive {:delivered, "flynn", ^id, "open"}
+
+    assert {:decision_pending, ^id} =
+             Escalation.escalate(
+               ctx.db,
+               call,
+               statute(),
+               escalation_ctx() |> Map.put(:dr_id, id) |> Map.put(:deliver_owner, delivery)
+             )
+
+    refute_receive {:delivered, _, _, _}
+  end
+
+  test "digest drops note and idempotency key but changes for effect-bearing params", ctx do
+    base = call(ctx.raiser, %{assignment_id: "a2", kind: "completion"})
+
+    reissue =
+      call(ctx.raiser, %{
+        assignment_id: "a2",
+        kind: "completion",
+        note: "annotation",
+        idempotency_key: "wire-2"
+      })
+
+    assert Escalation.digest(base) == Escalation.digest(reissue)
+
+    refute Escalation.digest(base) ==
+             Escalation.digest(call(ctx.raiser, %{assignment_id: "a2", kind: "progress"}))
+  end
+
+  test "rule uses admin axis, closed decisions, idempotent re-rule, and wakes on its reserved fact",
+       ctx do
+    call = call(ctx.raiser, %{assignment_id: "a3", kind: "completion"})
+    {:decision_pending, id} = open(ctx, call, statute())
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.raiser.session_key,
+        origin: "agent:raiser",
+        prompt: "re-adjudicate",
+        due_at: System.system_time(:millisecond) + 60_000,
+        condition_kind: "escalation-ruled",
+        condition_scope: id,
+        creator_session_key: ctx.raiser.session_key
+      })
+
+    handlers = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})
+
+    assert %{code: "not_owner"} =
+             handlers["rule"].(%{
+               origin: "process:cron",
+               principal: {:process, "cron"},
+               params: %{request_id: id, decision: "allow"}
+             })
+
+    assert %{code: "invalid_decision"} =
+             handlers["rule"].(%{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{request_id: id, decision: "later"}
+             })
+
+    ruled = handlers["rule"].(rule_call(id, "allow"))
+    assert ruled.status == "ruled"
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert_receive {:lane_nudged, _}
+
+    assert handlers["rule"].(rule_call(id, "allow")).ruling_fact_id == ruled.ruling_fact_id
+    assert %{code: "not_open"} = handlers["rule"].(rule_call(id, "deny"))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind = 'escalation-ruled' AND scope = ?1 AND origin = 'process:tightbeam'",
+               [id]
+             )
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "decision_request_ruled" and event.subject == id
+           end) == 1
+  end
+
+  test "request waiver resolves all opens, live waiver allows, and revoke is prospective", ctx do
+    statute = statute()
+    first_call = call(ctx.raiser, %{assignment_id: "a4", kind: "completion"})
+    second_call = call(ctx.raiser, %{assignment_id: "a4", kind: "progress"})
+    {:decision_pending, first} = open(ctx, first_call, statute)
+    {:decision_pending, second} = open(ctx, second_call, statute)
+
+    waiver =
+      Escalation.waive(
+        ctx.db,
+        %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{request_id: first}},
+        authorized: true,
+        scheduler: ctx.scheduler
+      )
+
+    assert request(ctx, first).decision == "waived"
+    assert request(ctx, second).decision == "waived"
+    assert :allow = Escalation.resolve(ctx.db, first_call, statute)
+
+    assert %{revoked_at: revoked_at} =
+             Escalation.revoke_waiver(
+               ctx.db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{waiver_id: waiver.id}
+               },
+               authorized: true
+             )
+
+    assert is_integer(revoked_at)
+    assert {:needs_request, nil} = Escalation.resolve(ctx.db, first_call, statute)
+    assert request(ctx, first).decision == "waived"
+  end
+
+  test "withdrawal is raiser-only and retirement sweeps requests and waivers", ctx do
+    call = call(ctx.raiser, %{assignment_id: "a5", kind: "completion"})
+    {:decision_pending, id} = open(ctx, call, statute())
+
+    assert %{code: "not_raiser"} =
+             Escalation.withdraw(ctx.db, %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{request_id: id, reason: "no"}
+             })
+
+    assert %{status: "withdrawn", withdrawn_reason: "changed course"} =
+             Escalation.withdraw(ctx.db, %{
+               origin: "agent:raiser",
+               principal: {:session, ctx.raiser.session_key},
+               params: %{request_id: id, reason: "changed course"}
+             })
+
+    {:decision_pending, fresh} = open(ctx, call, statute())
+
+    waiver =
+      Escalation.waive(
+        ctx.db,
+        %{
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          params: %{session_key: ctx.raiser.session_key, statute_name: "review"}
+        },
+        authorized: true
+      )
+
+    :ok = Escalation.withdraw_for_retired(ctx.db, ctx.raiser.session_key)
+    assert request(ctx, fresh).withdrawn_reason == "raiser-retired"
+
+    assert {:ok, [["process:tightbeam"]]} =
+             DB.query(ctx.db, "SELECT revokedBy FROM escalation_waivers WHERE id = ?1", [
+               waiver.id
+             ])
+  end
+
+  test "boot recovery catches a retired session and read surfaces enforce owner or raiser", ctx do
+    call = call(ctx.raiser, %{assignment_id: "a6", kind: "completion"})
+    {:decision_pending, id} = open(ctx, call, statute())
+
+    unrelated = %{origin: "user:other", principal: {:user, "other"}, params: %{}}
+    assert [] = Escalation.list(ctx.db, unrelated, nil, owner_user_id: "other")
+    assert nil == Escalation.get(ctx.db, unrelated, id, owner_user_id: "other")
+
+    assert [%{id: ^id}] = Escalation.list(ctx.db, call, "open")
+    assert %{id: ^id, context: %{"verb" => "attest"}} = Escalation.get(ctx.db, call, id)
+
+    Org.retire(ctx.db, ctx.raiser.session_key)
+    :ok = Escalation.recover_retired(ctx.db)
+    assert request(ctx, id).status == "withdrawn"
+  end
+
+  test "non-session raisers use the origin domain and option labels resolve to effects", ctx do
+    call = %{
+      verb: "attest",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{assignment_id: "a-origin", kind: "completion"}
+    }
+
+    {:decision_pending, id} =
+      Escalation.escalate(ctx.db, call, statute(), %{
+        question: "Choose",
+        options: [%{"label" => "ship", "effect" => "allow"}]
+      })
+
+    assert %{raiser_id: "user:flynn", raiser_session_key: nil} =
+             Escalation.get(ctx.db, call, id)
+
+    assert %{decision: "allow"} =
+             Escalation.rule(
+               ctx.db,
+               %{
+                 origin: "user:other-admin",
+                 principal: {:user, "other-admin"},
+                 params: %{request_id: id, decision: "ship"}
+               },
+               authorized: true
+             )
+
+    assert {:allow, ^id} = Escalation.resolve(ctx.db, call, statute())
+    :ok = Escalation.withdraw_for_retired(ctx.db, ctx.raiser.session_key)
+    assert Escalation.get(ctx.db, call, id).status == "ruled"
+  end
+
+  test "escalation-ruled remains substrate-reserved", ctx do
+    assert {:error, %{code: "reserved_kind"}} =
+             ConditionFacts.file(ctx.db, ctx.scheduler, %{
+               kind: "escalation-ruled",
+               scope: "dr_fake",
+               origin: "agent:raiser"
+             })
+  end
+
+  defp session(db, name, owner) do
+    Org.create(db, %{
+      session_key: "agent:#{name}:app",
+      display_name: name,
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable"
+    })
+  end
+
+  defp call(session, params) do
+    %{
+      verb: "attest",
+      origin: "agent:raiser",
+      principal: {:session, session.session_key},
+      session_key: nil,
+      params: params
+    }
+  end
+
+  defp statute, do: %{name: "review", text: "owner denied review"}
+
+  defp escalation_ctx, do: %{question: "Allow this action?", options: nil}
+
+  defp open(ctx, call, statute) do
+    Escalation.escalate(ctx.db, call, statute, escalation_ctx())
+  end
+
+  defp rule_call(id, decision) do
+    %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{request_id: id, decision: decision}
+    }
+  end
+
+  defp request(ctx, id) do
+    Escalation.get(ctx.db, rule_call(id, "allow"), id, owner_user_id: "flynn")
+  end
+end

@@ -3,7 +3,7 @@ defmodule Tightbeam.Supervision do
 
   use GenServer
 
-  alias Tightbeam.{Assignments, DB, Dispatch, EventLog, Ledger, Org, Wakes}
+  alias Tightbeam.{Assignments, DB, Dispatch, Escalation, EventLog, Ledger, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @prods_ddl """
@@ -165,6 +165,7 @@ defmodule Tightbeam.Supervision do
   end
 
   def handle_cast({:retired, session_key}, state) do
+    :ok = Escalation.withdraw_for_retired(state.db, session_key)
     safe_evaluate(state, session_key, fn -> doorbells_for_holder(state.db, session_key) end)
     {:noreply, state}
   end

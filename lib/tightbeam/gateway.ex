@@ -66,6 +66,7 @@ defmodule Tightbeam.Gateway do
     Placement,
     DB,
     Devices,
+    Escalation,
     EventLog,
     Homes,
     Idempotency,
@@ -98,7 +99,8 @@ defmodule Tightbeam.Gateway do
           default_model: String.t(),
           max_live_sessions_per_user: pos_integer(),
           wake_tick_ms: pos_integer(),
-          prod_limit: non_neg_integer()
+          prod_limit: non_neg_integer(),
+          escalation_decision_deadline_ms: pos_integer()
         }
 
   @doc """
@@ -123,6 +125,7 @@ defmodule Tightbeam.Gateway do
           Devices,
           Idempotency,
           ConditionFacts,
+          Escalation,
           Wakes,
           Projection,
           Org,
@@ -361,6 +364,41 @@ defmodule Tightbeam.Gateway do
           %{code: "invalid", message: "a condition fact requires a kind"}
         end
       end,
+      "rule" => fn call ->
+        Escalation.rule(db, call,
+          authorized: admin_origin?(db, call.origin),
+          scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+        )
+      end,
+      "waive" => fn call ->
+        Escalation.waive(db, call,
+          authorized: admin_origin?(db, call.origin),
+          scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+        )
+      end,
+      "revoke-waiver" => fn call ->
+        Escalation.revoke_waiver(db, call, authorized: admin_origin?(db, call.origin))
+      end,
+      "withdraw" => fn call -> Escalation.withdraw(db, call) end,
+      "decision-requests" => fn call ->
+        caller = resolve_caller(db, call.origin)
+
+        %{
+          decision_requests:
+            Escalation.list(db, call, call.params[:status] || "open",
+              owner_user_id: caller && caller.owner_user_id
+            )
+        }
+      end,
+      "decision-request" => fn call ->
+        caller = resolve_caller(db, call.origin)
+        id = call.params[:request_id] || call.params[:request]
+
+        case Escalation.get(db, call, id, owner_user_id: caller && caller.owner_user_id) do
+          nil -> %{code: "not_found", message: "decision request not found"}
+          request -> %{decision_request: request}
+        end
+      end,
       "approve-device" =>
         admin_handler(db, fn p ->
           d = Devices.approve(db, p.device_id, p[:user_id])
@@ -535,6 +573,22 @@ defmodule Tightbeam.Gateway do
       "tune" => fn call -> tune_result(config, db, call) end,
       "retire" => fn call -> retire_result(config, db, call) end
     }
+  end
+
+  @doc "Attach the post-commit owner delivery used by `Escalation.escalate/4`."
+  @spec escalation_context(config(), DB.server(), map()) :: map()
+  def escalation_context(config, db, ctx) do
+    Map.put(ctx, :deliver_owner, fn owner_user_id, request ->
+      options = if request.options, do: "\nOptions: #{JSON.encode!(request.options)}", else: ""
+
+      prompt =
+        "Decision #{request.id} pending on #{request.statute_name}.\n" <>
+          request.question <>
+          options <>
+          "\nContext: #{JSON.encode!(request.context)}"
+
+      notify_session(config, db, Org.personal_session_key(owner_user_id), prompt)
+    end)
   end
 
   @doc """
