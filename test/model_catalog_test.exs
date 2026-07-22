@@ -54,17 +54,17 @@ defmodule Tightbeam.ModelCatalogTest do
     {codex, :fresh} = ModelCatalog.get("codex", catalog)
 
     assert Enum.map(claude, & &1.ref) == [
-             "claude-opus-4-8[high]",
              "claude-opus-4-8[low]",
-             "claude-opus-4-8[max]",
              "claude-opus-4-8[medium]",
+             "claude-opus-4-8[high]",
+             "claude-opus-4-8[max]",
              "claude-haiku-4-5"
            ]
 
     opus = hd(claude)
     assert opus.display_name == "Claude Opus 4.8"
     assert opus.max_input_tokens == 1_000_000
-    assert opus.efforts == ["high", "low", "max", "medium"]
+    assert opus.efforts == ["low", "medium", "high", "max"]
 
     assert Enum.map(codex, & &1.ref) == [
              "gpt-5.6-sol[low]",
@@ -77,6 +77,84 @@ defmodule Tightbeam.ModelCatalogTest do
            ]
 
     refute Enum.any?(claude ++ codex, &String.contains?(&1.ref, "[1m]"))
+  end
+
+  test "claude efforts sort by ascending tier rank, unknown tiers after max", ctx do
+    claude_json =
+      JSON.encode!(%{
+        data: [
+          %{
+            id: "claude-sort-test",
+            display_name: "Claude Sort Test",
+            max_input_tokens: 1_000_000,
+            capabilities: %{
+              effort: %{
+                xhigh: %{supported: true},
+                max: %{supported: true},
+                low: %{supported: true},
+                ultra: %{supported: true},
+                high: %{supported: true},
+                medium: %{supported: true}
+              }
+            }
+          }
+        ]
+      })
+
+    claude_fetch = fn "/v1/models?limit=100", _headers -> {:ok, claude_json} end
+
+    catalog = start_catalog(ctx, claude_fetch: claude_fetch)
+    await_fresh(catalog, "claude")
+
+    {claude, :fresh} = ModelCatalog.get("claude", catalog)
+
+    assert Enum.map(claude, & &1.ref) == [
+             "claude-sort-test[low]",
+             "claude-sort-test[medium]",
+             "claude-sort-test[high]",
+             "claude-sort-test[xhigh]",
+             "claude-sort-test[max]",
+             "claude-sort-test[ultra]"
+           ]
+  end
+
+  test "codex efforts sort by ascending tier rank, unknown tiers after max preserving catalog order",
+       ctx do
+    codex_json =
+      JSON.encode!(%{
+        models: [
+          %{
+            slug: "gpt-sort-test",
+            display_name: "GPT Sort Test",
+            supported_reasoning_levels: [
+              %{effort: "mega"},
+              %{effort: "xhigh"},
+              %{effort: "max"},
+              %{effort: "low"},
+              %{effort: "ultra"},
+              %{effort: "high"},
+              %{effort: "medium"}
+            ]
+          }
+        ]
+      })
+
+    codex_read = fn _path -> {:ok, codex_json} end
+
+    catalog = start_catalog(ctx, codex_read: codex_read)
+    await_fresh(catalog, "codex")
+
+    {codex, :fresh} = ModelCatalog.get("codex", catalog)
+
+    assert Enum.map(codex, & &1.ref) == [
+             "gpt-sort-test[low]",
+             "gpt-sort-test[medium]",
+             "gpt-sort-test[high]",
+             "gpt-sort-test[xhigh]",
+             "gpt-sort-test[max]",
+             "gpt-sort-test[mega]",
+             "gpt-sort-test[ultra]"
+           ]
   end
 
   test "membership carries fresh, stale, and unavailable health", ctx do

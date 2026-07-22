@@ -11,6 +11,7 @@ defmodule Tightbeam.ModelCatalog do
 
   @default_ttl_ms :timer.minutes(15)
   @harnesses ["claude", "codex"]
+  @effort_rank %{"low" => 0, "medium" => 1, "high" => 2, "xhigh" => 3, "max" => 4}
 
   @type health :: :fresh | :stale | {:unavailable, term()}
   @type entry :: %{
@@ -249,7 +250,7 @@ defmodule Tightbeam.ModelCatalog do
             is_map(detail) and detail["supported"] == true
           end)
           |> Enum.map(&elem(&1, 0))
-          |> Enum.sort()
+          |> sort_efforts()
 
         entries_for(model, id, efforts, capabilities)
 
@@ -264,7 +265,8 @@ defmodule Tightbeam.ModelCatalog do
         levels = model["supported_reasoning_levels"] || []
 
         efforts =
-          for %{"effort" => effort} <- levels, is_binary(effort), do: effort
+          for(%{"effort" => effort} <- levels, is_binary(effort), do: effort)
+          |> sort_efforts()
 
         capabilities =
           Map.put(model["capabilities"] || %{}, "supported_reasoning_levels", levels)
@@ -274,6 +276,10 @@ defmodule Tightbeam.ModelCatalog do
       _ ->
         []
     end)
+  end
+
+  defp sort_efforts(efforts) do
+    Enum.sort_by(efforts, &Map.get(@effort_rank, &1, map_size(@effort_rank)))
   end
 
   defp entries_for(model, id, efforts, capabilities) do
