@@ -756,9 +756,29 @@ defmodule Tightbeam.Gateway do
             preferences -> preferences
           end
 
-        {_model, effort} = Adapter.parse_model_ref(session.model)
+        {base_model, effort} = Adapter.parse_model_ref(session.model)
         {catalog, _health} = ModelCatalog.get(session.harness, ModelCatalog)
         unsupported = fn reason -> %{supported: false, reason: reason} end
+
+        models_once = Enum.uniq_by(catalog, &base_ref(&1.ref))
+
+        current_efforts =
+          case Enum.find(catalog, &(base_ref(&1.ref) == base_model)) do
+            nil -> []
+            entry -> entry.efforts
+          end
+
+        reasoning_capability =
+          case current_efforts do
+            [] ->
+              unsupported.("current model has no effort tiers")
+
+            efforts ->
+              %{
+                supported: true,
+                options: Enum.map(efforts, &%{title: &1, value: &1, enabled: true})
+              }
+          end
 
         %{
           # sessionKey is REQUIRED by the client's SessionStatus decoder — its
@@ -766,7 +786,11 @@ defmodule Tightbeam.Gateway do
           # populates (found live; the TS reference omitted it too).
           sessionKey: session_key,
           display: %{
-            model: session.model,
+            # Base ref only: the footer both displays this text verbatim when
+            # it can't match a catalog row and matches it against the (now
+            # base-ref) catalog rows for the current-model checkmark. The
+            # effort qualifier is carried separately in reasoningLevel.
+            model: base_model,
             modelPreferences: model_preferences,
             provider: session.provider,
             harness: session.harness,
@@ -791,16 +815,17 @@ defmodule Tightbeam.Gateway do
             cancelCurrentRun: %{supported: true},
             setModel: %{
               supported: true,
-              options: Enum.map(catalog, &%{title: &1.name, value: &1.ref, enabled: true})
+              options:
+                Enum.map(models_once, &%{title: &1.name, value: base_ref(&1.ref), enabled: true})
             },
             setThinking: unsupported.("thinking control lands in a later milestone"),
-            setReasoning: unsupported.("select an effort variant via the model picker"),
+            setReasoning: reasoning_capability,
             setFastMode: unsupported.("not supported"),
             setMode: unsupported.("sessions run YOLO"),
             setVerbosity: unsupported.("not supported"),
             canCancelCurrentRun: true,
             canChangeModel: true,
-            canChangeReasoning: false,
+            canChangeReasoning: current_efforts != [],
             canChangeFastMode: false,
             canChangeVerbosity: false,
             readOnlyStatus: false
@@ -808,16 +833,27 @@ defmodule Tightbeam.Gateway do
           modelCatalog: %{
             available: true,
             # Client Model decoder REQUIRES id + provider + ref (id is the
-            # stable identity; ref doubles as it here).
+            # stable identity; ref doubles as it here). The client's model
+            # picker reads THIS list (falling back to setModel.options only
+            # when unavailable) and sends ref back as the set_model value, so
+            # rows are one-per-model with base refs — tune_result composes
+            # the effort qualifier from the reasoning selection.
             models:
               Enum.map(
-                catalog,
-                &%{id: &1.ref, ref: &1.ref, name: &1.name, provider: session.provider}
+                models_once,
+                &%{
+                  id: base_ref(&1.ref),
+                  ref: base_ref(&1.ref),
+                  name: &1.name,
+                  provider: session.provider
+                }
               )
           }
         }
     end
   end
+
+  defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
 
   defp defaults(config) do
     harness = config.default_harness
@@ -1897,52 +1933,104 @@ defmodule Tightbeam.Gateway do
       p[:setting] == "remove_override" ->
         remove_override_result(config, db, call)
 
-      p[:setting] != "set_model" or not is_binary(p[:model]) ->
-        %{ok: false, code: "unsupported", message: "tune does not support #{p[:setting]} yet"}
-
-      true ->
+      p[:setting] == "set_model" and is_binary(p[:model]) ->
         case Org.get(db, call.session_key) do
           nil ->
             %{ok: false, code: "not_found"}
 
           session ->
-            with :ok <- validate_catalog_model(session.harness, p.model, false) do
-              Org.set_model(db, call.session_key, p.model, session.provider)
-
-              load_result =
-                with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
-                     coordinator when is_pid(coordinator) <-
-                       Process.whereis(Tightbeam.AdapterCoordinator),
-                     {:ok, adapter, _generation} <-
-                       AdapterCoordinator.adapter_for(
-                         coordinator,
-                         {String.to_existing_atom(session.harness), session.identity_name,
-                          session.host}
-                       ) do
-                  AdapterCoordinator.with_load_slot(coordinator, fn ->
-                    Adapter.load_session(
-                      adapter,
-                      pointer.harness_session_id,
-                      p.model,
-                      Placement.holder_workdir(config, session),
-                      session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
-                    )
-                  end)
-                else
-                  _ -> :ok
-                end
-
-              case load_result do
-                {:error, :contained_sandbox_disable_failed} ->
-                  %{ok: false, reason: :contained_sandbox_disable_failed}
-
-                _ ->
-                  %{ok: true}
-              end
-            else
-              {:error, denial} -> denial
-            end
+            new_ref = compose_model_selection(session.harness, session.model, p.model)
+            apply_model_change(config, db, call, session, new_ref)
         end
+
+      p[:setting] == "set_reasoning" and is_binary(p[:reasoningLevel]) ->
+        case Org.get(db, call.session_key) do
+          nil ->
+            %{ok: false, code: "not_found"}
+
+          session ->
+            new_ref = "#{base_ref(session.model)}[#{p.reasoningLevel}]"
+            apply_model_change(config, db, call, session, new_ref)
+        end
+
+      true ->
+        %{ok: false, code: "unsupported", message: "tune does not support #{p[:setting]} yet"}
+    end
+  end
+
+  # A bare model id (no "[effort]" suffix, e.g. from setModel.options) is
+  # composed with the session's current effort, falling back to "medium" or
+  # the first available tier when the current effort doesn't apply to the
+  # newly selected model. A ref already carrying "[effort]" is passed through
+  # unchanged (back-compat with callers that send a full ref directly).
+  defp compose_model_selection(harness, current_ref, selected) do
+    if String.contains?(selected, "[") do
+      selected
+    else
+      {_current_base, current_effort} = Adapter.parse_model_ref(current_ref)
+
+      case efforts_for(harness, selected) do
+        [] ->
+          selected
+
+        efforts ->
+          "#{selected}[#{pick_effort(efforts, current_effort)}]"
+      end
+    end
+  end
+
+  defp pick_effort(efforts, current_effort) do
+    cond do
+      current_effort in efforts -> current_effort
+      "medium" in efforts -> "medium"
+      true -> List.first(efforts)
+    end
+  end
+
+  defp efforts_for(harness, base_model) do
+    {catalog, _health} = ModelCatalog.get(harness, ModelCatalog)
+
+    case Enum.find(catalog, &(base_ref(&1.ref) == base_model)) do
+      nil -> []
+      entry -> entry.efforts
+    end
+  end
+
+  defp apply_model_change(config, db, call, session, new_ref) do
+    with :ok <- validate_catalog_model(session.harness, new_ref, false) do
+      Org.set_model(db, call.session_key, new_ref, session.provider)
+
+      load_result =
+        with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
+             coordinator when is_pid(coordinator) <-
+               Process.whereis(Tightbeam.AdapterCoordinator),
+             {:ok, adapter, _generation} <-
+               AdapterCoordinator.adapter_for(
+                 coordinator,
+                 {String.to_existing_atom(session.harness), session.identity_name, session.host}
+               ) do
+          AdapterCoordinator.with_load_slot(coordinator, fn ->
+            Adapter.load_session(
+              adapter,
+              pointer.harness_session_id,
+              new_ref,
+              Placement.holder_workdir(config, session),
+              session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
+            )
+          end)
+        else
+          _ -> :ok
+        end
+
+      case load_result do
+        {:error, :contained_sandbox_disable_failed} ->
+          %{ok: false, reason: :contained_sandbox_disable_failed}
+
+        _ ->
+          %{ok: true}
+      end
+    else
+      {:error, denial} -> denial
     end
   end
 
