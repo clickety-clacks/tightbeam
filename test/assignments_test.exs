@@ -10,6 +10,7 @@ defmodule Tightbeam.AssignmentsTest do
     Gateway,
     Idempotency,
     Org,
+    Projection,
     Roles,
     Rules,
     WorkItems,
@@ -20,7 +21,17 @@ defmodule Tightbeam.AssignmentsTest do
     db = :"assignments_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Devices, Idempotency, Org, Roles, WorkItems, Assignments, WorkState, EventLog] do
+    for module <- [
+          Devices,
+          Idempotency,
+          Org,
+          Projection,
+          Roles,
+          WorkItems,
+          Assignments,
+          WorkState,
+          EventLog
+        ] do
       :ok = module.ensure_schema(db)
     end
 
@@ -641,6 +652,79 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "verdict"))
   end
 
+  test "work lifecycle markers land in the actor transcript with exact event text", ctx do
+    completed = handle(ctx, "assign", assign_call({:user, "flynn"}, "completed markers"))
+
+    progress =
+      handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
+
+    verdict_call =
+      attest_call({:session, "holder"}, completed.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+
+    verdict = handle(ctx, "attest", verdict_call)
+
+    marker_count_before_user_verdict = length(marker_contents(ctx.db, "holder"))
+
+    user_verdict_call =
+      attest_call({:user, "flynn"}, completed.id, "verdict")
+      |> put_in([:params, :verdict_kind], "user-ruling")
+
+    user_verdict = handle(ctx, "attest", user_verdict_call)
+
+    assert length(marker_contents(ctx.db, "holder")) == marker_count_before_user_verdict
+
+    completion =
+      handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "completion"))
+
+    surrendered = handle(ctx, "assign", assign_call({:user, "flynn"}, "surrender markers"))
+
+    surrender =
+      handle(ctx, "attest", attest_call({:session, "holder"}, surrendered.id, "surrender"))
+
+    revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "revoke markers"))
+    revocation = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked.id))
+
+    assert marker_contents(ctx.db, "holder") == [
+             "[assignment opened: #{completed.id}]",
+             "[progress filed on #{completed.id}]",
+             "[verdict filed: reviewed-clean on #{completed.id}]",
+             "[completion filed on #{completed.id}]",
+             "[assignment closed: #{completed.id} — completed]",
+             "[assignment opened: #{surrendered.id}]",
+             "[surrendered #{surrendered.id} — needs user input]",
+             "[assignment closed: #{surrendered.id} — surrendered]",
+             "[assignment opened: #{revoked.id}]",
+             "[assignment revoked: #{revoked.id}]"
+           ]
+
+    assert progress.attest.kind == "progress"
+    assert verdict.attest.verdictKind == "reviewed-clean"
+    assert user_verdict.attest.byUser == "flynn"
+    assert completion.assignment.outcome == "completed"
+    assert completion.assignment.closingAttestId == completion.attest.id
+    assert surrender.assignment.outcome == "surrendered"
+    assert surrender.assignment.closingAttestId == surrender.attest.id
+    assert revocation.outcome == "revoked"
+    assert revocation.closingAttestId == nil
+
+    assert Enum.all?(Projection.list_after(ctx.db, "holder", nil, 100), fn marker ->
+             marker.role == "assistant" and marker.sender == "process:tightbeam"
+           end)
+  end
+
+  test "a marker insert failure does not fail the underlying attest", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "marker failure"))
+    :ok = DB.execute(ctx.db, "DROP TABLE messages")
+
+    result =
+      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+    assert result.assignment.id == assignment.id
+    assert result.attest.kind == "progress"
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+  end
+
   test "revoke permits admin and typed openers, denies others, and creates no attest", ctx do
     for {principal, opener} <- [
           {{:user, "admin"}, {:user, "flynn"}},
@@ -747,6 +831,12 @@ defmodule Tightbeam.AssignmentsTest do
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
     result
+  end
+
+  defp marker_contents(db, session_key) do
+    db
+    |> Projection.list_after(session_key, nil, 100)
+    |> Enum.map(& &1.content)
   end
 
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do

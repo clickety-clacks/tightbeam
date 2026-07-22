@@ -96,6 +96,7 @@ defmodule Tightbeam.Projection do
     case existing do
       [row] ->
         message = to_message(row)
+
         if message.content == Map.fetch!(input, :content), do: {:duplicate, message}, else: {:conflict, message}
 
       [] ->
@@ -124,6 +125,17 @@ defmodule Tightbeam.Projection do
         [row] = select_by_id(txn, id)
         {:appended, to_message(row)}
     end
+  end
+
+  @doc "Append a Tightbeam-authored transcript marker inside an existing transaction."
+  @spec append_marker_in_txn(Txn.t(), String.t(), String.t()) :: {:appended, message()}
+  def append_marker_in_txn(%Txn{} = txn, session_key, content) do
+    append_in_txn(txn, %{
+      session_key: session_key,
+      role: "assistant",
+      content: content,
+      sender: "process:tightbeam"
+    })
   end
 
   @doc "Fetch one message by store id, or nil."

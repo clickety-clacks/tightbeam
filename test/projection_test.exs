@@ -87,6 +87,24 @@ defmodule Tightbeam.ProjectionTest do
     assert Projection.get(db, assistant.id) == assistant
   end
 
+  test "transaction markers use the ordinary anti-forgery transcript row shape", %{db: db} do
+    assert {:ok, {:appended, marker}} =
+             DB.transaction(db, fn txn ->
+               Projection.append_marker_in_txn(txn, "k1", "[context reset]")
+             end)
+
+    assert marker.session_key == "k1"
+    assert marker.role == "assistant"
+    assert marker.content == "[context reset]"
+    assert marker.sender == "process:tightbeam"
+    assert marker.llm_visible_message_id == marker.id
+    assert marker.attachments == []
+    assert marker.device_id == nil
+    assert marker.client_message_id == nil
+    assert marker.reply_to_message_id == nil
+    assert marker.reply_to_client_message_id == nil
+  end
+
   test "after replays in order and an unknown cursor replays from the start", %{db: db} do
     messages =
       Enum.map(["one", "two", "three"], fn content ->
