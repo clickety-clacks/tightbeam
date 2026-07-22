@@ -298,17 +298,15 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{verb: "tune", session_key: ^key}}
   end
 
-  test "PATCH /api/streams/:key decodes a double-encoded '%2520' path key as a space", ctx do
-    key = "agent:main:clawline:mike:main s_test2520"
+  test "PATCH /api/streams/:key decodes the captured double-encoded Clawline path", ctx do
+    key = "agent:main:clawline:flynn:main s_request_path"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
-
-    double_encoded_key = String.replace(key, " ", "%2520")
 
     response =
       conn(
         :patch,
-        "/api/streams/#{double_encoded_key}",
+        "/api/streams/agent%253Amain%253Aclawline%253Aflynn%253Amain%2520s_request_path",
         JSON.encode!(%{"displayName" => "Renamed"})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
@@ -318,8 +316,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{verb: "tune", session_key: ^key}}
   end
 
-  test "DELETE /api/streams/:key decodes a double-encoded '%2520' path key as a space", ctx do
-    key = "agent:main:clawline:mike:main s_test2521"
+  test "DELETE /api/streams/:key decodes the captured double-encoded Clawline path", ctx do
+    key = "agent:main:clawline:flynn:main s_request_path"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -328,10 +326,12 @@ defmodule Tightbeam.Wire.RouterTest do
         %{deleted_session_key: call.session_key}
       end)
 
-    double_encoded_key = String.replace(key, " ", "%2520")
-
     response =
-      conn(:delete, "/api/streams/#{double_encoded_key}", JSON.encode!(%{}))
+      conn(
+        :delete,
+        "/api/streams/agent%253Amain%253Aclawline%253Aflynn%253Amain%2520s_request_path",
+        JSON.encode!(%{})
+      )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
       |> Router.call(Router.init(opts))
 
