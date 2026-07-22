@@ -1,0 +1,10 @@
+[fixture]
+class = "C1"
+name = "no-git-checkout-discard"
+phase = "green"
+blocking_phase = ""
+kind = "harness-gate"
+source = "Shipped engineering.toml"
+legibility = "gate:no-git-checkout-discard"
+shipped_ref = "engineering.toml:no-git-checkout-discard"
+pattern = "git[[:space:]]+checkout[[:space:]]+--([[:space:]]|$)"

@@ -1,0 +1,10 @@
+[fixture]
+class = "C1"
+name = "no-git-clean-force"
+phase = "green"
+blocking_phase = ""
+kind = "harness-gate"
+source = "Shipped engineering.toml"
+legibility = "gate:no-git-clean-force"
+shipped_ref = "engineering.toml:no-git-clean-force"
+pattern = "git[[:space:]]+clean[[:space:]]+(--force|-[^[:space:]]*f)"

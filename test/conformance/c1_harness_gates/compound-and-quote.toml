@@ -1,0 +1,10 @@
+[fixture]
+class = "C1"
+name = "compound-and-quote"
+phase = "green"
+blocking_phase = ""
+kind = "harness-gate"
+source = "Rails raw-JSON compilation contract"
+legibility = "gate:no-git-stash"
+shipped_ref = "engineering.toml:no-git-stash"
+pattern = "git[[:space:]]+stash([[:space:]]+(push|pop|drop|clear|apply|save)|[[:space:]]*([^[:alnum:][:space:]]|$))"

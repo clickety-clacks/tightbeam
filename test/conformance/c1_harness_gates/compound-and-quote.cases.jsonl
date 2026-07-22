@@ -1,0 +1,4 @@
+{"case":"compound-reset-denied","kind":"positive","expect":"deny","reason":"no-git-reset-hard","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cd src && git reset --hard\"}}"}
+{"case":"quoted-compound-stash-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git commit -m \\\"wip\\\" && git stash\"}}"}
+{"case":"quoted-mention-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git commit -m \\\"do not git stash by hand\\\"\"}}"}
+{"case":"compound-denial-is-legible","kind":"legibility","expect":"deny","reason":"no-git-stash","emits":"gate:no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git commit -m \\\"wip\\\" && git stash\"}}"}

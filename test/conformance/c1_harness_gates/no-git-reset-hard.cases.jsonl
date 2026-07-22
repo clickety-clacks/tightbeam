@@ -1,0 +1,5 @@
+{"case":"hard-reset-denied","kind":"positive","expect":"deny","reason":"no-git-reset-hard","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --hard HEAD~1\"}}"}
+{"case":"bare-hard-reset-denied","kind":"positive","expect":"deny","reason":"no-git-reset-hard","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --hard\"}}"}
+{"case":"path-reset-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset HEAD file\"}}"}
+{"case":"soft-reset-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --soft HEAD~1\"}}"}
+{"case":"reset-denial-is-legible","kind":"legibility","expect":"deny","reason":"no-git-reset-hard","emits":"gate:no-git-reset-hard","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --hard\"}}"}

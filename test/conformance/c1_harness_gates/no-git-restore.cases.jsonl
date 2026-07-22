@@ -1,0 +1,4 @@
+{"case":"restore-path-denied","kind":"positive","expect":"deny","reason":"no-git-restore","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git restore src/a.ex\"}}"}
+{"case":"status-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git status\"}}"}
+{"case":"stash-show-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash show -p\"}}"}
+{"case":"restore-denial-is-legible","kind":"legibility","expect":"deny","reason":"no-git-restore","emits":"gate:no-git-restore","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git restore --staged f\"}}"}

@@ -1,0 +1,10 @@
+[fixture]
+class = "C1"
+name = "no-git-stash"
+phase = "green"
+blocking_phase = ""
+kind = "harness-gate"
+source = "Shipped engineering.toml"
+legibility = "gate:no-git-stash"
+shipped_ref = "engineering.toml:no-git-stash"
+pattern = "git[[:space:]]+stash([[:space:]]+(push|pop|drop|clear|apply|save)|[[:space:]]*([^[:alnum:][:space:]]|$))"

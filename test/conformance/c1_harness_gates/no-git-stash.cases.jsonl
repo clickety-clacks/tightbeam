@@ -1,0 +1,11 @@
+{"case":"bare-stash-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash\"}}"}
+{"case":"stash-u-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash -u\"}}"}
+{"case":"stash-push-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash push -m wip\"}}"}
+{"case":"stash-pop-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash pop\"}}"}
+{"case":"stash-drop-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash drop\"}}"}
+{"case":"stash-apply-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash apply\"}}"}
+{"case":"stash-save-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash save wip\"}}"}
+{"case":"stash-list-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash list\"}}"}
+{"case":"stash-show-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash show -p\"}}"}
+{"case":"stash-prose-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo git stashing is fun\"}}"}
+{"case":"stash-denial-is-legible","kind":"legibility","expect":"deny","reason":"no-git-stash","emits":"gate:no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash clear\"}}"}
