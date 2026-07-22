@@ -1123,17 +1123,7 @@ defmodule Tightbeam.PlacementTest do
 
     commands = collect_commands([])
 
-    assert [
-             stamp,
-             wipe,
-             rsync,
-             lib_mkdir,
-             lib_rsync,
-             lib_rsync_d,
-             lib_rsync_h,
-             lib_rsync_2,
-             auth
-           ] = commands
+    assert [stamp, wipe, rsync, auth] = commands
 
     assert stamp == [
              "ssh",
@@ -1173,34 +1163,6 @@ defmodule Tightbeam.PlacementTest do
 
     refute "--delete" in rsync
 
-    # Library replica catch-up: the satellite's replica receives every
-    # elected skill so the staged home's links resolve on arrival.
-    assert lib_mkdir == [
-             "ssh",
-             "-o",
-             "BatchMode=yes",
-             "-o",
-             "ConnectTimeout=5",
-             "worker",
-             "mkdir",
-             "-p",
-             "/remote/tb/identity/skills"
-           ]
-
-    assert lib_rsync == [
-             "rsync",
-             "-a",
-             "-e",
-             "ssh -o BatchMode=yes -o ConnectTimeout=5",
-             Path.join([base_dir, "identity", "skills", "tightbeam-assimilate"]),
-             "worker:/remote/tb/identity/skills/"
-           ]
-
-    assert Enum.at(lib_rsync_d, -2) =~ "tightbeam-dispatching"
-    assert Enum.at(lib_rsync_h, -2) =~ "tightbeam-harnesses"
-    assert List.last(lib_rsync_2) == "worker:/remote/tb/identity/skills/"
-    assert Enum.at(lib_rsync_2, -2) =~ "tightbeam-skills"
-
     assert Enum.take(auth, 8) == [
              "ssh",
              "-o",
@@ -1218,11 +1180,12 @@ defmodule Tightbeam.PlacementTest do
     staged_home = Path.join([base_dir, "staging", "worker", "homes", "default", "codex"])
     assert Enum.sort(File.ls!(staged_home)) == [".tightbeam-manifest", "AGENTS.md", "skills"]
 
-    # The staged link dangles HERE and resolves on the satellite — it
-    # points into the satellite's replica, not the gateway's library.
+    # Baseline skills come from the substrate's shipped priv, never the org
+    # library replica.
     assert staged_home
            |> Path.join("skills/tightbeam-assimilate")
-           |> File.read_link!() == "/remote/tb/identity/skills/tightbeam-assimilate"
+           |> File.read_link!() ==
+             Application.app_dir(:tightbeam, "priv/skills/tightbeam-assimilate")
 
     refute File.exists?(Path.join(staged_home, "auth.json"))
   end

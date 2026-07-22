@@ -9,11 +9,13 @@ defmodule Tightbeam.Archetypes do
   design needs and nothing else:
 
       name = "coder"
-      skills = ["tightbeam-assimilate"] # election from the shared skills
-                                        # library (identity/skills/<name>/
-                                        # SKILL.md). Omitted = the built-in
-                                        # set; named = exactly that list.
-                                        # Unknown names fail the boot.
+      skills = ["deploy"]          # election from the org skills library
+                                   # (identity/skills/<name>/SKILL.md).
+                                   # Omitted = no org elections; substrate
+                                   # baseline skills project separately.
+                                   # Unknown names fail the boot, while
+                                   # substrate names are valid but reserved
+                                   # from org library copies.
       where = ["work-1", "work-2"]      # allowed host-set (§Placement).
                                         # Optional; default: the gateway's
                                         # own hostname.
@@ -253,194 +255,19 @@ defmodule Tightbeam.Archetypes do
     memory of your own.
   """
 
-  @builtin_assimilation """
-  Assimilation onboards a machine as a host. It is a CEREMONY you can run
-  end-to-end when the operator asks — no source-diving, no guessing; this
-  section is the complete procedure.
-
-  1. `tightbeam assimilate <ssh-dest> --as-user <operatorId>` (admin act —
-     run it AS the operator who asked). <ssh-dest> is anything ssh resolves
-     (tailnet names work). Preconditions the probe checks for you: key-based
-     ssh access and node on the target. Useful flags: --name <hostname>
-     (defaults from the destination), --harness claude,codex, --dry-run.
-  2. Credentials. Doctrine: every {org, host, harness} gets its OWN grant —
-     the ceremony's ONBOARD step runs the harness's login on the satellite,
-     which needs an interactive terminal. YOU do not have one: assimilate
-     will print the per-harness login commands instead — relay them to the
-     operator VERBATIM and say plainly that this step is theirs. A
-     "credentials missing" result is not failure: the host registers anyway
-     and degrades visibly (turns there fail with an auth marker) until the
-     operator onboards it. Never work around this with --push-credentials
-     unless the operator explicitly chooses it — pushed copies share a
-     grant, and shared grants revoke each other on refresh.
-  3. Allow placement. A registered host is usable only where an archetype's
-     WHERE admits it. Archetypes are TOML manifests at
-     `$TIGHTBEAM_HOME/identity/archetypes/<name>.toml`. The built-in
-     "default" archetype has NO file; writing `default.toml` overrides it —
-     minimal contents to admit a new host alongside the gateway's own:
-
-         name = "default"
-         where = ["<gateway-host>", "<new-host>"]
-
-     Editing `where` alone never touches guidance, so it costs no session
-     its memory.
-  4. Restart to apply. Archetype manifests load at substrate BOOT: a
-     manifest edit takes effect at the next gateway restart, not before.
-     Say so in your report — "registered and allowed; takes effect on the
-     next substrate restart" — and never sit waiting for it silently.
-  5. Verify. After the restart: the host appears in `tightbeam list`, and
-     `spawn --host <name>` places a session there.
-  """
-
-  @builtin_skill_mgmt """
-  You can manage this org's skill library — the shared body of on-demand
-  knowledge every archetype elects from. This is the complete procedure;
-  no source-diving, no guessing.
-
-  WHAT SKILLS ARE HERE. The library lives at
-  `$TIGHTBEAM_HOME/identity/skills/<name>/SKILL.md` and is REPLICATED to
-  every host; your home's `skills/` entries are symlinks into your host's
-  replica. Two shapes, one mechanism:
-  - A ONE-SHOT skill: one directory, its SKILL.md, any support files.
-  - A SUBJECT TREE: a directory whose root SKILL.md is a routing MANIFEST
-    over nested technique skills ("structured concurrency →
-    `concurrency/SKILL.md`"), each technique a subdirectory with its own
-    SKILL.md. When AUTHORING a tree: the parent teaches nothing itself —
-    it routes, with relative paths and one line on when each child
-    applies.
-
-  OPERATING ON THE LIBRARY (admin verbs — run --as-user the operator who
-  asked):
-  - `tightbeam skill list` — every skill, tree membership, who elects it.
-  - `tightbeam skill put <name> --file <path>` — create or update. <name>
-    may be a tree path ("swift/concurrency"). The write propagates to
-    every host's replica IMMEDIATELY; a host reported as "error: ..." is
-    degraded, not failed — it heals at its next home delivery. Content
-    edits are LIVE for every electing agent and never cost anyone memory.
-  - `tightbeam skill rm <name>` — remove. Refused for a root any
-    archetype elects (retire the election first); pruning inside an
-    elected tree is an ordinary edit.
-
-  ELECTION is separate from content: an archetype names its skills in its
-  manifest (`skills = [...]` in
-  `$TIGHTBEAM_HOME/identity/archetypes/<name>.toml`; omitted = the
-  built-in set). Election is ATOMIC at tree roots — electing a subject
-  takes the whole tree; nested names are invalid. Election edits are
-  IDENTITY changes: they apply at the next substrate restart and
-  regenerate the electing homes (sessions there lose model memory,
-  visibly, via the context-reset marker). Say both facts in your report
-  when you change an election.
-  """
-
-  @builtin_harness_matrix """
-  Per-harness feature support: FACTS, not guesses. Consult this before
-  promising any feature on a specific harness; a feature not listed here
-  diverges nowhere. Never say "probably" about a row below.
-
-  claude (via claude-agent-acp):
-  - Skills: NATIVE — discovered from your home's skills/ dir, invoked via
-    the Skill tool.
-  - Rails gates: ENFORCED — PreToolUse hooks refuse matching tool calls
-    before execution; a refusal quoting "[gate: <name>]" is the runtime
-    acting, not the model declining.
-  - Credentials: .credentials.json file OR a long-lived setup-token grant
-    injected as env (the rotation-proof form).
-  - Slash commands: /clear /compact /model verified as passthrough.
-  - Emits per-turn context-usage telemetry.
-
-  codex (via codex-acp):
-  - Skills: NO native discovery — the same skill files exist at the same
-    paths in your home; READ them when the operator asks (the Operations
-    pointer names the path).
-  - Rails gates: ENFORCED FOR NON-MALICIOUS AGENTS — the same compiled
-    PreToolUse hooks as claude, delivered as hooks.json and WIRING-CHECKED
-    at adapter spawn: the substrate proves a probe command is refused before
-    serving sessions, and a codex adapter that cannot prove it does not come
-    up. The refusal envelope is "Command blocked by PreToolUse hook: [gate:
-    <name>] …" — the runtime acting, not the model declining. This is
-    enumerated-call denial for a cooperative-but-forgetful agent, NOT a
-    sandbox or tamper-proof; malicious and config-hostile actors are out of
-    scope, exactly as for claude rails.
-  - Credentials: auth.json via codex login only; no token-env equivalent,
-    so the rotation caveat applies to shared logins.
-  - Slash-command vocabulary differs from claude and is unverified — do
-    not promise specific commands.
-  - Verified working (2026-07-18): turns, tool use, AGENTS.md identity,
-    read-on-demand skills, gpt-5.6-sol model selection. Headless login
-    exists: codex login --device-auth.
-
-  Both: sessions/turns/cancel/load, model+effort selection, projected
-  identity (CLAUDE.md vs AGENTS.md), hash-gated homes with surviving
-  session state, harness switching with the history barrier. Neither:
-  structured compaction events — compaction is invisible to the substrate
-  today. The full matrix with mechanisms lives in the spec repo
-  (harness-support.md); if reality disagrees with this skill, say so and
-  flag the operator — this file is maintained law, not folklore.
-  """
-
-  @builtin_skills %{
-    "tightbeam-harnesses" =>
-      """
-      ---
-      name: tightbeam-harnesses
-      description: Per-harness feature support matrix (claude vs codex) — what works where and by what mechanism. Consult before promising or relying on a harness-specific feature.
-      ---
-
-      """ <> @builtin_harness_matrix,
-    "tightbeam-skills" =>
-      """
-      ---
-      name: tightbeam-skills
-      description: Manage the org's skill library — create, update, structure (one-shot skills and subject trees), and remove skills via the skill verbs. Use when the operator asks to add or change skills.
-      ---
-
-      """ <> @builtin_skill_mgmt,
-    "tightbeam-assimilate" =>
-      """
-      ---
-      name: tightbeam-assimilate
-      description: Onboard a machine as a tightbeam host — the complete assimilation ceremony (probe, credentials, archetype WHERE, restart, verify). Use when the operator asks to assimilate a machine.
-      ---
-
-      """ <> @builtin_assimilation,
-    "tightbeam-dispatching" => """
-    ---
-    name: tightbeam-dispatching
-    description: Assignment and attest hygiene when dispatching work to another session or holding an assignment yourself. Use when hiring, delegating, or working under an open assignment.
-    ---
-
-    Dispatching work: spawn (or pick) the worker, then open the
-    obligation as a row — `tightbeam assign --subject "..."
-    (--session K | --role R)` — and wake the worker with the brief.
-    Done is rows, not prose: the assignment closes only by the holder's
-    completion or surrender attest, or the operator's revoke.
-
-    Holding an assignment: every turn you end must leave a filing
-    (`tightbeam attest <id> --kind progress|completion|surrender
-    [--note "..."]`) or a continuation wake on the clock. Progress rows
-    reset the prod countdown; scheduled wakes pause it; words do
-    neither. If you stall, prods arrive from process:tightbeam and
-    escalate up your spawner chain after N misses.
-
-    Supervising: an escalation wake means your hire's assignment
-    stalled — N prods, no rows. Judgment is yours: read their stream,
-    wake them, re-staff, or ask the operator to revoke the assignment.
-    The substrate will not conclude why and will not act for you.
-    """
-  }
-
   @doc """
   Load every manifest under `<base_dir>/identity/archetypes/*.toml`, validate,
   merge over the built-in default, and store the set in :persistent_term.
   Raises (failing boot) on: unparseable TOML, unknown top-level keys, `where`
   not a non-empty list of strings, defaults.harness outside claude|codex, a
-  reference missing `location`. Returns the loaded map (name => t()).
+  reference missing `location`, or an org skill using a reserved substrate
+  name. Returns the loaded map (name => t()).
   """
   @spec load!(String.t()) :: %{optional(String.t()) => t()}
   def load!(base_dir) do
     manifest_dir = Path.join([base_dir, "identity", "archetypes"])
 
-    materialize_builtin_skills!(base_dir)
+    refuse_reserved_substrate_skills!(base_dir)
 
     library =
       base_dir
@@ -449,6 +276,7 @@ defmodule Tightbeam.Archetypes do
       |> Path.wildcard()
       |> Enum.map(&(&1 |> Path.dirname() |> Path.basename()))
       |> MapSet.new()
+      |> MapSet.union(MapSet.new(Tightbeam.Homes.baseline_skill_names()))
 
     archetypes =
       manifest_dir
@@ -500,13 +328,13 @@ defmodule Tightbeam.Archetypes do
     archetypes
   end
 
-  defp materialize_builtin_skills!(base_dir) do
-    for {name, content} <- @builtin_skills do
+  defp refuse_reserved_substrate_skills!(base_dir) do
+    for name <- Tightbeam.Homes.baseline_skill_names() do
       path = Path.join([skills_dir(base_dir), name, "SKILL.md"])
 
-      unless File.exists?(path) do
-        File.mkdir_p!(Path.dirname(path))
-        File.write!(path, content)
+      if File.regular?(path) do
+        raise ArgumentError,
+              "#{path}: rename or remove the org copy; substrate names are reserved"
       end
     end
   end
@@ -729,13 +557,19 @@ defmodule Tightbeam.Archetypes do
             |> Path.wildcard()
             |> Enum.map(&(&1 |> Path.dirname() |> Path.basename()))
             |> MapSet.new()
+            |> MapSet.union(MapSet.new(Tightbeam.Homes.baseline_skill_names()))
 
           unknown =
             skills |> Enum.uniq() |> Enum.reject(&MapSet.member?(roots, &1)) |> Enum.sort()
 
           if unknown == [] do
             normalized =
-              skills |> Enum.uniq() |> Enum.reject(&(&1 in archetype.skills)) |> Enum.sort()
+              skills
+              |> Enum.uniq()
+              |> Enum.reject(
+                &(&1 in archetype.skills or &1 in Tightbeam.Homes.baseline_skill_names())
+              )
+              |> Enum.sort()
 
             {:ok, normalized}
           else
@@ -863,13 +697,12 @@ defmodule Tightbeam.Archetypes do
   end
 
   @doc """
-  The shared skills LIBRARY (spec §Agent identity: "skills chosen by name
-  from one shared library"): `<base_dir>/identity/skills/<name>/SKILL.md`.
-  Built-in skills are materialized into the library at load — only when the
-  file is ABSENT, so an operator's edit always wins and deleting the file
-  restores the built-in at next boot. Archetypes elect skills by name;
-  election is validated against the library at load (an unknown name fails
-  the boot — bad law stops the boot).
+  The org skills LIBRARY (spec §Agent identity: "skills chosen by name from
+  one shared library"): `<base_dir>/identity/skills/<name>/SKILL.md`.
+  It contains org skills only; substrate baseline skills ship separately in
+  `priv/skills` and their names are reserved. Archetypes elect org skills by
+  name; election is validated against the library at load (an unknown name
+  fails the boot — bad law stops the boot).
 
   Projection is BY REFERENCE (Homes): a local home gets a symlink into the
   library, so editing a skill updates every electing agent LIVE — no home
@@ -891,8 +724,6 @@ defmodule Tightbeam.Archetypes do
         File.mkdir_p!(Path.join(identity_dir, directory))
       end
 
-      materialize_builtin_skills!(base_dir)
-
       write_unless_exists!(
         Path.join([identity_dir, "archetypes", "default.toml"]),
         builtin_default_toml()
@@ -913,9 +744,9 @@ defmodule Tightbeam.Archetypes do
     end
   end
 
-  @doc "Built-in skill names — the default election when a manifest names none."
+  @doc "Built-in archetype skill election; substrate baseline skills project separately."
   @spec builtin_skill_names() :: [String.t()]
-  def builtin_skill_names, do: @builtin_skills |> Map.keys() |> Enum.sort()
+  def builtin_skill_names, do: []
 
   @doc """
   Library CRUD (the skill verbs' engine — mutation reaches here only

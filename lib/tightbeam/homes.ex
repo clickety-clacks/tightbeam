@@ -26,12 +26,13 @@ defmodule Tightbeam.Homes do
 
   @typedoc """
   A structured harness-home projection input. `skills` is the archetype's
-  election; every entry projects the same way — a symlink at
-  `skills/<name>` pointing at `link_to`, the electing HOST's library
-  replica (local library for local homes; the satellite's replica path for
-  staged homes — dangling in staging by design, valid on arrival). One
-  mode everywhere: content updates flow through the replica, never through
-  home regeneration.
+  election. The substrate baseline is prepended to that election, and every
+  entry projects the same way — a symlink at `skills/<name>` pointing at
+  `link_to`. Baseline links point into the substrate's shipped `priv`; elected
+  links point into the electing HOST's library replica (local library for
+  local homes; the satellite's replica path for staged homes — dangling in
+  staging by design, valid on arrival). One mode everywhere: content updates
+  flow through the linked source, never through home regeneration.
   """
   @type skill_ref :: %{
           name: String.t(),
@@ -59,6 +60,24 @@ defmodule Tightbeam.Homes do
 
   @stamp_file ".tightbeam-manifest"
   @known_credential_files [".credentials.json", "oauth-token", "auth.json"]
+
+  # Namespace invariant: this ordered set is the one substrate baseline truth.
+  # It projects before org elections, and its names are reserved from org skill
+  # libraries; when an election overlaps, the substrate entry wins the one slot.
+  @baseline_skill_names [
+    "tightbeam-dispatching",
+    "tightbeam-assimilate",
+    "tightbeam-harnesses",
+    "tightbeam-skills",
+    "tightbeam-onboarding",
+    "tightbeam-guidance-authoring",
+    "tightbeam-law-minting",
+    "tightbeam-archetype-cultivation"
+  ]
+
+  @doc "Ordered names reserved for the substrate skills baseline."
+  @spec baseline_skill_names() :: [String.t()]
+  def baseline_skill_names, do: @baseline_skill_names
 
   @doc """
   Projects one home from its spec: the harness instruction file, extra files,
@@ -95,7 +114,7 @@ defmodule Tightbeam.Homes do
       File.write!(stamp_path, manifest)
     end
 
-    project_skills(home_path, Map.get(spec, :skills, []))
+    project_skills(home_path, projected_skills(spec))
 
     %{
       home_path: home_path,
@@ -115,7 +134,7 @@ defmodule Tightbeam.Homes do
 
     skills =
       spec
-      |> Map.get(:skills, [])
+      |> projected_skills()
       |> Enum.map(fn skill ->
         %{
           "name" => skill.name,
@@ -224,6 +243,21 @@ defmodule Tightbeam.Homes do
     end
 
     :ok
+  end
+
+  defp projected_skills(spec) do
+    baseline =
+      Enum.map(@baseline_skill_names, fn name ->
+        %{
+          name: name,
+          link_to: Application.app_dir(:tightbeam, "priv/skills/#{name}"),
+          provenance: "substrate",
+          linkage: "linked"
+        }
+      end)
+
+    reserved = MapSet.new(@baseline_skill_names)
+    baseline ++ Enum.reject(Map.get(spec, :skills, []), &MapSet.member?(reserved, &1.name))
   end
 
   # An auth entry that is a REGULAR file in the home (not our symlink) was
