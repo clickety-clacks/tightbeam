@@ -3,6 +3,7 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Projection
 
   defmodule TransitionRace do
     @moduledoc false
@@ -277,6 +278,7 @@ defmodule Tightbeam.Assignments do
               by_provider: input.by_provider
             })
 
+          append_attest_marker(txn, attest)
           {:ok, attest}
         else
           %{code: _} = failure -> {:error, failure}
@@ -492,7 +494,9 @@ defmodule Tightbeam.Assignments do
           )
         end
 
-        fetch_assignment!(txn, id)
+        assignment = fetch_assignment!(txn, id)
+        append_assignment_marker(txn, assignment, :opened)
+        assignment
 
       [] ->
         error("not_found", "unknown sessionKey: #{call.session_key}")
@@ -538,6 +542,7 @@ defmodule Tightbeam.Assignments do
               attest = insert_attest(txn, call, assignment_id)
 
               if call.params.kind == "progress" do
+                append_attest_marker(txn, attest)
                 %{assignment: assignment, attest: attest}
               else
                 outcome =
@@ -554,7 +559,10 @@ defmodule Tightbeam.Assignments do
                 )
 
                 if Txn.changes(txn) != 1, do: raise(TransitionRace)
-                %{assignment: fetch_assignment!(txn, assignment_id), attest: attest}
+                closed_assignment = fetch_assignment!(txn, assignment_id)
+                append_attest_marker(txn, attest)
+                append_assignment_marker(txn, closed_assignment, :closed)
+                %{assignment: closed_assignment, attest: attest}
               end
             end
         end
@@ -582,6 +590,7 @@ defmodule Tightbeam.Assignments do
                  do: raise(TransitionRace)
 
               attest = insert_attest(txn, call, assignment_id)
+              append_attest_marker(txn, attest)
               %{assignment: assignment, attest: attest}
             end
         end
@@ -617,9 +626,52 @@ defmodule Tightbeam.Assignments do
             )
 
             if Txn.changes(txn) != 1, do: raise(TransitionRace)
-            fetch_assignment!(txn, assignment_id)
+            revoked_assignment = fetch_assignment!(txn, assignment_id)
+            append_assignment_marker(txn, revoked_assignment, :revoked)
+            revoked_assignment
         end
     end
+  end
+
+  defp append_attest_marker(_txn, %{bySession: nil}), do: :ok
+
+  defp append_attest_marker(txn, attest) do
+    text =
+      case attest.kind do
+        "verdict" ->
+          "[verdict filed: #{attest.verdictKind} on #{attest.assignmentId}]"
+
+        "completion" ->
+          "[completion filed on #{attest.assignmentId}]"
+
+        "surrender" ->
+          "[surrendered #{attest.assignmentId} — needs user input]"
+
+        "progress" ->
+          "[progress filed on #{attest.assignmentId}]"
+      end
+
+    append_marker(txn, attest.bySession, text)
+  end
+
+  defp append_assignment_marker(txn, assignment, :opened) do
+    append_marker(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
+  end
+
+  defp append_assignment_marker(txn, assignment, :closed) do
+    append_marker(
+      txn,
+      assignment.holderKey,
+      "[assignment closed: #{assignment.id} — #{assignment.outcome}]"
+    )
+  end
+
+  defp append_assignment_marker(txn, assignment, :revoked) do
+    append_marker(txn, assignment.holderKey, "[assignment revoked: #{assignment.id}]")
+  end
+
+  defp append_marker(txn, session_key, text) do
+    best_effort(fn -> Projection.append_marker_in_txn(txn, session_key, text) end)
   end
 
   defp revoke_allowed?(txn, {:user, user}, assignment) do
