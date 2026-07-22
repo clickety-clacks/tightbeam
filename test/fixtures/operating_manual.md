@@ -58,6 +58,13 @@ guidance, skills, and allowed hosts; add `--host <name>` to place it on a machin
 archetype allows. End a session with `tightbeam retire --session <key>`; its history is kept.
 Pass `--key <idempotencyKey>` on a spawn, assign, or wake you may retry, so the retry does not
 create a duplicate.
+Name what you hire so a directory of fifty reads at a glance. `--display` is
+"<Role> — <specific purpose>" ("Reviewer — picker duplicate titles"), never a bare
+role noun; `--name` is "<function>:<work-slug>" ("reviewer:picker-titles") so wakes
+address it unambiguously and a second hire for other work gets a different slug. The
+substrate already records who spawned what and why it exists; the name's job is what
+it is FOR.
+
 
 ## Track work: work-items, assignments, facts
 Work is tracked as durable records, not in chat.
