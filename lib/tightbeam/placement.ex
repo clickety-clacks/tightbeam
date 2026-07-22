@@ -516,6 +516,15 @@ defmodule Tightbeam.Placement do
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
 
     if host_config.ssh == nil do
+      codex_shim = Path.join(config.cli_bin, "codex")
+
+      # Invariant: CODEX_PATH pins codex-acp to the projected shim (the operator-controlled
+      # system codex); unset it and codex-acp silently runs its bundled, different binary.
+      codex_path_env =
+        if harness == :codex and File.exists?(codex_shim),
+          do: [{"CODEX_PATH", codex_shim}],
+          else: []
+
       opts = [
         harness: harness,
         cmd: [binary],
@@ -528,8 +537,7 @@ defmodule Tightbeam.Placement do
             {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
             {"TIGHTBEAM_LINEAGE", lineage}
           ] ++
-            harness_token_env(config.base_dir, harness) ++
-            if(rails?, do: [{"CODEX_CONFIG", ~s({"bypass_hook_trust":true})}], else: [])
+            harness_token_env(config.base_dir, harness) ++ codex_path_env
       ]
 
       if contained? do
@@ -619,13 +627,15 @@ defmodule Tightbeam.Placement do
         (token_env ++
            [
              "#{home_env}=#{home}",
-             if(rails?, do: ~s(CODEX_CONFIG='{"bypass_hook_trust":true}')),
              "TIGHTBEAM_HOME=#{host_config.base_dir}",
              "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
              "PATH=#{cli_bin}:$PATH",
              "TIGHTBEAM_LINEAGE=#{lineage}"
            ])
         |> Enum.reject(&is_nil/1)
+
+      # Remote/satellite follow-up: project the codex shim on cli_bin and set CODEX_PATH to
+      # pin codex-acp to that operator-controlled system codex instead of its bundled binary.
 
       Keyword.merge(
         [

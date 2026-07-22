@@ -21,6 +21,8 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_attestation_timeout 120_000
   @gate_marker "[gate: tightbeam-probe]"
   @gate_prompt "Run exactly this command with your shell tool, then stop: tightbeam-gate-probe"
+  @gate_raw_update_limit 20
+  @gate_raw_log_limit 4_096
 
   @presets %{
     claude: %{
@@ -193,7 +195,12 @@ defmodule Tightbeam.Acp.Adapter do
             adapter_ready(opts)
             {:noreply, state}
 
-          {:error, detail, output} ->
+          {:error, detail, output, raw_updates} ->
+            gate_log(
+              Keyword.get(opts, :stderr_path, "/dev/null"),
+              "[gate-drift] raw_updates=#{gate_raw_updates(raw_updates)}"
+            )
+
             gate_log(
               Keyword.get(opts, :stderr_path, "/dev/null"),
               "gate wiring-check FAIL detail=#{detail} output=#{inspect(output)}"
@@ -420,8 +427,8 @@ defmodule Tightbeam.Acp.Adapter do
            }) do
       gate_prompt(state.conn, sid, deadline)
     else
-      {:error, :deadline} -> {:error, :deadline, ""}
-      {:error, _error} -> {:error, :turn_error, ""}
+      {:error, :deadline} -> {:error, :deadline, "", []}
+      {:error, _error} -> {:error, :turn_error, "", []}
     end
   end
 
@@ -441,7 +448,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp gate_prompt(conn, sid, deadline) do
     case gate_remaining(deadline) do
       remaining when remaining <= 0 ->
-        {:error, :deadline, ""}
+        {:error, :deadline, "", []}
 
       remaining ->
         parent = self()
@@ -459,17 +466,24 @@ defmodule Tightbeam.Acp.Adapter do
         end)
 
         timer = Process.send_after(self(), :gate_attestation_deadline, remaining)
-        gate_prompt_wait(sid, timer, [])
+        gate_prompt_wait(sid, timer, {[], []})
     end
   end
 
-  defp gate_prompt_wait(sid, timer, output) do
+  defp gate_prompt_wait(sid, timer, {output, raw_updates}) do
     receive do
       {:acp_notification, "session/update", %{"sessionId" => ^sid, "update" => update}} ->
-        gate_prompt_wait(sid, timer, gate_update_output(update) ++ output)
+        gate_prompt_wait(
+          sid,
+          timer,
+          {
+            gate_update_output(update) ++ output,
+            [update | raw_updates] |> Enum.take(@gate_raw_update_limit)
+          }
+        )
 
       {:acp_notification, _method, _params} ->
-        gate_prompt_wait(sid, timer, output)
+        gate_prompt_wait(sid, timer, {output, raw_updates})
 
       {:gate_attestation_prompt_done, ^sid, result} ->
         cancel_gate_timer(timer)
@@ -479,21 +493,21 @@ defmodule Tightbeam.Acp.Adapter do
           {:ok, _} ->
             if String.contains?(collected, @gate_marker),
               do: {:ok, collected},
-              else: {:error, :no_marker, collected}
+              else: {:error, :no_marker, collected, raw_updates}
 
           {:error, :deadline} ->
-            {:error, :deadline, collected}
+            {:error, :deadline, collected, raw_updates}
 
           {:error, _error} ->
-            {:error, :turn_error, collected}
+            {:error, :turn_error, collected, raw_updates}
         end
 
       :gate_attestation_deadline ->
-        {:error, :deadline, output |> Enum.reverse() |> Enum.join()}
+        {:error, :deadline, output |> Enum.reverse() |> Enum.join(), raw_updates}
 
       {:acp_exit, _status} ->
         cancel_gate_timer(timer)
-        {:error, :turn_error, output |> Enum.reverse() |> Enum.join()}
+        {:error, :turn_error, output |> Enum.reverse() |> Enum.join(), raw_updates}
     end
   end
 
@@ -509,6 +523,13 @@ defmodule Tightbeam.Acp.Adapter do
        do: [JSON.encode!(content)]
 
   defp gate_update_output(_update), do: []
+
+  defp gate_raw_updates(raw_updates) do
+    raw_updates
+    |> Enum.reverse()
+    |> JSON.encode!()
+    |> String.slice(0, @gate_raw_log_limit)
+  end
 
   defp gate_remaining(deadline), do: deadline - System.monotonic_time(:millisecond)
 

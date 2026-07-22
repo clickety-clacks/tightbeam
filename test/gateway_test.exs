@@ -440,6 +440,59 @@ defmodule Tightbeam.GatewayTest do
     end)
   end
 
+  test "children installs the codex hook-trust shim and skips missing or self-resolved codex",
+       ctx do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_codex_shim_#{System.unique_integer([:positive])}"
+      )
+
+    real_bin = Path.join(root, "real-bin")
+    real_codex = Path.join(real_bin, "codex")
+    shim_base = Path.join(root, "shim-base")
+    missing_bin = Path.join(root, "missing-bin")
+    missing_base = Path.join(root, "missing-base")
+    self_base = Path.join(root, "self-base")
+    self_codex = Path.join(self_base, "bin/codex")
+    original_path = System.get_env("PATH")
+
+    File.mkdir_p!(real_bin)
+    File.write!(real_codex, "#!/bin/sh\n")
+    File.chmod!(real_codex, 0o755)
+    File.mkdir_p!(missing_bin)
+    File.mkdir_p!(Path.dirname(self_codex))
+    File.write!(self_codex, "self-sentinel")
+    File.chmod!(self_codex, 0o755)
+
+    on_exit(fn ->
+      File.rm_rf!(root)
+
+      if original_path do
+        System.put_env("PATH", original_path)
+      else
+        System.delete_env("PATH")
+      end
+    end)
+
+    System.put_env("PATH", real_bin)
+    Gateway.children(gateway_config(shim_base, ctx.db, 0))
+    shim = Path.join(shim_base, "bin/codex")
+
+    assert File.read!(shim) ==
+             "#!/bin/sh\nexec \"#{real_codex}\" --dangerously-bypass-hook-trust \"$@\"\n"
+
+    assert File.stat!(shim).mode |> Bitwise.band(0o777) == 0o755
+
+    System.put_env("PATH", missing_bin)
+    Gateway.children(gateway_config(missing_base, ctx.db, 0))
+    refute File.exists?(Path.join(missing_base, "bin/codex"))
+
+    System.put_env("PATH", Path.dirname(self_codex))
+    Gateway.children(gateway_config(self_base, ctx.db, 0))
+    assert File.read!(self_codex) == "self-sentinel"
+  end
+
   test "wake idempotency replays one scheduled wake", ctx do
     wake = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["wake"]
     due_at = System.system_time(:millisecond) + 60_000

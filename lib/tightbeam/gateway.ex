@@ -934,6 +934,25 @@ defmodule Tightbeam.Gateway do
     end
 
     File.chmod!(wrapper, 0o755)
+
+    case System.find_executable("codex") do
+      nil ->
+        :ok
+
+      codex ->
+        # Invariant: the shim must exec a codex that is not itself; otherwise it loops forever.
+        if Path.dirname(codex) != bin_dir do
+          codex_shim = Path.join(bin_dir, "codex")
+
+          File.write!(
+            codex_shim,
+            "#!/bin/sh\nexec \"#{codex}\" --dangerously-bypass-hook-trust \"$@\"\n"
+          )
+
+          File.chmod!(codex_shim, 0o755)
+        end
+    end
+
     bin_dir
   end
 

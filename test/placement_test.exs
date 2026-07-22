@@ -649,10 +649,11 @@ defmodule Tightbeam.PlacementTest do
     refute Keyword.has_key?(opts, :probe_cwd)
     refute Keyword.has_key?(opts, :probe_model)
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
+    refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     refute_receive {:unexpected_sh, _}
   end
 
-  test "adapter_opts seeds and prepares a local codex gate probe only when statutes exist", %{
+  test "adapter_opts prepares a local codex gate probe without CODEX_CONFIG", %{
     base_dir: base_dir
   } do
     install_statute(base_dir)
@@ -662,11 +663,16 @@ defmodule Tightbeam.PlacementTest do
     File.mkdir_p!(probe_cwd)
     File.write!(Path.join(probe_cwd, "stale"), "remove me")
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    cli_bin = Path.join(base_dir, "bin")
+    codex_shim = Path.join(cli_bin, "codex")
+    File.mkdir_p!(cli_bin)
+    File.write!(codex_shim, "#!/bin/sh\n")
+
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: cli_bin, default_model: "fable"}
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
-    assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
-    assert Enum.count(opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end) == 1
+    refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
+    assert {"CODEX_PATH", codex_shim} in opts[:env]
     assert opts[:probe_cwd] == probe_cwd
     assert opts[:probe_model] == "gpt-5.6-sol[medium]"
     refute opts[:probe_model] == config.default_model
@@ -676,6 +682,7 @@ defmodule Tightbeam.PlacementTest do
     refute Keyword.has_key?(claude_opts, :probe_cwd)
     refute Keyword.has_key?(claude_opts, :probe_model)
     refute Enum.any?(claude_opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
+    refute Enum.any?(claude_opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
   end
 
   test "adapter_opts injects the org's claude token env when the store holds one", %{
@@ -755,7 +762,7 @@ defmodule Tightbeam.PlacementTest do
     refute Enum.any?(opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
   end
 
-  test "adapter_opts quotes the remote codex trust seed and prepares the remote probe", %{
+  test "adapter_opts prepares the remote codex probe without CODEX_CONFIG", %{
     base_dir: base_dir
   } do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
@@ -782,7 +789,7 @@ defmodule Tightbeam.PlacementTest do
     }
 
     opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
-    assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
+    refute Enum.any?(opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
     assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
     assert opts[:probe_model] == "gpt-5.6-sol[medium]"
 
@@ -1043,7 +1050,13 @@ defmodule Tightbeam.PlacementTest do
     auth_path = Path.join(auth_dir, "auth.json")
     File.write!(auth_path, "old")
 
-    config = %{base_dir: canonical_base, cwd: "/work", cli_bin: "/bin", default_model: "fable", db: db}
+    config = %{
+      base_dir: canonical_base,
+      cwd: "/work",
+      cli_bin: "/bin",
+      default_model: "fable",
+      db: db
+    }
 
     home = Placement.deliver_home(config, {:codex, "default", "testhost"})
     nested = Path.join(home, "sessions/state.json")
@@ -1275,6 +1288,7 @@ defmodule Tightbeam.PlacementTest do
       cli_bin: "/local/bin",
       default_model: "claude-fable-5"
     }
+
     lawless_codex_home = Placement.deliver_home(config, {:codex, "default", "testhost"})
     lawless_agents = File.read!(Path.join(lawless_codex_home, "AGENTS.md"))
     lawless_manifest = File.read!(Path.join(lawless_codex_home, ".tightbeam-manifest"))

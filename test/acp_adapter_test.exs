@@ -70,6 +70,10 @@ defmodule Tightbeam.Acp.AdapterTest do
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "command not found" } } } });
             return send({ id: m.id, result: { stopReason: "end_turn" } });
           }
+          if (gateMode === "drift") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "drifted_shape", zz_payload: { text: "x".repeat(8000) } } } });
+            return send({ id: m.id, result: { stopReason: "end_turn" } });
+          }
           if (gateMode === "turn-error") {
             return send({ id: m.id, error: { code: -32000, message: "probe turn failed" } });
           }
@@ -328,7 +332,22 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       assert capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
                "gate wiring-check PASS [gate: tightbeam-probe]"
+
+      refute capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+               "[gate-drift]"
     end
+  end
+
+  test "gate wiring-check logs bounded raw updates only when an update shape drifts" do
+    {adapter, capture_path} = start_adapter(harness: :codex, gate_mode: "drift")
+    monitor = Process.monitor(adapter)
+
+    assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, :no_marker}}
+
+    log = capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!()
+    assert log =~ "[gate-drift] raw_updates="
+    assert log =~ ~s("sessionUpdate":"drifted_shape")
+    assert byte_size(log) < 5_000
   end
 
   test "gate wiring-check fails closed without the marker or on a probe turn error" do
