@@ -4,7 +4,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.ModelCatalog
 
-  @shortdoc "Diff the live model catalog against characterized model guidance"
+  @shortdoc "Diff the live model catalog against the preferred-model working set"
 
   @harnesses ["claude", "codex"]
   @poll_interval_ms 250
@@ -20,7 +20,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     end
 
     base_dir = options[:base_dir] || base_dir()
-    guidance_path = Path.join([base_dir, "identity", "guidance", "model-selection.md"])
+    guidance_path = Path.join([base_dir, "identity", "guidance", "preferred-models.md"])
 
     inventories =
       case fetch_live(base_dir) do
@@ -62,7 +62,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
   @doc false
   def evaluate(inventories, guidance_path) do
-    characterized = read_characterized!(guidance_path)
+    working_set = read_working_set!(guidance_path)
 
     live =
       inventories
@@ -73,19 +73,19 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
       |> Enum.sort()
 
     live_models = MapSet.new(live, &base_ref/1)
-    characterized_models = MapSet.new(characterized, &base_ref/1)
+    working_set_models = MapSet.new(working_set, &base_ref/1)
 
-    # A characterization covers the catalog's base model identity regardless of
+    # Working-set membership covers the catalog's base model identity regardless of
     # whether either side spells the ref with an effort qualifier. Reports retain
     # the source refs; only set membership is normalized through the shared parser.
     diff = %{
-      uncharacterized: Enum.reject(live, &MapSet.member?(characterized_models, base_ref(&1))),
-      vanished: Enum.reject(characterized, &MapSet.member?(live_models, base_ref(&1))),
+      missing_from_catalog: Enum.reject(working_set, &MapSet.member?(live_models, base_ref(&1))),
+      new_arrivals: Enum.reject(live, &MapSet.member?(working_set_models, base_ref(&1))),
       live: live,
-      characterized: characterized
+      working_set: working_set
     }
 
-    status = if diff.uncharacterized == [] and diff.vanished == [], do: 0, else: 1
+    status = if diff.missing_from_catalog == [], do: 0, else: 1
     {status, diff}
   end
 
@@ -94,10 +94,10 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
   def format(diff, :human) do
     [
-      report_section("UNCHARACTERIZED live refs", diff.uncharacterized),
-      report_section("VANISHED characterized refs", diff.vanished),
+      report_section("MISSING FROM CATALOG (drift)", diff.missing_from_catalog),
+      report_section("NEW ARRIVALS (info)", diff.new_arrivals),
       "Live refs: #{length(diff.live)}",
-      "Characterized refs: #{length(diff.characterized)}"
+      "Working-set models: #{length(diff.working_set)}"
     ]
     |> Enum.join("\n")
   end
@@ -126,26 +126,23 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     end
   end
 
-  defp read_characterized!(guidance_path) do
+  defp read_working_set!(guidance_path) do
     guidance_path
     |> File.read!()
     |> String.split("\n")
-    |> Enum.drop_while(&(not String.starts_with?(&1, "Characterizations")))
+    |> Enum.drop_while(&(&1 != "## Working set (capsules)"))
     |> case do
-      [] -> Mix.raise("model_selection_parse_failed: Characterizations section not found")
-      [_heading | section] -> characterization_bullets(section)
+      [] -> Mix.raise("preferred_models_parse_failed: Working set (capsules) section not found")
+      [_heading | section] -> working_set_bullets(section)
     end
   end
 
-  defp characterization_bullets(lines) do
+  defp working_set_bullets(lines) do
     lines
-    |> Enum.drop_while(&(not Regex.match?(~r/^- `[^`]+`/, &1)))
-    |> Enum.take_while(fn line ->
-      line == "" or String.starts_with?(line, "- `") or String.match?(line, ~r/^\s/)
-    end)
+    |> Enum.take_while(&(not String.starts_with?(&1, "## ")))
     |> Enum.flat_map(fn line ->
-      case Regex.run(~r/^- `([^`]+)`/, line) do
-        [_, ref] -> [ref]
+      case Regex.run(~r/^- \*\*([^*]+)\*\* —/, line) do
+        [_, model_id] -> [model_id]
         nil -> []
       end
     end)

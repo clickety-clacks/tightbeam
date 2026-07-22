@@ -3,33 +3,37 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
 
   alias Mix.Tasks.Tightbeam.Catalog.Diff
 
-  test "detects uncharacterized live refs" do
+  test "working-set model absent from the live catalog is drift" do
+    with_guidance(["known", "vanished"], fn path ->
+      {status, diff} = Diff.evaluate(inventories(["known[low]"]), path)
+
+      assert status == 1
+      assert diff.missing_from_catalog == ["vanished"]
+      assert diff.new_arrivals == []
+    end)
+  end
+
+  test "live model outside the working set is informational" do
     with_guidance(["known"], fn path ->
       {status, diff} = Diff.evaluate(inventories(["known[low]", "new[high]"]), path)
 
-      assert status == 1
-      assert diff.uncharacterized == ["new[high]"]
-      assert diff.vanished == []
+      assert status == 0
+      assert diff.missing_from_catalog == []
+      assert diff.new_arrivals == ["new[high]"]
+
+      report = Diff.format(diff, :human)
+      assert report =~ "MISSING FROM CATALOG (drift): none"
+      assert report =~ "NEW ARRIVALS (info):\n  - new[high]"
     end)
   end
 
-  test "detects vanished characterized refs" do
-    with_guidance(["known", "retired[low]"], fn path ->
-      {status, diff} = Diff.evaluate(inventories(["known[high]"]), path)
-
-      assert status == 1
-      assert diff.uncharacterized == []
-      assert diff.vanished == ["retired[low]"]
-    end)
-  end
-
-  test "clean coverage has zero exit status" do
+  test "all working-set models live has zero exit status even with new arrivals" do
     with_guidance(["known"], fn path ->
-      {status, diff} = Diff.evaluate(inventories(["known[low]", "known[high]"]), path)
+      {status, diff} = Diff.evaluate(inventories(["known[low]", "new[high]"]), path)
 
       assert status == 0
-      assert diff.uncharacterized == []
-      assert diff.vanished == []
+      assert diff.missing_from_catalog == []
+      assert diff.new_arrivals == ["new[high]"]
     end)
   end
 
@@ -39,21 +43,42 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
 
       assert {:ok,
               %{
-                "uncharacterized" => ["new[xhigh]"],
-                "vanished" => ["retired"],
+                "missing_from_catalog" => ["retired"],
+                "new_arrivals" => ["new[xhigh]"],
                 "live" => ["known[low]", "new[xhigh]"],
-                "characterized" => ["known", "retired"]
+                "working_set" => ["known", "retired"]
               }} = JSON.decode(Diff.format(diff, :json))
     end)
   end
 
   test "bare and effort-qualified refs normalize to the same model" do
-    with_guidance(["known[xhigh]"], fn path ->
+    with_guidance(["known"], fn path ->
       {status, diff} = Diff.evaluate(inventories(["known[low]", "known[medium]"]), path)
 
       assert status == 0
-      assert diff.uncharacterized == []
-      assert diff.vanished == []
+      assert diff.missing_from_catalog == []
+      assert diff.new_arrivals == []
+    end)
+  end
+
+  test "ignores non-capsule bullets and stops at the next level-two heading" do
+    with_guidance(["known"], fn path ->
+      File.write!(path, File.read!(path) <> "\n- **outside** — not in the working set\n")
+
+      {status, diff} = Diff.evaluate(inventories(["known[low]"]), path)
+
+      assert status == 0
+      assert diff.working_set == ["known"]
+    end)
+  end
+
+  test "raises a classified error when the working-set section is absent" do
+    with_guidance(["known"], fn path ->
+      File.write!(path, "# Preferred models\n")
+
+      assert_raise Mix.Error,
+                   ~r/preferred_models_parse_failed: Working set \(capsules\) section not found/,
+                   fn -> Diff.evaluate(inventories(["known"]), path) end
     end)
   end
 
@@ -62,13 +87,13 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     @tag skip: "run with --only external"
   end
 
-  test "live catalog is fully characterized" do
+  test "real working set is present in the live catalog" do
     base_dir = Diff.base_dir()
-    guidance_path = Path.join([base_dir, "identity", "guidance", "model-selection.md"])
+    guidance_path = Path.join([base_dir, "identity", "guidance", "preferred-models.md"])
 
     assert {:ok, inventories} = Diff.fetch_live(base_dir)
-    result = Diff.evaluate(inventories, guidance_path)
-    assert {0, _diff} = result, inspect(result)
+    {status, diff} = Diff.evaluate(inventories, guidance_path)
+    assert status == 0, inspect(diff.missing_from_catalog)
   end
 
   defp inventories(refs) do
@@ -85,18 +110,21 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
         "tightbeam-catalog-diff-#{System.unique_integer([:positive])}"
       )
 
-    path = Path.join(dir, "model-selection.md")
+    path = Path.join(dir, "preferred-models.md")
     File.mkdir_p!(dir)
 
     body =
       """
-      # Choosing a model for a job
+      # Preferred models
 
-      Characterizations — the entries below are examples; replace them with this org's models and
-      judgments:
-      #{Enum.map_join(refs, "\n", &"- `#{&1}`: characterization")}
+      ## Working set (capsules)
 
-      Format for an entry: guidance.
+      #{Enum.map_join(refs, "\n", &"- **#{&1}** — capsule")}
+      - [Flynn: confirm the set — add/drop as needed]
+
+      ## Activity
+
+      - **activity-model** — not a working-set capsule
       """
 
     File.write!(path, body)
