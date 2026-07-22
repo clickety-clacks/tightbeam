@@ -340,6 +340,119 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body) == %{"deletedSessionKey" => key}
   end
 
+  test "PATCH /api/streams/:key accepts at most four total percent-decode layers", ctx do
+    key = "agent:main:clawline:mike:main s_test_decode_cap"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", &send_call/1)
+
+    four_layer_key = String.replace(key, " ", "%25252520")
+
+    accepted =
+      conn(
+        :patch,
+        "/api/streams/#{four_layer_key}",
+        JSON.encode!(%{"displayName" => "Renamed"})
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert accepted.status == 200
+    assert_receive {:call, %{verb: "tune", session_key: ^key}}
+
+    five_layer_key = String.replace(key, " ", "%2525252520")
+
+    rejected =
+      conn(
+        :patch,
+        "/api/streams/#{five_layer_key}",
+        JSON.encode!(%{"displayName" => "Not renamed"})
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert rejected.status == 404
+    refute_received {:call, _}
+  end
+
+  test "stream mutations reject a repeatedly encoded path separator before lookup", ctx do
+    key = "agent:main:clawline:mike:main/child"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts =
+      ctx.opts
+      |> with_handler("tune", &send_call/1)
+      |> with_handler("retire", &send_call/1)
+
+    encoded_key = String.replace(key, "/", "%252F")
+
+    patch =
+      conn(:patch, "/api/streams/#{encoded_key}", JSON.encode!(%{"displayName" => "Renamed"}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    delete =
+      conn(:delete, "/api/streams/#{encoded_key}", JSON.encode!(%{}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert patch.status == 400
+    assert delete.status == 400
+    refute_received {:call, _}
+  end
+
+  test "stream mutations reject malformed percent encoding before lookup", ctx do
+    key = "agent:main:clawline:mike:main%zz"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts =
+      ctx.opts
+      |> with_handler("tune", &send_call/1)
+      |> with_handler("retire", &send_call/1)
+
+    encoded_key = String.replace(key, "%", "%2525")
+
+    patch =
+      conn(:patch, "/api/streams/#{encoded_key}", JSON.encode!(%{"displayName" => "Renamed"}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    delete =
+      conn(:delete, "/api/streams/#{encoded_key}", JSON.encode!(%{}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert patch.status == 400
+    assert delete.status == 400
+    refute_received {:call, _}
+  end
+
+  test "encoded stream keys do not widen PATCH or DELETE ownership", ctx do
+    other = approved_device(ctx.db, "other-stream-device", "Other Stream Owner")
+    key = "agent:main:clawline:other:main s_private"
+    create_session(ctx.db, key, other.user_id)
+
+    opts =
+      ctx.opts
+      |> with_handler("tune", &send_call/1)
+      |> with_handler("retire", &send_call/1)
+
+    encoded_key = String.replace(key, " ", "%2520")
+
+    patch =
+      conn(:patch, "/api/streams/#{encoded_key}", JSON.encode!(%{"displayName" => "Renamed"}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    delete =
+      conn(:delete, "/api/streams/#{encoded_key}", JSON.encode!(%{}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert patch.status == 404
+    assert delete.status == 404
+    refute_received {:call, _}
+  end
+
   test "PATCH /api/streams/:key resolves a double-encoded '%252B' path key as a literal plus",
        ctx do
     key = "agent:main:clawline:mike:main+plus_test2b"
@@ -361,7 +474,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{verb: "tune", session_key: ^key}}
   end
 
-  test "PATCH /api/streams/:key 404s cleanly on a malformed percent escape in the key", ctx do
+  test "PATCH /api/streams/:key rejects a malformed percent escape in the key", ctx do
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
     response =
@@ -373,7 +486,7 @@ defmodule Tightbeam.Wire.RouterTest do
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
       |> Router.call(Router.init(opts))
 
-    assert response.status == 404
+    assert response.status == 400
     refute_received {:call, _}
   end
 

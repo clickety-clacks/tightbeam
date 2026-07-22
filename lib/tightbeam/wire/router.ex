@@ -172,7 +172,8 @@ defmodule Tightbeam.Wire.Router do
 
   patch "/api/streams/:key" do
     with {:ok, device} <- device_auth(conn),
-         {:ok, session} <- owned_session(decode_session_key_param(key), device, conn),
+         {:ok, decoded_key} <- decode_session_key_param(key),
+         {:ok, session} <- owned_session(decoded_key, device, conn),
          {:ok, body, conn} <- read_json(conn),
          {:ok, display_name} <- required_string(body["displayName"]) do
       call = %{
@@ -191,7 +192,8 @@ defmodule Tightbeam.Wire.Router do
   delete "/api/streams/:key" do
     with {:ok, device} <- device_auth(conn),
          {:ok, body, conn} <- read_json(conn),
-         {:ok, session_key} <- retire_target(decode_session_key_param(key), body, device, conn) do
+         {:ok, decoded_key} <- decode_session_key_param(key),
+         {:ok, session_key} <- retire_target(decoded_key, body, device, conn) do
       params =
         if is_binary(body["idempotencyKey"]),
           do: %{idempotency_key: body["idempotencyKey"]},
@@ -548,34 +550,41 @@ defmodule Tightbeam.Wire.Router do
   # convention, not a path one) — session keys carry a space, never a literal '+'.
   #
   # The clawline iOS client sometimes double-percent-encodes the :key segment (a
-  # space becomes %2520 instead of %20); since Plug's router already decodes the
-  # segment once before we see it, a double-encoded key arrives still encoded
-  # (e.g. "%20"). Peel off up to @session_key_decode_passes more layers, stopping
-  # at the first fixed point so an already-decoded (single-encoded) key is left
-  # untouched. The "+" -> " " replacement runs first so an explicitly-escaped
-  # literal plus (%2B, which only becomes "+" via the decode loop) survives
-  # instead of being swept into the space heuristic meant for raw '+' characters.
-  @session_key_decode_passes 4
+  # space becomes %2520 instead of %20). Plug's router decodes the segment once
+  # before we see it, so three additional passes preserve the four-pass wire cap.
+  # Stop at the first fixed point. The "+" -> " " replacement runs first so an
+  # explicitly-escaped literal plus (%2B, which only becomes "+" via the decode
+  # loop) survives the heuristic meant for raw '+' characters.
+  @session_key_decode_passes 3
+  @malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
 
   defp decode_session_key_param(key) do
-    key
-    |> String.replace("+", " ")
-    |> decode_session_key_percent(@session_key_decode_passes)
-  end
-
-  defp decode_session_key_percent(key, 0), do: key
-
-  defp decode_session_key_percent(key, passes_left) do
-    case safe_uri_decode(key) do
-      ^key -> key
-      decoded -> decode_session_key_percent(decoded, passes_left - 1)
+    with {:ok, decoded} <-
+           key
+           |> String.replace("+", " ")
+           |> decode_session_key_percent(@session_key_decode_passes),
+         false <- String.contains?(decoded, "/") do
+      {:ok, decoded}
+    else
+      _ -> {:error, 400, "invalid_session_key", nil}
     end
   end
 
-  defp safe_uri_decode(key) do
-    URI.decode(key)
+  defp decode_session_key_percent(key, 0) do
+    if Regex.match?(@malformed_percent_escape, key), do: :error, else: {:ok, key}
+  end
+
+  defp decode_session_key_percent(key, passes_left) do
+    if Regex.match?(@malformed_percent_escape, key) do
+      :error
+    else
+      case URI.decode(key) do
+        ^key -> {:ok, key}
+        decoded -> decode_session_key_percent(decoded, passes_left - 1)
+      end
+    end
   rescue
-    ArgumentError -> key
+    ArgumentError -> :error
   end
 
   defp owned_session(key, device, conn) do
