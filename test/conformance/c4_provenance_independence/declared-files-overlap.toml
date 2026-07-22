@@ -1,0 +1,8 @@
+[fixture]
+class = "C4"
+name = "declared-files-overlap"
+phase = "green"
+blocking_phase = ""
+kind = "handler-refusal"
+source = "p3 §3.3/§4D handler transaction + concurrency"
+legibility = "handler:files_overlap"

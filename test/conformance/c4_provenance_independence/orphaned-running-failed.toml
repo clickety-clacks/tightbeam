@@ -1,0 +1,17 @@
+[fixture]
+class = "C4"
+name = "orphaned-running-failed"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "p3 r7 gateway boot recovery"
+legibility = "event:denied(rule=orphaned-running-failed)"
+
+[[fixture.rule]]
+name = "orphaned-running-failed"
+verb = "attest"
+text = "completion needs a producer verdict; orphaned running work fails closed"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["tests-passed"] },
+]

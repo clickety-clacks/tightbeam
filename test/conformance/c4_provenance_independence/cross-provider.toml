@@ -1,0 +1,17 @@
+[fixture]
+class = "C4"
+name = "cross-provider"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "p3 §4A assignment.cross_provider_verdict_kinds"
+legibility = "event:denied(rule=cross-provider-review)"
+
+[[fixture.rule]]
+name = "cross-provider-review"
+verb = "attest"
+text = "completion needs a commissioned cross-provider reviewed-clean verdict"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.cross_provider_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]

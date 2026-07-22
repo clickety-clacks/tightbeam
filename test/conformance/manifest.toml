@@ -30,8 +30,8 @@ id = "C4"
 dir = "c4_provenance_independence"
 title = "Provenance / independence"
 kind = "dispatch-rule + handler-refusal"
-phase = "pending"
-blocking_phase = "P3"
+phase = "green"
+blocking_phase = ""
 runners = ["rules_evaluate", "handler_refusal"]
 
 [[class]]

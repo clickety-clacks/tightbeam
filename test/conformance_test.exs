@@ -106,8 +106,16 @@ defmodule Tightbeam.ConformanceSupport do
     fixture
     |> Map.put("path", path)
     |> Map.put("cases", cases)
-    |> Map.put("runners", class["runners"])
+    |> Map.put("runners", applicable_runners(fixture["kind"], class["runners"]))
   end
+
+  defp applicable_runners("dispatch-rule", runners),
+    do: Enum.filter(runners, &(&1 == "rules_evaluate"))
+
+  defp applicable_runners("handler-refusal", runners),
+    do: Enum.filter(runners, &(&1 == "handler_refusal"))
+
+  defp applicable_runners(_kind, runners), do: runners
 
   defp load_loadset!(path, class) do
     loadset = path |> decode_toml!() |> Map.fetch!("loadset")
@@ -304,25 +312,21 @@ defmodule Tightbeam.ConformanceSupport do
     Rules.load!(base, Map.keys(handlers))
 
     try do
-      Enum.each(fixture["cases"], &run_rule_case(&1, handlers))
+      Enum.each(fixture["cases"], &run_rule_case(fixture, &1, handlers))
     after
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
     end
   end
 
-  defp run_rule_case(kase, handlers) do
+  defp run_rule_case(fixture, kase, handlers) do
     {db, pid} = memory_db!()
 
     try do
       ids = materialize_world(db, Map.get(kase, "world", %{}))
+      assert_fixture_world(fixture, kase, db, ids)
       call = build_call(kase["call"], ids)
-
-      case {kase["expect"], Rules.evaluate(db, call)} do
-        {"deny", {:deny, %{rule: reason}}} -> assert reason == kase["reason"]
-        {"pass", :ok} -> :ok
-        {expect, actual} -> flunk("#{kase["case"]}: expected #{expect}, got #{inspect(actual)}")
-      end
+      assert_rule_result(kase["case"], kase["expect"], kase["reason"], Rules.evaluate(db, call))
 
       if kase["kind"] == "legibility" do
         assert {:error, %{rule: reason}} = Dispatch.dispatch(db, handlers, call)
@@ -333,10 +337,53 @@ defmodule Tightbeam.ConformanceSupport do
 
         assert payload =~ ~s(rule: "#{kase["reason"]}")
       end
+
+      if phase2 = kase["phase2"] do
+        ids = materialize_world(db, Map.get(phase2, "world", %{}), ids)
+        phase2_call = build_call(phase2["call"] || kase["call"], ids)
+
+        assert_rule_result(
+          "#{kase["case"]} phase2",
+          phase2["expect"] || kase["expect"],
+          kase["reason"],
+          Rules.evaluate(db, phase2_call)
+        )
+      end
     after
       GenServer.stop(pid)
     end
   end
+
+  defp assert_rule_result(_case, "deny", reason, {:deny, %{rule: actual}}),
+    do: assert(actual == reason)
+
+  defp assert_rule_result(_case, "pass", _reason, :ok), do: :ok
+
+  defp assert_rule_result(case_id, expect, _reason, actual),
+    do: flunk("#{case_id}: expected #{expect}, got #{inspect(actual)}")
+
+  defp assert_fixture_world(%{"name" => "orphaned-running-failed"}, kase, db, ids) do
+    :ok = Producers.recover(db)
+
+    Enum.each(ids.producer_jobs, fn {_key, job_id} ->
+      job = Producers.get(db, job_id)
+
+      if kase["expect"] == "deny" do
+        assert job.state == "failed"
+        assert Assignments.list_attests(db, job.assignment_id) == []
+
+        assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
+                 event.kind == "producer_failed" and event.subject == job.assignment_id and
+                   event.detail =~ "orphaned"
+               end)
+      else
+        assert job.state == "done"
+        assert length(Assignments.list_attests(db, job.assignment_id)) == 1
+      end
+    end)
+  end
+
+  defp assert_fixture_world(_fixture, _kase, _db, _ids), do: :ok
 
   def run_handler_refusal_fixture(fixture) do
     Enum.each(fixture["cases"], fn kase ->
@@ -347,18 +394,34 @@ defmodule Tightbeam.ConformanceSupport do
         call = build_call(kase["call"], ids)
         handlers = Gateway.handlers(%{db: db})
         {:ok, [[before_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
-        result = Dispatch.dispatch(db, handlers, call)
-        {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
+        overlap? = Assignments.open_assignments_touching(db, call.params[:files] || []) != []
 
-        case kase["expect"] do
-          "refuse" ->
-            assert {:error, %{code: code}} = result
-            assert code == kase["reason"]
-            assert after_count == before_count
+        if String.contains?(kase["case"], "concurrent") do
+          results =
+            1..2
+            |> Enum.map(fn _ -> Task.async(fn -> Dispatch.dispatch(db, handlers, call) end) end)
+            |> Task.await_many()
 
-          "pass" ->
-            assert {:ok, _} = result
-            assert after_count == before_count + 1
+          {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
+          assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+          assert Enum.count(results, &match?({:error, %{code: "files_overlap"}}, &1)) == 1
+          assert after_count == before_count + 1
+        else
+          result = Dispatch.dispatch(db, handlers, call)
+          {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
+
+          case kase["expect"] do
+            "refuse" ->
+              assert overlap?
+              assert {:error, %{code: code}} = result
+              assert code == kase["reason"]
+              assert after_count == before_count
+
+            "pass" ->
+              refute overlap?
+              assert {:ok, _} = result
+              assert after_count == before_count + 1
+          end
         end
       after
         GenServer.stop(pid)
@@ -433,7 +496,11 @@ defmodule Tightbeam.ConformanceSupport do
     {name, pid}
   end
 
-  defp materialize_world(db, world) do
+  defp materialize_world(
+         db,
+         world,
+         ids \\ %{assignments: %{}, work_items: %{}, producer_jobs: %{}}
+       ) do
     Enum.each(Map.get(world, "users", []), fn user ->
       {:ok, _} =
         DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, ?2, 1)", [
@@ -467,18 +534,19 @@ defmodule Tightbeam.ConformanceSupport do
     end)
 
     work_items =
-      Enum.reduce(Map.get(world, "work_items", []), %{}, fn item, ids ->
+      Enum.reduce(Map.get(world, "work_items", []), ids.work_items, fn item, item_ids ->
         result =
           WorkItems.__handle__(db, "work-item-create", %{
             principal: {:user, first_user(world)},
             params: %{title: item["title"]}
           })
 
-        Map.put(ids, item["id"], result.id)
+        Map.put(item_ids, item["id"], result.id)
       end)
 
     assignments =
-      Enum.reduce(Map.get(world, "assignments", []), %{}, fn assignment, ids ->
+      Enum.reduce(Map.get(world, "assignments", []), ids.assignments, fn assignment,
+                                                                         assignment_ids ->
         principal =
           principal(
             assignment["creator"] || ["user", Org.get(db, assignment["holder"]).owner_user_id]
@@ -495,7 +563,7 @@ defmodule Tightbeam.ConformanceSupport do
             params: %{
               subject: assignment["id"],
               idempotency_key: nil,
-              reviews_assignment_id: ids[assignment["reviews"]],
+              reviews_assignment_id: assignment_ids[assignment["reviews"]],
               work_item_id: work_items[assignment["work_item"]],
               files: assignment["files"]
             }
@@ -504,7 +572,7 @@ defmodule Tightbeam.ConformanceSupport do
         assert is_binary(result.id),
                "failed to materialize assignment #{assignment["id"]}: #{inspect(result)}"
 
-        Map.put(ids, assignment["id"], result.id)
+        Map.put(assignment_ids, assignment["id"], result.id)
       end)
 
     Enum.each(Map.get(world, "attests", []), fn attest ->
@@ -558,70 +626,38 @@ defmodule Tightbeam.ConformanceSupport do
       end)
     end)
 
-    Enum.each(Map.get(world, "producer_job", []), fn producer_job ->
-      assignment_id = assignments[producer_job["assignment"]]
+    producer_jobs =
+      Enum.reduce(Map.get(world, "producer_job", []), ids.producer_jobs, fn producer_job,
+                                                                            job_ids ->
+        assignment_id = assignments[producer_job["assignment"]]
+        key = {producer_job["verb"], producer_job["assignment"]}
 
-      holder =
-        world["assignments"]
-        |> Enum.find(&(&1["id"] == producer_job["assignment"]))
-        |> Map.fetch!("holder")
+        {:ok, [[holder]]} =
+          DB.query(db, "SELECT holderKey FROM assignments WHERE id = ?1", [assignment_id])
 
-      %{queued: job_id} =
-        Producers.__handle__(
-          db,
-          producer_job["verb"],
-          %{
-            principal: {:session, holder},
-            params: %{assignment_id: assignment_id}
-          },
-          config: %{tests: "true", smoke: "true", timeout_ms: 5_000}
-        )
+        job_id =
+          case Map.fetch(job_ids, key) do
+            {:ok, existing} ->
+              existing
 
-      if producer_job["state"] != "queued" do
-        %{id: ^job_id} = job = Producers.claim_next(db)
+            :error ->
+              assert %{queued: queued} =
+                       Producers.__handle__(
+                         db,
+                         producer_job["verb"],
+                         %{
+                           principal: {:session, holder},
+                           params: %{assignment_id: assignment_id}
+                         },
+                         config: %{tests: "true", smoke: "true", timeout_ms: 5_000}
+                       )
 
-        case producer_job["state"] do
-          "running" ->
-            :ok
+              queued
+          end
 
-          "done" ->
-            {:ok, :done} =
-              DB.transaction(db, fn txn ->
-                Tightbeam.DB.Txn.q(
-                  txn,
-                  "UPDATE producer_jobs SET state = 'done' WHERE id = ?1 AND state = 'running'",
-                  [job.id]
-                )
-
-                assert Tightbeam.DB.Txn.changes(txn) == 1
-
-                {:ok, _} =
-                  Assignments.insert_producer_verdict_in_txn(txn, %{
-                    assignment_id: job.assignment_id,
-                    verdict_kind: job.verdict_kind,
-                    producer: job.producer,
-                    producer_command: job.command,
-                    by_session: job.by_session,
-                    by_user: job.by_user,
-                    by_harness: job.by_harness,
-                    by_provider: job.by_provider
-                  })
-
-                :done
-              end)
-
-          "failed" ->
-            assert Producers.fail_running(db, job.id, "conformance fixture") == :failed
-
-          "cancelled" ->
-            assert %{cancelled: ^job_id} =
-                     Producers.__handle__(db, "cancel-producer-job", %{
-                       principal: {:session, holder},
-                       params: %{job_id: job_id}
-                     })
-        end
-      end
-    end)
+        transition_producer_job(db, job_id, producer_job["state"], holder)
+        Map.put(job_ids, key, job_id)
+      end)
 
     Enum.each(List.wrap(Map.get(world, "ledger", [])), fn ledger ->
       if ledger["pending"] > 0 do
@@ -638,7 +674,76 @@ defmodule Tightbeam.ConformanceSupport do
       end
     end)
 
-    %{assignments: assignments, work_items: work_items}
+    %{assignments: assignments, work_items: work_items, producer_jobs: producer_jobs}
+  end
+
+  defp transition_producer_job(_db, _job_id, "queued", _holder), do: :ok
+
+  defp transition_producer_job(db, job_id, "cancelled", holder) do
+    assert %{cancelled: ^job_id} =
+             Producers.__handle__(db, "cancel-producer-job", %{
+               principal: {:session, holder},
+               params: %{job_id: job_id}
+             })
+
+    assert Producers.get(db, job_id).state == "cancelled"
+  end
+
+  defp transition_producer_job(db, job_id, state, _holder)
+       when state in ~w(running done failed) do
+    job = Producers.get(db, job_id)
+    job = if job.state == "queued", do: Producers.claim_next(db), else: job
+    assert job.id == job_id
+
+    case state do
+      "running" ->
+        assert Producers.get(db, job_id).state == "running"
+
+      "failed" ->
+        assert Producers.fail_running(db, job_id, "conformance fixture") == :failed
+        assert Assignments.list_attests(db, job.assignment_id) == []
+
+      "done" ->
+        assert finish_producer_job(db, job) == :done
+        assert finish_producer_job(db, job) == :noop
+        assert Producers.fail_running(db, job_id, "losing failure") == :noop
+        assert [verdict] = Assignments.list_attests(db, job.assignment_id)
+        assert verdict.byHarness == job.by_harness
+        assert verdict.byProvider == job.by_provider
+        assert verdict.producer == job.producer
+        assert verdict.producerCommand == job.command
+    end
+  end
+
+  defp finish_producer_job(db, job) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DB.Txn.q(
+          txn,
+          "UPDATE producer_jobs SET state = 'done' WHERE id = ?1 AND state = 'running'",
+          [job.id]
+        )
+
+        if Tightbeam.DB.Txn.changes(txn) == 1 do
+          {:ok, _} =
+            Assignments.insert_producer_verdict_in_txn(txn, %{
+              assignment_id: job.assignment_id,
+              verdict_kind: job.verdict_kind,
+              producer: job.producer,
+              producer_command: job.command,
+              by_session: job.by_session,
+              by_user: job.by_user,
+              by_harness: job.by_harness,
+              by_provider: job.by_provider
+            })
+
+          :done
+        else
+          :noop
+        end
+      end)
+
+    result
   end
 
   defp first_user(world), do: world |> Map.get("users", []) |> List.first() |> Map.fetch!("id")
@@ -744,7 +849,7 @@ defmodule Tightbeam.ConformanceTest do
         "#{structured} structured-legibility assertions pending LP4; #{class_pending} pending classes"
     )
 
-    assert green == 13
+    assert green == 23
     assert pending == 3
   end
 

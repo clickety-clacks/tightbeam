@@ -1,0 +1,17 @@
+[fixture]
+class = "C4"
+name = "review-link-independence-matrix"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "p3 §4A; guidance §6:independent-review; orchestrator:independence"
+legibility = "event:denied(rule=coder-completion-needs-independent-review)"
+
+[[fixture.rule]]
+name = "coder-completion-needs-independent-review"
+verb = "attest"
+text = "completion needs a reviewed-clean verdict from a commissioned cross-harness reviewer"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]

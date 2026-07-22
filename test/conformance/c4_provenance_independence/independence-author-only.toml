@@ -1,0 +1,17 @@
+[fixture]
+class = "C4"
+name = "independence-author-only"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "p3 §4A assignment.independent_verdict_kinds"
+legibility = "event:denied(rule=commissioned-author-only)"
+
+[[fixture.rule]]
+name = "commissioned-author-only"
+verb = "attest"
+text = "completion needs a verdict authored by the commissioned review holder"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]

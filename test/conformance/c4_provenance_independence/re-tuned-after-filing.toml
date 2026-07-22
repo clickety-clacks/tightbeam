@@ -1,0 +1,17 @@
+[fixture]
+class = "C4"
+name = "re-tuned-after-filing"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "p3 stamp-at-filing; review finding-14"
+legibility = "event:denied(rule=frozen-filing-harness)"
+
+[[fixture.rule]]
+name = "frozen-filing-harness"
+verb = "attest"
+text = "completion needs a cross-harness verdict as stamped when filed"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]
