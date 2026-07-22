@@ -94,12 +94,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert loaded["coder"] == %{
              name: "coder",
-             skills: [
-               "tightbeam-assimilate",
-               "tightbeam-dispatching",
-               "tightbeam-harnesses",
-               "tightbeam-skills"
-             ],
+             skills: [],
              where: ["work-1", "work-2"],
              model_preferences: ["claude-opus-4-8"],
              containment: %{fs: :off, network: :open},
@@ -290,19 +285,13 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  test "skills: builtins materialize into the library; operator edits win; unknown elections fail",
+  test "org skills are electable and unknown elections fail",
        ctx do
     Archetypes.load!(ctx.base_dir)
 
-    skill_path =
-      Path.join([Archetypes.skills_dir(ctx.base_dir), "tightbeam-assimilate", "SKILL.md"])
-
-    assert File.read!(skill_path) =~ "name: tightbeam-assimilate"
-
-    # Operator's edit survives reload (materialization only fills absence).
-    File.write!(skill_path, "# mine now")
-    Archetypes.load!(ctx.base_dir)
-    assert File.read!(skill_path) == "# mine now"
+    for name <- Tightbeam.Homes.baseline_skill_names() do
+      refute File.exists?(Path.join([Archetypes.skills_dir(ctx.base_dir), name, "SKILL.md"]))
+    end
 
     # Explicit election is exact; unknown names stop the boot.
     File.write!(Path.join(ctx.manifests, "coder.toml"), """
@@ -330,18 +319,20 @@ defmodule Tightbeam.ArchetypesTest do
     assert Archetypes.load!(ctx.base_dir)["coder"].skills == ["deploy"]
   end
 
-  test "tightbeam-harnesses states codex rails are wiring-checked for non-malicious agents",
-       ctx do
-    Archetypes.load!(ctx.base_dir)
+  test "load refuses an org copy of a reserved substrate skill and names its path", ctx do
+    path =
+      Path.join([
+        Archetypes.skills_dir(ctx.base_dir),
+        "tightbeam-onboarding",
+        "SKILL.md"
+      ])
 
-    text =
-      ctx.base_dir
-      |> Path.join("identity/skills/tightbeam-harnesses/SKILL.md")
-      |> File.read!()
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "# org shadow")
 
-    assert text =~ "Rails gates: ENFORCED FOR NON-MALICIOUS AGENTS"
-    assert text =~ "WIRING-CHECKED\n  at adapter spawn"
-    refute text =~ "NOT YET WIRED"
+    assert_raise ArgumentError,
+                 "#{path}: rename or remove the org copy; substrate names are reserved",
+                 fn -> Archetypes.load!(ctx.base_dir) end
   end
 
   test "skill CRUD: trees nest, roots are electable units, elected roots transform on removal",

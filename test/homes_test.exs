@@ -3,6 +3,17 @@ defmodule Tightbeam.HomesTest do
 
   alias Tightbeam.Homes
 
+  @baseline_skill_names [
+    "tightbeam-dispatching",
+    "tightbeam-assimilate",
+    "tightbeam-harnesses",
+    "tightbeam-skills",
+    "tightbeam-onboarding",
+    "tightbeam-guidance-authoring",
+    "tightbeam-law-minting",
+    "tightbeam-archetype-cultivation"
+  ]
+
   setup do
     base_dir =
       Path.join(System.tmp_dir!(), "tb-homes-#{System.unique_integer([:positive])}")
@@ -113,7 +124,7 @@ defmodule Tightbeam.HomesTest do
              File.read_link!(Path.join(b.home_path, "auth.json"))
   end
 
-  test "skills project as symlinks to the replica; content edits live-update; election keys the hash",
+  test "baseline skills precede elections, win overlaps, and preserve election projection semantics",
        %{base_dir: base_dir} do
     library = Path.join(base_dir, "identity/skills/deploy")
     File.mkdir_p!(library)
@@ -126,12 +137,34 @@ defmodule Tightbeam.HomesTest do
       parent_source: nil,
       guidance: "# G",
       skills: [
+        %{
+          name: "tightbeam-skills",
+          link_to: "/org/must-not-shadow",
+          provenance: "template",
+          linkage: "linked"
+        },
         %{name: "deploy", link_to: library, provenance: "template", linkage: "linked"}
       ]
     }
 
     home = Homes.project(base_dir, spec).home_path
+    skills_root = Path.join(home, "skills")
     link = Path.join(home, "skills/deploy")
+
+    assert MapSet.new(File.ls!(skills_root)) == MapSet.new(@baseline_skill_names ++ ["deploy"])
+
+    for name <- @baseline_skill_names do
+      baseline_link = Path.join(skills_root, name)
+
+      assert File.read_link!(baseline_link) ==
+               Application.app_dir(:tightbeam, "priv/skills/#{name}")
+    end
+
+    assert Enum.count(File.ls!(skills_root), &(&1 == "tightbeam-skills")) == 1
+
+    assert File.read_link!(Path.join(skills_root, "tightbeam-skills")) ==
+             Application.app_dir(:tightbeam, "priv/skills/tightbeam-skills")
+
     assert File.read_link!(link) == library
 
     # Content edit flows through the link with NO regeneration (stamp intact).
@@ -202,9 +235,18 @@ defmodule Tightbeam.HomesTest do
                "file" => "identity/archetypes/coder.toml",
                "sha256" => String.duplicate("a", 64)
              },
-             "skills" => [
-               %{"name" => "swift", "provenance" => "template", "linkage" => "linked"}
-             ]
+             "skills" =>
+               Enum.sort_by(
+                 baseline_manifest_skills() ++
+                   [
+                     %{
+                       "name" => "swift",
+                       "provenance" => "template",
+                       "linkage" => "linked"
+                     }
+                   ],
+                 &{&1["name"], &1["provenance"], &1["linkage"]}
+               )
            }
 
     Homes.project(base_dir, spec)
@@ -307,6 +349,12 @@ defmodule Tightbeam.HomesTest do
       },
       overrides
     )
+  end
+
+  defp baseline_manifest_skills do
+    Enum.map(@baseline_skill_names, fn name ->
+      %{"name" => name, "provenance" => "substrate", "linkage" => "linked"}
+    end)
   end
 
   defp sha256(content) do

@@ -1826,7 +1826,7 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
+    base = gateway_children_base!()
     manifests = Path.join([base, "identity", "archetypes"])
     File.mkdir_p!(manifests)
 
@@ -2073,7 +2073,7 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
+    base = gateway_children_base!()
 
     config = %{
       base_dir: base,
@@ -2158,7 +2158,7 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
+    base = gateway_children_base!()
 
     config = %{
       base_dir: base,
@@ -2226,7 +2226,7 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    base = Path.join(System.tmp_dir!(), "gateway_children_#{System.unique_integer([:positive])}")
+    base = gateway_children_base!()
 
     config = %{
       base_dir: base,
@@ -2314,6 +2314,14 @@ defmodule Tightbeam.GatewayTest do
       wake_tick_ms: 1_000,
       db: db
     }
+  end
+
+  defp gateway_children_base! do
+    suffix = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+    base = Path.join(System.tmp_dir!(), "gateway_children_#{suffix}")
+    File.mkdir!(base)
+    on_exit(fn -> File.rm_rf!(base) end)
+    base
   end
 
   defp role_test_base(suffix, ready? \\ true) do
