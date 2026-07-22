@@ -155,20 +155,6 @@ defmodule Tightbeam.Archetypes do
   Pass `--key <idempotencyKey>` on a spawn, assign, or wake you may retry, so the retry does not
   create a duplicate.
 
-  ## Add a machine to the org
-  Machines that run sessions are hosts. To prepare a new machine and register it as a host,
-  run the assimilation ceremony (admin) against its ssh destination:
-
-      tightbeam assimilate work-1.local --as-user mike
-
-  It probes the machine, installs the ACP adapters and this CLI, records the host, and walks
-  harness onboarding. The ceremony installs the CLI by shipping its own running binary, so
-  when the satellite's OS/CPU differs from the machine you run it on, that one step is
-  skipped: build the CLI on the satellite instead — copy the CLI source over, run
-  `cargo build --release` there (the satellite needs a Rust toolchain), install the result at
-  `<base-dir>/bin/tightbeam` — then re-run assimilate; every other step is idempotent. After
-  assimilation, add the host to an archetype's allowed hosts so spawns can place there.
-
   ## Track work: work-items, assignments, facts
   Work is tracked as durable records, not in chat.
   - A work-item is the durable thread for one feature or bug:
