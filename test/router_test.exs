@@ -226,6 +226,58 @@ defmodule Tightbeam.Wire.RouterTest do
            }
   end
 
+  test "PATCH /api/streams/:key decodes a clawline '+' path key as a space", ctx do
+    key = "agent:main:clawline:mike:main s_test1234"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", &send_call/1)
+
+    plus_key = String.replace(key, " ", "+")
+
+    response =
+      conn(:patch, "/api/streams/#{plus_key}", JSON.encode!(%{"displayName" => "Renamed"}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_receive {:call, %{verb: "tune", session_key: ^key}}
+  end
+
+  test "PATCH /api/streams/:key still accepts an already-decoded space in the key", ctx do
+    key = "agent:main:clawline:mike:main s_test5678"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", &send_call/1)
+
+    response =
+      conn(:patch, "/api/streams/#{key}", JSON.encode!(%{"displayName" => "Renamed"}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_receive {:call, %{verb: "tune", session_key: ^key}}
+  end
+
+  test "DELETE /api/streams/:key decodes a clawline '+' path key as a space", ctx do
+    key = "agent:main:clawline:mike:main s_test9012"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts =
+      with_handler(ctx.opts, "retire", fn call ->
+        send_call(call)
+        %{deleted_session_key: call.session_key}
+      end)
+
+    plus_key = String.replace(key, " ", "+")
+
+    response =
+      conn(:delete, "/api/streams/#{plus_key}", JSON.encode!(%{}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_receive {:call, %{verb: "retire", session_key: ^key}}
+    assert JSON.decode!(response.resp_body) == %{"deletedSessionKey" => key}
+  end
+
   test "agent dispatch enforces cli bearer, allowlist, and identity/target resolution", ctx do
     actor =
       Org.create(ctx.db, %{
@@ -826,6 +878,15 @@ defmodule Tightbeam.Wire.RouterTest do
     conn(:post, "/agent/dispatch", JSON.encode!(Map.put_new(body, :params, %{})))
     |> put_req_header("authorization", "Bearer #{bearer}")
     |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp with_handler(opts, verb, handler) do
+    Keyword.update!(opts, :handlers, &Map.put(&1, verb, handler))
+  end
+
+  defp send_call(call) do
+    send(self(), {:call, call})
+    %{}
   end
 
   defp create_session(db, key, owner, extra \\ []) do

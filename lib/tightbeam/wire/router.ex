@@ -172,7 +172,7 @@ defmodule Tightbeam.Wire.Router do
 
   patch "/api/streams/:key" do
     with {:ok, device} <- device_auth(conn),
-         {:ok, session} <- owned_session(key, device, conn),
+         {:ok, session} <- owned_session(decode_session_key_param(key), device, conn),
          {:ok, body, conn} <- read_json(conn),
          {:ok, display_name} <- required_string(body["displayName"]) do
       call = %{
@@ -191,7 +191,7 @@ defmodule Tightbeam.Wire.Router do
   delete "/api/streams/:key" do
     with {:ok, device} <- device_auth(conn),
          {:ok, body, conn} <- read_json(conn),
-         {:ok, session_key} <- retire_target(key, body, device, conn) do
+         {:ok, session_key} <- retire_target(decode_session_key_param(key), body, device, conn) do
       params =
         if is_binary(body["idempotencyKey"]),
           do: %{idempotency_key: body["idempotencyKey"]},
@@ -543,6 +543,10 @@ defmodule Tightbeam.Wire.Router do
         end
     end
   end
+
+  # Plug decodes %20 in path segments but leaves '+' literal (that's a query-string
+  # convention, not a path one) — session keys carry a space, never a literal '+'.
+  defp decode_session_key_param(key), do: String.replace(key, "+", " ")
 
   defp owned_session(key, device, conn) do
     case Org.get(db(conn), key) do
