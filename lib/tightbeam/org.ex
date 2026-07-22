@@ -36,6 +36,7 @@ defmodule Tightbeam.Org do
           thinking_level: String.t() | nil,
           host: String.t(),
           cleared_through_seq: integer(),
+          adjudication_hold: String.t() | nil,
           state: String.t(),
           created_at: integer(),
           updated_at: integer()
@@ -71,6 +72,7 @@ defmodule Tightbeam.Org do
     thinkingLevel TEXT,
     host          TEXT NOT NULL DEFAULT 'local',
     clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+    adjudicationHold TEXT,
     state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
     createdAt     INTEGER NOT NULL,
     updatedAt     INTEGER NOT NULL
@@ -97,7 +99,8 @@ defmodule Tightbeam.Org do
           "ALTER TABLE sessions ADD COLUMN clearedThroughSeq INTEGER NOT NULL DEFAULT 0",
           "ALTER TABLE sessions ADD COLUMN overrides TEXT",
           "ALTER TABLE sessions ADD COLUMN identityName TEXT",
-          "ALTER TABLE sessions ADD COLUMN cliToken TEXT"
+          "ALTER TABLE sessions ADD COLUMN cliToken TEXT",
+          "ALTER TABLE sessions ADD COLUMN adjudicationHold TEXT"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
@@ -282,13 +285,70 @@ defmodule Tightbeam.Org do
   """
   @spec set_harness(db(), String.t(), String.t(), String.t(), String.t()) :: session()
   def set_harness(db \\ Tightbeam.DB, session_key, harness, provider, model) do
-    update(db, session_key, "harness = ?2, provider = ?3, model = ?4", [harness, provider, model])
+    transaction!(db, fn txn ->
+      current = must_get(txn, session_key)
+
+      case swap_model_in_txn(
+             txn,
+             session_key,
+             {current.model, current.harness},
+             {model, harness, provider}
+           ) do
+        {:ok, session} -> session
+        {:duplicate, session} -> session
+        :stale -> raise "model mutation race"
+      end
+    end)
   end
 
   @doc "Retune a session's model+provider (the `tune` verb's write). Returns the updated session."
   @spec set_model(db(), String.t(), String.t(), String.t()) :: session()
   def set_model(db \\ Tightbeam.DB, session_key, model, provider) do
-    update(db, session_key, "model = ?2, provider = ?3", [model, provider])
+    transaction!(db, fn txn ->
+      current = must_get(txn, session_key)
+
+      case swap_model_in_txn(
+             txn,
+             session_key,
+             {current.model, current.harness},
+             {model, current.harness, provider}
+           ) do
+        {:ok, session} -> session
+        {:duplicate, session} -> session
+        :stale -> raise "model mutation race"
+      end
+    end)
+  end
+
+  @doc "Serialized expected-version mutation seam for every model/harness change."
+  @spec swap_model_in_txn(
+          Txn.t(),
+          String.t(),
+          {String.t(), String.t()},
+          {String.t(), String.t(), String.t()}
+        ) :: {:ok, session()} | {:duplicate, session()} | :stale
+  def swap_model_in_txn(
+        %Txn{} = txn,
+        session_key,
+        {expected_model, expected_harness},
+        {model, harness, provider}
+      ) do
+    current = must_get(txn, session_key)
+
+    if current.model == model and current.harness == harness do
+      {:duplicate, current}
+    else
+      Txn.q(
+        txn,
+        """
+        UPDATE sessions SET model=?4, harness=?5, provider=?6, updatedAt=?7
+        WHERE sessionKey=?1 AND model=?2 AND harness=?3
+        """,
+        [session_key, expected_model, expected_harness, model, harness, provider, now()]
+      )
+
+      if Txn.changes(txn) == 1, do: {:ok, must_get(txn, session_key)}, else: :stale
+    end
   end
 
   @doc """
@@ -330,6 +390,19 @@ defmodule Tightbeam.Org do
   @spec retire(db(), String.t()) :: session()
   def retire(db \\ Tightbeam.DB, session_key) do
     update(db, session_key, "state = 'retired'", [])
+  end
+
+  @doc false
+  @spec retire_in_txn(Txn.t(), String.t()) :: session()
+  def retire_in_txn(%Txn{} = txn, session_key) do
+    must_get(txn, session_key)
+
+    Txn.q(txn, "UPDATE sessions SET state = 'retired', updatedAt = ?2 WHERE sessionKey = ?1", [
+      session_key,
+      now()
+    ])
+
+    must_get(txn, session_key)
   end
 
   @doc """
@@ -436,7 +509,7 @@ defmodule Tightbeam.Org do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName, cliToken, harness, provider,
-           model, thinkingLevel, host, clearedThroughSeq, state, createdAt, updatedAt
+           model, thinkingLevel, host, clearedThroughSeq, adjudicationHold, state, createdAt, updatedAt
     FROM sessions
     """
   end
@@ -462,6 +535,7 @@ defmodule Tightbeam.Org do
          thinking_level,
          host,
          cleared_through_seq,
+         adjudication_hold,
          state,
          created_at,
          updated_at
@@ -487,6 +561,7 @@ defmodule Tightbeam.Org do
       thinking_level: thinking_level,
       host: host,
       cleared_through_seq: cleared_through_seq,
+      adjudication_hold: adjudication_hold,
       state: state,
       created_at: created_at,
       updated_at: updated_at

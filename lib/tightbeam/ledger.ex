@@ -155,12 +155,32 @@ defmodule Tightbeam.Ledger do
             :busy
 
           [] ->
+            session_filter =
+              case Txn.q(
+                     txn,
+                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+                   ) do
+                [[1]] ->
+                  """
+                  AND EXISTS (
+                    SELECT 1 FROM sessions AS s
+                    WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
+                      AND (s.adjudicationHold IS NULL OR
+                           (s.adjudicationHold != '*' AND t.wakeId = s.adjudicationHold))
+                  )
+                  """
+
+                [] ->
+                  ""
+              end
+
             Txn.q(
               txn,
               """
                 UPDATE turns SET status = 'running', owner = ?2, startedAt = ?3
-                WHERE seq = (SELECT seq FROM turns
-                             WHERE sessionKey = ?1 AND status = 'queued'
+                WHERE seq = (SELECT t.seq FROM turns AS t
+                             WHERE t.sessionKey = ?1 AND t.status = 'queued'
+                               #{session_filter}
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
               """,
@@ -202,23 +222,79 @@ defmodule Tightbeam.Ledger do
   @spec finish(db(), integer(), terminal(), String.t() | nil) :: :ok | :already_terminal
   def finish(db \\ Tightbeam.DB, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
-    now = System.system_time(:millisecond)
-
     {:ok, won} =
       DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          """
-            UPDATE turns SET status = ?2, endedAt = ?3, error = ?4
-            WHERE seq = ?1 AND status = 'running'
-          """,
-          [seq, terminal, now, error]
-        )
-
-        Txn.changes(txn) == 1
+        finish_in_txn(txn, seq, terminal, error)
       end)
 
     if won, do: :ok, else: :already_terminal
+  end
+
+  @doc "Terminal transition inside the caller's transaction; recovery completion releases its hold."
+  @spec finish_in_txn(Txn.t(), integer(), terminal(), String.t() | nil) :: boolean()
+  def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil)
+      when terminal in ~w(delivered canceled failed failed_unknown) do
+    now = System.system_time(:millisecond)
+
+    Txn.q(
+      txn,
+      "UPDATE turns SET status = ?2, endedAt = ?3, error = ?4 WHERE seq = ?1 AND status = 'running'",
+      [seq, terminal, now, error]
+    )
+
+    won = Txn.changes(txn) == 1
+
+    sessions_exist? =
+      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [[1]]
+
+    if won and sessions_exist? do
+      Txn.q(
+        txn,
+        """
+        UPDATE sessions SET adjudicationHold = NULL, updatedAt = ?2
+        WHERE sessionKey = (SELECT sessionKey FROM turns WHERE seq = ?1)
+          AND adjudicationHold = (SELECT wakeId FROM turns WHERE seq = ?1)
+        """,
+        [seq, now]
+      )
+    end
+
+    won
+  end
+
+  @doc """
+  Cancel every queued turn when a session retires, inside the retire transaction.
+
+  Invariant (newly minted): a retired session can never execute, so its queued
+  turns are canceled, not failed; this is the single drain point for every retire.
+  Setting endedAt routes each row through the existing terminal publication sweep.
+  """
+  @spec drain_queued_for_retire_in_txn(Txn.t(), String.t(), String.t()) :: [integer()]
+  def drain_queued_for_retire_in_txn(%Txn{} = txn, session_key, reason) do
+    turns_exist? =
+      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns'") == [[1]]
+
+    if turns_exist? do
+      rows =
+        Txn.q(
+          txn,
+          "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'queued' ORDER BY seq",
+          [session_key]
+        )
+
+      Txn.q(
+        txn,
+        """
+        UPDATE turns SET status = 'canceled', endedAt = ?2, error = ?3
+        WHERE sessionKey = ?1 AND status = 'queued'
+        """,
+        [session_key, System.system_time(:millisecond), reason]
+      )
+
+      Enum.map(rows, &hd/1)
+    else
+      []
+    end
   end
 
   @doc """

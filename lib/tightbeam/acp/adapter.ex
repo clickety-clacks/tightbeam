@@ -88,6 +88,12 @@ defmodule Tightbeam.Acp.Adapter do
   def load_session(adapter, session_id, model, cwd, mcp_servers),
     do: GenServer.call(adapter, {:load_session, session_id, model, cwd, mcp_servers}, 30_000)
 
+  @doc "Strict adjudication-only model apply: base, effort, then response read-back."
+  @spec apply_model_strict(adapter(), String.t(), model_ref(), model_ref()) ::
+          :ok | {:error, :model_unavailable | :partial_apply}
+  def apply_model_strict(adapter, session_id, model, prior_model),
+    do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
+
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
   this GenServer keeps routing updates, replies when the harness finishes.
@@ -137,7 +143,8 @@ defmodule Tightbeam.Acp.Adapter do
   itself cannot.
   """
   @spec knows_session?(adapter(), String.t()) :: boolean()
-  def knows_session?(adapter, session_id), do: GenServer.call(adapter, {:knows_session?, session_id})
+  def knows_session?(adapter, session_id),
+    do: GenServer.call(adapter, {:knows_session?, session_id})
 
   @doc "The underlying Acp.Conn (for pending_count / quiescence probes)."
   @spec conn(adapter()) :: pid()
@@ -262,6 +269,10 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  def handle_call({:apply_model_strict, sid, model, prior_model}, _from, state) do
+    {:reply, strict_apply_with_retry(state, sid, model, prior_model, 3), state}
+  end
+
   def handle_call({:knows_session?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
 
@@ -274,6 +285,7 @@ defmodule Tightbeam.Acp.Adapter do
         fun when is_function(fun, 2) -> put_in(state.progress[sid], {fun, nil, 0})
         _ -> state
       end
+
     # Fire the ACP prompt asynchronously so this GenServer keeps routing
     # session/update chunks while the turn runs.
     parent = self()
@@ -384,6 +396,68 @@ defmodule Tightbeam.Acp.Adapter do
       :ok
     end
   end
+
+  defp strict_apply_with_retry(state, sid, model_ref, prior_model, attempts) do
+    case strict_apply(state, sid, model_ref, prior_model) do
+      {:error, :model_unavailable} when attempts > 1 ->
+        strict_apply_with_retry(state, sid, model_ref, prior_model, attempts - 1)
+
+      result ->
+        result
+    end
+  end
+
+  defp strict_apply(state, sid, model_ref, prior_model) do
+    {model, effort} = parse_model_ref(model_ref)
+
+    case Conn.request(state.conn, "session/set_config_option", %{
+           sessionId: sid,
+           configId: "model",
+           value: model
+         }) do
+      {:ok, base_result} ->
+        effort_result =
+          if effort do
+            Conn.request(state.conn, "session/set_config_option", %{
+              sessionId: sid,
+              configId: state.preset.effort_config,
+              value: effort
+            })
+          else
+            {:ok, base_result}
+          end
+
+        if read_back?(base_result, "model", model) and
+             match?({:ok, _}, effort_result) and
+             (is_nil(effort) or
+                read_back?(elem(effort_result, 1), state.preset.effort_config, effort)) do
+          :ok
+        else
+          {prior_base, _prior_effort} = parse_model_ref(prior_model)
+
+          _ =
+            Conn.request(state.conn, "session/set_config_option", %{
+              sessionId: sid,
+              configId: "model",
+              value: prior_base
+            })
+
+          {:error, :partial_apply}
+        end
+
+      {:error, _} ->
+        {:error, :model_unavailable}
+    end
+  end
+
+  defp read_back?(%{"configOptions" => options}, id, expected) when is_list(options) do
+    Enum.any?(options, fn option ->
+      (option["id"] || option["configId"]) == id and
+        (option["currentValue"] || option["value"]) == expected
+    end)
+  end
+
+  defp read_back?(_, _id, _expected), do: false
 
   defp set_mode(%{contained: false} = state, sid) do
     _ =
