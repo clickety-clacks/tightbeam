@@ -36,6 +36,15 @@ pub enum Command {
         prompt: String,
         after_ms: Option<String>,
         at: Option<String>,
+        condition_kind: Option<String>,
+        condition_scope: Option<String>,
+        idempotency_key: Option<String>,
+    },
+    Condition {
+        identity: Identity,
+        kind: String,
+        scope: Option<String>,
+        idempotency_key: Option<String>,
     },
     Spawn {
         identity: Identity,
@@ -213,8 +222,8 @@ IDENTITY (optional inside a session workdir; otherwise required):
   --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
                        operator/admin actions or when no agent identity applies.
   --as-process <name>  act as automation (cron, CI, a webhook — e.g.
-                       "cron"). Processes may wake and cancel-wake ONLY —
-                       they cannot spawn, retire, or administer.
+                       "cron"). Processes may wake, cancel-wake, and file
+                       conditions ONLY — they cannot spawn, retire, or administer.
   Pass at most ONE identity. It is who the call is attributed to, NOT the
   target of the call. Inside a session workdir, omission lets the gateway
   derive the session's identity from its credential.
@@ -226,13 +235,19 @@ TARGET (for commands that take one — pass exactly one):
 
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
-       [--after 30s|5m|2h] [--at <epochMs>]
+       [--after 30s|5m|2h] [--at <epochMs>] [--key <idempotencyKey>]
+       [--when-fact <kind> [--when-scope <scope>] --fallback-after 30s|5m|2h]
       Send a prompt to the selected target. Immediate = a direct message; with --after or
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
       session (or yourself).
         tightbeam wake --role reviewer --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
+
+  condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
+      File an org/product condition fact. Reserved substrate kinds cannot be
+      filed through this command.
+        tightbeam condition --kind deploy-succeeded --scope prod --key deploy-8f2a
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness claude|codex] [--model <ref>] [--host <host>]
@@ -338,7 +353,8 @@ COMMANDS:
 DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
   TIGHTBEAM_URL + TIGHTBEAM_TOKEN, else <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
 
-DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
+DURATIONS (for --after/--fallback-after): <n>ms | <n>s | <n>m | <n>h
+  (e.g. 30s, 5m, 2h).
 
   tightbeam help | --help | -h    show this text."#;
 
@@ -577,13 +593,34 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             let after_ms = nonempty(flags, "after")
                 .map(|value| parse_after(&value))
                 .transpose()?;
+            let fallback_after_ms = nonempty(flags, "fallback-after")
+                .map(|value| parse_after(&value))
+                .transpose()?;
+            if after_ms.is_some() && fallback_after_ms.is_some() {
+                return Err("pass only one of --after or --fallback-after".to_owned());
+            }
             let at = nonempty(flags, "at").map(|value| js_number_json(number_coercion(&value)));
             Ok(Command::Wake {
                 identity: identity(flags)?,
                 target: targets.into_iter().next().expect("exactly one target"),
                 prompt,
-                after_ms,
+                after_ms: fallback_after_ms.or(after_ms),
                 at,
+                condition_kind: nonempty(flags, "when-fact"),
+                condition_scope: nonempty(flags, "when-scope"),
+                idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "condition" => {
+            if parsed.positional.get(1).is_some() {
+                return Err("usage: tightbeam condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]".to_owned());
+            }
+            let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
+            Ok(Command::Condition {
+                identity: identity(flags)?,
+                kind,
+                scope: nonempty(flags, "scope"),
+                idempotency_key: nonempty(flags, "key"),
             })
         }
         "spawn" => {
@@ -892,7 +929,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
         )),
     }
 }
@@ -1083,7 +1120,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, spawn, list, retire, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -1147,6 +1184,15 @@ mod tests {
         let commands = [
             strings(&[
                 "wake", "--role", "reviewer", "--prompt", "go", "--as", "coder",
+            ]),
+            strings(&[
+                "condition",
+                "--kind",
+                "deploy-succeeded",
+                "--scope",
+                "prod",
+                "--key",
+                "k",
             ]),
             strings(&[
                 "spawn",

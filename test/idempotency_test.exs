@@ -42,13 +42,13 @@ defmodule Tightbeam.IdempotencyTest do
     end
   end
 
-  test "fresh DDL accepts assign and a pre-assign database is rename-rebuilt", %{db: db} do
+  test "fresh DDL accepts condition and a pre-condition database is rename-rebuilt", %{db: db} do
     assert :ok =
              Idempotency.put(db, %{
                owner_user_id: "user:flynn",
-               operation: "assign",
+               operation: "condition",
                idempotency_key: "new",
-               session_key: "asg_new"
+               session_key: "1"
              })
 
     legacy = :"legacy_idempotency_#{System.unique_integer([:positive])}"
@@ -72,9 +72,9 @@ defmodule Tightbeam.IdempotencyTest do
     assert :ok =
              Idempotency.put(legacy, %{
                owner_user_id: "session:holder",
-               operation: "assign",
+               operation: "condition",
                idempotency_key: "new",
-               session_key: "asg_new"
+               session_key: "1"
              })
   end
 end

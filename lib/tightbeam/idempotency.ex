@@ -1,6 +1,6 @@
 defmodule Tightbeam.Idempotency do
   @moduledoc """
-  Durable idempotency ledger for spawn/retire/wake/assign (TS reference:
+  Durable idempotency ledger for spawn/retire/wake/assign/condition (TS reference:
   src/wire/idempotency.ts). Same key + same operation + same owner → the
   original session, forever. Scope is (owner_user_id, operation, key) — a
   spawn key never collides with a retire key.
@@ -21,7 +21,7 @@ defmodule Tightbeam.Idempotency do
   @ddl """
   CREATE TABLE IF NOT EXISTS wire_idempotency (
     ownerUserId    TEXT NOT NULL,
-    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign')),
+    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition')),
     idempotencyKey TEXT NOT NULL,
     sessionKey     TEXT NOT NULL,
     PRIMARY KEY (ownerUserId, operation, idempotencyKey)
@@ -47,7 +47,7 @@ defmodule Tightbeam.Idempotency do
 
     case rows do
       [[sql]] ->
-        if String.contains?(sql, "'assign'") do
+        if String.contains?(sql, "'condition'") do
           :ok
         else
           :ok = DB.execute(db, "ALTER TABLE wire_idempotency RENAME TO wire_idempotency_old;")
@@ -78,6 +78,27 @@ defmodule Tightbeam.Idempotency do
         [owner_user_id, operation, idempotency_key]
       )
 
+    row_from_query(rows)
+  end
+
+  @doc "Prior result lookup inside an existing DB transaction."
+  @spec get_in_txn(Txn.t(), String.t(), String.t(), String.t()) :: row() | nil
+  def get_in_txn(%Txn{} = txn, owner_user_id, operation, idempotency_key) do
+    rows =
+      Txn.q(
+        txn,
+        """
+          SELECT ownerUserId, operation, idempotencyKey, sessionKey
+          FROM wire_idempotency
+          WHERE ownerUserId = ?1 AND operation = ?2 AND idempotencyKey = ?3
+        """,
+        [owner_user_id, operation, idempotency_key]
+      )
+
+    row_from_query(rows)
+  end
+
+  defp row_from_query(rows) do
     case rows do
       [[owner_user_id, operation, idempotency_key, session_key]] ->
         %{
@@ -95,23 +116,27 @@ defmodule Tightbeam.Idempotency do
   @doc "Record a completed operation's session_key under its key."
   @spec put(db(), row()) :: :ok
   def put(db \\ Tightbeam.DB, row) do
-    transaction!(db, fn txn ->
-      Txn.q(
-        txn,
-        """
-          INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey)
-          VALUES (?1, ?2, ?3, ?4)
-        """,
-        [
-          Map.fetch!(row, :owner_user_id),
-          Map.fetch!(row, :operation),
-          Map.fetch!(row, :idempotency_key),
-          Map.fetch!(row, :session_key)
-        ]
-      )
+    transaction!(db, &put_in_txn(&1, row))
+  end
 
-      :ok
-    end)
+  @doc "Record a completed operation inside an existing DB transaction."
+  @spec put_in_txn(Txn.t(), row()) :: :ok
+  def put_in_txn(%Txn{} = txn, row) do
+    Txn.q(
+      txn,
+      """
+        INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey)
+        VALUES (?1, ?2, ?3, ?4)
+      """,
+      [
+        Map.fetch!(row, :owner_user_id),
+        Map.fetch!(row, :operation),
+        Map.fetch!(row, :idempotency_key),
+        Map.fetch!(row, :session_key)
+      ]
+    )
+
+    :ok
   end
 
   defp transaction!(db, fun) do

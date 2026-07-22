@@ -12,6 +12,7 @@ defmodule Tightbeam.EventLog do
   """
 
   alias Tightbeam.DB
+  alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
 
@@ -81,14 +82,27 @@ defmodule Tightbeam.EventLog do
   Append a verb event (`kind` is `"verb"` for an accepted call, `"denied"` for
   a refused one). Every dispatch outcome gets a row — including the denials.
   """
-  @spec append_event(db(), String.t(), String.t(), String.t(), String.t() | nil, term(), term()) :: :ok
-  def append_event(db \\ Tightbeam.DB, kind, verb, origin, session_key \\ nil, payload \\ nil, principal \\ nil)
+  @spec append_event(db(), String.t(), String.t(), String.t(), String.t() | nil, term(), term()) ::
+          :ok
+  def append_event(
+        db \\ Tightbeam.DB,
+        kind,
+        verb,
+        origin,
+        session_key \\ nil,
+        payload \\ nil,
+        principal \\ nil
+      )
       when kind in ~w(verb denied) do
     {:ok, _} =
-      DB.query(db, """
-        INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-      """, [now(), kind, verb, origin, serialize_principal(principal), session_key, encode(payload)])
+      DB.query(
+        db,
+        """
+          INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        """,
+        [now(), kind, verb, origin, serialize_principal(principal), session_key, encode(payload)]
+      )
 
     :ok
   end
@@ -97,13 +111,25 @@ defmodule Tightbeam.EventLog do
   @spec events_after(db(), integer(), pos_integer()) :: [verb_event()]
   def events_after(db \\ Tightbeam.DB, after_id, limit) do
     {:ok, rows} =
-      DB.query(db, "SELECT id, ts, kind, verb, origin, principal, sessionKey FROM events WHERE id > ?1 ORDER BY id LIMIT ?2", [
-        after_id,
-        limit
-      ])
+      DB.query(
+        db,
+        "SELECT id, ts, kind, verb, origin, principal, sessionKey FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
+        [
+          after_id,
+          limit
+        ]
+      )
 
     Enum.map(rows, fn [id, ts, kind, verb, origin, principal, sk] ->
-      %{id: id, ts: ts, kind: kind, verb: verb, origin: origin, principal: principal, session_key: sk}
+      %{
+        id: id,
+        ts: ts,
+        kind: kind,
+        verb: verb,
+        origin: origin,
+        principal: principal,
+        session_key: sk
+      }
     end)
   end
 
@@ -133,12 +159,28 @@ defmodule Tightbeam.EventLog do
   @spec lifecycle(db(), String.t(), String.t(), String.t() | nil) :: :ok
   def lifecycle(db \\ Tightbeam.DB, kind, subject, detail \\ nil) do
     {:ok, _} =
-      DB.query(db, "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)", [
-        now(),
-        kind,
-        subject,
-        detail
-      ])
+      DB.query(
+        db,
+        "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)",
+        [
+          now(),
+          kind,
+          subject,
+          detail
+        ]
+      )
+
+    :ok
+  end
+
+  @doc "Record a lifecycle event inside an existing DB transaction."
+  @spec lifecycle_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil) :: :ok
+  def lifecycle_in_txn(%Txn{} = txn, kind, subject, detail) do
+    Txn.q(
+      txn,
+      "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)",
+      [now(), kind, subject, detail]
+    )
 
     :ok
   end
@@ -146,8 +188,12 @@ defmodule Tightbeam.EventLog do
   @doc "All lifecycle events, oldest first."
   @spec lifecycle_events(db()) :: [lifecycle_event()]
   def lifecycle_events(db \\ Tightbeam.DB) do
-    {:ok, rows} = DB.query(db, "SELECT id, ts, kind, subject, detail FROM lifecycle_events ORDER BY id")
-    Enum.map(rows, fn [id, ts, kind, subject, detail] -> %{id: id, ts: ts, kind: kind, subject: subject, detail: detail} end)
+    {:ok, rows} =
+      DB.query(db, "SELECT id, ts, kind, subject, detail FROM lifecycle_events ORDER BY id")
+
+    Enum.map(rows, fn [id, ts, kind, subject, detail] ->
+      %{id: id, ts: ts, kind: kind, subject: subject, detail: detail}
+    end)
   end
 
   ## Boot epochs — dirty-exit inference
@@ -170,12 +216,16 @@ defmodule Tightbeam.EventLog do
 
         case prior do
           [[e]] ->
-            Tightbeam.DB.Txn.q(txn, "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1,?2,?3,?4)", [
-              now(),
-              "dirty_exit",
-              "epoch:#{e}",
-              "prior epoch had no clean shutdown"
-            ])
+            Tightbeam.DB.Txn.q(
+              txn,
+              "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1,?2,?3,?4)",
+              [
+                now(),
+                "dirty_exit",
+                "epoch:#{e}",
+                "prior epoch had no clean shutdown"
+              ]
+            )
 
           [] ->
             :ok
@@ -196,7 +246,9 @@ defmodule Tightbeam.EventLog do
   """
   @spec clean_shutdown(db(), pos_integer()) :: :ok
   def clean_shutdown(db \\ Tightbeam.DB, epoch) do
-    {:ok, _} = DB.query(db, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
+    {:ok, _} =
+      DB.query(db, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
+
     :ok
   end
 

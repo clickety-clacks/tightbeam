@@ -4,6 +4,7 @@ defmodule Tightbeam.SupervisionTest do
   alias Tightbeam.{
     Assignments,
     ConnRegistry,
+    ConditionFacts,
     DB,
     Devices,
     EventLog,
@@ -52,6 +53,7 @@ defmodule Tightbeam.SupervisionTest do
           WorkItems,
           Assignments,
           Ledger,
+          ConditionFacts,
           Wakes,
           Supervision,
           WorkState

@@ -43,7 +43,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles, WorkState}
   alias Tightbeam.Wire.{Payloads, Socket}
 
-  @agent_verbs ~w(wake spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update run-tests run-smoke cancel-producer-job)
+  @agent_verbs ~w(wake condition spawn retire inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update run-tests run-smoke cancel-producer-job)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -477,7 +477,7 @@ defmodule Tightbeam.Wire.Router do
         # Third origin class (closed set: user | agent | process): automation
         # that is neither a person nor a session — cron, CI, webhooks.
         # Local-trust like --as (named, not authenticated — v1 decision);
-        # powers are narrow: wake + cancel-wake, nothing else.
+        # powers are narrow: wake + cancel-wake + condition, nothing else.
         {:ok, "process:#{body["asProcess"]}"}
 
       true ->
