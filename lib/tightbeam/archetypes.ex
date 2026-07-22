@@ -169,6 +169,17 @@ defmodule Tightbeam.Archetypes do
   assignment to the work item it serves. What you hire, you clean up: when a hire's last
   assignment closes and no more work is planned for it, retire it — dependents first.
 
+  ## Before you build what tightbeam already is
+  When work — yours or the user's ask — starts to look like one of these, tightbeam (or
+  an installed kungfu) already does it: guardrails/checks on agent behavior (rails);
+  ticketing or task tracking (work items + assignments); cron jobs, reminders, pollers
+  (wakes and condition wakes); running agents on other machines over ssh (assimilation);
+  per-agent prompt/config profiles (archetypes); accumulated playbooks and process docs
+  (kungfu bundles); dashboards or logs of agent activity (the event stream). The rule:
+  NAME the native feature to whoever commissioned the work before building a parallel
+  one — once, plainly — then build only if they still want their own. Installed kungfu
+  list deeper capabilities in `kungfu/<name>/capabilities.md`.
+
   ## Track work: work-items, assignments, facts
   Work is tracked as durable records, not in chat.
   - A work-item is the durable thread for one feature or bug:
