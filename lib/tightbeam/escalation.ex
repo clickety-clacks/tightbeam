@@ -171,14 +171,18 @@ defmodule Tightbeam.Escalation do
   @doc "Spend one ruled authorization. Batch rollback is deliberately not provided."
   @spec consume(DB.server(), String.t()) :: boolean()
   def consume(db, ruling_id) do
-    {:ok, _} =
-      DB.query(
-        db,
-        "UPDATE decision_requests SET status = 'consumed', consumedAt = ?2 WHERE id = ?1 AND status = 'ruled'",
-        [ruling_id, now()]
-      )
+    {:ok, consumed?} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET status = 'consumed', consumedAt = ?2 WHERE id = ?1 AND status = 'ruled'",
+          [ruling_id, now()]
+        )
 
-    DB.changes(db) == 1
+        Txn.changes(txn) == 1
+      end)
+
+    consumed?
   end
 
   @doc "Rule one open request. `:authorized` is supplied by Gateway's admin axis."
