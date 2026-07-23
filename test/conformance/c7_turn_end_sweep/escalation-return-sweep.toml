@@ -12,4 +12,15 @@ verb = "attest"
 text = "sweep actor maps the unified escalation resolution union"
 edges = ["turn-end"]
 effect = "escalate"
-deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["owner-approved"] },
+]
+external_producer = true
+
+[[fixture.rule]]
+name = "later-sweep-statute"
+verb = "attest"
+text = "a later turn-end statute proves the escalation allow continued the fold"
+edges = ["turn-end"]
+deny_when = [{ fact = "assignment.holder_archetype", op = "eq", value = "allow-coder" }]

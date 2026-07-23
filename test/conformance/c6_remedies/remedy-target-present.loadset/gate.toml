@@ -3,8 +3,10 @@ name = "target-present"
 verb = "attest"
 text = "complete assign target"
 effect = "remedy"
-deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+deny_when = [{ fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }]
 [rule.remedy]
 action = "assign"
 produces = "reviewed-clean"
 target_role = "reviewer"
+[rule.remedy.params]
+subject = "review {assignment_id}"

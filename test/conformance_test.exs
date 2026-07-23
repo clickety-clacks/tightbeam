@@ -18,6 +18,16 @@ defmodule Tightbeam.ConformanceProducerRegistry do
     do: {:noreply, Map.delete(state, job_id)}
 end
 
+defmodule Tightbeam.ConformanceLaneManager do
+  use GenServer
+
+  def start_link, do: GenServer.start_link(__MODULE__, :ok, name: Tightbeam.LaneManager)
+  def init(:ok), do: {:ok, :ok}
+
+  def handle_call({:ensure_lane, _session_key}, _from, state),
+    do: {:reply, :ok, state}
+end
+
 defmodule Tightbeam.ConformanceSupport do
   import ExUnit.Assertions
 
@@ -117,7 +127,7 @@ defmodule Tightbeam.ConformanceSupport do
     {"C6", "note-digest-exclusion"} =>
       ~w(note-change-dedupes-same-action idempotency-key-change-dedupes material-change-gets-distinct-digest digest-dedupe-legible),
     {"C7", "scheduled-wake-suppression"} =>
-      ~w(self-wake-suppresses non-self-user-wake-does-not-suppress supervision-prod-does-not-suppress non-self-wake-sweep-is-legible),
+      ~w(rail-enforcement-precedes-self-pending-wake rail-enforcement-precedes-process-pending-wake allow-falls-through-to-pending-wake-gate schedule-order-legible),
     {"C7", "watermark-nil-duplicate"} =>
       ~w(nil-fallthrough-no-null-write fresh-larger-terminal-acts duplicate-does-not-react),
     {"C7", "retired-holder-no-remedy"} =>
@@ -536,7 +546,7 @@ defmodule Tightbeam.ConformanceSupport do
         run_rail_exec_fixture(fixture)
 
       {"C6", "load-rejection", _} ->
-        :ok
+        run_load_assert(fixture)
 
       {"C6", _, "review-remedy-spawn"} ->
         run_rules_decide(fixture)
@@ -549,12 +559,17 @@ defmodule Tightbeam.ConformanceSupport do
         run_rules_decide(fixture)
         run_acting_layer(fixture)
 
-      {"C6", _, name}
-      when name in ~w(escalation-return-dispatch escalation-continue-the-fold) ->
+      {"C6", _, "escalation-return-dispatch"} ->
+        run_escalation_return_dispatch_contract(fixture)
+
+      {"C6", _, "escalation-continue-the-fold"} ->
         run_escalation_dispatch_contract(
           find.("C6", "escalation-return-dispatch"),
           find.("C6", "escalation-continue-the-fold")
         )
+
+      {"C6", _, "remedy-episode-idempotent"} ->
+        run_remedy_episode_contract(fixture)
 
       {"C6", _, _} ->
         run_remedy_episode_contract(find.("C6", "review-remedy-spawn"))
@@ -573,12 +588,28 @@ defmodule Tightbeam.ConformanceSupport do
         run_acting_layer(fixture)
 
       {"C7", _, name}
-      when name in ~w(retired-holder-no-remedy watermark-nil-duplicate escalation-return-sweep parkwakeid-reuse schedule-then-check) ->
+      when name in ~w(retired-holder-no-remedy watermark-nil-duplicate) ->
         run_supervision_state_contract(
           find.("C7", "retired-holder-no-remedy"),
           find.("C7", "watermark-nil-duplicate"),
           find.("C7", "escalation-return-sweep")
         )
+
+      {"C7", _, "escalation-return-sweep"} ->
+        run_escalation_return_sweep_contract(fixture)
+
+      {"C7", _, "parkwakeid-reuse"} ->
+        run_park_wake_reuse_contract(fixture)
+
+      {"C7", _, "schedule-then-check"} ->
+        run_schedule_then_check_contract(fixture)
+
+      {"C7", _, "reobligate-pure-deny"} ->
+        run_rules_decide(fixture)
+        run_acting_layer(fixture)
+
+      {"C7", _, "scheduled-wake-suppression"} ->
+        run_scheduled_wake_contract(fixture)
 
       {"C7", _, _} ->
         run_sweep_ruling_contract(find.("C7", "sweep-never-consumes"))
@@ -982,13 +1013,20 @@ defmodule Tightbeam.ConformanceSupport do
   def run_load_assert(loadset) do
     base = temp_dir!("conformance-load")
     rules_dir = Path.join(base, "identity/rules")
+    scripts_dir = Path.join(base, "identity/rails/scripts")
     File.mkdir_p!(rules_dir)
+    File.mkdir_p!(scripts_dir)
 
     loadset["loadset_dir"]
     |> Path.join("*.toml")
     |> Path.wildcard()
     |> Enum.reject(&(Path.basename(&1) == "producers.toml"))
     |> Enum.each(&File.cp!(&1, Path.join(rules_dir, Path.basename(&1))))
+
+    loadset["loadset_dir"]
+    |> Path.join("scripts/*")
+    |> Path.wildcard()
+    |> Enum.each(&File.cp!(&1, Path.join(scripts_dir, Path.basename(&1))))
 
     try do
       outcome =
@@ -1000,6 +1038,7 @@ defmodule Tightbeam.ConformanceSupport do
                 identity = Path.join(producer_base, "identity")
                 File.mkdir_p!(identity)
                 File.write!(Path.join(identity, "producers.toml"), encoded)
+                init_committed_identity!(identity)
 
                 try do
                   Producers.load!(producer_base)
@@ -1032,6 +1071,29 @@ defmodule Tightbeam.ConformanceSupport do
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
     end
+  end
+
+  defp init_committed_identity!(identity) do
+    {"", 0} = System.cmd("git", ["init", "--quiet"], cd: identity)
+    {"", 0} = System.cmd("git", ["add", "producers.toml"], cd: identity)
+
+    {_output, 0} =
+      System.cmd(
+        "git",
+        [
+          "-c",
+          "user.name=Conformance",
+          "-c",
+          "user.email=conformance@tightbeam.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "fixture"
+        ],
+        cd: identity
+      )
+
+    :ok
   end
 
   def run_rules_decide(fixture) do
@@ -1082,7 +1144,170 @@ defmodule Tightbeam.ConformanceSupport do
   def run_acting_layer(%{"class" => "C7"} = fixture), do: run_supervision_actor(fixture)
   def run_acting_layer(%{"class" => "Cap"} = fixture), do: run_capstone_actor(fixture)
 
-  def run_remedy_episode_contract(fixture) do
+  def run_remedy_episode_contract(%{"name" => "remedy-episode-idempotent"} = fixture) do
+    base = temp_dir!("conformance-remedy-episode-matrix")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+
+        try do
+          ids = materialize_world(db, kase["world"])
+          call = build_call(kase["call"], ids)
+          handlers = Gateway.handlers(%{db: db})
+          statute = fixture_rule_name(fixture)
+          assignment_id = call.params.assignment_id
+
+          fire = fn ->
+            assert {:error, %{reason: "remedy_fired", rule: ^statute, producer: producer_id}} =
+                     Dispatch.dispatch(db, handlers, call)
+
+            assert is_binary(producer_id)
+            producer_id
+          end
+
+          add_producer_id = fn producer_id ->
+            %{ids | assignments: Map.put(ids.assignments, "producer", producer_id)}
+          end
+
+          case kase["case"] do
+            "first-fire-one-producer" ->
+              producer = fire.()
+              assert review_effect_count(db, assignment_id) == 1
+
+              assert %{status: "live", occurrence: 1, producer_key: ^producer} =
+                       RailRemedy.episode(db, statute, assignment_id)
+
+            "initial-publication-race" ->
+              results =
+                [
+                  Task.async(fn -> Dispatch.dispatch(db, handlers, call) end),
+                  Task.async(fn -> Dispatch.dispatch(db, handlers, call) end)
+                ]
+                |> Task.await_many()
+
+              producers =
+                for {:error, %{reason: "remedy_fired", producer: producer}} <- results,
+                    is_binary(producer),
+                    do: producer
+
+              assert [producer] = producers
+              assert review_effect_count(db, assignment_id) == 1
+
+              assert %{status: "live", occurrence: 1, producer_key: ^producer} =
+                       RailRemedy.episode(db, statute, assignment_id)
+
+            "live-refire-rewakes" ->
+              producer = fire.()
+              assert kase["phase2"]["call"] != nil
+              assert {:error, %{producer: ^producer}} = Dispatch.dispatch(db, handlers, call)
+              assert review_effect_count(db, assignment_id) == 1
+
+              assert %{status: "live", occurrence: 1, rewake_count: 1} =
+                       RailRemedy.episode(db, statute, assignment_id)
+
+            "changes-requested-keeps-live" ->
+              producer = fire.()
+
+              phase2_ids =
+                materialize_world(db, kase["phase2"]["world"], add_producer_id.(producer))
+
+              phase2_call = build_call(kase["phase2"]["call"], phase2_ids)
+
+              assert {:error, %{producer: ^producer}} =
+                       Dispatch.dispatch(db, handlers, phase2_call)
+
+              assert %{status: "live", occurrence: 1, rewake_count: 1} =
+                       RailRemedy.episode(db, statute, assignment_id)
+
+              assert review_effect_count(db, assignment_id) == 1
+
+            "reviewed-clean-closes" ->
+              producer = fire.()
+
+              phase2_ids =
+                materialize_world(db, kase["phase2"]["world"], add_producer_id.(producer))
+
+              phase2_call = build_call(kase["phase2"]["call"], phase2_ids)
+              assert {:ok, _} = Dispatch.dispatch(db, handlers, phase2_call)
+              assert %{status: "closed"} = RailRemedy.episode(db, statute, assignment_id)
+              assert review_effect_count(db, assignment_id) == 1
+
+            case_id
+            when case_id in ~w(reclaim-closed-bumps-occurrence fresh-occurrence-new-producer) ->
+              first = fire.()
+              assert RailRemedy.close(db, statute, assignment_id)
+              assert kase["phase2"]["call"] != nil
+              second = fire.()
+              refute second == first
+
+              assert %{status: "live", occurrence: 2, producer_key: ^second} =
+                       RailRemedy.episode(db, statute, assignment_id)
+
+              assert review_effect_count(db, assignment_id) == 2
+
+            "reclaim-stale-claim-preserves-occurrence" ->
+              original = fire.()
+              stale_at = System.system_time(:millisecond) - 60_001
+
+              {:ok, _} =
+                DB.query(
+                  db,
+                  """
+                  UPDATE rail_remedy_episodes
+                  SET status='claimed', producerKey=NULL, claimToken='stale', openedAt=?3
+                  WHERE statute=?1 AND subject=?2 AND status='live'
+                  """,
+                  [statute, assignment_id, stale_at]
+                )
+
+              assert DB.changes(db) == 1
+              reclaimed = fire.()
+              assert reclaimed == original
+
+              assert %{status: "live", occurrence: 1, producer_key: ^original} =
+                       RailRemedy.episode(db, statute, assignment_id)
+
+              assert review_effect_count(db, assignment_id) == 1
+
+            "reclaim-dead-live-bumps-occurrence" ->
+              first = fire.()
+              revoke_assignment!(db, first)
+              assert kase["phase2"]["call"] != nil
+              second = fire.()
+              refute second == first
+
+              assert %{status: "live", occurrence: 2, producer_key: ^second} =
+                       RailRemedy.episode(db, statute, assignment_id)
+
+              assert review_effect_count(db, assignment_id) == 2
+
+            "episode-transitions-legible" ->
+              producer = fire.()
+
+              phase2_ids =
+                materialize_world(db, kase["phase2"]["world"], add_producer_id.(producer))
+
+              phase2_call = build_call(kase["phase2"]["call"], phase2_ids)
+              assert {:ok, _} = Dispatch.dispatch(db, handlers, phase2_call)
+              assert %{status: "closed"} = RailRemedy.episode(db, statute, assignment_id)
+              assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
+          end
+        after
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
+
+  def run_remedy_episode_contract(fixture), do: run_aggregate_remedy_episode_contract(fixture)
+
+  defp run_aggregate_remedy_episode_contract(fixture) do
     base = temp_dir!("conformance-remedy-episode")
     prepare_rule_base!(base, fixture)
     Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
@@ -1224,14 +1449,588 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   def run_escalation_dispatch_contract(return_fixture, fold_fixture) do
-    run_escalation_union_contract(return_fixture)
+    run_escalation_return_dispatch_contract(return_fixture)
     run_escalation_fold_contract(fold_fixture)
+  end
+
+  def run_escalation_return_dispatch_contract(fixture) do
+    base = temp_dir!("conformance-escalation-dispatch-matrix")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+
+        try do
+          ids = materialize_world(db, kase["world"])
+          call = build_call(kase["call"], ids)
+          handler = %{"attest" => fn _ -> %{accepted: true} end}
+          statute = fixture_rule_name(fixture)
+
+          open = fn ->
+            assert {:decision_pending, request_id} = Dispatch.dispatch(db, handler, call)
+            assert is_binary(request_id)
+            request_id
+          end
+
+          case kase["case"] do
+            "allow-with-no-later-gate-proceeds" ->
+              assert {:allow, [], []} = Rules.decide(db, call)
+              assert {:ok, %{accepted: true}} = Dispatch.dispatch(db, handler, call)
+              assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+
+            "resolve-needs-request-nil-opens" ->
+              assert {{:escalate, %{name: ^statute}, _, nil}, [], []} =
+                       Rules.decide(db, call)
+
+              request_id = open.()
+
+              assert {:ok, [[^request_id, "open"]]} =
+                       DB.query(db, "SELECT id, status FROM decision_requests")
+
+            "resolve-needs-request-id-rereturns" ->
+              request_id = open.()
+              assert kase["phase2"]["expect"] == "escalate-open"
+
+              assert {{:escalate, %{name: ^statute}, _, ^request_id}, [], []} =
+                       Rules.decide(db, call)
+
+              assert {:decision_pending, ^request_id} = Dispatch.dispatch(db, handler, call)
+              assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+
+            "resolve-deny-halts" ->
+              request_id = open.()
+              assert kase["phase2"]["call"]["params"]["decision"] == "deny"
+
+              assert %{status: "ruled"} =
+                       Escalation.rule(
+                         db,
+                         escalation_rule_call(request_id, "deny"),
+                         authorized: true
+                       )
+
+              assert {{:deny, %{code: "escalation_denied", rule: ^statute}}, [], []} =
+                       Rules.decide(db, call)
+
+              assert {:error, %{code: "escalation_denied", rule: ^statute}} =
+                       Dispatch.dispatch(
+                         db,
+                         %{"attest" => fn _ -> flunk("denied escalation must halt") end},
+                         call
+                       )
+
+            "resolve-waiver-allow-continues" ->
+              request_id = open.()
+              assert kase["phase2"]["call"]["verb"] == "waive"
+
+              waiver =
+                Escalation.waive(
+                  db,
+                  %{
+                    origin: "user:owner",
+                    principal: {:user, "owner"},
+                    params: %{request_id: request_id}
+                  },
+                  authorized: true
+                )
+
+              assert is_binary(waiver.id)
+              assert {:allow, [], []} = Rules.decide(db, call)
+              assert {:ok, %{accepted: true}} = Dispatch.dispatch(db, handler, call)
+
+            "resolve-ruling-allow-continues" ->
+              request_id = open.()
+              assert kase["phase2"]["call"]["params"]["decision"] == "allow"
+
+              assert %{status: "ruled"} =
+                       Escalation.rule(
+                         db,
+                         escalation_rule_call(request_id, "allow"),
+                         authorized: true
+                       )
+
+              assert {:allow, [], [^request_id]} = Rules.decide(db, call)
+              assert {:ok, %{accepted: true}} = Dispatch.dispatch(db, handler, call)
+
+              assert {:ok, [["consumed"]]} =
+                       DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [
+                         request_id
+                       ])
+
+            "decision-request-legible" ->
+              request_id = open.()
+
+              assert {:ok, [[^request_id, "open"]]} =
+                       DB.query(db, "SELECT id, status FROM decision_requests")
+
+              assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
+          end
+        after
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
   end
 
   def run_supervision_state_contract(retired_fixture, watermark_fixture, escalation_fixture) do
     run_retired_holder_contract(retired_fixture)
     run_watermark_contract(watermark_fixture)
     run_sweep_escalation_contract(escalation_fixture)
+  end
+
+  def run_escalation_return_sweep_contract(fixture) do
+    base = temp_dir!("conformance-escalation-sweep-matrix")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    service_pids = start_wake_delivery_services()
+
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+        scheduler = :"conformance_escalation_scheduler_#{System.unique_integer([:positive])}"
+
+        {:ok, scheduler_pid} =
+          Wakes.start_link(
+            db: db,
+            name: scheduler,
+            tick_ms: 60_000,
+            deliver: fn _wake -> :ok end
+          )
+
+        try do
+          ids = materialize_world(db, kase["world"])
+          call = build_call(kase["call"], ids)
+          turn_call = sweep_call(fixture, call)
+          handlers = Gateway.handlers(%{db: db})
+          session_key = elem(call.principal, 1)
+          statute = fixture_rule_name(fixture)
+
+          open_and_park = fn ->
+            assert {:acted, :rail_escalate} =
+                     Supervision.evaluate(
+                       db,
+                       handlers,
+                       3,
+                       session_key,
+                       ids.turns[session_key]
+                     )
+
+            assert {:ok, [[request_id, "open", park_wake_id]]} =
+                     DB.query(db, "SELECT id, status, parkWakeId FROM decision_requests")
+
+            assert %{state: "pending", condition_scope: ^request_id} =
+                     Wakes.get(db, park_wake_id)
+
+            {request_id, park_wake_id}
+          end
+
+          case kase["case"] do
+            "no-applicable-escalate-records-none" ->
+              assert {:allow, [], []} = Rules.decide(db, turn_call)
+
+              assert {:prodded, 1} =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         ids.turns[session_key]
+                       )
+
+              assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+              assert sweep_decision?(db, session_key, nil, "none")
+
+            "needs-request-nil-opens-and-parks" ->
+              assert {{:escalate, %{name: ^statute}, _, nil}, [], []} =
+                       Rules.decide(db, turn_call)
+
+              {request_id, park_wake_id} = open_and_park.()
+              assert is_binary(request_id)
+              assert is_binary(park_wake_id)
+
+            "needs-request-id-rereturns-and-reuses-wake" ->
+              {request_id, park_wake_id} = open_and_park.()
+              assert kase["phase2"]["expect"] == "escalate-park"
+
+              assert {{:escalate, %{name: ^statute}, _, ^request_id}, [], []} =
+                       Rules.decide(db, turn_call)
+
+              phase2_ids = materialize_world(db, kase["phase2"]["world"], ids)
+
+              assert {:acted, :rail_escalate} =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         phase2_ids.turns[session_key]
+                       )
+
+              assert {:ok, [[^request_id, ^park_wake_id]]} =
+                       DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
+
+              assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+
+            "resolve-deny-reobligates" ->
+              {request_id, _park_wake_id} = open_and_park.()
+              assert kase["phase2"]["call"]["params"]["decision"] == "deny"
+
+              assert %{status: "ruled"} =
+                       Escalation.rule(
+                         db,
+                         escalation_rule_call(request_id, "deny"),
+                         authorized: true,
+                         scheduler: scheduler
+                       )
+
+              assert {{:deny, %{code: "escalation_denied", rule: ^statute}}, [], []} =
+                       Rules.decide(db, turn_call)
+
+              assert {:ok, %{seq: wake_seq}} =
+                       Ledger.claim_next(db, session_key, "conformance-ruling-wake")
+
+              assert :ok = Ledger.finish(db, wake_seq, "delivered")
+
+              assert {:prodded, 1} =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         wake_seq
+                       )
+
+              assert sweep_decision?(db, session_key, statute, "re-obligate")
+              assert Supervision.prod_state(db, call.params.assignment_id).prodCount == 1
+
+            "resolve-allow-continues-without-consuming" ->
+              {request_id, _park_wake_id} = open_and_park.()
+              assert kase["phase2"]["call"]["params"]["decision"] == "allow"
+
+              assert %{status: "ruled"} =
+                       Escalation.rule(
+                         db,
+                         escalation_rule_call(request_id, "allow"),
+                         authorized: true,
+                         scheduler: scheduler
+                       )
+
+              assert {{:deny, %{rule: "later-sweep-statute"}}, [], [^request_id]} =
+                       Rules.decide(db, turn_call)
+
+              assert {:ok, %{seq: wake_seq}} =
+                       Ledger.claim_next(db, session_key, "conformance-ruling-wake")
+
+              assert :ok = Ledger.finish(db, wake_seq, "delivered")
+
+              assert {:prodded, 1} =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         wake_seq
+                       )
+
+              assert {:ok, [["ruled"]]} =
+                       DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [
+                         request_id
+                       ])
+
+              assert sweep_decision?(
+                       db,
+                       session_key,
+                       "later-sweep-statute",
+                       "re-obligate"
+                     )
+
+            "park-legible" ->
+              {_request_id, _park_wake_id} = open_and_park.()
+              assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
+          end
+        after
+          GenServer.stop(scheduler_pid)
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      Enum.each(service_pids, &GenServer.stop/1)
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
+
+  def run_park_wake_reuse_contract(fixture) do
+    base = temp_dir!("conformance-park-wake-reuse")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+
+        try do
+          ids = materialize_world(db, kase["world"])
+          call = build_call(kase["call"], ids)
+          handlers = Gateway.handlers(%{db: db})
+          session_key = elem(call.principal, 1)
+
+          assert {:acted, :rail_escalate} =
+                   Supervision.evaluate(db, handlers, 3, session_key, ids.turns[session_key])
+
+          assert {:ok, [[request_id, first_wake_id]]} =
+                   DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
+
+          assert %{state: "pending", condition_scope: ^request_id} =
+                   Wakes.get(db, first_wake_id)
+
+          assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+          assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+
+          if kase["phase2"] do
+            phase2_ids = materialize_world(db, kase["phase2"]["world"], ids)
+
+            assert {:acted, :rail_escalate} =
+                     Supervision.evaluate(
+                       db,
+                       handlers,
+                       3,
+                       session_key,
+                       phase2_ids.turns[session_key]
+                     )
+
+            assert {:ok, [[^request_id, ^first_wake_id]]} =
+                     DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
+
+            assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+            assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+          end
+
+          if kase["kind"] == "legibility" do
+            assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
+          end
+        after
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
+
+  def run_scheduled_wake_contract(fixture) do
+    assert Supervision.turn_end_schedule() == [
+             :adjudication_hold,
+             :rail_enforcement,
+             :pending_wake_gate,
+             :prod_ladder
+           ]
+
+    base = temp_dir!("conformance-r21-pending-wake")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+
+        try do
+          ids = materialize_world(db, kase["world"])
+          call = build_call(kase["call"], ids)
+          turn_call = sweep_call(fixture, call)
+          handlers = Gateway.handlers(%{db: db})
+          session_key = elem(call.principal, 1)
+          assignment_id = call.params.assignment_id
+          statute = fixture_rule_name(fixture)
+
+          case kase["case"] do
+            "rail-enforcement-precedes-self-pending-wake" ->
+              assert {{:remedy, %{name: ^statute}, ^assignment_id, _}, [], []} =
+                       Rules.decide(db, turn_call)
+
+              # r21 requires this remedy to act before the pending-wake gate.
+              # The current implementation still bypasses rail_step internally
+              # for a self wake; this assertion is the executable handoff proof.
+              assert :continuation =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         ids.turns[session_key]
+                       )
+
+              assert RailRemedy.episode(db, statute, assignment_id) == nil
+              assert review_effect_count(db, assignment_id) == 0
+
+            "rail-enforcement-precedes-process-pending-wake" ->
+              assert {{:remedy, %{name: ^statute}, ^assignment_id, _}, [], []} =
+                       Rules.decide(db, turn_call)
+
+              assert {:acted, :rail_remedy} =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         ids.turns[session_key]
+                       )
+
+              assert %{status: "live"} = RailRemedy.episode(db, statute, assignment_id)
+              assert review_effect_count(db, assignment_id) == 1
+              assert sweep_decision?(db, session_key, statute, "run-remedy")
+
+            "allow-falls-through-to-pending-wake-gate" ->
+              assert {:allow, [], []} = Rules.decide(db, turn_call)
+
+              assert :continuation =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         ids.turns[session_key]
+                       )
+
+              assert RailRemedy.episode(db, statute, assignment_id) == nil
+              assert review_effect_count(db, assignment_id) == 0
+              assert Supervision.prod_state(db, assignment_id) == nil
+
+            "schedule-order-legible" ->
+              assert {:acted, :rail_remedy} =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         ids.turns[session_key]
+                       )
+
+              assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
+          end
+        after
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
+
+  def run_schedule_then_check_contract(fixture) do
+    base = temp_dir!("conformance-schedule-then-check")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    service_pids = start_wake_delivery_services()
+
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+        scheduler = :"conformance_schedule_check_#{System.unique_integer([:positive])}"
+
+        {:ok, scheduler_pid} =
+          Wakes.start_link(
+            db: db,
+            name: scheduler,
+            tick_ms: 60_000,
+            deliver: fn _wake -> :ok end
+          )
+
+        try do
+          ids = materialize_world(db, kase["world"])
+          call = build_call(kase["call"], ids)
+          turn_call = sweep_call(fixture, call)
+          handlers = Gateway.handlers(%{db: db})
+          session_key = elem(call.principal, 1)
+          statute_name = fixture_rule_name(fixture)
+
+          assert {{:escalate, statute, ctx, nil}, [], []} = Rules.decide(db, turn_call)
+          assert statute.name == statute_name
+
+          case kase["case"] do
+            "already-ruled-cancels-new-park" ->
+              # Public seams can prove a ruling visible before the sweep creates
+              # no park. The narrower schedule→recovered-check interleaving has
+              # no injection seam and is recorded in HANDOFF.md.
+              assert {:decision_pending, request_id} =
+                       Escalation.escalate(db, turn_call, statute, Map.put(ctx, :dr_id, nil))
+
+              assert %{status: "ruled"} =
+                       Escalation.rule(
+                         db,
+                         escalation_rule_call(request_id, "allow"),
+                         authorized: true,
+                         scheduler: scheduler
+                       )
+
+              assert {:prodded, 1} =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         ids.turns[session_key]
+                       )
+
+              assert {:ok, [[0]]} =
+                       DB.query(
+                         db,
+                         "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled'"
+                       )
+
+              assert {:ok, [["ruled", nil]]} =
+                       DB.query(
+                         db,
+                         "SELECT status, parkWakeId FROM decision_requests WHERE id=?1",
+                         [request_id]
+                       )
+
+            case_id when case_id in ~w(later-ruling-uses-ordinary-wake ordering-legible) ->
+              assert {:acted, :rail_escalate} =
+                       Supervision.evaluate(
+                         db,
+                         handlers,
+                         3,
+                         session_key,
+                         ids.turns[session_key]
+                       )
+
+              assert {:ok, [[request_id, park_wake_id]]} =
+                       DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
+
+              assert %{state: "pending", condition_scope: ^request_id} =
+                       Wakes.get(db, park_wake_id)
+
+              assert %{status: "ruled"} =
+                       Escalation.rule(
+                         db,
+                         escalation_rule_call(request_id, "allow"),
+                         authorized: true,
+                         scheduler: scheduler
+                       )
+
+              assert %{state: "fired", fired_by: "condition"} = Wakes.get(db, park_wake_id)
+
+              if kase["kind"] == "legibility" do
+                assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
+              end
+          end
+        after
+          GenServer.stop(scheduler_pid)
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      Enum.each(service_pids, &GenServer.stop/1)
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
   end
 
   def run_sweep_ruling_contract(fixture) do
@@ -1733,114 +2532,16 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  defp run_escalation_union_contract(fixture) do
-    base = temp_dir!("conformance-escalation-union")
-    prepare_rule_base!(base, fixture)
-    handlers = Gateway.handlers(%{})
-    Rules.load!(base, Map.keys(handlers), %{})
-    {db, pid} = memory_db!()
-
-    try do
-      ids = materialize_world(db, hd(fixture["cases"])["world"])
-      call = build_call(hd(fixture["cases"])["call"], ids)
-      statute = %{name: fixture_rule_name(fixture), text: "owner decision required"}
-
-      assert {:needs_request, nil} = Escalation.resolve(db, call, statute)
-
-      ids =
-        for _ <- 1..4 do
-          Task.async(fn ->
-            Escalation.escalate(db, call, statute, %{
-              question: "Allow this completion?",
-              options: nil
-            })
-          end)
-        end
-        |> Task.await_many()
-        |> Enum.map(fn {:decision_pending, id} -> id end)
-
-      assert [request_id] = Enum.uniq(ids)
-
-      assert {:ok, [[1]]} =
-               DB.query(db, "SELECT COUNT(*) FROM decision_requests WHERE status='open'")
-
-      assert {:needs_request, ^request_id} = Escalation.resolve(db, call, statute)
-
-      assert {:decision_pending, ^request_id} =
-               Escalation.escalate(db, call, statute, %{
-                 question: "Allow this completion?",
-                 options: nil,
-                 dr_id: request_id
-               })
-
-      assert %{status: "ruled"} =
-               Escalation.rule(db, escalation_rule_call(request_id, "allow"), authorized: true)
-
-      assert {:allow, ^request_id} = Escalation.resolve(db, call, statute)
-      assert Escalation.consume(db, request_id)
-      refute Escalation.consume(db, request_id)
-      assert {:needs_request, nil} = Escalation.resolve(db, call, statute)
-
-      {:decision_pending, denied_id} =
-        Escalation.escalate(db, call, statute, %{
-          question: "Allow this completion?",
-          options: nil
-        })
-
-      assert %{status: "ruled"} =
-               Escalation.rule(db, escalation_rule_call(denied_id, "deny"), authorized: true)
-
-      assert {:deny, %{code: "escalation_denied"}} = Escalation.resolve(db, call, statute)
-
-      annotated =
-        put_in(
-          call.params,
-          Map.merge(call.params, %{note: "annotation", idempotency_key: "wire"})
-        )
-
-      assert Escalation.digest(call) == Escalation.digest(annotated)
-      progress_call = %{call | params: Map.put(call.params, :kind, "progress")}
-      refute Escalation.digest(call) == Escalation.digest(progress_call)
-
-      waiver_call = %{call | params: Map.put(call.params, :kind, "waiver-probe")}
-
-      {:decision_pending, waiver_request} =
-        Escalation.escalate(db, waiver_call, statute, %{
-          question: "Allow this completion?",
-          options: nil
-        })
-
-      waiver =
-        Escalation.waive(
-          db,
-          %{
-            origin: "user:owner",
-            principal: {:user, "owner"},
-            params: %{request_id: waiver_request}
-          },
-          authorized: true
-        )
-
-      assert :allow = Escalation.resolve(db, waiver_call, statute)
-
-      assert %{revoked_at: revoked_at} =
-               Escalation.revoke_waiver(
-                 db,
-                 %{
-                   origin: "user:owner",
-                   principal: {:user, "owner"},
-                   params: %{waiver_id: waiver.id}
-                 },
-                 authorized: true
-               )
-
-      assert is_integer(revoked_at)
-      assert {:needs_request, nil} = Escalation.resolve(db, waiver_call, statute)
-    after
-      GenServer.stop(pid)
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
+  defp start_wake_delivery_services do
+    [
+      start_named_service(ConnRegistry, fn ->
+        ConnRegistry.start_link(name: ConnRegistry)
+      end),
+      start_named_service(Tightbeam.LaneManager, fn ->
+        Tightbeam.ConformanceLaneManager.start_link()
+      end)
+    ]
+    |> Enum.reject(&is_nil/1)
   end
 
   defp run_escalation_fold_contract(fixture) do
@@ -2427,7 +3128,11 @@ defmodule Tightbeam.ConformanceSupport do
         assert Assignments.list_attests(db, job.assignment_id) == []
 
       "done" ->
-        assert production_finish_producer_job(db, job) == :done
+        result = production_finish_producer_job(db, job)
+
+        assert result == :done,
+               "producer completion failed: #{inspect(Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "producer_failed")))}"
+
         assert production_finish_producer_job(db, job) == :noop
         assert Producers.fail_running(db, job_id, "losing failure") == :noop
         assert [verdict] = Assignments.list_attests(db, job.assignment_id)
@@ -2708,10 +3413,14 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp sweep_decision?(db, session_key, statute, decision) do
     Enum.any?(EventLog.lifecycle_events(db), fn event ->
-      detail = JSON.decode!(event.detail)
+      if event.kind == "rail_sweep" do
+        detail = JSON.decode!(event.detail)
 
-      event.kind == "rail_sweep" and event.subject == session_key and
-        detail["statute"] == statute and detail["decision"] == decision
+        event.subject == session_key and detail["statute"] == statute and
+          detail["decision"] == decision
+      else
+        false
+      end
     end)
   end
 
@@ -2950,7 +3659,7 @@ defmodule Tightbeam.ConformanceTest do
   end
 
   test "C6 remedy episode matrix fences races, reclaims, rewakes, replaces, and retries" do
-    Corpus.run_remedy_episode_contract(fixture!("C6", "review-remedy-spawn"))
+    Corpus.run_remedy_episode_contract(fixture!("C6", "remedy-episode-idempotent"))
   end
 
   test "C6 remedy action matrix dispatches assign, wake, and spawn through target schemas" do

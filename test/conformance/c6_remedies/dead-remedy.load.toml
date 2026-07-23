@@ -5,5 +5,5 @@ phase = "pending"
 blocking_phase = "P5"
 outcome = "load-raise"
 must_name = ["dead-remedy", "unused-kind"]
-error_match = "no gate"
-source = "mechanism §C1 dead remedy"
+error_match = "does not require"
+source = "mechanism §C1 produces must satisfy this gate"

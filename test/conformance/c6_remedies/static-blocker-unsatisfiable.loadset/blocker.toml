@@ -2,4 +2,4 @@
 name = "block-assign"
 verb = "assign"
 text = "statically block assignment"
-deny_when = [{ fact = "literal.true", op = "eq", value = true }]
+deny_when = [{ fact = "caller.origin_class", op = "eq", value = "remedy" }]

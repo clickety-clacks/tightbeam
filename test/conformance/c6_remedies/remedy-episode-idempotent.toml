@@ -5,14 +5,17 @@ phase = "pending"
 blocking_phase = "P5"
 kind = "remedy"
 source = "mechanism §C2 CAS; r9 occurrence rule"
-legibility = "event:denied(rule=remedy-episode-idempotent);lifecycle:rail_remedy(outcome=claimed|dispatched|live|closed)"
+legibility = "event:denied(rule=remedy-episode-idempotent);lifecycle:rail_remedy(outcome=claimed-dispatched);episode status=closed"
 [[fixture.rule]]
 name = "remedy-episode-idempotent"
 verb = "attest"
 text = "remedy episodes publish once per occurrence"
 edges = ["verb"]
 effect = "remedy"
-deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]
 [fixture.rule.remedy]
 action = "assign"
 produces = "reviewed-clean"
