@@ -107,7 +107,7 @@ defmodule Tightbeam.Roles do
   def bind(db \\ Tightbeam.DB, name, session_key) do
     transaction!(db, fn txn ->
       with :ok <- role_present(txn, name),
-           :ok <- active_binding(txn, session_key) do
+           :ok <- active_session(txn, session_key) do
         Txn.q(
           txn,
           "UPDATE roles SET boundSessionKey = ?2, updatedAt = ?3 WHERE name = ?1",
@@ -219,8 +219,9 @@ defmodule Tightbeam.Roles do
   end
 
   defp active_binding(_txn, nil), do: :ok
+  defp active_binding(txn, session_key), do: active_session(txn, session_key)
 
-  defp active_binding(txn, session_key) do
+  defp active_session(txn, session_key) do
     case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
       [["active"]] -> :ok
       _ -> {:error, %{code: "unknown_session", message: "unknown active session: #{session_key}"}}
