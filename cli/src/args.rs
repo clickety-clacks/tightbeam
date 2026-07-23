@@ -1,8 +1,7 @@
 //! Hand-parsed CLI arguments.
 //!
-//! Unlike the TypeScript reference CLI, this shipped Rust CLI rejects multiple
-//! identity flags and permits omission when session-file discovery proves the
-//! caller; the gateway remains the identity authority.
+//! Unlike the TypeScript seam, multiple identity flags are rejected as required
+//! by the port specification's conflict ruling.
 
 use std::collections::HashMap;
 use std::fs;
@@ -13,7 +12,6 @@ pub enum Identity {
     Role(String),
     User(String),
     Process(String),
-    Omitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,80 +24,12 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
-    Probe {
-        json: bool,
-        base_dir: Option<String>,
-    },
     Wake {
         identity: Identity,
         target: Target,
         prompt: String,
         after_ms: Option<String>,
         at: Option<String>,
-        condition_kind: Option<String>,
-        condition_scope: Option<String>,
-        idempotency_key: Option<String>,
-    },
-    Condition {
-        identity: Identity,
-        kind: String,
-        scope: Option<String>,
-        idempotency_key: Option<String>,
-    },
-    FactsRead {
-        identity: Identity,
-        kind: String,
-        scope: Option<String>,
-    },
-    ArtifactRecord {
-        identity: Identity,
-        kind: String,
-        title: String,
-        origin_path: String,
-        description: Option<String>,
-        work_item_id: Option<String>,
-        content_sha256: Option<String>,
-    },
-    ArtifactGet {
-        identity: Identity,
-        artifact_id: String,
-    },
-    Artifacts {
-        identity: Identity,
-        work_item_id: Option<String>,
-        session_key: Option<String>,
-        kind: Option<String>,
-    },
-    Rule {
-        identity: Identity,
-        request_id: String,
-        decision: String,
-        rationale: Option<String>,
-    },
-    Waive {
-        identity: Identity,
-        request_id: Option<String>,
-        session_key: Option<String>,
-        statute_name: Option<String>,
-        reason: Option<String>,
-    },
-    RevokeWaiver {
-        identity: Identity,
-        waiver_id: String,
-        reason: Option<String>,
-    },
-    Withdraw {
-        identity: Identity,
-        request_id: String,
-        reason: String,
-    },
-    DecisionRequests {
-        identity: Identity,
-        status: Option<String>,
-    },
-    DecisionRequest {
-        identity: Identity,
-        request_id: String,
     },
     Spawn {
         identity: Identity,
@@ -118,92 +48,6 @@ pub enum Command {
         identity: Identity,
         session_key: String,
         idempotency_key: Option<String>,
-    },
-    Critical {
-        identity: Identity,
-        for_ms: String,
-        reason: String,
-    },
-    Adjudicate {
-        identity: Identity,
-        episode: String,
-        action: String,
-        model: Option<String>,
-        reason: Option<String>,
-    },
-    Assign {
-        identity: Identity,
-        subject: String,
-        target: Target,
-        idempotency_key: Option<String>,
-        work_item_id: Option<String>,
-        reviews: Option<String>,
-        files: Option<Vec<String>>,
-    },
-    Dispatch {
-        identity: Identity,
-        subject: String,
-        holder: String,
-        work_item_id: Option<String>,
-        brief: String,
-        idempotency_key: Option<String>,
-    },
-    RunTests {
-        identity: Identity,
-        assignment_id: String,
-    },
-    RunSmoke {
-        identity: Identity,
-        assignment_id: String,
-    },
-    CancelProducerJob {
-        identity: Identity,
-        job_id: String,
-    },
-    WorkItemCreate {
-        identity: Identity,
-        title: String,
-        spec_ref_name: Option<String>,
-        spec_ref_sha256: Option<String>,
-    },
-    WorkItemUpdate {
-        identity: Identity,
-        work_item_id: String,
-        title: Option<String>,
-        spec_ref_name: Option<String>,
-        spec_ref_sha256: Option<String>,
-        clear_spec_ref: bool,
-    },
-    WorkItemGet {
-        identity: Identity,
-        work_item_id: String,
-    },
-    WorkItemList {
-        identity: Identity,
-    },
-    AssignmentGet {
-        identity: Identity,
-        assignment_id: String,
-    },
-    Attest {
-        identity: Identity,
-        assignment_id: String,
-        kind: String,
-        verdict: Option<String>,
-        note: Option<String>,
-    },
-    Attests {
-        identity: Identity,
-        assignment_id: String,
-    },
-    RevokeAssignment {
-        identity: Identity,
-        assignment_id: String,
-    },
-    Assignments {
-        identity: Identity,
-        target: Option<Target>,
-        state: Option<String>,
     },
     CancelWake {
         identity: Identity,
@@ -256,16 +100,6 @@ pub enum Command {
         user_id: String,
         is_admin: bool,
     },
-    ConfigGet {
-        identity: Identity,
-        setting: String,
-    },
-    ConfigSet {
-        identity: Identity,
-        setting: String,
-        value: String,
-    },
-    Init(InitArgs),
     Setup(SetupArgs),
     Assimilate(AssimilateArgs),
 }
@@ -300,7 +134,7 @@ Every command is one of the substrate's verbs; you invoke them exactly as the
 human operator does. Output is JSON on stdout; a nonzero exit means failure
 (the message is on stderr).
 
-IDENTITY (optional inside a session workdir; otherwise required):
+IDENTITY (required on every command — this is the #1 thing to get right):
   --as <role>          act as a role you currently hold. Use this when YOU (an
                        agent) run the command. The role must be bound to your
                        active session.
@@ -310,11 +144,10 @@ IDENTITY (optional inside a session workdir; otherwise required):
   --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
                        operator/admin actions or when no agent identity applies.
   --as-process <name>  act as automation (cron, CI, a webhook — e.g.
-                       "cron"). Processes may wake, cancel-wake, and file
-                       conditions ONLY — they cannot spawn, retire, or administer.
-  Pass at most ONE identity. It is who the call is attributed to, NOT the
-  target of the call. Inside a session workdir, omission lets the gateway
-  derive the session's identity from its credential.
+                       "cron"). Processes may wake and cancel-wake ONLY —
+                       they cannot spawn, retire, or administer.
+  Pass exactly ONE identity. It is who the call is attributed to, NOT the
+  target of the call.
 
 TARGET (for commands that take one — pass exactly one):
   --session <key>      this exact session incarnation
@@ -323,43 +156,13 @@ TARGET (for commands that take one — pass exactly one):
 
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
-       [--after 30s|5m|2h] [--at <epochMs>] [--key <idempotencyKey>]
-       [--when-fact <kind> [--when-scope <scope>] --fallback-after 30s|5m|2h]
+       [--after 30s|5m|2h] [--at <epochMs>]
       Send a prompt to the selected target. Immediate = a direct message; with --after or
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
       session (or yourself).
         tightbeam wake --role reviewer --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
-
-  condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
-      File an org/product condition fact. Reserved substrate kinds cannot be
-      filed through this command.
-        tightbeam condition --kind deploy-succeeded --scope prod --key deploy-8f2a
-
-  facts-read --kind <kind> [--scope <scope>]
-      Read the latest matching condition fact.
-
-  artifact-record --kind <kind> --title <title> --path <originPath>
-                  [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
-      Record a deliberate artifact pointer for the calling session.
-  artifact-get <artifactId>
-      Read one artifact row.
-  artifacts [--work-item <workItemId>] [--session <key>] [--kind <kind>]
-      List artifact rows matching every supplied exact filter.
-
-  rule --request <id> --decision <allow|deny|option> [--rationale "..."]
-      Resolve one open decision request.
-  waive (--request <id> | --session <key> --statute <name>) [--reason "..."]
-      Grant a raiser-scoped statute waiver.
-  revoke-waiver --waiver <id> [--reason "..."]
-      Revoke a waiver prospectively.
-  withdraw --request <id> --reason "..."
-      Retract your own open decision request.
-  decision-requests [--status <status>]
-      List visible decision requests (open by default).
-  decision-request <id>
-      Read one visible decision request with its halted-call context.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness claude|codex] [--model <ref>] [--host <host>]
@@ -382,45 +185,7 @@ COMMANDS:
         tightbeam list --as orchestrator:news
 
   retire --session <key> [--key <idempotencyKey>]
-      End a session and its spawned subtree deliberately.
-
-  critical --for <duration> --reason <text>
-      Declare or renew this session's bounded critical-section lease.
-
-  adjudicate --episode <correlationKey> --action park|swap|respawn|stop
-             [--model <ref>] [--reason <text>]
-      Rule on a model-adjudication episode currently owned by this session.
-
-  work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
-  work-item-update <workItemId> [--title "<title>"] [--spec-ref <name>]
-                   [--spec-sha256 <hex>] [--clear-spec-ref]
-  work-item-get <workItemId>
-  work-item-list
-  assign --subject "<work>" (--session <key> | --role <name>)
-         [--key <key>] [--work-item <workItemId>]
-         [--reviews <assignmentId>] [--files '["lib/a.ex","test/a_test.exs"]']
-      Open an obligation held by a session; a work item is the durable thread
-      across assignments.
-  dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
-           --brief "<one sentence>" [--work-item <workItemId>] [--key <key>]
-      Atomically open an assignment and wake its holder with the card id.
-  assignment-get <assignmentId>
-      Read one assignment row.
-  run-tests <assignmentId>
-  run-smoke <assignmentId>
-      Queue the committed mechanical producer for an assignment.
-  cancel-producer-job <jobId>
-      Cancel a queued or running producer job.
-  attest <assignmentId> --kind progress|completion|surrender|verdict
-         [--verdict <kind>] [--note "..."]
-      File against an assignment. Verdicts require --verdict and may be filed
-      by any session or user; lifecycle attests remain holder-filed.
-  attests <assignmentId>
-      List every attest filed against an assignment.
-  revoke-assignment <assignmentId>
-      Revoke an open assignment (admin or its opener).
-  assignments [--session <key> | --role <name>] [--state open|closed|all]
-      List assignments (open by default).
+      End a session deliberately.
 
   cancel-wake <wakeId>
       Cancel a pending (scheduled) wake by its id (from the wake command's
@@ -444,8 +209,6 @@ COMMANDS:
   deny-device <deviceId>                         reject a pending device
   revoke-device <deviceId>                       revoke a device's token
   promote-user <userId> [--demote]               grant/remove admin on a user
-  config get default-archetype                   read the default spawn archetype
-  config set default-archetype <name>            set the default spawn archetype
 
   setup [--base-dir p] [--harness claude,codex] [--force]
       Onboard harness credentials for THIS machine's org (run once at
@@ -455,10 +218,6 @@ COMMANDS:
       personal login. Copies share a grant, and shared grants revoke each
       other on refresh. Needs an interactive terminal.
         tightbeam setup --base-dir ~/.tightbeam-beam
-
-  init [--base-dir p]
-      Seed the identity working tree and create its git repository. Re-running
-      against an initialized identity repository is a no-op.
 
   assimilate <ssh-dest> [--name n] [--base-dir p] [--harness claude,codex]
              [--push-credentials] [--no-onboard] [--dry-run]
@@ -473,24 +232,19 @@ COMMANDS:
       After: add the host to an archetype's `where`.
         tightbeam assimilate work-1.local --as-user flynn
 
-  probe [--json] [--base-dir DIR]
-      Report local lineage claims, adapter candidates, and machine facts.
+DISCOVERY: the CLI finds the gateway via TIGHTBEAM_URL + TIGHTBEAM_TOKEN, else
+  <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json. In an agent shell this is already
+  set for you.
 
-DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
-  TIGHTBEAM_URL + TIGHTBEAM_TOKEN, else <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
-
-DURATIONS (for --after/--fallback-after): <n>ms | <n>s | <n>m | <n>h
-  (e.g. 30s, 5m, 2h).
+DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
 
   tightbeam help | --help | -h    show this text."#;
 
 const BOOLEAN_FLAGS: &[&str] = &[
-    "clear-spec-ref",
     "demote",
     "dry-run",
     "force",
     "help",
-    "json",
     "no-onboard",
     "push-credentials",
 ];
@@ -539,7 +293,9 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
 
     match identities.as_slice() {
         [identity] => Ok(identity.clone()),
-        [] => Ok(Identity::Omitted),
+        [] => Err(
+            "identity required: pass --as <your-agent-handle> (when an agent runs this) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'.".to_owned(),
+        ),
         _ => Err(
             "identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process"
                 .to_owned(),
@@ -688,20 +444,6 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
 
     let flags = &parsed.flags;
     match command.expect("checked above") {
-        "probe" => {
-            if parsed.positional.len() != 1
-                || flags
-                    .keys()
-                    .any(|flag| !matches!(flag.as_str(), "json" | "base-dir"))
-                || flags.get("base-dir").is_some_and(String::is_empty)
-            {
-                return Err("usage: tightbeam probe [--json] [--base-dir DIR]".to_owned());
-            }
-            Ok(Command::Probe {
-                json: flags.contains_key("json"),
-                base_dir: nonempty(flags, "base-dir"),
-            })
-        }
         "wake" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -719,160 +461,13 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             let after_ms = nonempty(flags, "after")
                 .map(|value| parse_after(&value))
                 .transpose()?;
-            let fallback_after_ms = nonempty(flags, "fallback-after")
-                .map(|value| parse_after(&value))
-                .transpose()?;
-            if after_ms.is_some() && fallback_after_ms.is_some() {
-                return Err("pass only one of --after or --fallback-after".to_owned());
-            }
             let at = nonempty(flags, "at").map(|value| js_number_json(number_coercion(&value)));
             Ok(Command::Wake {
                 identity: identity(flags)?,
                 target: targets.into_iter().next().expect("exactly one target"),
                 prompt,
-                after_ms: fallback_after_ms.or(after_ms),
+                after_ms,
                 at,
-                condition_kind: nonempty(flags, "when-fact"),
-                condition_scope: nonempty(flags, "when-scope"),
-                idempotency_key: nonempty(flags, "key"),
-            })
-        }
-        "condition" => {
-            if parsed.positional.get(1).is_some() {
-                return Err("usage: tightbeam condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]".to_owned());
-            }
-            let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
-            Ok(Command::Condition {
-                identity: identity(flags)?,
-                kind,
-                scope: nonempty(flags, "scope"),
-                idempotency_key: nonempty(flags, "key"),
-            })
-        }
-        "facts-read" => {
-            if parsed.positional.get(1).is_some() {
-                return Err(
-                    "usage: tightbeam facts-read --kind <kind> [--scope <scope>]".to_owned(),
-                );
-            }
-            let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
-            Ok(Command::FactsRead {
-                identity: identity(flags)?,
-                kind,
-                scope: nonempty(flags, "scope"),
-            })
-        }
-        "artifact-record" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]".to_owned());
-            }
-            Ok(Command::ArtifactRecord {
-                identity: identity(flags)?,
-                kind: nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?,
-                title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
-                origin_path: nonempty(flags, "path")
-                    .ok_or_else(|| "--path is required".to_owned())?,
-                description: nonempty(flags, "description"),
-                work_item_id: nonempty(flags, "work-item"),
-                content_sha256: nonempty(flags, "sha256"),
-            })
-        }
-        "artifact-get" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam artifact-get <artifactId>".to_owned());
-            }
-            Ok(Command::ArtifactGet {
-                identity: identity(flags)?,
-                artifact_id: parsed.positional[1].clone(),
-            })
-        }
-        "artifacts" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifacts [--work-item <workItemId>] [--session <key>] [--kind <kind>]".to_owned());
-            }
-            Ok(Command::Artifacts {
-                identity: identity(flags)?,
-                work_item_id: nonempty(flags, "work-item"),
-                session_key: nonempty(flags, "session"),
-                kind: nonempty(flags, "kind"),
-            })
-        }
-        "rule" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam rule --request <id> --decision <allow|deny|option> [--rationale ...]".to_owned());
-            }
-            Ok(Command::Rule {
-                identity: identity(flags)?,
-                request_id: nonempty(flags, "request")
-                    .ok_or_else(|| "--request is required".to_owned())?,
-                decision: nonempty(flags, "decision")
-                    .ok_or_else(|| "--decision is required".to_owned())?,
-                rationale: nonempty(flags, "rationale"),
-            })
-        }
-        "waive" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam waive (--request <id> | --session <key> --statute <name>) [--reason ...]".to_owned());
-            }
-            let request_id = nonempty(flags, "request");
-            let session_key = nonempty(flags, "session");
-            let statute_name = nonempty(flags, "statute");
-            let request_form =
-                request_id.is_some() && session_key.is_none() && statute_name.is_none();
-            let preemptive_form =
-                request_id.is_none() && session_key.is_some() && statute_name.is_some();
-            if !request_form && !preemptive_form {
-                return Err("usage: tightbeam waive (--request <id> | --session <key> --statute <name>) [--reason ...]".to_owned());
-            }
-            Ok(Command::Waive {
-                identity: identity(flags)?,
-                request_id,
-                session_key,
-                statute_name,
-                reason: nonempty(flags, "reason"),
-            })
-        }
-        "revoke-waiver" => {
-            if parsed.positional.len() != 1 {
-                return Err(
-                    "usage: tightbeam revoke-waiver --waiver <id> [--reason ...]".to_owned(),
-                );
-            }
-            Ok(Command::RevokeWaiver {
-                identity: identity(flags)?,
-                waiver_id: nonempty(flags, "waiver")
-                    .ok_or_else(|| "--waiver is required".to_owned())?,
-                reason: nonempty(flags, "reason"),
-            })
-        }
-        "withdraw" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam withdraw --request <id> --reason ...".to_owned());
-            }
-            Ok(Command::Withdraw {
-                identity: identity(flags)?,
-                request_id: nonempty(flags, "request")
-                    .ok_or_else(|| "--request is required".to_owned())?,
-                reason: nonempty(flags, "reason")
-                    .ok_or_else(|| "--reason is required".to_owned())?,
-            })
-        }
-        "decision-requests" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam decision-requests [--status <status>]".to_owned());
-            }
-            Ok(Command::DecisionRequests {
-                identity: identity(flags)?,
-                status: nonempty(flags, "status"),
-            })
-        }
-        "decision-request" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam decision-request <id>".to_owned());
-            }
-            Ok(Command::DecisionRequest {
-                identity: identity(flags)?,
-                request_id: parsed.positional[1].clone(),
             })
         }
         "spawn" => {
@@ -905,253 +500,6 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 identity: identity(flags)?,
                 session_key: session_key.expect("checked above"),
                 idempotency_key: nonempty(flags, "key"),
-            })
-        }
-        "critical" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam critical --for <duration> --reason <text>".to_owned());
-            }
-            let for_ms = nonempty(flags, "for")
-                .ok_or_else(|| "--for is required".to_owned())
-                .and_then(|value| {
-                    parse_after(&value).map_err(|error| error.replace("--after", "--for"))
-                })?;
-            let reason =
-                nonempty(flags, "reason").ok_or_else(|| "--reason is required".to_owned())?;
-            Ok(Command::Critical {
-                identity: identity(flags)?,
-                for_ms,
-                reason,
-            })
-        }
-        "adjudicate" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam adjudicate --episode <key> --action park|swap|respawn|stop [--model <ref>] [--reason <text>]".to_owned());
-            }
-            let episode =
-                nonempty(flags, "episode").ok_or_else(|| "--episode is required".to_owned())?;
-            let action =
-                nonempty(flags, "action").ok_or_else(|| "--action is required".to_owned())?;
-            if !matches!(action.as_str(), "park" | "swap" | "respawn" | "stop") {
-                return Err("--action must be park, swap, respawn, or stop".to_owned());
-            }
-            Ok(Command::Adjudicate {
-                identity: identity(flags)?,
-                episode,
-                action,
-                model: nonempty(flags, "model"),
-                reason: nonempty(flags, "reason"),
-            })
-        }
-        "assign" => {
-            let targets = [
-                nonempty(flags, "session").map(Target::Session),
-                nonempty(flags, "role").map(Target::Role),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-            if parsed.positional.get(1).is_some() || targets.len() != 1 {
-                return Err("usage: tightbeam assign --subject <text> exactly one of --session <key>, --role <name>".to_owned());
-            }
-            let subject =
-                nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
-            let files = nonempty(flags, "files")
-                .map(|encoded| {
-                    serde_json::from_str::<Vec<String>>(&encoded)
-                        .map_err(|_| "--files must be a JSON array of strings".to_owned())
-                })
-                .transpose()?;
-            Ok(Command::Assign {
-                identity: identity(flags)?,
-                subject,
-                target: targets.into_iter().next().expect("exactly one target"),
-                idempotency_key: nonempty(flags, "key")
-                    .or_else(|| nonempty(flags, "idempotency-key")),
-                work_item_id: nonempty(flags, "work-item"),
-                reviews: nonempty(flags, "reviews"),
-                files,
-            })
-        }
-        "dispatch" => {
-            let holders = [nonempty(flags, "to"), nonempty(flags, "holder")]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-            if parsed.positional.get(1).is_some() || holders.len() != 1 {
-                return Err("usage: tightbeam dispatch (--to <sessionKey> | --holder <sessionKey>) --subject <text> --brief <text>".to_owned());
-            }
-            let subject =
-                nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
-            let brief = nonempty(flags, "brief").ok_or_else(|| "--brief is required".to_owned())?;
-            Ok(Command::Dispatch {
-                identity: identity(flags)?,
-                subject,
-                holder: holders.into_iter().next().expect("exactly one holder"),
-                work_item_id: nonempty(flags, "work-item"),
-                brief,
-                idempotency_key: nonempty(flags, "key"),
-            })
-        }
-        "run-tests" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam run-tests <assignmentId>".to_owned());
-            }
-            Ok(Command::RunTests {
-                identity: identity(flags)?,
-                assignment_id: parsed.positional[1].clone(),
-            })
-        }
-        "run-smoke" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam run-smoke <assignmentId>".to_owned());
-            }
-            Ok(Command::RunSmoke {
-                identity: identity(flags)?,
-                assignment_id: parsed.positional[1].clone(),
-            })
-        }
-        "cancel-producer-job" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam cancel-producer-job <jobId>".to_owned());
-            }
-            Ok(Command::CancelProducerJob {
-                identity: identity(flags)?,
-                job_id: parsed.positional[1].clone(),
-            })
-        }
-        "work-item-create" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
-            }
-            let spec_ref_name = nonempty(flags, "spec-ref");
-            let spec_ref_sha256 = nonempty(flags, "spec-sha256");
-            let spec_ref_present = flags.contains_key("spec-ref");
-            let spec_sha_present = flags.contains_key("spec-sha256");
-            if spec_ref_present != spec_sha_present
-                || (spec_ref_present && (spec_ref_name.is_none() || spec_ref_sha256.is_none()))
-            {
-                return Err(
-                    "usage: --spec-ref and --spec-sha256 must be supplied together".to_owned(),
-                );
-            }
-            Ok(Command::WorkItemCreate {
-                identity: identity(flags)?,
-                title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
-                spec_ref_name,
-                spec_ref_sha256,
-            })
-        }
-        "work-item-update" => {
-            let work_item_id = parsed.positional.get(1).cloned().ok_or_else(|| {
-                "usage: tightbeam work-item-update <workItemId> [patch flags]".to_owned()
-            })?;
-            if parsed.positional.len() != 2 {
-                return Err(
-                    "usage: tightbeam work-item-update <workItemId> [patch flags]".to_owned(),
-                );
-            }
-            let clear_spec_ref = flags.contains_key("clear-spec-ref");
-            let spec_ref_name = nonempty(flags, "spec-ref");
-            let spec_ref_sha256 = nonempty(flags, "spec-sha256");
-            if clear_spec_ref
-                && (flags.contains_key("spec-ref") || flags.contains_key("spec-sha256"))
-            {
-                return Err(
-                    "usage: --clear-spec-ref conflicts with --spec-ref and --spec-sha256"
-                        .to_owned(),
-                );
-            }
-            Ok(Command::WorkItemUpdate {
-                identity: identity(flags)?,
-                work_item_id,
-                title: nonempty(flags, "title"),
-                spec_ref_name,
-                spec_ref_sha256,
-                clear_spec_ref,
-            })
-        }
-        "work-item-get" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam work-item-get <workItemId>".to_owned());
-            }
-            Ok(Command::WorkItemGet {
-                identity: identity(flags)?,
-                work_item_id: parsed.positional[1].clone(),
-            })
-        }
-        "work-item-list" => {
-            if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam work-item-list".to_owned());
-            }
-            Ok(Command::WorkItemList {
-                identity: identity(flags)?,
-            })
-        }
-        "assignment-get" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam assignment-get <assignmentId>".to_owned());
-            }
-            Ok(Command::AssignmentGet {
-                identity: identity(flags)?,
-                assignment_id: parsed.positional[1].clone(),
-            })
-        }
-        "attest" => {
-            let assignment_id =
-                parsed.positional.get(1).cloned().ok_or_else(|| {
-                    "usage: tightbeam attest <assignmentId> --kind <kind>".to_owned()
-                })?;
-            let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
-            let verdict = nonempty(flags, "verdict");
-            if kind == "verdict" && verdict.is_none() {
-                return Err("--verdict is required when --kind is verdict".to_owned());
-            }
-            if kind != "verdict" && verdict.is_some() {
-                return Err("--verdict is only valid when --kind is verdict".to_owned());
-            }
-            Ok(Command::Attest {
-                identity: identity(flags)?,
-                assignment_id,
-                kind,
-                verdict,
-                note: nonempty(flags, "note"),
-            })
-        }
-        "attests" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam attests <assignmentId>".to_owned());
-            }
-            Ok(Command::Attests {
-                identity: identity(flags)?,
-                assignment_id: parsed.positional[1].clone(),
-            })
-        }
-        "revoke-assignment" => {
-            let assignment_id =
-                parsed.positional.get(1).cloned().ok_or_else(|| {
-                    "usage: tightbeam revoke-assignment <assignmentId>".to_owned()
-                })?;
-            Ok(Command::RevokeAssignment {
-                identity: identity(flags)?,
-                assignment_id,
-            })
-        }
-        "assignments" => {
-            let targets = [
-                nonempty(flags, "session").map(Target::Session),
-                nonempty(flags, "role").map(Target::Role),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-            if parsed.positional.get(1).is_some() || targets.len() > 1 {
-                return Err("usage: tightbeam assignments [--session <key> | --role <name>] [--state <state>]".to_owned());
-            }
-            Ok(Command::Assignments {
-                identity: identity(flags)?,
-                target: targets.into_iter().next(),
-                state: nonempty(flags, "state"),
             })
         }
         "cancel-wake" => {
@@ -1202,18 +550,6 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 is_admin: !flags.contains_key("demote"),
             })
         }
-        "config" => parse_config(&parsed, flags),
-        "init" => {
-            if parsed.positional.len() != 1
-                || flags.keys().any(|flag| flag != "base-dir")
-                || flags.get("base-dir").is_some_and(String::is_empty)
-            {
-                return Err("usage: tightbeam init [--base-dir DIR]".to_owned());
-            }
-            Ok(Command::Init(InitArgs {
-                base_dir: nonempty(flags, "base-dir"),
-            }))
-        }
         "setup" => Ok(Command::Setup(SetupArgs {
             base_dir: nonempty(flags, "base-dir"),
             harnesses: nonempty(flags, "harness")
@@ -1248,31 +584,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, artifact-record, artifact-get, artifacts, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, assignment-get, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate"
         )),
-    }
-}
-
-fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    match (
-        parsed.positional.get(1).map(String::as_str),
-        parsed.positional.get(2).map(String::as_str),
-        parsed.positional.get(3),
-        parsed.positional.get(4),
-    ) {
-        (Some("get"), Some("default-archetype"), None, None) => Ok(Command::ConfigGet {
-            identity: identity(flags)?,
-            setting: "default-archetype".to_owned(),
-        }),
-        (Some("set"), Some("default-archetype"), Some(value), None) => Ok(Command::ConfigSet {
-            identity: identity(flags)?,
-            setting: "default-archetype".to_owned(),
-            value: value.clone(),
-        }),
-        _ => Err(
-            "usage: tightbeam config get default-archetype | config set default-archetype <name>"
-                .to_owned(),
-        ),
     }
 }
 
@@ -1378,6 +691,18 @@ mod tests {
     }
 
     #[test]
+    fn help_matches_typescript_reference_snapshot() {
+        let hash = HELP
+            .bytes()
+            .fold(14_695_981_039_346_656_037_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211)
+            });
+
+        assert_eq!(HELP.len(), 6_141);
+        assert_eq!(hash, 7_823_420_673_653_251_066);
+    }
+
+    #[test]
     fn parses_all_duration_units() {
         assert_eq!(parse_after("30s"), Ok("30000".to_owned()));
         assert_eq!(parse_after("5m"), Ok("300000".to_owned()));
@@ -1390,28 +715,6 @@ mod tests {
         assert_eq!(
             parse_after("soon"),
             Err("bad --after value: soon (use e.g. 30s, 5m, 2h)".to_owned())
-        );
-    }
-
-    #[test]
-    fn parses_critical_duration_and_reason() {
-        assert_eq!(
-            parse(strings(&[
-                "critical",
-                "--for",
-                "5m",
-                "--reason",
-                "main commit",
-            ])),
-            Ok(Command::Critical {
-                identity: Identity::Omitted,
-                for_ms: "300000".to_owned(),
-                reason: "main commit".to_owned(),
-            })
-        );
-        assert_eq!(
-            parse(strings(&["critical", "--for", "soon", "--reason", "x"])),
-            Err("bad --for value: soon (use e.g. 30s, 5m, 2h)".to_owned())
         );
     }
 
@@ -1437,48 +740,16 @@ mod tests {
     }
 
     #[test]
-    fn permits_missing_and_rejects_multiple_identity() {
-        assert_eq!(
-            parse(strings(&["list"])),
-            Ok(Command::List {
-                identity: Identity::Omitted
-            })
+    fn rejects_missing_and_multiple_identity() {
+        assert!(
+            parse(strings(&["list"]))
+                .unwrap_err()
+                .starts_with("identity required:")
         );
         assert_eq!(
             parse(strings(&["list", "--as", "coder", "--as-user", "flynn"])),
             Err("identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process".to_owned())
         );
-    }
-
-    #[test]
-    fn assign_key_spellings_parse_identically() {
-        let with_key = parse(strings(&[
-            "assign",
-            "--subject",
-            "ship",
-            "--session",
-            "holder",
-            "--key",
-            "idem",
-        ]));
-        let with_compat_alias = parse(strings(&[
-            "assign",
-            "--subject",
-            "ship",
-            "--session",
-            "holder",
-            "--idempotency-key",
-            "idem",
-        ]));
-
-        assert_eq!(with_key, with_compat_alias);
-        assert!(matches!(
-            with_key,
-            Ok(Command::Assign {
-                idempotency_key: Some(ref key),
-                ..
-            }) if key == "idem"
-        ));
     }
 
     #[test]
@@ -1515,122 +786,50 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, artifact-record, artifact-get, artifacts, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, assignment-get, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, spawn, list, retire, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, setup, assimilate".to_owned())
         );
     }
 
     #[test]
-    fn escalation_command_shapes_and_required_flags_are_pinned() {
-        assert!(matches!(
-            parse(strings(&[
-                "rule",
-                "--request",
-                "dr_1",
-                "--decision",
-                "allow",
-                "--as-user",
-                "flynn"
-            ])),
-            Ok(Command::Rule { .. })
-        ));
-        assert!(matches!(
-            parse(strings(&[
-                "waive",
-                "--session",
-                "s1",
-                "--statute",
-                "review",
-                "--as-user",
-                "flynn"
-            ])),
-            Ok(Command::Waive { .. })
-        ));
-        assert!(parse(strings(&["rule", "--request", "dr_1"])).is_err());
-        assert!(parse(strings(&["withdraw", "--request", "dr_1"])).is_err());
-        assert!(parse(strings(&["waive", "--request", "dr_1", "--session", "s1"])).is_err());
-        assert!(HELP.contains("decision-requests [--status <status>]"));
-    }
-
-    #[test]
-    fn work_item_cli_usage_rules_are_pinned() {
-        assert!(
-            parse(strings(&[
-                "work-item-create",
-                "--title",
-                "x",
-                "--spec-ref",
-                "spec.md"
-            ]))
-            .unwrap_err()
-            .contains("supplied together")
-        );
-
-        assert!(
-            parse(strings(&[
-                "work-item-update",
-                "wi_1",
-                "--clear-spec-ref",
-                "--spec-ref",
-                "spec.md"
-            ]))
-            .unwrap_err()
-            .contains("conflicts")
-        );
-
-        for args in [
-            strings(&["work-item-create", "--title", "x"]),
-            strings(&["work-item-update", "wi_1", "--title", "y"]),
-            strings(&["work-item-get", "wi_1"]),
-            strings(&["work-item-list"]),
+    fn commands_outside_the_typescript_reference_are_not_exposed() {
+        for command in [
+            "probe",
+            "condition",
+            "facts-read",
+            "artifact-record",
+            "artifact-get",
+            "artifacts",
+            "rule",
+            "waive",
+            "revoke-waiver",
+            "withdraw",
+            "decision-requests",
+            "decision-request",
+            "critical",
+            "adjudicate",
+            "assign",
+            "dispatch",
+            "run-tests",
+            "run-smoke",
+            "cancel-producer-job",
+            "work-item-create",
+            "work-item-update",
+            "work-item-get",
+            "work-item-list",
+            "assignment-get",
+            "attest",
+            "attests",
+            "revoke-assignment",
+            "assignments",
+            "config",
+            "init",
         ] {
-            assert!(parse(args).is_ok());
+            assert!(
+                parse(strings(&[command]))
+                    .unwrap_err()
+                    .starts_with(&format!("unknown command: {command} —"))
+            );
         }
-    }
-
-    #[test]
-    fn artifact_cli_usage_rules_are_pinned() {
-        for args in [
-            strings(&["artifact-record", "--kind", "spec", "--title", "Design"]),
-            strings(&["artifact-get"]),
-            strings(&["artifacts", "extra"]),
-        ] {
-            assert!(parse(args).is_err());
-        }
-
-        for args in [
-            strings(&[
-                "artifact-record",
-                "--kind",
-                "spec",
-                "--title",
-                "Design",
-                "--path",
-                "spec.md",
-            ]),
-            strings(&["artifact-get", "art_12345678"]),
-            strings(&["artifacts", "--work-item", "wi_1", "--kind", "spec"]),
-        ] {
-            assert!(parse(args).is_ok());
-        }
-    }
-
-    #[test]
-    fn verdict_flag_is_required_iff_kind_is_verdict() {
-        assert_eq!(
-            parse(strings(&["attest", "asg_1", "--kind", "verdict"])),
-            Err("--verdict is required when --kind is verdict".to_owned())
-        );
-        assert_eq!(
-            parse(strings(&[
-                "attest",
-                "asg_1",
-                "--kind",
-                "progress",
-                "--verdict",
-                "reviewed"
-            ])),
-            Err("--verdict is only valid when --kind is verdict".to_owned())
-        );
     }
 
     #[test]
@@ -1639,33 +838,6 @@ mod tests {
             strings(&[
                 "wake", "--role", "reviewer", "--prompt", "go", "--as", "coder",
             ]),
-            strings(&[
-                "condition",
-                "--kind",
-                "deploy-succeeded",
-                "--scope",
-                "prod",
-                "--key",
-                "k",
-            ]),
-            strings(&[
-                "facts-read",
-                "--kind",
-                "tour-given",
-                "--scope",
-                "agent:tour:app",
-            ]),
-            strings(&[
-                "artifact-record",
-                "--kind",
-                "spec",
-                "--title",
-                "Design",
-                "--path",
-                "spec.md",
-            ]),
-            strings(&["artifact-get", "art_12345678"]),
-            strings(&["artifacts", "--session", "agent:writer:app"]),
             strings(&[
                 "spawn",
                 "--display",
@@ -1677,33 +849,7 @@ mod tests {
             ]),
             strings(&["list", "--as-process", "cron"]),
             strings(&["retire", "--session", "agent:x", "--as", "owner"]),
-            strings(&[
-                "adjudicate",
-                "--episode",
-                "adj_1",
-                "--action",
-                "swap",
-                "--model",
-                "gpt-5.6-sol[high]",
-                "--as",
-                "owner",
-            ]),
             strings(&["cancel-wake", "w1", "--as-process", "cron"]),
-            strings(&["run-tests", "asg_1", "--as", "builder"]),
-            strings(&["run-smoke", "asg_1", "--as-user", "flynn"]),
-            strings(&[
-                "dispatch",
-                "--to",
-                "holder",
-                "--subject",
-                "ship",
-                "--brief",
-                "Please ship it.",
-                "--key",
-                "idem",
-            ]),
-            strings(&["assignment-get", "asg_1"]),
-            strings(&["cancel-producer-job", "pj_1", "--as", "builder"]),
             strings(&["role", "create", "reviewer", "--as-user", "flynn"]),
             strings(&["role", "bind", "reviewer", "agent:x", "--as-user", "flynn"]),
             strings(&["role", "rm", "reviewer", "--as-user", "flynn"]),
@@ -1714,21 +860,8 @@ mod tests {
             strings(&["deny-device", "d1", "--as-user", "flynn"]),
             strings(&["revoke-device", "d1", "--as-user", "flynn"]),
             strings(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
-            strings(&["config", "get", "default-archetype", "--as-user", "flynn"]),
-            strings(&[
-                "config",
-                "set",
-                "default-archetype",
-                "coder",
-                "--as-user",
-                "flynn",
-            ]),
-            strings(&["init"]),
-            strings(&["init", "--base-dir", "/tmp/tb"]),
             strings(&["setup"]),
             strings(&["assimilate", "host", "--as-user", "flynn"]),
-            strings(&["probe"]),
-            strings(&["probe", "--json", "--base-dir", "/tmp/tb"]),
         ];
         for args in commands {
             assert!(parse(args).is_ok());
@@ -1753,35 +886,6 @@ mod tests {
         ]);
         fs::remove_file(skill_path).unwrap();
         assert!(matches!(skill_put, Ok(Command::SkillPut { .. })));
-    }
-
-    #[test]
-    fn probe_rejects_positionals_unknown_flags_and_missing_base_dir() {
-        for values in [
-            strings(&["probe", "extra"]),
-            strings(&["probe", "--bogus"]),
-            strings(&["probe", "--base-dir"]),
-        ] {
-            assert_eq!(
-                parse(values),
-                Err("usage: tightbeam probe [--json] [--base-dir DIR]".to_owned())
-            );
-        }
-        assert!(HELP.contains("probe [--json] [--base-dir DIR]"));
-    }
-
-    #[test]
-    fn init_rejects_positionals_unknown_flags_and_missing_base_dir() {
-        for values in [
-            strings(&["init", "extra"]),
-            strings(&["init", "--bogus"]),
-            strings(&["init", "--base-dir"]),
-        ] {
-            assert_eq!(
-                parse(values),
-                Err("usage: tightbeam init [--base-dir DIR]".to_owned())
-            );
-        }
     }
 
     #[test]
