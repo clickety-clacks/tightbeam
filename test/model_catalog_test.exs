@@ -157,54 +157,94 @@ defmodule Tightbeam.ModelCatalogTest do
   end
 
   test "mixed valid and unexpectedly shaped rows degrade atomically", ctx do
-    for {harness, overrides} <- [
-          {"claude",
+    claude_valid = %{
+      id: "claude-valid",
+      display_name: "Claude Valid",
+      max_input_tokens: 200_000,
+      capabilities: %{effort: %{}}
+    }
+
+    codex_valid = %{
+      slug: "gpt-valid",
+      display_name: "GPT Valid",
+      supported_reasoning_levels: []
+    }
+
+    claude_fetch = fn malformed ->
+      fn "/v1/models?limit=100", _headers ->
+        {:ok, JSON.encode!(%{data: [claude_valid, malformed]})}
+      end
+    end
+
+    codex_read = fn malformed ->
+      fn _path ->
+        {:ok, JSON.encode!(%{models: [codex_valid, malformed]})}
+      end
+    end
+
+    for {label, harness, overrides} <- [
+          {:claude_missing_id, "claude",
            [
-             claude_fetch: fn
-               "/v1/models?limit=100", _headers ->
-                 {:ok,
-                  JSON.encode!(%{
-                    data: [
-                      %{
-                        id: "claude-valid",
-                        display_name: "Claude Valid",
-                        max_input_tokens: 200_000,
-                        capabilities: %{effort: %{}}
-                      },
-                      %{
-                        display_name: "Missing ID",
-                        max_input_tokens: 200_000,
-                        capabilities: %{effort: %{}}
-                      }
-                    ]
-                  })}
-             end
+             claude_fetch:
+               claude_fetch.(%{
+                 display_name: "Missing ID",
+                 max_input_tokens: 200_000,
+                 capabilities: %{effort: %{}}
+               })
            ]},
-          {"codex",
+          {:claude_missing_max_input_tokens, "claude",
            [
-             codex_read: fn _path ->
-               {:ok,
-                JSON.encode!(%{
-                  models: [
-                    %{
-                      slug: "gpt-valid",
-                      display_name: "GPT Valid",
-                      supported_reasoning_levels: []
-                    },
-                    %{
-                      display_name: "Missing Slug",
-                      supported_reasoning_levels: []
-                    }
-                  ]
-                })}
-             end
+             claude_fetch:
+               claude_fetch.(%{
+                 id: "claude-missing-max-input-tokens",
+                 display_name: "Missing Max Input Tokens",
+                 capabilities: %{effort: %{}}
+               })
+           ]},
+          {:claude_null_max_input_tokens, "claude",
+           [
+             claude_fetch:
+               claude_fetch.(%{
+                 id: "claude-null-max-input-tokens",
+                 display_name: "Null Max Input Tokens",
+                 max_input_tokens: nil,
+                 capabilities: %{effort: %{}}
+               })
+           ]},
+          {:codex_missing_slug, "codex",
+           [
+             codex_read:
+               codex_read.(%{
+                 display_name: "Missing Slug",
+                 supported_reasoning_levels: []
+               })
+           ]},
+          {:codex_missing_supported_reasoning_levels, "codex",
+           [
+             codex_read:
+               codex_read.(%{
+                 slug: "gpt-missing-supported-reasoning-levels",
+                 display_name: "Missing Supported Reasoning Levels"
+               })
+           ]},
+          {:codex_null_supported_reasoning_levels, "codex",
+           [
+             codex_read:
+               codex_read.(%{
+                 slug: "gpt-null-supported-reasoning-levels",
+                 display_name: "Null Supported Reasoning Levels",
+                 supported_reasoning_levels: nil
+               })
            ]}
         ] do
-      catalog = start_catalog(ctx, overrides)
+      catalog = start_catalog(ctx, Keyword.put(overrides, :name, unique_name(label)))
 
       await(fn ->
         ModelCatalog.get(harness, catalog) == {[], {:unavailable, :malformed_catalog}}
       end)
+
+      assert ModelCatalog.get(harness, catalog) ==
+               {[], {:unavailable, :malformed_catalog}}
     end
   end
 
