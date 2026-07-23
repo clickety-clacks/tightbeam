@@ -9,20 +9,22 @@ defmodule Tightbeam.Artifacts do
     kind              TEXT NOT NULL CHECK (kind IN ('spec','report','doc','data','other')),
     title             TEXT NOT NULL,
     description       TEXT,
-    createdBySession  TEXT NOT NULL,
-    workItemId        TEXT,
-    parentSession     TEXT,
+    createdBySession  TEXT NOT NULL REFERENCES sessions(sessionKey),
+    workItemId        TEXT NOT NULL REFERENCES work_items(id),
+    parentSession     TEXT REFERENCES sessions(sessionKey),
     originPath        TEXT NOT NULL,
     contentSha256     TEXT,
-    recordedMessageId INTEGER,
+    recordedMessageId TEXT NOT NULL REFERENCES messages(id),
     state             TEXT NOT NULL DEFAULT 'in-workspace'
                       CHECK (state IN ('in-workspace','archived','released')),
     home              TEXT,
     createdAt         INTEGER NOT NULL,
-    updatedAt         INTEGER NOT NULL
+    updatedAt         INTEGER NOT NULL,
+    CHECK ((state = 'archived') = (home IS NOT NULL))
   );
   CREATE INDEX IF NOT EXISTS artifacts_work_item ON artifacts (workItemId);
   CREATE INDEX IF NOT EXISTS artifacts_created_by_session ON artifacts (createdBySession);
+  CREATE INDEX IF NOT EXISTS artifacts_recorded_message ON artifacts (recordedMessageId);
   """
 
   @doc "Create the artifact registry schema."
@@ -46,8 +48,8 @@ defmodule Tightbeam.Artifacts do
               (artifactId, kind, title, description, createdBySession, workItemId,
                parentSession, originPath, contentSha256, recordedMessageId,
                state, home, createdAt, updatedAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL,
-                    'in-workspace', NULL, ?10, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    'in-workspace', NULL, ?11, ?11)
             """,
             [
               artifact_id,
@@ -55,10 +57,11 @@ defmodule Tightbeam.Artifacts do
               call.params.title,
               call.params[:description],
               session_key,
-              call.params[:work_item_id],
+              call.params.work_item_id,
               parent_session,
               call.params.origin_path,
               call.params[:content_sha256],
+              call.recorded_message_id,
               now
             ]
           )
@@ -84,14 +87,16 @@ defmodule Tightbeam.Artifacts do
   def list(db \\ Tightbeam.DB, filters \\ %{}) do
     {clauses, params} =
       [
-        {"workItemId", filters[:work_item_id]},
-        {"createdBySession", filters[:session_key]},
-        {"kind", filters[:kind]}
+        {"workItemId", "=", filters[:work_item_id]},
+        {"createdBySession", "=", filters[:session_key]},
+        {"kind", "=", filters[:kind]},
+        {"createdAt", ">=", filters[:created_after]},
+        {"createdAt", "<=", filters[:created_before]}
       ]
-      |> Enum.reject(fn {_column, value} -> is_nil(value) end)
+      |> Enum.reject(fn {_column, _operator, value} -> is_nil(value) end)
       |> Enum.with_index(1)
-      |> Enum.map_reduce([], fn {{column, value}, index}, values ->
-        {"#{column} = ?#{index}", values ++ [value]}
+      |> Enum.map_reduce([], fn {{column, operator, value}, index}, values ->
+        {"#{column} #{operator} ?#{index}", values ++ [value]}
       end)
 
     where = if clauses == [], do: "", else: " WHERE " <> Enum.join(clauses, " AND ")
@@ -112,77 +117,132 @@ defmodule Tightbeam.Artifacts do
     rows = list(db, %{session_key: session_key})
     live = Enum.filter(rows, &(&1.state == "in-workspace"))
 
-    if live != [] do
-      archived_path = archive_workspace(workspace_path, archive_root, session_key)
+    if live == [] do
+      remove_workspace(workspace_path)
+    else
+      ensure_workspace_available!(workspace_path)
+
+      relative_paths =
+        Map.new(live, fn row ->
+          {row.artifact_id, archived_relative_path!(row.origin_path, workspace_path)}
+        end)
+
+      archived_path = archive_workspace!(workspace_path, archive_root, session_key)
       updated_at = now()
 
-      Enum.each(live, fn row ->
-        home =
-          if archived_path do
-            archived_home(row.origin_path, workspace_path, archived_path)
-          else
-            row.origin_path
-          end
+      {:ok, :ok} =
+        DB.transaction(db, fn txn ->
+          Enum.each(live, fn row ->
+            DB.Txn.q(
+              txn,
+              """
+              UPDATE artifacts
+              SET state = 'archived', home = ?2, updatedAt = ?3
+              WHERE artifactId = ?1 AND state = 'in-workspace'
+              """,
+              [
+                row.artifact_id,
+                Path.join(archived_path, Map.fetch!(relative_paths, row.artifact_id)),
+                updated_at
+              ]
+            )
+          end)
 
-        {:ok, _} =
-          DB.query(
-            db,
-            """
-            UPDATE artifacts
-            SET state = 'archived', home = ?2, updatedAt = ?3
-            WHERE artifactId = ?1 AND state = 'in-workspace'
-            """,
-            [row.artifact_id, home, updated_at]
-          )
-      end)
+          :ok
+        end)
     end
 
     :ok
   end
 
-  defp archive_workspace(nil, _archive_root, _session_key), do: nil
+  @doc "Mark an archived artifact as released from Tightbeam custody."
+  @spec release(DB.server(), String.t()) :: map() | nil
+  def release(db \\ Tightbeam.DB, artifact_id) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        UPDATE artifacts
+        SET state = 'released', home = NULL, updatedAt = ?2
+        WHERE artifactId = ?1 AND state = 'archived'
+        """,
+        [artifact_id, now()]
+      )
 
-  defp archive_workspace(workspace_path, archive_root, session_key) do
-    if File.dir?(workspace_path) do
-      archive_dir =
-        Path.join(
-          archive_root,
-          "#{sanitize(session_key)}-#{System.system_time(:second)}"
-        )
-
-      File.mkdir_p!(archive_root)
-
-      case File.rename(workspace_path, archive_dir) do
-        :ok ->
-          archive_dir
-
-        {:error, _reason} ->
-          case File.cp_r(workspace_path, archive_dir) do
-            {:ok, _paths} ->
-              _ = File.rm_rf(workspace_path)
-              archive_dir
-
-            {:error, _reason, _file} ->
-              nil
-          end
-      end
-    end
-  rescue
-    _ -> nil
+    get(db, artifact_id)
   end
 
-  defp archived_home(origin_path, workspace_path, archive_dir) do
+  defp remove_workspace(nil), do: :ok
+
+  defp remove_workspace(workspace_path) do
+    if File.exists?(workspace_path), do: File.rm_rf!(workspace_path)
+    :ok
+  end
+
+  defp archive_workspace!(workspace_path, archive_root, session_key) do
+    ensure_workspace_available!(workspace_path)
+
+    archive_dir =
+      Path.join(
+        archive_root,
+        "#{sanitize(session_key)}-#{System.system_time(:millisecond)}"
+      )
+
+    File.mkdir_p!(archive_root)
+
+    case File.rename(workspace_path, archive_dir) do
+      :ok ->
+        archive_dir
+
+      {:error, _reason} ->
+        case File.cp_r(workspace_path, archive_dir) do
+          {:ok, _paths} ->
+            File.rm_rf!(workspace_path)
+            archive_dir
+
+          {:error, reason, file} ->
+            _ = File.rm_rf(archive_dir)
+
+            raise File.CopyError,
+              reason: reason,
+              action: "copy",
+              source: file,
+              destination: archive_dir
+        end
+    end
+  end
+
+  defp ensure_workspace_available!(workspace_path) do
+    unless is_binary(workspace_path) and File.dir?(workspace_path) do
+      raise ArgumentError, "workspace is unavailable for artifact archival"
+    end
+  end
+
+  defp archived_relative_path!(origin_path, nil) do
+    _ = origin_path
+    raise ArgumentError, "workspace is unavailable for artifact archival"
+  end
+
+  defp archived_relative_path!(origin_path, workspace_path) do
+    expanded_workspace = Path.expand(workspace_path)
+
     absolute_origin =
       if Path.type(origin_path) == :absolute,
         do: Path.expand(origin_path),
-        else: Path.expand(origin_path, workspace_path)
+        else: Path.expand(origin_path, expanded_workspace)
 
-    relative = Path.relative_to(absolute_origin, Path.expand(workspace_path))
+    relative = Path.relative_to(absolute_origin, expanded_workspace)
 
     if Path.type(relative) == :absolute or relative == ".." or
-         String.starts_with?(relative, "../"),
-       do: archive_dir,
-       else: Path.join(archive_dir, relative)
+         String.starts_with?(relative, "../") do
+      raise ArgumentError, "artifact origin is outside its session workspace"
+    end
+
+    unless File.exists?(absolute_origin) do
+      raise ArgumentError, "artifact origin is missing from its session workspace"
+    end
+
+    relative
   end
 
   defp parent_session(db, session_key) do
