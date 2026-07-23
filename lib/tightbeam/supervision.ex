@@ -181,8 +181,11 @@ defmodule Tightbeam.Supervision do
   end
 
   def handle_cast({:retired, session_key}, state) do
-    :ok = Escalation.withdraw_for_retired(state.db, session_key)
-    safe_evaluate(state, session_key, fn -> doorbells_for_holder(state.db, session_key) end)
+    safe_evaluate(state, session_key, fn ->
+      :ok = Escalation.withdraw_for_retired(state.db, session_key)
+      doorbells_for_holder(state.db, session_key)
+    end)
+
     {:noreply, state}
   end
 
@@ -678,17 +681,23 @@ defmodule Tightbeam.Supervision do
         Application.get_env(:tightbeam, :adjudication_response_window_ms, 86_400_000)
       )
 
-    {:ok, rows} =
+    open_holders =
+      state.db
+      |> Assignments.list(%{state: "open"})
+      |> Enum.map(& &1.holderKey)
+
+    {:ok, pending_rows} =
       DB.query(
         state.db,
-        """
-        SELECT holderKey FROM assignments WHERE state = 'open'
-        UNION
-        SELECT sessionKey FROM supervision_watermarks WHERE pendingBranch IS NOT NULL
-        """
+        "SELECT sessionKey FROM supervision_watermarks WHERE pendingBranch IS NOT NULL"
       )
 
-    Enum.each(rows, fn [session_key] ->
+    pending_sessions = Enum.map(pending_rows, fn [session_key] -> session_key end)
+
+    open_holders
+    |> Kernel.++(pending_sessions)
+    |> Enum.uniq()
+    |> Enum.each(fn session_key ->
       safe_evaluate(state, session_key, fn ->
         evaluate(
           state.db,

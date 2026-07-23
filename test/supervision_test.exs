@@ -758,6 +758,29 @@ defmodule Tightbeam.SupervisionTest do
     assert %{pendingBranch: "prod"} = Supervision.watermark(ctx.db, "holder")
   end
 
+  test "retirement handling is total-caught before the server continues", ctx do
+    name = :"supervision_retired_#{System.unique_integer([:positive])}"
+
+    pid =
+      start_supervised!(
+        {Supervision, db: ctx.db, handlers: ctx.handlers, prod_limit: 3, name: name}
+      )
+
+    :ok = DB.execute(ctx.db, "DROP TABLE decision_requests")
+    Supervision.notify_retired(name, "holder")
+
+    eventually(fn ->
+      Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+        event.kind == "supervision_evaluate_failed" and event.subject == "holder"
+      end)
+    end)
+
+    assert Process.alive?(pid)
+    Supervision.request_sweep(name)
+    Process.sleep(20)
+    assert Process.alive?(pid)
+  end
+
   test "N=0 cross-assignment re-entry exceeds N+1 and then quiesces at Main", ctx do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET spawnedBy='holder' WHERE sessionKey='supervisor'")

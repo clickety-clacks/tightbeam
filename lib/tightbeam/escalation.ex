@@ -106,7 +106,12 @@ defmodule Tightbeam.Escalation do
         assignment_id = assignment_id(call)
         request_id = "dr_" <> Tightbeam.Id.uuid4()
         question = fetch_string!(ctx, :question)
-        options = encode_optional(Map.get(ctx, :options) || Map.get(ctx, "options"))
+
+        options =
+          ctx
+          |> then(&(Map.get(&1, :options) || Map.get(&1, "options")))
+          |> validate_options!()
+          |> encode_optional()
 
         context =
           JSON.encode!(%{verb: Map.fetch!(call, :verb), params: Map.fetch!(call, :params)})
@@ -195,7 +200,7 @@ defmodule Tightbeam.Escalation do
          false <- raiser_id(call) == request.raiser_id,
          {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
       case request.status do
-        "ruled" when request.decision == decision ->
+        status when status in ["ruled", "consumed"] and request.decision == decision ->
           request
 
         "open" ->
@@ -623,8 +628,15 @@ defmodule Tightbeam.Escalation do
         [raiser_id, statute_name]
       )
 
-    count > 0
+    count > 0 and active_raiser?(db, raiser_id)
   end
+
+  defp active_raiser?(db, "session:" <> session_key) do
+    DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) ==
+      {:ok, [["active"]]}
+  end
+
+  defp active_raiser?(_db, _raiser_id), do: true
 
   defp current_request(db, raiser_id, statute_name, action_key) do
     {:ok, rows} =
@@ -865,6 +877,24 @@ defmodule Tightbeam.Escalation do
   defp encode_optional(value), do: JSON.encode!(value)
   defp decode_optional(nil), do: nil
   defp decode_optional(value), do: JSON.decode!(value)
+
+  defp validate_options!(nil), do: nil
+
+  defp validate_options!(options) when is_list(options) do
+    Enum.map(options, fn option ->
+      label = Map.get(option, :label) || Map.get(option, "label")
+      effect = Map.get(option, :effect) || Map.get(option, "effect")
+
+      if is_binary(label) and effect in ["allow", "deny"] do
+        %{"label" => label, "effect" => effect}
+      else
+        raise ArgumentError, "options must contain label and allow|deny effect"
+      end
+    end)
+  end
+
+  defp validate_options!(_options),
+    do: raise(ArgumentError, "options must contain label and allow|deny effect")
 
   defp error(code, message), do: %{code: code, message: message}
   defp now, do: System.system_time(:millisecond)
