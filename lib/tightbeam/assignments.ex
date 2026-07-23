@@ -543,7 +543,9 @@ defmodule Tightbeam.Assignments do
         error("session_retired", "assignments require an active holder session")
 
       [["active", harness, provider]] ->
-        case call.params[:work_item_id] do
+        work_item_id = if verb == "assign", do: call.params[:work_item_id], else: nil
+
+        case work_item_id do
           nil ->
             :ok
 
@@ -586,7 +588,7 @@ defmodule Tightbeam.Assignments do
             opened_user,
             opened_session,
             now,
-            call.params[:work_item_id],
+            work_item_id,
             reviews_assignment_id,
             harness,
             provider

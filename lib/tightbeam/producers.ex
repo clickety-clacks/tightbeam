@@ -357,45 +357,52 @@ defmodule Tightbeam.Producers do
 
   defp run_local(job, workdir, runner) do
     shell = System.find_executable("sh") || "/bin/sh"
-    launcher = System.find_executable("python3") || raise "python3 is required for producer jobs"
     env = minimal_env(workdir)
-
-    group_script =
-      "import os,sys; pid=os.fork(); " <>
-        "(os.setsid(), os.execv(sys.argv[1], sys.argv[1:])) if pid == 0 else None; " <>
-        "print(f'TB_PGID:{pid}', flush=True); _,status=os.waitpid(pid,0); " <>
-        "sys.exit(os.waitstatus_to_exitcode(status))"
 
     port =
       Port.open(
-        {:spawn_executable, launcher},
+        {:spawn_executable, shell},
         [
           :binary,
           :exit_status,
           :stderr_to_stdout,
           :hide,
-          {:args, ["-c", group_script, shell, "-lc", job.command]},
+          {:args,
+           [
+             "-c",
+             "kill -STOP $$; exec \"$1\" -lc \"$2\"",
+             "tightbeam-producer",
+             shell,
+             job.command
+           ]},
           {:cd, workdir},
           {:env, env}
         ]
       )
 
-    await_exit(
-      port,
-      System.monotonic_time(:millisecond) + job.timeout_ms,
-      runner,
-      job.id,
-      nil
-    )
+    os_pid = port |> Port.info(:os_pid) |> elem(1)
+
+    with :ok <- verify_process_group(os_pid),
+         :ok <- Tightbeam.ProducerRunner.register_process(runner, job.id, port, os_pid),
+         :ok <- continue_process_group(os_pid) do
+      await_exit(port, System.monotonic_time(:millisecond) + job.timeout_ms, os_pid)
+    else
+      :cancelled ->
+        kill_port(port, os_pid)
+        {:error, "cancelled"}
+
+      {:error, reason} ->
+        kill_process(port, os_pid)
+        {:error, reason}
+    end
   end
 
-  defp await_exit(port, deadline, runner, job_id, process_group) do
+  defp await_exit(port, deadline, process_group) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
-      {^port, {:data, output}} ->
-        process_group = process_group || register_process_group(output, runner, job_id, port)
-        await_exit(port, deadline, runner, job_id, process_group)
+      {^port, {:data, _output}} ->
+        await_exit(port, deadline, process_group)
 
       {^port, {:exit_status, status}} ->
         {:ok, status}
@@ -425,8 +432,7 @@ defmodule Tightbeam.Producers do
 
   defp kill_port(port, process_group) do
     if Port.info(port) do
-      os_pid = process_group || port |> Port.info(:os_pid) |> elem(1)
-      kill_process_group(os_pid)
+      kill_process_group(process_group)
       Port.close(port)
     end
 
@@ -435,43 +441,57 @@ defmodule Tightbeam.Producers do
     _ -> :ok
   end
 
-  defp register_process_group(output, runner, job_id, port) do
-    case Regex.run(~r/TB_PGID:(\d+)/, output) do
-      [_, pid] ->
-        os_pid = String.to_integer(pid)
-        Tightbeam.ProducerRunner.register_process(runner, job_id, port, os_pid)
-        os_pid
+  defp verify_process_group(os_pid, attempts \\ 1_000)
 
-      nil ->
-        nil
-    end
-  end
+  defp verify_process_group(_os_pid, 0),
+    do: {:error, "host-fail: producer process group unavailable"}
 
-  defp kill_process_group(os_pid) do
+  defp verify_process_group(os_pid, attempts) do
     pid = Integer.to_string(os_pid)
 
-    case System.cmd("ps", ["-o", "pgid=", "-p", pid], stderr_to_stdout: true) do
-      {pgid, 0} ->
-        if String.trim(pgid) == pid do
-          System.cmd("kill", ["-TERM", "-#{pid}"], stderr_to_stdout: true)
-        else
-          kill_tree(pid)
+    case System.cmd("ps", ["-o", "pgid=,state=", "-p", pid], stderr_to_stdout: true) do
+      {output, 0} ->
+        case String.split(output) do
+          [^pid, state] when state in ["T", "Ts"] ->
+            :ok
+
+          [^pid, _state] ->
+            Process.sleep(1)
+            verify_process_group(os_pid, attempts - 1)
+
+          _ ->
+            {:error, "host-fail: producer process group unavailable"}
         end
 
       _ ->
-        kill_tree(pid)
+        {:error, "host-fail: producer process group unavailable"}
     end
+  rescue
+    _ -> {:error, "host-fail: producer process group unavailable"}
+  end
 
+  defp continue_process_group(os_pid) do
+    case System.cmd("kill", ["-CONT", "-#{os_pid}"], stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      _ -> {:error, "host-fail: producer process group unavailable"}
+    end
+  rescue
+    _ -> {:error, "host-fail: producer process group unavailable"}
+  end
+
+  defp kill_process(port, os_pid) do
+    System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    if Port.info(port), do: Port.close(port)
     :ok
   rescue
     _ -> :ok
   end
 
-  defp kill_tree(pid) do
-    if System.find_executable("pkill"),
-      do: System.cmd("pkill", ["-TERM", "-P", pid], stderr_to_stdout: true)
-
-    System.cmd("kill", ["-TERM", pid], stderr_to_stdout: true)
+  defp kill_process_group(os_pid) do
+    System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+    :ok
+  rescue
+    _ -> :ok
   end
 
   defp local_holder(config, holder) do
@@ -706,7 +726,8 @@ defmodule Tightbeam.ProducerRunner do
        supervisor: Keyword.get(opts, :supervisor, Tightbeam.ProducerSupervisor),
        name: Keyword.get(opts, :name, __MODULE__),
        tasks: %{},
-       processes: %{}
+       processes: %{},
+       pending_kills: MapSet.new()
      }, {:continue, :drain}}
   end
 
@@ -717,31 +738,55 @@ defmodule Tightbeam.ProducerRunner do
   def handle_cast(:drain, state), do: drain(state)
 
   def handle_cast({:unregister_process, job_id}, state) do
-    {:noreply, update_in(state.processes, &Map.delete(&1, job_id))}
+    {:noreply,
+     state
+     |> update_in([:processes], &Map.delete(&1, job_id))
+     |> update_in([:pending_kills], &MapSet.delete(&1, job_id))}
   end
 
   def handle_cast({:kill, job_id}, state) do
-    case state.processes[job_id] do
-      %{port: port, os_pid: os_pid} ->
-        Task.start(fn -> best_effort_kill(port, os_pid) end)
+    state =
+      case state.processes[job_id] do
+        %{port: port, os_pid: os_pid} ->
+          Task.start(fn -> best_effort_kill(port, os_pid) end)
+          state
 
-      nil ->
-        :ok
-    end
+        nil ->
+          if Enum.any?(state.tasks, fn {_ref, task_job_id} -> task_job_id == job_id end),
+            do: update_in(state.pending_kills, &MapSet.put(&1, job_id)),
+            else: state
+      end
 
     {:noreply, state}
   end
 
   @impl true
   def handle_call({:register_process, job_id, port, os_pid}, _from, state) do
-    {:reply, :ok, put_in(state.processes[job_id], %{port: port, os_pid: os_pid})}
+    if MapSet.member?(state.pending_kills, job_id) do
+      {:reply, :cancelled, update_in(state.pending_kills, &MapSet.delete(&1, job_id))}
+    else
+      {:reply, :ok, put_in(state.processes[job_id], %{port: port, os_pid: os_pid})}
+    end
   end
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
     {job_id, tasks} = Map.pop(state.tasks, ref)
     if job_id, do: Producers.fail_running(state.db, job_id, "host-fail: producer task exited")
-    drain(%{state | tasks: tasks})
+
+    state =
+      if job_id do
+        %{
+          state
+          | tasks: tasks,
+            processes: Map.delete(state.processes, job_id),
+            pending_kills: MapSet.delete(state.pending_kills, job_id)
+        }
+      else
+        %{state | tasks: tasks}
+      end
+
+    drain(state)
   end
 
   def handle_info(:drain_more, state), do: drain(state)
@@ -768,30 +813,11 @@ defmodule Tightbeam.ProducerRunner do
   end
 
   defp best_effort_kill(port, os_pid) do
-    pid = Integer.to_string(os_pid)
-
-    case System.cmd("ps", ["-o", "pgid=", "-p", pid], stderr_to_stdout: true) do
-      {pgid, 0} ->
-        if String.trim(pgid) == pid do
-          System.cmd("kill", ["-TERM", "-#{pid}"], stderr_to_stdout: true)
-        else
-          kill_tree(pid)
-        end
-
-      _ ->
-        kill_tree(pid)
-    end
+    System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
 
     if Port.info(port), do: Port.close(port)
     :ok
   rescue
     _ -> :ok
-  end
-
-  defp kill_tree(pid) do
-    if System.find_executable("pkill"),
-      do: System.cmd("pkill", ["-TERM", "-P", pid], stderr_to_stdout: true)
-
-    System.cmd("kill", ["-TERM", pid], stderr_to_stdout: true)
   end
 end
