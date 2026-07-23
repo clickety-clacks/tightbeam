@@ -480,6 +480,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemList { identity } => {
             Ok(request(identity, "work-item-list", vec![], vec![]))
         }
+        Command::AssignmentGet {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "assignment-get",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
         Command::Attest {
             identity,
             assignment_id,
@@ -867,6 +876,7 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemList { identity }
+        | Command::AssignmentGet { identity, .. }
         | Command::Attest { identity, .. }
         | Command::Attests { identity, .. }
         | Command::RevokeAssignment { identity, .. }
@@ -1254,6 +1264,10 @@ mod tests {
         assert_eq!(
             body(&["attests", "asg_1", "--as", "reviewer"]),
             r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&["assignment-get", "asg_1", "--as", "reviewer"]),
+            r#"{"as":"reviewer","verb":"assignment-get","params":{"assignmentId":"asg_1"}}"#
         );
         assert_eq!(
             body(&["revoke-assignment", "asg_1", "--as-user", "flynn"]),

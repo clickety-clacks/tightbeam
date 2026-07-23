@@ -763,6 +763,62 @@ defmodule Tightbeam.Placement do
     end
   end
 
+  @doc """
+  Resolve and execute a harness CLI's version command without contacting the
+  harness service. Codex prefers the projected operator-controlled shim.
+  """
+  @spec harness_binary_probe(:claude | :codex, String.t(), keyword()) ::
+          {:ok, %{bin: String.t(), version: String.t()}}
+          | {:error, :not_found}
+          | {:error, {:exec_failed, String.t()}}
+  def harness_binary_probe(harness, cli_bin, opts \\ []) do
+    find_executable = Keyword.get(opts, :find_executable, &System.find_executable/1)
+    timeout = Keyword.get(opts, :timeout, 2_000)
+    run = Keyword.get(opts, :run, &system_cmd/1)
+
+    with bin when is_binary(bin) <- harness_binary_path(harness, cli_bin, find_executable),
+         {:ok, {output, 0}} <- bounded_run(run, [bin, "--version"], timeout) do
+      {:ok, %{bin: bin, version: String.trim(output)}}
+    else
+      nil ->
+        {:error, :not_found}
+
+      {:ok, {output, status}} ->
+        {:error,
+         {:exec_failed, "exit=#{status} output=#{inspect(String.trim(to_string(output)))}"}}
+
+      {:error, detail} ->
+        {:error, {:exec_failed, detail}}
+    end
+  end
+
+  defp harness_binary_path(:codex, cli_bin, find_executable) do
+    shim = Path.join(cli_bin, "codex")
+    if File.exists?(shim), do: shim, else: find_executable.("codex")
+  end
+
+  defp harness_binary_path(:claude, _cli_bin, find_executable),
+    do: find_executable.("claude")
+
+  defp bounded_run(run, command, timeout) do
+    task =
+      Task.async(fn ->
+        try do
+          {:ok, run.(command)}
+        rescue
+          error -> {:error, Exception.message(error)}
+        catch
+          kind, reason -> {:error, "#{kind}: #{inspect(reason)}"}
+        end
+      end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      {:exit, reason} -> {:error, "runner exited: #{inspect(reason)}"}
+      nil -> {:error, "timed out after #{timeout}ms"}
+    end
+  end
+
   # The thread/start trust-bypass override, as the JSON object codex-acp expects in
   # CODEX_CONFIG. Verified at codex rust-v0.145.0: this is the ONLY seam that arms
   # untrusted hooks under app-server (permission-seam-spike.md, final reversal).

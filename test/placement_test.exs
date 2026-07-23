@@ -33,6 +33,50 @@ defmodule Tightbeam.PlacementTest do
     %{base_dir: base_dir, db: db}
   end
 
+  test "harness binary probe resolves versions and classifies missing and failed executables", %{
+    base_dir: base_dir
+  } do
+    cli_bin = Path.join(base_dir, "bin")
+    shim = Path.join(cli_bin, "codex")
+    File.mkdir_p!(cli_bin)
+    File.write!(shim, "#!/bin/sh\n")
+
+    parent = self()
+
+    assert {:ok, %{bin: ^shim, version: "codex-cli 1.2.3"}} =
+             Placement.harness_binary_probe(:codex, cli_bin,
+               find_executable: fn _ -> flunk("projected codex shim was not preferred") end,
+               run: fn command ->
+                 send(parent, {:probe_command, command})
+                 {"codex-cli 1.2.3\n", 0}
+               end
+             )
+
+    assert_receive {:probe_command, [^shim, "--version"]}
+
+    assert {:error, :not_found} =
+             Placement.harness_binary_probe(:claude, cli_bin,
+               find_executable: fn "claude" -> nil end,
+               run: fn _ -> flunk("missing executable must not run") end
+             )
+
+    assert {:error, {:exec_failed, detail}} =
+             Placement.harness_binary_probe(:claude, cli_bin,
+               find_executable: fn "claude" -> "/fake/claude" end,
+               run: fn ["/fake/claude", "--version"] -> {"broken install\n", 9} end
+             )
+
+    assert detail =~ "exit=9"
+    assert detail =~ "broken install"
+
+    assert {:error, {:exec_failed, "timed out after 10ms"}} =
+             Placement.harness_binary_probe(:claude, cli_bin,
+               find_executable: fn "claude" -> "/fake/claude" end,
+               run: fn _ -> Process.sleep(100) end,
+               timeout: 10
+             )
+  end
+
   test "overridden identities normalize their name and reconstruct identical homes from session rows",
        %{base_dir: base_dir, db: db} do
     Archetypes.put_skill!(base_dir, "review", "# Review")

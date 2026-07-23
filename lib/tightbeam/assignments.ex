@@ -371,6 +371,7 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "dispatch", call), do: dispatch_result(db, call)
   def __handle__(db, "attest", call), do: attest_result(db, call)
   def __handle__(db, "attests", call), do: attests_result(db, call)
+  def __handle__(db, "assignment-get", call), do: assignment_get_result(db, call)
   def __handle__(db, "revoke-assignment", call), do: revoke_result(db, call)
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
@@ -534,6 +535,17 @@ defmodule Tightbeam.Assignments do
         assignments:
           list(db, %{holder_key: call.session_key, state: call.params[:state] || "open"})
       }
+    end
+  end
+
+  defp assignment_get_result(db, call) do
+    assignment_id = call.params[:assignment_id]
+
+    with :ok <- principal_allowed(call.principal) do
+      case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
+        {:ok, [row]} -> assignment(row)
+        {:ok, []} -> error("not_found", "unknown assignment: #{assignment_id}")
+      end
     end
   end
 

@@ -605,6 +605,31 @@ defmodule Tightbeam.GatewayTest do
     assert token != ""
   end
 
+  test "children refuses to boot when no harness binary is usable", ctx do
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_no_harness_#{System.unique_integer([:positive])}")
+
+    probe = fn
+      :claude, _cli_bin -> {:error, :not_found}
+      :codex, _cli_bin -> {:error, {:exec_failed, "exit=1 output=\"broken\""}}
+    end
+
+    exception =
+      assert_raise RuntimeError, fn ->
+        Gateway.children(
+          gateway_config(base_dir, ctx.db, 0)
+          |> Map.put(:harness_binary_probe, probe)
+        )
+      end
+
+    message = Exception.message(exception)
+
+    assert message =~ "no usable harness CLI"
+    assert message =~ "claude: not found"
+    assert message =~ "codex: exec failed"
+    assert message =~ "Install the claude or codex CLI"
+  end
+
   test "children backfills distinct tokens for active NULL rows only", ctx do
     second =
       Org.create(ctx.db, %{
@@ -709,6 +734,7 @@ defmodule Tightbeam.GatewayTest do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_corrupt_#{System.unique_integer([:positive])}")
 
+    File.rm_rf!(base_dir)
     File.mkdir_p!(base_dir)
     File.write!(Path.join(base_dir, "gateway.json"), "not json")
 
@@ -2360,6 +2386,7 @@ defmodule Tightbeam.GatewayTest do
     base =
       Path.join(System.tmp_dir!(), "gateway_remote_url_#{System.unique_integer([:positive])}")
 
+    File.rm_rf!(base)
     manifests = Path.join([base, "identity", "archetypes"])
     File.mkdir_p!(manifests)
 
@@ -2705,13 +2732,17 @@ defmodule Tightbeam.GatewayTest do
       default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
-      db: db
+      db: db,
+      harness_binary_probe: fn harness, _cli_bin ->
+        {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
+      end
     }
   end
 
   defp gateway_children_base! do
     suffix = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
     base = Path.join(System.tmp_dir!(), "gateway_children_#{suffix}")
+    File.rm_rf!(base)
     File.mkdir!(base)
     on_exit(fn -> File.rm_rf!(base) end)
     base
@@ -2724,6 +2755,7 @@ defmodule Tightbeam.GatewayTest do
         "gateway_roles_#{suffix}_#{System.unique_integer([:positive])}"
       )
 
+    File.rm_rf!(base_dir)
     File.mkdir_p!(base_dir)
 
     if ready? do
@@ -2766,6 +2798,7 @@ defmodule Tightbeam.GatewayTest do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_move_#{suffix}_#{System.unique_integer([:positive])}")
 
+    File.rm_rf!(base_dir)
     manifests = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
 

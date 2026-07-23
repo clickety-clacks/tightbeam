@@ -326,6 +326,23 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
+  test "assignment-get returns the full assignment row or not_found", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "fetch me"))
+
+    assert handle(
+             ctx,
+             "assignment-get",
+             assignment_get_call({:session, "other-session"}, assignment.id)
+           ) ==
+             assignment
+
+    assert handle(
+             ctx,
+             "assignment-get",
+             assignment_get_call({:session, "other-session"}, "asg_missing")
+           ) == %{code: "not_found", message: "unknown assignment: asg_missing"}
+  end
+
   test "work-item links validate on create but idempotent replay returns the original link",
        ctx do
     first =
@@ -975,7 +992,14 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp handle(ctx, verb, call)
-       when verb in ["assign", "dispatch", "attest", "revoke-assignment", "assignments"],
+       when verb in [
+              "assign",
+              "dispatch",
+              "assignment-get",
+              "attest",
+              "revoke-assignment",
+              "assignments"
+            ],
        do: Assignments.__handle__(ctx.db, verb, %{call | verb: verb})
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
@@ -1014,6 +1038,9 @@ defmodule Tightbeam.AssignmentsTest do
 
   defp attest_call(principal, id, kind),
     do: call("attest", principal, nil, %{assignment_id: id, kind: kind})
+
+  defp assignment_get_call(principal, id),
+    do: call("assignment-get", principal, nil, %{assignment_id: id})
 
   defp revoke_call(principal, id),
     do: call("revoke-assignment", principal, nil, %{assignment_id: id})
