@@ -368,35 +368,61 @@ defmodule Tightbeam.Assignments do
 
   @doc false
   def __handle__(db, "assign", call), do: assign_result(db, call)
+  def __handle__(db, "dispatch", call), do: dispatch_result(db, call)
   def __handle__(db, "attest", call), do: attest_result(db, call)
   def __handle__(db, "attests", call), do: attests_result(db, call)
   def __handle__(db, "revoke-assignment", call), do: revoke_result(db, call)
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
   defp assign_result(db, call) do
+    open_assignment_result(db, call, fn _txn, assignment ->
+      {:created, assignment, nil}
+    end)
+  end
+
+  defp dispatch_result(db, call) do
+    open_assignment_result(
+      db,
+      call,
+      fn txn, assignment ->
+        prompt = "[assignment: #{assignment.id}]\n\n" <> call.params.brief
+
+        delivery =
+          Tightbeam.Gateway.deliver_prompt_in_txn(
+            txn,
+            assignment.holderKey,
+            call.origin,
+            prompt,
+            sender: call.origin,
+            role_ref: assignment.holderRole,
+            role_fallback: assignment.holderFallback
+          )
+
+        {:created, assignment, delivery}
+      end,
+      fn -> valid_brief(call.params[:brief]) end
+    )
+  end
+
+  defp open_assignment_result(db, call, after_create, extra_validation \\ fn -> :ok end) do
     with :ok <- principal_allowed(call.principal),
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
-         {:ok, files} <- valid_files(call.params[:files]) do
+         {:ok, files} <- valid_files(call.params[:files]),
+         :ok <- extra_validation.() do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
 
       result =
         transaction(db, fn txn ->
-          case key && idempotency_assignment(txn, owner, key) do
-            nil ->
-              case create_assignment(txn, call, owner, key, files) do
-                %{code: _} = error -> error
-                assignment -> {:created, assignment}
-              end
-
-            id ->
-              {:replayed, fetch_assignment!(txn, id)}
+          case open_assignment_in_txn(txn, call, owner, key, files) do
+            {:created, assignment} -> after_create.(txn, assignment)
+            other -> other
           end
         end)
 
       case result do
-        {:created, assignment} ->
+        {:created, assignment, delivery} ->
           best_effort(fn -> notify(call, :on_assignment_change, assignment.id, nil) end)
 
           if assignment.workItemId do
@@ -404,6 +430,9 @@ defmodule Tightbeam.Assignments do
               notify(call, :on_work_item_change, assignment.workItemId, "composition")
             end)
           end
+
+          if delivery,
+            do: best_effort(fn -> notify(call, :on_dispatch_delivery, delivery, nil) end)
 
           assignment
 
@@ -417,6 +446,19 @@ defmodule Tightbeam.Assignments do
   rescue
     error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
     error in UnknownReviewTarget -> error("unknown_review_target", Exception.message(error))
+  end
+
+  defp open_assignment_in_txn(txn, call, owner, key, files) do
+    case key && idempotency_assignment(txn, owner, key) do
+      nil ->
+        case create_assignment(txn, call, owner, key, files) do
+          %{code: _} = error -> error
+          assignment -> {:created, assignment}
+        end
+
+      id ->
+        {:replayed, fetch_assignment!(txn, id)}
+    end
   end
 
   defp attest_result(db, call) do
@@ -855,6 +897,9 @@ defmodule Tightbeam.Assignments do
     max = Application.get_env(:tightbeam, :max_subject_len, 2000)
     error("invalid_subject", "subject must be 1..#{max} non-blank characters")
   end
+
+  defp valid_brief(brief) when is_binary(brief) and brief != "", do: :ok
+  defp valid_brief(_), do: error("invalid", "a dispatch must carry a brief")
 
   defp valid_note(nil), do: :ok
 

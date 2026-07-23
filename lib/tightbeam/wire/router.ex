@@ -43,7 +43,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles, WorkState}
   alias Tightbeam.Wire.{Payloads, Socket}
 
-  @agent_verbs ~w(wake condition spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update run-tests run-smoke cancel-producer-job rule waive revoke-waiver withdraw decision-requests decision-request)
+  @agent_verbs ~w(wake condition spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign dispatch attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update run-tests run-smoke cancel-producer-job rule waive revoke-waiver withdraw decision-requests decision-request)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -508,12 +508,12 @@ defmodule Tightbeam.Wire.Router do
       verb == "retire" and (given == ["role"] or given == ["userId"]) ->
         {:error, 400, "invalid_message", "retire takes sessionKey only"}
 
-      verb in ["assign", "assignments"] and given == ["userId"] ->
+      verb in ["assign", "dispatch", "assignments"] and given == ["userId"] ->
         {:error, 400, "invalid_target_kind",
          "assignments are held by sessions; target a sessionKey or role"}
 
-      verb == "assign" and given == [] ->
-        {:error, 400, "missing_target", "assign requires a sessionKey or role target"}
+      verb in ["assign", "dispatch"] and given == [] ->
+        {:error, 400, "missing_target", "#{verb} requires a sessionKey or role target"}
 
       given == [] ->
         {:ok, nil, %{role: nil, fallback: false}}
@@ -523,7 +523,7 @@ defmodule Tightbeam.Wire.Router do
           nil ->
             {:error, 404, "not_found", "unknown sessionKey: #{body["sessionKey"]}"}
 
-          %{state: "retired"} when verb == "assign" ->
+          %{state: "retired"} when verb in ["assign", "dispatch"] ->
             {:error, 400, "session_retired", "assignments require an active holder session"}
 
           session ->

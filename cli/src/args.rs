@@ -116,6 +116,14 @@ pub enum Command {
         reviews: Option<String>,
         files: Option<Vec<String>>,
     },
+    Dispatch {
+        identity: Identity,
+        subject: String,
+        holder: String,
+        work_item_id: Option<String>,
+        brief: String,
+        idempotency_key: Option<String>,
+    },
     RunTests {
         identity: Identity,
         assignment_id: String,
@@ -341,10 +349,13 @@ COMMANDS:
   work-item-get <workItemId>
   work-item-list
   assign --subject "<work>" (--session <key> | --role <name>)
-         [--idempotency-key <key>] [--work-item <workItemId>]
+         [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--files '["lib/a.ex","test/a_test.exs"]']
       Open an obligation held by a session; a work item is the durable thread
       across assignments.
+  dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
+           --brief "<one sentence>" [--work-item <workItemId>] [--key <key>]
+      Atomically open an assignment and wake its holder with the card id.
   run-tests <assignmentId>
   run-smoke <assignmentId>
       Queue the committed mechanical producer for an assignment.
@@ -855,10 +866,31 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 identity: identity(flags)?,
                 subject,
                 target: targets.into_iter().next().expect("exactly one target"),
-                idempotency_key: nonempty(flags, "idempotency-key"),
+                idempotency_key: nonempty(flags, "key")
+                    .or_else(|| nonempty(flags, "idempotency-key")),
                 work_item_id: nonempty(flags, "work-item"),
                 reviews: nonempty(flags, "reviews"),
                 files,
+            })
+        }
+        "dispatch" => {
+            let holders = [nonempty(flags, "to"), nonempty(flags, "holder")]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if parsed.positional.get(1).is_some() || holders.len() != 1 {
+                return Err("usage: tightbeam dispatch (--to <sessionKey> | --holder <sessionKey>) --subject <text> --brief <text>".to_owned());
+            }
+            let subject =
+                nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
+            let brief = nonempty(flags, "brief").ok_or_else(|| "--brief is required".to_owned())?;
+            Ok(Command::Dispatch {
+                identity: identity(flags)?,
+                subject,
+                holder: holders.into_iter().next().expect("exactly one holder"),
+                work_item_id: nonempty(flags, "work-item"),
+                brief,
+                idempotency_key: nonempty(flags, "key"),
             })
         }
         "run-tests" => {
@@ -1106,7 +1138,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
         )),
     }
 }
@@ -1286,6 +1318,37 @@ mod tests {
     }
 
     #[test]
+    fn assign_key_spellings_parse_identically() {
+        let with_key = parse(strings(&[
+            "assign",
+            "--subject",
+            "ship",
+            "--session",
+            "holder",
+            "--key",
+            "idem",
+        ]));
+        let with_compat_alias = parse(strings(&[
+            "assign",
+            "--subject",
+            "ship",
+            "--session",
+            "holder",
+            "--idempotency-key",
+            "idem",
+        ]));
+
+        assert_eq!(with_key, with_compat_alias);
+        assert!(matches!(
+            with_key,
+            Ok(Command::Assign {
+                idempotency_key: Some(ref key),
+                ..
+            }) if key == "idem"
+        ));
+    }
+
+    #[test]
     fn requires_exactly_one_wake_target_and_session_only_retire() {
         for args in [
             strings(&["wake", "--prompt", "hello", "--as-user", "flynn"]),
@@ -1319,7 +1382,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -1450,6 +1513,17 @@ mod tests {
             strings(&["cancel-wake", "w1", "--as-process", "cron"]),
             strings(&["run-tests", "asg_1", "--as", "builder"]),
             strings(&["run-smoke", "asg_1", "--as-user", "flynn"]),
+            strings(&[
+                "dispatch",
+                "--to",
+                "holder",
+                "--subject",
+                "ship",
+                "--brief",
+                "Please ship it.",
+                "--key",
+                "idem",
+            ]),
             strings(&["cancel-producer-job", "pj_1", "--as", "builder"]),
             strings(&["role", "create", "reviewer", "--as-user", "flynn"]),
             strings(&["role", "bind", "reviewer", "agent:x", "--as-user", "flynn"]),

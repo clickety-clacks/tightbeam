@@ -316,6 +316,31 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "assign", vec![target], params))
         }
+        Command::Dispatch {
+            identity,
+            subject,
+            holder,
+            work_item_id,
+            brief,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("subject", subject),
+                string_field("brief", brief),
+            ];
+            if let Some(value) = work_item_id {
+                params.push(string_field("workItemId", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(
+                identity,
+                "dispatch",
+                vec![string_field("sessionKey", holder)],
+                params,
+            ))
+        }
         Command::RunTests {
             identity,
             assignment_id,
@@ -744,6 +769,7 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::Critical { identity, .. }
         | Command::Adjudicate { identity, .. }
         | Command::Assign { identity, .. }
+        | Command::Dispatch { identity, .. }
         | Command::RunTests { identity, .. }
         | Command::RunSmoke { identity, .. }
         | Command::CancelProducerJob { identity, .. }
@@ -1002,6 +1028,24 @@ mod tests {
 
     #[test]
     fn builds_byte_exact_assignment_bodies() {
+        assert_eq!(
+            body(&[
+                "dispatch",
+                "--holder",
+                "agent:builder",
+                "--subject",
+                "ship",
+                "--brief",
+                "Please ship it.",
+                "--work-item",
+                "wi_1",
+                "--key",
+                "idem",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","idempotencyKey":"idem"}}"#
+        );
         assert_eq!(
             body(&[
                 "assign",

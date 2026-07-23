@@ -9,6 +9,7 @@ defmodule Tightbeam.AssignmentsTest do
     EventLog,
     Gateway,
     Idempotency,
+    Ledger,
     Org,
     Projection,
     Roles,
@@ -24,6 +25,7 @@ defmodule Tightbeam.AssignmentsTest do
     for module <- [
           Devices,
           Idempotency,
+          Ledger,
           Org,
           Projection,
           Roles,
@@ -172,6 +174,50 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'once'")
+  end
+
+  test "dispatch atomically opens an assignment and enqueues its brief with the card id", ctx do
+    assignment =
+      handle(ctx, "dispatch", dispatch_call({:user, "flynn"}, "ship it", "Please ship it."))
+
+    assert assignment.subject == "ship it"
+    assert assignment.holderKey == "holder"
+
+    assert {:ok, [[prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey = 'holder'")
+
+    assert prompt =~ assignment.id
+    assert prompt =~ "Please ship it."
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])
+  end
+
+  test "dispatch rolls back the assignment when prompt enqueue fails", ctx do
+    assert {:ok, _} = DB.query(ctx.db, "DROP TABLE turns")
+
+    assert {:error, %{code: "server_error", message: message}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               dispatch_call({:user, "flynn"}, "rollback", "Wake now.")
+             )
+
+    assert message =~ "no such table: turns"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'rollback'")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM messages WHERE content LIKE '%Wake now.%'")
+  end
+
+  test "dispatch rejects disallowed principals exactly as assign does", ctx do
+    for principal <- [{:process, "cron"}, nil] do
+      assign_error = handle(ctx, "assign", assign_call(principal, "work"))
+      dispatch_error = handle(ctx, "dispatch", dispatch_call(principal, "work", "Do work."))
+      assert dispatch_error == assign_error
+    end
   end
 
   test "work-item links validate on create but idempotent replay returns the original link",
@@ -823,7 +869,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp handle(ctx, verb, call)
-       when verb in ["assign", "attest", "revoke-assignment", "assignments"],
+       when verb in ["assign", "dispatch", "attest", "revoke-assignment", "assignments"],
        do: Assignments.__handle__(ctx.db, verb, %{call | verb: verb})
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
@@ -842,6 +888,16 @@ defmodule Tightbeam.AssignmentsTest do
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do
     call("assign", principal, "holder", %{
       subject: subject,
+      idempotency_key: key,
+      work_item_id: work_item_id
+    })
+    |> Map.merge(%{target_role: nil, role_fallback: false})
+  end
+
+  defp dispatch_call(principal, subject, brief, key \\ nil, work_item_id \\ nil) do
+    call("dispatch", principal, "holder", %{
+      subject: subject,
+      brief: brief,
       idempotency_key: key,
       work_item_id: work_item_id
     })
