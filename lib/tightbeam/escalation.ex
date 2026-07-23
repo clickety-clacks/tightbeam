@@ -458,7 +458,7 @@ defmodule Tightbeam.Escalation do
   defp rule_open(db, request, decision, rationale, origin, opts) do
     ruled_at = now()
 
-    {:ok, result} =
+    {:ok, {result, filed_fact_id}} =
       DB.transaction(db, fn txn ->
         Txn.q(
           txn,
@@ -486,17 +486,19 @@ defmodule Tightbeam.Escalation do
             "by=#{origin} decision=#{decision} factId=#{fact_id}"
           )
 
-          request_in_txn(txn, request.id)
+          {request_in_txn(txn, request.id), fact_id}
         else
           current = request_in_txn(txn, request.id)
 
+          # A concurrent-ruler loser filed nothing: it must not nudge (F13 —
+          # one post-commit nudge per filed fact, owned by the filer).
           if current.status == "ruled" and current.decision == decision,
-            do: current,
-            else: error("not_open", "decision request is not open")
+            do: {current, nil},
+            else: {error("not_open", "decision request is not open"), nil}
         end
       end)
 
-    if not Map.has_key?(result, :code), do: nudge(opts, [result.ruling_fact_id])
+    if filed_fact_id, do: nudge(opts, [filed_fact_id])
     result
   end
 
@@ -845,9 +847,9 @@ defmodule Tightbeam.Escalation do
         :ok
 
       scheduler ->
-        fact_ids
-        |> Enum.reject(&is_nil/1)
-        |> Enum.each(&Wakes.fire_matching(scheduler, &1))
+        # One ordered call: the scheduler serves fact_ids strictly in filing
+        # order (a later fact's fan-out never overtakes an earlier fact's).
+        Wakes.fire_matching(scheduler, fact_ids)
     end
   end
 

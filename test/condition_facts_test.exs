@@ -381,6 +381,50 @@ defmodule Tightbeam.ConditionFactsTest do
            }
   end
 
+  test "ordered multi-fact eager nudge: a later fact never overtakes an unserved earlier fact",
+       ctx do
+    # Fan-out (5) > 2×batch (2) forces at least two saturation continuations
+    # for fact A — the window where a separately-queued fact-B call could
+    # overtake A's remaining fan-out under per-fact nudging. Fire order is
+    # observed as turn-enqueue order (turns rowid).
+    a_wakes = for _ <- 1..5, do: condition_wake(ctx, "seq-kind", "a").wake_id
+    b_wake = condition_wake(ctx, "seq-kind", "b").wake_id
+
+    {:ok, fact_a} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{kind: "seq-kind", scope: "a", origin: "process:ci"})
+      end)
+
+    {:ok, fact_b} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{kind: "seq-kind", scope: "b", origin: "process:ci"})
+      end)
+
+    :ok = Wakes.fire_matching(ctx.scheduler, [fact_a.fact_id, fact_b.fact_id])
+
+    all = MapSet.new([b_wake | a_wakes])
+
+    fired_order =
+      Enum.reduce_while(1..50, [], fn _, _ ->
+        {:ok, rows} =
+          DB.query(
+            ctx.db,
+            "SELECT wakeId FROM turns WHERE wakeId IS NOT NULL ORDER BY rowid",
+            []
+          )
+
+        ids = for [id] <- rows, MapSet.member?(all, id), do: id
+        if length(ids) == 6, do: {:halt, ids}, else: (Process.sleep(50) && {:cont, ids})
+      end)
+
+    assert length(fired_order) == 6, "expected all 6 wakes to fire, got #{inspect(fired_order)}"
+
+    assert Enum.sort(Enum.take(fired_order, 5)) == Enum.sort(a_wakes),
+           "all of fact A's fan-out must be served before fact B's"
+
+    assert List.last(fired_order) == b_wake
+  end
+
   defp condition_wake(ctx, kind, scope, due_at \\ nil) do
     Wakes.schedule(ctx.db, %{
       session_key: ctx.session.session_key,

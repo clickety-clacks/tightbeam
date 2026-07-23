@@ -324,8 +324,23 @@ defmodule Tightbeam.Wakes do
     GenServer.call(server, :fire_due)
   end
 
-  @doc "Eagerly evaluate condition wakes for the fact that just committed."
-  @spec fire_matching(GenServer.server(), pos_integer()) :: :ok
+  @doc """
+  Eagerly evaluate condition wakes for the fact(s) that just committed.
+
+  A caller that filed SEVERAL facts in one transaction passes them as one
+  ordered list: the scheduler drains them sequentially, and a saturation
+  continuation carries the whole remaining list — so a later fact's fan-out
+  never overtakes an unserved earlier fact's (§4.3/7g).
+  """
+  @spec fire_matching(GenServer.server(), pos_integer() | [pos_integer()]) :: :ok
+  def fire_matching(_server, []), do: :ok
+
+  def fire_matching(server, [fact_id]), do: fire_matching(server, fact_id)
+
+  def fire_matching(server, fact_ids) when is_list(fact_ids) do
+    GenServer.call(server, {:fire_matching_seq, fact_ids})
+  end
+
   def fire_matching(server, fact_id) do
     GenServer.call(server, {:fire_matching, fact_id})
   end
@@ -350,7 +365,12 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_call({:fire_matching, fact_id}, _from, state) do
-    evaluate_conditions(state, {:eager, fact_id})
+    eager_step(state, fact_id)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:fire_matching_seq, fact_ids}, _from, state) do
+    drain_seq(state, fact_ids)
     {:reply, :ok, state}
   end
 
@@ -362,13 +382,39 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_info(:fire_matching, state) do
-    evaluate_conditions(state, :tick)
+    if evaluate_conditions(state, :tick) == :saturated, do: send(self(), :fire_matching)
     {:noreply, state}
   end
 
   def handle_info({:fire_matching, fact_id}, state) do
-    evaluate_conditions(state, {:eager, fact_id})
+    eager_step(state, fact_id)
     {:noreply, state}
+  end
+
+  def handle_info({:fire_matching_seq, fact_ids}, state) do
+    drain_seq(state, fact_ids)
+    {:noreply, state}
+  end
+
+  # One eager batch for one fact; saturation re-queues the same fact.
+  defp eager_step(state, fact_id) do
+    if evaluate_conditions(state, {:eager, fact_id}) == :saturated do
+      send(self(), {:fire_matching, fact_id})
+    end
+
+    :ok
+  end
+
+  # Ordered multi-fact drain: the head fact must be fully served before any
+  # later fact's fan-out starts; saturation carries the WHOLE remaining list
+  # into the continuation so mailbox interleaving cannot reorder facts.
+  defp drain_seq(_state, []), do: :ok
+
+  defp drain_seq(state, [head | rest] = all) do
+    case evaluate_conditions(state, {:eager, head}) do
+      :saturated -> send(self(), {:fire_matching_seq, all})
+      :done -> drain_seq(state, rest)
+    end
   end
 
   # Deliver-then-mark (see moduledoc — never reorder): a raising deliver
@@ -430,16 +476,12 @@ defmodule Tightbeam.Wakes do
       advance_watermark(db, rows, batch, watermark)
     end
 
-    if Enum.any?(~w(C1 C2 F), fn branch ->
-         Enum.count(rows, &(hd(&1) == branch)) == batch
-       end) do
-      case mode do
-        :tick -> send(self(), :fire_matching)
-        {:eager, fact_id} -> send(self(), {:fire_matching, fact_id})
-      end
-    end
+    saturated? =
+      Enum.any?(~w(C1 C2 F), fn branch ->
+        Enum.count(rows, &(hd(&1) == branch)) == batch
+      end)
 
-    :ok
+    if saturated?, do: :saturated, else: :done
   end
 
   defp select_candidates(db, batch, :tick) do
