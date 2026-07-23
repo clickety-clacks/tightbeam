@@ -49,7 +49,10 @@ defmodule Tightbeam.Spinup do
         ensure_remote_host(host, harness, host_name, sh)
 
       {output, _exit} ->
-        message = "host #{host_name} is unreachable: #{String.trim(output)}"
+        message =
+          "host #{host_name} is unreachable: #{String.trim(output)} " <>
+            "(check SSH access to #{host_name})"
+
         {{:error, host_unready(message)}, "DENIED: #{message}"}
     end
   end
@@ -77,7 +80,8 @@ defmodule Tightbeam.Spinup do
 
       {output, _exit} ->
         message =
-          "host #{host_name} is not ready for #{harness}: directory setup failed: #{String.trim(output)}"
+          "host #{host_name} is not ready for #{harness}: directory setup failed: #{String.trim(output)} " <>
+            "(fix directory permissions on #{host_name})"
 
         {{:error, host_unready(message)}, "reached; DENIED: #{message}"}
     end
@@ -91,7 +95,8 @@ defmodule Tightbeam.Spinup do
 
         {:error, reason} ->
           message =
-            "host #{host_name} is not ready for #{harness}: directory setup failed at #{path}: #{:file.format_error(reason)}"
+            "host #{host_name} is not ready for #{harness}: directory setup failed at #{path}: #{:file.format_error(reason)} " <>
+              "(fix directory permissions on #{host_name})"
 
           {:halt, {:error, host_unready(message), "reached; DENIED: #{message}"}}
       end
@@ -104,7 +109,10 @@ defmodule Tightbeam.Spinup do
     if File.exists?(path) do
       :ok
     else
-      message = "host #{host_name} is not ready for #{harness}: adapter missing at #{path}"
+      message =
+        "host #{host_name} is not ready for #{harness}: adapter missing at #{path} " <>
+          "(install the ACP adapters in the local Tightbeam checkout)"
+
       {:error, host_unready(message), "reached; directories ensured; DENIED: #{message}"}
     end
   end
@@ -131,7 +139,8 @@ defmodule Tightbeam.Spinup do
 
               {output, _exit} ->
                 message =
-                  "host #{host_name} is not ready for #{harness}: adapter still missing at #{path} after deployment: #{String.trim(output)}"
+                  "host #{host_name} is not ready for #{harness}: adapter still missing at #{path} after deployment: #{String.trim(output)} " <>
+                    "(verify the ACP adapter installation on #{host_name})"
 
                 {:error, host_unready(message),
                  "reached; directories ensured; deployed adapters; DENIED: #{message}"}
@@ -139,7 +148,8 @@ defmodule Tightbeam.Spinup do
 
           {output, _exit} ->
             message =
-              "host #{host_name} is not ready for #{harness}: adapter deployment failed: #{String.trim(output)}"
+              "host #{host_name} is not ready for #{harness}: adapter deployment failed: #{String.trim(output)} " <>
+                "(install Node.js/npm and the ACP adapters on #{host_name})"
 
             {:error, host_unready(message), "reached; directories ensured; DENIED: #{message}"}
         end
