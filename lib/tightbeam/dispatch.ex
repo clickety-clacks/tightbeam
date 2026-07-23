@@ -24,7 +24,7 @@ defmodule Tightbeam.Dispatch do
   still appends a "verb" row with the error.
   """
 
-  alias Tightbeam.{Escalation, EventLog, Rules}
+  alias Tightbeam.{DB, Escalation, EventLog, Rules}
 
   @typedoc """
   A verb call. `origin` is WHO (\"user:flynn\" | \"agent:<handle>\") — never
@@ -73,12 +73,27 @@ defmodule Tightbeam.Dispatch do
         {:error, ctx.error}
 
       {:allow, _to_close, to_consume} ->
-        if Enum.map(to_consume, &Escalation.consume(db, &1)) |> Enum.all?() do
-          dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key)
-        else
-          error = %{code: "rule_denied", message: "ruling authorization was no longer available"}
-          best_effort_denial(db, verb, origin, principal, session_key, error)
-          {:error, error}
+        consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1)})
+
+        case Enum.find(consumed, fn {_id, won?} -> not won? end) do
+          nil ->
+            dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key)
+
+          {lost_id, false} ->
+            error = %{
+              code: "rule_denied",
+              rule: ruling_statute(db, lost_id),
+              edge: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb"),
+              reason: "rule_denied",
+              script_exit_class: nil,
+              ref: gated_ref(call),
+              producer: nil,
+              identity_manifest_sha: nil,
+              message: "ruling authorization was no longer available"
+            }
+
+            best_effort_denial(db, verb, origin, principal, session_key, error)
+            {:error, error}
         end
     end
   end
@@ -128,5 +143,19 @@ defmodule Tightbeam.Dispatch do
     {:returned, handler.(call)}
   rescue
     exception -> {:raised, exception}
+  end
+
+  defp gated_ref(call) do
+    params = Map.fetch!(call, :params)
+
+    params[:assignment_id] || params[:work_item_id] || params["assignment_id"] ||
+      params["work_item_id"]
+  end
+
+  defp ruling_statute(db, ruling_id) do
+    case DB.query(db, "SELECT statuteName FROM decision_requests WHERE id = ?1", [ruling_id]) do
+      {:ok, [[statute]]} -> statute
+      _ -> "ruling-authorization"
+    end
   end
 end

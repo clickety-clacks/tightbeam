@@ -187,6 +187,9 @@ defmodule Tightbeam.Rules do
     if "remedy" in effects,
       do: fail.("effect remedy requires [rule.remedy] (roadmap phase P5)")
 
+    if "escalate" in effects,
+      do: fail.("effect escalate requires the escalation actor wiring (not yet wired)")
+
     %{
       name: raw_name,
       verb: verb,

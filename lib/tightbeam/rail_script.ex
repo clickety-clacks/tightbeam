@@ -34,25 +34,21 @@ defmodule Tightbeam.RailScript do
   defp execute(db, base_dir, scratch, rule, call, assignment) do
     case invocation_context(db, base_dir, assignment) do
       {:ok, context, cwd} ->
-        if context.host && context.host != Placement.local_host_name() do
-          {{:error, "script_error", "error:1"}, context}
-        else
-          input = invocation_input(call, context)
-          profile = Containment.profile([scratch])
-          script = Path.join([base_dir, "identity", "rails", "scripts", rule.check.script])
-          wrapper = Path.join([base_dir, "bin", "tightbeam"])
+        input = invocation_input(call, context)
+        profile = Containment.profile([scratch])
+        script = Path.join([base_dir, "identity", "rails", "scripts", rule.check.script])
+        wrapper = Path.join([base_dir, "bin", "tightbeam"])
 
-          {run_wrapper(
-             wrapper,
-             profile,
-             rule.check.timeout_ms,
-             script,
-             cwd,
-             scratch,
-             rule,
-             input
-           ), context}
-        end
+        {run_wrapper(
+           wrapper,
+           profile,
+           rule.check.timeout_ms,
+           script,
+           cwd,
+           scratch,
+           rule,
+           input
+         ), context}
 
       {:error, context} ->
         {{:error, "script_error", "error:1"}, context}
@@ -75,23 +71,32 @@ defmodule Tightbeam.RailScript do
           port: Application.get_env(:tightbeam, :port, 0)
         }
 
-        try do
-          workdir = Placement.holder_workdir(config, holder)
+        workdir = Placement.workdir_path(config, holder)
 
-          context = %{
-            holder_key: holder.session_key,
-            holder_workdir: workdir,
-            host: holder.host,
-            holder_harness: holder.harness,
-            holder_archetype: holder.archetype
-          }
+        context = %{
+          holder_key: holder.session_key,
+          holder_workdir: workdir,
+          host: holder.host,
+          holder_harness: holder.harness,
+          holder_archetype: holder.archetype
+        }
 
-          {:ok, context, workdir}
-        rescue
-          _ -> {:error, empty_context()}
-        catch
-          _, _ -> {:error, empty_context()}
+        if holder.host != Placement.local_host_name() do
+          {:error, context}
+        else
+          ensure_local_holder_workdir(config, holder, context)
         end
+    end
+  end
+
+  defp ensure_local_holder_workdir(config, holder, context) do
+    try do
+      workdir = Placement.holder_workdir(config, holder)
+      {:ok, %{context | holder_workdir: workdir}, workdir}
+    rescue
+      _ -> {:error, context}
+    catch
+      _, _ -> {:error, context}
     end
   end
 
@@ -154,7 +159,8 @@ defmodule Tightbeam.RailScript do
       ])
 
     true = Port.command(port, input <> "\n")
-    {stdout, status} = await(port, [])
+    deadline = System.monotonic_time(:millisecond) + timeout_ms + 2_000
+    {stdout, status} = await(port, [], deadline)
 
     stderr =
       case File.read(stderr_path) do
@@ -165,13 +171,19 @@ defmodule Tightbeam.RailScript do
     classify(status, stdout, stderr, rule.check.returns)
   end
 
-  defp await(port, output) do
+  defp await(port, output, deadline) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
     receive do
       {^port, {:data, bytes}} ->
-        await(port, [bytes | output])
+        await(port, [bytes | output], deadline)
 
       {^port, {:exit_status, status}} ->
         {output |> Enum.reverse() |> IO.iodata_to_binary(), status}
+    after
+      remaining_ms ->
+        Port.close(port)
+        {output |> Enum.reverse() |> IO.iodata_to_binary(), 20}
     end
   end
 

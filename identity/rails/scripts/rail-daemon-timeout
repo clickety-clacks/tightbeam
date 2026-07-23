@@ -1,0 +1,13 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use POSIX qw(setsid);
+
+my $pid = fork();
+if ($pid) {
+    sleep 30;
+    exit 0;
+}
+
+setsid();
+sleep 5;

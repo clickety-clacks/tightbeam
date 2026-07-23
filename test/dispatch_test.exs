@@ -1,12 +1,17 @@
 defmodule Tightbeam.DispatchTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.{DB, Dispatch, EventLog}
+  alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Rules}
 
   setup do
+    :persistent_term.erase(Rules)
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = EventLog.ensure_schema(name)
+    :ok = Escalation.ensure_schema(name)
+
+    on_exit(fn -> :persistent_term.erase(Rules) end)
+
     %{db: name}
   end
 
@@ -46,5 +51,57 @@ defmodule Tightbeam.DispatchTest do
     {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events")
     assert payload =~ "server_error"
     assert payload =~ "boom"
+  end
+
+  test "ruling CAS loss emits a queryable E1 denial", %{db: db} do
+    call = %{
+      verb: "post",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{assignment_id: "a-cas"}
+    }
+
+    rule = %{
+      name: "cas-rule",
+      verb: "post",
+      text: "owner approval required",
+      conditions: [],
+      edges: ["verb"],
+      effect: "escalate",
+      check: nil,
+      identity_manifest_sha: "identity-sha"
+    }
+
+    :persistent_term.put(Rules, [rule, rule])
+    action_key = Escalation.digest(call)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO decision_requests
+          (id, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName, actionKey,
+           question, context, status, decision)
+        VALUES ('dr_cas', 'user:flynn', 'flynn', 1, 2, 'cas-rule', ?1,
+                'owner approval required', '{}', 'ruled', 'allow')
+        """,
+        [action_key]
+      )
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "cas-rule",
+              edge: "verb",
+              reason: "rule_denied",
+              script_exit_class: nil,
+              ref: "a-cas",
+              producer: nil,
+              identity_manifest_sha: nil
+            }} = Dispatch.dispatch(db, %{"post" => fn _ -> flunk("CAS loss must deny") end}, call)
+
+    assert [%{rule: "cas-rule", edge: "verb", reason: "rule_denied", ref: "a-cas"}] =
+             EventLog.rail_denials(db, 0, 10)
   end
 end

@@ -1,6 +1,8 @@
 defmodule Tightbeam.RailScriptTest do
   use ExUnit.Case, async: false
 
+  @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
+
   alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Org, Placement, RailScript, Rules}
 
   setup do
@@ -90,6 +92,24 @@ defmodule Tightbeam.RailScriptTest do
     assert %{"reason" => "script_error", "exit_class" => ^exit_class} = JSON.decode!(detail)
   end
 
+  test "BEAM backstop closes a wrapper that outlives its timeout", ctx do
+    wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+    File.write!(wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
+    File.chmod!(wrapper, 0o755)
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, "script_timeout", "timeout"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               put_in(rule("rail-pass").check.timeout_ms, 10),
+               call(),
+               nil
+             )
+
+    assert System.monotonic_time(:millisecond) - started < 2_500
+  end
+
   test "runs at the holder workdir with scratch as its only rail write root", ctx do
     workdir = Placement.holder_workdir(%{base_dir: ctx.base_dir, port: 0}, ctx.holder)
     File.write!(Path.join(workdir, ".rail-cwd-marker"), "cwd")
@@ -118,6 +138,50 @@ defmodule Tightbeam.RailScriptTest do
              )
 
     refute File.exists?(Path.join(workdir, "rail-forbidden-write"))
+  end
+
+  test "remote holder fails closed before ensuring its workdir", ctx do
+    remote_base = Path.join(ctx.base_dir, "remote-host")
+    prior_hosts = Application.get_env(:tightbeam, :hosts)
+
+    Application.put_env(:tightbeam, :hosts, %{
+      "remote-testhost" => %{ssh: nil, base_dir: remote_base, cli_bin: nil}
+    })
+
+    on_exit(fn ->
+      if prior_hosts,
+        do: Application.put_env(:tightbeam, :hosts, prior_hosts),
+        else: Application.delete_env(:tightbeam, :hosts)
+    end)
+
+    remote_holder =
+      Org.create(ctx.db, %{
+        session_key: "remote-rail-holder",
+        display_name: "Remote rail holder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "remote-testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    expected_workdir =
+      Placement.workdir_path(%{base_dir: ctx.base_dir, port: 0}, remote_holder)
+
+    refute File.exists?(expected_workdir)
+
+    assert {:error, "script_error", "error:1"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               rule("rail-pass"),
+               call(%{assignment_id: "remote-a1"}),
+               %{holder_key: remote_holder.session_key}
+             )
+
+    refute File.exists?(expected_workdir)
   end
 
   test "validates the nested check grammar and edge restrictions", ctx do
@@ -186,9 +250,32 @@ defmodule Tightbeam.RailScriptTest do
              Rules.decide(ctx.db, %{call() | origin: "agent:coder"})
   end
 
+  test "escalate effects are load-gated for predicate and script statutes", ctx do
+    predicate =
+      """
+      [[rule]]
+      name = "predicate-escalate"
+      verb = "post"
+      text = "fixture"
+      effect = "escalate"
+      deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+      """
+
+    for contents <- [predicate, statute("rail-pass", %{"pass" => "escalate"})] do
+      path = put_statute(ctx, contents)
+      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+      assert error.message =~ path
+      assert error.message =~ "rule"
+
+      assert error.message =~
+               "effect escalate requires the escalation actor wiring (not yet wired)"
+    end
+  end
+
   test "decide is dry and evaluate preserves its collapsing legacy contract", ctx do
-    put_statute(ctx, statute("rail-pass", %{"pass" => "escalate"}))
-    Rules.load!(ctx.base_dir, ["post"])
+    put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
+    [loaded] = Rules.load!(ctx.base_dir, ["post"])
+    :persistent_term.put(Rules, [put_in(loaded.check.effects["pass"], "escalate")])
 
     assert {{:escalate, %{name: "script-escalate"}, %{question: "fixture"}, nil}, [], []} =
              Rules.decide(ctx.db, call())
@@ -265,6 +352,51 @@ defmodule Tightbeam.RailScriptTest do
     end)
 
     assert length(EventLog.lifecycle_events(ctx.db)) == length(cases)
+  end
+
+  if File.exists?(@release_binary) do
+    test "real Rust rail-exec matches BEAM framing for pass, deny, and escaped timeout", ctx do
+      wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+      File.cp!(@release_binary, wrapper)
+      File.chmod!(wrapper, 0o755)
+
+      assert {:ok, "pass", "returned"} =
+               RailScript.run(
+                 ctx.db,
+                 ctx.base_dir,
+                 put_in(rule("rail-pass").check.timeout_ms, 2_000),
+                 call(),
+                 nil
+               )
+
+      assert {:error, "script_out_of_set", "out-of-set"} =
+               RailScript.run(
+                 ctx.db,
+                 ctx.base_dir,
+                 put_in(rule("rail-deny").check.timeout_ms, 2_000),
+                 call(),
+                 nil
+               )
+
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, "script_timeout", "timeout"} =
+               RailScript.run(
+                 ctx.db,
+                 ctx.base_dir,
+                 put_in(rule("rail-daemon-timeout").check.timeout_ms, 200),
+                 call(),
+                 nil
+               )
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+    end
+  else
+    @tag skip:
+           "real rail-exec integration binary missing: #{@release_binary}; run cargo build --release in cli/"
+    test "real Rust rail-exec matches BEAM framing for pass, deny, and escaped timeout" do
+      flunk("release binary is required when this test is enabled")
+    end
   end
 
   defp rule(script) do

@@ -149,6 +149,13 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         thread::sleep(Duration::from_millis(2));
     };
 
+    if timed_out {
+        drop(stdin_writer);
+        drop(stdout_reader);
+        drop(stderr_reader);
+        return SCRIPT_TIMEOUT;
+    }
+
     let stdin_delivered = matches!(stdin_writer.join(), Ok(Ok(())));
     let stdout = stdout_reader
         .join()
@@ -162,10 +169,6 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         .unwrap_or_default();
 
     let _ = io::stderr().write_all(&stderr);
-
-    if timed_out {
-        return SCRIPT_TIMEOUT;
-    }
 
     if !stdin_delivered {
         eprintln!("tightbeam rail-exec child exit: 1");
@@ -342,6 +345,29 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
         thread::sleep(Duration::from_millis(1_100));
         assert!(!marker.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn timeout_does_not_join_a_reader_held_open_by_an_escaped_descendant() {
+        let dir = temp_dir();
+        let check = script(
+            &dir,
+            "daemonizes",
+            "/usr/bin/perl -MPOSIX=setsid -e 'if (fork) { sleep 30 } else { setsid(); sleep 1 }'",
+        );
+        let started = Instant::now();
+        let status = run_with_input(
+            RailExecArgs {
+                profile: permissive_profile(),
+                timeout: Duration::from_millis(40),
+                script: check,
+            },
+            b"{}\n".to_vec(),
+        );
+        assert_eq!(status, SCRIPT_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(1_100));
         fs::remove_dir_all(dir).unwrap();
     }
 }
