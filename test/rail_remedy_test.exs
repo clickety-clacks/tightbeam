@@ -108,26 +108,32 @@ defmodule Tightbeam.RailRemedyTest do
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
   end
 
-  test "TTL reclaim preserves occurrence and reuses exactly one external producer", ctx do
+  test "TTL reclaim racing a live original dispatch produces exactly one external effect", ctx do
     assignment = assignment(ctx, "ttl")
     load_review_gate(ctx)
-    key = "rail-dispatch:completion-needs-review:#{assignment.id}:1"
+    parent = self()
+    assign = ctx.handlers["assign"]
 
-    existing =
-      Assignments.__handle__(ctx.db, "assign", %{
-        verb: "assign",
-        origin: "remedy:completion-needs-review",
-        principal:
-          {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}},
-        session_key: ctx.reviewer.session_key,
-        target_role: "reviewer",
-        role_fallback: false,
-        params: %{
-          subject: "review #{assignment.id}",
-          reviews_assignment_id: assignment.id,
-          idempotency_key: key
-        }
-      })
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    handlers =
+      Map.put(ctx.handlers, "assign", fn call ->
+        first? = Agent.get_and_update(counter, &{&1 == 0, &1 + 1})
+
+        if first? do
+          send(parent, {:original_dispatch_running, self()})
+          receive do: (:release_original_dispatch -> :ok)
+        end
+
+        assign.(call)
+      end)
+
+    original =
+      Task.async(fn ->
+        Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
+      end)
+
+    assert_receive {:original_dispatch_running, original_pid}
 
     stale = System.system_time(:millisecond) - 60_001
 
@@ -135,22 +141,24 @@ defmodule Tightbeam.RailRemedyTest do
       DB.query(
         ctx.db,
         """
-        INSERT INTO rail_remedy_episodes
-          (statute, subject, status, occurrence, rewakeCount, claimToken, openedAt)
-        VALUES ('completion-needs-review', ?1, 'dispatched', 1, 0, 'old', ?2)
+        UPDATE rail_remedy_episodes
+        SET openedAt = ?2
+        WHERE statute = 'completion-needs-review' AND subject = ?1 AND status = 'dispatched'
         """,
         [assignment.id, stale]
       )
 
-    assert {:error, %{producer: producer}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+    reclaimed =
+      Task.async(fn ->
+        Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
+      end)
 
-    assert producer == existing.id
+    assert {:error, %{producer: producer}} = Task.await(reclaimed)
+    send(original_pid, :release_original_dispatch)
+    assert {:error, %{producer: ^producer}} = Task.await(original)
 
-    assert %{occurrence: 1, producer_key: producer_key, status: "live"} =
+    assert %{occurrence: 1, producer_key: ^producer, status: "live"} =
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
-
-    assert producer_key == existing.id
 
     assert {:ok, [[1]]} =
              DB.query(

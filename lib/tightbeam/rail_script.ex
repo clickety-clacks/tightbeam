@@ -122,6 +122,10 @@ defmodule Tightbeam.RailScript do
   end
 
   defp serialize_principal(nil), do: nil
+
+  defp serialize_principal({:remedy, %{statute: statute, action: action}}),
+    do: "remedy:#{action}:#{statute}"
+
   defp serialize_principal({kind, value}), do: "#{kind}:#{value}"
 
   defp run_wrapper(wrapper, profile, timeout_ms, script, cwd, scratch, rule, input) do
