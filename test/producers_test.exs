@@ -5,12 +5,14 @@ defmodule Tightbeam.ProducersTest do
     Assignments,
     DB,
     Devices,
+    Dispatch,
     EventLog,
     Gateway,
     Idempotency,
     Org,
     Producers,
     Roles,
+    Rules,
     WorkItems
   }
 
@@ -32,6 +34,7 @@ defmodule Tightbeam.ProducersTest do
       Path.join(System.tmp_dir!(), "tightbeam-producers-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join(base_dir, "identity"))
+    init_identity_repo(base_dir)
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     holder = session(db, "holder", "flynn", "claude", "anthropic")
@@ -41,14 +44,21 @@ defmodule Tightbeam.ProducersTest do
     %{db: db, base_dir: base_dir, holder: holder, other: other, assignment: assignment}
   end
 
-  test "loads the exact committed config shape and permits an absent file", ctx do
+  test "loads only committed config with the exact shape and permits an absent file", ctx do
     assert Producers.load!(ctx.base_dir) == %{timeout_ms: 600_000}
 
     write_config(ctx.base_dir, "tests = \"true\"\nsmoke = \"false\"\ntimeout_ms = 42\n")
 
     assert Producers.load!(ctx.base_dir) == %{tests: "true", smoke: "false", timeout_ms: 42}
 
-    write_config(ctx.base_dir, "tests = \"true\"\nextra = \"no\"\n")
+    File.write!(
+      Path.join(ctx.base_dir, "identity/producers.toml"),
+      "tests = \"uncommitted\"\nextra = \"no\"\n"
+    )
+
+    assert Producers.load!(ctx.base_dir) == %{tests: "true", smoke: "false", timeout_ms: 42}
+
+    commit_identity(ctx.base_dir, "uncommitted producer edit")
     assert_raise ArgumentError, ~r/unknown keys: extra/, fn -> Producers.load!(ctx.base_dir) end
   end
 
@@ -193,12 +203,10 @@ defmodule Tightbeam.ProducersTest do
     assert length(EventLog.lifecycle_events(ctx.db)) == event_count
   end
 
-  test "cancel winning against a running command prevents the success verdict", ctx do
-    started = Path.join(ctx.base_dir, "started")
-    finished = Path.join(ctx.base_dir, "finished")
-
-    command =
-      "printf started > #{shell_quote(started)}; sleep 5; printf finished > #{shell_quote(finished)}"
+  test "cancellation kills the producer shell, child, and grandchild before delayed effects",
+       ctx do
+    tree = descendant_tree(ctx.base_dir, "cancel")
+    command = descendant_command(tree)
 
     producer_config = %{tests: command, timeout_ms: 10_000}
     {_sup, runner} = start_runner(ctx, producer_config)
@@ -213,8 +221,11 @@ defmodule Tightbeam.ProducersTest do
       )
 
     assert_wait(fn ->
-      File.exists?(started) and Producers.get(ctx.db, job_id).state == "running"
+      descendant_pids_ready?(tree) and Producers.get(ctx.db, job_id).state == "running"
     end)
+
+    pids = descendant_pids(tree)
+    assert Enum.all?(pids, &process_exists?/1)
 
     assert %{cancelled: ^job_id} =
              Producers.__handle__(
@@ -225,9 +236,42 @@ defmodule Tightbeam.ProducersTest do
              )
 
     assert_wait(fn -> Producers.get(ctx.db, job_id).state == "cancelled" end)
-    Process.sleep(100)
-    refute File.exists?(finished)
+    assert_wait(fn -> Enum.all?(pids, &(not process_exists?(&1))) end)
+    Process.sleep(2_200)
+    refute File.exists?(tree.finished)
     assert Assignments.list_attests(ctx.db, ctx.assignment.id) == []
+  end
+
+  test "timeout kills the producer shell, child, and grandchild before delayed effects", ctx do
+    tree = descendant_tree(ctx.base_dir, "timeout")
+    producer_config = %{tests: descendant_command(tree), timeout_ms: 1_000}
+    {_sup, runner} = start_runner(ctx, producer_config)
+    assignment = assignment(ctx.db, ctx.holder.session_key, "timeout descendants")
+
+    %{queued: job_id} =
+      Producers.__handle__(
+        ctx.db,
+        "run-tests",
+        producer_call("run-tests", {:session, ctx.holder.session_key}, assignment.id),
+        config: producer_config,
+        runner: runner
+      )
+
+    assert_wait(fn ->
+      descendant_pids_ready?(tree) and Producers.get(ctx.db, job_id).state == "running"
+    end)
+
+    pids = descendant_pids(tree)
+    assert Enum.all?(pids, &process_exists?/1)
+    assert_wait(fn -> Producers.get(ctx.db, job_id).state == "failed" end)
+    assert_wait(fn -> Enum.all?(pids, &(not process_exists?(&1))) end)
+    Process.sleep(1_200)
+    refute File.exists?(tree.finished)
+    assert Assignments.list_attests(ctx.db, assignment.id) == []
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.subject == assignment.id and event.detail =~ "timeout"
+           end)
   end
 
   test "unconfigured, nonzero, timeout, and remote holder fail loudly without verdicts", ctx do
@@ -336,6 +380,73 @@ defmodule Tightbeam.ProducersTest do
     assert length(Assignments.list_attests(ctx.db, second.id)) == 1
   end
 
+  test "public run-tests stays behind the gate until its async worker files the verdict", ctx do
+    release = Path.join(ctx.base_dir, "release-produced-tests")
+    command = "while [ ! -f #{shell_quote(release)} ]; do sleep 0.01; done"
+    write_config(ctx.base_dir, "tests = #{JSON.encode!(command)}\ntimeout_ms = 5000\n")
+    producer_config = Producers.load!(ctx.base_dir)
+    {_sup, runner} = start_runner(ctx, producer_config)
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        producer_config: producer_config,
+        producer_runner: runner
+      })
+
+    rules_dir = Path.join(ctx.base_dir, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    File.write!(Path.join(rules_dir, "produced-tests.toml"), """
+    [[rule]]
+    name = "completion-needs-produced-tests"
+    verb = "attest"
+    text = "completion needs produced tests"
+    [[rule.deny_when]]
+    fact = "attest.kind"
+    op = "eq"
+    value = "completion"
+    [[rule.deny_when]]
+    fact = "assignment.produced_verdict_kinds"
+    op = "not_in"
+    value = ["tests-passed"]
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(handlers), producer_config)
+    completion = attest_call(ctx.holder.session_key, ctx.assignment.id, "completion")
+
+    assert {:error, %{code: "rule_denied"}} =
+             Dispatch.dispatch(ctx.db, handlers, completion)
+
+    assert %{state: "open"} =
+             Assignments.list(ctx.db, %{state: "all"})
+             |> Enum.find(&(&1.id == ctx.assignment.id))
+
+    assert {:ok, %{queued: job_id}} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               producer_call(
+                 "run-tests",
+                 {:session, ctx.holder.session_key},
+                 ctx.assignment.id
+               )
+             )
+
+    assert Producers.get(ctx.db, job_id).state in ["queued", "running"]
+    assert Assignments.produced_verdict_kinds(ctx.db, ctx.assignment.id) == []
+
+    assert {:error, %{code: "rule_denied"}} =
+             Dispatch.dispatch(ctx.db, handlers, completion)
+
+    File.write!(release, "run")
+    assert_wait(fn -> Producers.get(ctx.db, job_id).state == "done" end)
+    assert Assignments.produced_verdict_kinds(ctx.db, ctx.assignment.id) == ["tests-passed"]
+
+    assert {:ok, %{assignment: %{state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, handlers, completion)
+  end
+
   test "principal and assignment denials have pinned precedence", ctx do
     unconfigured = %{timeout_ms: 5_000}
 
@@ -415,6 +526,16 @@ defmodule Tightbeam.ProducersTest do
     }
   end
 
+  defp attest_call(holder, assignment_id, kind) do
+    %{
+      verb: "attest",
+      origin: "agent:#{holder}",
+      principal: {:session, holder},
+      session_key: nil,
+      params: %{assignment_id: assignment_id, kind: kind}
+    }
+  end
+
   defp cancel_call(principal, job_id) do
     %{
       verb: "cancel-producer-job",
@@ -458,6 +579,33 @@ defmodule Tightbeam.ProducersTest do
 
   defp write_config(base_dir, contents) do
     File.write!(Path.join(base_dir, "identity/producers.toml"), contents)
+    commit_identity(base_dir, "update producers")
+  end
+
+  defp init_identity_repo(base_dir) do
+    identity_dir = Path.join(base_dir, "identity")
+    git!(identity_dir, ["init", "-q"])
+    File.write!(Path.join(identity_dir, ".gitkeep"), "")
+    git!(identity_dir, ["add", ".gitkeep"])
+    git!(identity_dir, ["commit", "-q", "-m", "initialize identity"])
+  end
+
+  defp commit_identity(base_dir, message) do
+    identity_dir = Path.join(base_dir, "identity")
+    git!(identity_dir, ["add", "producers.toml"])
+    git!(identity_dir, ["commit", "-q", "-m", message])
+  end
+
+  defp git!(identity_dir, args) do
+    env = [
+      {"GIT_AUTHOR_NAME", "Tightbeam Test"},
+      {"GIT_AUTHOR_EMAIL", "tightbeam@test.local"},
+      {"GIT_COMMITTER_NAME", "Tightbeam Test"},
+      {"GIT_COMMITTER_EMAIL", "tightbeam@test.local"}
+    ]
+
+    assert {_output, 0} =
+             System.cmd("git", args, cd: identity_dir, stderr_to_stdout: true, env: env)
   end
 
   defp assert_wait(fun, attempts \\ 200)
@@ -469,6 +617,41 @@ defmodule Tightbeam.ProducersTest do
     else
       Process.sleep(10)
       assert_wait(fun, attempts - 1)
+    end
+  end
+
+  defp descendant_tree(base_dir, prefix) do
+    %{
+      root: Path.join(base_dir, "#{prefix}-root.pid"),
+      child: Path.join(base_dir, "#{prefix}-child.pid"),
+      grandchild: Path.join(base_dir, "#{prefix}-grandchild.pid"),
+      finished: Path.join(base_dir, "#{prefix}-finished")
+    }
+  end
+
+  defp descendant_command(tree) do
+    child =
+      "printf '%s' \"$$\" > #{shell_quote(tree.child)}; " <>
+        "sleep 2 & printf '%s' \"$!\" > #{shell_quote(tree.grandchild)}; " <>
+        "wait; printf finished > #{shell_quote(tree.finished)}"
+
+    "printf '%s' \"$$\" > #{shell_quote(tree.root)}; sh -c #{shell_quote(child)} & wait"
+  end
+
+  defp descendant_pids_ready?(tree) do
+    Enum.all?([tree.root, tree.child, tree.grandchild], &File.exists?/1)
+  end
+
+  defp descendant_pids(tree) do
+    Enum.map([tree.root, tree.child, tree.grandchild], fn path ->
+      path |> File.read!() |> String.trim() |> String.to_integer()
+    end)
+  end
+
+  defp process_exists?(pid) do
+    case System.cmd("ps", ["-p", Integer.to_string(pid), "-o", "pid="], stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output) != ""
+      _ -> false
     end
   end
 

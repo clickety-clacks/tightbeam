@@ -29,7 +29,7 @@ defmodule Tightbeam.Assignments do
   @assignments_ddl """
   CREATE TABLE IF NOT EXISTS assignments (
     id TEXT PRIMARY KEY,
-    subject TEXT NOT NULL,
+    subject TEXT NOT NULL CHECK(length(subject) BETWEEN 1 AND 2000 AND length(trim(subject)) >= 1),
     holderKey TEXT NOT NULL REFERENCES sessions(sessionKey),
     holderRole TEXT NULL,
     holderFallback INTEGER NOT NULL DEFAULT 0 CHECK(holderFallback IN (0, 1)),
@@ -66,7 +66,7 @@ defmodule Tightbeam.Assignments do
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
     kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
     verdictKind TEXT NULL,
-    note TEXT NULL,
+    note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
     bySession TEXT NULL REFERENCES sessions(sessionKey),
     byUser TEXT NULL REFERENCES users(userId),
     producer TEXT NULL,
@@ -452,14 +452,14 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, verb),
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
-         {:ok, files} <- valid_files(call.params[:files]),
+         {:ok, files} <- assignment_files(verb, call.params),
          :ok <- extra_validation.() do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
 
       result =
         transaction(db, fn txn ->
-          case open_assignment_in_txn(txn, call, owner, key, files) do
+          case open_assignment_in_txn(txn, call, owner, key, files, verb) do
             {:created, assignment} -> after_create.(txn, assignment)
             other -> other
           end
@@ -468,12 +468,6 @@ defmodule Tightbeam.Assignments do
       case result do
         {:created, assignment, delivery} ->
           best_effort(fn -> notify(call, :on_assignment_change, assignment.id, nil) end)
-
-          if assignment.workItemId do
-            best_effort(fn ->
-              notify(call, :on_work_item_change, assignment.workItemId, "composition")
-            end)
-          end
 
           if delivery,
             do: best_effort(fn -> notify(call, :on_dispatch_delivery, delivery, nil) end)
@@ -492,10 +486,10 @@ defmodule Tightbeam.Assignments do
     error in UnknownReviewTarget -> error("unknown_review_target", Exception.message(error))
   end
 
-  defp open_assignment_in_txn(txn, call, owner, key, files) do
+  defp open_assignment_in_txn(txn, call, owner, key, files, verb) do
     case key && idempotency_assignment(txn, owner, key) do
       nil ->
-        case create_assignment(txn, call, owner, key, files) do
+        case create_assignment(txn, call, owner, key, files, verb) do
           %{code: _} = error -> error
           assignment -> {:created, assignment}
         end
@@ -571,7 +565,7 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp create_assignment(txn, call, owner, key, files) do
+  defp create_assignment(txn, call, owner, key, files, verb) do
     case Txn.q(txn, "SELECT state, harness, provider FROM sessions WHERE sessionKey = ?1", [
            call.session_key
          ]) do
@@ -579,7 +573,9 @@ defmodule Tightbeam.Assignments do
         error("session_retired", "assignments require an active holder session")
 
       [["active", harness, provider]] ->
-        case call.params[:work_item_id] do
+        work_item_id = if verb == "assign", do: call.params[:work_item_id], else: nil
+
+        case work_item_id do
           nil ->
             :ok
 
@@ -588,7 +584,8 @@ defmodule Tightbeam.Assignments do
               do: raise(UnknownWorkItem, work_item_id: work_item_id)
         end
 
-        reviews_assignment_id = call.params[:reviews_assignment_id]
+        reviews_assignment_id =
+          if verb == "assign", do: call.params[:reviews_assignment_id], else: nil
 
         if reviews_assignment_id &&
              Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1", [reviews_assignment_id]) == [],
@@ -621,7 +618,7 @@ defmodule Tightbeam.Assignments do
             opened_user,
             opened_session,
             now,
-            call.params[:work_item_id],
+            work_item_id,
             reviews_assignment_id,
             harness,
             provider
@@ -946,17 +943,13 @@ defmodule Tightbeam.Assignments do
   defp principal_allowed({kind, _}, _verb) when kind in [:session, :user], do: :ok
 
   defp valid_subject(subject) when is_binary(subject) do
-    max = Application.get_env(:tightbeam, :max_subject_len, 2000)
-
-    if String.length(String.trim(subject)) in 1..max,
+    if String.length(subject) in 1..2000 and String.trim(subject) != "",
       do: :ok,
-      else: error("invalid_subject", "subject must be 1..#{max} non-blank characters")
+      else: error("invalid_subject", "subject must be 1..2000 non-blank characters")
   end
 
-  defp valid_subject(_) do
-    max = Application.get_env(:tightbeam, :max_subject_len, 2000)
-    error("invalid_subject", "subject must be 1..#{max} non-blank characters")
-  end
+  defp valid_subject(_),
+    do: error("invalid_subject", "subject must be 1..2000 non-blank characters")
 
   defp valid_brief(brief) when is_binary(brief) and brief != "", do: :ok
   defp valid_brief(_), do: error("invalid", "a dispatch must carry a brief")
@@ -964,11 +957,9 @@ defmodule Tightbeam.Assignments do
   defp valid_note(nil), do: :ok
 
   defp valid_note(note) when is_binary(note) do
-    max = Application.get_env(:tightbeam, :max_note_len, 2000)
-
-    if String.length(String.trim(note)) in 1..max,
+    if String.length(String.trim(note)) in 1..2000,
       do: :ok,
-      else: error("invalid_note", "note must be 1..#{max} non-blank characters")
+      else: error("invalid_note", "note must be 1..2000 non-blank characters")
   end
 
   defp valid_note(_), do: error("invalid_note", "note must be text")
@@ -985,14 +976,12 @@ defmodule Tightbeam.Assignments do
     do: error("missing_verdict_kind", "verdictKind is required when kind is verdict")
 
   defp valid_verdict_kind(kind) when is_binary(kind) do
-    max = Application.get_env(:tightbeam, :max_verdict_kind_len, 64)
-
-    if String.length(kind) in 1..max and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, kind),
+    if String.length(kind) in 1..64 and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, kind),
       do: :ok,
       else:
         error(
           "invalid_verdict_kind",
-          "verdictKind must be 1..#{max} lowercase letters, digits, or hyphens"
+          "verdictKind must be 1..64 lowercase letters, digits, or hyphens"
         )
   end
 
@@ -1006,13 +995,11 @@ defmodule Tightbeam.Assignments do
   defp valid_idempotency_key(nil), do: :ok
 
   defp valid_idempotency_key(key) when is_binary(key) do
-    max = Application.get_env(:tightbeam, :max_idem_key_len, 200)
-
-    if String.trim(key) == "" or String.length(key) > max,
+    if String.trim(key) == "" or String.length(key) > 200,
       do:
         error(
           "invalid_idempotency_key",
-          "idempotencyKey must be non-blank and at most #{max} characters"
+          "idempotencyKey must be non-blank and at most 200 characters"
         ),
       else: :ok
   end
@@ -1035,6 +1022,9 @@ defmodule Tightbeam.Assignments do
 
   defp valid_files(_),
     do: error("invalid_files", "files must be an array of paths")
+
+  defp assignment_files("assign", params), do: valid_files(params[:files])
+  defp assignment_files(_verb, _params), do: {:ok, []}
 
   defp valid_producer(producer) when is_binary(producer) do
     if String.length(producer) in 1..64 and
@@ -1212,7 +1202,8 @@ defmodule Tightbeam.Assignments do
       "CHECK(producer IS NULL OR kind = 'verdict')",
       "CHECK(producerCommand IS NULL OR producer IS NOT NULL)",
       "CHECK(byHarness IS NULL OR kind = 'verdict')",
-      "CHECK(byProvider IS NULL OR kind = 'verdict')"
+      "CHECK(byProvider IS NULL OR kind = 'verdict')",
+      "CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000)"
     ]
 
     unless Enum.all?(target_fragments, &String.contains?(sql, &1)) do
