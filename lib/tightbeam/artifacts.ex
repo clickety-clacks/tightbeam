@@ -2,9 +2,9 @@ defmodule Tightbeam.Artifacts do
   @moduledoc "Artifact pointers and provenance."
 
   alias Tightbeam.DB
+  alias Tightbeam.DB.Txn
 
-  @ddl """
-  CREATE TABLE IF NOT EXISTS artifacts (
+  @table_definition """
     artifactId        TEXT PRIMARY KEY,
     kind              TEXT NOT NULL CHECK (kind IN ('spec','report','doc','data','other')),
     title             TEXT NOT NULL,
@@ -21,15 +21,35 @@ defmodule Tightbeam.Artifacts do
     createdAt         INTEGER NOT NULL,
     updatedAt         INTEGER NOT NULL,
     CHECK ((state = 'archived') = (home IS NOT NULL))
+  """
+
+  @index_ddl [
+    "CREATE INDEX IF NOT EXISTS artifacts_work_item ON artifacts (workItemId)",
+    "CREATE INDEX IF NOT EXISTS artifacts_created_by_session ON artifacts (createdBySession)",
+    "CREATE INDEX IF NOT EXISTS artifacts_recorded_message ON artifacts (recordedMessageId)"
+  ]
+
+  @ddl """
+  CREATE TABLE IF NOT EXISTS artifacts (
+  #{@table_definition}
   );
-  CREATE INDEX IF NOT EXISTS artifacts_work_item ON artifacts (workItemId);
-  CREATE INDEX IF NOT EXISTS artifacts_created_by_session ON artifacts (createdBySession);
-  CREATE INDEX IF NOT EXISTS artifacts_recorded_message ON artifacts (recordedMessageId);
+  #{Enum.join(@index_ddl, ";\n")};
+  """
+
+  @rebuild_ddl """
+  CREATE TABLE artifacts_new (
+  #{@table_definition}
+  )
   """
 
   @doc "Create the artifact registry schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- ensure_table_shape(db) do
+      :ok
+    end
+  end
 
   @doc "Record a deliberate artifact pointer for the authenticated calling session."
   @spec record(DB.server(), map()) :: map()
@@ -179,6 +199,95 @@ defmodule Tightbeam.Artifacts do
     :ok
   end
 
+  defp ensure_table_shape(db) do
+    {:ok, columns} = DB.query(db, "PRAGMA table_info(artifacts)")
+    {:ok, foreign_keys} = DB.query(db, "PRAGMA foreign_key_list(artifacts)")
+
+    {:ok, [[table_sql]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'"
+      )
+
+    if target_shape?(columns, foreign_keys, table_sql),
+      do: :ok,
+      else: rebuild_table(db)
+  end
+
+  defp target_shape?(columns, foreign_keys, table_sql) do
+    column_shape =
+      Map.new(columns, fn row ->
+        {Enum.at(row, 1), {Enum.at(row, 2), Enum.at(row, 3)}}
+      end)
+
+    expected_foreign_keys =
+      MapSet.new([
+        {"createdBySession", "sessions", "sessionKey"},
+        {"workItemId", "work_items", "id"},
+        {"parentSession", "sessions", "sessionKey"},
+        {"recordedMessageId", "messages", "id"}
+      ])
+
+    actual_foreign_keys =
+      MapSet.new(foreign_keys, fn row ->
+        {Enum.at(row, 3), Enum.at(row, 2), Enum.at(row, 4)}
+      end)
+
+    normalized_sql = String.replace(table_sql, ~r/\s+/, "")
+
+    column_shape["createdBySession"] == {"TEXT", 1} and
+      column_shape["workItemId"] == {"TEXT", 1} and
+      column_shape["parentSession"] == {"TEXT", 0} and
+      column_shape["recordedMessageId"] == {"TEXT", 1} and
+      actual_foreign_keys == expected_foreign_keys and
+      String.contains?(
+        normalized_sql,
+        "CHECK((state='archived')=(homeISNOTNULL))"
+      )
+  end
+
+  defp rebuild_table(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    try do
+      case DB.transaction(db, fn txn ->
+             Txn.exec(txn, @rebuild_ddl)
+
+             Txn.q(
+               txn,
+               """
+               INSERT INTO artifacts_new
+                 (artifactId, kind, title, description, createdBySession, workItemId,
+                  parentSession, originPath, contentSha256, recordedMessageId,
+                  state, home, createdAt, updatedAt)
+               SELECT
+                 artifactId, kind, title, description, createdBySession, workItemId,
+                 parentSession, originPath, contentSha256, recordedMessageId,
+                 state, home, createdAt, updatedAt
+               FROM artifacts
+               """
+             )
+
+             Txn.exec(txn, "DROP TABLE artifacts")
+             Txn.exec(txn, "ALTER TABLE artifacts_new RENAME TO artifacts")
+             Enum.each(@index_ddl, &Txn.exec(txn, &1))
+
+             case Txn.q(txn, "PRAGMA foreign_key_check(artifacts)") do
+               [] ->
+                 :ok
+
+               rows ->
+                 raise DB.Error, message: "artifact foreign key check failed: #{inspect(rows)}"
+             end
+           end) do
+        {:ok, :ok} -> :ok
+        {:error, error} -> {:error, error}
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+    end
+  end
+
   defp archive_workspace!(workspace_path, archive_root, session_key) do
     ensure_workspace_available!(workspace_path)
 
@@ -213,8 +322,12 @@ defmodule Tightbeam.Artifacts do
   end
 
   defp ensure_workspace_available!(workspace_path) do
-    unless is_binary(workspace_path) and File.dir?(workspace_path) do
-      raise ArgumentError, "workspace is unavailable for artifact archival"
+    case is_binary(workspace_path) && File.lstat(workspace_path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        :ok
+
+      _ ->
+        raise ArgumentError, "workspace is unavailable for artifact archival"
     end
   end
 
@@ -231,18 +344,51 @@ defmodule Tightbeam.Artifacts do
         do: Path.expand(origin_path),
         else: Path.expand(origin_path, expanded_workspace)
 
-    relative = Path.relative_to(absolute_origin, expanded_workspace)
+    canonical_workspace = canonical_path!(expanded_workspace)
+    canonical_origin = canonical_path!(absolute_origin)
+    relative = Path.relative_to(canonical_origin, canonical_workspace)
 
     if Path.type(relative) == :absolute or relative == ".." or
          String.starts_with?(relative, "../") do
       raise ArgumentError, "artifact origin is outside its session workspace"
     end
 
-    unless File.exists?(absolute_origin) do
-      raise ArgumentError, "artifact origin is missing from its session workspace"
-    end
-
     relative
+  end
+
+  defp canonical_path!(path, symlink_hops \\ 0)
+
+  defp canonical_path!(_path, symlink_hops) when symlink_hops > 40 do
+    raise ArgumentError, "artifact origin has too many symbolic links"
+  end
+
+  defp canonical_path!(path, symlink_hops) do
+    [root | components] = Path.expand(path) |> Path.split()
+    canonical_components!(root, components, symlink_hops)
+  end
+
+  defp canonical_components!(canonical, [], _symlink_hops), do: canonical
+
+  defp canonical_components!(canonical, [component | rest], symlink_hops) do
+    candidate = Path.join(canonical, component)
+
+    case File.lstat(candidate) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        target = File.read_link!(candidate)
+
+        target_path =
+          if Path.type(target) == :absolute,
+            do: target,
+            else: Path.expand(target, Path.dirname(candidate))
+
+        canonical_path!(Enum.reduce(rest, target_path, &Path.join(&2, &1)), symlink_hops + 1)
+
+      {:ok, _stat} ->
+        canonical_components!(candidate, rest, symlink_hops)
+
+      {:error, _reason} ->
+        raise ArgumentError, "artifact origin is missing from its session workspace"
+    end
   end
 
   defp parent_session(db, session_key) do
