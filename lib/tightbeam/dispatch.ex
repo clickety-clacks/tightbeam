@@ -56,7 +56,8 @@ defmodule Tightbeam.Dispatch do
   "verb" event. A raising handler is caught: "verb" event with the error,
   `{:error, %{code: "server_error", message: _}}` to the caller.
   """
-  @spec dispatch(GenServer.server(), handlers(), call()) :: {:ok, map()} | {:error, map()}
+  @spec dispatch(GenServer.server(), handlers(), call()) ::
+          {:ok, map()} | {:error, map()} | {:decision_pending, String.t()}
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
     verb = Map.fetch!(call, :verb)
     origin = Map.fetch!(call, :origin)
@@ -77,9 +78,15 @@ defmodule Tightbeam.Dispatch do
         best_effort_denial(db, verb, origin, principal, session_key, error)
         {:error, error}
 
-      {:escalate, _statute, ctx, _dr_id} ->
+      {:escalate, statute, ctx, dr_id} ->
+        outcome =
+          case dr_id do
+            nil -> Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
+            id -> {:decision_pending, id}
+          end
+
         best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
-        {:error, ctx.error}
+        outcome
 
       :allow ->
         consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1)})

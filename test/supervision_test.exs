@@ -8,6 +8,7 @@ defmodule Tightbeam.SupervisionTest do
     ConditionFacts,
     DB,
     Devices,
+    Escalation,
     EventLog,
     Gateway,
     Idempotency,
@@ -57,6 +58,7 @@ defmodule Tightbeam.SupervisionTest do
           Ledger,
           ConditionFacts,
           Wakes,
+          Escalation,
           Supervision,
           WorkState,
           Adjudication,
@@ -257,6 +259,48 @@ defmodule Tightbeam.SupervisionTest do
            ] = rail_sweep_details(ctx.db, "holder")
 
     assert Supervision.prod_state(ctx.db, "asg_1") == nil
+  end
+
+  test "turn-end escalation still opens and parks the same decision request", ctx do
+    write_rules(
+      ctx,
+      """
+      [[rule]]
+      name = "completion-needs-owner"
+      verb = "attest"
+      text = "owner approval required"
+      edges = ["verb", "turn-end"]
+      effect = "escalate"
+      deny_when = [
+        { fact = "attest.kind", op = "eq", value = "completion" }
+      ]
+      """
+    )
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:acted, :rail_escalate} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert {:ok, [[id, "open", park_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id, status, parkWakeId FROM decision_requests WHERE statuteName = 'completion-needs-owner'"
+             )
+
+    assert is_binary(id)
+    assert is_binary(park_wake_id)
+
+    assert %{condition_kind: "escalation-ruled", condition_scope: ^id} =
+             Wakes.get(ctx.db, park_wake_id)
+
+    assert [
+             %{
+               "decision" => "escalate-park",
+               "ref" => "asg_1",
+               "statute" => "completion-needs-owner"
+             }
+           ] = rail_sweep_details(ctx.db, "holder")
   end
 
   test "only a durable self-created continuation suppresses the turn-end remedy", ctx do

@@ -17,13 +17,24 @@ defmodule Tightbeam.RailScriptTest do
     :ok
   end
 
-  alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Org, Placement, RailScript, Rules}
+  alias Tightbeam.{
+    ConditionFacts,
+    DB,
+    Dispatch,
+    Escalation,
+    EventLog,
+    Org,
+    Placement,
+    RailScript,
+    Rules
+  }
 
   setup do
     db = :"rail_script_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Org.ensure_schema(db)
     :ok = EventLog.ensure_schema(db)
+    :ok = ConditionFacts.ensure_schema(db)
     :ok = Escalation.ensure_schema(db)
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
@@ -266,7 +277,7 @@ defmodule Tightbeam.RailScriptTest do
              Rules.decide(ctx.db, %{call() | origin: "agent:coder"})
   end
 
-  test "escalate effects are load-gated for predicate and script statutes", ctx do
+  test "escalate effects load cleanly for predicate and script statutes", ctx do
     predicate =
       """
       [[rule]]
@@ -278,14 +289,60 @@ defmodule Tightbeam.RailScriptTest do
       """
 
     for contents <- [predicate, statute("rail-pass", %{"pass" => "escalate"})] do
-      path = put_statute(ctx, contents)
-      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"], %{}) end
-      assert error.message =~ path
-      assert error.message =~ "rule"
+      put_statute(ctx, contents)
+      assert [loaded] = Rules.load!(ctx.base_dir, ["post"], %{})
 
-      assert error.message =~
-               "effect escalate requires the escalation actor wiring (not yet wired)"
+      assert loaded.effect == "escalate" or
+               "escalate" in Map.values(loaded.check.effects)
     end
+  end
+
+  test "verb-edge escalation opens once, returns pending, and consumes an allow ruling", ctx do
+    parent = self()
+
+    escalated_call = %{
+      call()
+      | origin: "agent:rail-holder",
+        principal: {:session, ctx.holder.session_key}
+    }
+
+    handlers = %{
+      "post" => fn _call ->
+        send(parent, :handler_ran)
+        %{ok: true}
+      end
+    }
+
+    put_statute(ctx, statute("rail-pass", %{"pass" => "escalate"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+
+    assert {:decision_pending, id} = Dispatch.dispatch(ctx.db, handlers, escalated_call)
+    refute_received :handler_ran
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status = 'open'")
+
+    assert {:decision_pending, ^id} = Dispatch.dispatch(ctx.db, handlers, escalated_call)
+    refute_received :handler_ran
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+
+    assert %{status: "ruled"} =
+             Escalation.rule(
+               ctx.db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{request_id: id, decision: "allow"}
+               },
+               authorized: true
+             )
+
+    assert {:ok, %{ok: true}} = Dispatch.dispatch(ctx.db, handlers, escalated_call)
+    assert_received :handler_ran
+
+    assert {:ok, [["consumed"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
   end
 
   test "decide is dry and evaluate preserves its collapsing legacy contract", ctx do

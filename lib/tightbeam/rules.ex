@@ -242,9 +242,6 @@ defmodule Tightbeam.Rules do
     if remedy && "remedy" not in effects,
       do: fail.("[rule.remedy] requires a remedy effect")
 
-    if "escalate" in effects,
-      do: fail.("effect escalate requires the escalation actor wiring (not yet wired)")
-
     external_producer = Map.get(rule, "external_producer", false)
     unless is_boolean(external_producer), do: fail.("external_producer must be a boolean")
 
