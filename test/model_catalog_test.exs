@@ -54,17 +54,17 @@ defmodule Tightbeam.ModelCatalogTest do
     {codex, :fresh} = ModelCatalog.get("codex", catalog)
 
     assert Enum.map(claude, & &1.ref) == [
-             "claude-opus-4-8[low]",
-             "claude-opus-4-8[medium]",
              "claude-opus-4-8[high]",
+             "claude-opus-4-8[low]",
              "claude-opus-4-8[max]",
+             "claude-opus-4-8[medium]",
              "claude-haiku-4-5"
            ]
 
-    opus = hd(claude)
+    opus = Enum.find(claude, &(&1.ref == "claude-opus-4-8[low]"))
     assert opus.display_name == "Claude Opus 4.8"
     assert opus.max_input_tokens == 1_000_000
-    assert opus.efforts == ["low", "medium", "high", "max"]
+    assert opus.efforts == ["high", "low", "max", "medium"]
 
     assert Enum.map(codex, & &1.ref) == [
              "gpt-5.6-sol[low]",
@@ -79,7 +79,7 @@ defmodule Tightbeam.ModelCatalogTest do
     refute Enum.any?(claude ++ codex, &String.contains?(&1.ref, "[1m]"))
   end
 
-  test "claude efforts sort by ascending tier rank, unknown tiers after max", ctx do
+  test "claude preserves every provider capability without imposing a tier allowlist", ctx do
     claude_json =
       JSON.encode!(%{
         data: [
@@ -109,17 +109,16 @@ defmodule Tightbeam.ModelCatalogTest do
     {claude, :fresh} = ModelCatalog.get("claude", catalog)
 
     assert Enum.map(claude, & &1.ref) == [
-             "claude-sort-test[low]",
-             "claude-sort-test[medium]",
              "claude-sort-test[high]",
-             "claude-sort-test[xhigh]",
+             "claude-sort-test[low]",
              "claude-sort-test[max]",
-             "claude-sort-test[ultra]"
+             "claude-sort-test[medium]",
+             "claude-sort-test[ultra]",
+             "claude-sort-test[xhigh]"
            ]
   end
 
-  test "codex efforts sort by ascending tier rank, unknown tiers after max preserving catalog order",
-       ctx do
+  test "codex preserves provider-reported effort order without tier presentation logic", ctx do
     codex_json =
       JSON.encode!(%{
         models: [
@@ -147,14 +146,66 @@ defmodule Tightbeam.ModelCatalogTest do
     {codex, :fresh} = ModelCatalog.get("codex", catalog)
 
     assert Enum.map(codex, & &1.ref) == [
-             "gpt-sort-test[low]",
-             "gpt-sort-test[medium]",
-             "gpt-sort-test[high]",
+             "gpt-sort-test[mega]",
              "gpt-sort-test[xhigh]",
              "gpt-sort-test[max]",
-             "gpt-sort-test[mega]",
-             "gpt-sort-test[ultra]"
+             "gpt-sort-test[low]",
+             "gpt-sort-test[ultra]",
+             "gpt-sort-test[high]",
+             "gpt-sort-test[medium]"
            ]
+  end
+
+  test "mixed valid and unexpectedly shaped rows degrade atomically", ctx do
+    for {harness, overrides} <- [
+          {"claude",
+           [
+             claude_fetch: fn
+               "/v1/models?limit=100", _headers ->
+                 {:ok,
+                  JSON.encode!(%{
+                    data: [
+                      %{
+                        id: "claude-valid",
+                        display_name: "Claude Valid",
+                        max_input_tokens: 200_000,
+                        capabilities: %{effort: %{}}
+                      },
+                      %{
+                        display_name: "Missing ID",
+                        max_input_tokens: 200_000,
+                        capabilities: %{effort: %{}}
+                      }
+                    ]
+                  })}
+             end
+           ]},
+          {"codex",
+           [
+             codex_read: fn _path ->
+               {:ok,
+                JSON.encode!(%{
+                  models: [
+                    %{
+                      slug: "gpt-valid",
+                      display_name: "GPT Valid",
+                      supported_reasoning_levels: []
+                    },
+                    %{
+                      display_name: "Missing Slug",
+                      supported_reasoning_levels: []
+                    }
+                  ]
+                })}
+             end
+           ]}
+        ] do
+      catalog = start_catalog(ctx, overrides)
+
+      await(fn ->
+        ModelCatalog.get(harness, catalog) == {[], {:unavailable, :malformed_catalog}}
+      end)
+    end
   end
 
   test "membership carries fresh, stale, and unavailable health", ctx do

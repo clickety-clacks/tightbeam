@@ -11,7 +11,6 @@ defmodule Tightbeam.ModelCatalog do
 
   @default_ttl_ms :timer.minutes(15)
   @harnesses ["claude", "codex"]
-  @effort_rank %{"low" => 0, "medium" => 1, "high" => 2, "xhigh" => 3, "max" => 4}
 
   @type health :: :fresh | :stale | {:unavailable, term()}
   @type entry :: %{
@@ -165,7 +164,8 @@ defmodule Tightbeam.ModelCatalog do
          {:ok, body} <- state.claude_fetch.("/v1/models?limit=100", headers),
          {:ok, models} <- decode_models(body),
          {:ok, models} <- fill_claude_capabilities(models, headers, state.claude_fetch),
-         entries when entries != [] <- derive_claude_entries(models) do
+         {:ok, entries} <- derive_claude_entries(models),
+         entries when entries != [] <- entries do
       {:ok, entries}
     else
       {:error, reason} -> {:error, reason}
@@ -180,7 +180,8 @@ defmodule Tightbeam.ModelCatalog do
 
     with {:ok, body} <- state.codex_read.(path),
          {:ok, models} <- decode_models(body),
-         entries when entries != [] <- derive_codex_entries(models) do
+         {:ok, entries} <- derive_codex_entries(models),
+         entries when entries != [] <- entries do
       {:ok, entries}
     else
       {:error, :enoent} -> {:error, :missing_cache}
@@ -239,47 +240,78 @@ defmodule Tightbeam.ModelCatalog do
   end
 
   defp derive_claude_entries(models) do
-    Enum.flat_map(models, fn
-      %{"id" => id} = model when is_binary(id) ->
-        capabilities = model["capabilities"] || %{}
+    Enum.reduce_while(models, {:ok, []}, fn
+      %{
+        "id" => id,
+        "display_name" => display_name,
+        "capabilities" => capabilities
+      } = model,
+      {:ok, entries}
+      when is_binary(id) and is_binary(display_name) and is_map(capabilities) ->
+        max_input_tokens = model["max_input_tokens"]
 
-        efforts =
-          capabilities
-          |> Map.get("effort", %{})
-          |> Enum.filter(fn {_effort, detail} ->
-            is_map(detail) and detail["supported"] == true
-          end)
-          |> Enum.map(&elem(&1, 0))
-          |> sort_efforts()
+        if is_nil(max_input_tokens) or
+             (is_integer(max_input_tokens) and max_input_tokens >= 0) do
+          case claude_efforts(capabilities) do
+            {:ok, efforts} ->
+              {:cont, {:ok, entries ++ entries_for(model, id, efforts, capabilities)}}
 
-        entries_for(model, id, efforts, capabilities)
+            :error ->
+              {:halt, {:error, :malformed_catalog}}
+          end
+        else
+          {:halt, {:error, :malformed_catalog}}
+        end
 
-      _ ->
-        []
+      _, _ ->
+        {:halt, {:error, :malformed_catalog}}
     end)
   end
 
   defp derive_codex_entries(models) do
-    Enum.flat_map(models, fn
-      %{"slug" => slug} = model when is_binary(slug) ->
+    Enum.reduce_while(models, {:ok, []}, fn
+      %{"slug" => slug, "display_name" => display_name} = model, {:ok, entries}
+      when is_binary(slug) and is_binary(display_name) ->
         levels = model["supported_reasoning_levels"] || []
+        capabilities = model["capabilities"] || %{}
+        max_input_tokens = model["max_input_tokens"] || model["context_window"]
 
-        efforts =
-          for(%{"effort" => effort} <- levels, is_binary(effort), do: effort)
-          |> sort_efforts()
+        if is_list(levels) and is_map(capabilities) and
+             (is_nil(max_input_tokens) or
+                (is_integer(max_input_tokens) and max_input_tokens >= 0)) and
+             Enum.all?(levels, &match?(%{"effort" => effort} when is_binary(effort), &1)) do
+          efforts = Enum.map(levels, & &1["effort"])
+          capabilities = Map.put(capabilities, "supported_reasoning_levels", levels)
+          {:cont, {:ok, entries ++ entries_for(model, slug, efforts, capabilities)}}
+        else
+          {:halt, {:error, :malformed_catalog}}
+        end
 
-        capabilities =
-          Map.put(model["capabilities"] || %{}, "supported_reasoning_levels", levels)
-
-        entries_for(model, slug, efforts, capabilities)
-
-      _ ->
-        []
+      _, _ ->
+        {:halt, {:error, :malformed_catalog}}
     end)
   end
 
-  defp sort_efforts(efforts) do
-    Enum.sort_by(efforts, &Map.get(@effort_rank, &1, map_size(@effort_rank)))
+  defp claude_efforts(capabilities) do
+    effort_capabilities = Map.get(capabilities, "effort", %{})
+
+    if is_map(effort_capabilities) and
+         Enum.all?(effort_capabilities, fn
+           {effort, %{"supported" => supported}}
+           when is_binary(effort) and is_boolean(supported) ->
+             true
+
+           _ ->
+             false
+         end) do
+      {:ok,
+       for(
+         {effort, %{"supported" => true}} <- effort_capabilities,
+         do: effort
+       )}
+    else
+      :error
+    end
   end
 
   defp entries_for(model, id, efforts, capabilities) do
