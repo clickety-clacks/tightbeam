@@ -108,6 +108,59 @@ defmodule Tightbeam.RailRemedyTest do
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
   end
 
+  test "remedy producer assign traverses dispatch and is denied by a script statute", ctx do
+    assignment = assignment(ctx, "script-gated-producer")
+    install_script_assign_gate!(ctx)
+    put_rules(ctx, review_gate() <> script_assign_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+
+    assert {:error,
+            %{
+              reason: "remedy_fired",
+              producer: nil,
+              rule: "completion-needs-review"
+            }} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id) == nil
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignments WHERE reviewsAssignmentId = ?1",
+               [assignment.id]
+             )
+
+    assert %{
+             rule: "script-block-remedy-assign",
+             edge: "verb",
+             reason: "rule_denied",
+             script_exit_class: "returned",
+             origin: "remedy:completion-needs-review",
+             principal: "remedy:assign:completion-needs-review"
+           } =
+             Enum.find(
+               EventLog.rail_denials(ctx.db, 0, 10),
+               &(&1.rule == "script-block-remedy-assign")
+             )
+
+    assert %{
+             "verb" => "assign",
+             "origin" => "remedy:completion-needs-review",
+             "return" => "block",
+             "exit_class" => "returned"
+           } =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.find(
+               &(&1.kind == "rail_script" and &1.subject == "script-block-remedy-assign")
+             )
+             |> Map.fetch!(:detail)
+             |> JSON.decode!()
+
+    assert [%{"outcome" => "blocked", "producer_id" => nil}] = remedy_events(ctx.db)
+  end
+
   test "TTL reclaim racing a live original dispatch produces exactly one external effect", ctx do
     assignment = assignment(ctx, "ttl")
     load_review_gate(ctx)
@@ -621,6 +674,56 @@ defmodule Tightbeam.RailRemedyTest do
     subject = "review {assignment_id}"
     reviews = "{assignment_id}"
     """
+  end
+
+  defp script_assign_gate do
+    """
+
+    [[rule]]
+    name = "script-block-remedy-assign"
+    verb = "assign"
+    text = "script blocks remedy assignment"
+    [rule.check]
+    script = "block-remedy-assign"
+    returns = ["block"]
+    [rule.check.effects]
+    block = "deny"
+    """
+  end
+
+  defp install_script_assign_gate!(ctx) do
+    scripts = Path.join([ctx.base_dir, "identity", "rails", "scripts"])
+    bin = Path.join(ctx.base_dir, "bin")
+    File.mkdir_p!(scripts)
+    File.mkdir_p!(bin)
+
+    script = Path.join(scripts, "block-remedy-assign")
+
+    File.write!(
+      script,
+      """
+      #!/bin/sh
+      IFS= read -r input
+      case "$input" in
+        *'"verb":"assign"'*) ;;
+        *) exit 7 ;;
+      esac
+      case "$input" in
+        *'"origin":"remedy:completion-needs-review"'*) ;;
+        *) exit 8 ;;
+      esac
+      case "$input" in
+        *'"principal":"remedy:assign:completion-needs-review"'*) printf block ;;
+        *) exit 9 ;;
+      esac
+      """
+    )
+
+    File.chmod!(script, 0o755)
+
+    wrapper = Path.join(bin, "tightbeam")
+    File.cp!(Path.expand("fixtures/rail_exec/tightbeam", __DIR__), wrapper)
+    File.chmod!(wrapper, 0o755)
   end
 
   defp produced_gate do
