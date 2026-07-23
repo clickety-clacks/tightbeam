@@ -1,0 +1,16 @@
+name = "default"
+where = ["eezo", "tars", "racter"]
+skills = ["tightbeam-dispatching", "tightbeam-onboarding", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+
+[guidance]
+text = """
+#include "wisdom.md"
+
+#include "preferred-models.md"
+
+#include "network-map.md"
+
+#include "tentpoles.md"
+
+#include "default.md"
+"""
