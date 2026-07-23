@@ -174,6 +174,14 @@ defmodule Tightbeam.Rules do
     |> decide_rules(db, call, %{}, [], [])
   end
 
+  @doc false
+  @spec active_identity_manifest_sha() :: String.t() | nil
+  def active_identity_manifest_sha do
+    @persist_key
+    |> :persistent_term.get([])
+    |> Enum.find_value(& &1.identity_manifest_sha)
+  end
+
   defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
 
@@ -1057,7 +1065,7 @@ defmodule Tightbeam.Rules do
       case {call.verb, Map.get(call.params, :files)} do
         {"assign", files} when is_list(files) and files != [] ->
           if Enum.all?(files, fn path ->
-               is_binary(path) and String.trim(path) != "" and byte_size(path) <= 2_000
+               is_binary(path) and String.length(String.trim(path)) in 1..2_000
              end) do
             Assignments.open_assignments_touching(db, Enum.uniq(files)) != []
           else
