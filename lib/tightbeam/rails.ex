@@ -22,32 +22,31 @@ defmodule Tightbeam.Rails do
   adversarial containment belongs to sandboxes and credentials. Gates stop
   mistakes deterministically.
 
-  Codex hooks (`hooks.json`, since 0.124.0) enforce ONLY under `codex exec`. They
-  are INERT under `codex app-server` — the surface codex-acp drives — established
-  empirically 2026-07-22 against a real codex-acp adapter boot: ZERO hooks fire
-  (not PreToolUse, not SessionStart), independent of hook-trust bypass
-  (`--dangerously-bypass-hook-trust` is honored by `exec` only) and independent of
-  matcher; the app-server shell command runs through a `terminal`/`unified_exec`
-  tool the hook layer never sees. So the codex gate does not run under the adapter
-  and never has — there is no known-good version. Claude rails are unaffected
-  (claude enforces `settings.json` hooks natively).
+  Codex hooks (`hooks.json`) run under BOTH `codex exec` and `codex app-server`
+  through the same core engine; the only gate is TRUST — codex arms a hook handler
+  only if it is trusted or `bypass_hook_trust` is set (discovery filters untrusted
+  handlers silently). `bypass_hook_trust` is a thread/start REQUEST override only:
+  it is not a config.toml key, and `--dangerously-bypass-hook-trust` is honored by
+  `exec` only (a no-op for the app-server subcommand). Verified at rust-v0.145.0
+  (permission-seam-spike.md, final reversal): PreToolUse fires for both the shell
+  and `unified_exec` tools (tool name "Bash", full command text), and the deny
+  protocol actually blocks execution. An earlier "hooks are inert under app-server"
+  conclusion came from a polluted 0.144.x test (bundled un-pinned binary +
+  untrusted hook state); it is refuted. Claude rails are unaffected (claude
+  enforces `settings.json` hooks natively).
 
-  What this module's codex path therefore does, and does not do:
-  - It PINS the codex binary. codex-acp's app-server runs a BUNDLED codex unless
-    `CODEX_PATH` names an executable, so placement projects a `codex` shim into the
-    home's bin dir and sets `CODEX_PATH` to it — codex-acp then runs the operator's
-    system codex, not a bundled copy of a drifting version. Binary-pinning is
-    doctrine independent of hooks: never inherit a bundler's default harness binary.
-  - The shim also passes `--dangerously-bypass-hook-trust` for the exec path; it is
-    a harmless no-op under app-server.
-  - The dead `CODEX_CONFIG={"bypass_hook_trust":true}` 0.144.x seed is REMOVED.
-  - The boot wiring-check still runs and codex still fails it (hooks inert): codex
-    enforcement is being moved to the SUBSTRATE — assignment-as-capability + verb
-    rails (accountability constitution §6), harness-independent — and a pending
-    hooks-inert harness declaration will let the adapter skip the unpassable
-    wiring-check for so-declared harnesses and instead stamp each session with a
-    visible "harness hooks: inert" fact (total emission). Those two pieces are a
-    separate lane; THIS module only pins the binary and removes the dead seed.
+  What this module's codex path therefore relies on:
+  - Binary PINNING. codex-acp's app-server runs a BUNDLED codex unless `CODEX_PATH`
+    names an executable, so placement projects a `codex` shim into the home's bin
+    dir and sets `CODEX_PATH` to it — codex-acp then runs the operator's system
+    codex, not a bundled copy of a drifting version. Binary-pinning is doctrine
+    independent of hooks: never inherit a bundler's default harness binary.
+  - The TRUST-BYPASS SEED. Placement sets `CODEX_CONFIG={"bypass_hook_trust":true}`
+    on the codex adapter when statutes are loaded; codex-acp spreads that JSON into
+    every thread/start config map, which arms the home's untrusted hooks.json.
+  - The boot wiring-check runs the gate probe and fails closed if hooks do not
+    demonstrably fire — the standing defense against the next silent harness
+    behavior change (re-probe per version; harness CLIs auto-update under us).
 
   Rails-tier denial (where it runs, i.e. claude and codex exec) is for a
   cooperative agent — not a sandbox or tamper-proof; malicious/config-hostile

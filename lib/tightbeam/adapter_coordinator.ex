@@ -84,6 +84,16 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, :health)
   end
 
+  @doc "Best-effort planned teardown of the currently running adapter for `key`."
+  @spec close_adapter(GenServer.server(), adapter_key()) :: :ok
+  def close_adapter(server \\ __MODULE__, key) do
+    GenServer.call(server, {:close_adapter, key})
+  rescue
+    _reason -> :ok
+  catch
+    :exit, _reason -> :ok
+  end
+
   @impl true
   def init(opts) do
     {:ok,
@@ -143,6 +153,34 @@ defmodule Tightbeam.AdapterCoordinator do
       end)
 
     {:reply, health, state}
+  end
+
+  def handle_call({:close_adapter, key}, _from, state) do
+    case state.adapters[key] do
+      %{pid: pid, monitor: ref} = entry when is_pid(pid) ->
+        Process.demonitor(ref, [:flush])
+
+        try do
+          conn = Tightbeam.Acp.Adapter.conn(pid)
+          Tightbeam.Acp.Conn.close(conn)
+          GenServer.stop(conn)
+          GenServer.stop(pid)
+        catch
+          :exit, _reason -> :ok
+        end
+
+        entry = %{entry | pid: nil, monitor: nil}
+
+        {:reply, :ok,
+         %{
+           state
+           | adapters: Map.put(state.adapters, key, entry),
+             monitors: Map.delete(state.monitors, ref)
+         }}
+
+      _ ->
+        {:reply, :ok, state}
+    end
   end
 
   @impl true
@@ -258,6 +296,7 @@ defmodule Tightbeam.AdapterCoordinator do
         failures = entry.failures + 1
         circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
+
         timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(state, failures))
 
         entry = %{
