@@ -11,4 +11,5 @@ name = "satisfied-obligation-no-sweep"
 verb = "attest"
 text = "a satisfied obligation has no sweep action"
 edges = ["turn-end"]
+external_producer = true
 deny_when = [{ fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }]

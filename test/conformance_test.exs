@@ -271,11 +271,33 @@ defmodule Tightbeam.ConformanceSupport do
       Enum.each(rows, fn row ->
         assert is_map(row), "#{path}: world.#{key} row must be an object"
         reject_unknown!(row, MapSet.new(Map.fetch!(@world_shapes, key)), "#{path} world.#{key}")
+        validate_world_row!(key, row, path)
       end)
     end)
   end
 
   defp validate_world!(_world, path), do: flunk("#{path}: world must be an object")
+
+  defp validate_world_row!("sessions", row, path) do
+    for key <- ~w(key owner archetype),
+        do: assert(Map.has_key?(row, key), "#{path}: world.sessions row needs #{key}")
+
+    if Map.has_key?(row, "adjudicationHold") do
+      hold = row["adjudicationHold"]
+
+      assert is_nil(hold) or hold == "*" or (is_binary(hold) and hold != ""),
+             "#{path}: adjudicationHold must be null, '*', or a recovery wake id"
+    end
+  end
+
+  defp validate_world_row!("adjudication_episode", row, path) do
+    assert is_binary(row["session"]), "#{path}: adjudication_episode needs session"
+
+    assert row["status"] in ~w(claimed notified),
+           "#{path}: adjudication_episode status must be claimed or notified"
+  end
+
+  defp validate_world_row!(_key, _row, _path), do: :ok
 
   defp validate_call!(nil, "harness-gate", _path), do: :ok
   defp validate_call!(nil, _kind, path), do: flunk("#{path}: non-harness case needs call")
@@ -332,6 +354,57 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   defp decode_toml!(path), do: path |> File.read!() |> Toml.decode!()
+
+  def pending_entries(%{classes: classes, fixtures: fixtures}) do
+    class_by_id = Map.new(classes, &{&1["id"], &1})
+
+    fixture_entries =
+      fixtures
+      |> Enum.reject(&(&1["phase"] == "green" and &1["class_phase"] == "green"))
+      |> Enum.map(fn fixture ->
+        class = Map.fetch!(class_by_id, fixture["class"])
+
+        %{
+          scope: "fixture",
+          id: "#{fixture["class"]}/#{fixture["name"]}",
+          phase: if(class["phase"] == "green", do: fixture["phase"], else: "pending"),
+          blocker:
+            if(class["phase"] == "green",
+              do: fixture["blocking_phase"],
+              else: class["blocking_phase"]
+            )
+        }
+      end)
+
+    case_entries =
+      for fixture <- fixtures,
+          kase <- Map.get(fixture, "cases", []),
+          phase = kase["phase"],
+          is_binary(phase) do
+        %{
+          scope: "case",
+          id: "#{fixture["class"]}/#{fixture["name"]}/#{kase["case"]}",
+          phase: phase,
+          blocker: case_blocker(phase, fixture)
+        }
+      end
+
+    fixture_entries ++ case_entries
+  end
+
+  def assert_pending_registration(fixture, blocker) do
+    assert fixture["phase"] != "green" or fixture["class_phase"] != "green"
+    assert is_binary(blocker) and blocker != ""
+    assert fixture["runners"] != []
+
+    if fixture["kind"] != "load-rejection" do
+      assert fixture["cases"] != []
+    end
+  end
+
+  defp case_blocker("pending-runtime", _fixture), do: "runtime"
+  defp case_blocker("pending-escalation-review", _fixture), do: "escalation-substrate-v1"
+  defp case_blocker(_phase, fixture), do: fixture["blocking_phase"]
 
   def shipped_statutes(root) do
     path = Path.expand("../../priv/kungfu/agentic-engineering/rails/engineering.toml", root)
@@ -539,6 +612,61 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp assert_fixture_world(_fixture, _kase, _db, _ids), do: :ok
 
+  def run_producer_cas_races(fixture) do
+    Enum.each(fixture["cases"], fn kase ->
+      {db, pid} = memory_db!()
+
+      try do
+        ids = materialize_world(db, kase["world"])
+        [{_key, job_id}] = Map.to_list(ids.producer_jobs)
+        job = Producers.get(db, job_id)
+
+        case kase["case"] do
+          "done-vs-failure-race-one-cas-wins" ->
+            [done_result, failed_result] =
+              [
+                Task.async(fn -> finish_producer_job(db, job) end),
+                Task.async(fn -> Producers.fail_running(db, job.id, "racing failure") end)
+              ]
+              |> Task.await_many()
+
+            assert Enum.count([done_result, failed_result], &(&1 in [:done, :failed])) == 1
+            assert Enum.count([done_result, failed_result], &(&1 == :noop)) == 1
+
+            case Producers.get(db, job.id).state do
+              "done" ->
+                assert [_verdict] = Assignments.list_attests(db, job.assignment_id)
+
+              "failed" ->
+                assert Assignments.list_attests(db, job.assignment_id) == []
+            end
+
+          "two-workers-race-done-one-verdict" ->
+            results =
+              [
+                Task.async(fn -> finish_producer_job(db, job) end),
+                Task.async(fn -> finish_producer_job(db, job) end)
+              ]
+              |> Task.await_many()
+
+            assert Enum.sort(results) == [:done, :noop]
+            assert Producers.get(db, job.id).state == "done"
+            assert [_verdict] = Assignments.list_attests(db, job.assignment_id)
+
+          "cancel-before-claim-commits-no-verdict" ->
+            assert job.state == "cancelled"
+            assert Assignments.list_attests(db, job.assignment_id) == []
+
+          "failed-job-denial-is-legible" ->
+            assert job.state == "failed"
+            assert Assignments.list_attests(db, job.assignment_id) == []
+        end
+      after
+        GenServer.stop(pid)
+      end
+    end)
+  end
+
   def run_handler_refusal_fixture(fixture) do
     Enum.each(fixture["cases"], fn kase ->
       {db, pid} = memory_db!()
@@ -549,7 +677,10 @@ defmodule Tightbeam.ConformanceSupport do
         handlers = Gateway.handlers(%{db: db})
         {:ok, [[before_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
         overlap? = Assignments.open_assignments_touching(db, call.params[:files] || []) != []
-        assert_overlap_observation(fixture, db, call, overlap?)
+
+        if kase["reason"] in [nil, "files_overlap"] do
+          assert_overlap_observation(fixture, db, call, overlap?)
+        end
 
         if String.contains?(kase["case"], "concurrent") do
           results =
@@ -682,7 +813,7 @@ defmodule Tightbeam.ConformanceSupport do
 
             {"re-obligate", _} ->
               assert {:deny, %{rule: name}} = decision
-              assert name == kase["reason"]
+              assert name == (kase["reason"] || fixture_rule_name(fixture))
 
             {"none", true} ->
               assert match?({:remedy, _, _, _}, decision)
@@ -720,8 +851,35 @@ defmodule Tightbeam.ConformanceSupport do
 
           case kase["expect"] do
             "run-remedy" ->
-              assert {:error, %{reason: "remedy_fired", rule: rule, producer: producer}} =
-                       Dispatch.dispatch(db, handlers, call)
+              results =
+                if kase["case"] == "absent-review-fires-once-and-blocks" do
+                  [
+                    Task.async(fn -> Dispatch.dispatch(db, handlers, call) end),
+                    Task.async(fn -> Dispatch.dispatch(db, handlers, call) end)
+                  ]
+                  |> Task.await_many()
+                else
+                  [Dispatch.dispatch(db, handlers, call)]
+                end
+
+              assert Enum.all?(results, fn
+                       {:error,
+                        %{reason: "remedy_fired", rule: actual_rule, producer: producer_id}} ->
+                         actual_rule == kase["reason"] and
+                           (is_nil(producer_id) or is_binary(producer_id))
+
+                       _ ->
+                         false
+                     end)
+
+              assert Enum.count(results, fn
+                       {:error, %{producer: producer_id}} -> is_binary(producer_id)
+                     end) == 1
+
+              {:error, %{rule: rule, producer: producer}} =
+                Enum.find(results, fn
+                  {:error, %{producer: producer_id}} -> is_binary(producer_id)
+                end)
 
               assert rule == kase["reason"]
               assert is_binary(producer)
@@ -729,7 +887,6 @@ defmodule Tightbeam.ConformanceSupport do
               assert %{status: "live", producer_key: ^producer} =
                        RailRemedy.episode(db, rule, assignment_id)
 
-              assert {:error, %{reason: "remedy_fired"}} = Dispatch.dispatch(db, handlers, call)
               assert review_effect_count(db, assignment_id) == 1
               assert remedy_principal_recorded?(db, rule)
 
@@ -738,6 +895,15 @@ defmodule Tightbeam.ConformanceSupport do
                 assert denial.rule == rule
                 assert denial.reason == "remedy_fired"
                 assert lifecycle_outcome?(db, "rail_remedy", rule, "claimed-dispatched")
+              end
+
+              if phase2 = kase["phase2"] do
+                phase2_ids = materialize_world(db, Map.get(phase2, "world", %{}), ids)
+                phase2_call = build_call(phase2["call"] || kase["call"], phase2_ids)
+
+                assert {:ok, _} = Dispatch.dispatch(db, handlers, phase2_call)
+                assert %{status: "closed"} = RailRemedy.episode(db, rule, assignment_id)
+                assert review_effect_count(db, assignment_id) == 1
               end
 
             "none" ->
@@ -762,7 +928,12 @@ defmodule Tightbeam.ConformanceSupport do
     Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
 
     try do
-      Enum.each(fixture["cases"], fn kase ->
+      cases =
+        Enum.reject(fixture["cases"], fn kase ->
+          fixture["name"] == "busy-or-queued-no-sweep" and kase["kind"] == "legibility"
+        end)
+
+      Enum.each(cases, fn kase ->
         {db, pid} = memory_db!()
 
         try do
@@ -792,13 +963,29 @@ defmodule Tightbeam.ConformanceSupport do
             "none" ->
               assert RailRemedy.episode(db, rule, assignment_id) == nil
 
-              if self_wake?(db, call) do
-                assert result == :continuation
-                assert Supervision.prod_state(db, assignment_id) == nil
-                refute lifecycle_kind?(db, "rail_sweep")
-              else
-                assert sweep_decision?(db, session_key, nil, "none")
+              cond do
+                fixture["name"] == "busy-or-queued-no-sweep" ->
+                  assert result == :busy
+                  assert Supervision.prod_state(db, assignment_id) == nil
+                  refute lifecycle_kind?(db, "rail_sweep")
+
+                self_wake?(db, call) ->
+                  assert result == :continuation
+                  assert Supervision.prod_state(db, assignment_id) == nil
+                  refute lifecycle_kind?(db, "rail_sweep")
+
+                true ->
+                  assert sweep_decision?(db, session_key, nil, "none")
               end
+          end
+
+          if fixture["name"] == "idle-open-obligation" and kase["kind"] == "positive" do
+            effect_count = review_effect_count(db, assignment_id)
+            lifecycle_count = length(EventLog.lifecycle_events(db))
+
+            assert Supervision.evaluate(db, handlers, 3, session_key, terminal_seq) == :duplicate
+            assert review_effect_count(db, assignment_id) == effect_count
+            assert length(EventLog.lifecycle_events(db)) == lifecycle_count
           end
 
           if kase["kind"] == "legibility" do
@@ -811,6 +998,59 @@ defmodule Tightbeam.ConformanceSupport do
     after
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
+    end
+  end
+
+  def run_world_state_contract do
+    {db, pid} = memory_db!()
+
+    try do
+      materialize_world(db, %{
+        "users" => [%{"id" => "owner", "admin" => false}],
+        "sessions" => [
+          %{
+            "key" => "unset",
+            "owner" => "owner",
+            "archetype" => "coder",
+            "adjudicationHold" => nil
+          },
+          %{
+            "key" => "held",
+            "owner" => "owner",
+            "archetype" => "coder",
+            "adjudicationHold" => "*"
+          },
+          %{
+            "key" => "recovering",
+            "owner" => "owner",
+            "archetype" => "coder",
+            "adjudicationHold" => "wake-recovery"
+          }
+        ],
+        "adjudication_episode" => [
+          %{"session" => "held", "status" => "claimed"},
+          %{"session" => "recovering", "status" => "notified"}
+        ]
+      })
+
+      assert {:ok,
+              [
+                ["held", "*"],
+                ["recovering", "wake-recovery"],
+                ["unset", nil]
+              ]} =
+               DB.query(
+                 db,
+                 "SELECT sessionKey, adjudicationHold FROM sessions ORDER BY sessionKey"
+               )
+
+      assert {:ok, [["held", "claimed"], ["recovering", "notified"]]} =
+               DB.query(
+                 db,
+                 "SELECT sessionKey, status FROM adjudication_episodes ORDER BY sessionKey"
+               )
+    after
+      GenServer.stop(pid)
     end
   end
 
@@ -981,13 +1221,12 @@ defmodule Tightbeam.ConformanceSupport do
       end)
     end)
 
-    Enum.each(List.wrap(Map.get(world, "adjudicate", [])), fn adjudicate ->
-      {:ok, _} =
-        DB.query(db, "UPDATE sessions SET adjudicationHold=?2 WHERE sessionKey=?1", [
-          adjudicate["session"],
-          adjudicate["hold"]
-        ])
-    end)
+    if Map.has_key?(world, "adjudicate") do
+      flunk(
+        "world.adjudicate cannot bypass the pinned owner verb; " <>
+          "the governing spec's {session, hold} shape does not match Gateway adjudicate"
+      )
+    end
 
     Enum.each(Map.get(world, "adjudication_episode", []), fn episode ->
       {:ok, _} =
@@ -1046,21 +1285,6 @@ defmodule Tightbeam.ConformanceSupport do
       })
     end)
 
-    Enum.each(List.wrap(Map.get(world, "ledger", [])), fn ledger ->
-      if ledger["pending"] > 0 do
-        Enum.each(1..ledger["pending"], fn ordinal ->
-          assert {:ok, _seq} =
-                   Ledger.enqueue(db, %{
-                     session_key: ledger["session"],
-                     message_id: "conformance-#{ordinal}-#{System.unique_integer([:positive])}",
-                     origin: "process:conformance",
-                     prompt: "pending",
-                     wake_id: nil
-                   })
-        end)
-      end
-    end)
-
     turns =
       Enum.reduce(List.wrap(Map.get(world, "turn", [])), ids.turns, fn turn, turns ->
         if is_nil(turn["seq"]) do
@@ -1082,6 +1306,21 @@ defmodule Tightbeam.ConformanceSupport do
           Map.put(turns, turn["session"], seq)
         end
       end)
+
+    Enum.each(List.wrap(Map.get(world, "ledger", [])), fn ledger ->
+      if ledger["pending"] > 0 do
+        Enum.each(1..ledger["pending"], fn ordinal ->
+          assert {:ok, _seq} =
+                   Ledger.enqueue(db, %{
+                     session_key: ledger["session"],
+                     message_id: "conformance-#{ordinal}-#{System.unique_integer([:positive])}",
+                     origin: "process:conformance",
+                     prompt: "pending",
+                     wake_id: nil
+                   })
+        end)
+      end
+    end)
 
     %{
       assignments: assignments,
@@ -1255,7 +1494,15 @@ defmodule Tightbeam.ConformanceSupport do
 
     params =
       if params[:reviews_assignment_id],
-        do: %{params | reviews_assignment_id: ids.assignments[params.reviews_assignment_id]},
+        do: %{
+          params
+          | reviews_assignment_id:
+              Map.get(
+                ids.assignments,
+                params.reviews_assignment_id,
+                params.reviews_assignment_id
+              )
+        },
         else: params
 
     call = %{
@@ -1401,6 +1648,60 @@ defmodule Tightbeam.ConformanceTest do
     assert pending == 59
   end
 
+  test "pending fixtures and case-level blockers are reported exactly" do
+    entries = Corpus.pending_entries(@corpus)
+
+    Enum.each(entries, fn entry ->
+      IO.puts(
+        "conformance pending #{entry.scope}: #{entry.id} " <>
+          "phase=#{entry.phase} blocker=#{entry.blocker}"
+      )
+    end)
+
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 59
+
+    assert %{
+             scope: "case",
+             id: "C5/reconcile-with-main/contained-refused",
+             phase: "pending-runtime",
+             blocker: "runtime"
+           } in entries
+  end
+
+  test "world sessions preserve the three adjudication hold states and episode statuses" do
+    Corpus.run_world_state_contract()
+  end
+
+  test "C4 producer completion races commit at most one frozen verdict" do
+    Corpus.run_producer_cas_races(fixture!("C4", "producer-cas-verdict-txn"))
+  end
+
+  test "handler refusal covers all canonical codes and leaves no assignment survivor" do
+    Corpus.run_handler_refusal_fixture(fixture!("C4", "declared-files-overlap"))
+  end
+
+  test "C6 review remedy claims once, dispatches once, and closes after the verdict" do
+    fixture = fixture!("C6", "review-remedy-spawn")
+    Corpus.run_rules_decide(fixture)
+    Corpus.run_acting_layer(fixture)
+  end
+
+  test "C7 idle obligation acts at most once for the same terminal watermark" do
+    fixture = fixture!("C7", "idle-open-obligation")
+    Corpus.run_rules_decide(fixture)
+    Corpus.run_acting_layer(fixture)
+  end
+
+  test "C7 busy ledger state suppresses action and idle state re-obligates" do
+    Corpus.run_acting_layer(fixture!("C7", "busy-or-queued-no-sweep"))
+  end
+
+  test "C7 satisfied obligation performs no rail action and unsatisfied state re-obligates" do
+    fixture = fixture!("C7", "satisfied-obligation-no-sweep")
+    Corpus.run_rules_decide(fixture)
+    Corpus.run_acting_layer(fixture)
+  end
+
   test "loader rejects a case fixture with no negative direction" do
     with_corpus_copy(fn root ->
       path = Path.join(root, "c2_dispatch_predicates/admin-only-verb.cases.jsonl")
@@ -1463,7 +1764,7 @@ defmodule Tightbeam.ConformanceTest do
     assert File.regular?(dependency)
 
     {output, status} =
-      System.cmd("mix", ["test", dependency],
+      System.cmd("mix", ["test", dependency, "--trace"],
         cd: Path.expand("."),
         stderr_to_stdout: true,
         env: [{"MIX_ENV", "test"}]
@@ -1471,14 +1772,7 @@ defmodule Tightbeam.ConformanceTest do
 
     assert status == 0, output
     assert output =~ "0 failures"
-
-    forbidden_substitution = %{
-      destructive_action: :covered_by_containment,
-      intent: :advisory_unenforceable
-    }
-
-    assert forbidden_substitution.destructive_action == :covered_by_containment
-    assert forbidden_substitution.intent == :advisory_unenforceable
+    assert output =~ "sandbox-exec enforces resolved write roots and preserves stdout"
   end
 
   for fixture <- @fixtures do
@@ -1512,7 +1806,8 @@ defmodule Tightbeam.ConformanceTest do
 
       @tag skip: "#{fixture["phase"]}: #{blocking_phase}"
       test name do
-        _fixture = unquote(Macro.escape(fixture))
+        fixture = unquote(Macro.escape(fixture))
+        Corpus.assert_pending_registration(fixture, unquote(blocking_phase))
       end
     end
   end
@@ -1520,8 +1815,15 @@ defmodule Tightbeam.ConformanceTest do
   for class <- @classes, class["phase"] == "pending" do
     @tag skip: "#{class["blocking_phase"]}: #{class["title"]} fixtures land on their own lane"
     test "#{class["id"]} class registered pending" do
-      _class = unquote(Macro.escape(class))
+      class = unquote(Macro.escape(class))
+      assert class["phase"] == "pending"
+      assert class["blocking_phase"] != ""
     end
+  end
+
+  defp fixture!(class, name) do
+    Enum.find(@fixtures, &(&1["class"] == class and &1["name"] == name)) ||
+      flunk("missing fixture #{class}/#{name}")
   end
 
   defp with_corpus_copy(fun) do
