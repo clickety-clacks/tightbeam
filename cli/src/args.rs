@@ -51,6 +51,25 @@ pub enum Command {
         kind: String,
         scope: Option<String>,
     },
+    ArtifactRecord {
+        identity: Identity,
+        kind: String,
+        title: String,
+        origin_path: String,
+        description: Option<String>,
+        work_item_id: Option<String>,
+        content_sha256: Option<String>,
+    },
+    ArtifactGet {
+        identity: Identity,
+        artifact_id: String,
+    },
+    Artifacts {
+        identity: Identity,
+        work_item_id: Option<String>,
+        session_key: Option<String>,
+        kind: Option<String>,
+    },
     Rule {
         identity: Identity,
         request_id: String,
@@ -316,6 +335,14 @@ COMMANDS:
 
   facts-read --kind <kind> [--scope <scope>]
       Read the latest matching condition fact.
+
+  artifact-record --kind <kind> --title <title> --path <originPath>
+                  [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
+      Record a deliberate artifact pointer for the calling session.
+  artifact-get <artifactId>
+      Read one artifact row.
+  artifacts [--work-item <workItemId>] [--session <key>] [--kind <kind>]
+      List artifact rows matching every supplied exact filter.
 
   rule --request <id> --decision <allow|deny|option> [--rationale "..."]
       Resolve one open decision request.
@@ -727,6 +754,41 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 identity: identity(flags)?,
                 kind,
                 scope: nonempty(flags, "scope"),
+            })
+        }
+        "artifact-record" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]".to_owned());
+            }
+            Ok(Command::ArtifactRecord {
+                identity: identity(flags)?,
+                kind: nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?,
+                title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
+                origin_path: nonempty(flags, "path")
+                    .ok_or_else(|| "--path is required".to_owned())?,
+                description: nonempty(flags, "description"),
+                work_item_id: nonempty(flags, "work-item"),
+                content_sha256: nonempty(flags, "sha256"),
+            })
+        }
+        "artifact-get" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam artifact-get <artifactId>".to_owned());
+            }
+            Ok(Command::ArtifactGet {
+                identity: identity(flags)?,
+                artifact_id: parsed.positional[1].clone(),
+            })
+        }
+        "artifacts" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam artifacts [--work-item <workItemId>] [--session <key>] [--kind <kind>]".to_owned());
+            }
+            Ok(Command::Artifacts {
+                identity: identity(flags)?,
+                work_item_id: nonempty(flags, "work-item"),
+                session_key: nonempty(flags, "session"),
+                kind: nonempty(flags, "kind"),
             })
         }
         "rule" => {
@@ -1171,7 +1233,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, artifact-record, artifact-get, artifacts, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe"
         )),
     }
 }
@@ -1438,7 +1500,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, artifact-record, artifact-get, artifacts, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -1511,6 +1573,33 @@ mod tests {
     }
 
     #[test]
+    fn artifact_cli_usage_rules_are_pinned() {
+        for args in [
+            strings(&["artifact-record", "--kind", "spec", "--title", "Design"]),
+            strings(&["artifact-get"]),
+            strings(&["artifacts", "extra"]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+
+        for args in [
+            strings(&[
+                "artifact-record",
+                "--kind",
+                "spec",
+                "--title",
+                "Design",
+                "--path",
+                "spec.md",
+            ]),
+            strings(&["artifact-get", "art_12345678"]),
+            strings(&["artifacts", "--work-item", "wi_1", "--kind", "spec"]),
+        ] {
+            assert!(parse(args).is_ok());
+        }
+    }
+
+    #[test]
     fn verdict_flag_is_required_iff_kind_is_verdict() {
         assert_eq!(
             parse(strings(&["attest", "asg_1", "--kind", "verdict"])),
@@ -1551,6 +1640,17 @@ mod tests {
                 "--scope",
                 "agent:tour:app",
             ]),
+            strings(&[
+                "artifact-record",
+                "--kind",
+                "spec",
+                "--title",
+                "Design",
+                "--path",
+                "spec.md",
+            ]),
+            strings(&["artifact-get", "art_12345678"]),
+            strings(&["artifacts", "--session", "agent:writer:app"]),
             strings(&[
                 "spawn",
                 "--display",

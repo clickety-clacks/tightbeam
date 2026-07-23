@@ -147,6 +147,58 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "facts-read", vec![], params))
         }
+        Command::ArtifactRecord {
+            identity,
+            kind,
+            title,
+            origin_path,
+            description,
+            work_item_id,
+            content_sha256,
+        } => {
+            let mut params = vec![
+                string_field("kind", kind),
+                string_field("title", title),
+                string_field("originPath", origin_path),
+            ];
+            for (name, value) in [
+                ("description", description),
+                ("workItemId", work_item_id),
+                ("contentSha256", content_sha256),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            Ok(request(identity, "artifact-record", vec![], params))
+        }
+        Command::ArtifactGet {
+            identity,
+            artifact_id,
+        } => Ok(request(
+            identity,
+            "artifact-get",
+            vec![],
+            vec![string_field("artifactId", artifact_id)],
+        )),
+        Command::Artifacts {
+            identity,
+            work_item_id,
+            session_key,
+            kind,
+        } => {
+            let mut params = Vec::new();
+            for (name, value) in [
+                ("workItemId", work_item_id),
+                ("sessionKey", session_key),
+                ("kind", kind),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            Ok(request(identity, "artifacts", vec![], params))
+        }
         Command::Rule {
             identity,
             request_id,
@@ -792,6 +844,9 @@ fn identity_omitted(command: &Command) -> bool {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
         | Command::FactsRead { identity, .. }
+        | Command::ArtifactRecord { identity, .. }
+        | Command::ArtifactGet { identity, .. }
+        | Command::Artifacts { identity, .. }
         | Command::Rule { identity, .. }
         | Command::Waive { identity, .. }
         | Command::RevokeWaiver { identity, .. }
@@ -987,6 +1042,46 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"facts-read","params":{"kind":"tour-given","scope":"agent:tour:app"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_artifact_bodies() {
+        assert_eq!(
+            body(&[
+                "artifact-record",
+                "--kind",
+                "spec",
+                "--title",
+                "Banana design",
+                "--path",
+                "specs/banana.md",
+                "--description",
+                "Ratified design",
+                "--work-item",
+                "wi_1",
+                "--sha256",
+                "abc123",
+            ]),
+            r#"{"verb":"artifact-record","params":{"kind":"spec","title":"Banana design","originPath":"specs/banana.md","description":"Ratified design","workItemId":"wi_1","contentSha256":"abc123"}}"#
+        );
+        assert_eq!(
+            body(&["artifact-get", "art_12345678", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"artifact-get","params":{"artifactId":"art_12345678"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "artifacts",
+                "--work-item",
+                "wi_1",
+                "--session",
+                "agent:writer:app",
+                "--kind",
+                "spec",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"artifacts","params":{"workItemId":"wi_1","sessionKey":"agent:writer:app","kind":"spec"}}"#
         );
     }
 

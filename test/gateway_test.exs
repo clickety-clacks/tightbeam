@@ -3,6 +3,7 @@ defmodule Tightbeam.GatewayTest do
 
   alias Tightbeam.{
     Archetypes,
+    Artifacts,
     Assignments,
     ConnRegistry,
     CriticalLeases,
@@ -228,6 +229,7 @@ defmodule Tightbeam.GatewayTest do
 
     for module <- [
           Devices,
+          Artifacts,
           EventLog,
           Idempotency,
           Ledger,
@@ -405,6 +407,73 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:close_session, "harness-last"}
     assert_receive {:close_adapter, {:claude, "reap-last-identity", "testhost"}}
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
+  end
+
+  test "reap archives a local workspace with artifacts before adapter teardown", ctx do
+    ensure_global_registry()
+
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_artifacts_#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    session = create_session(ctx.db, "artifact:writer", "flynn")
+    local_host = Placement.local_host_name()
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET host = ?2 WHERE sessionKey = ?1", [
+        session.session_key,
+        local_host
+      ])
+
+    session = Org.get(ctx.db, session.session_key)
+    workspace = Placement.workdir_path(%{base_dir: base_dir}, session)
+    artifact_path = Path.join(workspace, "specs/banana.md")
+    File.mkdir_p!(Path.dirname(artifact_path))
+    File.write!(artifact_path, "banana")
+
+    artifact =
+      Artifacts.record(ctx.db, %{
+        principal: {:session, session.session_key},
+        session_key: session.session_key,
+        params: %{
+          kind: "spec",
+          title: "Banana spec",
+          origin_path: artifact_path,
+          work_item_id: "wi_banana"
+        }
+      })
+
+    external =
+      Artifacts.record(ctx.db, %{
+        principal: {:session, session.session_key},
+        session_key: session.session_key,
+        params: %{
+          kind: "report",
+          title: "External report",
+          origin_path: "/outside/report.md"
+        }
+      })
+
+    result =
+      Gateway.handlers(%{db: ctx.db, base_dir: base_dir})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [session.session_key]
+    refute File.exists?(workspace)
+
+    [archive_dir] = Path.wildcard(Path.join(base_dir, "archive/artifact_writer-*"))
+    archived = Artifacts.get(ctx.db, artifact.artifact_id)
+    assert archived.state == "archived"
+    assert archived.home == Path.join(archive_dir, "specs/banana.md")
+    assert File.read!(archived.home) == "banana"
+
+    archived_external = Artifacts.get(ctx.db, external.artifact_id)
+    assert archived_external.state == "archived"
+    assert archived_external.home == archive_dir
   end
 
   test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do

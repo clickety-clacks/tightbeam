@@ -43,7 +43,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles, WorkState}
   alias Tightbeam.Wire.{Payloads, Socket}
 
-  @agent_verbs ~w(wake condition facts-read spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign dispatch attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update run-tests run-smoke cancel-producer-job rule waive revoke-waiver withdraw decision-requests decision-request)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host skill-put skill-rm skill-list role-create role-bind role-rm role-list assign dispatch attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update run-tests run-smoke cancel-producer-job rule waive revoke-waiver withdraw decision-requests decision-request)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -101,7 +101,7 @@ defmodule Tightbeam.Wire.Router do
         verb: verb,
         origin: origin,
         principal: principal,
-        session_key: session_key,
+        session_key: artifact_caller_session(verb, session_key, principal),
         target_role: target_meta.role,
         role_fallback: target_meta.fallback,
         params: atomize_params(body["params"] || %{})
@@ -545,6 +545,11 @@ defmodule Tightbeam.Wire.Router do
         end
     end
   end
+
+  defp artifact_caller_session("artifact-record", nil, {:session, session_key}),
+    do: session_key
+
+  defp artifact_caller_session(_verb, session_key, _principal), do: session_key
 
   # Plug decodes %20 in path segments but leaves '+' literal (that's a query-string
   # convention, not a path one) — session keys carry a space, never a literal '+'.

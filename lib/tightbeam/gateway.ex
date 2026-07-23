@@ -62,6 +62,7 @@ defmodule Tightbeam.Gateway do
     AdapterCoordinator,
     Adjudication,
     Archetypes,
+    Artifacts,
     Assignments,
     ConditionFacts,
     CriticalLeases,
@@ -129,6 +130,7 @@ defmodule Tightbeam.Gateway do
 
     for module <- [
           Tightbeam.Assets,
+          Artifacts,
           Adjudication,
           Devices,
           Idempotency,
@@ -382,6 +384,11 @@ defmodule Tightbeam.Gateway do
         end
       end,
       "facts-read" => fn call -> facts_read_result(db, call) end,
+      "artifact-record" => fn call -> Artifacts.record(db, call) end,
+      "artifact-get" => fn call ->
+        Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
+      end,
+      "artifacts" => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       "rule" => fn call ->
         Escalation.rule(db, call,
           authorized: admin_origin?(db, call.origin),
@@ -3022,6 +3029,8 @@ defmodule Tightbeam.Gateway do
   defp reap_retired_sessions(config, db, session_keys) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
+    Enum.each(session_keys, &archive_retired_workspace(config, db, &1))
+
     session_keys
     |> Enum.flat_map(fn session_key ->
       with session when not is_nil(session) <- Org.get(db, session_key),
@@ -3045,6 +3054,30 @@ defmodule Tightbeam.Gateway do
     _ -> :ok
   catch
     :exit, _ -> :ok
+  end
+
+  defp archive_retired_workspace(config, db, session_key) do
+    with session when not is_nil(session) <- Org.get(db, session_key) do
+      host = Placement.hosts(config.base_dir)[session.host]
+
+      # Remote workspaces are derivable but not locally accessible. Reap has
+      # no remote workspace-removal mechanism, so v1 flips their rows only.
+      workspace_path =
+        if host && host.ssh == nil,
+          do: Placement.workdir_path(config, session),
+          else: nil
+
+      Artifacts.archive_session(
+        db,
+        session_key,
+        workspace_path,
+        Path.join(config.base_dir, "archive")
+      )
+    end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   defp reap_adapter_sessions(db, coordinator, key, retired) do

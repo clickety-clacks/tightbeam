@@ -80,6 +80,21 @@ defmodule Tightbeam.Wire.RouterTest do
       "work-item-update" => fn call ->
         send(parent, {:call, call})
         %{id: call.params.work_item_id, title: call.params[:title]}
+      end,
+      "artifact-record" => fn call ->
+        send(parent, {:call, call})
+        %{artifact_id: "art_12345678", created_by_session: call.session_key}
+      end,
+      "artifact-get" => fn call ->
+        send(parent, {:call, call})
+
+        if call.params[:return_code],
+          do: %{code: call.params.return_code},
+          else: %{artifact_id: call.params.artifact_id}
+      end,
+      "artifacts" => fn call ->
+        send(parent, {:call, call})
+        %{artifacts: []}
       end
     }
 
@@ -879,6 +894,51 @@ defmodule Tightbeam.Wire.RouterTest do
     refute JSON.decode!(list.resp_body)["result"]["sessions"]
            |> List.first()
            |> Map.has_key?("created_at")
+  end
+
+  test "artifact verbs are agent verbs and recording binds the authenticated session caller",
+       ctx do
+    session = create_session(ctx.db, "artifact-writer", "flynn")
+    Roles.create!(ctx.db, "artifact-writer", "flynn", session.session_key)
+
+    recorded =
+      dispatch_cli(ctx, session.cli_token, %{
+        verb: "artifact-record",
+        params: %{kind: "spec", title: "Design", originPath: "spec.md"}
+      })
+
+    assert recorded.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "artifact-record",
+                      principal: {:session, "artifact-writer"},
+                      session_key: "artifact-writer",
+                      params: %{kind: "spec", title: "Design", origin_path: "spec.md"}
+                    }}
+
+    assert JSON.decode!(recorded.resp_body)["result"]["createdBySession"] == "artifact-writer"
+
+    for {verb, params} <- [
+          {"artifact-get", %{artifactId: "art_12345678"}},
+          {"artifacts", %{workItemId: "wi_1", sessionKey: "artifact-writer", kind: "spec"}}
+        ] do
+      response =
+        dispatch_cli(ctx, "tbc_test", %{verb: verb, asUser: "flynn", params: params})
+
+      assert response.status == 200
+      assert_receive {:call, %{verb: ^verb}}
+    end
+
+    missing =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "artifact-get",
+        asUser: "flynn",
+        params: %{artifactId: "missing", returnCode: "not_found"}
+      })
+
+    assert missing.status == 404
+    assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
   end
 
   test "session bearer enforces the identity ladder and threads the normative principal seam",
