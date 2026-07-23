@@ -1,0 +1,13 @@
+# Surrendering an assignment escalates to the owner for a decision (rather than just
+# closing it out). Exercises the escalate effect live: attest kind=surrender → opens a
+# decision-request to the owner → owner rules → the verb proceeds.
+[[rule]]
+name = "surrender-escalates-to-owner"
+verb = "attest"
+text = "surrendering an assignment escalates to the owner for a decision"
+external_producer = false
+edges = ["verb"]
+effect = "escalate"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "surrender" },
+]

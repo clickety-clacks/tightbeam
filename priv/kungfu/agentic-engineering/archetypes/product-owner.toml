@@ -1,0 +1,13 @@
+name = "product-owner"
+skills = ["tightbeam-dispatching", "product-discovery", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+
+[guidance]
+text = """
+#include "wisdom.md"
+
+#include "engineering-tenets.md"
+
+#include "preferred-models.md"
+
+#include "product-owner.md"
+"""
