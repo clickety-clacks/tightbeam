@@ -39,8 +39,8 @@ id = "C5"
 dir = "c5_script_guards"
 title = "Script guards"
 kind = "script-guard"
-phase = "pending"
-blocking_phase = "P4"
+phase = "green"
+blocking_phase = ""
 runners = ["rules_evaluate"]
 
 [[class]]
@@ -48,8 +48,8 @@ id = "C6"
 dir = "c6_remedies"
 title = "Remedies / active gates"
 kind = "remedy + load-rejection"
-phase = "pending"
-blocking_phase = "P5"
+phase = "green"
+blocking_phase = ""
 runners = ["rules_decide", "acting_layer", "load_assert"]
 
 [[class]]
@@ -57,8 +57,8 @@ id = "C7"
 dir = "c7_turn_end_sweep"
 title = "Turn-end sweep"
 kind = "sweep"
-phase = "pending"
-blocking_phase = "P6"
+phase = "green"
+blocking_phase = ""
 runners = ["rules_decide", "acting_layer"]
 
 [[class]]

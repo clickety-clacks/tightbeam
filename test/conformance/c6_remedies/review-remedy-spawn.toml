@@ -1,0 +1,26 @@
+[fixture]
+class = "C6"
+name = "review-remedy-spawn"
+phase = "green"
+blocking_phase = ""
+kind = "remedy"
+source = "mechanism §C2; smoke spec C6 representative remedy"
+legibility = "event:denied(reason=remedy_fired,rule=review-remedy-spawn);lifecycle:rail_remedy(outcome=claimed-dispatched)"
+
+[[fixture.rule]]
+name = "review-remedy-spawn"
+verb = "attest"
+text = "completion requires a reviewed-clean verdict"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] },
+]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"
+[fixture.rule.remedy.params]
+subject = "review of assignment {assignment_id}"
+reviews = "{assignment_id}"

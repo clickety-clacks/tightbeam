@@ -1,0 +1,26 @@
+[fixture]
+class = "C7"
+name = "scheduled-wake-suppression"
+phase = "green"
+blocking_phase = ""
+kind = "sweep"
+source = "mechanism §D; smoke spec C7 self-wake suppression"
+legibility = "lifecycle:rail_sweep(decision=run-remedy) for non-self wake"
+
+[[fixture.rule]]
+name = "scheduled-wake-suppression"
+verb = "attest"
+text = "idle completion requires a reviewed-clean verdict"
+edges = ["turn-end"]
+effect = "remedy"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] },
+]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"
+[fixture.rule.remedy.params]
+subject = "review of assignment {assignment_id}"
+reviews = "{assignment_id}"

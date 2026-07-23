@@ -1,0 +1,24 @@
+[fixture]
+class = "C5"
+name = "script-check"
+phase = "green"
+blocking_phase = ""
+kind = "script-guard"
+source = "mechanism §A; smoke spec C5 representative rail-exec guard"
+legibility = "event:denied(rule=script-check);lifecycle:rail_script(return=deny)"
+
+[[fixture.rule]]
+name = "script-check"
+verb = "attest"
+text = "the script check must allow only its passing return"
+edges = ["verb"]
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+]
+[fixture.rule.check]
+script = "conformance-script-check"
+returns = ["allow", "deny"]
+timeout_ms = 5000
+[fixture.rule.check.effects]
+allow = "allow"
+deny = "deny"

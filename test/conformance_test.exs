@@ -2,16 +2,22 @@ defmodule Tightbeam.ConformanceSupport do
   import ExUnit.Assertions
 
   alias Tightbeam.{
+    Adjudication,
     Assignments,
+    ConditionFacts,
     DB,
     Devices,
     Dispatch,
+    Escalation,
     EventLog,
     Gateway,
     Idempotency,
     Ledger,
     Org,
+    Placement,
     Producers,
+    Projection,
+    RailRemedy,
     Rails,
     Roles,
     Rules,
@@ -115,6 +121,12 @@ defmodule Tightbeam.ConformanceSupport do
   defp applicable_runners("handler-refusal", runners),
     do: Enum.filter(runners, &(&1 == "handler_refusal"))
 
+  defp applicable_runners("remedy", runners),
+    do: Enum.filter(runners, &(&1 in ~w(rules_decide acting_layer)))
+
+  defp applicable_runners("sweep", runners),
+    do: Enum.filter(runners, &(&1 in ~w(rules_decide acting_layer)))
+
   defp applicable_runners(_kind, runners), do: runners
 
   defp load_loadset!(path, class) do
@@ -133,7 +145,7 @@ defmodule Tightbeam.ConformanceSupport do
     |> Map.put("kind", "load-rejection")
     |> Map.put("path", path)
     |> Map.put("loadset_dir", String.replace_suffix(path, ".load.toml", ".loadset"))
-    |> Map.put("runners", class["runners"])
+    |> Map.put("runners", Enum.filter(class["runners"], &(&1 == "load_assert")))
   end
 
   defp load_cases!(path, fixture) do
@@ -305,9 +317,7 @@ defmodule Tightbeam.ConformanceSupport do
 
   def run_rules_fixture(fixture) do
     base = temp_dir!("conformance-rules")
-    rules_dir = Path.join(base, "identity/rules")
-    File.mkdir_p!(rules_dir)
-    File.write!(Path.join(rules_dir, "fixture.toml"), serialize_rules(fixture["rule"]))
+    prepare_rule_base!(base, fixture)
     handlers = Gateway.handlers(%{})
     Rules.load!(base, Map.keys(handlers), %{tests: "fixture", smoke: "fixture"})
 
@@ -325,7 +335,7 @@ defmodule Tightbeam.ConformanceSupport do
     try do
       ids = materialize_world(db, Map.get(kase, "world", %{}))
       assert_fixture_world(fixture, kase, db, ids)
-      call = build_call(kase["call"], ids)
+      call = kase["call"] |> build_call(ids) |> with_script_return(kase)
       assert_rule_result(kase["case"], kase["expect"], kase["reason"], Rules.evaluate(db, call))
 
       if kase["kind"] == "legibility" do
@@ -341,6 +351,16 @@ defmodule Tightbeam.ConformanceSupport do
                  EventLog.rail_denials(db, 0, 1)
 
         assert rule == kase["reason"]
+
+        if fixture["kind"] == "script-guard" do
+          assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
+                   detail = JSON.decode!(event.detail)
+
+                   event.kind == "rail_script" and event.subject == kase["reason"] and
+                     detail["return"] == kase["script_return"] and
+                     detail["exit_class"] == "returned"
+                 end)
+        end
       end
 
       if phase2 = kase["phase2"] do
@@ -471,11 +491,159 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  def run_rules_decide(_fixture),
-    do: flunk("rules_decide fixture was enabled before Tightbeam.Rules.decide/2 landed")
+  def run_rules_decide(fixture) do
+    base = temp_dir!("conformance-decide")
+    prepare_rule_base!(base, fixture)
+    handlers = Gateway.handlers(%{})
+    Rules.load!(base, Map.keys(handlers), %{})
 
-  def run_acting_layer(_fixture),
-    do: flunk("acting_layer fixture was enabled before the C6/C7 acting APIs landed")
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+
+        try do
+          ids = materialize_world(db, Map.get(kase, "world", %{}))
+          call = build_call(kase["call"], ids)
+          {decision, _to_close, _to_consume} = Rules.decide(db, sweep_call(fixture, call))
+
+          case {kase["expect"], self_wake?(db, call)} do
+            {"run-remedy", _} ->
+              assert {:remedy, %{name: name}, _, _} = decision
+              assert name == kase["reason"]
+
+            {"re-obligate", _} ->
+              assert {:deny, %{rule: name}} = decision
+              assert name == kase["reason"]
+
+            {"none", true} ->
+              assert match?({:remedy, _, _, _}, decision)
+
+            {"none", false} ->
+              assert decision == :allow
+          end
+        after
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
+
+  def run_acting_layer(%{"class" => "C6"} = fixture), do: run_dispatch_actor(fixture)
+  def run_acting_layer(%{"class" => "C7"} = fixture), do: run_supervision_actor(fixture)
+
+  defp run_dispatch_actor(fixture) do
+    base = temp_dir!("conformance-dispatch-actor")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+
+        try do
+          ids = materialize_world(db, Map.get(kase, "world", %{}))
+          call = build_call(kase["call"], ids)
+          handlers = Gateway.handlers(%{db: db})
+          assignment_id = call.params.assignment_id
+
+          case kase["expect"] do
+            "run-remedy" ->
+              assert {:error, %{reason: "remedy_fired", rule: rule, producer: producer}} =
+                       Dispatch.dispatch(db, handlers, call)
+
+              assert rule == kase["reason"]
+              assert is_binary(producer)
+
+              assert %{status: "live", producer_key: ^producer} =
+                       RailRemedy.episode(db, rule, assignment_id)
+
+              assert {:error, %{reason: "remedy_fired"}} = Dispatch.dispatch(db, handlers, call)
+              assert review_effect_count(db, assignment_id) == 1
+              assert remedy_principal_recorded?(db, rule)
+
+              if kase["kind"] == "legibility" do
+                assert [denial | _] = EventLog.rail_denials(db, 0, 10)
+                assert denial.rule == rule
+                assert denial.reason == "remedy_fired"
+                assert lifecycle_outcome?(db, "rail_remedy", rule, "claimed-dispatched")
+              end
+
+            "none" ->
+              assert {:ok, _} = Dispatch.dispatch(db, handlers, call)
+              assert RailRemedy.episode(db, fixture_rule_name(fixture), assignment_id) == nil
+              assert review_effect_count(db, assignment_id) == 0
+              refute lifecycle_kind?(db, "rail_remedy")
+          end
+        after
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
+
+  defp run_supervision_actor(fixture) do
+    base = temp_dir!("conformance-supervision-actor")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+
+    try do
+      Enum.each(fixture["cases"], fn kase ->
+        {db, pid} = memory_db!()
+
+        try do
+          ids = materialize_world(db, Map.get(kase, "world", %{}))
+          call = build_call(kase["call"], ids)
+          handlers = Gateway.handlers(%{db: db})
+          session_key = call.principal |> elem(1)
+          assignment_id = call.params.assignment_id
+          terminal_seq = Map.fetch!(ids.turns, session_key)
+          result = Supervision.evaluate(db, handlers, 3, session_key, terminal_seq)
+          rule = fixture_rule_name(fixture)
+
+          case kase["expect"] do
+            "run-remedy" ->
+              assert result == {:acted, :rail_remedy}
+              assert %{status: "live"} = RailRemedy.episode(db, rule, assignment_id)
+              assert review_effect_count(db, assignment_id) == 1
+              assert Supervision.prod_state(db, assignment_id) == nil
+              assert sweep_decision?(db, session_key, rule, "run-remedy")
+
+            "re-obligate" ->
+              assert result == {:prodded, 1}
+              assert RailRemedy.episode(db, rule, assignment_id) == nil
+              assert Supervision.prod_state(db, assignment_id).prodCount == 1
+              assert sweep_decision?(db, session_key, rule, "re-obligate")
+
+            "none" ->
+              assert RailRemedy.episode(db, rule, assignment_id) == nil
+
+              if self_wake?(db, call) do
+                assert result == :continuation
+                assert Supervision.prod_state(db, assignment_id) == nil
+                refute lifecycle_kind?(db, "rail_sweep")
+              else
+                assert sweep_decision?(db, session_key, nil, "none")
+              end
+          end
+
+          if kase["kind"] == "legibility" do
+            assert lifecycle_kind?(db, "rail_sweep")
+          end
+        after
+          GenServer.stop(pid)
+        end
+      end)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
 
   defp memory_db! do
     name = :"conformance_db_#{System.unique_integer([:positive])}"
@@ -484,6 +652,7 @@ defmodule Tightbeam.ConformanceSupport do
     for module <- [
           Devices,
           Idempotency,
+          Projection,
           Org,
           Roles,
           WorkItems,
@@ -492,8 +661,12 @@ defmodule Tightbeam.ConformanceSupport do
           EventLog,
           Producers,
           Ledger,
+          ConditionFacts,
           Wakes,
-          Supervision
+          Supervision,
+          Adjudication,
+          Escalation,
+          RailRemedy
         ] do
       :ok = module.ensure_schema(name)
     end
@@ -504,7 +677,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp materialize_world(
          db,
          world,
-         ids \\ %{assignments: %{}, work_items: %{}, producer_jobs: %{}}
+         ids \\ %{assignments: %{}, work_items: %{}, producer_jobs: %{}, turns: %{}}
        ) do
     Enum.each(Map.get(world, "users", []), fn user ->
       {:ok, _} =
@@ -524,7 +697,7 @@ defmodule Tightbeam.ConformanceSupport do
         harness: session["harness"] || "claude",
         provider: session["provider"] || "anthropic",
         model: session["model"] || "fable",
-        host: session["host"] || "eezo"
+        host: session["host"] || Placement.local_host_name()
       })
 
       Roles.create!(db, session["key"], session["owner"], session["key"])
@@ -664,6 +837,17 @@ defmodule Tightbeam.ConformanceSupport do
         Map.put(job_ids, key, job_id)
       end)
 
+    Enum.each(Map.get(world, "wakes", []), fn wake ->
+      Wakes.schedule(db, %{
+        session_key: wake["target"],
+        target_role: nil,
+        origin: "process:conformance",
+        prompt: "conformance continuation",
+        due_at: wake["at"],
+        creator_session_key: wake["creatorSessionKey"]
+      })
+    end)
+
     Enum.each(List.wrap(Map.get(world, "ledger", [])), fn ledger ->
       if ledger["pending"] > 0 do
         Enum.each(1..ledger["pending"], fn ordinal ->
@@ -679,7 +863,30 @@ defmodule Tightbeam.ConformanceSupport do
       end
     end)
 
-    %{assignments: assignments, work_items: work_items, producer_jobs: producer_jobs}
+    turns =
+      Enum.reduce(List.wrap(Map.get(world, "turn", [])), ids.turns, fn turn, turns ->
+        message_id = "conformance-terminal-#{System.unique_integer([:positive])}"
+
+        assert {:ok, seq} =
+                 Ledger.enqueue(db, %{
+                   session_key: turn["session"],
+                   message_id: message_id,
+                   origin: "user:conformance",
+                   prompt: "terminal"
+                 })
+
+        assert seq == turn["seq"]
+        assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, turn["session"], "conformance")
+        assert :ok = Ledger.finish(db, seq, "delivered")
+        Map.put(turns, turn["session"], seq)
+      end)
+
+    %{
+      assignments: assignments,
+      work_items: work_items,
+      producer_jobs: producer_jobs,
+      turns: turns
+    }
   end
 
   defp transition_producer_job(_db, _job_id, "queued", _holder), do: :ok
@@ -753,6 +960,88 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp first_user(world), do: world |> Map.get("users", []) |> List.first() |> Map.fetch!("id")
 
+  defp prepare_rule_base!(base, fixture) do
+    rules_dir = Path.join(base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    File.write!(Path.join(rules_dir, "fixture.toml"), serialize_rules(fixture["rule"]))
+
+    scripts =
+      fixture["rule"]
+      |> Enum.map(&get_in(&1, ["check", "script"]))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    if scripts != [] do
+      scripts_dir = Path.join(base, "identity/rails/scripts")
+      bin_dir = Path.join(base, "bin")
+      File.mkdir_p!(scripts_dir)
+      File.mkdir_p!(bin_dir)
+
+      Enum.each(scripts, fn script ->
+        source = Path.join([Path.dirname(fixture["path"]), "scripts", script])
+        destination = Path.join(scripts_dir, script)
+        File.cp!(source, destination)
+        File.chmod!(destination, 0o755)
+      end)
+
+      wrapper = Path.join(bin_dir, "tightbeam")
+      File.cp!(Path.join([__DIR__, "fixtures", "rail_exec", "tightbeam"]), wrapper)
+      File.chmod!(wrapper, 0o755)
+    end
+  end
+
+  defp with_script_return(call, %{"script_return" => token}) do
+    put_in(call.params[:conformance_script_return], token)
+  end
+
+  defp with_script_return(call, _kase), do: call
+
+  defp sweep_call(%{"class" => "C7"}, call), do: Map.put(call, :edge, :turn_end)
+  defp sweep_call(_fixture, call), do: call
+
+  defp self_wake?(db, %{principal: {:session, session_key}}),
+    do: Wakes.self_pending_count(db, session_key) > 0
+
+  defp self_wake?(_db, _call), do: false
+
+  defp fixture_rule_name(fixture), do: fixture["rule"] |> List.first() |> Map.fetch!("name")
+
+  defp review_effect_count(db, assignment_id) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT COUNT(*) FROM assignments WHERE reviewsAssignmentId = ?1", [
+        assignment_id
+      ])
+
+    count
+  end
+
+  defp remedy_principal_recorded?(db, rule) do
+    {:ok, rows} =
+      DB.query(db, "SELECT principal FROM events WHERE kind = 'verb' AND verb = 'assign'")
+
+    Enum.any?(rows, fn [principal] -> principal == "remedy:assign:#{rule}" end)
+  end
+
+  defp lifecycle_kind?(db, kind) do
+    Enum.any?(EventLog.lifecycle_events(db), &(&1.kind == kind))
+  end
+
+  defp lifecycle_outcome?(db, kind, subject, outcome) do
+    Enum.any?(EventLog.lifecycle_events(db), fn event ->
+      event.kind == kind and event.subject == subject and
+        JSON.decode!(event.detail)["outcome"] == outcome
+    end)
+  end
+
+  defp sweep_decision?(db, session_key, statute, decision) do
+    Enum.any?(EventLog.lifecycle_events(db), fn event ->
+      detail = JSON.decode!(event.detail)
+
+      event.kind == "rail_sweep" and event.subject == session_key and
+        detail["statute"] == statute and detail["decision"] == decision
+    end)
+  end
+
   defp build_call(raw, ids) do
     principal = principal(raw["principal"])
     params = atomize(raw["params"])
@@ -798,20 +1087,66 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp serialize_rules(rules) do
     Enum.map_join(rules, "\n", fn rule ->
-      conditions = Enum.map_join(rule["deny_when"], ",\n  ", &toml_inline/1)
+      conditions = Enum.map_join(Map.get(rule, "deny_when", []), ",\n  ", &toml_inline/1)
 
-      """
+      base = """
       [[rule]]
       name = #{toml_value(rule["name"])}
       verb = #{toml_value(rule["verb"])}
       text = #{toml_value(rule["text"])}
       external_producer = #{toml_value(Map.get(rule, "external_producer", false))}
+      #{optional_toml("edges", rule["edges"])}
+      #{optional_toml("effect", rule["effect"])}
       deny_when = [
         #{conditions}
       ]
       """
+
+      base <> serialize_check(rule["check"]) <> serialize_remedy(rule["remedy"])
     end)
   end
+
+  defp serialize_check(nil), do: ""
+
+  defp serialize_check(check) do
+    effects =
+      Enum.map_join(check["effects"], "\n", fn {token, effect} ->
+        "#{token} = #{toml_value(effect)}"
+      end)
+
+    """
+    [rule.check]
+    script = #{toml_value(check["script"])}
+    returns = #{toml_value(check["returns"])}
+    timeout_ms = #{toml_value(Map.get(check, "timeout_ms", 5_000))}
+    [rule.check.effects]
+    #{effects}
+    """
+  end
+
+  defp serialize_remedy(nil), do: ""
+
+  defp serialize_remedy(remedy) do
+    fields =
+      remedy
+      |> Map.drop(["params"])
+      |> Enum.map_join("\n", fn {key, value} -> "#{key} = #{toml_value(value)}" end)
+
+    params =
+      remedy
+      |> Map.get("params", %{})
+      |> Enum.map_join("\n", fn {key, value} -> "#{key} = #{toml_value(value)}" end)
+
+    """
+    [rule.remedy]
+    #{fields}
+    [rule.remedy.params]
+    #{params}
+    """
+  end
+
+  defp optional_toml(_key, nil), do: ""
+  defp optional_toml(key, value), do: "#{key} = #{toml_value(value)}"
 
   defp toml_inline(map) do
     "{ " <>
@@ -855,7 +1190,7 @@ defmodule Tightbeam.ConformanceTest do
         "#{structured} structured-legibility assertion sets active; #{class_pending} pending classes"
     )
 
-    assert green == 23
+    assert green == 28
     assert pending == 3
   end
 

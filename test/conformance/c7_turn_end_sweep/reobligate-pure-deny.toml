@@ -1,0 +1,19 @@
+[fixture]
+class = "C7"
+name = "reobligate-pure-deny"
+phase = "green"
+blocking_phase = ""
+kind = "sweep"
+source = "mechanism §D; smoke spec C7 pure-deny re-obligation"
+legibility = "lifecycle:rail_sweep(decision=re-obligate)"
+
+[[fixture.rule]]
+name = "reobligate-pure-deny"
+verb = "attest"
+text = "completion remains owed when no progress verdict exists"
+edges = ["turn-end"]
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["progress-recorded"] },
+]
+external_producer = true
