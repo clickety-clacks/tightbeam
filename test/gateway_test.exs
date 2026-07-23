@@ -734,6 +734,7 @@ defmodule Tightbeam.GatewayTest do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_corrupt_#{System.unique_integer([:positive])}")
 
+    File.rm_rf!(base_dir)
     File.mkdir_p!(base_dir)
     File.write!(Path.join(base_dir, "gateway.json"), "not json")
 
@@ -2385,6 +2386,7 @@ defmodule Tightbeam.GatewayTest do
     base =
       Path.join(System.tmp_dir!(), "gateway_remote_url_#{System.unique_integer([:positive])}")
 
+    File.rm_rf!(base)
     manifests = Path.join([base, "identity", "archetypes"])
     File.mkdir_p!(manifests)
 
@@ -2740,6 +2742,7 @@ defmodule Tightbeam.GatewayTest do
   defp gateway_children_base! do
     suffix = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
     base = Path.join(System.tmp_dir!(), "gateway_children_#{suffix}")
+    File.rm_rf!(base)
     File.mkdir!(base)
     on_exit(fn -> File.rm_rf!(base) end)
     base
@@ -2752,6 +2755,7 @@ defmodule Tightbeam.GatewayTest do
         "gateway_roles_#{suffix}_#{System.unique_integer([:positive])}"
       )
 
+    File.rm_rf!(base_dir)
     File.mkdir_p!(base_dir)
 
     if ready? do
@@ -2794,6 +2798,7 @@ defmodule Tightbeam.GatewayTest do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_move_#{suffix}_#{System.unique_integer([:positive])}")
 
+    File.rm_rf!(base_dir)
     manifests = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
 
