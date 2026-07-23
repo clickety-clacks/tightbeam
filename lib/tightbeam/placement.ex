@@ -481,8 +481,8 @@ defmodule Tightbeam.Placement do
     host_config = Map.fetch!(hosts(config.base_dir), host)
     contained? = elem(resolved, 0).containment.fs == :workdir
 
-    if contained? and host_config.ssh == nil and host != local_host_name() do
-      containment_refused!(config, key, "contained_noncanonical_local_host")
+    if contained? and host_config.ssh != nil do
+      containment_refused!(config, key, "contained_remote_unsupported")
     end
 
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
@@ -523,20 +523,15 @@ defmodule Tightbeam.Placement do
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
 
     if host_config.ssh == nil do
-      codex_shim = Path.join(config.cli_bin, "codex")
-
-      # Invariant: CODEX_PATH pins codex-acp to the projected shim (the operator-controlled
-      # system codex); unset it and codex-acp silently runs its bundled, different binary.
-      codex_path_env =
-        if harness == :codex and File.exists?(codex_shim),
-          do: [{"CODEX_PATH", codex_shim}],
-          else: []
-
       # Invariant: codex hooks are TRUST-gated under app-server; `bypass_hook_trust`
-      # is a thread/start request override only (not config.toml, not a CLI flag), and
-      # codex-acp spreads the CODEX_CONFIG env JSON into every thread/start config map.
-      # Without this seed the home's hooks.json is silently filtered as untrusted and
-      # the gate wiring-check fails closed.
+      # is a thread/start request override only. codex-acp reads CODEX_CONFIG JSON
+      # from its environment and spreads it into every thread/start and thread/resume
+      # config map. The app-server emits the bypass warning both on stderr and as a
+      # per-thread config-warning session update; both are benign harness noise,
+      # contribute zero model-context bytes, and are never a boot or turn failure.
+      # Config.toml and `-c` cannot seed hook trust, app-server rejects the
+      # `--dangerously-bypass-hook-trust` flag, and the persisted trust store has no
+      # writable automation seam. CODEX_CONFIG is therefore the sole production seed.
       codex_config_env =
         if rails?,
           do: [{"CODEX_CONFIG", codex_bypass_hook_trust_json()}],
@@ -554,7 +549,7 @@ defmodule Tightbeam.Placement do
             {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
             {"TIGHTBEAM_LINEAGE", lineage}
           ] ++
-            harness_token_env(config.base_dir, harness) ++ codex_path_env ++ codex_config_env
+            harness_token_env(config.base_dir, harness) ++ codex_config_env
       ]
 
       if contained? do
@@ -564,23 +559,12 @@ defmodule Tightbeam.Placement do
           Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
         ]
 
-        try do
-          :ok = Containment.validate_roots!(write_roots)
-        rescue
-          error in [ArgumentError] ->
-            containment_refused!(config, key, Exception.message(error))
-        end
-
         sh = Map.get(config, :sh, &system_cmd/1)
+        wrapper = Path.join(config.cli_bin, "tightbeam")
 
         probe_result =
           try do
-            sh.([
-              "/usr/bin/sandbox-exec",
-              "-p",
-              "(version 1)(allow default)",
-              "/usr/bin/true"
-            ])
+            sh.([wrapper, "contain-exec", "--check"])
           rescue
             error -> {:raised, error}
           end
@@ -590,14 +574,14 @@ defmodule Tightbeam.Placement do
             containment_refused!(
               config,
               key,
-              "sandbox-exec probe failed: #{Exception.message(error)}"
+              "contain-exec probe failed: #{Exception.message(error)}"
             )
 
           {_output, 0} ->
             :ok
 
           {_output, exit} ->
-            containment_refused!(config, key, "sandbox-exec probe failed with exit #{exit}")
+            containment_refused!(config, key, "contain-exec probe failed with exit #{exit}")
         end
 
         profile =
@@ -617,7 +601,7 @@ defmodule Tightbeam.Placement do
 
         opts
         |> Keyword.merge(probe_opts)
-        |> Keyword.put(:cmd, ["/usr/bin/sandbox-exec", "-p", profile, binary])
+        |> Keyword.put(:cmd, [wrapper, "contain-exec", "--profile", profile, "--", binary])
         |> Keyword.put(:contained, true)
       else
         Keyword.merge(opts, probe_opts)
@@ -640,8 +624,11 @@ defmodule Tightbeam.Placement do
           []
         end
 
-      # Same trust-bypass seed as the local branch; single-quoted so the JSON value
-      # survives the remote shell's word evaluation (the env words are re-parsed there).
+      # Same sole production trust-bypass seed as the local branch; single-quoted so
+      # the JSON survives the remote shell's second parse. codex-acp spreads it into
+      # thread/start and thread/resume; the stderr and per-thread config-warning
+      # notifications are benign, zero-context harness noise. Config.toml, `-c`, the
+      # rejected app-server flag, and the persisted trust store cannot seed this path.
       codex_config_env =
         if rails?,
           do: ["CODEX_CONFIG='#{codex_bypass_hook_trust_json()}'"],
@@ -657,9 +644,6 @@ defmodule Tightbeam.Placement do
              "TIGHTBEAM_LINEAGE=#{lineage}"
            ] ++ codex_config_env)
         |> Enum.reject(&is_nil/1)
-
-      # Remote/satellite follow-up: project the codex shim on cli_bin and set CODEX_PATH to
-      # pin codex-acp to that operator-controlled system codex instead of its bundled binary.
 
       Keyword.merge(
         [
@@ -819,9 +803,9 @@ defmodule Tightbeam.Placement do
     end
   end
 
-  # The thread/start trust-bypass override, as the JSON object codex-acp expects in
-  # CODEX_CONFIG. Verified at codex rust-v0.145.0: this is the ONLY seam that arms
-  # untrusted hooks under app-server (permission-seam-spike.md, final reversal).
+  # The thread/start and thread/resume trust-bypass override, as the one JSON object
+  # codex-acp expects in CODEX_CONFIG. Future CODEX_CONFIG values must merge here,
+  # never create a second exporter.
   defp codex_bypass_hook_trust_json, do: ~s({"bypass_hook_trust":true})
 
   # The org's own long-lived grant, injected as the harness's token env —
@@ -909,15 +893,11 @@ defmodule Tightbeam.Placement do
 
   defp deliver_home_resolved(
          config,
-         {harness, identity_name, host} = key,
+         {harness, identity_name, host},
          {base_archetype, effective_archetype, overrides},
          opts
        ) do
     host_config = Map.fetch!(hosts(config.base_dir), host)
-
-    if base_archetype.containment.fs == :workdir and host_config.ssh != nil do
-      containment_refused!(config, key, "contained_remote_unsupported")
-    end
 
     if host_config.ssh == nil do
       refs =

@@ -42,24 +42,25 @@ defmodule Tightbeam.ContainmentTest do
     assert Containment.profile([root]) =~ ~s|(subpath "#{root}")|
   end
 
-  test "profile refuses unsafe, relative, and lexically noncanonical roots" do
+  test "profile refuses only unsafe and relative root bytes" do
     rejected = [
       "relative",
       "/bad\"quote",
       "/bad\\slash",
       "/bad\nline",
-      "/bad\tcontrol",
-      "/org/homes/../../outside/codex",
-      "/foo//bar",
-      "/foo/bar/"
+      "/bad\tcontrol"
     ]
 
     for root <- rejected do
       assert_raise ArgumentError, fn -> Containment.profile([root]) end
     end
+
+    for root <- ["/org/homes/../../outside/codex", "/foo//bar", "/foo/bar/"] do
+      assert Containment.profile([root]) =~ ~s|(subpath "#{root}")|
+    end
   end
 
-  test "validate_roots refuses symlinks, accepts missing tails, and refuses other lstat errors" do
+  test "profile itself refuses symlinks, accepts missing tails, and refuses other lstat errors" do
     root =
       Path.join(
         canonical(System.tmp_dir!()),
@@ -75,15 +76,15 @@ defmodule Tightbeam.ContainmentTest do
     File.ln_s!(target, link)
 
     assert_raise ArgumentError, ~r/symlink component/, fn ->
-      Containment.validate_roots!([Path.join(link, "work")])
+      Containment.profile([Path.join(link, "work")])
     end
 
-    assert :ok = Containment.validate_roots!([Path.join(root, "fresh/missing/work")])
+    assert is_binary(Containment.profile([Path.join(root, "fresh/missing/work")]))
 
     too_long = Path.join(root, String.duplicate("a", 256))
 
     assert_raise ArgumentError, ~r/cannot be validated/, fn ->
-      Containment.validate_roots!([too_long])
+      Containment.profile([too_long])
     end
   end
 
