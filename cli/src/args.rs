@@ -793,6 +793,7 @@ mod tests {
     #[test]
     fn commands_outside_the_typescript_reference_are_not_exposed() {
         for command in [
+            "rail-exec",
             "probe",
             "condition",
             "facts-read",
@@ -833,40 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_every_command_happy_shape() {
-        let commands = [
-            strings(&[
-                "wake", "--role", "reviewer", "--prompt", "go", "--as", "coder",
-            ]),
-            strings(&[
-                "spawn",
-                "--display",
-                "Worker",
-                "--key",
-                "k",
-                "--as-user",
-                "flynn",
-            ]),
-            strings(&["list", "--as-process", "cron"]),
-            strings(&["retire", "--session", "agent:x", "--as", "owner"]),
-            strings(&["cancel-wake", "w1", "--as-process", "cron"]),
-            strings(&["role", "create", "reviewer", "--as-user", "flynn"]),
-            strings(&["role", "bind", "reviewer", "agent:x", "--as-user", "flynn"]),
-            strings(&["role", "rm", "reviewer", "--as-user", "flynn"]),
-            strings(&["role", "list", "--as-user", "flynn"]),
-            strings(&["skill", "list", "--as-user", "flynn"]),
-            strings(&["skill", "rm", "swift", "--as-user", "flynn"]),
-            strings(&["approve-device", "d1", "--as-user", "flynn"]),
-            strings(&["deny-device", "d1", "--as-user", "flynn"]),
-            strings(&["revoke-device", "d1", "--as-user", "flynn"]),
-            strings(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
-            strings(&["setup"]),
-            strings(&["assimilate", "host", "--as-user", "flynn"]),
-        ];
-        for args in commands {
-            assert!(parse(args).is_ok());
-        }
-
+    fn parses_every_command_happy_shape_exactly() {
         let skill_path = std::env::temp_dir().join(format!(
             "tightbeam_skill_{}",
             SystemTime::now()
@@ -875,17 +843,234 @@ mod tests {
                 .as_nanos()
         ));
         fs::write(&skill_path, "skill body").unwrap();
-        let skill_put = parse(vec![
-            "skill".to_owned(),
-            "put".to_owned(),
-            "swift".to_owned(),
-            "--file".to_owned(),
-            skill_path.display().to_string(),
-            "--as-user".to_owned(),
-            "flynn".to_owned(),
-        ]);
+        let skill_path = skill_path.display().to_string();
+
+        let commands = vec![
+            (
+                strings(&[
+                    "wake", "--role", "reviewer", "--prompt", "go", "--after", "30s", "--at",
+                    "123", "--as", "coder",
+                ]),
+                Command::Wake {
+                    identity: Identity::Role("coder".to_owned()),
+                    target: Target::Role("reviewer".to_owned()),
+                    prompt: "go".to_owned(),
+                    after_ms: Some("30000".to_owned()),
+                    at: Some("123".to_owned()),
+                },
+            ),
+            (
+                strings(&[
+                    "spawn",
+                    "--display",
+                    "Worker",
+                    "--key",
+                    "k",
+                    "--archetype",
+                    "worker",
+                    "--harness",
+                    "codex",
+                    "--model",
+                    "gpt",
+                    "--name",
+                    "reviewer",
+                    "--host",
+                    "eezo",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::Spawn {
+                    identity: Identity::User("flynn".to_owned()),
+                    display_name: "Worker".to_owned(),
+                    idempotency_key: "k".to_owned(),
+                    archetype: Some("worker".to_owned()),
+                    harness: Some("codex".to_owned()),
+                    model: Some("gpt".to_owned()),
+                    handle: Some("reviewer".to_owned()),
+                    host: Some("eezo".to_owned()),
+                },
+            ),
+            (
+                strings(&["list", "--as-process", "cron"]),
+                Command::List {
+                    identity: Identity::Process("cron".to_owned()),
+                },
+            ),
+            (
+                strings(&[
+                    "retire",
+                    "--session",
+                    "agent:x",
+                    "--key",
+                    "retire-k",
+                    "--as",
+                    "owner",
+                ]),
+                Command::Retire {
+                    identity: Identity::Role("owner".to_owned()),
+                    session_key: "agent:x".to_owned(),
+                    idempotency_key: Some("retire-k".to_owned()),
+                },
+            ),
+            (
+                strings(&["cancel-wake", "w1", "--as-process", "cron"]),
+                Command::CancelWake {
+                    identity: Identity::Process("cron".to_owned()),
+                    wake_id: "w1".to_owned(),
+                },
+            ),
+            (
+                strings(&[
+                    "role",
+                    "create",
+                    "reviewer",
+                    "--bind",
+                    "agent:x",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::RoleCreate {
+                    identity: Identity::User("flynn".to_owned()),
+                    name: "reviewer".to_owned(),
+                    bind: Some("agent:x".to_owned()),
+                },
+            ),
+            (
+                strings(&["role", "bind", "reviewer", "agent:y", "--as-user", "flynn"]),
+                Command::RoleBind {
+                    identity: Identity::User("flynn".to_owned()),
+                    name: "reviewer".to_owned(),
+                    session_key: "agent:y".to_owned(),
+                },
+            ),
+            (
+                strings(&["role", "rm", "reviewer", "--as-user", "flynn"]),
+                Command::RoleRemove {
+                    identity: Identity::User("flynn".to_owned()),
+                    name: "reviewer".to_owned(),
+                },
+            ),
+            (
+                strings(&["role", "list", "--as-user", "flynn"]),
+                Command::RoleList {
+                    identity: Identity::User("flynn".to_owned()),
+                },
+            ),
+            (
+                strings(&["skill", "list", "--as-user", "flynn"]),
+                Command::SkillList {
+                    identity: Identity::User("flynn".to_owned()),
+                },
+            ),
+            (
+                vec![
+                    "skill".to_owned(),
+                    "put".to_owned(),
+                    "swift".to_owned(),
+                    "--file".to_owned(),
+                    skill_path.clone(),
+                    "--as-user".to_owned(),
+                    "flynn".to_owned(),
+                ],
+                Command::SkillPut {
+                    identity: Identity::User("flynn".to_owned()),
+                    name: "swift".to_owned(),
+                    content: "skill body".to_owned(),
+                },
+            ),
+            (
+                strings(&["skill", "rm", "swift", "--as-user", "flynn"]),
+                Command::SkillRemove {
+                    identity: Identity::User("flynn".to_owned()),
+                    name: "swift".to_owned(),
+                },
+            ),
+            (
+                strings(&[
+                    "approve-device",
+                    "d1",
+                    "--user",
+                    "mike",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::ApproveDevice {
+                    identity: Identity::User("flynn".to_owned()),
+                    device_id: "d1".to_owned(),
+                    user_id: Some("mike".to_owned()),
+                },
+            ),
+            (
+                strings(&["deny-device", "d2", "--as-user", "flynn"]),
+                Command::DenyDevice {
+                    identity: Identity::User("flynn".to_owned()),
+                    device_id: "d2".to_owned(),
+                },
+            ),
+            (
+                strings(&["revoke-device", "d3", "--as-user", "flynn"]),
+                Command::RevokeDevice {
+                    identity: Identity::User("flynn".to_owned()),
+                    device_id: "d3".to_owned(),
+                },
+            ),
+            (
+                strings(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
+                Command::PromoteUser {
+                    identity: Identity::User("flynn".to_owned()),
+                    user_id: "mike".to_owned(),
+                    is_admin: false,
+                },
+            ),
+            (
+                strings(&[
+                    "setup",
+                    "--base-dir",
+                    "/tmp/tightbeam",
+                    "--harness",
+                    "claude,codex",
+                    "--force",
+                ]),
+                Command::Setup(SetupArgs {
+                    base_dir: Some("/tmp/tightbeam".to_owned()),
+                    harnesses: vec!["claude".to_owned(), "codex".to_owned()],
+                    force: true,
+                }),
+            ),
+            (
+                strings(&[
+                    "assimilate",
+                    "flynn@host",
+                    "--name",
+                    "host",
+                    "--base-dir",
+                    "/srv/tightbeam",
+                    "--harness",
+                    "codex",
+                    "--push-credentials",
+                    "--no-onboard",
+                    "--dry-run",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::Assimilate(AssimilateArgs {
+                    ssh_dest: "flynn@host".to_owned(),
+                    as_user: "flynn".to_owned(),
+                    name: Some("host".to_owned()),
+                    base_dir: "/srv/tightbeam".to_owned(),
+                    harnesses: vec!["codex".to_owned()],
+                    push_credentials: true,
+                    no_onboard: true,
+                    dry_run: true,
+                }),
+            ),
+        ];
+
+        for (args, expected) in commands {
+            assert_eq!(parse(args), Ok(expected));
+        }
+
         fs::remove_file(skill_path).unwrap();
-        assert!(matches!(skill_put, Ok(Command::SkillPut { .. })));
     }
 
     #[test]

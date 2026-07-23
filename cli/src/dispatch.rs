@@ -353,9 +353,6 @@ fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
 }
 
 pub fn run(command: Command) -> Result<(), String> {
-    let _ = crate::ceremonies::init as fn(crate::args::InitArgs) -> Result<(), String>;
-    let _ = crate::probe::run as fn(bool, Option<String>) -> Result<(), String>;
-
     match command {
         Command::Help => unreachable!("help is handled before dispatch"),
         Command::Setup(args) => crate::ceremonies::setup(args),
@@ -515,6 +512,85 @@ mod tests {
             body(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"promote-user","params":{"userId":"mike","isAdmin":false}}"#
         );
+    }
+
+    #[test]
+    fn builds_byte_exact_bodies_for_all_remaining_dispatch_commands() {
+        for (args, expected) in [
+            (
+                &["list", "--as", "coder"][..],
+                r#"{"as":"coder","verb":"inspect","params":{}}"#,
+            ),
+            (
+                &[
+                    "retire",
+                    "--session",
+                    "agent:r",
+                    "--key",
+                    "retire-k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"idempotencyKey":"retire-k"}}"#,
+            ),
+            (
+                &["cancel-wake", "wake-1", "--as-process", "cron"][..],
+                r#"{"asProcess":"cron","verb":"wake","params":{"cancelWakeId":"wake-1"}}"#,
+            ),
+            (
+                &[
+                    "role",
+                    "create",
+                    "reviewer",
+                    "--bind",
+                    "agent:r",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"role-create","params":{"name":"reviewer","bind":"agent:r"}}"#,
+            ),
+            (
+                &["role", "rm", "reviewer", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"role-rm","params":{"name":"reviewer"}}"#,
+            ),
+            (
+                &["role", "list", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"role-list","params":{}}"#,
+            ),
+            (
+                &["skill", "list", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"skill-list","params":{}}"#,
+            ),
+            (
+                &["skill", "rm", "swift", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"skill-rm","params":{"name":"swift"}}"#,
+            ),
+            (
+                &[
+                    "approve-device",
+                    "device-1",
+                    "--user",
+                    "mike",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"approve-device","params":{"deviceId":"device-1","userId":"mike"}}"#,
+            ),
+            (
+                &["deny-device", "device-2", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"deny-device","params":{"deviceId":"device-2"}}"#,
+            ),
+            (
+                &["revoke-device", "device-3", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"revoke-device","params":{"deviceId":"device-3"}}"#,
+            ),
+            (
+                &["promote-user", "mike", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"promote-user","params":{"userId":"mike","isAdmin":true}}"#,
+            ),
+        ] {
+            assert_eq!(body(args), expected);
+        }
     }
 
     #[test]
