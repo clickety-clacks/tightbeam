@@ -625,6 +625,17 @@ defmodule Tightbeam.Archetypes do
     "product-discovery"
   ]
 
+  @kungfu_template_paths [
+    "archetypes/<name>-role.toml",
+    "guidance/<name>-role.md",
+    "skills/<name>-example/SKILL.md",
+    "rails/<name>-example.toml",
+    "kungfu/<name>/capabilities.md",
+    "kungfu/<name>/preferred-models.md",
+    "kungfu/<name>/intake.md",
+    "kungfu/<name>/README.md"
+  ]
+
   @doc """
   The org skills LIBRARY (spec §Agent identity: "skills chosen by name from
   one shared library"): `<base_dir>/identity/skills/<name>/SKILL.md`.
@@ -772,6 +783,49 @@ defmodule Tightbeam.Archetypes do
   end
 
   @doc """
+  Writes a valid, unelected kungfu starter into the identity repository's
+  scanned and bundle-local homes, then records the whole scaffold as one
+  attributed commit.
+  """
+  @spec scaffold_kungfu!(String.t(), String.t(), String.t()) :: [String.t()]
+  def scaffold_kungfu!(base_dir, name, author) do
+    name = validate_kungfu_name!(name)
+    init_identity!(base_dir)
+    identity_dir = Path.join(base_dir, "identity")
+
+    targets =
+      Enum.map(@kungfu_template_paths, fn template_relative ->
+        target_relative = String.replace(template_relative, "<name>", name)
+
+        content =
+          :tightbeam
+          |> Application.app_dir(Path.join("priv/kungfu-template", template_relative))
+          |> File.read!()
+          |> String.replace("<name>", name)
+
+        {Path.join(identity_dir, target_relative), content}
+      end)
+
+    case Enum.find(targets, fn {path, _content} -> File.exists?(path) end) do
+      {path, _content} ->
+        relative = Path.relative_to(path, identity_dir)
+        raise ArgumentError, "kungfu scaffold target already exists: identity/#{relative}"
+
+      nil ->
+        :ok
+    end
+
+    Enum.each(targets, fn {path, content} ->
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, content)
+    end)
+
+    paths = Enum.map(targets, &elem(&1, 0))
+    commit_identity!(base_dir, paths, "kungfu-scaffold: #{name}", author)
+    paths
+  end
+
+  @doc """
   Remove a skill (or tree node). Removing an elected root is a transform:
   the library content is deleted and the current manifest electors and
   restart warnings are returned to the caller. Boot validation remains
@@ -868,6 +922,15 @@ defmodule Tightbeam.Archetypes do
 
     unless valid?, do: raise(ArgumentError, "invalid skill name: #{inspect(name)}")
     Enum.join(segments, "/")
+  end
+
+  defp validate_kungfu_name!(name) do
+    valid? =
+      is_binary(name) and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, name) and
+        not String.contains?(name, "--") and not String.ends_with?(name, "-")
+
+    unless valid?, do: raise(ArgumentError, "invalid kungfu name: #{inspect(name)}")
+    name
   end
 
   @doc "The built-in default archetype (used when no manifest overrides it)."

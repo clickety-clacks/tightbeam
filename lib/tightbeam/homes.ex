@@ -72,7 +72,8 @@ defmodule Tightbeam.Homes do
     "tightbeam-onboarding",
     "tightbeam-guidance-authoring",
     "tightbeam-law-minting",
-    "tightbeam-archetype-cultivation"
+    "tightbeam-archetype-cultivation",
+    "tightbeam-kungfu-crafting"
   ]
 
   @doc "Ordered names reserved for the substrate skills baseline."
