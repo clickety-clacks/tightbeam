@@ -435,10 +435,34 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(artifact_path))
     File.write!(artifact_path, "banana")
 
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items
+          (id, title, createdByUser, createdAt)
+        VALUES ('wi_banana', 'Banana', 'flynn', 1)
+        """
+      )
+
+    for message_id <- ~w(msg_banana_artifact msg_external_artifact) do
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO messages
+            (id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+          VALUES (?1, ?2, 'assistant', 'artifact-record', 1, ?1)
+          """,
+          [message_id, session.session_key]
+        )
+    end
+
     artifact =
       Artifacts.record(ctx.db, %{
         principal: {:session, session.session_key},
         session_key: session.session_key,
+        recorded_message_id: "msg_banana_artifact",
         params: %{
           kind: "spec",
           title: "Banana spec",
@@ -451,10 +475,12 @@ defmodule Tightbeam.GatewayTest do
       Artifacts.record(ctx.db, %{
         principal: {:session, session.session_key},
         session_key: session.session_key,
+        recorded_message_id: "msg_external_artifact",
         params: %{
           kind: "report",
           title: "External report",
-          origin_path: "/outside/report.md"
+          origin_path: "/outside/report.md",
+          work_item_id: "wi_banana"
         }
       })
 
@@ -474,9 +500,9 @@ defmodule Tightbeam.GatewayTest do
     assert archived.home == Path.join(archive_dir, "specs/banana.md")
     assert File.read!(archived.home) == "banana"
 
-    archived_external = Artifacts.get(ctx.db, external.artifact_id)
-    assert archived_external.state == "archived"
-    assert archived_external.home == archive_dir
+    unchanged_external = Artifacts.get(ctx.db, external.artifact_id)
+    assert unchanged_external.state == "in-workspace"
+    assert unchanged_external.home == nil
   end
 
   test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
