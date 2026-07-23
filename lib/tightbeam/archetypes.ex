@@ -595,6 +595,7 @@ defmodule Tightbeam.Archetypes do
     "recon" => [
       "recon-first-investigation",
       "recon-lifecycle",
+      "bug-provenance",
       "tightbeam-law-minting",
       "tightbeam-guidance-authoring"
     ],
@@ -621,6 +622,7 @@ defmodule Tightbeam.Archetypes do
     "review-for-yagni",
     "recon-first-investigation",
     "recon-lifecycle",
+    "bug-provenance",
     "drafting-requirements",
     "product-discovery"
   ]
