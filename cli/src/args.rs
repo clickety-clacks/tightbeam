@@ -46,6 +46,11 @@ pub enum Command {
         scope: Option<String>,
         idempotency_key: Option<String>,
     },
+    FactsRead {
+        identity: Identity,
+        kind: String,
+        scope: Option<String>,
+    },
     Rule {
         identity: Identity,
         request_id: String,
@@ -228,6 +233,15 @@ pub enum Command {
         user_id: String,
         is_admin: bool,
     },
+    ConfigGet {
+        identity: Identity,
+        setting: String,
+    },
+    ConfigSet {
+        identity: Identity,
+        setting: String,
+        value: String,
+    },
     Init(InitArgs),
     Setup(SetupArgs),
     Assimilate(AssimilateArgs),
@@ -299,6 +313,9 @@ COMMANDS:
       File an org/product condition fact. Reserved substrate kinds cannot be
       filed through this command.
         tightbeam condition --kind deploy-succeeded --scope prod --key deploy-8f2a
+
+  facts-read --kind <kind> [--scope <scope>]
+      Read the latest matching condition fact.
 
   rule --request <id> --decision <allow|deny|option> [--rationale "..."]
       Resolve one open decision request.
@@ -394,6 +411,8 @@ COMMANDS:
   deny-device <deviceId>                         reject a pending device
   revoke-device <deviceId>                       revoke a device's token
   promote-user <userId> [--demote]               grant/remove admin on a user
+  config get default-archetype                   read the default spawn archetype
+  config set default-archetype <name>            set the default spawn archetype
 
   setup [--base-dir p] [--harness claude,codex] [--force]
       Onboard harness credentials for THIS machine's org (run once at
@@ -695,6 +714,19 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 kind,
                 scope: nonempty(flags, "scope"),
                 idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "facts-read" => {
+            if parsed.positional.get(1).is_some() {
+                return Err(
+                    "usage: tightbeam facts-read --kind <kind> [--scope <scope>]".to_owned(),
+                );
+            }
+            let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
+            Ok(Command::FactsRead {
+                identity: identity(flags)?,
+                kind,
+                scope: nonempty(flags, "scope"),
             })
         }
         "rule" => {
@@ -1093,6 +1125,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 is_admin: !flags.contains_key("demote"),
             })
         }
+        "config" => parse_config(&parsed, flags),
         "init" => {
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| flag != "base-dir")
@@ -1138,8 +1171,31 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe"
         )),
+    }
+}
+
+fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    match (
+        parsed.positional.get(1).map(String::as_str),
+        parsed.positional.get(2).map(String::as_str),
+        parsed.positional.get(3),
+        parsed.positional.get(4),
+    ) {
+        (Some("get"), Some("default-archetype"), None, None) => Ok(Command::ConfigGet {
+            identity: identity(flags)?,
+            setting: "default-archetype".to_owned(),
+        }),
+        (Some("set"), Some("default-archetype"), Some(value), None) => Ok(Command::ConfigSet {
+            identity: identity(flags)?,
+            setting: "default-archetype".to_owned(),
+            value: value.clone(),
+        }),
+        _ => Err(
+            "usage: tightbeam config get default-archetype | config set default-archetype <name>"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1382,7 +1438,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -1489,6 +1545,13 @@ mod tests {
                 "k",
             ]),
             strings(&[
+                "facts-read",
+                "--kind",
+                "tour-given",
+                "--scope",
+                "agent:tour:app",
+            ]),
+            strings(&[
                 "spawn",
                 "--display",
                 "Worker",
@@ -1535,6 +1598,15 @@ mod tests {
             strings(&["deny-device", "d1", "--as-user", "flynn"]),
             strings(&["revoke-device", "d1", "--as-user", "flynn"]),
             strings(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
+            strings(&["config", "get", "default-archetype", "--as-user", "flynn"]),
+            strings(&[
+                "config",
+                "set",
+                "default-archetype",
+                "coder",
+                "--as-user",
+                "flynn",
+            ]),
             strings(&["init"]),
             strings(&["init", "--base-dir", "/tmp/tb"]),
             strings(&["setup"]),

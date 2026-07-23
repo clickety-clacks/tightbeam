@@ -194,7 +194,7 @@ defmodule Tightbeam.Gateway do
     File.write!(gateway_path, JSON.encode!(%{port: config.port, cliToken: cli_token}))
     File.chmod!(gateway_path, 0o600)
     cli_bin = install_cli_bin(config.base_dir)
-    defaults = defaults(config)
+    defaults = defaults(config, db)
     on_terminal = fn session_key, seq -> Supervision.notify_terminal(session_key, seq) end
     producer_config = Producers.load!(config.base_dir)
     producer_runner = Map.get(config, :producer_runner, Tightbeam.ProducerRunner)
@@ -381,6 +381,7 @@ defmodule Tightbeam.Gateway do
           %{code: "invalid", message: "a condition fact requires a kind"}
         end
       end,
+      "facts-read" => fn call -> facts_read_result(db, call) end,
       "rule" => fn call ->
         Escalation.rule(db, call,
           authorized: admin_origin?(db, call.origin),
@@ -529,6 +530,7 @@ defmodule Tightbeam.Gateway do
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
+      "config" => admin_handler(db, fn p -> config_result(db, p) end),
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -937,11 +939,13 @@ defmodule Tightbeam.Gateway do
 
   defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
 
-  defp defaults(config) do
+  defp defaults(config, db) do
     harness = config.default_harness
 
     %{
-      archetype: "default",
+      # Invariant: only omitted archetypes consult the org default; an explicit
+      # spawn archetype is never replaced by organization policy.
+      archetype: Org.get_setting(db, "default-archetype") || "default",
       harness: harness,
       provider: if(harness == :codex, do: :openai, else: :anthropic),
       model: config.default_model
@@ -1568,6 +1572,32 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp config_result(db, %{action: "get", setting: "default-archetype"}) do
+    %{
+      setting: "default-archetype",
+      value: Org.get_setting(db, "default-archetype") || "default"
+    }
+  end
+
+  defp config_result(db, %{
+         action: "set",
+         setting: "default-archetype",
+         value: archetype_name
+       }) do
+    case Archetypes.get(archetype_name) do
+      nil ->
+        %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
+
+      _archetype ->
+        :ok = Org.put_setting(db, "default-archetype", archetype_name)
+        %{setting: "default-archetype", value: archetype_name}
+    end
+  end
+
+  defp config_result(_db, _params) do
+    %{code: "invalid", message: "config supports get/set default-archetype"}
+  end
+
   defp admin_handler(db, fun) do
     fn call ->
       if admin_origin?(db, call.origin),
@@ -1748,7 +1778,8 @@ defmodule Tightbeam.Gateway do
                 :model,
                 :origin,
                 :spawned_by,
-                :state
+                :state,
+                :created_at
               ])
             ),
           wakes: wakes,
@@ -1767,6 +1798,22 @@ defmodule Tightbeam.Gateway do
         else
           result
         end
+    end
+  end
+
+  defp facts_read_result(db, call) do
+    p = call.params
+
+    cond do
+      not (is_binary(p[:kind]) and p.kind != "") ->
+        %{code: "invalid", message: "facts-read requires a kind"}
+
+      not (is_nil(p[:scope]) or (is_binary(p.scope) and p.scope != "")) ->
+        %{code: "invalid", message: "facts-read scope must be a non-empty string"}
+
+      true ->
+        fact = ConditionFacts.latest(db, p.kind, p[:scope])
+        %{exists: not is_nil(fact), fact: fact}
     end
   end
 
@@ -1888,7 +1935,7 @@ defmodule Tightbeam.Gateway do
 
   defp create_spawn(config, db, call, caller) do
     p = call.params
-    defaults = defaults(config)
+    defaults = defaults(config, db)
     archetype_name = p[:archetype] || defaults.archetype
 
     # Identity must exist; placement is constitutional set membership
@@ -1917,7 +1964,7 @@ defmodule Tightbeam.Gateway do
 
   defp create_spawn(config, db, call, caller, archetype, host, overrides) do
     p = call.params
-    defaults = defaults(config)
+    defaults = defaults(config, db)
     harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
     harness_string = to_string(harness)
     harness_atom = if harness_string == "codex", do: :codex, else: :claude
@@ -2391,6 +2438,8 @@ defmodule Tightbeam.Gateway do
                 end)
               end)
 
+              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+
               %{
                 deleted_session_key: session.session_key,
                 retired_session_keys: Enum.map(result.retired, & &1.session_key),
@@ -2631,6 +2680,8 @@ defmodule Tightbeam.Gateway do
       end)
     end)
 
+    reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+
     %{
       ok: true,
       action: "stop",
@@ -2804,7 +2855,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp adjudicate_respawn(_config, db, call, episode) do
+  defp adjudicate_respawn(config, db, call, episode) do
     with {:ok, harness, provider} <- harness_for_ref(call.params.model) do
       old = Org.get(db, episode.session_key)
 
@@ -2939,6 +2990,8 @@ defmodule Tightbeam.Gateway do
         Payloads.stream_created(Payloads.stream_session(new_session))
       )
 
+      reap_retired_sessions(config, db, [old.session_key])
+
       %{
         ok: true,
         action: "respawn",
@@ -2957,6 +3010,75 @@ defmodule Tightbeam.Gateway do
       wake_id,
       System.system_time(:millisecond)
     ])
+  end
+
+  # Retire durability owns the ordering: every DB transition commits before
+  # this seam touches a harness. Adapters are shared by key, so each retired
+  # harness SID is closed independently and the adapter itself is closed only
+  # when no active session still shares that key. Every operation is guarded:
+  # an absent/dead adapter can never turn a committed retire into a failure.
+  defp reap_retired_sessions(_config, _db, []), do: :ok
+
+  defp reap_retired_sessions(config, db, session_keys) do
+    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+
+    session_keys
+    |> Enum.flat_map(fn session_key ->
+      with session when not is_nil(session) <- Org.get(db, session_key),
+           %{harness_session_id: sid} <- Org.current_pointer(db, session_key) do
+        [
+          %{
+            session_key: session_key,
+            sid: sid,
+            key: {String.to_existing_atom(session.harness), session.identity_name, session.host}
+          }
+        ]
+      else
+        _ -> []
+      end
+    end)
+    |> Enum.group_by(& &1.key)
+    |> Enum.each(fn {key, retired} -> reap_adapter_sessions(db, coordinator, key, retired) end)
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp reap_adapter_sessions(db, coordinator, key, retired) do
+    with {:ok, adapter, _generation} <- AdapterCoordinator.adapter_for(coordinator, key) do
+      Enum.each(retired, fn %{sid: sid} -> _ = Adapter.close_session(adapter, sid) end)
+
+      if live_session_on_adapter?(db, key) do
+        Enum.each(retired, fn %{session_key: session_key} ->
+          EventLog.lifecycle(
+            db,
+            "harness_context_resident",
+            session_key,
+            "harness context resident until adapter recycle"
+          )
+        end)
+      else
+        AdapterCoordinator.close_adapter(coordinator, key)
+      end
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp live_session_on_adapter?(db, {harness, identity_name, host}) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sessions WHERE state='active' AND harness=?1 AND identityName=?2 AND host=?3",
+        [Atom.to_string(harness), identity_name, host]
+      )
+
+    count > 0
   end
 
   defp harness_for_ref(ref) do

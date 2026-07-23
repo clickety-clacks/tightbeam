@@ -525,6 +525,16 @@ defmodule Tightbeam.Placement do
           do: [{"CODEX_PATH", codex_shim}],
           else: []
 
+      # Invariant: codex hooks are TRUST-gated under app-server; `bypass_hook_trust`
+      # is a thread/start request override only (not config.toml, not a CLI flag), and
+      # codex-acp spreads the CODEX_CONFIG env JSON into every thread/start config map.
+      # Without this seed the home's hooks.json is silently filtered as untrusted and
+      # the gate wiring-check fails closed.
+      codex_config_env =
+        if rails?,
+          do: [{"CODEX_CONFIG", codex_bypass_hook_trust_json()}],
+          else: []
+
       opts = [
         harness: harness,
         cmd: [binary],
@@ -537,7 +547,7 @@ defmodule Tightbeam.Placement do
             {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
             {"TIGHTBEAM_LINEAGE", lineage}
           ] ++
-            harness_token_env(config.base_dir, harness) ++ codex_path_env
+            harness_token_env(config.base_dir, harness) ++ codex_path_env ++ codex_config_env
       ]
 
       if contained? do
@@ -623,6 +633,13 @@ defmodule Tightbeam.Placement do
           []
         end
 
+      # Same trust-bypass seed as the local branch; single-quoted so the JSON value
+      # survives the remote shell's word evaluation (the env words are re-parsed there).
+      codex_config_env =
+        if rails?,
+          do: ["CODEX_CONFIG='#{codex_bypass_hook_trust_json()}'"],
+          else: []
+
       remote_env =
         (token_env ++
            [
@@ -631,7 +648,7 @@ defmodule Tightbeam.Placement do
              "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
              "PATH=#{cli_bin}:$PATH",
              "TIGHTBEAM_LINEAGE=#{lineage}"
-           ])
+           ] ++ codex_config_env)
         |> Enum.reject(&is_nil/1)
 
       # Remote/satellite follow-up: project the codex shim on cli_bin and set CODEX_PATH to
@@ -738,6 +755,11 @@ defmodule Tightbeam.Placement do
       Path.join([host_config.base_dir, "adapters", "node_modules", ".bin", adapter])
     end
   end
+
+  # The thread/start trust-bypass override, as the JSON object codex-acp expects in
+  # CODEX_CONFIG. Verified at codex rust-v0.145.0: this is the ONLY seam that arms
+  # untrusted hooks under app-server (permission-seam-spike.md, final reversal).
+  defp codex_bypass_hook_trust_json, do: ~s({"bypass_hook_trust":true})
 
   # The org's own long-lived grant, injected as the harness's token env —
   # the strongest form of the credential doctrine: an env token never

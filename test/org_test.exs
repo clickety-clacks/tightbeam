@@ -102,6 +102,20 @@ defmodule Tightbeam.OrgTest do
     assert session.session_key =~ ~r/^agent:main:clawline:flynn:main s_[0-9a-f]{8}$/
   end
 
+  test "organization settings put and get through the KV seam", %{db: db} do
+    assert Org.get_setting(db, "default-archetype") == nil
+    assert :ok = Org.put_setting(db, "default-archetype", "coder")
+    assert Org.get_setting(db, "default-archetype") == "coder"
+
+    assert :ok = Org.put_setting(db, "default-archetype", "reviewer")
+    assert Org.get_setting(db, "default-archetype") == "reviewer"
+
+    assert {:ok, [["default-archetype", "reviewer", updated_at]]} =
+             DB.query(db, "SELECT key, value, updatedAt FROM org_settings")
+
+    assert is_integer(updated_at)
+  end
+
   test "session CLI tokens are unique, active-only, and indexed", %{db: db} do
     first = Org.create(db, base(%{session_key: "token-1"}))
     second = Org.create(db, base(%{session_key: "token-2"}))

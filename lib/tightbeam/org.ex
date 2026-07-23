@@ -86,6 +86,11 @@ defmodule Tightbeam.Org do
     createdAt        INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS pointers_session ON harness_pointers (sessionKey, id);
+  CREATE TABLE IF NOT EXISTS org_settings (
+    key       TEXT PRIMARY KEY,
+    value     TEXT NOT NULL,
+    updatedAt INTEGER NOT NULL
+  );
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -115,6 +120,38 @@ defmodule Tightbeam.Org do
       DB.query(db, "UPDATE sessions SET identityName = archetype WHERE identityName IS NULL")
 
     result
+  end
+
+  @doc "Read an organization setting, or nil when it is unset."
+  @spec get_setting(db(), String.t()) :: String.t() | nil
+  def get_setting(db \\ Tightbeam.DB, key) do
+    {:ok, rows} = DB.query(db, "SELECT value FROM org_settings WHERE key = ?1", [key])
+
+    case rows do
+      [[value]] -> value
+      [] -> nil
+    end
+  end
+
+  @doc "Write an organization setting."
+  @spec put_setting(db(), String.t(), String.t()) :: :ok
+  def put_setting(db \\ Tightbeam.DB, key, value) do
+    transaction!(db, fn txn -> put_setting_in_txn(txn, key, value) end)
+  end
+
+  @doc false
+  @spec put_setting_in_txn(Txn.t(), String.t(), String.t()) :: :ok
+  def put_setting_in_txn(%Txn{} = txn, key, value) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO org_settings (key, value, updatedAt) VALUES (?1, ?2, ?3)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt
+      """,
+      [key, value, now()]
+    )
+
+    :ok
   end
 
   @doc """

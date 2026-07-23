@@ -55,6 +55,12 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:acquire_load_slot, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
+    def handle_call({:close_adapter, key}, _from, {adapter, parent} = state) do
+      if is_pid(parent), do: send(parent, {:close_adapter, key})
+      GenServer.stop(adapter)
+      {:reply, :ok, state}
+    end
+
     def handle_cast({:release_load_slot, _slot}, state), do: {:noreply, state}
   end
 
@@ -75,6 +81,11 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers}, _from, parent),
       do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
 
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:close_session, sid})
+      {:reply, :ok, parent}
+    end
+
     def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
       do:
         {:reply,
@@ -91,6 +102,17 @@ defmodule Tightbeam.GatewayTest do
                      ))
 
       {:noreply, parent}
+    end
+  end
+
+  defmodule CloseErrorAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:close_session_failed, sid})
+      {:reply, {:error, :closed}, parent}
     end
   end
 
@@ -356,6 +378,99 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
+  test "retiring the last live session closes its harness session and shared adapter", ctx do
+    ensure_global_registry()
+    session = create_session(ctx.db, "reap-last", "flynn")
+    session = Org.set_identity(ctx.db, session.session_key, nil, "reap-last-identity")
+    Org.append_pointer(ctx.db, session.session_key, "harness-last", "created")
+
+    adapter =
+      start_supervised!(%{
+        id: {:reap_adapter, System.unique_integer([:positive])},
+        start: {AdapterStub, :start_link, [self()]},
+        restart: :temporary
+      })
+
+    coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
+    monitor = Process.monitor(adapter)
+
+    result =
+      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [session.session_key]
+    assert_receive {:close_session, "harness-last"}
+    assert_receive {:close_adapter, {:claude, "reap-last-identity", "testhost"}}
+    assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
+  end
+
+  test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
+    ensure_global_registry()
+    retired = create_session(ctx.db, "reap-sibling-retired", "flynn")
+    retired = Org.set_identity(ctx.db, retired.session_key, nil, "reap-sibling-identity")
+    sibling = create_session(ctx.db, "reap-sibling-live", "flynn")
+    _sibling = Org.set_identity(ctx.db, sibling.session_key, nil, "reap-sibling-identity")
+    Org.append_pointer(ctx.db, retired.session_key, "harness-retired", "created")
+
+    adapter =
+      start_supervised!(%{
+        id: {:reap_adapter, System.unique_integer([:positive])},
+        start: {AdapterStub, :start_link, [self()]},
+        restart: :temporary
+      })
+
+    coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    result =
+      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+        origin: "user:flynn",
+        session_key: retired.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [retired.session_key]
+    assert_receive {:close_session, "harness-retired"}
+    refute_receive {:close_adapter, _key}
+    assert Process.alive?(adapter)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_context_resident" and
+               event.subject == retired.session_key and
+               event.detail == "harness context resident until adapter recycle"
+           end)
+  end
+
+  test "a harness session close error cannot fail the committed retire", ctx do
+    ensure_global_registry()
+    session = create_session(ctx.db, "reap-close-error", "flynn")
+    session = Org.set_identity(ctx.db, session.session_key, nil, "reap-error-identity")
+    Org.append_pointer(ctx.db, session.session_key, "harness-close-error", "created")
+
+    adapter =
+      start_supervised!(%{
+        id: {:reap_error_adapter, System.unique_integer([:positive])},
+        start: {CloseErrorAdapterStub, :start_link, [self()]},
+        restart: :temporary
+      })
+
+    coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    result =
+      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [session.session_key]
+    assert Org.get(ctx.db, session.session_key).state == "retired"
+    assert_receive {:close_session_failed, "harness-close-error"}
+    assert_receive {:close_adapter, {:claude, "reap-error-identity", "testhost"}}
+  end
+
   test "critical lease renewal is hard-capped and defers the entire cascade idempotently", ctx do
     root = create_session(ctx.db, "leased-root", "flynn")
     child = create_session(ctx.db, "leased-child", "flynn", root.session_key)
@@ -475,6 +590,9 @@ defmodule Tightbeam.GatewayTest do
         session_key: nil,
         params: %{}
       })
+
+    assert [%{created_at: created_at}] = inspect.sessions
+    assert created_at == session.created_at
 
     projections = [
       inspect,
@@ -818,6 +936,88 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
+  end
+
+  test "config validates, persists, and controls only omitted spawn archetypes", ctx do
+    base_dir = role_test_base("default-archetype")
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "coder.toml"), """
+    name = "coder"
+    """)
+
+    Archetypes.load!(base_dir)
+
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    config = handlers["config"]
+    spawn = handlers["spawn"]
+
+    assert %{setting: "default-archetype", value: "default"} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "get", setting: "default-archetype"}
+             })
+
+    fallback =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{display_name: "Fallback", idempotency_key: "spawn-fallback"}
+      })
+
+    assert Org.get(ctx.db, fallback.session_key).archetype == "default"
+
+    assert %{code: "unknown_archetype", message: "no such archetype: missing"} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-archetype", value: "missing"}
+             })
+
+    assert Org.get_setting(ctx.db, "default-archetype") == nil
+
+    assert %{setting: "default-archetype", value: "coder"} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-archetype", value: "coder"}
+             })
+
+    assert Org.get_setting(ctx.db, "default-archetype") == "coder"
+
+    configured =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{display_name: "Configured", idempotency_key: "spawn-configured"}
+      })
+
+    assert Org.get(ctx.db, configured.session_key).archetype == "coder"
+
+    explicit =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{
+          display_name: "Explicit",
+          archetype: "default",
+          idempotency_key: "spawn-explicit"
+        }
+      })
+
+    assert Org.get(ctx.db, explicit.session_key).archetype == "default"
+
+    assert %{code: "forbidden", message: "admin required"} =
+             config.(%{
+               origin: "user:not-admin",
+               params: %{action: "set", setting: "default-archetype", value: "default"}
+             })
+
+    assert Org.get_setting(ctx.db, "default-archetype") == "coder"
   end
 
   test "spawn readiness denial creates no session, role, or idempotency row", ctx do
@@ -2484,6 +2684,13 @@ defmodule Tightbeam.GatewayTest do
       provider: "anthropic",
       model: "fable"
     })
+  end
+
+  defp ensure_global_registry do
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
   end
 
   defp move_test_base(suffix) do

@@ -136,6 +136,17 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "condition", vec![], params))
         }
+        Command::FactsRead {
+            identity,
+            kind,
+            scope,
+        } => {
+            let mut params = vec![string_field("kind", kind)];
+            if let Some(value) = scope {
+                params.push(string_field("scope", value));
+            }
+            Ok(request(identity, "facts-read", vec![], params))
+        }
         Command::Rule {
             identity,
             request_id,
@@ -570,6 +581,29 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 bool_field("isAdmin", *is_admin),
             ],
         )),
+        Command::ConfigGet { identity, setting } => Ok(request(
+            identity,
+            "config",
+            vec![],
+            vec![
+                string_field("action", "get"),
+                string_field("setting", setting),
+            ],
+        )),
+        Command::ConfigSet {
+            identity,
+            setting,
+            value,
+        } => Ok(request(
+            identity,
+            "config",
+            vec![],
+            vec![
+                string_field("action", "set"),
+                string_field("setting", setting),
+                string_field("value", value),
+            ],
+        )),
     }
 }
 
@@ -757,6 +791,7 @@ fn identity_omitted(command: &Command) -> bool {
     let identity = match command {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
+        | Command::FactsRead { identity, .. }
         | Command::Rule { identity, .. }
         | Command::Waive { identity, .. }
         | Command::RevokeWaiver { identity, .. }
@@ -793,6 +828,7 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::DenyDevice { identity, .. }
         | Command::RevokeDevice { identity, .. }
         | Command::PromoteUser { identity, .. } => identity,
+        Command::ConfigGet { identity, .. } | Command::ConfigSet { identity, .. } => identity,
         Command::Help
         | Command::Probe { .. }
         | Command::Init(_)
@@ -939,6 +975,19 @@ mod tests {
             ]),
             r#"{"asProcess":"ci","verb":"condition","params":{"kind":"deploy-succeeded","scope":"prod","idempotencyKey":"deploy-1"}}"#
         );
+
+        assert_eq!(
+            body(&[
+                "facts-read",
+                "--kind",
+                "tour-given",
+                "--scope",
+                "agent:tour:app",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"facts-read","params":{"kind":"tour-given","scope":"agent:tour:app"}}"#
+        );
     }
 
     #[test]
@@ -1023,6 +1072,21 @@ mod tests {
         assert_eq!(
             body(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"promote-user","params":{"userId":"mike","isAdmin":false}}"#
+        );
+        assert_eq!(
+            body(&["config", "get", "default-archetype", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"default-archetype"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "default-archetype",
+                "coder",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
         );
     }
 

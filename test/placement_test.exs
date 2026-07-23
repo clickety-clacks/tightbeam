@@ -653,7 +653,7 @@ defmodule Tightbeam.PlacementTest do
     refute_receive {:unexpected_sh, _}
   end
 
-  test "adapter_opts prepares a local codex gate probe without CODEX_CONFIG", %{
+  test "adapter_opts prepares a local codex gate probe with the trust-bypass CODEX_CONFIG", %{
     base_dir: base_dir
   } do
     install_statute(base_dir)
@@ -671,7 +671,7 @@ defmodule Tightbeam.PlacementTest do
     config = %{base_dir: base_dir, cwd: "/work", cli_bin: cli_bin, default_model: "fable"}
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
-    refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
+    assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     assert {"CODEX_PATH", codex_shim} in opts[:env]
     assert opts[:probe_cwd] == probe_cwd
     assert opts[:probe_model] == "gpt-5.6-sol[medium]"
@@ -762,7 +762,7 @@ defmodule Tightbeam.PlacementTest do
     refute Enum.any?(opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
   end
 
-  test "adapter_opts prepares the remote codex probe without CODEX_CONFIG", %{
+  test "adapter_opts prepares the remote codex probe with the trust-bypass CODEX_CONFIG", %{
     base_dir: base_dir
   } do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
@@ -789,7 +789,7 @@ defmodule Tightbeam.PlacementTest do
     }
 
     opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
-    refute Enum.any?(opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
+    assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
     assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
     assert opts[:probe_model] == "gpt-5.6-sol[medium]"
 
