@@ -1,0 +1,9 @@
+[[rule]]
+name = "target-missing"
+verb = "attest"
+text = "missing assign target"
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[rule.remedy]
+action = "assign"
+produces = "reviewed-clean"

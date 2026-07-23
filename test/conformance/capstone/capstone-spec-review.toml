@@ -1,0 +1,19 @@
+[fixture]
+class = "Cap"
+name = "capstone-spec-review"
+phase = "pending"
+blocking_phase = "P7"
+kind = "capstone"
+source = "smoke §3 capstone spec-review judge"
+legibility = "event:denied(rule=capstone-spec-review);lifecycle:rail_remedy"
+[[fixture.rule]]
+name = "capstone-spec-review"
+verb = "attest"
+text = "a commissioned spec-reviewed verdict releases the gate"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [{ fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["spec-reviewed"] }]
+[fixture.rule.remedy]
+action = "assign"
+produces = "spec-reviewed"
+target_role = "reviewer"

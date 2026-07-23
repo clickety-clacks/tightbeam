@@ -1,0 +1,3 @@
+{"case":"ttl-reclaim-dedupes-dead-live-replaces","kind":"positive","expect":"run-remedy","reason":"stale-claimant-fencing","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}},"note":"wire rail-dispatch:statute:subject:occurrence; claimToken row-fences only; TTL preserves occurrence; proven dead plus wire inspection bumps"}
+{"case":"live-claimant-dispatches-once","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"fence-legible","kind":"legibility","expect":"run-remedy","reason":"stale-claimant-fencing","emits":"lifecycle:rail_remedy(outcome=fenced,occurrence=1,rewakeCount=0)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

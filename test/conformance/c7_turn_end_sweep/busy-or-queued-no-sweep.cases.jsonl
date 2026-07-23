@@ -1,0 +1,3 @@
+{"case":"busy-or-queued-suppresses","kind":"positive","expect":"none","reason":"busy-or-queued-no-sweep","world":{"ledger":{"session":"holder","pending":1}},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}
+{"case":"idle-unsatisfied-reobligates","kind":"negative","expect":"re-obligate","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}
+{"case":"suppression-legible","kind":"legibility","expect":"none","reason":"busy-or-queued-no-sweep","emits":"lifecycle:rail_sweep(decision=none,reason=busy-or-queued)","world":{"ledger":{"session":"holder","pending":1}},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

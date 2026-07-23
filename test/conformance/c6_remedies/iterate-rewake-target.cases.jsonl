@@ -1,0 +1,3 @@
+{"case":"changes-requested-rewakes-live-target","kind":"positive","expect":"run-remedy","reason":"iterate-rewake-target","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"changes-requested"}},"note":"occurrence unchanged; rewakeCount increments; no respawn"}
+{"case":"closed-episode-does-not-rewake","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"reviewed-clean"}}}
+{"case":"rewake-legible","kind":"legibility","expect":"run-remedy","reason":"iterate-rewake-target","emits":"lifecycle:rail_remedy(outcome=rewake,target=live-producer)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"changes-requested"}}}

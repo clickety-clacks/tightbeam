@@ -1,0 +1,19 @@
+[fixture]
+class = "C6"
+name = "unbound-reviewer-remedy"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism lattice loud target resolution"
+legibility = "event:denied(reason=unbound,rule=unbound-reviewer-remedy)"
+[[fixture.rule]]
+name = "unbound-reviewer-remedy"
+verb = "attest"
+text = "reviewer remedy target resolution is loud"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"

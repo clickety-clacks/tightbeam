@@ -1,0 +1,3 @@
+{"case":"missing-yagni-judge-fires-remedy","kind":"positive","expect":"run-remedy","reason":"capstone-yagni-judge","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}
+{"case":"commissioned-yagni-clean-passes","kind":"negative","expect":"pass","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"yagni-loop-legible","kind":"legibility","expect":"run-remedy","reason":"capstone-yagni-judge","emits":"event:denied(rule=capstone-yagni-judge);lifecycle:rail_remedy(outcome=live)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

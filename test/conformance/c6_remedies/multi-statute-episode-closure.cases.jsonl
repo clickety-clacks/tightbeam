@@ -1,0 +1,3 @@
+{"case":"actor-closes-per-statute-subject","kind":"positive","expect":"run-remedy","reason":"multi-statute-episode-closure","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}},"note":"consumes {decision,to_close,to_consume}; UPDATE constrained by statute and subject; unrelated live episode remains"}
+{"case":"unsatisfied-episode-remains-live","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"closure-legible","kind":"legibility","expect":"run-remedy","reason":"multi-statute-episode-closure","emits":"lifecycle:rail_remedy(outcome=closed,scope=statute+subject)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

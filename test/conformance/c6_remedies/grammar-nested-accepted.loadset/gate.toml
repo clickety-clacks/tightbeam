@@ -1,0 +1,10 @@
+[[rule]]
+name = "grammar-nested-accepted"
+verb = "attest"
+text = "nested check loads"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[rule.check]
+script = "reconcile-with-main"
+returns = ["reconciled"]
+[rule.check.effects]
+reconciled = "allow"

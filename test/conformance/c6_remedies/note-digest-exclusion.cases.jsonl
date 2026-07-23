@@ -1,0 +1,3 @@
+{"case":"note-change-dedupes-same-occurrence","kind":"positive","expect":"run-remedy","reason":"note-digest-exclusion","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}},"note":"note content excluded from occurrence/wire digest"}
+{"case":"material-change-gets-distinct-digest","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"digest-dedupe-legible","kind":"legibility","expect":"run-remedy","reason":"note-digest-exclusion","emits":"lifecycle:rail_remedy(outcome=live,deduped_note=true)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

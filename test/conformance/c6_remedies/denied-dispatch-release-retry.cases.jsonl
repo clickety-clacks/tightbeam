@@ -1,0 +1,3 @@
+{"case":"denied-dispatch-deletes-lease","kind":"positive","expect":"run-remedy","reason":"denied-dispatch-release-retry","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}},"note":"records blocked; not live; next verb or sweep reclaims; no timer"}
+{"case":"successful-dispatch-holds-live-lease","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"blocked-retry-legible","kind":"legibility","expect":"run-remedy","reason":"denied-dispatch-release-retry","emits":"lifecycle:rail_remedy(outcome=blocked,lease=deleted)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

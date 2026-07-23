@@ -1,0 +1,9 @@
+[loadset]
+name = "remedy-target-missing"
+class = "C6"
+phase = "pending"
+blocking_phase = "P5"
+outcome = "load-raise"
+must_name = ["target-missing", "target_role"]
+error_match = "target"
+source = "mechanism §C1 missing remedy target"

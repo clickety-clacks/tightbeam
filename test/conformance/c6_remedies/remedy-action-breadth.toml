@@ -1,0 +1,21 @@
+[fixture]
+class = "C6"
+name = "remedy-action-breadth"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism §C1 target schemas"
+legibility = "event:denied(rule=remedy-action-breadth);lifecycle:rail_remedy"
+[[fixture.rule]]
+name = "remedy-action-breadth"
+verb = "attest"
+text = "assign wake and spawn remedies resolve declared targets"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"
+[fixture.rule.remedy.params]
+subject = "review {assignment_id}"

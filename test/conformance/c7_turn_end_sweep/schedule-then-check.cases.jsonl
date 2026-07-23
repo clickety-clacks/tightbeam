@@ -1,0 +1,3 @@
+{"case":"already-ruled-cancels-new-park","kind":"positive","expect":"escalate-continue","reason":"schedule-then-check","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}},"note":"wake first then recovered-check; cancel wake; no-replay cursor prevents stale replay"}
+{"case":"later-ruling-uses-ordinary-wake","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"ordering-legible","kind":"legibility","expect":"escalate-continue","reason":"schedule-then-check","emits":"lifecycle:rail_sweep(decision=escalate-continue,parkWake=cancelled)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

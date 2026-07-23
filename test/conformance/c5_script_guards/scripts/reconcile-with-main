@@ -1,0 +1,6 @@
+#!/bin/sh
+case "${TIGHTBEAM_CONFORMANCE_RETURN:-reconciled}" in
+  timeout) sleep 60 ;;
+  error:*) exit 13 ;;
+  *) printf '%s\n' "${TIGHTBEAM_CONFORMANCE_RETURN:-reconciled}" ;;
+esac

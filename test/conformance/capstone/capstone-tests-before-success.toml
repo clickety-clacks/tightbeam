@@ -1,0 +1,15 @@
+[fixture]
+class = "Cap"
+name = "capstone-tests-before-success"
+phase = "pending"
+blocking_phase = "P7"
+kind = "capstone"
+source = "smoke §3 capstone tests-before-success"
+legibility = "event:denied(rule=capstone-tests-before-success);lifecycle:rail_script; lifecycle:rail_sweep"
+[[fixture.rule]]
+name = "capstone-tests-before-success"
+verb = "attest"
+text = "reconcile then require mechanically produced tests"
+edges = ["verb", "turn-end"]
+deny_when = [{ fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["tests-passed"] }]
+external_producer = true

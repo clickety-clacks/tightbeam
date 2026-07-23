@@ -1,0 +1,22 @@
+[fixture]
+class = "C5"
+name = "files-touched-observed"
+phase = "pending"
+blocking_phase = "P4"
+kind = "script-guard"
+source = "mechanism §A; P3 §5E observed-set follow-on"
+legibility = "event:denied(reason=rule_denied,rule=files-touched-observed);lifecycle:rail_script"
+
+[[fixture.rule]]
+name = "files-touched-observed"
+verb = "attest"
+text = "observed branch changes must stay within the declared file set"
+edges = ["verb"]
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.check]
+script = "files-touched-observed"
+returns = ["within-declared", "outside-declared"]
+timeout_ms = 5000
+[fixture.rule.check.effects]
+within-declared = "allow"
+outside-declared = "deny"

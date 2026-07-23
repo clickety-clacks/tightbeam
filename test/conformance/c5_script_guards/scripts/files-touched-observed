@@ -1,0 +1,2 @@
+#!/bin/sh
+printf '%s\n' "${TIGHTBEAM_CONFORMANCE_RETURN:-within-declared}"

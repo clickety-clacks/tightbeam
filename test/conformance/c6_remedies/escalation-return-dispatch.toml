@@ -1,0 +1,15 @@
+[fixture]
+class = "C6"
+name = "escalation-return-dispatch"
+phase = "pending-escalation-review"
+blocking_phase = "escalation-substrate-v1 review-clean"
+kind = "remedy"
+source = "mechanism r9 resolve/3 union; escalation-substrate-v1"
+legibility = "event:denied(rule=escalation-return-dispatch)"
+[[fixture.rule]]
+name = "escalation-return-dispatch"
+verb = "attest"
+text = "dispatch actor maps the unified escalation resolution union"
+edges = ["verb"]
+effect = "escalate"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]

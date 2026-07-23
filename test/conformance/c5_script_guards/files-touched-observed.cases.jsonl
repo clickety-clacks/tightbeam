@@ -1,0 +1,3 @@
+{"case":"outside-declared-denies","kind":"positive","expect":"deny","reason":"files-touched-observed","script_return":"outside-declared","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}
+{"case":"within-declared-passes","kind":"negative","expect":"pass","script_return":"within-declared","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}
+{"case":"observed-set-denial-legible","kind":"legibility","expect":"deny","reason":"files-touched-observed","emits":"event:denied(reason=rule_denied,rule=files-touched-observed);lifecycle:rail_script(return=outside-declared)","script_return":"outside-declared","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

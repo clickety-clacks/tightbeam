@@ -1,0 +1,15 @@
+[fixture]
+class = "C7"
+name = "sweep-never-consumes"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism escalation case 22 twin"
+legibility = "lifecycle:rail_sweep(decision=escalate-continue)"
+[[fixture.rule]]
+name = "sweep-never-consumes"
+verb = "attest"
+text = "a sweep allow never consumes the ruling"
+edges = ["turn-end", "verb"]
+effect = "escalate"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]

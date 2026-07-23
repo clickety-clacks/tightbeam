@@ -1,0 +1,3 @@
+{"case":"assign-wake-spawn-target-schemas-dispatch","kind":"positive","expect":"run-remedy","reason":"remedy-action-breadth","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}},"note":"matrix covers assign target_role; wake target_role|target_session; spawn name/harness/model"}
+{"case":"satisfied-gate-fires-no-action","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"action-dispatch-legible","kind":"legibility","expect":"run-remedy","reason":"remedy-action-breadth","emits":"event:denied(rule=remedy-action-breadth);lifecycle:rail_remedy(outcome=live)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

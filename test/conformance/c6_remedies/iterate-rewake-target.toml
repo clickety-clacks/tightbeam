@@ -1,0 +1,19 @@
+[fixture]
+class = "C6"
+name = "iterate-rewake-target"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism lattice iterate target"
+legibility = "lifecycle:rail_remedy(outcome=rewake)"
+[[fixture.rule]]
+name = "iterate-rewake-target"
+verb = "attest"
+text = "iteration rewakes the live remedy producer target"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "changes-requested" }]
+[fixture.rule.remedy]
+action = "wake"
+produces = "reviewed-clean"
+target_role = "reviewer"

@@ -1,0 +1,19 @@
+[fixture]
+class = "Cap"
+name = "capstone-reviewer-loop"
+phase = "pending"
+blocking_phase = "P7; reviewer teardown descoped: missing reviewer-retired/session-liveness observable and org rail"
+kind = "capstone"
+source = "smoke §3 capstone; Q2 named gap"
+legibility = "event:denied(rule=capstone-reviewer-loop);lifecycle:rail_remedy; lifecycle:rail_sweep"
+[[fixture.rule]]
+name = "capstone-reviewer-loop"
+verb = "attest"
+text = "commissioned cross-harness review releases completion"
+edges = ["verb", "turn-end"]
+effect = "remedy"
+deny_when = [{ fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"

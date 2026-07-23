@@ -1,0 +1,3 @@
+{"case":"unknown-role-refuses-loudly","kind":"positive","expect":"run-remedy","reason":"unbound-reviewer-remedy","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}},"note":"owner fallback only where declared; unknown reviewer role never silently chooses a target"}
+{"case":"bound-reviewer-dispatches","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"unbound-is-legible","kind":"legibility","expect":"run-remedy","reason":"unbound-reviewer-remedy","emits":"event:denied(reason=unbound,rule=unbound-reviewer-remedy);lifecycle:rail_remedy(outcome=blocked)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

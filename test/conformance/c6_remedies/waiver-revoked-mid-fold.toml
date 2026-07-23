@@ -1,0 +1,15 @@
+[fixture]
+class = "C6"
+name = "waiver-revoked-mid-fold"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism r8 prospective revocation"
+legibility = "event:denied(rule=waiver-revoked-mid-fold)"
+[[fixture.rule]]
+name = "waiver-revoked-mid-fold"
+verb = "attest"
+text = "waiver revocation affects only calls reaching the fold afterward"
+edges = ["verb"]
+effect = "escalate"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]

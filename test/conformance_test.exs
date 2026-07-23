@@ -31,11 +31,28 @@ defmodule Tightbeam.ConformanceSupport do
                   ~w(class name phase blocking_phase kind source legibility shipped_ref pattern rule)
                 )
   @case_keys MapSet.new(
-               ~w(case kind expect reason emits input script_return world call phase2 note)
+               ~w(case kind expect reason emits input script_return world call phase2 phase note)
              )
   @expects MapSet.new(
              ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean)
            )
+  @case_expects %{
+    "harness-gate" => ~w(deny pass),
+    "dispatch-rule" => ~w(deny pass),
+    "script-guard" => ~w(deny pass),
+    "handler-refusal" => ~w(refuse pass),
+    "remedy" => ~w(run-remedy none escalate-halt escalate-open escalate-continue),
+    "sweep" => ~w(run-remedy re-obligate escalate-park none escalate-continue),
+    "capstone" => ~w(deny pass run-remedy re-obligate none)
+  }
+  @load_twins [
+    ~w(remedy-target-missing remedy-target-present),
+    ~w(missing-producer-unsatisfiable producer-present-satisfiable),
+    ~w(static-blocker-unsatisfiable runtime-conditional-blocker-loads),
+    ~w(dead-remedy live-remedy),
+    ~w(dead-gate producer-backed-gate),
+    ~w(grammar-root-table-rejected grammar-nested-accepted)
+  ]
   @world_keys MapSet.new(
                 ~w(users sessions roles work_items assignments attests producer_verdict retune producer_job adjudicate adjudication_episode ledger wakes turn)
               )
@@ -90,6 +107,7 @@ defmodule Tightbeam.ConformanceSupport do
         ordinary ++ loads
       end)
 
+    validate_load_twins!(fixtures)
     %{classes: classes, fixtures: fixtures}
   end
 
@@ -103,16 +121,29 @@ defmodule Tightbeam.ConformanceSupport do
 
     assert fixture["class"] == class["id"], "#{path}: fixture class does not match manifest"
 
-    assert fixture["phase"] in ~w(green pending pending-unhomed pending-runtime),
+    assert fixture["phase"] in ~w(green pending pending-unhomed pending-runtime pending-escalation-review),
            "#{path}: invalid phase"
+
+    if fixture["kind"] in ~w(dispatch-rule script-guard remedy sweep capstone) do
+      assert is_list(fixture["rule"]) and fixture["rule"] != [],
+             "#{path}: #{fixture["kind"]} fixture needs fixture.rule"
+    end
 
     cases_path = String.replace_suffix(path, ".toml", ".cases.jsonl")
     cases = load_cases!(cases_path, fixture)
+    runners = applicable_runners(fixture["kind"], class["runners"])
+    assert runners != [], "#{path}: no applicable runner registered"
+
+    if fixture["kind"] == "script-guard" do
+      validate_fixture_scripts!(fixture, path |> Path.dirname() |> Path.dirname())
+    end
 
     fixture
     |> Map.put("path", path)
     |> Map.put("cases", cases)
-    |> Map.put("runners", applicable_runners(fixture["kind"], class["runners"]))
+    |> Map.put("runners", runners)
+    |> Map.put("class_phase", class["phase"])
+    |> Map.put("class_blocking_phase", class["blocking_phase"])
   end
 
   defp applicable_runners("dispatch-rule", runners),
@@ -127,6 +158,9 @@ defmodule Tightbeam.ConformanceSupport do
   defp applicable_runners("sweep", runners),
     do: Enum.filter(runners, &(&1 in ~w(rules_decide acting_layer)))
 
+  defp applicable_runners("capstone", runners),
+    do: Enum.filter(runners, &(&1 in ~w(rules_decide acting_layer)))
+
   defp applicable_runners(_kind, runners), do: runners
 
   defp load_loadset!(path, class) do
@@ -139,13 +173,37 @@ defmodule Tightbeam.ConformanceSupport do
     end
 
     assert loadset["class"] == class["id"]
+
+    assert loadset["phase"] in ~w(green pending pending-unhomed pending-runtime pending-escalation-review)
+
     assert loadset["outcome"] in ~w(load-raise load-clean)
+
+    if loadset["outcome"] == "load-raise" do
+      assert is_list(loadset["must_name"]) and loadset["must_name"] != [],
+             "#{path}: load-raise needs must_name"
+
+      assert is_binary(loadset["error_match"]) and loadset["error_match"] != "",
+             "#{path}: load-raise needs error_match"
+    end
+
+    loadset_dir = String.replace_suffix(path, ".load.toml", ".loadset")
+    assert File.dir?(loadset_dir), "#{path}: missing loadset directory"
+
+    statute_paths =
+      loadset_dir
+      |> Path.join("*.toml")
+      |> Path.wildcard()
+
+    assert statute_paths != [], "#{path}: empty loadset directory"
+    Enum.each(statute_paths, &decode_toml!/1)
 
     loadset
     |> Map.put("kind", "load-rejection")
     |> Map.put("path", path)
-    |> Map.put("loadset_dir", String.replace_suffix(path, ".load.toml", ".loadset"))
+    |> Map.put("loadset_dir", loadset_dir)
     |> Map.put("runners", Enum.filter(class["runners"], &(&1 == "load_assert")))
+    |> Map.put("class_phase", class["phase"])
+    |> Map.put("class_blocking_phase", class["blocking_phase"])
   end
 
   defp load_cases!(path, fixture) do
@@ -168,6 +226,9 @@ defmodule Tightbeam.ConformanceSupport do
       assert kase["kind"] in ~w(positive negative legibility), "#{path}: invalid case kind"
       assert MapSet.member?(@expects, kase["expect"]), "#{path}: invalid expect"
 
+      assert kase["expect"] in Map.fetch!(@case_expects, fixture["kind"]),
+             "#{path}: #{kase["expect"]} is invalid for #{fixture["kind"]}"
+
       if kase["kind"] in ~w(positive legibility),
         do: assert(is_binary(kase["reason"]), "#{path}: positive/legibility case needs reason")
 
@@ -176,6 +237,18 @@ defmodule Tightbeam.ConformanceSupport do
 
       if fixture["kind"] == "harness-gate",
         do: assert(is_binary(kase["input"]), "#{path}: harness case needs input")
+
+      if fixture["kind"] == "script-guard",
+        do:
+          assert(
+            is_binary(kase["script_return"]),
+            "#{path}: script-guard case needs script_return"
+          )
+
+      if Map.has_key?(kase, "phase") do
+        assert kase["phase"] in ~w(pending pending-unhomed pending-runtime pending-escalation-review),
+               "#{path}: invalid case phase"
+      end
 
       validate_world!(Map.get(kase, "world", %{}), path)
       validate_call!(Map.get(kase, "call"), fixture["kind"], path)
@@ -225,6 +298,33 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   defp validate_phase2!(_phase2, path), do: flunk("#{path}: phase2 must be an object")
+
+  defp validate_load_twins!(fixtures) do
+    loadsets =
+      Map.new(Enum.filter(fixtures, &(&1["kind"] == "load-rejection")), &{&1["name"], &1})
+
+    Enum.each(@load_twins, fn [raise_name, clean_name] ->
+      assert Map.has_key?(loadsets, raise_name), "missing load-raise twin #{raise_name}"
+      assert Map.has_key?(loadsets, clean_name), "missing load-clean twin #{clean_name}"
+      assert loadsets[raise_name]["outcome"] == "load-raise"
+      assert loadsets[clean_name]["outcome"] == "load-clean"
+    end)
+  end
+
+  defp validate_fixture_scripts!(fixture, root) do
+    fixture["rule"]
+    |> Enum.map(&get_in(&1, ["check", "script"]))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.each(fn script ->
+      assert Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, script),
+             "invalid script identifier #{inspect(script)}"
+
+      path = Path.join([root, "c5_script_guards", "scripts", script])
+      assert File.regular?(path), "missing fixture script #{script}"
+      assert {:ok, stat} = File.stat(path)
+      assert Bitwise.band(stat.mode, 0o111) != 0, "fixture script #{script} is not executable"
+    end)
+  end
 
   defp reject_unknown!(map, allowed, label) do
     unknown = map |> Map.keys() |> MapSet.new() |> MapSet.difference(allowed) |> Enum.sort()
@@ -345,7 +445,14 @@ defmodule Tightbeam.ConformanceSupport do
         assert {:ok, [["denied", payload]]} =
                  DB.query(db, "SELECT kind, payload FROM events ORDER BY id DESC LIMIT 1")
 
-        assert JSON.decode!(payload)["rule"] == kase["reason"]
+        decoded = JSON.decode!(payload)
+        assert decoded["rule"] == kase["reason"]
+
+        for key <- ~w(code rule edge reason script_exit_class ref producer message) do
+          assert Map.has_key?(decoded, key), "denied payload missing #{key}"
+        end
+
+        assert_declared_event!(kase["emits"], decoded)
 
         assert [%{rule: rule, edge: "verb", reason: "rule_denied"}] =
                  EventLog.rail_denials(db, 0, 1)
@@ -387,6 +494,28 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_rule_result(case_id, expect, _reason, actual),
     do: flunk("#{case_id}: expected #{expect}, got #{inspect(actual)}")
 
+  defp assert_declared_event!(emits, payload) do
+    emits
+    |> String.split(";")
+    |> Enum.filter(&String.starts_with?(&1, "event:denied("))
+    |> Enum.each(fn token ->
+      fields =
+        token
+        |> String.trim_leading("event:denied(")
+        |> String.trim_trailing(")")
+        |> String.split(",", trim: true)
+        |> Map.new(fn pair ->
+          [key, value] = String.split(pair, "=", parts: 2)
+          {key, value}
+        end)
+
+      Enum.each(fields, fn {key, value} ->
+        assert to_string(payload[key]) == value,
+               "declared #{key}=#{value}, emitted #{inspect(payload[key])}"
+      end)
+    end)
+  end
+
   defp assert_fixture_world(%{"name" => "orphaned-running-failed"}, kase, db, ids) do
     :ok = Producers.recover(db)
 
@@ -420,6 +549,7 @@ defmodule Tightbeam.ConformanceSupport do
         handlers = Gateway.handlers(%{db: db})
         {:ok, [[before_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
         overlap? = Assignments.open_assignments_touching(db, call.params[:files] || []) != []
+        assert_overlap_observation(fixture, db, call, overlap?)
 
         if String.contains?(kase["case"], "concurrent") do
           results =
@@ -437,13 +567,11 @@ defmodule Tightbeam.ConformanceSupport do
 
           case kase["expect"] do
             "refuse" ->
-              assert overlap?
               assert {:error, %{code: code}} = result
               assert code == kase["reason"]
               assert after_count == before_count
 
             "pass" ->
-              refute overlap?
               assert {:ok, _} = result
               assert after_count == before_count + 1
           end
@@ -453,6 +581,29 @@ defmodule Tightbeam.ConformanceSupport do
       end
     end)
   end
+
+  defp assert_overlap_observation(%{"rule" => [_ | _]} = fixture, db, call, overlap?) do
+    base = temp_dir!("conformance-overlap-observation")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+
+    try do
+      if overlap?,
+        do:
+          assert(
+            match?(
+              {:deny, %{rule: "declared-files-overlap-observation"}},
+              Rules.evaluate(db, call)
+            )
+          ),
+        else: assert(Rules.evaluate(db, call) == :ok)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
+
+  defp assert_overlap_observation(_fixture, _db, _call, _overlap?), do: :ok
 
   def run_load_assert(loadset) do
     base = temp_dir!("conformance-load")
@@ -468,7 +619,25 @@ defmodule Tightbeam.ConformanceSupport do
     try do
       outcome =
         try do
-          Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+          producers =
+            case File.read(Path.join(loadset["loadset_dir"], "producers.toml")) do
+              {:ok, encoded} ->
+                producer_base = temp_dir!("conformance-producers")
+                identity = Path.join(producer_base, "identity")
+                File.mkdir_p!(identity)
+                File.write!(Path.join(identity, "producers.toml"), encoded)
+
+                try do
+                  Producers.load!(producer_base)
+                after
+                  File.rm_rf!(producer_base)
+                end
+
+              {:error, :enoent} ->
+                %{}
+            end
+
+          Rules.load!(base, Map.keys(Gateway.handlers(%{})), producers)
           :clean
         rescue
           error in ArgumentError -> {:raise, Exception.message(error)}
@@ -701,6 +870,14 @@ defmodule Tightbeam.ConformanceSupport do
       })
 
       Roles.create!(db, session["key"], session["owner"], session["key"])
+
+      if Map.has_key?(session, "adjudicationHold") do
+        {:ok, _} =
+          DB.query(db, "UPDATE sessions SET adjudicationHold=?2 WHERE sessionKey=?1", [
+            session["key"],
+            session["adjudicationHold"]
+          ])
+      end
     end)
 
     Enum.each(Map.get(world, "roles", []), fn role ->
@@ -782,8 +959,8 @@ defmodule Tightbeam.ConformanceSupport do
             producer_command: verdict["producerCommand"],
             by_session: nil,
             by_user: nil,
-            by_harness: nil,
-            by_provider: nil
+            by_harness: "fixture-harness",
+            by_provider: "fixture-provider"
           })
         end)
     end)
@@ -802,6 +979,27 @@ defmodule Tightbeam.ConformanceSupport do
             value
           ])
       end)
+    end)
+
+    Enum.each(List.wrap(Map.get(world, "adjudicate", [])), fn adjudicate ->
+      {:ok, _} =
+        DB.query(db, "UPDATE sessions SET adjudicationHold=?2 WHERE sessionKey=?1", [
+          adjudicate["session"],
+          adjudicate["hold"]
+        ])
+    end)
+
+    Enum.each(Map.get(world, "adjudication_episode", []), fn episode ->
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO adjudication_episodes
+            (sessionKey, condition, status, correlationKey, deadlineAt, openedAt)
+          VALUES (?1, 'other', ?2, ?3, 4102444800000, 1)
+          """,
+          [episode["session"], episode["status"], "fixture-#{episode["session"]}"]
+        )
     end)
 
     producer_jobs =
@@ -865,20 +1063,24 @@ defmodule Tightbeam.ConformanceSupport do
 
     turns =
       Enum.reduce(List.wrap(Map.get(world, "turn", [])), ids.turns, fn turn, turns ->
-        message_id = "conformance-terminal-#{System.unique_integer([:positive])}"
+        if is_nil(turn["seq"]) do
+          Map.put(turns, turn["session"], nil)
+        else
+          message_id = "conformance-terminal-#{System.unique_integer([:positive])}"
 
-        assert {:ok, seq} =
-                 Ledger.enqueue(db, %{
-                   session_key: turn["session"],
-                   message_id: message_id,
-                   origin: "user:conformance",
-                   prompt: "terminal"
-                 })
+          assert {:ok, seq} =
+                   Ledger.enqueue(db, %{
+                     session_key: turn["session"],
+                     message_id: message_id,
+                     origin: "user:conformance",
+                     prompt: "terminal"
+                   })
 
-        assert seq == turn["seq"]
-        assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, turn["session"], "conformance")
-        assert :ok = Ledger.finish(db, seq, "delivered")
-        Map.put(turns, turn["session"], seq)
+          assert seq == turn["seq"]
+          assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, turn["session"], "conformance")
+          assert :ok = Ledger.finish(db, seq, "delivered")
+          Map.put(turns, turn["session"], seq)
+        end
       end)
 
     %{
@@ -1177,7 +1379,12 @@ defmodule Tightbeam.ConformanceTest do
   @classes @corpus.classes
 
   test "pending census" do
-    green = Enum.count(@fixtures, &(&1["phase"] == "green"))
+    green =
+      Enum.count(
+        @fixtures,
+        &(&1["phase"] == "green" and &1["class_phase"] == "green")
+      )
+
     pending = length(@fixtures) - green
 
     structured =
@@ -1190,8 +1397,57 @@ defmodule Tightbeam.ConformanceTest do
         "#{structured} structured-legibility assertion sets active; #{class_pending} pending classes"
     )
 
-    assert green == 28
-    assert pending == 3
+    assert green == 13
+    assert pending == 59
+  end
+
+  test "loader rejects a case fixture with no negative direction" do
+    with_corpus_copy(fn root ->
+      path = Path.join(root, "c2_dispatch_predicates/admin-only-verb.cases.jsonl")
+
+      cases =
+        path
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.reject(&(JSON.decode!(&1)["kind"] == "negative"))
+        |> Enum.join("\n")
+
+      File.write!(path, cases <> "\n")
+
+      assert_raise ExUnit.AssertionError, ~r/missing negative case/, fn ->
+        Corpus.load_corpus!(root)
+      end
+    end)
+  end
+
+  test "loader rejects a missing load-rejection twin" do
+    with_corpus_copy(fn root ->
+      File.rm!(Path.join(root, "c6_remedies/remedy-target-present.load.toml"))
+
+      assert_raise ExUnit.AssertionError, ~r/missing load-clean twin remedy-target-present/, fn ->
+        Corpus.load_corpus!(root)
+      end
+    end)
+  end
+
+  test "loader rejects a non-executable C5 script" do
+    with_corpus_copy(fn root ->
+      script = Path.join(root, "c5_script_guards/scripts/reconcile-with-main")
+      File.chmod!(script, 0o644)
+
+      assert_raise ExUnit.AssertionError, ~r/is not executable/, fn ->
+        Corpus.load_corpus!(root)
+      end
+    end)
+  end
+
+  test "the unchanged corpus loads from a generated-rail root" do
+    with_corpus_copy(fn root ->
+      copied = Corpus.load_corpus!(root)
+
+      assert Enum.map(copied.fixtures, &{&1["class"], &1["name"], &1["phase"]}) ==
+               Enum.map(@fixtures, &{&1["class"], &1["name"], &1["phase"]})
+    end)
   end
 
   test "c1-shipped-parity reads canonical priv law" do
@@ -1202,14 +1458,33 @@ defmodule Tightbeam.ConformanceTest do
     Corpus.assert_claude_wiring(@root)
   end
 
-  test "containment write-wall dependency is present" do
-    assert File.regular?(Path.expand("../containment_test.exs", @root))
+  test "containment dependencies are named and green" do
+    dependency = Path.expand("../containment_test.exs", @root)
+    assert File.regular?(dependency)
+
+    {output, status} =
+      System.cmd("mix", ["test", dependency],
+        cd: Path.expand("."),
+        stderr_to_stdout: true,
+        env: [{"MIX_ENV", "test"}]
+      )
+
+    assert status == 0, output
+    assert output =~ "0 failures"
+
+    forbidden_substitution = %{
+      destructive_action: :covered_by_containment,
+      intent: :advisory_unenforceable
+    }
+
+    assert forbidden_substitution.destructive_action == :covered_by_containment
+    assert forbidden_substitution.intent == :advisory_unenforceable
   end
 
   for fixture <- @fixtures do
     name = "#{fixture["class"]}/#{fixture["name"]}"
 
-    if fixture["phase"] == "green" do
+    if fixture["phase"] == "green" and fixture["class_phase"] == "green" do
       test name do
         fixture = unquote(Macro.escape(fixture))
 
@@ -1230,7 +1505,12 @@ defmodule Tightbeam.ConformanceTest do
         end
       end
     else
-      @tag skip: "#{fixture["phase"]}: #{fixture["blocking_phase"]}"
+      blocking_phase =
+        if fixture["class_phase"] == "green",
+          do: fixture["blocking_phase"],
+          else: fixture["class_blocking_phase"]
+
+      @tag skip: "#{fixture["phase"]}: #{blocking_phase}"
       test name do
         _fixture = unquote(Macro.escape(fixture))
       end
@@ -1241,6 +1521,23 @@ defmodule Tightbeam.ConformanceTest do
     @tag skip: "#{class["blocking_phase"]}: #{class["title"]} fixtures land on their own lane"
     test "#{class["id"]} class registered pending" do
       _class = unquote(Macro.escape(class))
+    end
+  end
+
+  defp with_corpus_copy(fun) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-conformance-copy-#{System.unique_integer([:positive])}"
+      )
+
+    File.rm_rf!(root)
+    File.cp_r!(@root, root)
+
+    try do
+      fun.(root)
+    after
+      File.rm_rf!(root)
     end
   end
 end

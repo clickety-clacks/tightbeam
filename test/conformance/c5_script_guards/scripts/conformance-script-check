@@ -1,6 +1,0 @@
-#!/bin/sh
-IFS= read -r input
-case "$input" in
-  *'"conformance_script_return":"allow"'*) printf '%s\n' allow ;;
-  *) printf '%s\n' deny ;;
-esac

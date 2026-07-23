@@ -1,0 +1,25 @@
+[fixture]
+class = "C7"
+name = "turn-end-script-gate"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism §D C5×C7 omission edge"
+legibility = "lifecycle:rail_script; lifecycle:rail_sweep(decision=run-remedy)"
+[[fixture.rule]]
+name = "turn-end-script-gate"
+verb = "attest"
+text = "turn-end script result may select a remedy"
+edges = ["turn-end"]
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.check]
+script = "reconcile-with-main"
+returns = ["remedy", "allow"]
+[fixture.rule.check.effects]
+remedy = "remedy"
+allow = "allow"
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"

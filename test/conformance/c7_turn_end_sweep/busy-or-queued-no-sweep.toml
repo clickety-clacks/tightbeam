@@ -1,0 +1,14 @@
+[fixture]
+class = "C7"
+name = "busy-or-queued-no-sweep"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism §D sweep suppression"
+legibility = "lifecycle:rail_sweep(decision=none)"
+[[fixture.rule]]
+name = "busy-or-queued-no-sweep"
+verb = "attest"
+text = "busy or queued turns suppress the sweep"
+edges = ["turn-end"]
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]

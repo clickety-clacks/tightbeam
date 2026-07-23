@@ -1,0 +1,3 @@
+{"case":"remedy-token-runs-remedy","kind":"positive","expect":"run-remedy","reason":"turn-end-script-gate","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}
+{"case":"allow-token-records-none","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"script-sweep-legible","kind":"legibility","expect":"run-remedy","reason":"turn-end-script-gate","emits":"lifecycle:rail_script(return=remedy);lifecycle:rail_sweep(decision=run-remedy)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}

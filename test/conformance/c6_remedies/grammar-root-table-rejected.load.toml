@@ -1,0 +1,9 @@
+[loadset]
+name = "grammar-root-table-rejected"
+class = "C6"
+phase = "pending"
+blocking_phase = "P5"
+outcome = "load-raise"
+must_name = ["check"]
+error_match = "unknown"
+source = "mechanism §A1 root check table rejected"

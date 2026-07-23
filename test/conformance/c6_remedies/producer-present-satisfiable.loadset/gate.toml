@@ -1,0 +1,5 @@
+[[rule]]
+name = "needs-tests"
+verb = "attest"
+text = "completion requires produced tests"
+deny_when = [{ fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["tests-passed"] }]

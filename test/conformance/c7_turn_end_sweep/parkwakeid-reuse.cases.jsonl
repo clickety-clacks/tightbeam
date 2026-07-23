@@ -1,0 +1,3 @@
+{"case":"second-pass-rereturns-dr-and-reuses-wake","kind":"positive","expect":"escalate-park","reason":"parkwakeid-reuse","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}},"note":"resolve returns nonnil dr_id; no second DR and no double park"}
+{"case":"first-pass-opens-one-dr-and-wake","kind":"negative","expect":"none","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"progress"}}}
+{"case":"reuse-legible","kind":"legibility","expect":"escalate-park","reason":"parkwakeid-reuse","emits":"lifecycle:rail_sweep(decision=escalate-park,parkWakeId=reused)","world":{},"call":{"verb":"attest","principal":null,"params":{"kind":"completion"}}}
