@@ -31,13 +31,61 @@ defmodule Tightbeam.Rules do
   turns a denial into an allowed call.
   """
 
-  alias Tightbeam.{Assignments, DB, Devices, Escalation, EventLog, Org, RailScript, Roles}
+  alias Tightbeam.{
+    Assignments,
+    DB,
+    Devices,
+    Escalation,
+    EventLog,
+    Org,
+    RailRemedy,
+    RailScript,
+    Roles
+  }
+
   import Bitwise
 
   @persist_key __MODULE__
-  @rule_keys MapSet.new(["name", "verb", "deny_when", "text", "edges", "check", "effect"])
+  @rule_keys MapSet.new([
+               "name",
+               "verb",
+               "deny_when",
+               "text",
+               "edges",
+               "check",
+               "effect",
+               "remedy",
+               "external_producer"
+             ])
   @condition_keys MapSet.new(["fact", "op", "value"])
   @check_keys MapSet.new(["script", "returns", "timeout_ms", "effects"])
+  @remedy_keys MapSet.new([
+                 "action",
+                 "produces",
+                 "target_role",
+                 "target_session",
+                 "name",
+                 "harness",
+                 "model",
+                 "archetype",
+                 "host",
+                 "params"
+               ])
+  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)
+  @embedded_fields ~w(subject prompt display)
+  @whole_fields ~w(target_role target_session reviews work_item name harness model archetype host after at)
+  @verdict_facts ~w(
+    assignment.verdicts
+    assignment.independent_verdict_kinds
+    assignment.cross_harness_verdict_kinds
+    assignment.cross_provider_verdict_kinds
+    assignment.produced_verdict_kinds
+  )
+  @independence_facts ~w(
+    assignment.independent_verdict_kinds
+    assignment.cross_harness_verdict_kinds
+    assignment.cross_provider_verdict_kinds
+  )
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
     "caller.origin_class" => :string,
@@ -71,12 +119,14 @@ defmodule Tightbeam.Rules do
           conditions: [condition()],
           edges: [String.t()],
           effect: String.t(),
-          check: map() | nil
+          check: map() | nil,
+          remedy: map() | nil,
+          external_producer: boolean()
         }
 
   @doc "Load and validate all rule files, replacing the currently active set."
-  @spec load!(String.t(), Enumerable.t()) :: [rule()]
-  def load!(base_dir, valid_verbs) do
+  @spec load!(String.t(), Enumerable.t(), map()) :: [rule()]
+  def load!(base_dir, valid_verbs, producers) do
     verbs = MapSet.new(valid_verbs)
 
     identity_manifest_sha = identity_manifest_sha(base_dir)
@@ -96,6 +146,7 @@ defmodule Tightbeam.Rules do
         :ok
     end
 
+    validate_satisfiability!(rules, verbs, producers)
     :persistent_term.put(@persist_key, rules)
     rules
   end
@@ -183,12 +234,22 @@ defmodule Tightbeam.Rules do
       validate_effect!(Map.get(rule, "effect", "deny"), check, Map.has_key?(rule, "effect"), fail)
 
     effects = if check, do: Map.values(check.effects), else: [effect]
+    remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail)
 
-    if "remedy" in effects,
-      do: fail.("effect remedy requires [rule.remedy] (roadmap phase P5)")
+    if "remedy" in effects and is_nil(remedy),
+      do: fail.("effect remedy requires [rule.remedy]")
+
+    if remedy && "remedy" not in effects,
+      do: fail.("[rule.remedy] requires a remedy effect")
 
     if "escalate" in effects,
       do: fail.("effect escalate requires the escalation actor wiring (not yet wired)")
+
+    external_producer = Map.get(rule, "external_producer", false)
+    unless is_boolean(external_producer), do: fail.("external_producer must be a boolean")
+
+    if external_producer and verdict_requirements(conditions) == [],
+      do: fail.("external_producer is valid only on a verdict-fact gate")
 
     %{
       name: raw_name,
@@ -198,6 +259,8 @@ defmodule Tightbeam.Rules do
       edges: edges,
       effect: effect,
       check: check,
+      remedy: remedy,
+      external_producer: external_producer,
       source: path,
       base_dir: base_dir,
       identity_manifest_sha: identity_manifest_sha
@@ -284,6 +347,164 @@ defmodule Tightbeam.Rules do
 
   defp validate_check!(_check, _base_dir, fail), do: fail.("check must be a table")
 
+  defp validate_remedy!(nil, _conditions, _check, _effects, _fail), do: nil
+
+  defp validate_remedy!(remedy, conditions, check, effects, fail) when is_map(remedy) do
+    unknown = unknown_keys(remedy, @remedy_keys)
+    if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
+
+    action = Map.get(remedy, "action")
+
+    unless action in ~w(assign wake spawn),
+      do: fail.("remedy action must be assign, wake, or spawn")
+
+    params = Map.get(remedy, "params", %{})
+    unless is_map(params), do: fail.("remedy params must be a table")
+
+    {required_top, allowed_top, required_params, allowed_params} =
+      case action do
+        "assign" ->
+          {~w(target_role), ~w(target_role), ~w(subject), ~w(subject reviews files work_item)}
+
+        "wake" ->
+          {[], ~w(target_role target_session), ~w(prompt), ~w(prompt after at)}
+
+        "spawn" ->
+          {~w(name harness model), ~w(name harness model archetype host), [], ~w(display)}
+      end
+
+    present_top =
+      remedy
+      |> Map.keys()
+      |> Enum.filter(&(&1 not in ~w(action produces params)))
+
+    missing_top = required_top -- present_top
+    if missing_top != [], do: fail.("remedy #{action} is missing #{Enum.join(missing_top, ", ")}")
+
+    extra_top = present_top -- allowed_top
+
+    if extra_top != [],
+      do: fail.("remedy #{action} has invalid targets: #{Enum.join(extra_top, ", ")}")
+
+    if action == "wake" and Enum.count(present_top, &(&1 in ~w(target_role target_session))) != 1,
+      do: fail.("remedy wake requires exactly one of target_role or target_session")
+
+    missing_params = required_params -- Map.keys(params)
+
+    if missing_params != [],
+      do: fail.("remedy #{action} params are missing #{Enum.join(missing_params, ", ")}")
+
+    extra_params = Map.keys(params) -- allowed_params
+
+    if extra_params != [],
+      do: fail.("remedy #{action} has invalid params: #{Enum.join(extra_params, ", ")}")
+
+    Enum.each(Map.take(remedy, present_top), fn {field, value} ->
+      validate_interpolation!(field, value, fail)
+    end)
+
+    Enum.each(params, fn
+      {"files", files} when is_list(files) ->
+        Enum.each(files, &validate_interpolation!("files", &1, fail))
+
+      {"files", _} ->
+        fail.("remedy files must be a non-empty list")
+
+      {field, value} ->
+        validate_interpolation!(field, value, fail)
+    end)
+
+    requirements = verdict_requirements(conditions)
+    produces = Map.get(remedy, "produces")
+
+    cond do
+      check && not is_nil(produces) ->
+        fail.("script-effect remedy must omit produces")
+
+      is_nil(check) and requirements == [] ->
+        fail.("predicate remedy requires a verdict-fact gate")
+
+      is_nil(check) and not valid_verdict_kind?(produces) ->
+        fail.("remedy produces must be a verdictKind required by the gate")
+
+      is_nil(check) and not Enum.any?(requirements, fn {_fact, kinds} -> produces in kinds end) ->
+        fail.("remedy produces #{inspect(produces)} but the gate does not require it")
+
+      true ->
+        :ok
+    end
+
+    if is_nil(check) and
+         Enum.any?(requirements, fn {fact, kinds} ->
+           fact in @independence_facts and produces in kinds
+         end) and params["reviews"] != "{assignment_id}" do
+      fail.("independence-fact remedy requires reviews = \"{assignment_id}\"")
+    end
+
+    if "remedy" not in effects, do: fail.("[rule.remedy] requires a remedy effect")
+
+    %{
+      action: action,
+      produces: produces,
+      target:
+        remedy
+        |> Map.take(allowed_top)
+        |> Map.new(fn {key, value} -> {String.to_atom(key), value} end),
+      params: Map.new(params, fn {key, value} -> {String.to_atom(key), value} end)
+    }
+  end
+
+  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail),
+    do: fail.("remedy must be a table")
+
+  defp validate_interpolation!(field, value, fail) when field in @embedded_fields do
+    unless is_binary(value), do: fail.("remedy #{field} must be a string")
+    validate_tokens!(value, fail)
+  end
+
+  defp validate_interpolation!("files", value, fail) do
+    unless is_binary(value), do: fail.("remedy files entries must be strings")
+    validate_whole_interpolation("files", value, fail)
+  end
+
+  defp validate_interpolation!(field, value, fail) when field in @whole_fields do
+    validate_whole_interpolation(field, value, fail)
+  end
+
+  defp validate_whole_interpolation(field, value, fail) when is_binary(value) do
+    validate_tokens!(value, fail)
+
+    if Regex.match?(~r/\{[^{}]+\}/, value) and
+         not Regex.match?(~r/^\{[a-z_]+\}$/, value) do
+      fail.("remedy #{field} must be a whole token or literal")
+    end
+  end
+
+  defp validate_whole_interpolation(field, value, _fail)
+       when field in ~w(after at) and is_integer(value),
+       do: :ok
+
+  defp validate_whole_interpolation(field, _value, fail),
+    do: fail.("remedy #{field} must be a whole token or literal")
+
+  defp validate_tokens!(value, fail) do
+    tokens =
+      Regex.scan(~r/\{([^{}]+)\}/, value, capture: :all_but_first)
+      |> List.flatten()
+
+    case Enum.find(tokens, &(&1 not in @binding_tokens)) do
+      nil -> :ok
+      token -> fail.("remedy uses unknown binding token {#{token}}")
+    end
+  end
+
+  defp valid_verdict_kind?(kind) when is_binary(kind) do
+    max = Application.get_env(:tightbeam, :max_verdict_kind_len, 64)
+    String.length(kind) in 1..max and Regex.match?(@name_re, kind)
+  end
+
+  defp valid_verdict_kind?(_kind), do: false
+
   defp validate_condition!(condition, index, fail) do
     unknown = unknown_keys(condition, @condition_keys)
 
@@ -350,13 +571,146 @@ defmodule Tightbeam.Rules do
     |> Enum.sort()
   end
 
+  defp validate_satisfiability!(rules, valid_verbs, producers) when is_map(producers) do
+    Enum.each(rules, &validate_producer_existence!(&1, producers))
+    Enum.each(rules, &validate_remedy_reachability!(&1, rules, valid_verbs))
+    validate_producer_cycles!(rules, producers)
+  end
+
+  defp validate_satisfiability!(_rules, _valid_verbs, producers) do
+    raise ArgumentError, "producer registry must be a map, got: #{inspect(producers)}"
+  end
+
+  defp validate_producer_existence!(%{check: check}, _producers) when not is_nil(check), do: :ok
+
+  defp validate_producer_existence!(rule, producers) do
+    Enum.each(verdict_requirements(rule.conditions), fn {fact, kinds} ->
+      covered? =
+        (rule.external_producer and fact != "assignment.produced_verdict_kinds") or
+          remedy_covers?(rule.remedy, fact, kinds) or
+          producer_registry_covers?(producers, fact, kinds)
+
+      unless covered? do
+        raise ArgumentError,
+              "#{rule.source}: rule #{inspect(rule.name)}: F1 unsatisfied verdict gate #{fact}; no producer for #{Enum.join(kinds, ", ")}"
+      end
+    end)
+  end
+
+  defp remedy_covers?(nil, _fact, _kinds), do: false
+  defp remedy_covers?(_remedy, "assignment.produced_verdict_kinds", _kinds), do: false
+
+  defp remedy_covers?(remedy, fact, kinds) do
+    remedy.produces in kinds and
+      (fact not in @independence_facts or remedy.params[:reviews] == "{assignment_id}")
+  end
+
+  defp producer_registry_covers?(producers, "assignment.produced_verdict_kinds", kinds) do
+    available =
+      []
+      |> maybe_add_producer_kind(producers, :tests, "tests-passed")
+      |> maybe_add_producer_kind(producers, :smoke, "real-run-passed")
+
+    Enum.any?(kinds, &(&1 in available))
+  end
+
+  defp producer_registry_covers?(_producers, _fact, _kinds), do: false
+
+  defp maybe_add_producer_kind(kinds, producers, key, verdict_kind) do
+    if is_binary(producers[key]) and producers[key] != "", do: [verdict_kind | kinds], else: kinds
+  end
+
+  defp validate_remedy_reachability!(%{remedy: nil}, _rules, _valid_verbs), do: :ok
+
+  defp validate_remedy_reachability!(rule, rules, valid_verbs) do
+    action = rule.remedy.action
+
+    unless MapSet.member?(valid_verbs, action) do
+      raise ArgumentError,
+            "#{rule.source}: rule #{inspect(rule.name)}: F2 handler #{inspect(action)} cannot admit remedy statute #{inspect(rule.name)}"
+    end
+
+    case Enum.find(rules, &provable_blocker?(&1, rule)) do
+      nil ->
+        :ok
+
+      blocker ->
+        raise ArgumentError,
+              "#{rule.source}: rule #{inspect(rule.name)}: F2 remedy statute #{inspect(rule.name)} is blocked by statute #{inspect(blocker.name)}"
+    end
+  end
+
+  defp provable_blocker?(candidate, remedy_rule) do
+    candidate.verb == remedy_rule.remedy.action and
+      is_nil(candidate.remedy) and
+      is_nil(candidate.check) and
+      candidate.effect == "deny" and
+      candidate.conditions != [] and
+      Enum.all?(candidate.conditions, &fixed_condition_true?(&1, remedy_rule.remedy))
+  end
+
+  defp fixed_condition_true?(
+         %{fact: "caller.origin_class", op: op, value: value},
+         _remedy
+       ) do
+    compare("remedy", op, value)
+  end
+
+  defp fixed_condition_true?(_condition, _remedy), do: false
+
+  defp validate_producer_cycles!(rules, producers) do
+    remedy_rules =
+      Enum.filter(
+        rules,
+        &(not is_nil(&1.remedy) and not escaping_static_producer?(&1, producers))
+      )
+
+    Enum.each(remedy_rules, fn rule ->
+      walk_producer_chain!(rule, rule, remedy_rules, [rule.name])
+    end)
+  end
+
+  defp escaping_static_producer?(%{external_producer: true}, _producers), do: true
+
+  defp escaping_static_producer?(rule, producers) do
+    requirements = verdict_requirements(rule.conditions)
+
+    requirements != [] and
+      Enum.all?(requirements, fn {fact, kinds} ->
+        producer_registry_covers?(producers, fact, kinds)
+      end)
+  end
+
+  defp walk_producer_chain!(root, current, rules, path) do
+    next_rules = Enum.filter(rules, &(&1.verb == current.remedy.action))
+
+    Enum.each(next_rules, fn next ->
+      if next.name in path do
+        raise ArgumentError,
+              "#{root.source}: rule #{inspect(root.name)}: F2 producer cycle between statutes #{inspect(current.name)} and #{inspect(next.name)}"
+      else
+        walk_producer_chain!(root, next, rules, [next.name | path])
+      end
+    end)
+  end
+
+  defp verdict_requirements(conditions) do
+    Enum.flat_map(conditions, fn
+      %{fact: fact, op: "not_in", value: kinds} when fact in @verdict_facts ->
+        [{fact, kinds}]
+
+      _ ->
+        []
+    end)
+  end
+
   defp decide_rules([], _db, _call, _cache, to_close, to_consume),
     do: {:allow, Enum.reverse(to_close), Enum.reverse(to_consume)}
 
   defp decide_rules([rule | rest], db, call, cache, to_close, to_consume) do
     case evaluate_conditions(rule.conditions, rule, db, call, cache) do
       {:no_match, cache} ->
-        decide_rules(rest, db, call, cache, to_close, to_consume)
+        decide_rules(rest, db, call, cache, maybe_close(rule, db, call, to_close), to_consume)
 
       {:error, fact} ->
         error =
@@ -408,8 +762,16 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  defp fold_effect("allow", _rule, rest, db, call, cache, to_close, to_consume, _exit_class),
-    do: decide_rules(rest, db, call, cache, to_close, to_consume)
+  defp fold_effect("allow", rule, rest, db, call, cache, to_close, to_consume, _exit_class),
+    do:
+      decide_rules(
+        rest,
+        db,
+        call,
+        cache,
+        maybe_close(rule, db, call, to_close),
+        to_consume
+      )
 
   defp fold_effect("deny", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
     error = denial_error(rule, call, "rule_denied", exit_class)
@@ -469,6 +831,15 @@ defmodule Tightbeam.Rules do
 
     params[:assignment_id] || params[:work_item_id] || params["assignment_id"] ||
       params["work_item_id"]
+  end
+
+  defp maybe_close(rule, db, call, to_close) do
+    subject = gated_ref(call)
+
+    if not is_nil(rule.remedy) and is_binary(subject) and
+         RailRemedy.live?(db, rule.name, subject),
+       do: [{rule.name, subject} | to_close],
+       else: to_close
   end
 
   defp evaluate_conditions([], _rule, _db, _call, cache), do: {:match, cache}
@@ -536,6 +907,9 @@ defmodule Tightbeam.Rules do
         {[], cache}
 
       {:process, _} ->
+        {[], cache}
+
+      {:remedy, _} ->
         {[], cache}
 
       {:agent, role_name} ->
@@ -774,6 +1148,12 @@ defmodule Tightbeam.Rules do
       {:process, _} ->
         {nil, cache}
 
+      {:remedy, _} ->
+        case Map.get(call, :principal) do
+          {:remedy, %{owner: owner}} -> {owner, cache}
+          _ -> {nil, cache}
+        end
+
       {:agent, role_name} ->
         value =
           case Roles.get(db, role_name) do
@@ -800,6 +1180,9 @@ defmodule Tightbeam.Rules do
 
   defp parse_origin(origin) when is_binary(origin) do
     case String.split(origin, ":", parts: 2) do
+      ["remedy", rest] when rest != "" ->
+        {:remedy, rest}
+
       [prefix, rest] when prefix in ~w(user agent process) and rest != "" ->
         {String.to_existing_atom(prefix), rest}
 

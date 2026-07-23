@@ -182,6 +182,10 @@ defmodule Tightbeam.EventLog do
   end
 
   defp serialize_principal(nil), do: nil
+
+  defp serialize_principal({:remedy, %{statute: statute, action: action}}),
+    do: "remedy:#{action}:#{statute}"
+
   defp serialize_principal({kind, value}), do: "#{kind}:#{value}"
 
   @doc "Count verb attempts by exact origin and verb strictly after `since_ms`."

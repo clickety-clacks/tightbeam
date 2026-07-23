@@ -63,7 +63,7 @@ defmodule Tightbeam.RailScriptTest do
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
-      Rules.load!(System.tmp_dir!() <> "/missing-p4-rules-reset", [])
+      Rules.load!(System.tmp_dir!() <> "/missing-p4-rules-reset", [], %{})
     end)
 
     %{db: db, base_dir: base_dir, holder: holder}
@@ -201,7 +201,9 @@ defmodule Tightbeam.RailScriptTest do
   test "validates the nested check grammar and edge restrictions", ctx do
     valid = statute("rail-pass", %{"pass" => "allow"})
     put_statute(ctx, valid)
-    assert [%{check: %{timeout_ms: 5_000}, edges: ["verb"]}] = Rules.load!(ctx.base_dir, ["post"])
+
+    assert [%{check: %{timeout_ms: 5_000}, edges: ["verb"]}] =
+             Rules.load!(ctx.base_dir, ["post"], %{})
 
     cases = [
       {"[[rule]]\nname='empty'\nverb='post'\ntext='empty'\n", "at least one"},
@@ -226,7 +228,7 @@ defmodule Tightbeam.RailScriptTest do
       put_statute(ctx, contents)
 
       assert_raise ArgumentError, ~r/#{Regex.escape(message)}/, fn ->
-        Rules.load!(ctx.base_dir, ["post"])
+        Rules.load!(ctx.base_dir, ["post"], %{})
       end
     end
   end
@@ -239,7 +241,7 @@ defmodule Tightbeam.RailScriptTest do
       )
 
     put_statute(ctx, turn_end)
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
     attest = %{call(%{assignment_id: "a-edge"}) | verb: "attest"}
 
     assert {:allow, [], []} = Rules.decide(ctx.db, attest)
@@ -255,7 +257,7 @@ defmodule Tightbeam.RailScriptTest do
       )
     )
 
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
     before_count = length(EventLog.lifecycle_events(ctx.db))
     assert {:allow, [], []} = Rules.decide(ctx.db, call())
     assert length(EventLog.lifecycle_events(ctx.db)) == before_count
@@ -277,7 +279,7 @@ defmodule Tightbeam.RailScriptTest do
 
     for contents <- [predicate, statute("rail-pass", %{"pass" => "escalate"})] do
       path = put_statute(ctx, contents)
-      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"], %{}) end
       assert error.message =~ path
       assert error.message =~ "rule"
 
@@ -288,7 +290,7 @@ defmodule Tightbeam.RailScriptTest do
 
   test "decide is dry and evaluate preserves its collapsing legacy contract", ctx do
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
-    [loaded] = Rules.load!(ctx.base_dir, ["post"])
+    [loaded] = Rules.load!(ctx.base_dir, ["post"], %{})
     :persistent_term.put(Rules, [put_in(loaded.check.effects["pass"], "escalate")])
 
     assert {{:escalate, %{name: "script-escalate"}, %{question: "fixture"}, nil}, [], []} =
@@ -312,13 +314,13 @@ defmodule Tightbeam.RailScriptTest do
     }
 
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
     assert {:ok, %{ok: true}} = Dispatch.dispatch(ctx.db, handlers, call())
     assert_received :handler_ran
     assert EventLog.rail_denials(ctx.db, 0, 10) == []
 
     put_statute(ctx, statute("rail-deny", %{"blocked" => "deny"}))
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
 
     assert {:error,
             %{
@@ -354,7 +356,7 @@ defmodule Tightbeam.RailScriptTest do
 
     Enum.reduce(cases, 0, fn {script, effects, reason, exit_class}, since_id ->
       put_statute(ctx, statute(script, effects))
-      Rules.load!(ctx.base_dir, ["post"])
+      Rules.load!(ctx.base_dir, ["post"], %{})
 
       assert {:error, %{reason: ^reason, script_exit_class: ^exit_class}} =
                Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-bands"}))

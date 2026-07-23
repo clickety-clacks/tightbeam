@@ -30,7 +30,7 @@ defmodule Tightbeam.RulesTest do
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
-      Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [])
+      Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [], %{})
     end)
 
     %{db: db, base_dir: base_dir, handlers: Gateway.handlers(%{db: db})}
@@ -38,12 +38,12 @@ defmodule Tightbeam.RulesTest do
 
   test "missing and empty directories load zero rules and an empty load clears prior rules",
        ctx do
-    assert Rules.load!(ctx.base_dir, ["post"]) == []
+    assert Rules.load!(ctx.base_dir, ["post"], %{}) == []
     put_rule(ctx, rule("one", "post", "caller.origin_class", "eq", "user"))
-    assert [_] = Rules.load!(ctx.base_dir, ["post"])
+    assert [_] = Rules.load!(ctx.base_dir, ["post"], %{})
 
     File.rm_rf!(Path.join(ctx.base_dir, "identity/rules"))
-    assert Rules.load!(ctx.base_dir, ["post"]) == []
+    assert Rules.load!(ctx.base_dir, ["post"], %{}) == []
     assert :ok = Rules.evaluate(ctx.db, call())
   end
 
@@ -65,7 +65,7 @@ defmodule Tightbeam.RulesTest do
 
     for {contents, reason} <- cases do
       path = put_raw(ctx, contents)
-      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"], %{}) end
       assert error.message =~ path
       assert error.message =~ reason
       refute error.message =~ "rule #"
@@ -122,7 +122,7 @@ defmodule Tightbeam.RulesTest do
 
     for {contents, reason} <- cases do
       path = put_raw(ctx, contents)
-      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"], %{}) end
       assert error.message =~ path
       assert error.message =~ reason
       assert error.message =~ "rule"
@@ -133,7 +133,7 @@ defmodule Tightbeam.RulesTest do
     put_raw(ctx, rule("same", "post", "caller.origin_class", "eq", "user"), "a.toml")
     path = put_raw(ctx, rule("same", "post", "caller.origin_class", "eq", "agent"), "b.toml")
 
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"], %{}) end
     assert error.message =~ "same"
     assert error.message =~ "rule"
     assert error.message =~ Path.dirname(path)
@@ -147,7 +147,7 @@ defmodule Tightbeam.RulesTest do
           "\n" <> rule("same-table", "post", "caller.origin_class", "eq", "agent")
       )
 
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"], %{}) end
     assert error.message =~ same_file
     assert error.message =~ "same-table"
   end
@@ -166,7 +166,7 @@ defmodule Tightbeam.RulesTest do
 
     for {op, value, fires?} <- scalar_cases do
       put_rule(ctx, rule("scalar", "post", "caller.origin_class", op, value))
-      Rules.load!(ctx.base_dir, ["post"])
+      Rules.load!(ctx.base_dir, ["post"], %{})
       assert match_result(Rules.evaluate(ctx.db, call())) == fires?
     end
 
@@ -183,7 +183,7 @@ defmodule Tightbeam.RulesTest do
           {"lte", 0, false}
         ] do
       put_rule(ctx, rule("ordered", "post", "caller.verb_count_24h", op, value))
-      Rules.load!(ctx.base_dir, ["post"])
+      Rules.load!(ctx.base_dir, ["post"], %{})
       assert match_result(Rules.evaluate(ctx.db, call())) == fires?
     end
   end
@@ -202,18 +202,18 @@ defmodule Tightbeam.RulesTest do
 
     for {fact, op, value} <- cases do
       put_rule(ctx, rule("nil", "post", fact, op, value))
-      Rules.load!(ctx.base_dir, ["post"])
+      Rules.load!(ctx.base_dir, ["post"], %{})
       assert :ok = Rules.evaluate(ctx.db, %{call() | origin: "malformed"})
     end
 
     put_rule(ctx, rule("malformed-no-read", "post", "caller.verb_count_24h", "gte", 0))
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
     assert :ok = Rules.evaluate(:missing_db, call("user:"))
   end
 
   test "an empty roles list is present and not_in fires", ctx do
     put_rule(ctx, rule("no-admin-role", "post", "caller.roles", "not_in", ["admin"]))
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
 
     assert {:deny, %{code: "rule_denied", rule: "no-admin-role"}} =
              Rules.evaluate(ctx.db, call())
@@ -234,11 +234,11 @@ defmodule Tightbeam.RulesTest do
     ]
     """)
 
-    Rules.load!(ctx.base_dir, ["post", "wake"])
+    Rules.load!(ctx.base_dir, ["post", "wake"], %{})
     assert :ok = Rules.evaluate(dead_db, call())
 
     put_rule(ctx, rule("other-verb", "wake", "caller.is_admin", "eq", true))
-    Rules.load!(ctx.base_dir, ["post", "wake"])
+    Rules.load!(ctx.base_dir, ["post", "wake"], %{})
     assert :ok = Rules.evaluate(dead_db, call())
 
     put_raw(
@@ -248,7 +248,7 @@ defmodule Tightbeam.RulesTest do
         rule("later", "post", "caller.is_admin", "eq", true)
     )
 
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
     assert {:deny, %{rule: "first"}} = Rules.evaluate(dead_db, call())
   end
 
@@ -263,14 +263,14 @@ defmodule Tightbeam.RulesTest do
       "a.toml"
     )
 
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
     assert {:deny, %{rule: "table-two"}} = Rules.evaluate(ctx.db, call())
   end
 
   test "fact escapes are total and dispatch denies even when the audit sink is unavailable",
        ctx do
     put_rule(ctx, rule("admin-read", "post", "caller.is_admin", "eq", true))
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
 
     assert {:deny, %{code: "rule_error", rule: "admin-read", fact: "caller.is_admin"}} =
              Rules.evaluate(:missing_db, call())
@@ -320,7 +320,7 @@ defmodule Tightbeam.RulesTest do
 
     for {dispatch_call, fact, op, value, fires?} <- assertions do
       put_rule(ctx, rule("matrix", "post", fact, op, value))
-      Rules.load!(ctx.base_dir, ["post"])
+      Rules.load!(ctx.base_dir, ["post"], %{})
       assert match_result(Rules.evaluate(ctx.db, dispatch_call)) == fires?
     end
 
@@ -329,7 +329,7 @@ defmodule Tightbeam.RulesTest do
       rule("live-count", "post", "org.live_sessions_owned_by_caller", "eq", 1)
     )
 
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
     assert {:deny, %{rule: "live-count"}} = Rules.evaluate(ctx.db, call("user:flynn"))
     assert :ok = Rules.evaluate(ctx.db, call("process:cron"))
     assert :ok = Rules.evaluate(ctx.db, call("broken"))
@@ -358,7 +358,7 @@ defmodule Tightbeam.RulesTest do
 
     for {key, fact, value, fires?} <- assertions do
       put_rule(ctx, rule("target", "post", fact, "eq", value))
-      Rules.load!(ctx.base_dir, ["post"])
+      Rules.load!(ctx.base_dir, ["post"], %{})
       assert match_result(Rules.evaluate(ctx.db, %{call() | session_key: key})) == fires?
     end
   end
@@ -385,14 +385,14 @@ defmodule Tightbeam.RulesTest do
     assert EventLog.verb_count(ctx.db, "user:flynn", "post", now - 86_400_000) == 1
 
     put_rule(ctx, rule("quota", "post", "caller.verb_count_24h", "gte", 1))
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
     assert {:deny, %{rule: "quota"}} = Rules.evaluate(ctx.db, call())
     assert :ok = Rules.evaluate(ctx.db, call("malformed"))
   end
 
   test "rule denial is before the handler and records exactly one denied row", ctx do
     put_rule(ctx, rule("stop", "post", "caller.origin_class", "eq", "user"))
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
 
     assert {:error, %{code: "rule_denied", message: "stop: denied"}} =
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> flunk("handler ran") end}, call())
@@ -404,7 +404,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "zero rules preserves success, handler denial, mutation, and event behavior", ctx do
-    Rules.load!(ctx.base_dir, ["post"])
+    Rules.load!(ctx.base_dir, ["post"], %{})
     {:ok, _} = DB.query(ctx.db, "CREATE TABLE domain (value INTEGER NOT NULL)")
 
     success = fn _ ->
@@ -433,13 +433,13 @@ defmodule Tightbeam.RulesTest do
     handler = Gateway.handlers(config)["spawn"]
     process_call = %{call("process:cron") | verb: "spawn"}
 
-    Rules.load!(ctx.base_dir, ["spawn"])
+    Rules.load!(ctx.base_dir, ["spawn"], %{})
 
     assert {:error, %{code: "forbidden"}} =
              Dispatch.dispatch(ctx.db, %{"spawn" => handler}, process_call)
 
     put_rule(ctx, rule("statute", "spawn", "caller.origin_class", "eq", "process"))
-    Rules.load!(ctx.base_dir, ["spawn"])
+    Rules.load!(ctx.base_dir, ["spawn"], %{})
 
     assert {:error, %{code: "rule_denied"}} =
              Dispatch.dispatch(ctx.db, %{"spawn" => handler}, process_call)
@@ -457,18 +457,18 @@ defmodule Tightbeam.RulesTest do
 
     for fact <- list_facts do
       put_rule(ctx, rule("valid-list", "attest", fact, "in", ["reviewed-clean"]))
-      assert [_] = Rules.load!(ctx.base_dir, ["attest"])
+      assert [_] = Rules.load!(ctx.base_dir, ["attest"], %{})
 
       put_rule(ctx, rule("bad-list-op", "attest", fact, "eq", ["reviewed-clean"]))
 
       assert_raise ArgumentError, ~r/invalid for a list fact/, fn ->
-        Rules.load!(ctx.base_dir, ["attest"])
+        Rules.load!(ctx.base_dir, ["attest"], %{})
       end
 
       put_rule(ctx, rule("bad-list-value", "attest", fact, "not_in", []))
 
       assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
-        Rules.load!(ctx.base_dir, ["attest"])
+        Rules.load!(ctx.base_dir, ["attest"], %{})
       end
     end
 
@@ -477,14 +477,14 @@ defmodule Tightbeam.RulesTest do
       rule("overlap", "assign", "assign.declared_files_overlap_open", "eq", true)
     )
 
-    assert [_] = Rules.load!(ctx.base_dir, ["assign"])
+    assert [_] = Rules.load!(ctx.base_dir, ["assign"], %{})
 
     put_rule(
       ctx,
       rule("overlap-ne", "assign", "assign.declared_files_overlap_open", "ne", false)
     )
 
-    assert [_] = Rules.load!(ctx.base_dir, ["assign"])
+    assert [_] = Rules.load!(ctx.base_dir, ["assign"], %{})
 
     put_rule(
       ctx,
@@ -492,11 +492,14 @@ defmodule Tightbeam.RulesTest do
     )
 
     assert_raise ArgumentError, ~r/does not match bool/, fn ->
-      Rules.load!(ctx.base_dir, ["assign"])
+      Rules.load!(ctx.base_dir, ["assign"], %{})
     end
 
     put_rule(ctx, rule("removed", "attest", "assignment.verdict_kinds_any", "in", ["x"]))
-    assert_raise ArgumentError, ~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end
+
+    assert_raise ArgumentError, ~r/unknown fact/, fn ->
+      Rules.load!(ctx.base_dir, ["attest"], %{})
+    end
 
     put_rule(
       ctx,
@@ -510,7 +513,7 @@ defmodule Tightbeam.RulesTest do
     )
 
     assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], %{})
     end
   end
 
@@ -526,8 +529,13 @@ defmodule Tightbeam.RulesTest do
     ]
 
     for fact <- list_facts do
-      put_rule(ctx, rule("missing", "attest", fact, "not_in", ["required"]))
-      Rules.load!(ctx.base_dir, ["attest"])
+      kind = if fact == "assignment.produced_verdict_kinds", do: "tests-passed", else: "required"
+
+      producers =
+        if fact == "assignment.produced_verdict_kinds", do: %{tests: "fixture"}, else: %{}
+
+      put_rule(ctx, rule("missing", "attest", fact, "not_in", [kind]))
+      Rules.load!(ctx.base_dir, ["attest"], producers)
 
       assert :ok = Rules.evaluate(ctx.db, p3_call("attest", nil, %{kind: "completion"}))
 
@@ -568,7 +576,7 @@ defmodule Tightbeam.RulesTest do
           "assignment.cross_provider_verdict_kinds"
         ] do
       put_rule(ctx, rule("unstamped", "attest", fact, "not_in", ["required"]))
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], %{})
 
       assert :ok =
                Rules.evaluate(
@@ -595,7 +603,7 @@ defmodule Tightbeam.RulesTest do
         rule("overlap", "assign", "assign.declared_files_overlap_open", "eq", expected)
       )
 
-      Rules.load!(ctx.base_dir, ["assign"])
+      Rules.load!(ctx.base_dir, ["assign"], %{})
       result = Rules.evaluate(ctx.db, p3_call("assign", {:user, "flynn"}, params))
       assert match_result(result) == fires?
     end
@@ -605,7 +613,7 @@ defmodule Tightbeam.RulesTest do
       rule("wrong-verb", "attest", "assign.declared_files_overlap_open", "eq", true)
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
     assert :ok = Rules.evaluate(ctx.db, p3_call("attest", nil, %{files: ["lib/a.ex"]}))
 
     put_rule(
@@ -613,7 +621,7 @@ defmodule Tightbeam.RulesTest do
       rule("overlap-error", "assign", "assign.declared_files_overlap_open", "eq", true)
     )
 
-    Rules.load!(ctx.base_dir, ["assign"])
+    Rules.load!(ctx.base_dir, ["assign"], %{})
 
     assert {:deny, %{code: "rule_error", fact: "assign.declared_files_overlap_open"}} =
              Rules.evaluate(
@@ -669,7 +677,7 @@ defmodule Tightbeam.RulesTest do
 
     for {fact, kind, fires?} <- assertions do
       put_rule(ctx, rule("matrix", "attest", fact, "in", [kind]))
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], %{})
 
       result =
         Rules.evaluate(
@@ -692,7 +700,7 @@ defmodule Tightbeam.RulesTest do
     ]
     """)
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
 
     assert {:deny, %{rule: "cached-authors"}} =
              Rules.evaluate(
@@ -725,7 +733,7 @@ defmodule Tightbeam.RulesTest do
       )
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
 
     assert {:deny, %{rule: "frozen"}} =
              Rules.evaluate(
@@ -749,7 +757,7 @@ defmodule Tightbeam.RulesTest do
         rule("absent", "attest", "assignment.produced_verdict_kinds", "in", [kind])
       )
 
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], %{})
 
       assert :ok =
                Rules.evaluate(
@@ -771,7 +779,7 @@ defmodule Tightbeam.RulesTest do
       )
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
 
     assert {:deny, %{rule: "present"}} =
              Rules.evaluate(
@@ -794,7 +802,7 @@ defmodule Tightbeam.RulesTest do
       end)
 
     put_raw(ctx, review_gate_rule())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{tests: "fixture"})
 
     completion =
       p3_call("attest", {:session, holder.session_key}, %{
@@ -820,7 +828,7 @@ defmodule Tightbeam.RulesTest do
 
     tests_assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     put_raw(ctx, producer_gate_rule())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{tests: "fixture"})
 
     tests_completion =
       p3_call("attest", {:session, holder.session_key}, %{
@@ -924,6 +932,7 @@ defmodule Tightbeam.RulesTest do
     name = "needs-cross-review"
     verb = "attest"
     text = "completion requires cross-harness review"
+    external_producer = true
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
       { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
@@ -962,10 +971,24 @@ defmodule Tightbeam.RulesTest do
   defp rule(name, verb, fact, op, value, opts \\ []) do
     encoded = if opts[:raw], do: value, else: toml(value)
 
+    external =
+      if op == "not_in" and
+           fact in [
+             "assignment.verdicts",
+             "assignment.independent_verdict_kinds",
+             "assignment.cross_harness_verdict_kinds",
+             "assignment.cross_provider_verdict_kinds"
+           ] do
+        "external_producer = true"
+      else
+        ""
+      end
+
     """
     [[rule]]
     name = #{toml(name)}
     verb = #{toml(verb)}
+    #{external}
     deny_when = [{ fact = #{toml(fact)}, op = #{toml(op)}, value = #{encoded} }]
     text = "denied"
     """

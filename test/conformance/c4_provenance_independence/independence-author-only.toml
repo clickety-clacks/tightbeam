@@ -10,6 +10,7 @@ legibility = "event:denied(rule=commissioned-author-only)"
 [[fixture.rule]]
 name = "commissioned-author-only"
 verb = "attest"
+external_producer = true
 text = "completion needs a verdict authored by the commissioned review holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },

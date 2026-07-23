@@ -49,7 +49,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     holder = session(db, "holder", "flynn")
     other = session(db, "other-session", "other")
-    Rules.load!(System.tmp_dir!(), Map.keys(Gateway.handlers(%{db: db})))
+    Rules.load!(System.tmp_dir!(), Map.keys(Gateway.handlers(%{db: db})), %{})
     %{db: db, holder: holder, other: other, handlers: Gateway.handlers(%{db: db})}
   end
 
@@ -974,7 +974,7 @@ defmodule Tightbeam.AssignmentsTest do
     """)
 
     on_exit(fn -> File.rm_rf!(base) end)
-    Rules.load!(base, Map.keys(ctx.handlers))
+    Rules.load!(base, Map.keys(ctx.handlers), %{})
 
     assert {:error, %{code: "rule_denied"}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, assign_call({:session, "holder"}, "denied"))

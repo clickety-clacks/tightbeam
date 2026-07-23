@@ -37,7 +37,7 @@ defmodule Tightbeam.CheckTierTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(base_dir, Map.keys(handlers))
+    Rules.load!(base_dir, Map.keys(handlers), %{})
     %{db: db, holder: holder, reviewer: reviewer, base_dir: base_dir, handlers: handlers}
   end
 
@@ -246,6 +246,7 @@ defmodule Tightbeam.CheckTierTest do
     name = "needs-tests"
     verb = "attest"
     text = "completion requires tests"
+    external_producer = true
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
       { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
@@ -253,7 +254,7 @@ defmodule Tightbeam.CheckTierTest do
     ]
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
 
     assert {:error, %{code: "rule_denied", rule: "needs-tests"}} =
              Dispatch.dispatch(
@@ -329,7 +330,7 @@ defmodule Tightbeam.CheckTierTest do
 
     for {fact, op, value, dispatch_call, fires?} <- assertions do
       put_rules(ctx, rule("matrix", fact, op, value, dispatch_call.verb))
-      Rules.load!(ctx.base_dir, [dispatch_call.verb])
+      Rules.load!(ctx.base_dir, [dispatch_call.verb], %{})
       assert match?({:deny, _}, Rules.evaluate(ctx.db, dispatch_call)) == fires?
     end
 
@@ -337,7 +338,7 @@ defmodule Tightbeam.CheckTierTest do
       Map.delete(call("attest", nil, %{assignment_id: assignment.id}), :principal)
 
     put_rules(ctx, rule("missing-principal", "assignment.caller_is_holder", "eq", false))
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
     assert :ok = Rules.evaluate(ctx.db, without_principal)
 
     verdict(ctx, {:session, "reviewer"}, assignment.id, "reviewed")
@@ -349,24 +350,24 @@ defmodule Tightbeam.CheckTierTest do
     put_rules(ctx, rule("bad-list-op", "assignment.verdicts", "eq", ["reviewed"]))
 
     assert_raise ArgumentError, ~r/invalid for a list fact/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], %{})
     end
 
     put_rules(ctx, rule("bad-list-value", "assignment.verdicts", "in", [1]))
 
     assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], %{})
     end
 
     put_rules(ctx, rule("bad-bool", "assignment.caller_is_holder", "eq", "true"))
 
     assert_raise ArgumentError, ~r/does not match bool/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], %{})
     end
 
     assignment = assign(ctx)
     put_rules(ctx, rule("fact-error", "assignment.verdicts", "not_in", ["reviewed"]))
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
 
     lazy_call =
       call("attest", {:session, "holder"}, %{
@@ -379,17 +380,18 @@ defmodule Tightbeam.CheckTierTest do
     name = "lazy"
     verb = "attest"
     text = "denied"
+    external_producer = true
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
       { fact = "assignment.verdicts", op = "not_in", value = ["reviewed"] }
     ]
     """)
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
     assert :ok = Rules.evaluate(:missing_db, lazy_call)
 
     put_rules(ctx, rule("fact-error", "assignment.verdicts", "not_in", ["reviewed"]))
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], %{})
 
     assert {:deny, %{code: "rule_error", fact: "assignment.verdicts"}} =
              Rules.evaluate(
@@ -401,7 +403,7 @@ defmodule Tightbeam.CheckTierTest do
   test "no-self-verdict statute blocks holder while user verdict succeeds", ctx do
     assignment = assign(ctx)
     put_rules(ctx, rule("no-self-verdicts", "assignment.caller_is_holder", "eq", true))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
 
     assert {:error, %{code: "rule_denied"}} =
              Dispatch.dispatch(
@@ -499,11 +501,20 @@ defmodule Tightbeam.CheckTierTest do
   defp rule(name, fact, op, value, verb \\ "attest") do
     value = if is_binary(value), do: inspect(value), else: inspect(value)
 
+    external =
+      if op == "not_in" and String.starts_with?(fact, "assignment.") and
+           String.ends_with?(fact, "verdicts") do
+        "external_producer = true"
+      else
+        ""
+      end
+
     """
     [[rule]]
     name = "#{name}"
     verb = "#{verb}"
     text = "denied"
+    #{external}
     deny_when = [{ fact = "#{fact}", op = "#{op}", value = #{value} }]
     """
   end

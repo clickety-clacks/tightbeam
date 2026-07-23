@@ -10,6 +10,7 @@ legibility = "event:denied(rule=coder-completion-needs-independent-review)"
 [[fixture.rule]]
 name = "coder-completion-needs-independent-review"
 verb = "attest"
+external_producer = true
 text = "completion needs a reviewed-clean verdict from a commissioned cross-harness reviewer"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },

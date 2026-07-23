@@ -10,6 +10,7 @@ legibility = "event:denied(rule=verdict-present-tests)"
 [[fixture.rule]]
 name = "verdict-present-tests"
 verb = "attest"
+external_producer = true
 text = "completion requires a tests-passed verdict"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },

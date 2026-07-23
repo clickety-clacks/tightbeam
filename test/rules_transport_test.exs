@@ -44,7 +44,7 @@ defmodule Tightbeam.RulesTransportTest do
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
     """)
 
-    Rules.load!(base_dir, ["post", "spawn", "inspect"])
+    Rules.load!(base_dir, ["post", "spawn", "inspect"], %{})
     parent = self()
 
     handlers =
@@ -92,7 +92,7 @@ defmodule Tightbeam.RulesTransportTest do
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
-      Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [])
+      Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [], %{})
     end)
 
     router_opts = [
@@ -195,7 +195,7 @@ defmodule Tightbeam.RulesTransportTest do
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
     """)
 
-    Rules.load!(ctx.router_opts[:base_dir], ["post", "spawn", "inspect", "tune"])
+    Rules.load!(ctx.router_opts[:base_dir], ["post", "spawn", "inspect", "tune"], %{})
 
     request =
       conn(

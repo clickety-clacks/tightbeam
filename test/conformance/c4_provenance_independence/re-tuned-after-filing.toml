@@ -10,6 +10,7 @@ legibility = "event:denied(rule=frozen-filing-harness)"
 [[fixture.rule]]
 name = "frozen-filing-harness"
 verb = "attest"
+external_producer = true
 text = "completion needs a cross-harness verdict as stamped when filed"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },

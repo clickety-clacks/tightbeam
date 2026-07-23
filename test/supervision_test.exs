@@ -74,7 +74,7 @@ defmodule Tightbeam.SupervisionTest do
 
     File.mkdir_p!(base)
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(base, Map.keys(handlers))
+    Rules.load!(base, Map.keys(handlers), %{})
     on_exit(fn -> File.rm_rf!(base) end)
 
     %{db: db, handlers: handlers, main: main, supervisor: supervisor, holder: holder}

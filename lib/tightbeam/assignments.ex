@@ -920,6 +920,11 @@ defmodule Tightbeam.Assignments do
   defp principal_allowed({:process, _}),
     do: error("process_denied", "process principals cannot use assignment verbs")
 
+  defp principal_allowed({:remedy, %{action: "assign"}}), do: :ok
+
+  defp principal_allowed({:remedy, _}),
+    do: error("process_denied", "remedy principal action does not admit this assignment verb")
+
   defp principal_allowed(nil),
     do:
       error(
@@ -1063,8 +1068,10 @@ defmodule Tightbeam.Assignments do
 
   defp principal_id({:user, user}), do: "user:" <> user
   defp principal_id({:session, session}), do: "session:" <> session
+  defp principal_id({:remedy, %{owner: owner}}), do: "user:" <> owner
   defp opener({:user, user}), do: {user, nil}
   defp opener({:session, session}), do: {nil, session}
+  defp opener({:remedy, %{owner: owner}}), do: {owner, nil}
 
   defp assignment_closed, do: error("assignment_closed", "assignment is already closed")
   defp error(code, message), do: %{code: code, message: message}

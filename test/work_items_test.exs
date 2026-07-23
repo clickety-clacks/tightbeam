@@ -36,7 +36,7 @@ defmodule Tightbeam.WorkItemsTest do
     holder = session(db, "holder", "flynn")
     other = session(db, "other-holder", "other")
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+    Rules.load!(System.tmp_dir!(), Map.keys(handlers), %{})
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
@@ -241,7 +241,7 @@ defmodule Tightbeam.WorkItemsTest do
     value = "agent"
     """)
 
-    Rules.load!(base, Map.keys(ctx.handlers))
+    Rules.load!(base, Map.keys(ctx.handlers), %{})
 
     assert {:error, %{code: "rule_denied"}} =
              Dispatch.dispatch(

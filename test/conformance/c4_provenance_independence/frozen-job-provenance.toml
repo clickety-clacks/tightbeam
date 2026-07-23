@@ -10,6 +10,7 @@ legibility = "event:denied(rule=frozen-job-provenance)"
 [[fixture.rule]]
 name = "frozen-job-provenance"
 verb = "attest"
+external_producer = true
 text = "completion needs a commissioned cross-harness producer verdict"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },

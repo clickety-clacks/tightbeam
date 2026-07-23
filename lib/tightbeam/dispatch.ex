@@ -24,7 +24,7 @@ defmodule Tightbeam.Dispatch do
   still appends a "verb" row with the error.
   """
 
-  alias Tightbeam.{DB, Escalation, EventLog, Rules}
+  alias Tightbeam.{DB, Escalation, EventLog, RailRemedy, Rules}
 
   @typedoc """
   A verb call. `origin` is WHO (\"user:flynn\" | \"agent:<handle>\") — never
@@ -37,7 +37,11 @@ defmodule Tightbeam.Dispatch do
           required(:session_key) => String.t() | nil,
           required(:params) => map(),
           optional(:principal) =>
-            {:session, String.t()} | {:user, String.t()} | {:process, String.t()} | nil
+            {:session, String.t()}
+            | {:user, String.t()}
+            | {:process, String.t()}
+            | {:remedy, map()}
+            | nil
         }
 
   @typedoc "A handler: pure-ish fun; returns a result map, or %{code: _} to deny."
@@ -59,20 +63,25 @@ defmodule Tightbeam.Dispatch do
     principal = Map.get(call, :principal)
     session_key = Map.get(call, :session_key)
 
-    case Rules.decide(db, call) do
-      {{:deny, error}, _to_close, _to_consume} ->
+    {decision, to_close, to_consume} = Rules.decide(db, call)
+    Enum.each(to_close, fn {statute, subject} -> RailRemedy.close(db, statute, subject) end)
+
+    case decision do
+      {:deny, error} ->
         best_effort_denial(db, verb, origin, principal, session_key, error)
         {:error, error}
 
-      {{:remedy, _statute, _ref, error}, _to_close, _to_consume} ->
+      {:remedy, statute, ref, error} ->
+        outcome = RailRemedy.fire(db, handlers, statute, ref, call)
+        error = %{error | reason: "remedy_fired", producer: outcome.producer_id}
         best_effort_denial(db, verb, origin, principal, session_key, error)
         {:error, error}
 
-      {{:escalate, _statute, ctx, _dr_id}, _to_close, _to_consume} ->
+      {:escalate, _statute, ctx, _dr_id} ->
         best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
         {:error, ctx.error}
 
-      {:allow, _to_close, to_consume} ->
+      :allow ->
         consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1)})
 
         case Enum.find(consumed, fn {_id, won?} -> not won? end) do

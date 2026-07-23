@@ -309,7 +309,7 @@ defmodule Tightbeam.ConformanceSupport do
     File.mkdir_p!(rules_dir)
     File.write!(Path.join(rules_dir, "fixture.toml"), serialize_rules(fixture["rule"]))
     handlers = Gateway.handlers(%{})
-    Rules.load!(base, Map.keys(handlers))
+    Rules.load!(base, Map.keys(handlers), %{tests: "fixture", smoke: "fixture"})
 
     try do
       Enum.each(fixture["cases"], &run_rule_case(fixture, &1, handlers))
@@ -448,7 +448,7 @@ defmodule Tightbeam.ConformanceSupport do
     try do
       outcome =
         try do
-          Rules.load!(base, Map.keys(Gateway.handlers(%{})))
+          Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
           :clean
         rescue
           error in ArgumentError -> {:raise, Exception.message(error)}
@@ -805,6 +805,7 @@ defmodule Tightbeam.ConformanceSupport do
       name = #{toml_value(rule["name"])}
       verb = #{toml_value(rule["verb"])}
       text = #{toml_value(rule["text"])}
+      external_producer = #{toml_value(Map.get(rule, "external_producer", false))}
       deny_when = [
         #{conditions}
       ]

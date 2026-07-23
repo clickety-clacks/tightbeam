@@ -10,6 +10,7 @@ legibility = "event:denied(rule=verdict-and-archetype)"
 [[fixture.rule]]
 name = "verdict-and-archetype"
 verb = "attest"
+external_producer = true
 text = "coder completion requires a tests-passed verdict"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },

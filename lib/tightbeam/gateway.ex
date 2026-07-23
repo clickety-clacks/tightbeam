@@ -79,6 +79,7 @@ defmodule Tightbeam.Gateway do
     Org,
     Projection,
     Producers,
+    RailRemedy,
     Rails,
     Rules,
     Roles,
@@ -143,6 +144,7 @@ defmodule Tightbeam.Gateway do
           Roles,
           WorkItems,
           Assignments,
+          RailRemedy,
           Producers,
           Supervision,
           WorkState
@@ -214,7 +216,7 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:producer_runner, producer_runner)
       |> handlers()
 
-    Rules.load!(config.base_dir, Map.keys(handler_table))
+    Rules.load!(config.base_dir, Map.keys(handler_table), producer_config)
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
@@ -383,7 +385,7 @@ defmodule Tightbeam.Gateway do
               message: "a condition wake requires a fallback (--fallback-after / --at)"
             }
 
-          is_nil(resolve_caller(db, call.origin)) ->
+          not wake_principal_allowed?(db, call) ->
             %{code: "unknown_caller"}
 
           true ->
@@ -1939,7 +1941,7 @@ defmodule Tightbeam.Gateway do
   defp spawn_result(config, db, call) do
     p = call.params
 
-    case resolve_caller(db, call.origin) do
+    case spawn_caller(db, call) do
       nil ->
         %{code: "unknown_caller"}
 
@@ -1966,6 +1968,15 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  defp spawn_caller(_db, %{principal: {:remedy, %{action: "spawn", owner: owner}}})
+       when is_binary(owner),
+       do: %{owner_user_id: owner, caller_session: nil}
+
+  defp spawn_caller(db, call), do: resolve_caller(db, call.origin)
+
+  defp wake_principal_allowed?(_db, %{principal: {:remedy, %{action: "wake"}}}), do: true
+  defp wake_principal_allowed?(db, call), do: not is_nil(resolve_caller(db, call.origin))
 
   defp create_spawn(config, db, call, caller) do
     p = call.params

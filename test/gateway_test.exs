@@ -1033,6 +1033,46 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
   end
 
+  test "spawn admits only its matching reserved remedy principal", ctx do
+    base_dir = role_test_base("remedy-spawn")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :remedy_spawn_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    created =
+      spawn.(%{
+        verb: "spawn",
+        origin: "remedy:hire-reviewer",
+        principal: {:remedy, %{statute: "hire-reviewer", action: "spawn", owner: "flynn"}},
+        session_key: nil,
+        params: %{
+          display_name: "Remedy Reviewer",
+          handle: "remedy-reviewer",
+          idempotency_key: "rail-dispatch:hire-reviewer:subject:1"
+        }
+      })
+
+    assert is_binary(created.session_key)
+    assert Org.get(ctx.db, created.session_key).owner_user_id == "flynn"
+
+    assert %{code: "unknown_caller"} =
+             spawn.(%{
+               verb: "spawn",
+               origin: "remedy:wrong-action",
+               principal: {:remedy, %{statute: "wrong-action", action: "wake", owner: "flynn"}},
+               session_key: nil,
+               params: %{
+                 display_name: "Rejected",
+                 idempotency_key: "rail-dispatch:wrong-action:subject:1"
+               }
+             })
+  end
+
   test "config validates, persists, and controls only omitted spawn archetypes", ctx do
     base_dir = role_test_base("default-archetype")
     manifests = Path.join([base_dir, "identity", "archetypes"])

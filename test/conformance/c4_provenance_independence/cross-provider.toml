@@ -10,6 +10,7 @@ legibility = "event:denied(rule=cross-provider-review)"
 [[fixture.rule]]
 name = "cross-provider-review"
 verb = "attest"
+external_producer = true
 text = "completion needs a commissioned cross-provider reviewed-clean verdict"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
