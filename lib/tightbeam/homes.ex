@@ -93,7 +93,8 @@ defmodule Tightbeam.Homes do
     home_path = Path.join([base_dir, "homes", spec.archetype, Atom.to_string(harness)])
     auth_dir = Path.join([base_dir, "auth", Atom.to_string(harness)])
     stamp_path = Path.join(home_path, @stamp_file)
-    manifest = manifest_bytes(spec)
+    extra_files = projected_extra_files(base_dir, spec)
+    manifest = manifest_bytes(Map.put(spec, :extra_files, extra_files))
     guard_identity_collision!(stamp_path, spec.archetype, Map.get(spec, :identity_sha256))
 
     instructions_file = if harness == :claude, do: "CLAUDE.md", else: "AGENTS.md"
@@ -105,7 +106,7 @@ defmodule Tightbeam.Homes do
       File.mkdir_p!(home_path)
       File.write!(instructions_path, spec.guidance)
 
-      for {relative_path, content} <- Map.get(spec, :extra_files, %{}) do
+      for {relative_path, content} <- extra_files do
         absolute_path = Path.join(home_path, relative_path)
         File.mkdir_p!(Path.dirname(absolute_path))
         File.write!(absolute_path, content)
@@ -258,6 +259,37 @@ defmodule Tightbeam.Homes do
 
     reserved = MapSet.new(@baseline_skill_names)
     baseline ++ Enum.reject(Map.get(spec, :skills, []), &MapSet.member?(reserved, &1.name))
+  end
+
+  defp projected_extra_files(base_dir, spec) do
+    direct_identity = Path.join(base_dir, "identity")
+
+    identity_dir =
+      if File.dir?(direct_identity) do
+        direct_identity
+      else
+        base_dir
+        |> Path.dirname()
+        |> Path.dirname()
+        |> Path.join("identity")
+      end
+
+    capability_files =
+      identity_dir
+      |> Path.join("kungfu/*/capabilities.md")
+      |> Path.wildcard()
+      |> Map.new(fn path ->
+        bundle = path |> Path.dirname() |> Path.basename()
+        {Path.join(["kungfu", bundle, "capabilities.md"]), File.read!(path)}
+      end)
+
+    session_readable_files =
+      case File.read(Path.join(identity_dir, "tentpoles.md")) do
+        {:ok, tentpoles} -> Map.put(capability_files, "tentpoles.md", tentpoles)
+        {:error, :enoent} -> capability_files
+      end
+
+    Map.merge(Map.get(spec, :extra_files, %{}), session_readable_files)
   end
 
   # An auth entry that is a REGULAR file in the home (not our symlink) was

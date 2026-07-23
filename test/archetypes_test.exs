@@ -21,18 +21,43 @@ defmodule Tightbeam.ArchetypesTest do
 
     identity_dir = Path.join(ctx.base_dir, "identity")
 
-    assert File.regular?(Path.join([identity_dir, "archetypes", "default.toml"]))
+    archetype_names = [
+      "default",
+      "orchestrator",
+      "spec-writer",
+      "coder",
+      "reviewer",
+      "recon",
+      "product-owner"
+    ]
 
-    for name <- Map.keys(Archetypes.builtin_fragments()) do
+    for name <- archetype_names do
+      assert File.regular?(Path.join([identity_dir, "archetypes", "#{name}.toml"]))
+    end
+
+    for name <- Map.keys(Archetypes.builtin_fragments()) -- ["operating-manual.md"] do
       assert File.regular?(Path.join([identity_dir, "guidance", name]))
     end
+
+    refute File.exists?(Path.join([identity_dir, "guidance", "operating-manual.md"]))
 
     for name <- Archetypes.builtin_skill_names() do
       assert File.regular?(Path.join([identity_dir, "skills", name, "SKILL.md"]))
     end
 
-    assert File.regular?(Path.join([identity_dir, "rails", ".gitkeep"]))
+    assert File.regular?(Path.join([identity_dir, "rails", "engineering.toml"]))
     assert File.regular?(Path.join([identity_dir, "rules", ".gitkeep"]))
+
+    assert File.regular?(
+             Path.join([identity_dir, "kungfu", "agentic-engineering", "manifest.toml"])
+           )
+
+    assert File.regular?(
+             Path.join([identity_dir, "kungfu", "agentic-engineering", "capabilities.md"])
+           )
+
+    assert File.regular?(Path.join([identity_dir, "kungfu", "agentic-engineering", "intake.md"]))
+    assert File.regular?(Path.join(identity_dir, "tentpoles.md"))
     assert {"1\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
 
     assert {"seed: tightbeam defaults\n", 0} =
@@ -40,8 +65,27 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
 
-    seeded_default = Archetypes.load!(ctx.base_dir)["default"]
+    seeded = Archetypes.load!(ctx.base_dir)
+    seeded_default = seeded["default"]
     assert Map.put(seeded_default, :source, nil) == Archetypes.builtin_default()
+    assert Map.keys(seeded) |> Enum.sort() == Enum.sort(archetype_names)
+
+    for name <- archetype_names -- ["default"] do
+      guidance = Archetypes.guidance(seeded[name])
+
+      assert guidance =~
+               File.read!("priv/kungfu/agentic-engineering/guidance/engineering-tenets.md")
+
+      assert guidance =~ File.read!("priv/kungfu/agentic-engineering/guidance/preferred-models.md")
+      assert guidance =~ File.read!("priv/kungfu/agentic-engineering/archetypes/#{name}.md")
+    end
+
+    assert seeded["product-owner"].skills == [
+             "tightbeam-dispatching",
+             "product-discovery",
+             "tightbeam-law-minting",
+             "tightbeam-guidance-authoring"
+           ]
 
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"1\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
@@ -519,7 +563,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     first = Archetypes.guidance(archetype)
 
-    manual = File.read!("test/fixtures/operating_manual.md")
+    manual = File.read!("priv/guidance/operating-manual.md")
 
     assert first ==
              "# Tightbeam · coder\n\n" <>
@@ -542,23 +586,33 @@ defmodule Tightbeam.ArchetypesTest do
            )
   end
 
-  test "the exact operating manual is the sole built-in fragment" do
-    assert Archetypes.builtin_fragments() == %{
-             "operating-manual.md" => File.read!("test/fixtures/operating_manual.md")
-           }
+  test "built-in fragments exactly match the shipped guidance bundle" do
+    fragments = Archetypes.builtin_fragments()
+
+    assert fragments["operating-manual.md"] == File.read!("priv/guidance/operating-manual.md")
+
+    for name <- ["engineering-tenets.md", "harness-support.md", "preferred-models.md", "wisdom.md"] do
+      assert fragments[name] ==
+               File.read!("priv/kungfu/agentic-engineering/guidance/#{name}")
+    end
+
+    for name <- ["orchestrator", "spec-writer", "coder", "reviewer", "recon", "product-owner"] do
+      assert fragments["#{name}.md"] ==
+               File.read!("priv/kungfu/agentic-engineering/archetypes/#{name}.md")
+    end
   end
 
   test "every loaded archetype receives the operating manual", ctx do
     File.write!(Path.join(ctx.manifests, "coder.toml"), "name = \"coder\"\n")
     loaded = Archetypes.load!(ctx.base_dir)
-    manual = File.read!("test/fixtures/operating_manual.md") |> String.trim_trailing()
+    manual = File.read!("priv/guidance/operating-manual.md") |> String.trim_trailing()
 
     for name <- ["default", "coder"] do
       assert Archetypes.guidance(loaded[name]) =~ manual
     end
   end
 
-  test "fragments: operator files override built-ins and #include composes", ctx do
+  test "fragments: the operating manual is immutable while elected fragments compose", ctx do
     gdir = Path.join([ctx.base_dir, "identity", "guidance"])
     File.mkdir_p!(gdir)
     File.write!(Path.join(gdir, "operating-manual.md"), "Custom operating manual.")
@@ -579,8 +633,8 @@ defmodule Tightbeam.ArchetypesTest do
     Archetypes.load!(ctx.base_dir)
     text = Archetypes.guidance(Archetypes.get("coder"))
 
-    assert text =~ "Custom operating manual."
-    refute text =~ "# Operating tightbeam"
+    refute text =~ "Custom operating manual."
+    assert text =~ "# Operating tightbeam"
     assert text =~ "before\nCoders live on work hosts.\nafter"
     refute text =~ "#include"
   end
