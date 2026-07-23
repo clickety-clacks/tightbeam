@@ -63,13 +63,7 @@ defmodule Tightbeam.WorkItems do
       result = transaction(db, fn txn -> update_in_txn(txn, call.params) end)
 
       case result do
-        {:updated, item, changed?} ->
-          if changed? do
-            best_effort(fn ->
-              Map.get(call, :on_work_item_change, fn _, _ -> :ok end).(item.id, "metadata")
-            end)
-          end
-
+        {:updated, item, _changed?} ->
           item
 
         error ->
@@ -233,16 +227,6 @@ defmodule Tightbeam.WorkItems do
   defp error(code, message), do: %{code: code, message: message}
 
   defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256}
-
-  defp best_effort(fun) do
-    try do
-      fun.()
-    rescue
-      _ -> :ok
-    catch
-      _, _ -> :ok
-    end
-  end
 
   defp transaction(db, fun) do
     case DB.transaction(db, fun) do

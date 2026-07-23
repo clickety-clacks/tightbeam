@@ -81,7 +81,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "assignment text limits use application config", ctx do
+  test "assignment text limits are fixed by the specs, not application config", ctx do
     old_values =
       for key <- [:max_subject_len, :max_note_len, :max_verdict_kind_len, :max_idem_key_len],
           into: %{} do
@@ -100,35 +100,39 @@ defmodule Tightbeam.AssignmentsTest do
     Application.put_env(:tightbeam, :max_verdict_kind_len, 3)
     Application.put_env(:tightbeam, :max_idem_key_len, 3)
 
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "four", "four"))
+    assert assignment.subject == "four"
+
+    progress =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], "four")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert progress.attest.note == "four"
+
+    verdict =
+      attest_call({:user, "flynn"}, assignment.id, "verdict")
+      |> put_in([:params, :verdict_kind], "four")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert verdict.attest.verdictKind == "four"
+
     assert %{code: "invalid_subject"} =
-             handle(ctx, "assign", assign_call({:user, "flynn"}, "four"))
-
-    assert %{code: "invalid_idempotency_key"} =
-             handle(ctx, "assign", assign_call({:user, "flynn"}, "ok", "four"))
-
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "ok"))
+             handle(
+               ctx,
+               "assign",
+               assign_call({:user, "flynn"}, String.duplicate(" ", 2000) <> "x")
+             )
 
     assert %{code: "invalid_note"} =
-             ctx
-             |> handle(
-               "attest",
-               put_in(
-                 attest_call({:session, "holder"}, assignment.id, "progress"),
-                 [:params, :note],
-                 "four"
-               )
-             )
+             attest_call({:session, "holder"}, assignment.id, "progress")
+             |> put_in([:params, :note], String.duplicate("x", 2001))
+             |> then(&handle(ctx, "attest", &1))
 
     assert %{code: "invalid_verdict_kind"} =
-             ctx
-             |> handle(
-               "attest",
-               put_in(
-                 attest_call({:user, "flynn"}, assignment.id, "verdict"),
-                 [:params, :verdict_kind],
-                 "four"
-               )
-             )
+             attest_call({:user, "flynn"}, assignment.id, "verdict")
+             |> put_in([:params, :verdict_kind], String.duplicate("x", 65))
+             |> then(&handle(ctx, "attest", &1))
   end
 
   test "assign validates principals, input, liveness, opener typing, and idempotent races", ctx do
@@ -197,7 +201,7 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])
   end
 
-  test "dispatch reroutes a session through one fired rumination wake per work-item", ctx do
+  test "linked dispatch remains one atomic assign-and-wake action", ctx do
     work_item =
       handle(
         ctx,
@@ -213,48 +217,6 @@ defmodule Tightbeam.AssignmentsTest do
         nil,
         work_item.id
       )
-
-    assert %{
-             rumination_required: true,
-             work_item_id: work_item_id,
-             message: message
-           } = handle(ctx, "dispatch", call)
-
-    assert work_item_id == work_item.id
-
-    assert message ==
-             "Sent you to ruminate on #{work_item.id} first — re-dispatch when you're done thinking."
-
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId = ?1", [
-               work_item.id
-             ])
-
-    assert [wake] = Wakes.list_pending(ctx.db)
-    assert wake.session_key == "other-session"
-    assert wake.creator_session_key == "other-session"
-    assert wake.origin == "agent:other-session"
-    assert wake.rumination
-    assert wake.work_item_id == work_item.id
-
-    assert wake.prompt ==
-             "digest: Ruminate on work-item #{work_item.id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=ship the rail brief=Implement the ratified behavior. When you've thought it through, re-issue the dispatch."
-
-    scheduler = :"rumination_wake_#{System.unique_integer([:positive])}"
-    test_pid = self()
-
-    start_supervised!(
-      {Wakes,
-       db: ctx.db,
-       name: scheduler,
-       tick_ms: 60_000,
-       deliver: fn delivered -> send(test_pid, {:rumination_delivered, delivered}) end}
-    )
-
-    assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:rumination_delivered, %{wake_id: wake_id}}
-    assert wake_id == wake.wake_id
-    assert Wakes.rumination_exists?(ctx.db, work_item.id, "other-session")
 
     assignment = handle(ctx, "dispatch", call)
     assert assignment.workItemId == work_item.id
@@ -272,7 +234,7 @@ defmodule Tightbeam.AssignmentsTest do
         dispatch_call(
           {:user, "flynn"},
           "user dispatch",
-          "Users do not ruminate.",
+          "Dispatch immediately.",
           nil,
           work_item.id
         )
@@ -297,6 +259,21 @@ defmodule Tightbeam.AssignmentsTest do
       )
 
     assert assigned.workItemId == work_item.id
+  end
+
+  test "review and file declarations are assign-only inputs", ctx do
+    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "reviewed"))
+
+    call =
+      dispatch_call({:user, "flynn"}, "dispatch", "Do the work.")
+      |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> put_in([:params, :files], ["lib/ignored.ex"])
+      |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :work_item_change) end)
+
+    dispatched = handle(ctx, "dispatch", call)
+    assert dispatched.reviewsAssignmentId == nil
+    assert Assignments.declared_files(ctx.db, dispatched.id) == []
+    refute_received :work_item_change
   end
 
   test "dispatch rolls back the assignment when prompt enqueue fails", ctx do
@@ -470,6 +447,7 @@ defmodule Tightbeam.AssignmentsTest do
           prior_attest_insert(starting_shape)
         )
 
+      :ok = WorkItems.ensure_schema(db)
       :ok = Assignments.ensure_schema(db)
       :ok = Assignments.ensure_schema(db)
 
@@ -491,7 +469,8 @@ defmodule Tightbeam.AssignmentsTest do
             "CHECK(producer IS NULL OR kind = 'verdict')",
             "CHECK(producerCommand IS NULL OR producer IS NOT NULL)",
             "CHECK(byHarness IS NULL OR kind = 'verdict')",
-            "CHECK(byProvider IS NULL OR kind = 'verdict')"
+            "CHECK(byProvider IS NULL OR kind = 'verdict')",
+            "CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000)"
           ] do
         assert sql =~ fragment
       end
@@ -670,6 +649,19 @@ defmodule Tightbeam.AssignmentsTest do
     valid =
       attest_call({:session, third.session_key}, valid_review.id, "verdict")
       |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    wrong_producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "other producer"))
+
+    wrong_review =
+      assign_call({:user, "flynn"}, "wrong-link review")
+      |> Map.put(:session_key, third.session_key)
+      |> put_in([:params, :reviews_assignment_id], wrong_producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _wrong_link_verdict =
+      attest_call({:session, third.session_key}, wrong_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "wrong-link")
       |> then(&handle(ctx, "attest", &1))
 
     direct =
@@ -980,6 +972,79 @@ defmodule Tightbeam.AssignmentsTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, assign_call({:session, "holder"}, "denied"))
   end
 
+  test "zero rules allow completion without verdicts and verdict emits one verb event", ctx do
+    completion_assignment = dispatch!(ctx, assign_call({:session, "holder"}, "completion"))
+
+    assert {:ok, %{assignment: closed, attest: completion}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call({:session, "holder"}, completion_assignment.id, "completion")
+             )
+
+    assert closed.state == "closed"
+    assert completion.verdictKind == nil
+    assert completion.byUser == nil
+
+    assert {:ok, [[before_verdict]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM events WHERE kind = 'verb' AND verb = 'attest'"
+             )
+
+    verdict_assignment = dispatch!(ctx, assign_call({:session, "holder"}, "verdict event"))
+
+    verdict_call =
+      attest_call({:user, "flynn"}, verdict_assignment.id, "verdict")
+      |> put_in([:params, :verdict_kind], "tests-passed")
+
+    assert {:ok, %{attest: verdict}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, verdict_call)
+
+    assert verdict.verdictKind == "tests-passed"
+
+    assert {:ok, [[after_verdict]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM events WHERE kind = 'verb' AND verb = 'attest'"
+             )
+
+    assert after_verdict == before_verdict + 1
+  end
+
+  test "attests returns every kind in timestamp and id order", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "all attests"))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests
+          (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts)
+        VALUES
+          ('att_progress', ?1, 'progress', NULL, NULL, 'holder', NULL, 30),
+          ('att_completion', ?1, 'completion', NULL, NULL, 'holder', NULL, 20),
+          ('att_surrender', ?1, 'surrender', NULL, NULL, 'holder', NULL, 20),
+          ('att_verdict', ?1, 'verdict', 'reviewed-clean', NULL, NULL, 'flynn', 10)
+        """,
+        [assignment.id]
+      )
+
+    assert %{attests: attests} =
+             handle(
+               ctx,
+               "attests",
+               call("attests", {:user, "flynn"}, nil, %{assignment_id: assignment.id})
+             )
+
+    assert Enum.map(attests, &{&1.kind, &1.ts, &1.id}) == [
+             {"verdict", 10, "att_verdict"},
+             {"completion", 20, "att_completion"},
+             {"surrender", 20, "att_surrender"},
+             {"progress", 30, "att_progress"}
+           ]
+  end
+
   test "accepted handler commit survives event append failure", ctx do
     {:ok, _} = DB.query(ctx.db, "DROP TABLE events")
 
@@ -997,6 +1062,7 @@ defmodule Tightbeam.AssignmentsTest do
               "dispatch",
               "assignment-get",
               "attest",
+              "attests",
               "revoke-assignment",
               "assignments"
             ],
@@ -1083,7 +1149,6 @@ defmodule Tightbeam.AssignmentsTest do
       sessionKey TEXT PRIMARY KEY, harness TEXT NOT NULL, provider TEXT NOT NULL,
       state TEXT NOT NULL
     );
-    CREATE TABLE work_items (id TEXT PRIMARY KEY);
     INSERT INTO users (userId) VALUES ('flynn');
     INSERT INTO sessions (sessionKey, harness, provider, state)
       VALUES ('holder', 'claude', 'anthropic', 'active');

@@ -167,6 +167,15 @@ defmodule Tightbeam.WorkItemsTest do
     cleared = update(ctx, {:user, "flynn"}, pinned.id, %{spec_ref_name: nil})
     assert cleared.specRefName == nil
     assert cleared.specRefSha256 == nil
+
+    callback_call =
+      update_call({:user, "flynn"}, pinned.id, %{title: "No secondary event"})
+      |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :work_item_change) end)
+
+    assert WorkItems.__handle__(ctx.db, "work-item-update", callback_call).title ==
+             "No secondary event"
+
+    refute_received :work_item_change
   end
 
   test "get and list return deterministic eras, aspects, and ordering", ctx do

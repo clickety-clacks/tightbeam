@@ -33,14 +33,15 @@ defmodule Tightbeam.Producers do
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
-  @doc "Load and validate identity/producers.toml. A missing file is an empty registry."
+  @doc "Load and validate the committed identity/producers.toml. A missing file is empty."
   @spec load!(String.t()) :: map()
   def load!(base_dir) do
-    path = Path.join(base_dir, "identity/producers.toml")
+    identity_dir = Path.join(base_dir, "identity")
+    path = Path.join(identity_dir, "producers.toml")
 
     config =
-      case File.read(path) do
-        {:error, :enoent} ->
+      case committed_config(identity_dir) do
+        :missing ->
           %{timeout_ms: @default_timeout_ms}
 
         {:ok, encoded} ->
@@ -356,37 +357,54 @@ defmodule Tightbeam.Producers do
 
   defp run_local(job, workdir, runner) do
     shell = System.find_executable("sh") || "/bin/sh"
+    launcher = System.find_executable("python3") || raise "python3 is required for producer jobs"
     env = minimal_env(workdir)
+
+    group_script =
+      "import os,sys; pid=os.fork(); " <>
+        "(os.setsid(), os.execv(sys.argv[1], sys.argv[1:])) if pid == 0 else None; " <>
+        "print(f'TB_PGID:{pid}', flush=True); _,status=os.waitpid(pid,0); " <>
+        "sys.exit(os.waitstatus_to_exitcode(status))"
 
     port =
       Port.open(
-        {:spawn_executable, shell},
+        {:spawn_executable, launcher},
         [
           :binary,
           :exit_status,
           :stderr_to_stdout,
           :hide,
-          {:args, ["-lc", job.command]},
+          {:args, ["-c", group_script, shell, "-lc", job.command]},
           {:cd, workdir},
           {:env, env}
         ]
       )
 
-    os_pid = port |> Port.info(:os_pid) |> elem(1)
-    Tightbeam.ProducerRunner.register_process(runner, job.id, port, os_pid)
-    await_exit(port, System.monotonic_time(:millisecond) + job.timeout_ms)
+    await_exit(
+      port,
+      System.monotonic_time(:millisecond) + job.timeout_ms,
+      runner,
+      job.id,
+      nil
+    )
   end
 
-  defp await_exit(port, deadline) do
+  defp await_exit(port, deadline, runner, job_id, process_group) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
-      {^port, {:data, _output}} -> await_exit(port, deadline)
-      {^port, {:exit_status, status}} -> {:ok, status}
-      {^port, :closed} -> {:error, "cancelled"}
+      {^port, {:data, output}} ->
+        process_group = process_group || register_process_group(output, runner, job_id, port)
+        await_exit(port, deadline, runner, job_id, process_group)
+
+      {^port, {:exit_status, status}} ->
+        {:ok, status}
+
+      {^port, :closed} ->
+        {:error, "cancelled"}
     after
       remaining ->
-        kill_port(port)
+        kill_port(port, process_group)
         {:error, "timeout"}
     end
   end
@@ -405,9 +423,9 @@ defmodule Tightbeam.Producers do
   defp kill(nil, _job_id), do: :ok
   defp kill(runner, job_id), do: Tightbeam.ProducerRunner.kill(runner, job_id)
 
-  defp kill_port(port) do
+  defp kill_port(port, process_group) do
     if Port.info(port) do
-      os_pid = port |> Port.info(:os_pid) |> elem(1)
+      os_pid = process_group || port |> Port.info(:os_pid) |> elem(1)
       kill_process_group(os_pid)
       Port.close(port)
     end
@@ -415,6 +433,18 @@ defmodule Tightbeam.Producers do
     :ok
   rescue
     _ -> :ok
+  end
+
+  defp register_process_group(output, runner, job_id, port) do
+    case Regex.run(~r/TB_PGID:(\d+)/, output) do
+      [_, pid] ->
+        os_pid = String.to_integer(pid)
+        Tightbeam.ProducerRunner.register_process(runner, job_id, port, os_pid)
+        os_pid
+
+      nil ->
+        nil
+    end
   end
 
   defp kill_process_group(os_pid) do
@@ -548,6 +578,48 @@ defmodule Tightbeam.Producers do
 
   defp validate_command!(path, key, _),
     do: raise(ArgumentError, "#{path}: #{key} must be a command string")
+
+  defp committed_config(identity_dir) do
+    file = Path.join(identity_dir, "producers.toml")
+
+    case System.cmd(
+           "git",
+           ["-C", identity_dir, "rev-parse", "--is-inside-work-tree"],
+           stderr_to_stdout: true
+         ) do
+      {"true\n", 0} ->
+        committed_config_from_git(identity_dir)
+
+      {message, status} ->
+        if File.exists?(file),
+          do:
+            raise(
+              "cannot read committed producer config (git #{status}): #{String.trim(message)}"
+            ),
+          else: :missing
+    end
+  rescue
+    error in ErlangError ->
+      if File.exists?(Path.join(identity_dir, "producers.toml")),
+        do: raise("cannot read committed producer config: #{Exception.message(error)}"),
+        else: :missing
+  end
+
+  defp committed_config_from_git(identity_dir) do
+    case System.cmd(
+           "git",
+           ["-C", identity_dir, "show", "HEAD:producers.toml"],
+           stderr_to_stdout: true
+         ) do
+      {encoded, 0} ->
+        {:ok, encoded}
+
+      {message, _status} ->
+        if message =~ "does not exist in" or message =~ "exists on disk, but not in",
+          do: :missing,
+          else: raise("cannot read committed producer config: #{String.trim(message)}")
+    end
+  end
 
   defp producer_job_id do
     <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)
