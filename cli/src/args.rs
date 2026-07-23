@@ -181,6 +181,10 @@ pub enum Command {
     WorkItemList {
         identity: Identity,
     },
+    AssignmentGet {
+        identity: Identity,
+        assignment_id: String,
+    },
     Attest {
         identity: Identity,
         assignment_id: String,
@@ -400,6 +404,8 @@ COMMANDS:
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>] [--key <key>]
       Atomically open an assignment and wake its holder with the card id.
+  assignment-get <assignmentId>
+      Read one assignment row.
   run-tests <assignmentId>
   run-smoke <assignmentId>
       Queue the committed mechanical producer for an assignment.
@@ -1082,6 +1088,15 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 identity: identity(flags)?,
             })
         }
+        "assignment-get" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam assignment-get <assignmentId>".to_owned());
+            }
+            Ok(Command::AssignmentGet {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+            })
+        }
         "attest" => {
             let assignment_id =
                 parsed.positional.get(1).cloned().ok_or_else(|| {
@@ -1233,7 +1248,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, artifact-record, artifact-get, artifacts, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, artifact-record, artifact-get, artifacts, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, assignment-get, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe"
         )),
     }
 }
@@ -1500,7 +1515,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, artifact-record, artifact-get, artifacts, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, artifact-record, artifact-get, artifacts, rule, waive, revoke-waiver, withdraw, decision-requests, decision-request, spawn, list, retire, critical, work-item-create, work-item-update, work-item-get, work-item-list, assign, dispatch, assignment-get, run-tests, run-smoke, cancel-producer-job, attest, attests, revoke-assignment, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, init, setup, assimilate, probe".to_owned())
         );
     }
 
@@ -1687,6 +1702,7 @@ mod tests {
                 "--key",
                 "idem",
             ]),
+            strings(&["assignment-get", "asg_1"]),
             strings(&["cancel-producer-job", "pj_1", "--as", "builder"]),
             strings(&["role", "create", "reviewer", "--as-user", "flynn"]),
             strings(&["role", "bind", "reviewer", "agent:x", "--as-user", "flynn"]),
