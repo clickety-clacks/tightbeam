@@ -267,6 +267,22 @@ defmodule Tightbeam.Wakes do
     count
   end
 
+  @doc "Count pending wakes targeting a session that were durably created by that same session."
+  @spec self_pending_count(db(), String.t()) :: non_neg_integer()
+  def self_pending_count(db \\ Tightbeam.DB, session_key) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        """
+        SELECT count(*) FROM wakes
+        WHERE state = 'pending' AND sessionKey = ?1 AND creatorSessionKey = ?1
+        """,
+        [session_key]
+      )
+
+    count
+  end
+
   @doc "Whether a delivered rumination wake exists for this work-item and caller session."
   @spec rumination_exists?(db(), String.t(), String.t()) :: boolean()
   def rumination_exists?(db \\ Tightbeam.DB, work_item_id, caller_session) do

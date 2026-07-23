@@ -12,6 +12,8 @@ defmodule Tightbeam.Supervision do
     EventLog,
     Ledger,
     Org,
+    RailRemedy,
+    Rules,
     Wakes
   }
 
@@ -138,6 +140,9 @@ defmodule Tightbeam.Supervision do
           | {:escalated, pos_integer(), String.t()}
           | :terminus
           | :stranded
+          | {:acted, :rail_remedy}
+          | {:acted, :rail_escalate}
+          | {:held, :adjudication_hold}
           | {:refused, String.t()}
   def evaluate(db, handlers, n, session_key, terminal_seq) do
     case drain(db, handlers, session_key) do
@@ -193,20 +198,15 @@ defmodule Tightbeam.Supervision do
 
       assignment ->
         with :new <- dedupe(watermark(db, session_key), terminal_seq),
-             0 <- Ledger.pending_count(db, session_key),
-             false <- Adjudication.open_for_session?(db, session_key),
-             0 <- Wakes.pending_count(db, session_key) do
+             0 <- Ledger.pending_count(db, session_key) do
           case holder_state(db, session_key) do
             :retired ->
+              write_watermark(db, session_key, terminal_seq)
               doorbells_for_holder(db, session_key)
               :stranded
 
             :live ->
-              if is_nil(terminal_seq) do
-                :idle
-              else
-                claim_and_act(db, handlers, n, session_key, terminal_seq, assignment)
-              end
+              evaluate_live(db, handlers, n, session_key, terminal_seq, assignment)
           end
         else
           :duplicate ->
@@ -216,12 +216,158 @@ defmodule Tightbeam.Supervision do
             :coalesced
 
           count when is_integer(count) and count > 0 ->
-            if Ledger.pending_count(db, session_key) > 0, do: :busy, else: :continuation
-
-          true ->
-            :continuation
+            :busy
         end
     end
+  end
+
+  defp evaluate_live(db, handlers, n, session_key, terminal_seq, assignment) do
+    case adjudication_hold(db, session_key, terminal_seq) do
+      {:held, :adjudication_hold} = held ->
+        held
+
+      :fallthrough ->
+        case rail_step(db, handlers, session_key, assignment, terminal_seq) do
+          {:acted, _tag} = acted ->
+            acted
+
+          :fallthrough ->
+            if Wakes.pending_count(db, session_key) == 0 do
+              if is_nil(terminal_seq) do
+                :idle
+              else
+                claim_and_act(db, handlers, n, session_key, terminal_seq, assignment)
+              end
+            else
+              :continuation
+            end
+        end
+    end
+  end
+
+  defp adjudication_hold(_db, _session_key, nil), do: :fallthrough
+
+  defp adjudication_hold(db, session_key, terminal_seq) do
+    if Adjudication.open_for_session?(db, session_key) do
+      write_watermark(db, session_key, terminal_seq)
+      {:held, :adjudication_hold}
+    else
+      :fallthrough
+    end
+  end
+
+  defp rail_step(_db, _handlers, _session_key, _assignment, nil), do: :fallthrough
+
+  defp rail_step(db, handlers, session_key, assignment, terminal_seq) do
+    if Wakes.self_pending_count(db, session_key) > 0 do
+      :fallthrough
+    else
+      call = %{
+        verb: "attest",
+        origin: "remedy:sweep",
+        principal: {:session, assignment.holderKey},
+        session_key: nil,
+        edge: :turn_end,
+        params: %{assignment_id: assignment.id, kind: "completion"}
+      }
+
+      {decision, to_close, _to_consume} = Rules.decide(db, call)
+      Enum.each(to_close, fn {statute, subject} -> RailRemedy.close(db, statute, subject) end)
+
+      case decision do
+        {:remedy, statute, ref, _error} ->
+          RailRemedy.fire(db, handlers, statute, ref, call)
+          rail_sweep_lifecycle(db, session_key, ref, statute.name, "run-remedy")
+          write_watermark(db, session_key, terminal_seq)
+          {:acted, :rail_remedy}
+
+        {:escalate, statute, ctx, dr_id} ->
+          decision_request_id =
+            case dr_id do
+              nil ->
+                {:decision_pending, id} =
+                  Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
+
+                id
+
+              id ->
+                id
+            end
+
+          park_escalation(db, session_key, decision_request_id)
+          rail_sweep_lifecycle(db, session_key, assignment.id, statute.name, "escalate-park")
+          write_watermark(db, session_key, terminal_seq)
+          {:acted, :rail_escalate}
+
+        {:deny, error} ->
+          rail_sweep_lifecycle(db, session_key, assignment.id, error.rule, "re-obligate")
+          :fallthrough
+
+        :allow ->
+          rail_sweep_lifecycle(db, session_key, assignment.id, nil, "none")
+          :fallthrough
+      end
+    end
+  end
+
+  defp park_escalation(db, session_key, decision_request_id) do
+    transaction!(db, fn txn ->
+      [[deadline_at, park_wake_id]] =
+        Txn.q(
+          txn,
+          "SELECT deadlineAt, parkWakeId FROM decision_requests WHERE id = ?1",
+          [decision_request_id]
+        )
+
+      if is_nil(park_wake_id) do
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: session_key,
+            target_role: nil,
+            origin: "process:tightbeam",
+            prompt:
+              "Decision request #{decision_request_id} was ruled; re-adjudicate the obligation.",
+            due_at: deadline_at,
+            condition_kind: "escalation-ruled",
+            condition_scope: decision_request_id,
+            creator_session_key: nil
+          })
+
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET parkWakeId = ?2 WHERE id = ?1 AND parkWakeId IS NULL",
+          [decision_request_id, wake.wake_id]
+        )
+      end
+    end)
+  end
+
+  defp rail_sweep_lifecycle(db, session_key, ref, statute, decision) do
+    detail = JSON.encode!(%{ref: ref, statute: statute, decision: decision})
+    best_effort_lifecycle(db, "rail_sweep", session_key, detail)
+  end
+
+  defp write_watermark(_db, _session_key, nil), do: :ok
+
+  defp write_watermark(db, session_key, terminal_seq) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO supervision_watermarks
+          (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN)
+        VALUES (?1, ?2, NULL, NULL, NULL, NULL)
+        ON CONFLICT(sessionKey) DO UPDATE SET
+          lastEvaluatedTerminal = excluded.lastEvaluatedTerminal,
+          pendingBranch = NULL,
+          pendingAssignment = NULL,
+          pendingK = NULL,
+          pendingN = NULL
+        """,
+        [session_key, terminal_seq]
+      )
+
+    :ok
   end
 
   defp dedupe(_watermark, nil), do: :new

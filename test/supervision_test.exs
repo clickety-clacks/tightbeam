@@ -2,6 +2,7 @@ defmodule Tightbeam.SupervisionTest do
   use ExUnit.Case, async: false
 
   alias Tightbeam.{
+    Adjudication,
     Assignments,
     ConnRegistry,
     ConditionFacts,
@@ -13,6 +14,7 @@ defmodule Tightbeam.SupervisionTest do
     Ledger,
     Org,
     Projection,
+    RailRemedy,
     Roles,
     Rules,
     Supervision,
@@ -56,7 +58,9 @@ defmodule Tightbeam.SupervisionTest do
           ConditionFacts,
           Wakes,
           Supervision,
-          WorkState
+          WorkState,
+          Adjudication,
+          RailRemedy
         ] do
       :ok = module.ensure_schema(db)
     end
@@ -77,7 +81,14 @@ defmodule Tightbeam.SupervisionTest do
     Rules.load!(base, Map.keys(handlers), %{})
     on_exit(fn -> File.rm_rf!(base) end)
 
-    %{db: db, handlers: handlers, main: main, supervisor: supervisor, holder: holder}
+    %{
+      db: db,
+      handlers: handlers,
+      main: main,
+      supervisor: supervisor,
+      holder: holder,
+      base: base
+    }
   end
 
   test "schema and neutral row APIs expose the exact durable state", ctx do
@@ -120,6 +131,9 @@ defmodule Tightbeam.SupervisionTest do
     assert wake.origin == "process:tightbeam"
     assert wake.prompt =~ "prod 1 of 3"
     assert wake.reresolve == nil
+
+    assert [%{"decision" => "none", "ref" => "asg_1", "statute" => nil}] =
+             rail_sweep_details(ctx.db, "holder")
   end
 
   test "progress resets delivered and attempted counters before the next claim", ctx do
@@ -163,13 +177,24 @@ defmodule Tightbeam.SupervisionTest do
     assert Supervision.ladder_target(ctx.db, "holder", 1) == ctx.main.session_key
   end
 
-  test "a retired holder is derived-stranded and receives no claim or wake", ctx do
+  test "a retired holder with a pending wake is stranded before continuation", ctx do
+    existing =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "later",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
     seq = terminal!(ctx.db, "holder")
     Org.retire(ctx.db, "holder")
 
     assert :stranded = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
-    assert Supervision.watermark(ctx.db, "holder") == nil
-    assert Wakes.list_pending(ctx.db) == []
+
+    assert %{lastEvaluatedTerminal: ^seq} = Supervision.watermark(ctx.db, "holder")
+    assert [%{wake_id: wake_id}] = Wakes.list_pending(ctx.db)
+    assert wake_id == existing.wake_id
 
     stranded =
       Assignments.list(ctx.db, %{holder_key: "holder", state: "open"})
@@ -178,6 +203,119 @@ defmodule Tightbeam.SupervisionTest do
       end)
 
     assert Enum.map(stranded, & &1.id) == ["asg_1"]
+  end
+
+  test "an open model adjudication episode holds before rails and prod", ctx do
+    seq = terminal!(ctx.db, "holder")
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO adjudication_episodes
+          (sessionKey, condition, status, correlationKey, deadlineAt, openedAt)
+        VALUES ('holder', 'quota_exhausted', 'claimed', 'adj_hold', ?1, ?2)
+        """,
+        [now + 60_000, now]
+      )
+
+    assert {:held, :adjudication_hold} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{lastEvaluatedTerminal: ^seq} = Supervision.watermark(ctx.db, "holder")
+    assert Wakes.list_pending(ctx.db) == []
+    assert rail_sweep_details(ctx.db, "holder") == []
+  end
+
+  test "turn-end remedy acts once through the episode claim and records run-remedy", ctx do
+    prepare_review_gate(ctx)
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{status: "live", occurrence: 1, producer_key: producer_key} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
+
+    assert is_binary(producer_key)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignments WHERE reviewsAssignmentId = 'asg_1'"
+             )
+
+    assert [
+             %{
+               "decision" => "run-remedy",
+               "ref" => "asg_1",
+               "statute" => "completion-needs-review"
+             }
+           ] = rail_sweep_details(ctx.db, "holder")
+
+    assert Supervision.prod_state(ctx.db, "asg_1") == nil
+  end
+
+  test "only a durable self-created continuation suppresses the turn-end remedy", ctx do
+    prepare_review_gate(ctx)
+
+    self_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "self continuation",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder"
+      })
+
+    assert Wakes.self_pending_count(ctx.db, "holder") == 1
+    seq = terminal!(ctx.db, "holder")
+    assert :continuation = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1") == nil
+    assert Supervision.prod_state(ctx.db, "asg_1") == nil
+
+    assert Wakes.cancel(ctx.db, self_wake.wake_id, self_wake.origin)
+
+    reminder =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "user reminder",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: nil
+      })
+
+    assert Wakes.pending_count(ctx.db, "holder") == 1
+    assert Wakes.self_pending_count(ctx.db, "holder") == 0
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{status: "live"} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
+
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "pending"
+    assert Supervision.prod_state(ctx.db, "asg_1") == nil
+  end
+
+  test "turn-end denial without a remedy records re-obligate and uses the normal prod", ctx do
+    load_turn_end_deny(ctx)
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert [
+             %{
+               "decision" => "re-obligate",
+               "ref" => "asg_1",
+               "statute" => "completion-still-owed"
+             }
+           ] = rail_sweep_details(ctx.db, "holder")
   end
 
   test "atomic target gate skips plain dead targets and re-runs the ladder for escalation", ctx do
@@ -686,6 +824,65 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test")
     assert :ok = Ledger.finish(db, seq, "delivered")
     seq
+  end
+
+  defp prepare_review_gate(ctx) do
+    reviewer = session(ctx.db, "reviewer", ctx.main.session_key)
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET harness='codex' WHERE sessionKey='reviewer'")
+    Roles.create!(ctx.db, "reviewer", "flynn", reviewer.session_key)
+
+    write_rules(
+      ctx,
+      """
+      [[rule]]
+      name = "completion-needs-review"
+      verb = "attest"
+      text = "completion requires review"
+      edges = ["verb", "turn-end"]
+      effect = "remedy"
+      deny_when = [
+        { fact = "attest.kind", op = "eq", value = "completion" },
+        { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }
+      ]
+      [rule.remedy]
+      action = "assign"
+      produces = "reviewed-clean"
+      target_role = "reviewer"
+      [rule.remedy.params]
+      subject = "review of assignment {assignment_id}"
+      reviews = "{assignment_id}"
+      """
+    )
+  end
+
+  defp load_turn_end_deny(ctx) do
+    write_rules(
+      ctx,
+      """
+      [[rule]]
+      name = "completion-still-owed"
+      verb = "attest"
+      text = "completion remains owed"
+      edges = ["turn-end"]
+      deny_when = [
+        { fact = "attest.kind", op = "eq", value = "completion" }
+      ]
+      """
+    )
+  end
+
+  defp write_rules(ctx, contents) do
+    rules_dir = Path.join(ctx.base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    File.write!(Path.join(rules_dir, "turn-end.toml"), contents)
+    Rules.load!(ctx.base, Map.keys(ctx.handlers), %{})
+  end
+
+  defp rail_sweep_details(db, session_key) do
+    db
+    |> EventLog.lifecycle_events()
+    |> Enum.filter(&(&1.kind == "rail_sweep" and &1.subject == session_key))
+    |> Enum.map(&JSON.decode!(&1.detail))
   end
 
   defp assignment(db, id, holder, subject, opened_at) do
