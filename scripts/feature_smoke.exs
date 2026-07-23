@@ -13,14 +13,88 @@ defmodule FeatureSmoke do
   def run do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
-    state = %{port: gw["port"], token: gw["cliToken"], pass: 0}
+    Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
+    state = %{port: gw["port"], token: gw["cliToken"], base_dir: base_dir, pass: 0}
 
     state
     |> check_facts_read()
     |> check_config_default_archetype()
     |> check_work_item_and_assignment_get()
     |> check_dispatch_opens_assignment()
+    |> check_flagship_review_loop()
     |> finish()
+  end
+
+  # --- P7 flagship enforced loop: completion requires an independent review ---
+  # Proves the whole enforcement spine live over HTTP: a coder attesting completion
+  # WITHOUT a reviewed-clean verdict is not denied — the substrate assigns a reviewer
+  # (the remedy), blocks the completion, and self-releases once the review lands.
+  # Requires the `completion-requires-review` rail loaded (identity/rules/engineering.toml).
+  defp check_flagship_review_loop(state) do
+    u = unique()
+    # A reviewer role bound to a live reviewer session (the remedy's assign target).
+    post(state, "role-create", %{"name" => "reviewer"})
+    reviewer = ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
+    reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
+    ok!(state, "role-bind", %{"name" => "reviewer", "sessionKey" => reviewer_key})
+    reviewer_tok = session_token(state, reviewer_key)
+
+    # A coder holding a work assignment.
+    wi = ok!(state, "work-item-create", %{"title" => "flagship #{u}", "idempotencyKey" => "fwi-#{u}"})
+    wi_id = wi["workItemId"] || wi["id"]
+    coder = ok!(state, "spawn", %{"displayName" => "smoke-coder-#{u}", "idempotencyKey" => "cd-#{u}"})
+    coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
+    # A session needs a role bound to act (attest) under its own credential.
+    post(state, "role-create", %{"name" => "coder-#{u}"})
+    ok!(state, "role-bind", %{"name" => "coder-#{u}", "sessionKey" => coder_key})
+    coder_tok = session_token(state, coder_key)
+    asg = ok!(state, "assign", %{"sessionKey" => coder_key, "subject" => "impl #{u}", "workItemId" => wi_id, "idempotencyKey" => "fa-#{u}"})
+    asg_id = asg["id"] || asg["assignmentId"]
+
+    # 1. Coder attests completion with NO review on record → BLOCKED by the rule.
+    # (The wire exposes only code+message; a remedy and a plain deny both carry
+    # code=rule_denied — the remedy's `reason=remedy_fired` is stripped. Proof that
+    # it was a REMEDY, not a bare deny, is step 2: the reviewer gets assigned.)
+    blocked = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+    assert(state, get_in(blocked, ["error", "rule"]) == "completion-requires-review" or
+                  (get_in(blocked, ["error", "message"]) || "") =~ "completion-requires-review",
+      "flagship: completion without review should be blocked by the rule, got #{inspect(blocked)}")
+
+    # 2. The remedy assigned the reviewer a review of the coder's assignment.
+    reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+    review_asg =
+      (reviews["assignments"] || reviews)
+      |> List.wrap()
+      |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
+    assert(state, is_map(review_asg), "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{inspect(reviews)}")
+    review_id = review_asg["id"] || review_asg["assignmentId"]
+
+    # 3. Reviewer files the reviewed-clean verdict on the review assignment.
+    v = post_as(state, reviewer_tok, "attest", %{"assignmentId" => review_id, "kind" => "verdict", "verdictKind" => "reviewed-clean"})
+    assert(state, not (is_map(v) and Map.has_key?(v, "error")), "flagship: reviewer verdict failed: #{inspect(v)}")
+
+    # 4. Coder re-attests completion → the verdict is present → the gate passes.
+    done = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+    assert(state, not (is_map(done) and Map.has_key?(done, "error")),
+      "flagship: completion after review should PASS the gate, got #{inspect(done)}")
+
+    retire(state, reviewer)
+    retire(state, coder)
+    pass(state, "flagship reviewer-loop enforced end-to-end: blocked → reviewer assigned → verdict → completes")
+  end
+
+  # Fetch a session's own CLI bearer token from the state DB (local test harness only).
+  defp session_token(state, session_key) do
+    db = Path.join(state.base_dir, "state.db")
+    {out, 0} = System.cmd("sqlite3", [db, "SELECT cliToken FROM sessions WHERE sessionKey = #{sql_quote(session_key)}"])
+    token = String.trim(out)
+    if token == "", do: fail(state, "no cliToken for session #{session_key}"), else: token
+  end
+
+  defp sql_quote(s), do: "'" <> String.replace(s, "'", "''") <> "'"
+
+  defp post_as(state, token, verb, params) do
+    post(state |> Map.put(:token, token) |> Map.put(:as_session, true), verb, params)
   end
 
   # --- facts-read: file a condition fact, read it back -----------------------
@@ -129,16 +203,29 @@ defmodule FeatureSmoke do
     res["result"] || res
   end
 
+  # Verbs whose sessionKey/role/userId is a router-extracted BODY-ROOT target.
+  # Other verbs (role-bind, role-rm, …) carry sessionKey as a normal param.
+  @target_verbs ~w(assign dispatch wake retire critical assignments cancel)
+
   defp post(state, verb, params) do
     {as_key, params} = Map.pop(params, "asSession")
-    # Target fields (sessionKey/role/userId) ride the BODY ROOT, not params — the
-    # router extracts them there (see Wire.Router target validation).
-    {target, params} = Map.split(params, ["sessionKey", "role", "userId"])
+
+    {target, params} =
+      if verb in @target_verbs,
+        do: Map.split(params, ["sessionKey", "role", "userId"]),
+        else: {%{}, params}
 
     body =
       %{"verb" => verb, "params" => params}
       |> Map.merge(target)
-      |> then(fn b -> if as_key, do: Map.put(b, "asSession", as_key), else: Map.put(b, "asUser", @owner) end)
+      |> then(fn b ->
+        cond do
+          # Session-authenticated: the session's own bearer token IS the principal.
+          Map.get(state, :as_session) -> b
+          as_key -> Map.put(b, "asSession", as_key)
+          true -> Map.put(b, "asUser", @owner)
+        end
+      end)
 
     url = "http://127.0.0.1:#{state.port}/agent/dispatch"
 
@@ -186,7 +273,7 @@ defmodule FeatureSmoke do
     :ok
   end
 
-  defp unique, do: System.unique_integer([:positive])
+  defp unique, do: "#{Process.get(:salt, "")}#{System.unique_integer([:positive])}"
 end
 
 FeatureSmoke.run()
