@@ -19,7 +19,11 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
       default_harness: :claude,
       advertised_url: "https://tightbeam.example",
       hosts: %{"local-test" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}},
-      local_host_name: "local-test"
+      local_host_name: "local-test",
+      cli_bin: Path.join(base_dir, "bin"),
+      harness_binary_probe: fn harness, _cli_bin ->
+        {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
+      end
     ]
 
     catalog =
@@ -57,12 +61,40 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert find(passing, "harness_auth:codex").ok
 
     catalog = put_in(ctx.catalog, [Access.elem(1), "codex"], [])
-    {1, report} = Doctor.evaluate(catalog, ctx.inputs)
+    {0, report} = Doctor.evaluate(catalog, ctx.inputs)
     failed = find(report, "harness_auth:codex")
 
     refute failed.ok
+    assert failed.level == :warn
     assert failed.detail =~ "dead_sign_in: harness=codex reason=:empty_inventory"
     assert failed.fix =~ "Re-onboard the codex"
+  end
+
+  test "one fully ready harness passes while the unavailable harness warns", ctx do
+    probe = fn
+      :claude, _cli_bin -> {:ok, %{bin: "/fake/claude", version: "claude 1.0"}}
+      :codex, _cli_bin -> {:error, :not_found}
+    end
+
+    {0, report} =
+      Doctor.evaluate(ctx.catalog, put(ctx.inputs, :harness_binary_probe, probe))
+
+    assert report.ready
+    assert find(report, "harness_binary:claude").level == :pass
+    assert find(report, "harness_binary:codex").level == :warn
+    assert find(report, "harness_binary:codex").fix =~ "Install the codex CLI"
+    assert Doctor.format(report, :human) =~ "WARN"
+  end
+
+  test "zero usable harnesses fails with the non-default harness as WARN", ctx do
+    probe = fn _harness, _cli_bin -> {:error, :not_found} end
+
+    {1, report} =
+      Doctor.evaluate(ctx.catalog, put(ctx.inputs, :harness_binary_probe, probe))
+
+    refute report.ready
+    assert find(report, "harness_binary:claude").level == :fail
+    assert find(report, "harness_binary:codex").level == :warn
   end
 
   test "catalog fetch failures are loud and classified for auth and model checks", ctx do
@@ -126,6 +158,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
              report |> Doctor.format(:json) |> JSON.decode()
 
     assert Enum.any?(checks, &(&1["name"] == "advertised_url" and &1["ok"] == true))
+    assert Enum.all?(checks, &is_binary(&1["level"]))
   end
 
   defp put(inputs, key, value), do: Keyword.put(inputs, key, value)

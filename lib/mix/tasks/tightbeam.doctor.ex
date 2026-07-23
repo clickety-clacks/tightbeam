@@ -36,7 +36,8 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         System.get_env("TIGHTBEAM_ADVERTISED_URL") ||
           Application.get_env(:tightbeam, :advertised_url),
       hosts: Placement.hosts(base_dir),
-      local_host_name: Placement.local_host_name()
+      local_host_name: Placement.local_host_name(),
+      cli_bin: Path.join(base_dir, "bin")
     ]
 
     {status, report} = evaluate(catalog, inputs)
@@ -55,17 +56,44 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     advertised_url = Keyword.get(inputs, :advertised_url)
     hosts = Keyword.fetch!(inputs, :hosts)
     local_host_name = Keyword.fetch!(inputs, :local_host_name)
+    cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
+    binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
 
-    checks =
-      [default_model_check(catalog, default_harness, default_model)] ++
-        Enum.map(@harnesses, &harness_auth_check(catalog, &1)) ++
-        [
-          identity_check(base_dir),
-          advertised_url_check(advertised_url),
-          hosts_check(hosts, local_host_name)
-        ]
+    harness_checks =
+      Map.new(@harnesses, fn harness ->
+        {harness,
+         [
+           harness_binary_check(binary_probe.(String.to_atom(harness), cli_bin), harness),
+           harness_auth_check(catalog, harness)
+         ]}
+      end)
 
-    ready = Enum.all?(checks, & &1.ok)
+    ready_harnesses =
+      Enum.filter(@harnesses, fn harness ->
+        Enum.all?(Map.fetch!(harness_checks, harness), & &1.ok)
+      end)
+
+    harness_checks =
+      Enum.flat_map(@harnesses, fn harness ->
+        Enum.map(Map.fetch!(harness_checks, harness), fn check ->
+          cond do
+            check.ok -> check
+            ready_harnesses != [] -> %{check | level: :warn}
+            harness != default_harness -> %{check | level: :warn}
+            true -> check
+          end
+        end)
+      end)
+
+    non_harness_checks = [
+      default_model_check(catalog, default_harness, default_model),
+      identity_check(base_dir),
+      advertised_url_check(advertised_url),
+      hosts_check(hosts, local_host_name)
+    ]
+
+    checks = [hd(non_harness_checks)] ++ harness_checks ++ tl(non_harness_checks)
+    ready = ready_harnesses != [] and Enum.all?(non_harness_checks, & &1.ok)
     {if(ready, do: 0, else: 1), %{checks: checks, ready: ready}}
   end
 
@@ -75,7 +103,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   def format(report, :human) do
     rows =
       Enum.map(report.checks, fn check ->
-        [check.name, if(check.ok, do: "PASS", else: "FAIL"), check.detail, check.fix]
+        [check.name, check.level |> Atom.to_string() |> String.upcase(), check.detail, check.fix]
       end)
 
     headings = ["check", "status", "detail", "fix-if-failed"]
@@ -143,6 +171,19 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     )
   end
 
+  defp harness_binary_check({:ok, %{version: version}}, harness) do
+    check("harness_binary:#{harness}", true, version, "")
+  end
+
+  defp harness_binary_check({:error, reason}, harness) do
+    check(
+      "harness_binary:#{harness}",
+      false,
+      inspect(reason),
+      "Install the #{harness} CLI and ensure it is on PATH."
+    )
+  end
+
   defp identity_check(base_dir) do
     identity_dir = Path.join(base_dir, "identity")
 
@@ -200,8 +241,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     end
   end
 
-  defp check(name, ok, detail, fix),
-    do: %{name: name, ok: ok, detail: detail, fix: if(ok, do: "", else: fix)}
+  defp check(name, ok, detail, fix) do
+    level = if(ok, do: :pass, else: :fail)
+    %{name: name, ok: ok, level: level, detail: detail, fix: if(ok, do: "", else: fix)}
+  end
 
   defp catalog_error(degraded) do
     degraded

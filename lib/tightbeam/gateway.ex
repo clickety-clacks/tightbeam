@@ -221,6 +221,7 @@ defmodule Tightbeam.Gateway do
     # boot (bad law stops the boot). Placement owns every host mechanic.
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)
+    assert_harness_binary_ready!(config, cli_bin)
     Homes.sweep_auth(config.base_dir, :claude)
     Homes.sweep_auth(config.base_dir, :codex)
 
@@ -306,6 +307,31 @@ defmodule Tightbeam.Gateway do
        name: Tightbeam.LaneManager},
       {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
     ]
+  end
+
+  defp assert_harness_binary_ready!(config, cli_bin) do
+    probe = Map.get(config, :harness_binary_probe, &Placement.harness_binary_probe/2)
+
+    results =
+      Enum.map([:claude, :codex], fn harness ->
+        {harness, probe.(harness, cli_bin)}
+      end)
+
+    unless Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) do
+      detail =
+        Enum.map_join(results, "; ", fn {harness, result} ->
+          reason =
+            case result do
+              {:error, :not_found} -> "not found"
+              {:error, {:exec_failed, exec_detail}} -> "exec failed: #{exec_detail}"
+            end
+
+          "#{harness}: #{reason}"
+        end)
+
+      raise "no usable harness CLI is installed (#{detail}). " <>
+              "Install the claude or codex CLI and ensure it is on PATH."
+    end
   end
 
   @doc "The immutable verb-handler table (see moduledoc list) — built once, passed to Dispatch."
