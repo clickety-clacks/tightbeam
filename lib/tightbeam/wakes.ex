@@ -324,10 +324,10 @@ defmodule Tightbeam.Wakes do
     GenServer.call(server, :fire_due)
   end
 
-  @doc "Eagerly evaluate condition wakes after a fact commits."
-  @spec fire_matching(GenServer.server()) :: :ok
-  def fire_matching(server \\ Tightbeam.WakeScheduler) do
-    GenServer.call(server, :fire_matching)
+  @doc "Eagerly evaluate condition wakes for the fact that just committed."
+  @spec fire_matching(GenServer.server(), pos_integer()) :: :ok
+  def fire_matching(server, fact_id) do
+    GenServer.call(server, {:fire_matching, fact_id})
   end
 
   @impl true
@@ -349,8 +349,8 @@ defmodule Tightbeam.Wakes do
     {:reply, :ok, state}
   end
 
-  def handle_call(:fire_matching, _from, state) do
-    evaluate_conditions(state, :eager)
+  def handle_call({:fire_matching, fact_id}, _from, state) do
+    evaluate_conditions(state, {:eager, fact_id})
     {:reply, :ok, state}
   end
 
@@ -363,6 +363,11 @@ defmodule Tightbeam.Wakes do
 
   def handle_info(:fire_matching, state) do
     evaluate_conditions(state, :tick)
+    {:noreply, state}
+  end
+
+  def handle_info({:fire_matching, fact_id}, state) do
+    evaluate_conditions(state, {:eager, fact_id})
     {:noreply, state}
   end
 
@@ -428,7 +433,10 @@ defmodule Tightbeam.Wakes do
     if Enum.any?(~w(C1 C2 F), fn branch ->
          Enum.count(rows, &(hd(&1) == branch)) == batch
        end) do
-      send(self(), :fire_matching)
+      case mode do
+        :tick -> send(self(), :fire_matching)
+        {:eager, fact_id} -> send(self(), {:fire_matching, fact_id})
+      end
     end
 
     :ok
@@ -443,9 +451,8 @@ defmodule Tightbeam.Wakes do
     end)
   end
 
-  defp select_candidates(db, batch, :eager) do
+  defp select_candidates(db, batch, {:eager, fact_id}) do
     transaction!(db, fn txn ->
-      [[fact_id]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
       {Txn.q(txn, candidate_sql(:eager), [fact_id, batch, now()]), nil}
     end)
   end

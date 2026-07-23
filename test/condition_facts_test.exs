@@ -29,6 +29,19 @@ defmodule Tightbeam.ConditionFactsTest do
     end
   end
 
+  defmodule FactNudgeSpy do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:fire_matching, fact_id}, _from, parent) do
+      send(parent, {:fire_matching, fact_id})
+      {:reply, :ok, parent}
+    end
+  end
+
   setup do
     db = :"condition_db_#{System.unique_integer([:positive])}"
     scheduler = :"condition_scheduler_#{System.unique_integer([:positive])}"
@@ -107,6 +120,73 @@ defmodule Tightbeam.ConditionFactsTest do
              event.kind == "wake_condition_fired" and event.subject == wake.wake_id and
                String.contains?(event.detail, "matchedFactId=#{matching.fact_id}")
            end)
+  end
+
+  test "each filer eagerly evaluates the specific fact it committed", ctx do
+    {:ok, nudge_spy} = FactNudgeSpy.start_link(self())
+
+    filed =
+      ConditionFacts.file(ctx.db, nudge_spy, %{
+        kind: "first-kind",
+        scope: "prod",
+        origin: "process:ci"
+      })
+
+    assert_receive {:fire_matching, fact_id}
+    assert fact_id == filed.fact_id
+
+    idempotent =
+      ConditionFacts.file_idempotent(ctx.db, nudge_spy, %{
+        kind: "second-kind",
+        scope: "prod",
+        origin: "process:ci",
+        idempotency_key: "specific-fact"
+      })
+
+    assert_receive {:fire_matching, idempotent_fact_id}
+    assert idempotent_fact_id == idempotent.fact_id
+
+    assert idempotent ==
+             ConditionFacts.file_idempotent(ctx.db, nudge_spy, %{
+               kind: "second-kind",
+               scope: "prod",
+               origin: "process:ci",
+               idempotency_key: "specific-fact"
+             })
+
+    refute_receive {:fire_matching, _}
+  end
+
+  test "eager evaluation cannot skip an older committed fact when a newer fact exists", ctx do
+    older_wake = condition_wake(ctx, "older-kind", "prod")
+    newer_wake = condition_wake(ctx, "newer-kind", "prod")
+
+    {:ok, {older_fact, newer_fact}} =
+      DB.transaction(ctx.db, fn txn ->
+        older =
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "older-kind",
+            scope: "prod",
+            origin: "process:ci"
+          })
+
+        newer =
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "newer-kind",
+            scope: "prod",
+            origin: "process:ci"
+          })
+
+        {older, newer}
+      end)
+
+    assert older_fact.fact_id < newer_fact.fact_id
+    assert :ok = Wakes.fire_matching(ctx.scheduler, older_fact.fact_id)
+    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, older_wake.wake_id)
+    assert Wakes.get(ctx.db, newer_wake.wake_id).state == "pending"
+
+    assert :ok = Wakes.fire_matching(ctx.scheduler, newer_fact.fact_id)
+    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, newer_wake.wake_id)
   end
 
   test "fallback consumes a condition wake and an unresolved fire records its cause", ctx do
