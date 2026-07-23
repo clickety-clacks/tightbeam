@@ -2,6 +2,20 @@ defmodule Tightbeam.RailScriptTest do
   use ExUnit.Case, async: false
 
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
+  @cli_dir Path.expand("../cli", __DIR__)
+
+  # The real-binary integration test invokes @release_binary. `File.exists?` is not
+  # enough — a STALE binary (built before rail-exec existed) passes existence yet fails
+  # the subcommand. Refresh it to current before the suite so the test always exercises
+  # code matching this checkout. Cached cargo makes this ~seconds after the first build;
+  # a cargo-less environment leaves whatever exists and the compile-time guard skips.
+  setup_all do
+    if File.exists?(@release_binary) do
+      _ = System.cmd("cargo", ["build", "--release"], cd: @cli_dir, stderr_to_stdout: true)
+    end
+
+    :ok
+  end
 
   alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Org, Placement, RailScript, Rules}
 
