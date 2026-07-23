@@ -92,6 +92,44 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "wake", vec![target], params))
         }
+        Command::ArtifactRecord {
+            identity,
+            kind,
+            title,
+            origin_path,
+            description,
+            work_item_id,
+            content_sha256,
+        } => {
+            let mut params = vec![
+                string_field("kind", kind),
+                string_field("title", title),
+                string_field("originPath", origin_path),
+            ];
+            for (name, value) in [
+                ("description", description),
+                ("workItemId", work_item_id),
+                ("contentSha256", content_sha256),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            Ok(request(identity, "artifact-record", vec![], params))
+        }
+        Command::Artifacts {
+            identity,
+            work_item_id,
+            session_key,
+        } => {
+            let mut params = Vec::new();
+            for (name, value) in [("workItemId", work_item_id), ("sessionKey", session_key)] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            Ok(request(identity, "artifacts", vec![], params))
+        }
         Command::Spawn {
             identity,
             display_name,
@@ -135,6 +173,153 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 vec![string_field("sessionKey", session_key)],
                 params,
             ))
+        }
+        Command::Assign {
+            identity,
+            subject,
+            target,
+            idempotency_key,
+            work_item_id,
+            reviews,
+            files,
+        } => {
+            let target = match target {
+                Target::Session(value) => string_field("sessionKey", value),
+                Target::Role(value) => string_field("role", value),
+                Target::User(_) => unreachable!("assign has no user target"),
+            };
+            let mut params = vec![string_field("subject", subject)];
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            if let Some(value) = work_item_id {
+                params.push(string_field("workItemId", value));
+            }
+            if let Some(value) = reviews {
+                params.push(string_field("reviews", value));
+            }
+            if let Some(value) = files {
+                params.push(format!(
+                    "\"files\":{}",
+                    serde_json::to_string(value).expect("strings are JSON serializable")
+                ));
+            }
+            Ok(request(identity, "assign", vec![target], params))
+        }
+        Command::Dispatch {
+            identity,
+            subject,
+            holder,
+            work_item_id,
+            brief,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("subject", subject),
+                string_field("brief", brief),
+            ];
+            if let Some(value) = work_item_id {
+                params.push(string_field("workItemId", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(
+                identity,
+                "dispatch",
+                vec![string_field("sessionKey", holder)],
+                params,
+            ))
+        }
+        Command::RunTests {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "run-tests",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::RunSmoke {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "run-smoke",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::WorkItemCreate {
+            identity,
+            title,
+            spec_ref_name,
+            spec_ref_sha256,
+        } => {
+            let mut params = vec![string_field("title", title)];
+            if let Some(value) = spec_ref_name {
+                params.push(string_field("specRefName", value));
+            }
+            if let Some(value) = spec_ref_sha256 {
+                params.push(string_field("specRefSha256", value));
+            }
+            Ok(request(identity, "work-item-create", vec![], params))
+        }
+        Command::WorkItemGet {
+            identity,
+            work_item_id,
+        } => Ok(request(
+            identity,
+            "work-item-get",
+            vec![],
+            vec![string_field("workItemId", work_item_id)],
+        )),
+        Command::Attest {
+            identity,
+            assignment_id,
+            kind,
+            verdict,
+            note,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("kind", kind),
+            ];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            if let Some(value) = verdict {
+                params.push(string_field("verdictKind", value));
+            }
+            Ok(request(identity, "attest", vec![], params))
+        }
+        Command::Attests {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "attests",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::Assignments {
+            identity,
+            target,
+            state,
+        } => {
+            let fields = target
+                .as_ref()
+                .map(|target| match target {
+                    Target::Session(value) => string_field("sessionKey", value),
+                    Target::Role(value) => string_field("role", value),
+                    Target::User(_) => unreachable!("assignments has no user target"),
+                })
+                .into_iter()
+                .collect();
+            let params = state
+                .as_ref()
+                .map(|value| vec![string_field("state", value)])
+                .unwrap_or_default();
+            Ok(request(identity, "assignments", fields, params))
         }
         Command::CancelWake { identity, wake_id } => Ok(request(
             identity,
@@ -230,6 +415,29 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![
                 string_field("userId", user_id),
                 bool_field("isAdmin", *is_admin),
+            ],
+        )),
+        Command::ConfigGet { identity, setting } => Ok(request(
+            identity,
+            "config",
+            vec![],
+            vec![
+                string_field("action", "get"),
+                string_field("setting", setting),
+            ],
+        )),
+        Command::ConfigSet {
+            identity,
+            setting,
+            value,
+        } => Ok(request(
+            identity,
+            "config",
+            vec![],
+            vec![
+                string_field("action", "set"),
+                string_field("setting", setting),
+                string_field("value", value),
             ],
         )),
     }
@@ -511,6 +719,186 @@ mod tests {
         assert_eq!(
             body(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"promote-user","params":{"userId":"mike","isAdmin":false}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_artifact_bodies() {
+        assert_eq!(
+            body(&[
+                "artifact-record",
+                "--kind",
+                "spec",
+                "--title",
+                "Banana design",
+                "--path",
+                "specs/banana.md",
+                "--description",
+                "Ratified design",
+                "--work-item",
+                "wi_1",
+                "--sha256",
+                "abc123",
+                "--as",
+                "writer",
+            ]),
+            r#"{"as":"writer","verb":"artifact-record","params":{"kind":"spec","title":"Banana design","originPath":"specs/banana.md","description":"Ratified design","workItemId":"wi_1","contentSha256":"abc123"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "artifacts",
+                "--work-item",
+                "wi_1",
+                "--session",
+                "agent:writer:app",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"artifacts","params":{"workItemId":"wi_1","sessionKey":"agent:writer:app"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_assignment_bodies() {
+        assert_eq!(
+            body(&[
+                "assign",
+                "--subject",
+                "ship",
+                "--role",
+                "builder",
+                "--key",
+                "idem",
+                "--work-item",
+                "wi_1",
+                "--reviews",
+                "asg_parent",
+                "--files",
+                "[\"lib/a.ex\",\"test/a_test.exs\"]",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","files":["lib/a.ex","test/a_test.exs"]}}"#
+        );
+        assert_eq!(
+            body(&[
+                "dispatch",
+                "--holder",
+                "agent:builder",
+                "--subject",
+                "ship",
+                "--brief",
+                "Please ship it.",
+                "--work-item",
+                "wi_1",
+                "--key",
+                "idem",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","idempotencyKey":"idem"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assignments",
+                "--session",
+                "s1",
+                "--state",
+                "all",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_attest_bodies() {
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "completion",
+                "--note",
+                "ready",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","note":"ready"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "tests-passed",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"tests-passed"}}"#
+        );
+        assert_eq!(
+            body(&["attests", "asg_1", "--as", "reviewer"]),
+            r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_work_item_bodies() {
+        let sha = "a".repeat(64);
+        assert_eq!(
+            body(&[
+                "work-item-create",
+                "--title",
+                "Ship",
+                "--spec-ref",
+                "spec.md",
+                "--spec-sha256",
+                &sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-create","params":{{"title":"Ship","specRefName":"spec.md","specRefSha256":"{sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_producer_bodies() {
+        assert_eq!(
+            body(&["run-tests", "asg_1", "--as", "builder"]),
+            r#"{"as":"builder","verb":"run-tests","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&["run-smoke", "asg_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"run-smoke","params":{"assignmentId":"asg_1"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_config_bodies() {
+        assert_eq!(
+            body(&["config", "get", "default-archetype", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"default-archetype"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "default-archetype",
+                "coder",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
         );
     }
 
