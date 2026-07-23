@@ -244,23 +244,18 @@ defmodule Tightbeam.ModelCatalog do
       %{
         "id" => id,
         "display_name" => display_name,
+        "max_input_tokens" => max_input_tokens,
         "capabilities" => capabilities
       } = model,
       {:ok, entries}
-      when is_binary(id) and is_binary(display_name) and is_map(capabilities) ->
-        max_input_tokens = model["max_input_tokens"]
+      when is_binary(id) and is_binary(display_name) and is_integer(max_input_tokens) and
+             max_input_tokens >= 0 and is_map(capabilities) ->
+        case claude_efforts(capabilities) do
+          {:ok, efforts} ->
+            {:cont, {:ok, entries ++ entries_for(model, id, efforts, capabilities)}}
 
-        if is_nil(max_input_tokens) or
-             (is_integer(max_input_tokens) and max_input_tokens >= 0) do
-          case claude_efforts(capabilities) do
-            {:ok, efforts} ->
-              {:cont, {:ok, entries ++ entries_for(model, id, efforts, capabilities)}}
-
-            :error ->
-              {:halt, {:error, :malformed_catalog}}
-          end
-        else
-          {:halt, {:error, :malformed_catalog}}
+          :error ->
+            {:halt, {:error, :malformed_catalog}}
         end
 
       _, _ ->
@@ -270,13 +265,17 @@ defmodule Tightbeam.ModelCatalog do
 
   defp derive_codex_entries(models) do
     Enum.reduce_while(models, {:ok, []}, fn
-      %{"slug" => slug, "display_name" => display_name} = model, {:ok, entries}
-      when is_binary(slug) and is_binary(display_name) ->
-        levels = model["supported_reasoning_levels"] || []
+      %{
+        "slug" => slug,
+        "display_name" => display_name,
+        "supported_reasoning_levels" => levels
+      } = model,
+      {:ok, entries}
+      when is_binary(slug) and is_binary(display_name) and is_list(levels) ->
         capabilities = model["capabilities"] || %{}
         max_input_tokens = model["max_input_tokens"] || model["context_window"]
 
-        if is_list(levels) and is_map(capabilities) and
+        if is_map(capabilities) and
              (is_nil(max_input_tokens) or
                 (is_integer(max_input_tokens) and max_input_tokens >= 0)) and
              Enum.all?(levels, &match?(%{"effort" => effort} when is_binary(effort), &1)) do
