@@ -191,6 +191,45 @@ defmodule Tightbeam.ConditionFactsTest do
            }).code == "reserved_kind"
   end
 
+  test "facts-read returns the latest fact by kind and optional scope", ctx do
+    first =
+      ConditionFacts.file(ctx.db, ctx.scheduler, %{
+        kind: "tour-given",
+        scope: "agent:first:app",
+        origin: "user:flynn"
+      })
+
+    second =
+      ConditionFacts.file(ctx.db, ctx.scheduler, %{
+        kind: "tour-given",
+        scope: ctx.session.session_key,
+        origin: "agent:guide"
+      })
+
+    facts_read = Gateway.handlers(%{db: ctx.db})["facts-read"]
+
+    assert facts_read.(%{params: %{kind: "tour-given", scope: "agent:first:app"}}) == %{
+             exists: true,
+             fact: %{
+               id: first.fact_id,
+               ts: first.ts,
+               kind: "tour-given",
+               scope: "agent:first:app",
+               origin: "user:flynn"
+             }
+           }
+
+    assert facts_read.(%{params: %{kind: "tour-given"}}).fact.id == second.fact_id
+
+    assert facts_read.(%{params: %{kind: "missing", scope: ctx.session.session_key}}) == %{
+             exists: false,
+             fact: nil
+           }
+
+    assert facts_read.(%{params: %{kind: ""}}).code == "invalid"
+    assert facts_read.(%{params: %{kind: "tour-given", scope: 42}}).code == "invalid"
+  end
+
   test "a wildcard subscription matches a scoped fact", ctx do
     wake = condition_wake(ctx, "build-green", nil)
 

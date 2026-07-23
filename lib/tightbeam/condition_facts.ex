@@ -98,6 +98,26 @@ defmodule Tightbeam.ConditionFacts do
     result
   end
 
+  @spec latest(DB.server(), String.t(), String.t() | nil) :: map() | nil
+  def latest(db, kind, scope \\ nil) do
+    {sql, params} =
+      if is_nil(scope) do
+        {"SELECT id, ts, kind, scope, origin FROM condition_facts WHERE kind = ?1 ORDER BY id DESC LIMIT 1",
+         [kind]}
+      else
+        {"SELECT id, ts, kind, scope, origin FROM condition_facts INDEXED BY condition_facts_match WHERE kind = ?1 AND scope = ?2 ORDER BY id DESC LIMIT 1",
+         [kind, scope]}
+      end
+
+    case DB.query(db, sql, params) do
+      {:ok, [[id, ts, fact_kind, fact_scope, origin]]} ->
+        %{id: id, ts: ts, kind: fact_kind, scope: fact_scope, origin: origin}
+
+      {:ok, []} ->
+        nil
+    end
+  end
+
   defp fact_in_txn(txn, fact_id) do
     case Txn.q(txn, "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1", [
            fact_id

@@ -381,6 +381,7 @@ defmodule Tightbeam.Gateway do
           %{code: "invalid", message: "a condition fact requires a kind"}
         end
       end,
+      "facts-read" => fn call -> facts_read_result(db, call) end,
       "rule" => fn call ->
         Escalation.rule(db, call,
           authorized: admin_origin?(db, call.origin),
@@ -1739,7 +1740,8 @@ defmodule Tightbeam.Gateway do
                 :model,
                 :origin,
                 :spawned_by,
-                :state
+                :state,
+                :created_at
               ])
             ),
           wakes: wakes,
@@ -1758,6 +1760,22 @@ defmodule Tightbeam.Gateway do
         else
           result
         end
+    end
+  end
+
+  defp facts_read_result(db, call) do
+    p = call.params
+
+    cond do
+      not (is_binary(p[:kind]) and p.kind != "") ->
+        %{code: "invalid", message: "facts-read requires a kind"}
+
+      not (is_nil(p[:scope]) or (is_binary(p.scope) and p.scope != "")) ->
+        %{code: "invalid", message: "facts-read scope must be a non-empty string"}
+
+      true ->
+        fact = ConditionFacts.latest(db, p.kind, p[:scope])
+        %{exists: not is_nil(fact), fact: fact}
     end
   end
 

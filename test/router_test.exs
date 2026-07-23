@@ -836,6 +836,51 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(vacant.resp_body)["error"]["message"] =~ "vacant"
   end
 
+  test "facts-read routes as a read verb and list sessions use createdAt on the wire", ctx do
+    parent = self()
+
+    facts_opts =
+      with_handler(ctx.opts, "facts-read", fn call ->
+        send(parent, {:call, call})
+        %{exists: false, fact: nil}
+      end)
+
+    facts =
+      dispatch_cli(%{ctx | opts: facts_opts}, "tbc_test", %{
+        verb: "facts-read",
+        asUser: "flynn",
+        params: %{kind: "tour-given", scope: "agent:tour:app"}
+      })
+
+    assert facts.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "facts-read",
+                      params: %{kind: "tour-given", scope: "agent:tour:app"}
+                    }}
+
+    assert JSON.decode!(facts.resp_body)["result"] == %{"exists" => false, "fact" => nil}
+
+    list_opts =
+      with_handler(ctx.opts, "inspect", fn _call ->
+        %{sessions: [%{session_key: "agent:tour:app", created_at: 123}]}
+      end)
+
+    list =
+      dispatch_cli(%{ctx | opts: list_opts}, "tbc_test", %{
+        verb: "inspect",
+        asUser: "flynn"
+      })
+
+    assert %{"createdAt" => 123} =
+             JSON.decode!(list.resp_body)["result"]["sessions"] |> List.first()
+
+    refute JSON.decode!(list.resp_body)["result"]["sessions"]
+           |> List.first()
+           |> Map.has_key?("created_at")
+  end
+
   test "session bearer enforces the identity ladder and threads the normative principal seam",
        ctx do
     holder = create_session(ctx.db, "holder-token", "flynn")

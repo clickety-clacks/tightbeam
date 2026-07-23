@@ -476,6 +476,9 @@ defmodule Tightbeam.GatewayTest do
         params: %{}
       })
 
+    assert [%{created_at: created_at}] = inspect.sessions
+    assert created_at == session.created_at
+
     projections = [
       inspect,
       Payloads.stream_session(session),
