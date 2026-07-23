@@ -46,6 +46,11 @@ pub enum Command {
         scope: Option<String>,
         idempotency_key: Option<String>,
     },
+    FactsRead {
+        identity: Identity,
+        kind: String,
+        scope: Option<String>,
+    },
     Rule {
         identity: Identity,
         request_id: String,
@@ -300,6 +305,9 @@ COMMANDS:
       File an org/product condition fact. Reserved substrate kinds cannot be
       filed through this command.
         tightbeam condition --kind deploy-succeeded --scope prod --key deploy-8f2a
+
+  facts-read --kind <kind> [--scope <scope>]
+      Read the latest matching condition fact.
 
   rule --request <id> --decision <allow|deny|option> [--rationale "..."]
       Resolve one open decision request.
@@ -695,6 +703,19 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 kind,
                 scope: nonempty(flags, "scope"),
                 idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "facts-read" => {
+            if parsed.positional.get(1).is_some() {
+                return Err(
+                    "usage: tightbeam facts-read --kind <kind> [--scope <scope>]".to_owned(),
+                );
+            }
+            let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
+            Ok(Command::FactsRead {
+                identity: identity(flags)?,
+                kind,
+                scope: nonempty(flags, "scope"),
             })
         }
         "rule" => {
@@ -1459,6 +1480,13 @@ mod tests {
                 "prod",
                 "--key",
                 "k",
+            ]),
+            strings(&[
+                "facts-read",
+                "--kind",
+                "tour-given",
+                "--scope",
+                "agent:tour:app",
             ]),
             strings(&[
                 "spawn",

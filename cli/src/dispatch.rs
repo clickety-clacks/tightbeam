@@ -136,6 +136,17 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "condition", vec![], params))
         }
+        Command::FactsRead {
+            identity,
+            kind,
+            scope,
+        } => {
+            let mut params = vec![string_field("kind", kind)];
+            if let Some(value) = scope {
+                params.push(string_field("scope", value));
+            }
+            Ok(request(identity, "facts-read", vec![], params))
+        }
         Command::Rule {
             identity,
             request_id,
@@ -755,6 +766,7 @@ fn identity_omitted(command: &Command) -> bool {
     let identity = match command {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
+        | Command::FactsRead { identity, .. }
         | Command::Rule { identity, .. }
         | Command::Waive { identity, .. }
         | Command::RevokeWaiver { identity, .. }
@@ -936,6 +948,19 @@ mod tests {
                 "ci",
             ]),
             r#"{"asProcess":"ci","verb":"condition","params":{"kind":"deploy-succeeded","scope":"prod","idempotencyKey":"deploy-1"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "facts-read",
+                "--kind",
+                "tour-given",
+                "--scope",
+                "agent:tour:app",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"facts-read","params":{"kind":"tour-given","scope":"agent:tour:app"}}"#
         );
     }
 
