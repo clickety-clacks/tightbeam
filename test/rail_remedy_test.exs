@@ -52,8 +52,14 @@ defmodule Tightbeam.RailRemedyTest do
     reviewer = session(db, "reviewer-session", "flynn", "codex", "reviewer")
     Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
 
+    # Canonicalize the tmp base: Darwin's System.tmp_dir!/0 sits under the /var
+    # symlink (/var -> /private/var), and Containment.profile/1 (the rail scratch
+    # write-root) refuses uncanonical components, which fails the contained script
+    # launch (error:1) instead of letting it return a clean deny.
+    tmp_base = to_string(:string.trim(:os.cmd(~c(realpath #{System.tmp_dir!()}))))
+
     base_dir =
-      Path.join(System.tmp_dir!(), "tightbeam-remedy-#{System.unique_integer([:positive])}")
+      Path.join(tmp_base, "tightbeam-remedy-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join(base_dir, "identity/rules"))
     handlers = Gateway.handlers(%{db: db})

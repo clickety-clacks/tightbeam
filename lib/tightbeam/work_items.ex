@@ -63,7 +63,18 @@ defmodule Tightbeam.WorkItems do
       result = transaction(db, fn txn -> update_in_txn(txn, call.params) end)
 
       case result do
-        {:updated, item, _changed?} ->
+        {:updated, item, changed?} ->
+          # Work-item-grain metadata doorbell (observability-v1 §work_item_events,
+          # kind="metadata"): title/spec-ref pin changed, so observability must
+          # invalidate/refetch its card (work-item-v1 §Mutability cross-spec note).
+          # observability-v1 OWNS this doorbell; work-item-v1 declines to build it,
+          # it does not forbid it.
+          if changed? do
+            best_effort(fn ->
+              Map.get(call, :on_work_item_change, fn _, _ -> :ok end).(item.id, "metadata")
+            end)
+          end
+
           item
 
         error ->
@@ -227,6 +238,16 @@ defmodule Tightbeam.WorkItems do
   defp error(code, message), do: %{code: code, message: message}
 
   defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256}
+
+  defp best_effort(fun) do
+    try do
+      fun.()
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
 
   defp transaction(db, fun) do
     case DB.transaction(db, fun) do

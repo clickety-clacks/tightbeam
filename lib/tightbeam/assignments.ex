@@ -469,6 +469,16 @@ defmodule Tightbeam.Assignments do
         {:created, assignment, delivery} ->
           best_effort(fn -> notify(call, :on_assignment_change, assignment.id, nil) end)
 
+          # Work-item-grain composition doorbell (observability-v1 §work_item_events,
+          # kind="composition"): a work item gained a child assignment. observability-v1
+          # OWNS work_item_events; work-item-v1's "no new event kinds" refers to the
+          # Dispatch AUDIT stream, not this doorbell — do not conflate them again.
+          if assignment.workItemId,
+            do:
+              best_effort(fn ->
+                notify(call, :on_work_item_change, assignment.workItemId, "composition")
+              end)
+
           if delivery,
             do: best_effort(fn -> notify(call, :on_dispatch_delivery, delivery, nil) end)
 
