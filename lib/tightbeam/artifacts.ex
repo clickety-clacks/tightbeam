@@ -54,8 +54,14 @@ defmodule Tightbeam.Artifacts do
   @doc "Record a deliberate artifact pointer for the authenticated calling session."
   @spec record(DB.server(), map()) :: map()
   def record(db \\ Tightbeam.DB, call) do
-    case {call[:principal], call[:session_key]} do
-      {{:session, session_key}, session_key} when is_binary(session_key) ->
+    case {
+      call[:principal],
+      call[:session_key],
+      call[:recorded_message_id],
+      call[:params][:work_item_id]
+    } do
+      {{:session, session_key}, session_key, recorded_message_id, work_item_id}
+      when is_binary(session_key) and is_binary(recorded_message_id) and is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
         parent_session = parent_session(db, session_key)
         now = now()
@@ -77,16 +83,20 @@ defmodule Tightbeam.Artifacts do
               call.params.title,
               call.params[:description],
               session_key,
-              call.params.work_item_id,
+              work_item_id,
               parent_session,
               call.params.origin_path,
               call.params[:content_sha256],
-              call.recorded_message_id,
+              recorded_message_id,
               now
             ]
           )
 
         get(db, artifact_id)
+
+      {{:session, session_key}, session_key, _recorded_message_id, _work_item_id}
+      when is_binary(session_key) ->
+        %{code: "invalid", message: "artifact-record requires provenance edges"}
 
       _ ->
         %{code: "invalid", message: "artifact-record requires a session caller"}
@@ -107,16 +117,14 @@ defmodule Tightbeam.Artifacts do
   def list(db \\ Tightbeam.DB, filters \\ %{}) do
     {clauses, params} =
       [
-        {"workItemId", "=", filters[:work_item_id]},
-        {"createdBySession", "=", filters[:session_key]},
-        {"kind", "=", filters[:kind]},
-        {"createdAt", ">=", filters[:created_after]},
-        {"createdAt", "<=", filters[:created_before]}
+        {"workItemId", filters[:work_item_id]},
+        {"createdBySession", filters[:session_key]},
+        {"kind", filters[:kind]}
       ]
-      |> Enum.reject(fn {_column, _operator, value} -> is_nil(value) end)
+      |> Enum.reject(fn {_column, value} -> is_nil(value) end)
       |> Enum.with_index(1)
-      |> Enum.map_reduce([], fn {{column, operator, value}, index}, values ->
-        {"#{column} #{operator} ?#{index}", values ++ [value]}
+      |> Enum.map_reduce([], fn {{column, value}, index}, values ->
+        {"#{column} = ?#{index}", values ++ [value]}
       end)
 
     where = if clauses == [], do: "", else: " WHERE " <> Enum.join(clauses, " AND ")
@@ -142,17 +150,18 @@ defmodule Tightbeam.Artifacts do
     else
       ensure_workspace_available!(workspace_path)
 
-      relative_paths =
-        Map.new(live, fn row ->
-          {row.artifact_id, archived_relative_path!(row.origin_path, workspace_path)}
-        end)
+      {relative_paths, errors} = archive_candidates(live, workspace_path)
+
+      if map_size(relative_paths) == 0 do
+        raise hd(errors)
+      end
 
       archived_path = archive_workspace!(workspace_path, archive_root, session_key)
       updated_at = now()
 
       {:ok, :ok} =
         DB.transaction(db, fn txn ->
-          Enum.each(live, fn row ->
+          Enum.each(relative_paths, fn {artifact_id, relative_path} ->
             DB.Txn.q(
               txn,
               """
@@ -161,8 +170,8 @@ defmodule Tightbeam.Artifacts do
               WHERE artifactId = ?1 AND state = 'in-workspace'
               """,
               [
-                row.artifact_id,
-                Path.join(archived_path, Map.fetch!(relative_paths, row.artifact_id)),
+                artifact_id,
+                Path.join(archived_path, relative_path),
                 updated_at
               ]
             )
@@ -173,6 +182,17 @@ defmodule Tightbeam.Artifacts do
     end
 
     :ok
+  end
+
+  defp archive_candidates(live, workspace_path) do
+    Enum.reduce(live, {%{}, []}, fn row, {paths, errors} ->
+      try do
+        relative_path = archived_relative_path!(row.origin_path, workspace_path)
+        {Map.put(paths, row.artifact_id, relative_path), errors}
+      rescue
+        error in ArgumentError -> {paths, errors ++ [error]}
+      end
+    end)
   end
 
   @doc "Mark an archived artifact as released from Tightbeam custody."

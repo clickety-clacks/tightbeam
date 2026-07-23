@@ -32,13 +32,12 @@
   required. The spec owner must also rule how pre-migration rows with a null
   `workItemId` are repaired without inventing intent or deleting permanent rows.
 
-- **Clause 14 — all load-bearing edges are exact FKs:** the owned migration installs
-  all four FKs on compatible existing tables. A legacy row written by the old
-  implementation always has a null `recordedMessageId` and may have a null
-  `workItemId`, so it cannot be copied into the ratified non-null shape without
-  fabricated provenance. The spec owner must define a truthful legacy-row repair,
-  and the test owner must add the populated legacy upgrade case to
-  `test/artifacts_test.exs`.
+- **Clause 14 — legacy rows with absent load-bearing edges:** the owned persistent
+  migration and rollback paths are now covered against both compatible data and a
+  row actually produced by the old writer. That old writer always stored a null
+  `recordedMessageId` and could store a null `workItemId`, so those rows cannot enter
+  the ratified non-null FK shape without fabricated provenance. The spec owner must
+  define a truthful legacy-row repair policy.
 
 - **Clause 20 — released transition:** `Artifacts.release/2` performs the real
   transition, but no shipped verb reaches it. Gateway, router, and CLI owners must
@@ -80,15 +79,27 @@
   expose that operation and prove the observable end state through the shipped
   interface.
 
+- **Clauses 38 and 39 — warm custody-handoff notice:** the required notice belongs
+  in relocating-agent archetype guidance, not in the artifact substrate. The
+  `lib/tightbeam/archetypes.ex` owner must add the ratified plain-language notice
+  before any relocating agent moves archived bytes into user/org-managed space,
+  with an archetype test that asserts the notice is present.
+
 - **Clause 40 — durable topology reaches the exact conversation:** this depends on
   the authoritative firing-turn binding and required CLI work-item input described
   for clauses 8, 11, and 12. The router/transcript and CLI owners must implement and
   integration-test those edges; `Artifacts` cannot infer them truthfully.
 
-- **Clause 45 — time-window filters:** the owned query implements inclusive
-  `created_after` / `created_before` bounds. The spec owner must confirm the bound
-  names and created-time interpretation, then CLI/router owners must expose the
-  fields and test both inclusive boundaries through the shipped interface.
+- **Clause 45 — time-window filters:** the spec requires a time window but does not
+  define the bound names, inclusivity, or which artifact timestamp the window uses.
+  The spec owner must ratify those semantics before `Artifacts.list/2`, Gateway,
+  router, and CLI owners implement and test the full public filter.
+
+- **Clause 51 — org-visible branch registration:** the branch-producing
+  reconciliation/integration path is outside `Artifacts`; its owner must call the
+  artifact-record seam for the resulting org-visible branch with authoritative
+  work-item, session, and transcript provenance, then prove the branch row is
+  queryable from the work item.
 
 - **Clause 57 — authoritative work-item spec resolver:** generic artifact filtering
   cannot decide which artifact satisfies `work_items.specRefName`.

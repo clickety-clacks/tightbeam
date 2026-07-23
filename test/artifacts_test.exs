@@ -87,11 +87,6 @@ defmodule Tightbeam.ArtifactsTest do
              }),
              & &1.artifact_id
            ) == [first.artifact_id]
-
-    assert Enum.map(
-             Artifacts.list(ctx.db, %{created_after: 2, created_before: 2}),
-             & &1.artifact_id
-           ) == [second.artifact_id]
   end
 
   test "gateway verbs return rows, filtered lists, not-found, and the session-caller error",
@@ -129,6 +124,17 @@ defmodule Tightbeam.ArtifactsTest do
              code: "invalid",
              message: "artifact-record requires a session caller"
            }
+
+    assert handlers["artifact-record"].(%{
+             principal: {:session, ctx.child.session_key},
+             session_key: ctx.child.session_key,
+             params: call.params
+           }) == %{
+             code: "invalid",
+             message: "artifact-record requires provenance edges"
+           }
+
+    assert Artifacts.list(ctx.db, %{session_key: ctx.child.session_key}) == [row]
   end
 
   test "schema is idempotent and enforces the closed kind/state sets", ctx do
@@ -203,6 +209,124 @@ defmodule Tightbeam.ArtifactsTest do
                        'msg_child', 'released', '/claimed/home', 1, 1)
                """
              )
+  end
+
+  test "persistent compatible legacy rows migrate with all provenance foreign keys", _ctx do
+    path = persistent_db_path("compatible")
+    first_db = :"legacy_compatible_first_#{System.unique_integer([:positive])}"
+    first_id = {:legacy_compatible_first, first_db}
+
+    on_exit(fn -> File.rm(path) end)
+
+    start_db(first_id, first_db, path)
+    seed_legacy_database(first_db)
+
+    {:ok, _} =
+      DB.query(
+        first_db,
+        """
+        INSERT INTO artifacts
+          (artifactId, kind, title, createdBySession, workItemId, parentSession,
+           originPath, recordedMessageId, state, home, createdAt, updatedAt)
+        VALUES ('art_legacy', 'spec', 'Legacy spec', 'child', 'wi_banana', 'parent',
+                'specs/legacy.md', 'msg_child', 'archived', '/archive/specs/legacy.md', 1, 2)
+        """
+      )
+
+    stop_supervised!(first_id)
+
+    second_db = :"legacy_compatible_second_#{System.unique_integer([:positive])}"
+    second_id = {:legacy_compatible_second, second_db}
+    start_db(second_id, second_db, path)
+
+    assert :ok = Artifacts.ensure_schema(second_db)
+
+    assert Artifacts.get(second_db, "art_legacy") == %{
+             artifact_id: "art_legacy",
+             kind: "spec",
+             title: "Legacy spec",
+             description: nil,
+             created_by_session: "child",
+             work_item_id: "wi_banana",
+             parent_session: "parent",
+             origin_path: "specs/legacy.md",
+             content_sha256: nil,
+             recorded_message_id: "msg_child",
+             state: "archived",
+             home: "/archive/specs/legacy.md",
+             created_at: 1,
+             updated_at: 2
+           }
+
+    assert {:ok, foreign_keys} = DB.query(second_db, "PRAGMA foreign_key_list(artifacts)")
+
+    assert MapSet.new(Enum.map(foreign_keys, fn row -> {Enum.at(row, 3), Enum.at(row, 2)} end)) ==
+             MapSet.new([
+               {"createdBySession", "sessions"},
+               {"workItemId", "work_items"},
+               {"parentSession", "sessions"},
+               {"recordedMessageId", "messages"}
+             ])
+
+    assert {:error, _} =
+             DB.query(
+               second_db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId, originPath,
+                  recordedMessageId, state, createdAt, updatedAt)
+               VALUES ('art_invalid_edge', 'other', 'Invalid', 'child', 'wi_missing',
+                       'invalid', 'msg_child', 'in-workspace', 3, 3)
+               """
+             )
+  end
+
+  test "persistent main-written null provenance row rolls migration back intact", _ctx do
+    path = persistent_db_path("rollback")
+    first_db = :"legacy_rollback_first_#{System.unique_integer([:positive])}"
+    first_id = {:legacy_rollback_first, first_db}
+
+    on_exit(fn -> File.rm(path) end)
+
+    start_db(first_id, first_db, path)
+    seed_legacy_database(first_db)
+
+    {:ok, _} =
+      DB.query(
+        first_db,
+        """
+        INSERT INTO artifacts
+          (artifactId, kind, title, createdBySession, workItemId, parentSession,
+           originPath, recordedMessageId, state, home, createdAt, updatedAt)
+        VALUES ('art_main_writer', 'report', 'Main writer row', 'child', 'wi_banana',
+                'parent', 'reports/main.md', NULL, 'in-workspace', NULL, 1, 1)
+        """
+      )
+
+    stop_supervised!(first_id)
+
+    second_db = :"legacy_rollback_second_#{System.unique_integer([:positive])}"
+    second_id = {:legacy_rollback_second, second_db}
+    start_db(second_id, second_db, path)
+
+    assert {:error, %DB.Error{message: message}} = Artifacts.ensure_schema(second_db)
+    assert message =~ "NOT NULL constraint failed: artifacts_new.recordedMessageId"
+
+    assert {:ok, [["art_main_writer", nil]]} =
+             DB.query(
+               second_db,
+               "SELECT artifactId, recordedMessageId FROM artifacts"
+             )
+
+    assert {:ok, []} = DB.query(second_db, "PRAGMA foreign_key_list(artifacts)")
+
+    assert {:ok, []} =
+             DB.query(
+               second_db,
+               "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'artifacts_new'"
+             )
+
+    assert {:ok, [[1]]} = DB.query(second_db, "PRAGMA foreign_keys")
   end
 
   test "archives the exact artifact home and release clears custody location", ctx do
@@ -313,6 +437,152 @@ defmodule Tightbeam.ArtifactsTest do
     refute File.exists?(archive_root)
   end
 
+  test "canonical custody accepts an internal symlink and records the archived target", ctx do
+    workspace =
+      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
+
+    archive_root =
+      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(workspace, "data"))
+    File.write!(Path.join(workspace, "data/inside.md"), "inside")
+    File.ln_s!("data/inside.md", Path.join(workspace, "inside-link.md"))
+
+    on_exit(fn ->
+      File.rm_rf(workspace)
+      File.rm_rf(archive_root)
+    end)
+
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "doc",
+        title: "Internal symlink",
+        origin_path: "inside-link.md"
+      })
+
+    assert :ok =
+             Artifacts.archive_session(
+               ctx.db,
+               ctx.child.session_key,
+               workspace,
+               archive_root
+             )
+
+    [archive_dir_name] = File.ls!(archive_root)
+    archived = Artifacts.get(ctx.db, row.artifact_id)
+
+    assert archived.state == "archived"
+    assert archived.home == Path.join([archive_root, archive_dir_name, "data/inside.md"])
+    assert File.read!(archived.home) == "inside"
+    refute File.exists?(workspace)
+  end
+
+  test "canonical custody rejects a symlink to bytes outside the workspace", ctx do
+    workspace =
+      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
+
+    outside =
+      Path.join(System.tmp_dir!(), "outside-artifact-#{System.unique_integer([:positive])}.md")
+
+    archive_root =
+      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(workspace)
+    File.write!(outside, "outside")
+    File.ln_s!(outside, Path.join(workspace, "outside-link.md"))
+
+    on_exit(fn ->
+      File.rm_rf(workspace)
+      File.rm(outside)
+      File.rm_rf(archive_root)
+    end)
+
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "doc",
+        title: "External symlink",
+        origin_path: "outside-link.md"
+      })
+
+    assert_raise ArgumentError, "artifact origin is outside its session workspace", fn ->
+      Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    end
+
+    unchanged = Artifacts.get(ctx.db, row.artifact_id)
+    assert unchanged.state == "in-workspace"
+    assert unchanged.home == nil
+    assert File.dir?(workspace)
+    refute File.exists?(archive_root)
+  end
+
+  test "valid artifacts archive despite each invalid mixed-row class", ctx do
+    for invalid_kind <- [:outside, :missing, :external_symlink] do
+      suffix = "#{invalid_kind}-#{System.unique_integer([:positive])}"
+      session_key = "mixed-#{suffix}"
+      workspace = Path.join(System.tmp_dir!(), "artifact-workspace-#{suffix}")
+      archive_root = Path.join(System.tmp_dir!(), "artifact-archive-#{suffix}")
+      outside = Path.join(System.tmp_dir!(), "outside-artifact-#{suffix}.md")
+
+      session(ctx.db, session_key, nil)
+      seed_message(ctx.db, session_key)
+      File.mkdir_p!(Path.join(workspace, "reports"))
+      File.write!(Path.join(workspace, "reports/valid.md"), "valid #{invalid_kind}")
+      File.write!(outside, "outside #{invalid_kind}")
+
+      invalid_origin =
+        case invalid_kind do
+          :outside ->
+            outside
+
+          :missing ->
+            "reports/missing.md"
+
+          :external_symlink ->
+            File.ln_s!(outside, Path.join(workspace, "reports/escape.md"))
+            "reports/escape.md"
+        end
+
+      valid =
+        record(ctx.db, session_key, %{
+          kind: "report",
+          title: "Valid #{invalid_kind}",
+          origin_path: "reports/valid.md"
+        })
+
+      invalid =
+        record(ctx.db, session_key, %{
+          kind: "report",
+          title: "Invalid #{invalid_kind}",
+          origin_path: invalid_origin
+        })
+
+      assert :ok =
+               Artifacts.archive_session(
+                 ctx.db,
+                 session_key,
+                 workspace,
+                 archive_root
+               )
+
+      [archive_dir_name] = File.ls!(archive_root)
+      archived = Artifacts.get(ctx.db, valid.artifact_id)
+      unchanged = Artifacts.get(ctx.db, invalid.artifact_id)
+
+      assert archived.state == "archived"
+
+      assert archived.home ==
+               Path.join([archive_root, archive_dir_name, "reports/valid.md"])
+
+      assert File.read!(archived.home) == "valid #{invalid_kind}"
+      assert unchanged.state == "in-workspace"
+      assert unchanged.home == nil
+      refute File.exists?(workspace)
+
+      File.rm_rf!(archive_root)
+      File.rm!(outside)
+    end
+  end
+
   test "removes an artifact-free workspace", ctx do
     workspace =
       Path.join(
@@ -364,6 +634,56 @@ defmodule Tightbeam.ArtifactsTest do
         """,
         ["msg_#{session_key}", session_key]
       )
+  end
+
+  defp start_db(id, name, path) do
+    start_supervised!(%{
+      id: id,
+      start: {DB, :start_link, [[path: path, name: name]]}
+    })
+  end
+
+  defp seed_legacy_database(db) do
+    :ok = Org.ensure_schema(db)
+    :ok = Projection.ensure_schema(db)
+    :ok = WorkItems.ensure_schema(db)
+    parent = session(db, "parent", nil)
+    _child = session(db, "child", parent.session_key)
+    seed_work_items(db)
+    seed_message(db, parent.session_key)
+    seed_message(db, "child")
+    :ok = DB.execute(db, legacy_artifacts_ddl())
+  end
+
+  defp legacy_artifacts_ddl do
+    """
+    CREATE TABLE artifacts (
+      artifactId        TEXT PRIMARY KEY,
+      kind              TEXT NOT NULL CHECK (kind IN ('spec','report','doc','data','other')),
+      title             TEXT NOT NULL,
+      description       TEXT,
+      createdBySession  TEXT NOT NULL,
+      workItemId        TEXT,
+      parentSession     TEXT,
+      originPath        TEXT NOT NULL,
+      contentSha256     TEXT,
+      recordedMessageId INTEGER,
+      state             TEXT NOT NULL DEFAULT 'in-workspace'
+                        CHECK (state IN ('in-workspace','archived','released')),
+      home              TEXT,
+      createdAt         INTEGER NOT NULL,
+      updatedAt         INTEGER NOT NULL
+    );
+    CREATE INDEX artifacts_work_item ON artifacts (workItemId);
+    CREATE INDEX artifacts_created_by_session ON artifacts (createdBySession);
+    """
+  end
+
+  defp persistent_db_path(suffix) do
+    Path.join(
+      System.tmp_dir!(),
+      "artifacts-legacy-#{suffix}-#{System.unique_integer([:positive])}.sqlite3"
+    )
   end
 
   defp session(db, key, spawned_by) do
