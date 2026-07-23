@@ -22,7 +22,50 @@ defmodule FeatureSmoke do
     |> check_work_item_and_assignment_get()
     |> check_dispatch_opens_assignment()
     |> check_flagship_review_loop()
+    |> check_escalation_to_owner()
     |> finish()
+  end
+
+  # --- #3 escalation: a gated verb escalates to the owner for a decision --------
+  # Requires the `surrender-escalates-to-owner` rail. Proves the escalate effect live:
+  # attest surrender → decision-request opened to the owner → owner rules allow → proceeds.
+  defp check_escalation_to_owner(state) do
+    u = unique()
+    wi = ok!(state, "work-item-create", %{"title" => "esc #{u}", "idempotencyKey" => "ewi-#{u}"})
+    wi_id = wi["workItemId"] || wi["id"]
+    coder = ok!(state, "spawn", %{"displayName" => "smoke-esc-coder-#{u}", "idempotencyKey" => "ec-#{u}"})
+    coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
+    post(state, "role-create", %{"name" => "coder-esc-#{u}"})
+    ok!(state, "role-bind", %{"name" => "coder-esc-#{u}", "sessionKey" => coder_key})
+    coder_tok = session_token(state, coder_key)
+    asg = ok!(state, "assign", %{"sessionKey" => coder_key, "subject" => "esc impl #{u}", "workItemId" => wi_id, "idempotencyKey" => "ea-#{u}"})
+    asg_id = asg["id"] || asg["assignmentId"]
+
+    # 1. Coder attests surrender → escalates (does NOT proceed; a decision-request opens).
+    _esc = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "surrender"})
+
+    # 2. The owner sees an open decision-request for this escalation.
+    drs = ok!(state, "decision-requests", %{})
+    dr =
+      (drs["requests"] || drs["decisionRequests"] || drs)
+      |> List.wrap()
+      |> Enum.find(fn d ->
+        (d["statute"] || d["statuteName"]) == "surrender-escalates-to-owner" or
+          (d["ref"] || d["subject"] || "") =~ asg_id
+      end)
+    assert(state, is_map(dr), "escalation: no decision-request opened for the surrender; got #{inspect(drs)}")
+    dr_id = dr["id"] || dr["requestId"] || dr["decisionRequestId"]
+
+    # 3. Owner rules allow.
+    ok!(state, "rule", %{"requestId" => dr_id, "decision" => "allow", "rationale" => "smoke ok"})
+
+    # 4. Coder re-attests surrender → the ruling is consumed → the verb proceeds.
+    done = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "surrender"})
+    assert(state, not (is_map(done) and Map.has_key?(done, "error")),
+      "escalation: surrender after the owner's allow should proceed, got #{inspect(done)}")
+
+    retire(state, coder)
+    pass(state, "escalation to owner: surrender → decision-request → owner rules allow → proceeds")
   end
 
   # --- P7 flagship enforced loop: completion requires an independent review ---
