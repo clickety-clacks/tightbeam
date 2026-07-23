@@ -12,10 +12,51 @@ verb = "attest"
 text = "assign wake and spawn remedies resolve declared targets"
 edges = ["verb"]
 effect = "remedy"
-deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "assign-remedy" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }
+]
 [fixture.rule.remedy]
 action = "assign"
 produces = "reviewed-clean"
 target_role = "reviewer"
 [fixture.rule.remedy.params]
 subject = "review {assignment_id}"
+reviews = "{assignment_id}"
+
+[[fixture.rule]]
+name = "remedy-action-wake"
+verb = "attest"
+text = "wake remedy resolves a declared target session"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "wake-remedy" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }
+]
+[fixture.rule.remedy]
+action = "wake"
+produces = "reviewed-clean"
+target_session = "reviewer-session"
+[fixture.rule.remedy.params]
+prompt = "review {assignment_id}"
+after = 60000
+
+[[fixture.rule]]
+name = "remedy-action-spawn"
+verb = "attest"
+text = "spawn remedy resolves its declared identity"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "spawn-remedy" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }
+]
+[fixture.rule.remedy]
+action = "spawn"
+produces = "reviewed-clean"
+name = "remedy-reviewer"
+harness = "codex"
+model = "test"
+[fixture.rule.remedy.params]
+display = "Reviewer {assignment_id}"

@@ -13,3 +13,13 @@ text = "an allowed escalation never bypasses later statutes"
 edges = ["verb"]
 effect = "escalate"
 deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+
+[[fixture.rule]]
+name = "later-statute"
+verb = "attest"
+text = "the statute after an allowed escalation still runs"
+edges = ["verb"]
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "caller.is_admin", op = "eq", value = false }
+]

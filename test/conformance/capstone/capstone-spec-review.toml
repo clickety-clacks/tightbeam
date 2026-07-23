@@ -17,3 +17,6 @@ deny_when = [{ fact = "assignment.independent_verdict_kinds", op = "not_in", val
 action = "assign"
 produces = "spec-reviewed"
 target_role = "reviewer"
+[fixture.rule.remedy.params]
+subject = "review spec for {assignment_id}"
+reviews = "{assignment_id}"

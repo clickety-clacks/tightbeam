@@ -17,3 +17,6 @@ deny_when = [{ fact = "assignment.cross_harness_verdict_kinds", op = "not_in", v
 action = "assign"
 produces = "reviewed-clean"
 target_role = "reviewer"
+[fixture.rule.remedy.params]
+subject = "review {assignment_id}"
+reviews = "{assignment_id}"

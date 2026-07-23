@@ -1,6 +1,24 @@
 #!/bin/sh
-case "${TIGHTBEAM_CONFORMANCE_RETURN:-reconciled}" in
-  timeout) sleep 60 ;;
-  error:*) exit 13 ;;
-  *) printf '%s\n' "${TIGHTBEAM_CONFORMANCE_RETURN:-reconciled}" ;;
+input=$(cat)
+holder_workdir=$(printf '%s' "$input" | jq -r '.context.holder_workdir')
+[ "$(realpath "$holder_workdir")" = "$(pwd -P)" ] || exit 71
+printf '%s' "$input" | jq -e '.context | has("repo") | not' >/dev/null || exit 72
+case "$(cat .tightbeam-conformance-mode 2>/dev/null || true)" in
+  out-of-set)
+    printf '%s\n' unexpected
+    ;;
+  error)
+    touch .tightbeam-forbidden-write
+    exit 13
+    ;;
+  timeout)
+    sleep 60
+    ;;
+  *)
+    if git merge-base --is-ancestor main HEAD; then
+      printf '%s\n' reconciled
+    else
+      printf '%s\n' behind
+    fi
+    ;;
 esac

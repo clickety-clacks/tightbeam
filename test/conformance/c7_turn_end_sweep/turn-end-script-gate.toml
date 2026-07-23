@@ -11,15 +11,16 @@ name = "turn-end-script-gate"
 verb = "attest"
 text = "turn-end script result may select a remedy"
 edges = ["turn-end"]
-effect = "remedy"
 deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
 [fixture.rule.check]
 script = "reconcile-with-main"
-returns = ["remedy", "allow"]
+returns = ["reconciled", "behind"]
 [fixture.rule.check.effects]
-remedy = "remedy"
-allow = "allow"
+reconciled = "remedy"
+behind = "allow"
 [fixture.rule.remedy]
 action = "assign"
-produces = "reviewed-clean"
 target_role = "reviewer"
+[fixture.rule.remedy.params]
+subject = "review {assignment_id}"
+reviews = "{assignment_id}"
