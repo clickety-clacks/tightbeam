@@ -201,8 +201,12 @@ defmodule Tightbeam.Supervision do
              0 <- Ledger.pending_count(db, session_key) do
           case holder_state(db, session_key) do
             :retired ->
-              write_watermark(db, session_key, terminal_seq)
+              # Act-then-watermark (matches the remedy branch): doorbells are an
+              # idempotent CAS, so a crash before the watermark re-rings them on
+              # redelivery. Watermark-first would lose them permanently (a retired
+              # session never re-terminals).
               doorbells_for_holder(db, session_key)
+              write_watermark(db, session_key, terminal_seq)
               :stranded
 
             :live ->
