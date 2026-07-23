@@ -194,7 +194,7 @@ defmodule Tightbeam.Gateway do
     File.write!(gateway_path, JSON.encode!(%{port: config.port, cliToken: cli_token}))
     File.chmod!(gateway_path, 0o600)
     cli_bin = install_cli_bin(config.base_dir)
-    defaults = defaults(config)
+    defaults = defaults(config, db)
     on_terminal = fn session_key, seq -> Supervision.notify_terminal(session_key, seq) end
     producer_config = Producers.load!(config.base_dir)
     producer_runner = Map.get(config, :producer_runner, Tightbeam.ProducerRunner)
@@ -529,6 +529,7 @@ defmodule Tightbeam.Gateway do
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
+      "config" => admin_handler(db, fn p -> config_result(db, p) end),
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -928,11 +929,13 @@ defmodule Tightbeam.Gateway do
 
   defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
 
-  defp defaults(config) do
+  defp defaults(config, db) do
     harness = config.default_harness
 
     %{
-      archetype: "default",
+      # Invariant: only omitted archetypes consult the org default; an explicit
+      # spawn archetype is never replaced by organization policy.
+      archetype: Org.get_setting(db, "default-archetype") || "default",
       harness: harness,
       provider: if(harness == :codex, do: :openai, else: :anthropic),
       model: config.default_model
@@ -1559,6 +1562,32 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp config_result(db, %{action: "get", setting: "default-archetype"}) do
+    %{
+      setting: "default-archetype",
+      value: Org.get_setting(db, "default-archetype") || "default"
+    }
+  end
+
+  defp config_result(db, %{
+         action: "set",
+         setting: "default-archetype",
+         value: archetype_name
+       }) do
+    case Archetypes.get(archetype_name) do
+      nil ->
+        %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
+
+      _archetype ->
+        :ok = Org.put_setting(db, "default-archetype", archetype_name)
+        %{setting: "default-archetype", value: archetype_name}
+    end
+  end
+
+  defp config_result(_db, _params) do
+    %{code: "invalid", message: "config supports get/set default-archetype"}
+  end
+
   defp admin_handler(db, fun) do
     fn call ->
       if admin_origin?(db, call.origin),
@@ -1879,7 +1908,7 @@ defmodule Tightbeam.Gateway do
 
   defp create_spawn(config, db, call, caller) do
     p = call.params
-    defaults = defaults(config)
+    defaults = defaults(config, db)
     archetype_name = p[:archetype] || defaults.archetype
 
     # Identity must exist; placement is constitutional set membership
@@ -1908,7 +1937,7 @@ defmodule Tightbeam.Gateway do
 
   defp create_spawn(config, db, call, caller, archetype, host, overrides) do
     p = call.params
-    defaults = defaults(config)
+    defaults = defaults(config, db)
     harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
     harness_string = to_string(harness)
     harness_atom = if harness_string == "codex", do: :codex, else: :claude

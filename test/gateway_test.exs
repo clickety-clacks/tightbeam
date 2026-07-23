@@ -820,6 +820,88 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
   end
 
+  test "config validates, persists, and controls only omitted spawn archetypes", ctx do
+    base_dir = role_test_base("default-archetype")
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "coder.toml"), """
+    name = "coder"
+    """)
+
+    Archetypes.load!(base_dir)
+
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    config = handlers["config"]
+    spawn = handlers["spawn"]
+
+    assert %{setting: "default-archetype", value: "default"} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "get", setting: "default-archetype"}
+             })
+
+    fallback =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{display_name: "Fallback", idempotency_key: "spawn-fallback"}
+      })
+
+    assert Org.get(ctx.db, fallback.session_key).archetype == "default"
+
+    assert %{code: "unknown_archetype", message: "no such archetype: missing"} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-archetype", value: "missing"}
+             })
+
+    assert Org.get_setting(ctx.db, "default-archetype") == nil
+
+    assert %{setting: "default-archetype", value: "coder"} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-archetype", value: "coder"}
+             })
+
+    assert Org.get_setting(ctx.db, "default-archetype") == "coder"
+
+    configured =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{display_name: "Configured", idempotency_key: "spawn-configured"}
+      })
+
+    assert Org.get(ctx.db, configured.session_key).archetype == "coder"
+
+    explicit =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{
+          display_name: "Explicit",
+          archetype: "default",
+          idempotency_key: "spawn-explicit"
+        }
+      })
+
+    assert Org.get(ctx.db, explicit.session_key).archetype == "default"
+
+    assert %{code: "forbidden", message: "admin required"} =
+             config.(%{
+               origin: "user:not-admin",
+               params: %{action: "set", setting: "default-archetype", value: "default"}
+             })
+
+    assert Org.get_setting(ctx.db, "default-archetype") == "coder"
+  end
+
   test "spawn readiness denial creates no session, role, or idempotency row", ctx do
     base_dir = role_test_base("spawn-unready", false)
     Archetypes.load!(base_dir)

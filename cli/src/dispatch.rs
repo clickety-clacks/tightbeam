@@ -545,6 +545,29 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 bool_field("isAdmin", *is_admin),
             ],
         )),
+        Command::ConfigGet { identity, setting } => Ok(request(
+            identity,
+            "config",
+            vec![],
+            vec![
+                string_field("action", "get"),
+                string_field("setting", setting),
+            ],
+        )),
+        Command::ConfigSet {
+            identity,
+            setting,
+            value,
+        } => Ok(request(
+            identity,
+            "config",
+            vec![],
+            vec![
+                string_field("action", "set"),
+                string_field("setting", setting),
+                string_field("value", value),
+            ],
+        )),
     }
 }
 
@@ -767,6 +790,7 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::DenyDevice { identity, .. }
         | Command::RevokeDevice { identity, .. }
         | Command::PromoteUser { identity, .. } => identity,
+        Command::ConfigGet { identity, .. } | Command::ConfigSet { identity, .. } => identity,
         Command::Help
         | Command::Probe { .. }
         | Command::Init(_)
@@ -997,6 +1021,21 @@ mod tests {
         assert_eq!(
             body(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"promote-user","params":{"userId":"mike","isAdmin":false}}"#
+        );
+        assert_eq!(
+            body(&["config", "get", "default-archetype", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"default-archetype"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "default-archetype",
+                "coder",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
         );
     }
 
