@@ -353,6 +353,9 @@ fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
 }
 
 pub fn run(command: Command) -> Result<(), String> {
+    let _ = crate::ceremonies::init as fn(crate::args::InitArgs) -> Result<(), String>;
+    let _ = crate::probe::run as fn(bool, Option<String>) -> Result<(), String>;
+
     match command {
         Command::Help => unreachable!("help is handled before dispatch"),
         Command::Setup(args) => crate::ceremonies::setup(args),
@@ -375,7 +378,13 @@ mod tests {
     use super::*;
     use crate::args;
     use std::collections::HashMap;
+    use std::process::Command as ProcessCommand;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const DISCOVERY_CHILD: &str = "TIGHTBEAM_TEST_DISCOVERY_CHILD";
+    const EXPECTED_BASE: &str = "TIGHTBEAM_TEST_EXPECTED_BASE";
+    const EXPECTED_TOKEN: &str = "TIGHTBEAM_TEST_EXPECTED_TOKEN";
+    const EXPECTED_ERROR: &str = "TIGHTBEAM_TEST_EXPECTED_ERROR";
 
     fn parse(values: &[&str]) -> Command {
         args::parse(values.iter().map(|value| (*value).to_owned()).collect()).unwrap()
@@ -569,6 +578,151 @@ mod tests {
             gateway_config_path(&|name| env.get(name).cloned(), &root),
             PathBuf::from("gateway.json")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_ignores_session_files_across_full_precedence_matrix() {
+        if std::env::var_os(DISCOVERY_CHILD).is_some() {
+            if let Ok(expected) = std::env::var(EXPECTED_ERROR) {
+                assert_eq!(discover(), Err(expected));
+            } else {
+                assert_eq!(
+                    discover(),
+                    Ok(Endpoint {
+                        base: std::env::var(EXPECTED_BASE).unwrap(),
+                        token: std::env::var(EXPECTED_TOKEN).unwrap(),
+                    })
+                );
+            }
+            return;
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam_cli_session_ignored_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let ancestor = root.join("ancestor");
+        let cwd = ancestor.join("work").join("nested");
+        let configured = root.join("configured");
+        let home = root.join("home");
+        let empty_home = root.join("empty-home");
+
+        for directory in [&cwd, &configured, &home.join(".tightbeam"), &empty_home] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            ancestor.join(".tightbeam-session"),
+            r#"{"url":"https://ancestor-session","token":"ancestor-token"}"#,
+        )
+        .unwrap();
+        fs::write(
+            ancestor.join("work").join(".tightbeam-session"),
+            r#"{"url":"https://nearest-session","token":"nearest-token"}"#,
+        )
+        .unwrap();
+        fs::write(
+            configured.join("gateway.json"),
+            r#"{"port":4321,"cliToken":"configured"}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".tightbeam").join("gateway.json"),
+            r#"{"port":9876,"cliToken":"default"}"#,
+        )
+        .unwrap();
+
+        let configured_path = configured.display().to_string();
+        let home_path = home.display().to_string();
+        let empty_home_path = empty_home.display().to_string();
+        let missing_config = empty_home.join(".tightbeam").join("gateway.json");
+        let missing_error = format!(
+            "ENOENT: no such file or directory, open '{}'",
+            missing_config.display()
+        );
+        let cases = [
+            (
+                "complete env",
+                vec![
+                    ("HOME", home_path.as_str()),
+                    ("TIGHTBEAM_HOME", configured_path.as_str()),
+                    ("TIGHTBEAM_URL", "https://env-gateway"),
+                    ("TIGHTBEAM_TOKEN", "env-token"),
+                    (EXPECTED_BASE, "https://env-gateway"),
+                    (EXPECTED_TOKEN, "env-token"),
+                ],
+            ),
+            (
+                "url-only env falls back to configured home",
+                vec![
+                    ("HOME", home_path.as_str()),
+                    ("TIGHTBEAM_HOME", configured_path.as_str()),
+                    ("TIGHTBEAM_URL", "https://incomplete"),
+                    (EXPECTED_BASE, "http://127.0.0.1:4321"),
+                    (EXPECTED_TOKEN, "configured"),
+                ],
+            ),
+            (
+                "token-only env falls back to configured home",
+                vec![
+                    ("HOME", home_path.as_str()),
+                    ("TIGHTBEAM_HOME", configured_path.as_str()),
+                    ("TIGHTBEAM_TOKEN", "incomplete"),
+                    (EXPECTED_BASE, "http://127.0.0.1:4321"),
+                    (EXPECTED_TOKEN, "configured"),
+                ],
+            ),
+            (
+                "configured home without env credentials",
+                vec![
+                    ("HOME", home_path.as_str()),
+                    ("TIGHTBEAM_HOME", configured_path.as_str()),
+                    (EXPECTED_BASE, "http://127.0.0.1:4321"),
+                    (EXPECTED_TOKEN, "configured"),
+                ],
+            ),
+            (
+                "default home",
+                vec![
+                    ("HOME", home_path.as_str()),
+                    (EXPECTED_BASE, "http://127.0.0.1:9876"),
+                    (EXPECTED_TOKEN, "default"),
+                ],
+            ),
+            (
+                "session files alone are not discovery sources",
+                vec![
+                    ("HOME", empty_home_path.as_str()),
+                    (EXPECTED_ERROR, missing_error.as_str()),
+                ],
+            ),
+        ];
+
+        let current_exe = std::env::current_exe().unwrap();
+        for (name, environment) in cases {
+            let output = ProcessCommand::new(&current_exe)
+                .arg("--exact")
+                .arg("dispatch::tests::discovery_ignores_session_files_across_full_precedence_matrix")
+                .arg("--nocapture")
+                .current_dir(&cwd)
+                .env_clear()
+                .env(DISCOVERY_CHILD, "1")
+                .envs(environment)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{name} child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
         fs::remove_dir_all(root).unwrap();
     }
 
