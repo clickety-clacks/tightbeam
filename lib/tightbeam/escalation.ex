@@ -496,7 +496,7 @@ defmodule Tightbeam.Escalation do
         end
       end)
 
-    if not Map.has_key?(result, :code), do: nudge(opts)
+    if not Map.has_key?(result, :code), do: nudge(opts, [result.ruling_fact_id])
     result
   end
 
@@ -505,7 +505,7 @@ defmodule Tightbeam.Escalation do
     granted_at = now()
     reason = param(call, :reason)
 
-    {:ok, {waiver, facts?}} =
+    {:ok, {waiver, fact_ids}} =
       DB.transaction(db, fn txn ->
         Txn.q(
           txn,
@@ -520,7 +520,7 @@ defmodule Tightbeam.Escalation do
           "raiser=#{raiser_id} statute=#{statute_name} by=#{call.origin} path=#{path}"
         )
 
-        facts? =
+        fact_ids =
           if path == "request" do
             open_ids =
               Txn.q(
@@ -529,7 +529,7 @@ defmodule Tightbeam.Escalation do
                 [raiser_id, statute_name]
               )
 
-            Enum.each(open_ids, fn [id] ->
+            Enum.flat_map(open_ids, fn [id] ->
               Txn.q(
                 txn,
                 "UPDATE decision_requests SET status = 'ruled', decision = 'waived', rationale = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
@@ -555,18 +555,20 @@ defmodule Tightbeam.Escalation do
                   id,
                   "by=#{call.origin} decision=waived factId=#{fact_id}"
                 )
+
+                [fact_id]
+              else
+                []
               end
             end)
-
-            open_ids != []
           else
-            false
+            []
           end
 
-        {waiver_in_txn(txn, waiver_id), facts?}
+        {waiver_in_txn(txn, waiver_id), fact_ids}
       end)
 
-    if facts?, do: nudge(opts)
+    if fact_ids != [], do: nudge(opts, fact_ids)
     waiver
   end
 
@@ -837,10 +839,15 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp nudge(opts) do
+  defp nudge(opts, fact_ids) do
     case Keyword.get(opts, :scheduler) do
-      nil -> :ok
-      scheduler -> Wakes.fire_matching(scheduler)
+      nil ->
+        :ok
+
+      scheduler ->
+        fact_ids
+        |> Enum.reject(&is_nil/1)
+        |> Enum.each(&Wakes.fire_matching(scheduler, &1))
     end
   end
 

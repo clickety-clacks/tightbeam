@@ -271,8 +271,12 @@ defmodule Tightbeam.EscalationTest do
 
     assert request(ctx, first).decision == "waived"
     assert request(ctx, second).decision == "waived"
+    # The eager path fires per filed fact (wake-on-fact-v1 §candidate query:
+    # `f.id = :factId`), and waive nudges once per ruling fact — so BOTH
+    # ruling wakes fire eagerly. (The old latest-fact-only pending state was
+    # an artifact of the broadcast MAX(id) approximation.)
     assert Wakes.get(ctx.db, second_wake.wake_id).state == "fired"
-    assert Wakes.get(ctx.db, first_wake.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, first_wake.wake_id).state == "fired"
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, first_wake.wake_id).state == "fired"
