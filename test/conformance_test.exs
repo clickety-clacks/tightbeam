@@ -1160,7 +1160,11 @@ defmodule Tightbeam.ConformanceSupport do
     do: "[" <> Enum.map_join(value, ", ", &toml_value/1) <> "]"
 
   defp temp_dir!(prefix) do
-    path = Path.join(System.tmp_dir!(), "#{prefix}-#{System.unique_integer([:positive])}")
+    # Canonicalize the tmp base: on Darwin System.tmp_dir!/0 sits under the /var
+    # symlink (/var -> /private/var), and Containment.profile/1 refuses write
+    # roots with unresolved symlink components.
+    base = to_string(:string.trim(:os.cmd(~c(realpath #{System.tmp_dir!()}))))
+    path = Path.join(base, "#{prefix}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(path)
     path
   end
