@@ -201,7 +201,8 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])
   end
 
-  test "linked dispatch remains one atomic assign-and-wake action", ctx do
+  test "linked dispatch ruminates first, then atomically assigns and wakes without linking",
+       ctx do
     work_item =
       handle(
         ctx,
@@ -218,14 +219,63 @@ defmodule Tightbeam.AssignmentsTest do
         work_item.id
       )
 
-    assignment = handle(ctx, "dispatch", call)
-    assert assignment.workItemId == work_item.id
+    assert {:ok,
+            %{
+              rumination_required: true,
+              work_item_id: work_item_id,
+              message: message
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    assert work_item_id == work_item.id
+
+    assert message ==
+             "Sent you to ruminate on #{work_item.id} first — re-dispatch when you're done thinking."
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'ship the rail'")
+
+    assert [wake] = Wakes.list_pending(ctx.db)
+    assert wake.session_key == "other-session"
+    assert wake.creator_session_key == "other-session"
+    assert wake.origin == "agent:other-session"
+    assert wake.rumination
+    assert wake.work_item_id == work_item.id
+
+    assert wake.prompt ==
+             "digest: Ruminate on work-item #{work_item.id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=ship the rail brief=Implement the ratified behavior. When you've thought it through, re-issue the dispatch."
+
+    scheduler = :"rumination_wake_#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn delivered -> send(test_pid, {:rumination_delivered, delivered}) end}
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:rumination_delivered, %{wake_id: wake_id}}
+    assert wake_id == wake.wake_id
+    assert Wakes.rumination_exists?(ctx.db, work_item.id, "other-session")
+
+    assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert assignment.workItemId == nil
     assert assignment.openedBySession == "other-session"
 
     assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId = ?1", [
-               work_item.id
-             ])
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId IS NULL",
+               [assignment.id]
+             )
+
+    assert {:ok, [[prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey = 'holder'")
+
+    assert prompt =~ assignment.id
+    assert prompt =~ "Implement the ratified behavior"
 
     user_dispatch =
       handle(
@@ -240,7 +290,14 @@ defmodule Tightbeam.AssignmentsTest do
         )
       )
 
-    assert user_dispatch.workItemId == work_item.id
+    assert user_dispatch.workItemId == nil
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId IS NULL",
+               [user_dispatch.id]
+             )
 
     unlinked =
       handle(
@@ -259,6 +316,13 @@ defmodule Tightbeam.AssignmentsTest do
       )
 
     assert assigned.workItemId == work_item.id
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId = ?2",
+               [assigned.id, work_item.id]
+             )
   end
 
   test "review and file declarations are assign-only inputs", ctx do
