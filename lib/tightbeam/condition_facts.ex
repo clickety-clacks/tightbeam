@@ -28,7 +28,12 @@ defmodule Tightbeam.ConditionFacts do
   @spec file(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file(db, scheduler, input) do
     result = transaction!(db, &file_in_txn(&1, input))
-    if match?(%{fact_id: _}, result), do: Wakes.fire_matching(scheduler)
+
+    case result do
+      %{fact_id: fact_id} -> Wakes.fire_matching(scheduler, fact_id)
+      _ -> :ok
+    end
+
     result
   end
 
@@ -94,7 +99,7 @@ defmodule Tightbeam.ConditionFacts do
         end
       end)
 
-    if filed?, do: Wakes.fire_matching(scheduler)
+    if filed?, do: Wakes.fire_matching(scheduler, result.fact_id)
     result
   end
 
