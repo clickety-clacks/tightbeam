@@ -3,7 +3,7 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Projection
+  alias Tightbeam.{Projection, Wakes}
 
   defmodule TransitionRace do
     @moduledoc false
@@ -381,6 +381,38 @@ defmodule Tightbeam.Assignments do
   end
 
   defp dispatch_result(db, call) do
+    case {call.params[:work_item_id], call.principal} do
+      {work_item_id, {:session, caller_session}} when not is_nil(work_item_id) ->
+        if Wakes.rumination_exists?(db, work_item_id, caller_session) do
+          open_dispatch_result(db, call)
+        else
+          transaction(db, fn txn ->
+            Wakes.schedule_in_txn(txn, %{
+              session_key: caller_session,
+              origin: call.origin,
+              creator_session_key: caller_session,
+              prompt:
+                "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
+              due_at: now(),
+              rumination: true,
+              work_item_id: work_item_id
+            })
+
+            %{
+              rumination_required: true,
+              work_item_id: work_item_id,
+              message:
+                "Sent you to ruminate on #{work_item_id} first — re-dispatch when you're done thinking."
+            }
+          end)
+        end
+
+      _ ->
+        open_dispatch_result(db, call)
+    end
+  end
+
+  defp open_dispatch_result(db, call) do
     open_assignment_result(
       db,
       call,

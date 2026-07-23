@@ -124,4 +124,43 @@ defmodule Tightbeam.WakesTest do
     refute_receive {:delivered, _}
     assert Wakes.get(db, wake.wake_id).state == "pending"
   end
+
+  test "rumination markers count only after firing and are scoped by work-item and caller", %{
+    db: db,
+    scheduler: scheduler
+  } do
+    test_pid = self()
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn wake -> send(test_pid, {:delivered, wake}) end}
+    )
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "caller",
+        origin: "agent:caller",
+        creator_session_key: "caller",
+        prompt: "digest: think first",
+        due_at: System.system_time(:millisecond),
+        rumination: true,
+        work_item_id: "wi_one"
+      })
+
+    assert wake.rumination
+    assert wake.work_item_id == "wi_one"
+    refute Wakes.rumination_exists?(db, "wi_one", "caller")
+    refute Wakes.rumination_exists?(db, "wi_other", "caller")
+    refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:delivered, %{wake_id: wake_id}}
+    assert wake_id == wake.wake_id
+    assert Wakes.rumination_exists?(db, "wi_one", "caller")
+    refute Wakes.rumination_exists?(db, "wi_other", "caller")
+    refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
+  end
 end

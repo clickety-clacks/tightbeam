@@ -42,6 +42,8 @@ defmodule Tightbeam.Wakes do
           condition_after_id: integer() | nil,
           fired_by: String.t() | nil,
           creator_session_key: String.t() | nil,
+          rumination: boolean(),
+          work_item_id: String.t() | nil,
           reresolve: String.t() | nil,
           reresolve_seed: String.t() | nil,
           reresolve_rung: integer() | nil
@@ -68,7 +70,9 @@ defmodule Tightbeam.Wakes do
     conditionScope TEXT NULL,
     conditionAfterId INTEGER NULL,
     firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
-    creatorSessionKey TEXT NULL
+    creatorSessionKey TEXT NULL,
+    rumination INTEGER NOT NULL DEFAULT 0,
+    work_item_id TEXT
   );
   CREATE INDEX IF NOT EXISTS wakes_due ON wakes (state, dueAt);
   CREATE TABLE IF NOT EXISTS scheduler_state (
@@ -91,7 +95,9 @@ defmodule Tightbeam.Wakes do
           "ALTER TABLE wakes ADD COLUMN conditionScope TEXT NULL",
           "ALTER TABLE wakes ADD COLUMN conditionAfterId INTEGER NULL",
           "ALTER TABLE wakes ADD COLUMN firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback'))",
-          "ALTER TABLE wakes ADD COLUMN creatorSessionKey TEXT NULL"
+          "ALTER TABLE wakes ADD COLUMN creatorSessionKey TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN rumination INTEGER NOT NULL DEFAULT 0",
+          "ALTER TABLE wakes ADD COLUMN work_item_id TEXT"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
@@ -148,6 +154,8 @@ defmodule Tightbeam.Wakes do
       condition_after_id: condition_after_id,
       fired_by: nil,
       creator_session_key: Map.get(input, :creator_session_key),
+      rumination: Map.get(input, :rumination, false),
+      work_item_id: Map.get(input, :work_item_id),
       reresolve: Map.get(input, :reresolve),
       reresolve_seed: Map.get(input, :reresolve_seed),
       reresolve_rung: Map.get(input, :reresolve_rung)
@@ -159,9 +167,9 @@ defmodule Tightbeam.Wakes do
         INSERT INTO wakes
           (wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt,
            reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope,
-           conditionAfterId, firedBy, creatorSessionKey)
+           conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, ?8, ?9, ?10,
-                ?11, ?12, ?13, NULL, ?14)
+                ?11, ?12, ?13, NULL, ?14, ?15, ?16)
       """,
       [
         wake.wake_id,
@@ -177,7 +185,9 @@ defmodule Tightbeam.Wakes do
         wake.condition_kind,
         wake.condition_scope,
         wake.condition_after_id,
-        wake.creator_session_key
+        wake.creator_session_key,
+        if(wake.rumination, do: 1, else: 0),
+        wake.work_item_id
       ]
     )
 
@@ -255,6 +265,24 @@ defmodule Tightbeam.Wakes do
       ])
 
     count
+  end
+
+  @doc "Whether a delivered rumination wake exists for this work-item and caller session."
+  @spec rumination_exists?(db(), String.t(), String.t()) :: boolean()
+  def rumination_exists?(db \\ Tightbeam.DB, work_item_id, caller_session) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT 1 FROM wakes
+        WHERE rumination = 1 AND work_item_id = ?1 AND creatorSessionKey = ?2
+          AND state = 'fired'
+        LIMIT 1
+        """,
+        [work_item_id, caller_session]
+      )
+
+    rows != []
   end
 
   ## Scheduler process
@@ -628,7 +656,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id FROM wakes"
   end
 
   defp to_wake([
@@ -648,7 +676,9 @@ defmodule Tightbeam.Wakes do
          condition_scope,
          condition_after_id,
          fired_by,
-         creator_session_key
+         creator_session_key,
+         rumination,
+         work_item_id
        ]) do
     %{
       wake_id: wake_id,
@@ -667,7 +697,9 @@ defmodule Tightbeam.Wakes do
       condition_scope: condition_scope,
       condition_after_id: condition_after_id,
       fired_by: fired_by,
-      creator_session_key: creator_session_key
+      creator_session_key: creator_session_key,
+      rumination: rumination == 1,
+      work_item_id: work_item_id
     }
   end
 

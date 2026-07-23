@@ -3,6 +3,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   alias Tightbeam.{
     Assignments,
+    ConditionFacts,
     DB,
     Devices,
     Dispatch,
@@ -14,6 +15,7 @@ defmodule Tightbeam.AssignmentsTest do
     Projection,
     Roles,
     Rules,
+    Wakes,
     WorkItems,
     WorkState
   }
@@ -24,11 +26,13 @@ defmodule Tightbeam.AssignmentsTest do
 
     for module <- [
           Devices,
+          ConditionFacts,
           Idempotency,
           Ledger,
           Org,
           Projection,
           Roles,
+          Wakes,
           WorkItems,
           Assignments,
           WorkState,
@@ -191,6 +195,108 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])
+  end
+
+  test "dispatch reroutes a session through one fired rumination wake per work-item", ctx do
+    work_item =
+      handle(
+        ctx,
+        "work-item-create",
+        work_item_call("work-item-create", {:user, "flynn"}, %{title: "Rumination rail"})
+      )
+
+    call =
+      dispatch_call(
+        {:session, "other-session"},
+        "ship the rail",
+        "Implement the ratified behavior",
+        nil,
+        work_item.id
+      )
+
+    assert %{
+             rumination_required: true,
+             work_item_id: work_item_id,
+             message: message
+           } = handle(ctx, "dispatch", call)
+
+    assert work_item_id == work_item.id
+
+    assert message ==
+             "Sent you to ruminate on #{work_item.id} first — re-dispatch when you're done thinking."
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId = ?1", [
+               work_item.id
+             ])
+
+    assert [wake] = Wakes.list_pending(ctx.db)
+    assert wake.session_key == "other-session"
+    assert wake.creator_session_key == "other-session"
+    assert wake.origin == "agent:other-session"
+    assert wake.rumination
+    assert wake.work_item_id == work_item.id
+
+    assert wake.prompt ==
+             "digest: Ruminate on work-item #{work_item.id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=ship the rail brief=Implement the ratified behavior. When you've thought it through, re-issue the dispatch."
+
+    scheduler = :"rumination_wake_#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn delivered -> send(test_pid, {:rumination_delivered, delivered}) end}
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:rumination_delivered, %{wake_id: wake_id}}
+    assert wake_id == wake.wake_id
+    assert Wakes.rumination_exists?(ctx.db, work_item.id, "other-session")
+
+    assignment = handle(ctx, "dispatch", call)
+    assert assignment.workItemId == work_item.id
+    assert assignment.openedBySession == "other-session"
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId = ?1", [
+               work_item.id
+             ])
+
+    user_dispatch =
+      handle(
+        ctx,
+        "dispatch",
+        dispatch_call(
+          {:user, "flynn"},
+          "user dispatch",
+          "Users do not ruminate.",
+          nil,
+          work_item.id
+        )
+      )
+
+    assert user_dispatch.workItemId == work_item.id
+
+    unlinked =
+      handle(
+        ctx,
+        "dispatch",
+        dispatch_call({:session, "other-session"}, "unlinked", "Dispatch immediately.")
+      )
+
+    assert unlinked.subject == "unlinked"
+
+    assigned =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "other-session"}, "bookkeeping", nil, work_item.id)
+      )
+
+    assert assigned.workItemId == work_item.id
   end
 
   test "dispatch rolls back the assignment when prompt enqueue fails", ctx do
