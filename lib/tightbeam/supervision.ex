@@ -228,27 +228,106 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  # ── THE TURN-END SCHEDULE (supervision-impl r21) ──────────────────────────
+  #
+  # This list IS the end-of-turn shift: every governance that acts when a
+  # turn ends holds exactly one named slot here, and the shift runs them in
+  # this order, first halt wins. The order is SEMANTIC, not incidental:
+  #
+  #   :adjudication_hold — an open adjudication freezes everything downstream
+  #                        (a held turn must not be enforced or prodded);
+  #   :rail_enforcement  — the org's statutes get the turn before the
+  #                        substrate's own ladder does (Rules.decide → remedy /
+  #                        escalate / legibility rows; rails-mechanism-v1 owns
+  #                        the semantics of this step, this module only hosts
+  #                        its slot);
+  #   :pending_wake_gate — an already-pending wake means the strand is not
+  #                        stalled; nothing downstream should fire;
+  #   :prod_ladder       — the sweep proper (prods, escalation ladder,
+  #                        watermark). Always halts; the schedule never runs
+  #                        off the end.
+  #
+  # ADDING A STEP (the lease — all four lines, or the shift rejects you):
+  #   1. Add the atom HERE, in its semantically correct position.
+  #   2. Add a `turn_end_step/2` clause returning `:cont` or `{:halt, result}`.
+  #      Read state freely; any write must be idempotent (the terminal cast
+  #      can be redelivered) and must NOT move the watermark — the watermark
+  #      has ONE writer, the acting step that ends the shift.
+  #   3. Extend the termination argument (spec §r21): your step must be
+  #      bounded per shift and must not unconditionally re-trigger a turn —
+  #      the enforcement loop is bounded ONLY because remedies are
+  #      once-per-occurrence; say why yours is bounded too.
+  #   4. Extend the order-pinning test in supervision_test.exs — it fails on
+  #      any unannounced change to this list, by design.
+  #
+  # PRINCIPLES every step inherits (r20's invariants, kept verbatim): the
+  # substrate never judges ("gave up" is not a state), never punishes (no
+  # retire/cancel/re-staff — substrate acts are wakes, stamps, and
+  # org-authored statute effects), never reads content (rows or nothing).
+  #
+  # This list is deliberately NOT a runtime registration seam: steps share
+  # the turn context, the order carries meaning, and the termination proof is
+  # over the closed composition. Orgs extend turn-end behavior through
+  # STATUTES (data, hosted by :rail_enforcement) — never by code injection.
+  @turn_end_schedule [:adjudication_hold, :rail_enforcement, :pending_wake_gate, :prod_ladder]
+
+  @doc "The end-of-turn shift, in execution order. Pinned by test; amend both."
+  def turn_end_schedule, do: @turn_end_schedule
+
   defp evaluate_live(db, handlers, n, session_key, terminal_seq, assignment) do
-    case adjudication_hold(db, session_key, terminal_seq) do
-      {:held, :adjudication_hold} = held ->
-        held
+    ctx = %{
+      db: db,
+      handlers: handlers,
+      n: n,
+      session_key: session_key,
+      terminal_seq: terminal_seq,
+      assignment: assignment
+    }
 
-      :fallthrough ->
-        case rail_step(db, handlers, session_key, assignment, terminal_seq) do
-          {:acted, _tag} = acted ->
-            acted
+    run_schedule(@turn_end_schedule, ctx)
+  end
 
-          :fallthrough ->
-            if Wakes.pending_count(db, session_key) == 0 do
-              if is_nil(terminal_seq) do
-                :idle
-              else
-                claim_and_act(db, handlers, n, session_key, terminal_seq, assignment)
-              end
-            else
-              :continuation
-            end
-        end
+  # First halt wins; :prod_ladder always halts, so the list never runs dry.
+  defp run_schedule([step | rest], ctx) do
+    case turn_end_step(step, ctx) do
+      :cont -> run_schedule(rest, ctx)
+      {:halt, result} -> result
+    end
+  end
+
+  defp turn_end_step(:adjudication_hold, ctx) do
+    case adjudication_hold(ctx.db, ctx.session_key, ctx.terminal_seq) do
+      {:held, :adjudication_hold} = held -> {:halt, held}
+      :fallthrough -> :cont
+    end
+  end
+
+  defp turn_end_step(:rail_enforcement, ctx) do
+    case rail_step(ctx.db, ctx.handlers, ctx.session_key, ctx.assignment, ctx.terminal_seq) do
+      {:acted, _tag} = acted -> {:halt, acted}
+      :fallthrough -> :cont
+    end
+  end
+
+  defp turn_end_step(:pending_wake_gate, ctx) do
+    if Wakes.pending_count(ctx.db, ctx.session_key) == 0,
+      do: :cont,
+      else: {:halt, :continuation}
+  end
+
+  defp turn_end_step(:prod_ladder, ctx) do
+    if is_nil(ctx.terminal_seq) do
+      {:halt, :idle}
+    else
+      {:halt,
+       claim_and_act(
+         ctx.db,
+         ctx.handlers,
+         ctx.n,
+         ctx.session_key,
+         ctx.terminal_seq,
+         ctx.assignment
+       )}
     end
   end
 
