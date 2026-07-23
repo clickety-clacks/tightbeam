@@ -1,0 +1,6 @@
+#!/bin/sh
+test -f .rail-cwd-marker
+read -r input
+printf '%s' "$input" | /usr/bin/grep -q '"holder_workdir"'
+printf 'scratch-write' > "$HOME/rail-write"
+echo pass

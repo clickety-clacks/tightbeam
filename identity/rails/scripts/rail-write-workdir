@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+printf 'forbidden' > rail-forbidden-write
+echo pass

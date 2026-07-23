@@ -1,0 +1,4 @@
+#!/bin/sh
+read -r input
+printf '%s' "$input" | /usr/bin/grep -q '"verb":"post"'
+echo pass

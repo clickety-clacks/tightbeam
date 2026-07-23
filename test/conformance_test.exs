@@ -335,7 +335,12 @@ defmodule Tightbeam.ConformanceSupport do
         assert {:ok, [["denied", payload]]} =
                  DB.query(db, "SELECT kind, payload FROM events ORDER BY id DESC LIMIT 1")
 
-        assert payload =~ ~s(rule: "#{kase["reason"]}")
+        assert JSON.decode!(payload)["rule"] == kase["reason"]
+
+        assert [%{rule: rule, edge: "verb", reason: "rule_denied"}] =
+                 EventLog.rail_denials(db, 0, 1)
+
+        assert rule == kase["reason"]
       end
 
       if phase2 = kase["phase2"] do
@@ -846,7 +851,7 @@ defmodule Tightbeam.ConformanceTest do
 
     IO.puts(
       "conformance census: #{green} green fixtures; #{pending} pending fixtures; " <>
-        "#{structured} structured-legibility assertions pending LP4; #{class_pending} pending classes"
+        "#{structured} structured-legibility assertion sets active; #{class_pending} pending classes"
     )
 
     assert green == 23
@@ -883,9 +888,9 @@ defmodule Tightbeam.ConformanceTest do
       end
 
       if fixture["kind"] == "dispatch-rule" do
-        @tag skip: "LP4: structured denied payload and EventLog.rail_denials/3 have not landed"
         test "#{name} structured legibility" do
-          _fixture = unquote(Macro.escape(fixture))
+          fixture = unquote(Macro.escape(fixture))
+          Corpus.run_rules_fixture(fixture)
         end
       end
     else

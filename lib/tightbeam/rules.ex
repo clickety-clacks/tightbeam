@@ -31,11 +31,13 @@ defmodule Tightbeam.Rules do
   turns a denial into an allowed call.
   """
 
-  alias Tightbeam.{Assignments, DB, Devices, EventLog, Org, Roles}
+  alias Tightbeam.{Assignments, DB, Devices, Escalation, EventLog, Org, RailScript, Roles}
+  import Bitwise
 
   @persist_key __MODULE__
-  @rule_keys MapSet.new(["name", "verb", "deny_when", "text"])
+  @rule_keys MapSet.new(["name", "verb", "deny_when", "text", "edges", "check", "effect"])
   @condition_keys MapSet.new(["fact", "op", "value"])
+  @check_keys MapSet.new(["script", "returns", "timeout_ms", "effects"])
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
     "caller.origin_class" => :string,
@@ -62,19 +64,29 @@ defmodule Tightbeam.Rules do
   @operators ~w(eq ne gt gte lt lte in not_in)
 
   @type condition :: %{fact: String.t(), op: String.t(), value: term()}
-  @type rule :: %{name: String.t(), verb: String.t(), text: String.t(), conditions: [condition()]}
+  @type rule :: %{
+          name: String.t(),
+          verb: String.t(),
+          text: String.t(),
+          conditions: [condition()],
+          edges: [String.t()],
+          effect: String.t(),
+          check: map() | nil
+        }
 
   @doc "Load and validate all rule files, replacing the currently active set."
   @spec load!(String.t(), Enumerable.t()) :: [rule()]
   def load!(base_dir, valid_verbs) do
     verbs = MapSet.new(valid_verbs)
 
+    identity_manifest_sha = identity_manifest_sha(base_dir)
+
     rules =
       base_dir
       |> Path.join("identity/rules/*.toml")
       |> Path.wildcard()
       |> Enum.sort()
-      |> Enum.flat_map(&load_file!(&1, verbs))
+      |> Enum.flat_map(&load_file!(&1, verbs, base_dir, identity_manifest_sha))
 
     case Enum.find(rules, fn rule -> Enum.count(rules, &(&1.name == rule.name)) > 1 end) do
       %{name: name, source: source} ->
@@ -91,15 +103,27 @@ defmodule Tightbeam.Rules do
   @doc "Evaluate the active statutes for a raw dispatch call."
   @spec evaluate(GenServer.server(), map()) :: :ok | {:deny, map()}
   def evaluate(db, call) do
-    rules = :persistent_term.get(@persist_key, [])
-    verb = Map.fetch!(call, :verb)
-
-    rules
-    |> Enum.filter(&(&1.verb == verb))
-    |> evaluate_rules(db, call, %{})
+    case decide(db, call) do
+      {:allow, _to_close, _to_consume} -> :ok
+      {{:deny, error}, _to_close, _to_consume} -> {:deny, error}
+      {{:remedy, _statute, _ref, error}, _to_close, _to_consume} -> {:deny, error}
+      {{:escalate, _statute, ctx, _dr_id}, _to_close, _to_consume} -> {:deny, ctx.error}
+    end
   end
 
-  defp load_file!(path, valid_verbs) do
+  @doc "Return the dry statute decision and the actor-owned close/consume work."
+  @spec decide(GenServer.server(), map()) :: {term(), [term()], [String.t()]}
+  def decide(db, call) do
+    rules = :persistent_term.get(@persist_key, [])
+    verb = Map.fetch!(call, :verb)
+    edge = if Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb"
+
+    rules
+    |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
+    |> decide_rules(db, call, %{}, [], [])
+  end
+
+  defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
 
     if String.trim(contents) == "" do
@@ -121,14 +145,17 @@ defmodule Tightbeam.Rules do
       rules when is_list(rules) and rules != [] ->
         rules
         |> Enum.with_index(1)
-        |> Enum.map(fn {rule, ordinal} -> validate_rule!(path, ordinal, rule, valid_verbs) end)
+        |> Enum.map(fn {rule, ordinal} ->
+          validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)
+        end)
 
       _ ->
         raise ArgumentError, "#{path}: must contain one or more [[rule]] tables"
     end
   end
 
-  defp validate_rule!(path, ordinal, rule, valid_verbs) when is_map(rule) do
+  defp validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)
+       when is_map(rule) do
     raw_name = Map.get(rule, "name")
     label = if valid_name?(raw_name), do: "rule #{inspect(raw_name)}", else: "rule ##{ordinal}"
     fail = fn message -> raise ArgumentError, "#{path}: #{label}: #{message}" end
@@ -144,29 +171,115 @@ defmodule Tightbeam.Rules do
     text = Map.get(rule, "text")
     unless is_binary(text) and String.trim(text) != "", do: fail.("missing or blank text")
 
-    conditions = Map.get(rule, "deny_when")
+    conditions = validate_conditions!(Map.get(rule, "deny_when"), fail)
+    check = validate_check!(Map.get(rule, "check"), base_dir, fail)
 
-    unless is_list(conditions) and conditions != [] and Enum.all?(conditions, &is_map/1) do
-      fail.("deny_when must be a non-empty list of condition tables")
-    end
+    if conditions == [] and is_nil(check),
+      do: fail.("must carry at least one of deny_when or [rule.check]")
 
-    validated =
-      conditions
-      |> Enum.with_index(1)
-      |> Enum.map(fn {condition, index} -> validate_condition!(condition, index, fail) end)
+    edges = validate_edges!(Map.get(rule, "edges", ["verb"]), verb, fail)
+
+    effect =
+      validate_effect!(Map.get(rule, "effect", "deny"), check, Map.has_key?(rule, "effect"), fail)
+
+    effects = if check, do: Map.values(check.effects), else: [effect]
+
+    if "remedy" in effects,
+      do: fail.("effect remedy requires [rule.remedy] (roadmap phase P5)")
 
     %{
       name: raw_name,
       verb: verb,
       text: String.trim(text),
-      conditions: validated,
-      source: path
+      conditions: conditions,
+      edges: edges,
+      effect: effect,
+      check: check,
+      source: path,
+      base_dir: base_dir,
+      identity_manifest_sha: identity_manifest_sha
     }
   end
 
-  defp validate_rule!(path, ordinal, _rule, _valid_verbs) do
+  defp validate_rule!(path, ordinal, _rule, _valid_verbs, _base_dir, _identity_manifest_sha) do
     raise ArgumentError, "#{path}: rule ##{ordinal}: rule must be a table"
   end
+
+  defp validate_conditions!(nil, _fail), do: []
+
+  defp validate_conditions!(conditions, fail) do
+    unless is_list(conditions) and conditions != [] and Enum.all?(conditions, &is_map/1) do
+      fail.("deny_when must be a non-empty list of condition tables")
+    end
+
+    conditions
+    |> Enum.with_index(1)
+    |> Enum.map(fn {condition, index} -> validate_condition!(condition, index, fail) end)
+  end
+
+  defp validate_edges!(edges, verb, fail) do
+    unless is_list(edges) and edges != [] and Enum.all?(edges, &(&1 in ~w(verb turn-end))) and
+             Enum.uniq(edges) == edges do
+      fail.(~s(edges must be a non-empty subset of ["verb", "turn-end"]))
+    end
+
+    if "turn-end" in edges and verb != "attest",
+      do: fail.(~s(edge "turn-end" is legal only for verb "attest"))
+
+    edges
+  end
+
+  defp validate_effect!(effect, check, explicit?, fail) do
+    unless effect in ~w(deny remedy escalate),
+      do: fail.("effect must be one of deny, remedy, escalate")
+
+    if check && explicit?,
+      do: fail.("effect is valid only on predicate-only statutes")
+
+    effect
+  end
+
+  defp validate_check!(nil, _base_dir, _fail), do: nil
+
+  defp validate_check!(check, base_dir, fail) when is_map(check) do
+    unknown = unknown_keys(check, @check_keys)
+    if unknown != [], do: fail.("check has unknown keys: #{Enum.join(unknown, ", ")}")
+
+    script = Map.get(check, "script")
+    unless valid_name?(script), do: fail.("check script has an invalid or missing name")
+
+    path = Path.join([base_dir, "identity", "rails", "scripts", script])
+
+    case File.stat(path) do
+      {:ok, %File.Stat{type: :regular, mode: mode}} when (mode &&& 0o111) != 0 -> :ok
+      _ -> fail.("check script must be an existing executable regular file: #{path}")
+    end
+
+    returns = Map.get(check, "returns")
+
+    unless is_list(returns) and returns != [] and Enum.all?(returns, &valid_name?/1) and
+             Enum.uniq(returns) == returns do
+      fail.("check returns must be a non-empty unique list of tokens")
+    end
+
+    timeout_ms = Map.get(check, "timeout_ms", 5_000)
+
+    unless is_integer(timeout_ms) and timeout_ms in 1..60_000,
+      do: fail.("check timeout_ms must be an integer in 1..60000")
+
+    effects = Map.get(check, "effects")
+    unless is_map(effects), do: fail.("check effects must be a table")
+
+    unless Map.keys(effects) |> Enum.sort() == Enum.sort(returns),
+      do: fail.("check effects must map every declared return and no others")
+
+    unless Enum.all?(effects, fn {_token, effect} -> effect in ~w(allow deny remedy escalate) end),
+           do: fail.("check effects must be one of allow, deny, remedy, escalate")
+
+    %{script: script, returns: returns, timeout_ms: timeout_ms, effects: effects}
+  end
+
+  defp validate_check!(_check, _base_dir, fail), do: fail.("check must be a table")
 
   defp validate_condition!(condition, index, fail) do
     unknown = unknown_keys(condition, @condition_keys)
@@ -234,25 +347,125 @@ defmodule Tightbeam.Rules do
     |> Enum.sort()
   end
 
-  defp evaluate_rules([], _db, _call, _cache), do: :ok
+  defp decide_rules([], _db, _call, _cache, to_close, to_consume),
+    do: {:allow, Enum.reverse(to_close), Enum.reverse(to_consume)}
 
-  defp evaluate_rules([rule | rest], db, call, cache) do
+  defp decide_rules([rule | rest], db, call, cache, to_close, to_consume) do
     case evaluate_conditions(rule.conditions, rule, db, call, cache) do
-      {:match, _cache} ->
-        {:deny, %{code: "rule_denied", rule: rule.name, message: "#{rule.name}: #{rule.text}"}}
-
       {:no_match, cache} ->
-        evaluate_rules(rest, db, call, cache)
+        decide_rules(rest, db, call, cache, to_close, to_consume)
 
       {:error, fact} ->
-        {:deny,
-         %{
-           code: "rule_error",
-           rule: rule.name,
-           fact: fact,
-           message: "#{rule.name}: failed to compute #{fact}"
-         }}
+        error =
+          denial_error(rule, call, "rule_denied", nil)
+          |> Map.merge(%{
+            code: "rule_error",
+            fact: fact,
+            message: "#{rule.name}: failed to compute #{fact}"
+          })
+
+        {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+
+      {:match, cache} ->
+        evaluate_reached_rule(rule, rest, db, call, cache, to_close, to_consume)
     end
+  end
+
+  defp evaluate_reached_rule(rule, rest, db, call, cache, to_close, to_consume) do
+    case rule.check do
+      nil ->
+        fold_effect(rule.effect, rule, rest, db, call, cache, to_close, to_consume, nil)
+
+      _check ->
+        case fetch_fact("$assignment", db, call, cache) do
+          {:ok, assignment, cache} ->
+            case RailScript.run(db, rule.base_dir, rule, call, assignment) do
+              {:ok, token, exit_class} ->
+                fold_effect(
+                  rule.check.effects[token],
+                  rule,
+                  rest,
+                  db,
+                  call,
+                  cache,
+                  to_close,
+                  to_consume,
+                  exit_class
+                )
+
+              {:error, reason, exit_class} ->
+                error = denial_error(rule, call, reason, exit_class)
+                {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+            end
+
+          :error ->
+            error = denial_error(rule, call, "script_error", "error:1")
+            {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+        end
+    end
+  end
+
+  defp fold_effect("allow", _rule, rest, db, call, cache, to_close, to_consume, _exit_class),
+    do: decide_rules(rest, db, call, cache, to_close, to_consume)
+
+  defp fold_effect("deny", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
+    error = denial_error(rule, call, "rule_denied", exit_class)
+    {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+  end
+
+  defp fold_effect("remedy", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
+    error = denial_error(rule, call, "remedy_fired", exit_class)
+
+    {{:remedy, rule, gated_ref(call), error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+  end
+
+  defp fold_effect("escalate", rule, rest, db, call, cache, to_close, to_consume, exit_class) do
+    ctx = %{
+      question: rule.text,
+      error: denial_error(rule, call, "escalated", exit_class)
+    }
+
+    case Escalation.resolve(db, call, rule) do
+      :allow ->
+        decide_rules(rest, db, call, cache, to_close, to_consume)
+
+      {:allow, ruling_id} ->
+        decide_rules(rest, db, call, cache, to_close, [ruling_id | to_consume])
+
+      {:deny, error} ->
+        error = enrich_denial(error, rule, call, "rule_denied", exit_class)
+        {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+
+      {:needs_request, dr_id} ->
+        {{:escalate, rule, ctx, dr_id}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+    end
+  end
+
+  defp denial_error(rule, call, reason, script_exit_class) do
+    %{
+      code: "rule_denied",
+      rule: rule.name,
+      edge: edge(call),
+      reason: reason,
+      script_exit_class: script_exit_class,
+      ref: gated_ref(call),
+      producer: nil,
+      identity_manifest_sha: rule.identity_manifest_sha,
+      message: "#{rule.name}: #{rule.text}"
+    }
+  end
+
+  defp enrich_denial(error, rule, call, reason, script_exit_class) do
+    denial_error(rule, call, reason, script_exit_class) |> Map.merge(error)
+  end
+
+  defp edge(call), do: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb")
+
+  defp gated_ref(call) do
+    params = Map.fetch!(call, :params)
+
+    params[:assignment_id] || params[:work_item_id] || params["assignment_id"] ||
+      params["work_item_id"]
   end
 
   defp evaluate_conditions([], _rule, _db, _call, cache), do: {:match, cache}
@@ -609,4 +822,15 @@ defmodule Tightbeam.Rules do
 
   defp compare(left, "in", right), do: left in right
   defp compare(left, "not_in", right), do: left not in right
+
+  defp identity_manifest_sha(base_dir) do
+    identity_dir = Path.join(base_dir, "identity")
+
+    case System.cmd("git", ["-C", identity_dir, "rev-parse", "HEAD"], stderr_to_stdout: true) do
+      {sha, 0} -> String.trim(sha)
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
 end

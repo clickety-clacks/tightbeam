@@ -36,6 +36,20 @@ defmodule Tightbeam.EventLog do
           detail: String.t() | nil
         }
 
+  @typedoc "A payload-projecting dispatch-tier rail denial."
+  @type rail_denial :: %{
+          id: integer(),
+          ts: integer(),
+          rule: String.t(),
+          edge: String.t(),
+          reason: String.t(),
+          script_exit_class: String.t() | nil,
+          ref: String.t() | nil,
+          identity_manifest_sha: String.t() | nil,
+          origin: String.t(),
+          principal: String.t() | nil
+        }
+
   @ddl """
   CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +143,40 @@ defmodule Tightbeam.EventLog do
         origin: origin,
         principal: principal,
         session_key: sk
+      }
+    end)
+  end
+
+  @doc "Dispatch-tier rail denials with id > `since_id`, including their legibility payload."
+  @spec rail_denials(db(), integer(), pos_integer()) :: [rail_denial()]
+  def rail_denials(db \\ Tightbeam.DB, since_id, limit) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, ts, payload, origin, principal
+        FROM events
+        WHERE id > ?1 AND kind = 'denied' AND json_valid(payload)
+          AND json_type(payload, '$.rule') = 'text'
+        ORDER BY id LIMIT ?2
+        """,
+        [since_id, limit]
+      )
+
+    Enum.map(rows, fn [id, ts, payload, origin, principal] ->
+      decoded = JSON.decode!(payload)
+
+      %{
+        id: id,
+        ts: ts,
+        rule: decoded["rule"],
+        edge: decoded["edge"],
+        reason: decoded["reason"],
+        script_exit_class: decoded["script_exit_class"],
+        ref: decoded["ref"],
+        identity_manifest_sha: decoded["identity_manifest_sha"],
+        origin: origin,
+        principal: principal
       }
     end)
   end
