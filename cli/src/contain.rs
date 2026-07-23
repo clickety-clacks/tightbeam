@@ -148,6 +148,22 @@ mod macos_custody {
     const POLL: Duration = Duration::from_millis(100);
     const EOF_TIMER_IDENT: usize = 1;
 
+    #[derive(Debug, PartialEq)]
+    pub(super) enum BatchAction {
+        Natural,
+        Signal(i32),
+        Error,
+        StdinEof,
+        ArmEofTimer,
+        Continue,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) enum KillDelivery {
+        Delivered,
+        Absent,
+    }
+
     pub(super) fn run(profile: String, argv: Vec<String>) -> Result<i32, String> {
         install_handlers_and_block().map_err(|error| format!("signal setup failed: {error}"))?;
 
@@ -179,7 +195,7 @@ mod macos_custody {
 
         let kq = unsafe { libc::kqueue() };
         if kq == -1 {
-            unblock_signals();
+            let _ = unblock_signals();
             return Ok(teardown(pid, Trigger::Error));
         }
         let _kqueue = Kqueue(kq);
@@ -202,10 +218,8 @@ mod macos_custody {
         ];
 
         let registered = retry_kevent(kq, &changes, &mut [], ptr::null());
-        unblock_signals();
-
-        if registered.is_err() {
-            return Ok(teardown(pid, Trigger::Error));
+        if let Some(status) = setup_error_teardown(pid, registered, unblock_signals()) {
+            return Ok(status);
         }
 
         let mut eof_grace = false;
@@ -217,54 +231,72 @@ mod macos_custody {
             };
             let batch = &events[..count];
 
-            if batch.iter().any(|event| {
-                event.filter == libc::EVFILT_PROC && event.fflags & libc::NOTE_EXIT != 0
-            }) {
-                return Ok(teardown(pid, Trigger::Natural));
-            }
-
-            if let Some(signal) = batch.iter().find_map(|event| {
-                if event.filter == libc::EVFILT_SIGNAL {
-                    Some(event.ident as i32)
-                } else {
-                    None
+            match select_batch_action(batch, eof_grace) {
+                BatchAction::Natural => return Ok(teardown(pid, Trigger::Natural)),
+                BatchAction::Signal(signal) => {
+                    return Ok(teardown(pid, Trigger::Signal(signal)));
                 }
-            }) {
-                return Ok(teardown(pid, Trigger::Signal(signal)));
-            }
-
-            if batch.iter().any(|event| event.flags & libc::EV_ERROR != 0) {
-                return Ok(teardown(pid, Trigger::Error));
-            }
-
-            if batch
-                .iter()
-                .any(|event| event.filter == libc::EVFILT_TIMER && event.ident == EOF_TIMER_IDENT)
-            {
-                return Ok(teardown(pid, Trigger::StdinEof));
-            }
-
-            if !eof_grace
-                && batch.iter().any(|event| {
-                    event.filter == libc::EVFILT_READ
-                        && event.ident == libc::STDIN_FILENO as usize
-                        && event.flags & libc::EV_EOF != 0
-                })
-            {
-                let timer = [libc::kevent {
-                    ident: EOF_TIMER_IDENT,
-                    filter: libc::EVFILT_TIMER,
-                    flags: libc::EV_ADD | libc::EV_ONESHOT,
-                    fflags: 0,
-                    data: 5_000,
-                    udata: ptr::null_mut(),
-                }];
-                if retry_kevent(kq, &timer, &mut [], ptr::null()).is_err() {
-                    return Ok(teardown(pid, Trigger::Error));
+                BatchAction::Error => return Ok(teardown(pid, Trigger::Error)),
+                BatchAction::StdinEof => return Ok(teardown(pid, Trigger::StdinEof)),
+                BatchAction::ArmEofTimer => {
+                    let timer = [libc::kevent {
+                        ident: EOF_TIMER_IDENT,
+                        filter: libc::EVFILT_TIMER,
+                        flags: libc::EV_ADD | libc::EV_ONESHOT,
+                        fflags: 0,
+                        data: 5_000,
+                        udata: ptr::null_mut(),
+                    }];
+                    if retry_kevent(kq, &timer, &mut [], ptr::null()).is_err() {
+                        return Ok(teardown(pid, Trigger::Error));
+                    }
+                    eof_grace = true;
                 }
-                eof_grace = true;
+                BatchAction::Continue => {}
             }
         }
+    }
+
+    pub(super) fn select_batch_action(batch: &[libc::kevent], eof_grace: bool) -> BatchAction {
+        if batch
+            .iter()
+            .any(|event| event.filter == libc::EVFILT_PROC && event.fflags & libc::NOTE_EXIT != 0)
+        {
+            return BatchAction::Natural;
+        }
+
+        if let Some(signal) = batch.iter().find_map(|event| {
+            if event.filter == libc::EVFILT_SIGNAL {
+                Some(event.ident as i32)
+            } else {
+                None
+            }
+        }) {
+            return BatchAction::Signal(signal);
+        }
+
+        if batch.iter().any(|event| event.flags & libc::EV_ERROR != 0) {
+            return BatchAction::Error;
+        }
+
+        if batch
+            .iter()
+            .any(|event| event.filter == libc::EVFILT_TIMER && event.ident == EOF_TIMER_IDENT)
+        {
+            return BatchAction::StdinEof;
+        }
+
+        if !eof_grace
+            && batch.iter().any(|event| {
+                event.filter == libc::EVFILT_READ
+                    && event.ident == libc::STDIN_FILENO as usize
+                    && event.flags & libc::EV_EOF != 0
+            })
+        {
+            return BatchAction::ArmEofTimer;
+        }
+
+        BatchAction::Continue
     }
 
     unsafe extern "C" fn noop_handler(_signal: libc::c_int) {}
@@ -292,19 +324,46 @@ mod macos_custody {
         Ok(())
     }
 
-    fn unblock_signals() {
+    fn unblock_signals() -> io::Result<()> {
         unsafe {
             let mut blocked: libc::sigset_t = mem::zeroed();
-            libc::sigemptyset(&mut blocked);
-            libc::sigaddset(&mut blocked, libc::SIGTERM);
-            libc::sigaddset(&mut blocked, libc::SIGINT);
-            libc::sigprocmask(libc::SIG_UNBLOCK, &blocked, ptr::null_mut());
+            if libc::sigemptyset(&mut blocked) == -1
+                || libc::sigaddset(&mut blocked, libc::SIGTERM) == -1
+                || libc::sigaddset(&mut blocked, libc::SIGINT) == -1
+                || libc::sigprocmask(libc::SIG_UNBLOCK, &blocked, ptr::null_mut()) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn setup_error_teardown(
+        pid: libc::pid_t,
+        registered: io::Result<usize>,
+        unblocked: io::Result<()>,
+    ) -> Option<i32> {
+        if registered.is_err() || unblocked.is_err() {
+            Some(teardown(pid, Trigger::Error))
+        } else {
+            None
         }
     }
 
     fn teardown(pid: libc::pid_t, trigger: Trigger) -> i32 {
+        teardown_with_kill(pid, trigger, kill_group)
+    }
+
+    pub(super) fn teardown_with_kill<F>(
+        pid: libc::pid_t,
+        trigger: Trigger,
+        mut send_signal: F,
+    ) -> i32
+    where
+        F: FnMut(libc::pid_t, libc::c_int) -> io::Result<KillDelivery>,
+    {
         let mut collected = None;
-        let natural = match waitpid_nohang(pid) {
+        let initially_natural = match waitpid_nohang(pid) {
             Ok(status) => {
                 collected = status;
                 status
@@ -312,23 +371,34 @@ mod macos_custody {
             Err(_) => None,
         };
 
-        if group_absent(pid) {
-            let status = natural.map(natural_status).unwrap_or(1);
+        if group_absent(pid).unwrap_or(false) {
+            if collected.is_none() {
+                collected = waitpid_nohang(pid).unwrap_or(None);
+            }
+            let status = collected.map(natural_status).unwrap_or(1);
             report(trigger, &format!("natural:{status}"));
             return status;
         }
 
-        let _ = kill_group(pid, libc::SIGTERM);
+        let term_delivery = send_signal(pid, libc::SIGTERM).ok();
         let term_absent = poll_absence(pid, TERM_GRACE, &mut collected);
-        let kill_absent = if term_absent {
-            false
+        let (kill_absent, kill_delivery) = if term_absent {
+            (false, None)
         } else {
-            let _ = kill_group(pid, libc::SIGKILL);
-            poll_absence(pid, KILL_GRACE, &mut collected)
+            let delivery = send_signal(pid, libc::SIGKILL).ok();
+            (poll_absence(pid, KILL_GRACE, &mut collected), delivery)
         };
 
+        let any_signal_delivered = matches!(term_delivery, Some(KillDelivery::Delivered))
+            || matches!(kill_delivery, Some(KillDelivery::Delivered));
+        let natural = if initially_natural.is_some() || !any_signal_delivered {
+            collected.map(natural_status)
+        } else {
+            None
+        };
+        let kill_delivered = matches!(kill_delivery, Some(KillDelivery::Delivered));
         let (status, outcome) =
-            classify_after_polls(natural.map(natural_status), term_absent, kill_absent);
+            classify_after_polls(natural, term_absent, kill_absent, kill_delivered);
         if status == CONTAIN_INCOMPLETE {
             eprintln!("{}", incomplete_marker(pid));
         }
@@ -340,12 +410,13 @@ mod macos_custody {
         natural: Option<i32>,
         term_absent: bool,
         kill_absent: bool,
+        kill_delivered: bool,
     ) -> (i32, &'static str) {
         if !term_absent && !kill_absent {
             (CONTAIN_INCOMPLETE, "incomplete")
         } else if let Some(status) = natural {
             (status, "natural")
-        } else if term_absent {
+        } else if term_absent || !kill_delivered {
             (CONTAIN_FORCED_TERM, "forced-term")
         } else {
             (CONTAIN_FORCED_KILL, "forced-kill")
@@ -375,7 +446,7 @@ mod macos_custody {
                     *collected = Some(status);
                 }
             }
-            if group_absent(pid) {
+            if group_absent(pid).unwrap_or(false) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -406,21 +477,59 @@ mod macos_custody {
         }
     }
 
-    fn group_absent(pgid: libc::pid_t) -> bool {
-        let result = unsafe { libc::kill(-pgid, 0) };
-        result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    pub(super) fn group_absent(pgid: libc::pid_t) -> io::Result<bool> {
+        group_absent_with(|| {
+            let result = unsafe { libc::kill(-pgid, 0) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
     }
 
-    fn kill_group(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
-        let result = unsafe { libc::killpg(pgid, signal) };
-        if result == 0 {
-            return Ok(());
+    pub(super) fn group_absent_with<F>(call: F) -> io::Result<bool>
+    where
+        F: FnMut() -> io::Result<()>,
+    {
+        match retry_eintr(call) {
+            Ok(()) => Ok(false),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+            Err(error) => Err(error),
         }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error)
+    }
+
+    fn kill_group(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<KillDelivery> {
+        kill_group_with(|| {
+            let result = unsafe { libc::killpg(pgid, signal) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+    }
+
+    pub(super) fn kill_group_with<F>(call: F) -> io::Result<KillDelivery>
+    where
+        F: FnMut() -> io::Result<()>,
+    {
+        match retry_eintr(call) {
+            Ok(()) => Ok(KillDelivery::Delivered),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(KillDelivery::Absent),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn retry_eintr<T, F>(mut call: F) -> io::Result<T>
+    where
+        F: FnMut() -> io::Result<T>,
+    {
+        loop {
+            match call() {
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                result => return result,
+            }
         }
     }
 
@@ -780,19 +889,23 @@ mod tests {
     #[test]
     fn custody_status_classification_pins_every_band() {
         assert_eq!(
-            macos_custody::classify_after_polls(Some(7), true, false),
+            macos_custody::classify_after_polls(Some(7), true, false, false),
             (7, "natural")
         );
         assert_eq!(
-            macos_custody::classify_after_polls(None, true, false),
+            macos_custody::classify_after_polls(None, true, false, false),
             (CONTAIN_FORCED_TERM, "forced-term")
         );
         assert_eq!(
-            macos_custody::classify_after_polls(None, false, true),
+            macos_custody::classify_after_polls(None, false, true, true),
             (CONTAIN_FORCED_KILL, "forced-kill")
         );
         assert_eq!(
-            macos_custody::classify_after_polls(None, false, false),
+            macos_custody::classify_after_polls(None, false, true, false),
+            (CONTAIN_FORCED_TERM, "forced-term")
+        );
+        assert_eq!(
+            macos_custody::classify_after_polls(None, false, false, true),
             (CONTAIN_INCOMPLETE, "incomplete")
         );
         assert_eq!(
@@ -849,6 +962,162 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn spawn_process_group(script: &str) -> Child {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn custody_event(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent {
+        libc::kevent {
+            ident,
+            filter,
+            flags,
+            fflags,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn custody_event_batches_prioritize_exit_then_signals_then_eof() {
+        let note_exit = custody_event(42, libc::EVFILT_PROC, libc::EV_ADD, libc::NOTE_EXIT);
+        let term = custody_event(libc::SIGTERM as usize, libc::EVFILT_SIGNAL, libc::EV_ADD, 0);
+        let interrupt = custody_event(libc::SIGINT as usize, libc::EVFILT_SIGNAL, libc::EV_ADD, 0);
+        let eof = custody_event(
+            libc::STDIN_FILENO as usize,
+            libc::EVFILT_READ,
+            libc::EV_EOF,
+            0,
+        );
+        let timer = custody_event(1, libc::EVFILT_TIMER, libc::EV_ADD, 0);
+        let error = custody_event(0, libc::EVFILT_READ, libc::EV_ERROR, 0);
+
+        assert_eq!(
+            macos_custody::select_batch_action(&[eof, term, note_exit], false),
+            macos_custody::BatchAction::Natural
+        );
+        assert_eq!(
+            macos_custody::select_batch_action(&[eof, term], false),
+            macos_custody::BatchAction::Signal(libc::SIGTERM)
+        );
+        assert_eq!(
+            macos_custody::select_batch_action(&[eof, interrupt], false),
+            macos_custody::BatchAction::Signal(libc::SIGINT)
+        );
+        assert_eq!(
+            macos_custody::select_batch_action(&[eof], false),
+            macos_custody::BatchAction::ArmEofTimer
+        );
+        assert_eq!(
+            macos_custody::select_batch_action(&[eof], true),
+            macos_custody::BatchAction::Continue
+        );
+        assert_eq!(
+            macos_custody::select_batch_action(&[timer], true),
+            macos_custody::BatchAction::StdinEof
+        );
+        assert_eq!(
+            macos_custody::select_batch_action(&[error], false),
+            macos_custody::BatchAction::Error
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn custody_retries_eintr_for_group_signal_and_absence_probe() {
+        let mut child = spawn_process_group("exec /bin/sleep 300");
+        let pid = child.id() as libc::pid_t;
+        thread::sleep(Duration::from_millis(50));
+
+        let mut signal_calls = 0;
+        let delivery = macos_custody::kill_group_with(|| {
+            signal_calls += 1;
+            if signal_calls == 1 {
+                return Err(io::Error::from_raw_os_error(libc::EINTR));
+            }
+            let result = unsafe { libc::killpg(pid, libc::SIGKILL) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+        .unwrap();
+        assert_eq!(delivery, macos_custody::KillDelivery::Delivered);
+        assert_eq!(signal_calls, 2);
+        child.wait().unwrap();
+
+        let mut probe_calls = 0;
+        let absent = macos_custody::group_absent_with(|| {
+            probe_calls += 1;
+            if probe_calls == 1 {
+                return Err(io::Error::from_raw_os_error(libc::EINTR));
+            }
+            let result = unsafe { libc::kill(-pid, 0) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+        .unwrap();
+        assert!(absent);
+        assert_eq!(probe_calls, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn custody_registration_and_unblock_failures_teardown_live_groups() {
+        for (registered, unblocked) in [
+            (Err(io::Error::from_raw_os_error(libc::EIO)), Ok(())),
+            (Ok(4), Err(io::Error::from_raw_os_error(libc::EIO))),
+        ] {
+            let child = spawn_process_group("exec /bin/sleep 300");
+            let pid = child.id() as libc::pid_t;
+            thread::sleep(Duration::from_millis(50));
+
+            let status = macos_custody::setup_error_teardown(pid, registered, unblocked).unwrap();
+            assert_eq!(status, CONTAIN_FORCED_TERM);
+            assert!(macos_custody::group_absent(pid).unwrap());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn custody_esrch_before_term_preserves_the_newly_natural_status() {
+        let mut child = spawn_process_group("read value; exit 7");
+        let pid = child.id() as libc::pid_t;
+        let mut stdin = child.stdin.take();
+        thread::sleep(Duration::from_millis(50));
+
+        let status = macos_custody::teardown_with_kill(pid, Trigger::Error, |_pgid, signal| {
+            assert_eq!(signal, libc::SIGTERM);
+            drop(stdin.take());
+            thread::sleep(Duration::from_millis(100));
+            Ok(macos_custody::KillDelivery::Absent)
+        });
+
+        assert_eq!(status, 7);
+        assert!(macos_custody::group_absent(pid).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn custody_propagates_natural_exit_and_signal_statuses() {
         let output = spawn_custody("exit 7").wait_with_output().unwrap();
@@ -888,6 +1157,20 @@ mod tests {
             Some(0),
             "{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn custody_inherits_payload_stdout() {
+        let output = spawn_custody("printf 'custody-stdout-ok\\n'")
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("custody-stdout-ok\n"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 
