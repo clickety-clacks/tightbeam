@@ -336,7 +336,7 @@ defmodule Tightbeam.Acp.AdapterTest do
                %{
                  "type" => "text",
                  "text" =>
-                   "Run exactly this command with your shell tool, then stop: tightbeam-gate-probe"
+                   "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
                }
              ]
 

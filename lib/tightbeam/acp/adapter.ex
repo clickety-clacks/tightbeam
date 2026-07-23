@@ -20,7 +20,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   @gate_attestation_timeout 120_000
   @gate_marker "[gate: tightbeam-probe]"
-  @gate_prompt "Run exactly this command with your shell tool, then stop: tightbeam-gate-probe"
+  @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
 
