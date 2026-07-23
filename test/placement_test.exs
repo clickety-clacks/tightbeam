@@ -708,15 +708,13 @@ defmodule Tightbeam.PlacementTest do
     File.write!(Path.join(probe_cwd, "stale"), "remove me")
 
     cli_bin = Path.join(base_dir, "bin")
-    codex_shim = Path.join(cli_bin, "codex")
     File.mkdir_p!(cli_bin)
-    File.write!(codex_shim, "#!/bin/sh\n")
 
     config = %{base_dir: base_dir, cwd: "/work", cli_bin: cli_bin, default_model: "fable"}
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
-    assert {"CODEX_PATH", codex_shim} in opts[:env]
+    refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     assert opts[:probe_cwd] == probe_cwd
     assert opts[:probe_model] == "gpt-5.6-sol[medium]"
     refute opts[:probe_model] == config.default_model
@@ -882,7 +880,10 @@ defmodule Tightbeam.PlacementTest do
 
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
     assert opts[:contained] == true
-    assert ["/usr/bin/sandbox-exec", "-p", profile, binary] = opts[:cmd]
+
+    assert ["/local/bin/tightbeam", "contain-exec", "--profile", profile, "--", binary] =
+             opts[:cmd]
+
     assert binary == Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
 
     work_root = Path.join(canonical_base, "work")
@@ -891,13 +892,7 @@ defmodule Tightbeam.PlacementTest do
     assert profile =~
              ~s|(subpath "#{work_root}")\n  (subpath "#{home}")\n  (subpath "#{auth_dir}")|
 
-    assert_receive {:probe,
-                    [
-                      "/usr/bin/sandbox-exec",
-                      "-p",
-                      "(version 1)(allow default)",
-                      "/usr/bin/true"
-                    ]}
+    assert_receive {:probe, ["/local/bin/tightbeam", "contain-exec", "--check"]}
 
     refute_receive {:probe, _}
 
@@ -924,11 +919,11 @@ defmodule Tightbeam.PlacementTest do
       sh: fn _ -> {"no", 1} end
     }
 
-    assert_raise ArgumentError, ~r/testhost.*sandbox-exec probe failed with exit 1/, fn ->
+    assert_raise ArgumentError, ~r/testhost.*contain-exec probe failed with exit 1/, fn ->
       Placement.adapter_opts(config, {:claude, "default", "testhost"})
     end
 
-    assert [%{detail: "DENIED: sandbox-exec probe failed with exit 1"}] =
+    assert [%{detail: "DENIED: contain-exec probe failed with exit 1"}] =
              EventLog.lifecycle_events(db)
   end
 
@@ -949,14 +944,15 @@ defmodule Tightbeam.PlacementTest do
       sh: fn _ -> raise ErlangError, original: :enoent end
     }
 
-    assert_raise ArgumentError, ~r/sandbox-exec probe failed/, fn ->
+    assert_raise ArgumentError, ~r/contain-exec probe failed/, fn ->
       Placement.adapter_opts(config, {:codex, "default", "testhost"})
     end
 
-    assert [%{detail: "DENIED: sandbox-exec probe failed:" <> _}] = EventLog.lifecycle_events(db)
+    assert [%{detail: "DENIED: contain-exec probe failed:" <> _}] =
+             EventLog.lifecycle_events(db)
   end
 
-  test "contained noncanonical ssh:nil host is refused by name before delivery and probe", %{
+  test "contained local aliases introduce no extra refusal", %{
     base_dir: base_dir,
     db: db
   } do
@@ -982,14 +978,11 @@ defmodule Tightbeam.PlacementTest do
       end
     }
 
-    assert_raise ArgumentError, ~r/contained_noncanonical_local_host/, fn ->
-      Placement.adapter_opts(config, {:codex, "default", "alias"})
-    end
+    opts = Placement.adapter_opts(config, {:codex, "default", "alias"})
+    assert opts[:contained]
+    assert_receive {:command, ["/local/bin/tightbeam", "contain-exec", "--check"]}
 
-    refute File.exists?(Path.join([canonical_base, "homes", "default", "codex"]))
-    refute_receive {:command, _}
-
-    assert [%{detail: "DENIED: contained_noncanonical_local_host"}] =
+    assert [%{detail: "assembled; fs=workdir network=open;" <> _}] =
              EventLog.lifecycle_events(db)
 
     write_containment_manifest(canonical_base, "default", "off")
@@ -999,7 +992,7 @@ defmodule Tightbeam.PlacementTest do
     refute_receive {:command, _}
   end
 
-  test "contained remote delivery is refused in the resolved core before every ssh touch", %{
+  test "adapter_opts refuses contained remote placement before public home delivery behavior", %{
     base_dir: base_dir,
     db: db
   } do
@@ -1030,14 +1023,14 @@ defmodule Tightbeam.PlacementTest do
       Placement.adapter_opts(config, {:codex, "default", "worker"})
     end
 
-    assert_raise ArgumentError, ~r/contained_remote_unsupported/, fn ->
-      Placement.deliver_home(config, {:codex, "default", "worker"}, sh: sh)
-    end
-
     refute_receive {:command, _}
 
+    assert Placement.deliver_home(config, {:codex, "default", "worker"}, sh: sh) ==
+             "/remote/tb/homes/default/codex"
+
+    assert_receive {:command, _}
+
     assert Enum.map(EventLog.lifecycle_events(db), & &1.detail) == [
-             "DENIED: contained_remote_unsupported",
              "DENIED: contained_remote_unsupported"
            ]
   end
@@ -1307,11 +1300,10 @@ defmodule Tightbeam.PlacementTest do
     claude_home = Placement.deliver_home(config, {:claude, "default", "testhost"})
     codex_home = Placement.deliver_home(config, {:codex, "default", "testhost"})
 
-    assert claude_home
-           |> Path.join("settings.json")
-           |> File.read!()
-           |> JSON.decode!() ==
-             Map.merge(Rails.hook_settings(), %{"model" => "claude-fable-5"})
+    claude_settings_bytes = claude_home |> Path.join("settings.json") |> File.read!()
+
+    assert claude_settings_bytes ==
+             JSON.encode!(Map.merge(Rails.hook_settings(), %{"model" => "claude-fable-5"}))
 
     refute claude_home |> Path.join("settings.json") |> File.read!() =~ "tightbeam-probe"
 

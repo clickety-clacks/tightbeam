@@ -54,6 +54,8 @@ defmodule Tightbeam.RolesTest do
     assert {:error, %{code: "unknown_session"}} = Roles.bind(db, "alpha", retired.session_key)
     assert :ok = Roles.bind(db, "alpha", "agent:a")
     assert Roles.get(db, "alpha").bound_session_key == "agent:a"
+    assert {:error, %{code: "unknown_session"}} = Roles.bind(db, "alpha", nil)
+    assert Roles.get(db, "alpha").bound_session_key == "agent:a"
     assert {:error, %{code: "unknown_role"}} = Roles.rm(db, "missing")
     assert :ok = Roles.rm(db, "alpha")
     assert Roles.get(db, "alpha") == nil

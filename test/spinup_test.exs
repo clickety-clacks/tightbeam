@@ -63,7 +63,19 @@ defmodule Tightbeam.SpinupTest do
     assert {:error, %{code: "host_unready", message: message}} = result
     assert message =~ "adapter missing"
     assert message =~ expected
+    assert message =~ "install the ACP adapters in the local Tightbeam checkout"
     assert [%{kind: "spinup", detail: "reached;" <> _}] = EventLog.lifecycle_events(ctx.db)
+  end
+
+  test "local directory setup failure names the permissions remedy", ctx do
+    work_path = Path.join(ctx.base_dir, "work")
+    File.write!(work_path, "not a directory")
+
+    assert {:error, %{code: "host_unready", message: message}} =
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :claude, "testhost", db: ctx.db)
+
+    assert message =~ "directory setup failed at #{work_path}"
+    assert message =~ "fix directory permissions on testhost"
   end
 
   test "missing credentials denies with path and setup ceremony", ctx do
@@ -169,8 +181,45 @@ defmodule Tightbeam.SpinupTest do
              )
 
     assert message =~ "npm: command not found"
+    assert message =~ "install Node.js/npm and the ACP adapters on worker"
     assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "DENIED"
+  end
+
+  test "remote adapter still missing after deployment names the verification remedy", ctx do
+    configure_remote(ctx.base_dir)
+
+    sh = fn command ->
+      if String.contains?(List.last(command), "test -x"), do: {"not found", 1}, else: {"", 0}
+    end
+
+    assert {:error, %{code: "host_unready", message: message}} =
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "worker",
+               db: ctx.db,
+               sh: sh
+             )
+
+    assert message =~ "adapter still missing"
+    assert message =~ "verify the ACP adapter installation on worker"
+  end
+
+  test "remote directory setup failure names the permissions remedy", ctx do
+    configure_remote(ctx.base_dir)
+
+    sh = fn command ->
+      if String.contains?(List.last(command), "mkdir -p"),
+        do: {"permission denied", 1},
+        else: {"", 0}
+    end
+
+    assert {:error, %{code: "host_unready", message: message}} =
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :claude, "worker",
+               db: ctx.db,
+               sh: sh
+             )
+
+    assert message =~ "directory setup failed: permission denied"
+    assert message =~ "fix directory permissions on worker"
   end
 
   test "unreachable host denies with ssh output and records history", ctx do
@@ -188,7 +237,8 @@ defmodule Tightbeam.SpinupTest do
                sh: sh
              )
 
-    assert message == "host worker is unreachable: connection refused"
+    assert message =~ "host worker is unreachable: connection refused"
+    assert message =~ "check SSH access to worker"
     assert [_reach] = receive_commands(1)
     assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "DENIED"

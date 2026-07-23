@@ -106,7 +106,12 @@ defmodule Tightbeam.Escalation do
         assignment_id = assignment_id(call)
         request_id = "dr_" <> Tightbeam.Id.uuid4()
         question = fetch_string!(ctx, :question)
-        options = encode_optional(Map.get(ctx, :options) || Map.get(ctx, "options"))
+
+        options =
+          ctx
+          |> then(&(Map.get(&1, :options) || Map.get(&1, "options")))
+          |> validate_options!()
+          |> encode_optional()
 
         context =
           JSON.encode!(%{verb: Map.fetch!(call, :verb), params: Map.fetch!(call, :params)})
@@ -195,7 +200,7 @@ defmodule Tightbeam.Escalation do
          false <- raiser_id(call) == request.raiser_id,
          {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
       case request.status do
-        "ruled" when request.decision == decision ->
+        status when status in ["ruled", "consumed"] and request.decision == decision ->
           request
 
         "open" ->
@@ -453,7 +458,7 @@ defmodule Tightbeam.Escalation do
   defp rule_open(db, request, decision, rationale, origin, opts) do
     ruled_at = now()
 
-    {:ok, result} =
+    {:ok, {result, filed_fact_id}} =
       DB.transaction(db, fn txn ->
         Txn.q(
           txn,
@@ -481,17 +486,19 @@ defmodule Tightbeam.Escalation do
             "by=#{origin} decision=#{decision} factId=#{fact_id}"
           )
 
-          request_in_txn(txn, request.id)
+          {request_in_txn(txn, request.id), fact_id}
         else
           current = request_in_txn(txn, request.id)
 
+          # A concurrent-ruler loser filed nothing: it must not nudge (F13 —
+          # one post-commit nudge per filed fact, owned by the filer).
           if current.status == "ruled" and current.decision == decision,
-            do: current,
-            else: error("not_open", "decision request is not open")
+            do: {current, nil},
+            else: {error("not_open", "decision request is not open"), nil}
         end
       end)
 
-    if not Map.has_key?(result, :code), do: nudge(opts)
+    if filed_fact_id, do: nudge(opts, [filed_fact_id])
     result
   end
 
@@ -500,7 +507,7 @@ defmodule Tightbeam.Escalation do
     granted_at = now()
     reason = param(call, :reason)
 
-    {:ok, {waiver, facts?}} =
+    {:ok, {waiver, fact_ids}} =
       DB.transaction(db, fn txn ->
         Txn.q(
           txn,
@@ -515,7 +522,7 @@ defmodule Tightbeam.Escalation do
           "raiser=#{raiser_id} statute=#{statute_name} by=#{call.origin} path=#{path}"
         )
 
-        facts? =
+        fact_ids =
           if path == "request" do
             open_ids =
               Txn.q(
@@ -524,7 +531,7 @@ defmodule Tightbeam.Escalation do
                 [raiser_id, statute_name]
               )
 
-            Enum.each(open_ids, fn [id] ->
+            Enum.flat_map(open_ids, fn [id] ->
               Txn.q(
                 txn,
                 "UPDATE decision_requests SET status = 'ruled', decision = 'waived', rationale = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
@@ -550,18 +557,20 @@ defmodule Tightbeam.Escalation do
                   id,
                   "by=#{call.origin} decision=waived factId=#{fact_id}"
                 )
+
+                [fact_id]
+              else
+                []
               end
             end)
-
-            open_ids != []
           else
-            false
+            []
           end
 
-        {waiver_in_txn(txn, waiver_id), facts?}
+        {waiver_in_txn(txn, waiver_id), fact_ids}
       end)
 
-    if facts?, do: nudge(opts)
+    if fact_ids != [], do: nudge(opts, fact_ids)
     waiver
   end
 
@@ -623,8 +632,15 @@ defmodule Tightbeam.Escalation do
         [raiser_id, statute_name]
       )
 
-    count > 0
+    count > 0 and active_raiser?(db, raiser_id)
   end
+
+  defp active_raiser?(db, "session:" <> session_key) do
+    DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) ==
+      {:ok, [["active"]]}
+  end
+
+  defp active_raiser?(_db, _raiser_id), do: true
 
   defp current_request(db, raiser_id, statute_name, action_key) do
     {:ok, rows} =
@@ -825,10 +841,15 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp nudge(opts) do
+  defp nudge(opts, fact_ids) do
     case Keyword.get(opts, :scheduler) do
-      nil -> :ok
-      scheduler -> Wakes.fire_matching(scheduler)
+      nil ->
+        :ok
+
+      scheduler ->
+        # One ordered call: the scheduler serves fact_ids strictly in filing
+        # order (a later fact's fan-out never overtakes an earlier fact's).
+        Wakes.fire_matching(scheduler, fact_ids)
     end
   end
 
@@ -865,6 +886,24 @@ defmodule Tightbeam.Escalation do
   defp encode_optional(value), do: JSON.encode!(value)
   defp decode_optional(nil), do: nil
   defp decode_optional(value), do: JSON.decode!(value)
+
+  defp validate_options!(nil), do: nil
+
+  defp validate_options!(options) when is_list(options) do
+    Enum.map(options, fn option ->
+      label = Map.get(option, :label) || Map.get(option, "label")
+      effect = Map.get(option, :effect) || Map.get(option, "effect")
+
+      if is_binary(label) and effect in ["allow", "deny"] do
+        %{"label" => label, "effect" => effect}
+      else
+        raise ArgumentError, "options must contain label and allow|deny effect"
+      end
+    end)
+  end
+
+  defp validate_options!(_options),
+    do: raise(ArgumentError, "options must contain label and allow|deny effect")
 
   defp error(code, message), do: %{code: code, message: message}
   defp now, do: System.system_time(:millisecond)

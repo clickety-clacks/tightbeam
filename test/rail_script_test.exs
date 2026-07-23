@@ -117,6 +117,40 @@ defmodule Tightbeam.RailScriptTest do
     assert %{"reason" => "script_error", "exit_class" => ^exit_class} = JSON.decode!(detail)
   end
 
+  test "serializes a reserved remedy principal into script input", ctx do
+    script = Path.join([ctx.base_dir, "identity", "rails", "scripts", "remedy-principal"])
+
+    File.write!(
+      script,
+      """
+      #!/bin/sh
+      IFS= read -r input
+      case "$input" in
+        *'"principal":"remedy:assign:completion-needs-review"'*) printf pass ;;
+        *) printf wrong ;;
+      esac
+      """
+    )
+
+    File.chmod!(script, 0o755)
+
+    remedy_call =
+      call()
+      |> Map.put(
+        :principal,
+        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}}
+      )
+
+    assert {:ok, "pass", "returned"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               rule("remedy-principal"),
+               remedy_call,
+               nil
+             )
+  end
+
   test "BEAM backstop closes a wrapper that outlives its timeout", ctx do
     wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
     File.write!(wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")

@@ -3,7 +3,7 @@ defmodule Tightbeam.OrgTest do
 
   doctest Tightbeam.Org
 
-  alias Tightbeam.{DB, Org}
+  alias Tightbeam.{DB, EventLog, Gateway, Ledger, Org}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -138,7 +138,7 @@ defmodule Tightbeam.OrgTest do
     assert index_sql =~ "UNIQUE INDEX"
   end
 
-  test "pre-existing session schema gains the token column before its index" do
+  test "gateway boot migrates and backfills a pre-existing session schema" do
     db = :"old_org_db_#{System.unique_integer([:positive])}"
     start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
 
@@ -154,9 +154,62 @@ defmodule Tightbeam.OrgTest do
       )
       """)
 
-    assert :ok = Org.ensure_schema(db)
+    :ok = Ledger.ensure_schema(db)
+    :ok = EventLog.ensure_schema(db)
+
+    now = System.system_time(:millisecond)
+
+    for {session_key, state} <- [{"old-active", "active"}, {"old-retired", "retired"}] do
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO sessions (
+            sessionKey, displayName, ownerUserId, origin, archetype, harness,
+            provider, model, state, createdAt, updatedAt
+          ) VALUES (?1, ?2, 'flynn', 'user:flynn', 'default', 'claude',
+                    'anthropic', 'fable', ?3, ?4, ?4)
+          """,
+          [session_key, session_key, state, now]
+        )
+    end
+
+    base_dir =
+      Path.join(System.tmp_dir!(), "old_org_boot_#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    assert is_list(
+             Gateway.children(%{
+               base_dir: base_dir,
+               cwd: "/tmp",
+               port: 0,
+               default_harness: :claude,
+               default_model: "claude-fable-5",
+               max_live_sessions_per_user: 50,
+               wake_tick_ms: 1_000,
+               db: db,
+               harness_binary_probe: fn harness, _cli_bin ->
+                 {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
+               end
+             })
+           )
+
     {:ok, columns} = DB.query(db, "PRAGMA table_info(sessions)")
     assert Enum.any?(columns, fn [_cid, name | _] -> name == "cliToken" end)
+
+    active_token = Org.get(db, "old-active").cli_token
+    assert active_token =~ ~r/^tbs_[A-Za-z0-9_-]{32}$/
+    assert Org.by_cli_token(db, active_token).session_key == "old-active"
+    assert Org.get(db, "old-retired").cli_token == nil
+
+    {:ok, [[index_sql]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'sessions_cli_token'"
+      )
+
+    assert index_sql =~ "UNIQUE INDEX"
   end
 
   test "list scopes active sessions by owner unless admin and preserves ordering", %{db: db} do

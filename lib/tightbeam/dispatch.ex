@@ -104,7 +104,7 @@ defmodule Tightbeam.Dispatch do
               script_exit_class: nil,
               ref: gated_ref(call),
               producer: nil,
-              identity_manifest_sha: nil,
+              identity_manifest_sha: Rules.active_identity_manifest_sha(),
               message: "ruling authorization was no longer available"
             }
 

@@ -98,10 +98,18 @@ defmodule Tightbeam.DispatchTest do
               script_exit_class: nil,
               ref: "a-cas",
               producer: nil,
-              identity_manifest_sha: nil
+              identity_manifest_sha: "identity-sha"
             }} = Dispatch.dispatch(db, %{"post" => fn _ -> flunk("CAS loss must deny") end}, call)
 
-    assert [%{rule: "cas-rule", edge: "verb", reason: "rule_denied", ref: "a-cas"}] =
+    assert [
+             %{
+               rule: "cas-rule",
+               edge: "verb",
+               reason: "rule_denied",
+               ref: "a-cas",
+               identity_manifest_sha: "identity-sha"
+             }
+           ] =
              EventLog.rail_denials(db, 0, 10)
   end
 end

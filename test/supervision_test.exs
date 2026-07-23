@@ -758,6 +758,29 @@ defmodule Tightbeam.SupervisionTest do
     assert %{pendingBranch: "prod"} = Supervision.watermark(ctx.db, "holder")
   end
 
+  test "retirement handling is total-caught before the server continues", ctx do
+    name = :"supervision_retired_#{System.unique_integer([:positive])}"
+
+    pid =
+      start_supervised!(
+        {Supervision, db: ctx.db, handlers: ctx.handlers, prod_limit: 3, name: name}
+      )
+
+    :ok = DB.execute(ctx.db, "DROP TABLE decision_requests")
+    Supervision.notify_retired(name, "holder")
+
+    eventually(fn ->
+      Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+        event.kind == "supervision_evaluate_failed" and event.subject == "holder"
+      end)
+    end)
+
+    assert Process.alive?(pid)
+    Supervision.request_sweep(name)
+    Process.sleep(20)
+    assert Process.alive?(pid)
+  end
+
   test "N=0 cross-assignment re-entry exceeds N+1 and then quiesces at Main", ctx do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET spawnedBy='holder' WHERE sessionKey='supervisor'")
@@ -989,5 +1012,23 @@ defmodule Tightbeam.SupervisionTest do
         Process.sleep(10)
         eventually(fun, tries - 1)
     end
+  end
+
+  # ── THE ORDER PIN (supervision-impl r21) ──────────────────────────────────
+  # This assertion is the executable lease on the turn-end shift: the
+  # schedule in Supervision.@turn_end_schedule may only change together with
+  # (1) this literal, (2) the termination argument in supervision-impl-v1
+  # §r21, and (3) a semantic justification for the new position — order is
+  # meaning here (hold freezes enforcement; statutes outrank the ladder; a
+  # pending wake silences everything downstream). If this test surprised you
+  # red, you changed the shift without signing the lease — go read the
+  # schedule comment in supervision.ex.
+  test "the turn-end schedule is exactly the r21 shift, in order" do
+    assert Tightbeam.Supervision.turn_end_schedule() == [
+             :adjudication_hold,
+             :rail_enforcement,
+             :pending_wake_gate,
+             :prod_ladder
+           ]
   end
 end

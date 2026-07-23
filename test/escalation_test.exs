@@ -88,6 +88,19 @@ defmodule Tightbeam.EscalationTest do
     refute Escalation.consume(ctx.db, id)
     assert {:needs_request, nil} = Escalation.resolve(ctx.db, call, statute)
 
+    reruled =
+      Escalation.rule(ctx.db, rule_call(id, "allow"),
+        authorized: true,
+        scheduler: ctx.scheduler
+      )
+
+    assert reruled.status == "consumed"
+    assert reruled.decision == "allow"
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "decision_request_ruled" and event.subject == id
+           end) == 1
+
     {:decision_pending, denied_id} = open(ctx, call, statute)
     Escalation.rule(ctx.db, rule_call(denied_id, "deny"), authorized: true)
     assert {:deny, %{code: "escalation_denied"}} = Escalation.resolve(ctx.db, call, statute)
@@ -258,8 +271,12 @@ defmodule Tightbeam.EscalationTest do
 
     assert request(ctx, first).decision == "waived"
     assert request(ctx, second).decision == "waived"
+    # The eager path fires per filed fact (wake-on-fact-v1 §candidate query:
+    # `f.id = :factId`), and waive nudges once per ruling fact — so BOTH
+    # ruling wakes fire eagerly. (The old latest-fact-only pending state was
+    # an artifact of the broadcast MAX(id) approximation.)
     assert Wakes.get(ctx.db, second_wake.wake_id).state == "fired"
-    assert Wakes.get(ctx.db, first_wake.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, first_wake.wake_id).state == "fired"
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, first_wake.wake_id).state == "fired"
@@ -282,6 +299,30 @@ defmodule Tightbeam.EscalationTest do
 
     {:decision_pending, fresh} = open(ctx, first_call, statute)
     refute fresh in [first, second]
+  end
+
+  test "a retired session raiser's unswept waiver is not consulted", ctx do
+    call = call(ctx.raiser, %{assignment_id: "a-retired-waiver", kind: "completion"})
+    {:decision_pending, id} = open(ctx, call, statute())
+
+    Escalation.waive(
+      ctx.db,
+      %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{request_id: id}},
+      authorized: true
+    )
+
+    assert :allow = Escalation.resolve(ctx.db, call, statute())
+
+    Org.retire(ctx.db, ctx.raiser.session_key)
+
+    assert {:needs_request, nil} = Escalation.resolve(ctx.db, call, statute())
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedAt FROM escalation_waivers WHERE raiserId = ?1",
+               ["session:" <> ctx.raiser.session_key]
+             )
   end
 
   test "withdrawal is raiser-only and retirement sweeps requests and waivers", ctx do
@@ -418,6 +459,35 @@ defmodule Tightbeam.EscalationTest do
              )
 
     assert is_integer(revoked_at)
+  end
+
+  test "decision request options require labels with allow or deny effects", ctx do
+    call = call(ctx.raiser, %{assignment_id: "a-options", kind: "completion"})
+
+    assert_raise ArgumentError, "options must contain label and allow|deny effect", fn ->
+      Escalation.escalate(ctx.db, call, statute(), %{
+        question: "Choose",
+        options: [%{"label" => "later", "effect" => "defer"}]
+      })
+    end
+
+    assert_raise ArgumentError, "options must contain label and allow|deny effect", fn ->
+      Escalation.escalate(ctx.db, call, statute(), %{
+        question: "Choose",
+        options: [%{"effect" => "allow"}]
+      })
+    end
+
+    {:decision_pending, id} =
+      Escalation.escalate(ctx.db, call, statute(), %{
+        question: "Choose",
+        options: [%{label: "ship", effect: "allow"}, %{label: "stop", effect: "deny"}]
+      })
+
+    assert request(ctx, id).options == [
+             %{"label" => "ship", "effect" => "allow"},
+             %{"label" => "stop", "effect" => "deny"}
+           ]
   end
 
   test "escalation-ruled remains substrate-reserved", ctx do
