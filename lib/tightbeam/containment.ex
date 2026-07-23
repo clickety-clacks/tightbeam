@@ -2,13 +2,13 @@ defmodule Tightbeam.Containment do
   @moduledoc """
   macOS Seatbelt profile rendering and write-root validation.
 
-  Profile rendering is pure. Filesystem canonicality is checked separately at
-  adapter start so a configured grant can never silently miss its real path.
+  Profile rendering validates every write root, including filesystem
+  canonicality, so a configured grant can never silently miss its real path.
   """
 
   @spec profile([String.t()]) :: String.t()
   def profile(write_roots) do
-    Enum.each(write_roots, &validate_root!/1)
+    validate_roots!(write_roots)
 
     roots = Enum.map_join(write_roots, "\n", &~s|  (subpath "#{&1}")|)
 
@@ -56,9 +56,6 @@ defmodule Tightbeam.Containment do
 
       String.contains?(root, ["\"", "\\"]) or contains_control?(root) ->
         raise ArgumentError, "containment write root contains a rejected byte: #{inspect(root)}"
-
-      root != Path.expand(root) ->
-        raise ArgumentError, "containment write root is not canonical: #{inspect(root)}"
 
       true ->
         :ok
