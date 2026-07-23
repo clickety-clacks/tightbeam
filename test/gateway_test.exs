@@ -162,11 +162,13 @@ defmodule Tightbeam.GatewayTest do
           %{
             id: "claude-fable-5",
             display_name: "Claude Fable 5",
+            max_input_tokens: 200_000,
             capabilities: %{effort: %{}}
           },
           %{
             id: "claude-sonnet-4-6",
             display_name: "Claude Sonnet 4.6",
+            max_input_tokens: 200_000,
             capabilities: %{effort: %{}}
           }
         ]
@@ -208,7 +210,8 @@ defmodule Tightbeam.GatewayTest do
               },
               %{
                 slug: "gpt-5.6-classic",
-                display_name: "GPT-5.6 Classic"
+                display_name: "GPT-5.6 Classic",
+                supported_reasoning_levels: []
               }
             ]
           })}
