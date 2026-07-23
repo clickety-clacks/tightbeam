@@ -64,6 +64,11 @@ defmodule Tightbeam.WorkItems do
 
       case result do
         {:updated, item, changed?} ->
+          # Work-item-grain metadata doorbell (observability-v1 §work_item_events,
+          # kind="metadata"): title/spec-ref pin changed, so observability must
+          # invalidate/refetch its card (work-item-v1 §Mutability cross-spec note).
+          # observability-v1 OWNS this doorbell; work-item-v1 declines to build it,
+          # it does not forbid it.
           if changed? do
             best_effort(fn ->
               Map.get(call, :on_work_item_change, fn _, _ -> :ok end).(item.id, "metadata")

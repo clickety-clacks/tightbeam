@@ -117,7 +117,15 @@ defmodule Tightbeam.RulesTest do
        "non-empty flat list"},
       {rule("roles-eq", "post", "caller.roles", "eq", "[\"admin\"]", raw: true),
        "invalid for a list fact"},
-      {rule("roles-type", "post", "caller.roles", "in", "[1]", raw: true), "non-empty flat list"}
+      {rule("roles-type", "post", "caller.roles", "in", "[1]", raw: true), "non-empty flat list"},
+      {rule(
+         "verdicts-not-in-type",
+         "post",
+         "assignment.verdicts",
+         "not_in",
+         "[1]",
+         raw: true
+       ), "non-empty flat list"}
     ]
 
     for {contents, reason} <- cases do
@@ -421,6 +429,27 @@ defmodule Tightbeam.RulesTest do
     assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
   end
 
+  test "zero rules lets completion close with null verdict filer fields and one verb event",
+       ctx do
+    holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
+    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: assignment.id,
+        kind: "completion"
+      })
+
+    assert {:ok,
+            %{
+              assignment: %{state: "closed"},
+              attest: %{kind: "completion", verdictKind: nil, byUser: nil}
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert [%{kind: "verb", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
+  end
+
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
     config = %{
       db: ctx.db,
@@ -593,6 +622,8 @@ defmodule Tightbeam.RulesTest do
       {%{files: "lib/a.ex"}, true, false},
       {%{files: ["ok", " "]}, true, false},
       {%{files: [String.duplicate("x", 2_001)]}, true, false},
+      {%{files: [String.duplicate("é", 2_000)]}, false, true},
+      {%{files: [" " <> String.duplicate("x", 2_000) <> " "]}, false, true},
       {%{files: ["lib/other.ex"]}, false, true},
       {%{files: ["lib/a.ex", "lib/a.ex"]}, true, true}
     ]
@@ -630,6 +661,90 @@ defmodule Tightbeam.RulesTest do
              )
   end
 
+  test "check-tier assignment facts are nil for every unresolved assignment shape", ctx do
+    holder = session(ctx.db, "check-tier-holder", "flynn", archetype: "coder")
+    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    unresolved_params = [
+      %{kind: "completion"},
+      %{assignment_id: 123, kind: "completion"},
+      %{assignment_id: "unknown", kind: "completion"}
+    ]
+
+    for params <- unresolved_params do
+      for {fact, op, value} <- [
+            {"assignment.verdicts", "not_in", ["required"]},
+            {"assignment.holder_archetype", "eq", "coder"},
+            {"assignment.caller_is_holder", "eq", true},
+            {"assignment.caller_is_holder", "eq", false}
+          ] do
+        put_rule(ctx, rule("unresolved", "attest", fact, op, value))
+        Rules.load!(ctx.base_dir, ["attest"], %{})
+
+        assert :ok =
+                 Rules.evaluate(
+                   ctx.db,
+                   p3_call("attest", {:session, holder.session_key}, params)
+                 )
+      end
+    end
+
+    put_rule(
+      ctx,
+      rule("resolved", "attest", "assignment.caller_is_holder", "eq", true)
+    )
+
+    Rules.load!(ctx.base_dir, ["attest"], %{})
+
+    assert {:deny, %{rule: "resolved"}} =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", {:session, holder.session_key}, %{
+                 assignment_id: assignment.id,
+                 kind: "completion"
+               })
+             )
+  end
+
+  test "two required verdict statutes deny under each missing kind's own name", ctx do
+    holder = session(ctx.db, "two-kind-holder", "flynn", archetype: "coder")
+    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "needs-tests"
+    verb = "attest"
+    text = "tests required"
+    external_producer = true
+    deny_when = [
+      { fact = "attest.kind", op = "eq", value = "completion" },
+      { fact = "assignment.verdicts", op = "not_in", value = ["tests-passed"] }
+    ]
+
+    [[rule]]
+    name = "needs-review"
+    verb = "attest"
+    text = "review required"
+    external_producer = true
+    deny_when = [
+      { fact = "attest.kind", op = "eq", value = "completion" },
+      { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }
+    ]
+    """)
+
+    Rules.load!(ctx.base_dir, ["attest"], %{})
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: assignment.id,
+        kind: "completion"
+      })
+
+    assert {:deny, %{rule: "needs-tests"}} = Rules.evaluate(ctx.db, completion)
+    verdict(ctx, holder.session_key, assignment.id, "tests-passed")
+    assert {:deny, %{rule: "needs-review"}} = Rules.evaluate(ctx.db, completion)
+  end
+
   test "independence facts enforce commissioned-review provenance and frozen stamps", ctx do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
@@ -658,20 +773,30 @@ defmodule Tightbeam.RulesTest do
 
     verdict(ctx, third.session_key, self_review.id, "self-commissioned")
 
+    other_producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    wrong_review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: other_producer.id)
+
+    verdict(ctx, reviewer.session_key, wrong_review.id, "wrong-link")
+
     assertions = [
       {"assignment.independent_verdict_kinds", "direct", false},
       {"assignment.independent_verdict_kinds", "third-session", false},
       {"assignment.independent_verdict_kinds", "user-on-review", false},
       {"assignment.independent_verdict_kinds", "self-commissioned", false},
+      {"assignment.independent_verdict_kinds", "wrong-link", false},
       {"assignment.independent_verdict_kinds", "reviewed-clean", true},
       {"assignment.independent_verdict_kinds", "same-harness", true},
       {"assignment.cross_harness_verdict_kinds", "direct", false},
       {"assignment.cross_harness_verdict_kinds", "third-session", false},
       {"assignment.cross_harness_verdict_kinds", "user-on-review", false},
       {"assignment.cross_harness_verdict_kinds", "self-commissioned", false},
+      {"assignment.cross_harness_verdict_kinds", "wrong-link", false},
       {"assignment.cross_harness_verdict_kinds", "reviewed-clean", true},
       {"assignment.cross_harness_verdict_kinds", "same-harness", false},
       {"assignment.cross_provider_verdict_kinds", "reviewed-clean", true},
+      {"assignment.cross_provider_verdict_kinds", "wrong-link", false},
       {"assignment.cross_provider_verdict_kinds", "same-harness", false}
     ]
 
@@ -713,13 +838,6 @@ defmodule Tightbeam.RulesTest do
         ctx.db,
         "UPDATE sessions SET harness = 'codex', provider = 'openai' WHERE sessionKey = ?1",
         [holder.session_key]
-      )
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE sessions SET harness = 'claude', provider = 'anthropic' WHERE sessionKey = ?1",
-        [reviewer.session_key]
       )
 
     put_rule(

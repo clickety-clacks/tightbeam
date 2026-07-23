@@ -142,4 +142,15 @@ defmodule Tightbeam.RailsTest do
                "echo \"[gate: tightbeam-probe] Spawn wiring-check probe command; " <>
                "always refused by design.\" >&2; exit 2'"
   end
+
+  test "moduledoc pins permission bypass separately from codex hook trust and version facts" do
+    assert {:docs_v1, _, _, _, %{"en" => moduledoc}, _, _} = Code.fetch_docs(Rails)
+    assert moduledoc =~ "since 0.124.0"
+    assert moduledoc =~ "0.144.x is the tested floor"
+    assert moduledoc =~ "executable codex-acp selects"
+    assert moduledoc =~ "permission bypass"
+    assert moduledoc =~ "codex `agent-full-access` and claude `bypassPermissions`"
+    assert moduledoc =~ "DISTINCT from permission bypass"
+    assert moduledoc =~ ~s(CODEX_CONFIG={"bypass_hook_trust":true})
+  end
 end

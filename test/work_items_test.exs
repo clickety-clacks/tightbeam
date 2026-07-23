@@ -167,6 +167,27 @@ defmodule Tightbeam.WorkItemsTest do
     cleared = update(ctx, {:user, "flynn"}, pinned.id, %{spec_ref_name: nil})
     assert cleared.specRefName == nil
     assert cleared.specRefSha256 == nil
+
+    # The metadata doorbell (observability-v1 §work_item_events, kind="metadata")
+    # fires on a real metadata change and is silent on a no-op. observability-v1
+    # OWNS this doorbell; work-item-v1 §Mutability flags the card-refresh need.
+    change_call =
+      update_call({:user, "flynn"}, pinned.id, %{title: "Retitled again"})
+      |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :work_item_change) end)
+
+    assert WorkItems.__handle__(ctx.db, "work-item-update", change_call).title ==
+             "Retitled again"
+
+    assert_received :work_item_change
+
+    noop_call =
+      update_call({:user, "flynn"}, pinned.id, %{title: "Retitled again"})
+      |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :work_item_change) end)
+
+    assert WorkItems.__handle__(ctx.db, "work-item-update", noop_call).title ==
+             "Retitled again"
+
+    refute_received :work_item_change
   end
 
   test "get and list return deterministic eras, aspects, and ordering", ctx do

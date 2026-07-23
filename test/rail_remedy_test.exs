@@ -52,8 +52,14 @@ defmodule Tightbeam.RailRemedyTest do
     reviewer = session(db, "reviewer-session", "flynn", "codex", "reviewer")
     Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
 
+    # Canonicalize the tmp base: Darwin's System.tmp_dir!/0 sits under the /var
+    # symlink (/var -> /private/var), and Containment.profile/1 (the rail scratch
+    # write-root) refuses uncanonical components, which fails the contained script
+    # launch (error:1) instead of letting it return a clean deny.
+    tmp_base = to_string(:string.trim(:os.cmd(~c(realpath #{System.tmp_dir!()}))))
+
     base_dir =
-      Path.join(System.tmp_dir!(), "tightbeam-remedy-#{System.unique_integer([:positive])}")
+      Path.join(tmp_base, "tightbeam-remedy-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join(base_dir, "identity/rules"))
     handlers = Gateway.handlers(%{db: db})
@@ -108,26 +114,85 @@ defmodule Tightbeam.RailRemedyTest do
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
   end
 
-  test "TTL reclaim preserves occurrence and reuses exactly one external producer", ctx do
+  test "remedy producer assign traverses dispatch and is denied by a script statute", ctx do
+    assignment = assignment(ctx, "script-gated-producer")
+    install_script_assign_gate!(ctx)
+    put_rules(ctx, review_gate() <> script_assign_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+
+    assert {:error,
+            %{
+              reason: "remedy_fired",
+              producer: nil,
+              rule: "completion-needs-review"
+            }} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id) == nil
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignments WHERE reviewsAssignmentId = ?1",
+               [assignment.id]
+             )
+
+    assert %{
+             rule: "script-block-remedy-assign",
+             edge: "verb",
+             reason: "rule_denied",
+             script_exit_class: "returned",
+             origin: "remedy:completion-needs-review",
+             principal: "remedy:assign:completion-needs-review"
+           } =
+             Enum.find(
+               EventLog.rail_denials(ctx.db, 0, 10),
+               &(&1.rule == "script-block-remedy-assign")
+             )
+
+    assert %{
+             "verb" => "assign",
+             "origin" => "remedy:completion-needs-review",
+             "return" => "block",
+             "exit_class" => "returned"
+           } =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.find(
+               &(&1.kind == "rail_script" and &1.subject == "script-block-remedy-assign")
+             )
+             |> Map.fetch!(:detail)
+             |> JSON.decode!()
+
+    assert [%{"outcome" => "blocked", "producer_id" => nil}] = remedy_events(ctx.db)
+  end
+
+  test "TTL reclaim racing a live original dispatch produces exactly one external effect", ctx do
     assignment = assignment(ctx, "ttl")
     load_review_gate(ctx)
-    key = "rail-dispatch:completion-needs-review:#{assignment.id}:1"
+    parent = self()
+    assign = ctx.handlers["assign"]
 
-    existing =
-      Assignments.__handle__(ctx.db, "assign", %{
-        verb: "assign",
-        origin: "remedy:completion-needs-review",
-        principal:
-          {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}},
-        session_key: ctx.reviewer.session_key,
-        target_role: "reviewer",
-        role_fallback: false,
-        params: %{
-          subject: "review #{assignment.id}",
-          reviews_assignment_id: assignment.id,
-          idempotency_key: key
-        }
-      })
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    handlers =
+      Map.put(ctx.handlers, "assign", fn call ->
+        first? = Agent.get_and_update(counter, &{&1 == 0, &1 + 1})
+
+        if first? do
+          send(parent, {:original_dispatch_running, self()})
+          receive do: (:release_original_dispatch -> :ok)
+        end
+
+        assign.(call)
+      end)
+
+    original =
+      Task.async(fn ->
+        Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
+      end)
+
+    assert_receive {:original_dispatch_running, original_pid}
 
     stale = System.system_time(:millisecond) - 60_001
 
@@ -135,22 +200,24 @@ defmodule Tightbeam.RailRemedyTest do
       DB.query(
         ctx.db,
         """
-        INSERT INTO rail_remedy_episodes
-          (statute, subject, status, occurrence, rewakeCount, claimToken, openedAt)
-        VALUES ('completion-needs-review', ?1, 'dispatched', 1, 0, 'old', ?2)
+        UPDATE rail_remedy_episodes
+        SET openedAt = ?2
+        WHERE statute = 'completion-needs-review' AND subject = ?1 AND status = 'dispatched'
         """,
         [assignment.id, stale]
       )
 
-    assert {:error, %{producer: producer}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+    reclaimed =
+      Task.async(fn ->
+        Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
+      end)
 
-    assert producer == existing.id
+    assert {:error, %{producer: producer}} = Task.await(reclaimed)
+    send(original_pid, :release_original_dispatch)
+    assert {:error, %{producer: ^producer}} = Task.await(original)
 
-    assert %{occurrence: 1, producer_key: producer_key, status: "live"} =
+    assert %{occurrence: 1, producer_key: ^producer, status: "live"} =
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
-
-    assert producer_key == existing.id
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -613,6 +680,56 @@ defmodule Tightbeam.RailRemedyTest do
     subject = "review {assignment_id}"
     reviews = "{assignment_id}"
     """
+  end
+
+  defp script_assign_gate do
+    """
+
+    [[rule]]
+    name = "script-block-remedy-assign"
+    verb = "assign"
+    text = "script blocks remedy assignment"
+    [rule.check]
+    script = "block-remedy-assign"
+    returns = ["block"]
+    [rule.check.effects]
+    block = "deny"
+    """
+  end
+
+  defp install_script_assign_gate!(ctx) do
+    scripts = Path.join([ctx.base_dir, "identity", "rails", "scripts"])
+    bin = Path.join(ctx.base_dir, "bin")
+    File.mkdir_p!(scripts)
+    File.mkdir_p!(bin)
+
+    script = Path.join(scripts, "block-remedy-assign")
+
+    File.write!(
+      script,
+      """
+      #!/bin/sh
+      IFS= read -r input
+      case "$input" in
+        *'"verb":"assign"'*) ;;
+        *) exit 7 ;;
+      esac
+      case "$input" in
+        *'"origin":"remedy:completion-needs-review"'*) ;;
+        *) exit 8 ;;
+      esac
+      case "$input" in
+        *'"principal":"remedy:assign:completion-needs-review"'*) printf block ;;
+        *) exit 9 ;;
+      esac
+      """
+    )
+
+    File.chmod!(script, 0o755)
+
+    wrapper = Path.join(bin, "tightbeam")
+    File.cp!(Path.expand("fixtures/rail_exec/tightbeam", __DIR__), wrapper)
+    File.chmod!(wrapper, 0o755)
   end
 
   defp produced_gate do

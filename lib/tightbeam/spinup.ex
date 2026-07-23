@@ -49,7 +49,10 @@ defmodule Tightbeam.Spinup do
         ensure_remote_host(host, harness, host_name, sh)
 
       {output, _exit} ->
-        message = "host #{host_name} is unreachable: #{String.trim(output)}"
+        message =
+          "host #{host_name} is unreachable: #{String.trim(output)} " <>
+            ssh_remedy(output, host_name)
+
         {{:error, host_unready(message)}, "DENIED: #{message}"}
     end
   end
@@ -77,7 +80,8 @@ defmodule Tightbeam.Spinup do
 
       {output, _exit} ->
         message =
-          "host #{host_name} is not ready for #{harness}: directory setup failed: #{String.trim(output)}"
+          "host #{host_name} is not ready for #{harness}: directory setup failed: #{String.trim(output)} " <>
+            remote_directory_remedy(output, host.base_dir, host_name)
 
         {{:error, host_unready(message)}, "reached; DENIED: #{message}"}
     end
@@ -91,7 +95,8 @@ defmodule Tightbeam.Spinup do
 
         {:error, reason} ->
           message =
-            "host #{host_name} is not ready for #{harness}: directory setup failed at #{path}: #{:file.format_error(reason)}"
+            "host #{host_name} is not ready for #{harness}: directory setup failed at #{path}: #{:file.format_error(reason)} " <>
+              local_directory_remedy(reason, path, host_name)
 
           {:halt, {:error, host_unready(message), "reached; DENIED: #{message}"}}
       end
@@ -104,7 +109,10 @@ defmodule Tightbeam.Spinup do
     if File.exists?(path) do
       :ok
     else
-      message = "host #{host_name} is not ready for #{harness}: adapter missing at #{path}"
+      message =
+        "host #{host_name} is not ready for #{harness}: adapter missing at #{path} " <>
+          "(install the ACP adapters in the local Tightbeam checkout)"
+
       {:error, host_unready(message), "reached; directories ensured; DENIED: #{message}"}
     end
   end
@@ -131,7 +139,8 @@ defmodule Tightbeam.Spinup do
 
               {output, _exit} ->
                 message =
-                  "host #{host_name} is not ready for #{harness}: adapter still missing at #{path} after deployment: #{String.trim(output)}"
+                  "host #{host_name} is not ready for #{harness}: adapter still missing at #{path} after deployment: #{String.trim(output)} " <>
+                    "(reinstall the ACP adapters on #{host_name}, then verify the ACP adapter installation on #{host_name} produced an executable at #{path})"
 
                 {:error, host_unready(message),
                  "reached; directories ensured; deployed adapters; DENIED: #{message}"}
@@ -139,7 +148,8 @@ defmodule Tightbeam.Spinup do
 
           {output, _exit} ->
             message =
-              "host #{host_name} is not ready for #{harness}: adapter deployment failed: #{String.trim(output)}"
+              "host #{host_name} is not ready for #{harness}: adapter deployment failed: #{String.trim(output)} " <>
+                adapter_deployment_remedy(output, install_dir, host_name)
 
             {:error, host_unready(message), "reached; directories ensured; DENIED: #{message}"}
         end
@@ -194,6 +204,88 @@ defmodule Tightbeam.Spinup do
 
   defp remote_command(destination, script) do
     ["ssh" | @ssh_opts] ++ [destination, "sh", "-c", shell_quote(script)]
+  end
+
+  defp ssh_remedy(output, host_name) do
+    output = String.downcase(output)
+
+    cond do
+      String.contains?(output, "connection refused") ->
+        "(start or restore the SSH service for #{host_name}, then check SSH access to #{host_name})"
+
+      String.contains?(output, "permission denied") or String.contains?(output, "publickey") ->
+        "(authorize the gateway's SSH key on #{host_name}, then check SSH access to #{host_name})"
+
+      String.contains?(output, "could not resolve") or
+          String.contains?(output, "name or service not known") ->
+        "(correct the SSH destination or DNS for #{host_name}, then check SSH access to #{host_name})"
+
+      String.contains?(output, "no route to host") or String.contains?(output, "timed out") or
+          String.contains?(output, "timeout") ->
+        "(restore network reachability to #{host_name}, then check SSH access to #{host_name})"
+
+      true ->
+        "(restore non-interactive SSH access to #{host_name}, then check SSH access to #{host_name})"
+    end
+  end
+
+  defp local_directory_remedy(reason, path, host_name) when reason in [:eacces, :eperm] do
+    "(grant the Tightbeam process search and write permission for #{path} on #{host_name})"
+  end
+
+  defp local_directory_remedy(:enospc, path, host_name) do
+    "(free disk space on #{host_name}, then retry creating #{path})"
+  end
+
+  defp local_directory_remedy(:enotdir, path, host_name) do
+    "(remove or rename the non-directory component blocking #{path} on #{host_name}; fix directory permissions on #{host_name} only if the replacement still lacks write access)"
+  end
+
+  defp local_directory_remedy(reason, path, host_name) do
+    "(resolve the #{:file.format_error(reason)} filesystem condition at #{path} on #{host_name}, then retry placement)"
+  end
+
+  defp remote_directory_remedy(output, base_dir, host_name) do
+    output = String.downcase(output)
+
+    cond do
+      String.contains?(output, "permission denied") ->
+        "(fix directory permissions on #{host_name} so Tightbeam can create directories under #{base_dir}, then retry placement)"
+
+      String.contains?(output, "not a directory") ->
+        "(remove or rename the non-directory component blocking #{base_dir} on #{host_name}, then retry placement)"
+
+      String.contains?(output, "no space left") ->
+        "(free disk space on #{host_name}, then retry creating directories under #{base_dir})"
+
+      String.contains?(output, "read-only file system") ->
+        "(make the filesystem containing #{base_dir} writable on #{host_name}, then retry placement)"
+
+      true ->
+        "(correct the reported mkdir failure under #{base_dir} on #{host_name}, then retry placement)"
+    end
+  end
+
+  defp adapter_deployment_remedy(output, install_dir, host_name) do
+    output = String.downcase(output)
+
+    cond do
+      String.contains?(output, "command not found") ->
+        "(install Node.js/npm and the ACP adapters on #{host_name})"
+
+      String.contains?(output, "permission denied") or String.contains?(output, "eacces") ->
+        "(grant npm write access to #{install_dir} on #{host_name}, then rerun the ACP adapter installation)"
+
+      String.contains?(output, "no space left") or String.contains?(output, "enospc") ->
+        "(free disk space on #{host_name}, then rerun the ACP adapter installation)"
+
+      String.contains?(output, "network") or String.contains?(output, "econn") or
+          String.contains?(output, "enotfound") ->
+        "(restore npm registry access on #{host_name}, then rerun the ACP adapter installation)"
+
+      true ->
+        "(correct the reported npm failure in #{install_dir} on #{host_name}, then rerun the ACP adapter installation)"
+    end
   end
 
   defp host_unready(message), do: %{code: "host_unready", message: message}
