@@ -376,9 +376,13 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
   defp assign_result(db, call) do
-    open_assignment_result(db, call, fn _txn, assignment ->
-      {:created, assignment, nil}
-    end)
+    open_assignment_result(
+      db,
+      call,
+      fn _txn, assignment -> {:created, assignment, nil} end,
+      fn -> :ok end,
+      "assign"
+    )
   end
 
   defp dispatch_result(db, call) do
@@ -433,12 +437,19 @@ defmodule Tightbeam.Assignments do
 
         {:created, assignment, delivery}
       end,
-      fn -> valid_brief(call.params[:brief]) end
+      fn -> valid_brief(call.params[:brief]) end,
+      "dispatch"
     )
   end
 
-  defp open_assignment_result(db, call, after_create, extra_validation \\ fn -> :ok end) do
-    with :ok <- principal_allowed(call.principal),
+  defp open_assignment_result(
+         db,
+         call,
+         after_create,
+         extra_validation,
+         verb
+       ) do
+    with :ok <- principal_allowed(call.principal, verb),
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          {:ok, files} <- valid_files(call.params[:files]),
@@ -495,7 +506,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_result(db, call) do
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- principal_allowed(call.principal, "attest") do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
       result = transaction(db, fn txn -> attest_in_txn(txn, call) end)
@@ -512,7 +523,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp revoke_result(db, call) do
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- principal_allowed(call.principal, "revoke-assignment") do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
       result = transaction(db, fn txn -> revoke_in_txn(txn, call) end)
@@ -529,7 +540,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp assignments_result(db, call) do
-    with :ok <- principal_allowed(call.principal),
+    with :ok <- principal_allowed(call.principal, "assignments"),
          :ok <- valid_state(call.params[:state]) do
       %{
         assignments:
@@ -541,7 +552,7 @@ defmodule Tightbeam.Assignments do
   defp assignment_get_result(db, call) do
     assignment_id = call.params[:assignment_id]
 
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- principal_allowed(call.principal, "assignment-get") do
       case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
         {:ok, [row]} -> assignment(row)
         {:ok, []} -> error("not_found", "unknown assignment: #{assignment_id}")
@@ -552,7 +563,7 @@ defmodule Tightbeam.Assignments do
   defp attests_result(db, call) do
     assignment_id = call.params[:assignment_id]
 
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- principal_allowed(call.principal, "attests") do
       case DB.query(db, "SELECT 1 FROM assignments WHERE id = ?1", [assignment_id]) do
         {:ok, [[1]]} -> %{attests: list_attests(db, assignment_id)}
         {:ok, []} -> error("unknown_assignment", "unknown assignment: #{assignment_id}")
@@ -917,22 +928,22 @@ defmodule Tightbeam.Assignments do
 
   defp fetch_assignment!(txn, id), do: fetch_assignment(txn, id) || raise("missing assignment")
 
-  defp principal_allowed({:process, _}),
+  defp principal_allowed({:process, _}, _verb),
     do: error("process_denied", "process principals cannot use assignment verbs")
 
-  defp principal_allowed({:remedy, %{action: "assign"}}), do: :ok
+  defp principal_allowed({:remedy, %{action: "assign"}}, "assign"), do: :ok
 
-  defp principal_allowed({:remedy, _}),
-    do: error("process_denied", "remedy principal action does not admit this assignment verb")
+  defp principal_allowed({:remedy, _}, verb),
+    do: principal_allowed({:process, "tightbeam"}, verb)
 
-  defp principal_allowed(nil),
+  defp principal_allowed(nil, _verb),
     do:
       error(
         "principal_required",
         "assignment verbs require a user credential or a session token"
       )
 
-  defp principal_allowed({kind, _}) when kind in [:session, :user], do: :ok
+  defp principal_allowed({kind, _}, _verb) when kind in [:session, :user], do: :ok
 
   defp valid_subject(subject) when is_binary(subject) do
     max = Application.get_env(:tightbeam, :max_subject_len, 2000)

@@ -2,14 +2,17 @@ defmodule Tightbeam.RailRemedyTest do
   use ExUnit.Case, async: false
 
   alias Tightbeam.{
+    Archetypes,
     Assignments,
     ConditionFacts,
+    ConnRegistry,
     DB,
     Devices,
     Dispatch,
     EventLog,
     Gateway,
     Idempotency,
+    ModelCatalog,
     Org,
     RailRemedy,
     Roles,
@@ -155,6 +158,113 @@ defmodule Tightbeam.RailRemedyTest do
                "SELECT COUNT(*) FROM assignments WHERE reviewsAssignmentId = ?1",
                [assignment.id]
              )
+  end
+
+  test "spawn remedy TTL replay restores the original producer session", ctx do
+    assignment = assignment(ctx, "spawn-replay")
+    put_rules(ctx, spawn_remedy())
+    handlers = spawn_handlers(ctx)
+    Rules.load!(ctx.base_dir, Map.keys(handlers), %{})
+
+    assert {:error, %{producer: producer}} =
+             Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
+
+    stale = System.system_time(:millisecond) - 60_001
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE rail_remedy_episodes
+        SET status = 'dispatched', producerKey = NULL, claimToken = 'crashed', openedAt = ?2
+        WHERE statute = 'spawn-remedy' AND subject = ?1
+        """,
+        [assignment.id, stale]
+      )
+
+    assert {:error, %{producer: ^producer}} =
+             Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
+
+    assert %{status: "live", producer_key: ^producer, occurrence: 1} =
+             RailRemedy.episode(ctx.db, "spawn-remedy", assignment.id)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM sessions WHERE handle = 'reviewer-new'", [])
+
+    assert %{session_key: ^producer} =
+             Idempotency.get(
+               ctx.db,
+               "flynn",
+               "spawn",
+               "rail-dispatch:spawn-remedy:#{assignment.id}:1"
+             )
+  end
+
+  test "spawn reserve-then-act collapses racing remedy calls without handle uniqueness", ctx do
+    handlers = spawn_handlers(ctx)
+    spawn = handlers["spawn"]
+    key = "rail-dispatch:spawn-race:subject:1"
+
+    calls =
+      for _ <- 1..8 do
+        Task.async(fn ->
+          spawn.(%{
+            verb: "spawn",
+            origin: "remedy:spawn-race",
+            principal: {:remedy, %{statute: "spawn-race", action: "spawn", owner: "flynn"}},
+            session_key: nil,
+            params: %{
+              display_name: "Unconstrained Racer",
+              harness: "codex",
+              model: "test",
+              idempotency_key: key
+            }
+          })
+        end)
+      end
+
+    session_keys = calls |> Enum.map(&Task.await(&1, 5_000).session_key) |> Enum.uniq()
+    assert [_session_key] = session_keys
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM sessions WHERE displayName = 'Unconstrained Racer'",
+               []
+             )
+  end
+
+  test "wake remedy reclaims a retired target through its wake ledger row", ctx do
+    assignment = assignment(ctx, "wake-reclaim")
+    put_rules(ctx, wake_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+
+    assert {:error, %{producer: producer}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert producer == ctx.reviewer.session_key
+    first_key = "rail-dispatch:wake-remedy:#{assignment.id}:1"
+
+    assert %{session_key: first_wake_id} =
+             Idempotency.get(ctx.db, "remedy:wake-remedy", "wake", first_key)
+
+    assert %{session_key: ^producer} = Wakes.get(ctx.db, first_wake_id)
+
+    Org.retire(ctx.db, producer)
+
+    assert {:error, %{producer: ^producer}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert %{status: "live", producer_key: ^producer, occurrence: 2} =
+             RailRemedy.episode(ctx.db, "wake-remedy", assignment.id)
+
+    second_key = "rail-dispatch:wake-remedy:#{assignment.id}:2"
+
+    assert %{session_key: second_wake_id} =
+             Idempotency.get(ctx.db, "remedy:wake-remedy", "wake", second_key)
+
+    refute second_wake_id == first_wake_id
+    assert %{session_key: ^producer} = Wakes.get(ctx.db, second_wake_id)
   end
 
   test "closed reopen and dead-live replacement bump occurrence and wire key", ctx do
@@ -347,6 +457,28 @@ defmodule Tightbeam.RailRemedyTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
 
     assert List.last(remedy_events(ctx.db))["outcome"] == "unbound"
+  end
+
+  test "assign remedy principal is rejected by every non-assign assignment verb", ctx do
+    principal =
+      {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}}
+
+    expected = %{
+      code: "process_denied",
+      message: "process principals cannot use assignment verbs"
+    }
+
+    calls = [
+      {"attest", %{principal: principal, params: %{assignment_id: "missing"}}},
+      {"revoke-assignment", %{principal: principal, params: %{assignment_id: "missing"}}},
+      {"assignments", %{principal: principal, session_key: ctx.holder.session_key, params: %{}}},
+      {"assignment-get", %{principal: principal, params: %{assignment_id: "missing"}}},
+      {"attests", %{principal: principal, params: %{assignment_id: "missing"}}}
+    ]
+
+    Enum.each(calls, fn {verb, call} ->
+      assert Assignments.__handle__(ctx.db, verb, call) == expected
+    end)
   end
 
   test "remedy grammar and F1/F2 reject dead rail sets while conditional blockers load", ctx do
@@ -587,6 +719,26 @@ defmodule Tightbeam.RailRemedyTest do
     """
   end
 
+  defp wake_gate do
+    """
+    [[rule]]
+    name = "wake-remedy"
+    verb = "attest"
+    text = "wake"
+    effect = "remedy"
+    deny_when = [
+      { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }
+    ]
+    [rule.remedy]
+    action = "wake"
+    produces = "reviewed-clean"
+    target_session = "reviewer-session"
+    [rule.remedy.params]
+    prompt = "review {assignment_id}"
+    after = 60000
+    """
+  end
+
   defp spawn_remedy do
     """
     [[rule]]
@@ -690,6 +842,72 @@ defmodule Tightbeam.RailRemedyTest do
       params: %{assignment_id: id}
     })
   end
+
+  defp spawn_handlers(ctx) do
+    auth_dir = Path.join([ctx.base_dir, "auth", "codex"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "auth.json"), "{}")
+    Archetypes.load!(ctx.base_dir)
+    start_model_catalog(ctx)
+    start_conn_registry()
+
+    Gateway.handlers(%{
+      base_dir: ctx.base_dir,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :codex,
+      default_model: "test",
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      db: ctx.db
+    })
+  end
+
+  defp start_conn_registry do
+    if is_nil(Process.whereis(ConnRegistry)) do
+      start_supervised!({ConnRegistry, name: ConnRegistry})
+    end
+  end
+
+  defp start_model_catalog(ctx) do
+    case Process.whereis(ModelCatalog) do
+      nil ->
+        start_supervised!(
+          {ModelCatalog,
+           base_dir: ctx.base_dir,
+           codex_home: Path.join(ctx.base_dir, "codex"),
+           claude_fetch: fn _, _ -> {:error, :unused} end,
+           codex_read: fn _ ->
+             {:ok,
+              JSON.encode!(%{
+                models: [
+                  %{
+                    slug: "test",
+                    display_name: "Test",
+                    supported_reasoning_levels: []
+                  }
+                ]
+              })}
+           end}
+        )
+
+        await_catalog()
+
+      _pid ->
+        :ok
+    end
+  end
+
+  defp await_catalog(tries \\ 100)
+
+  defp await_catalog(tries) when tries > 0 do
+    case ModelCatalog.get("codex", ModelCatalog) do
+      {_, :fresh} -> :ok
+      _ -> Process.sleep(5) && await_catalog(tries - 1)
+    end
+  end
+
+  defp await_catalog(0), do: flunk("model catalog did not become fresh")
 
   defp remedy_events(db) do
     EventLog.lifecycle_events(db)

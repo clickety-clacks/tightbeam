@@ -1,7 +1,7 @@
 defmodule Tightbeam.RailRemedy do
   @moduledoc "Active rail remedy execution and durable remedy-episode lifecycle."
 
-  alias Tightbeam.{DB, Dispatch, EventLog, Idempotency, Org, Roles}
+  alias Tightbeam.{DB, Dispatch, EventLog, Idempotency, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
 
   @ttl_ms 60_000
@@ -155,11 +155,12 @@ defmodule Tightbeam.RailRemedy do
            db,
            """
            UPDATE rail_remedy_episodes
-           SET status = 'claimed', producerKey = NULL, claimToken = ?4, openedAt = ?5
+           SET status = 'claimed', producerKey = NULL, claimToken = ?5, openedAt = ?6
            WHERE statute = ?1 AND subject = ?2
              AND status IN ('claimed','dispatched') AND openedAt < ?3
+             AND occurrence = ?4
            """,
-           [rule.name, subject, current - @ttl_ms, token, current]
+           [rule.name, subject, current - @ttl_ms, occurrence, token, current]
          ) do
       {:claimed, token, occurrence, false}
     else
@@ -520,10 +521,16 @@ defmodule Tightbeam.RailRemedy do
         "wake" -> "remedy:" <> rule.name
       end
 
-    match?(
-      %{session_key: ^producer_key},
-      Idempotency.get(db, owner, rule.remedy.action, key)
-    )
+    case Idempotency.get(db, owner, rule.remedy.action, key) do
+      %{session_key: wake_id} when rule.remedy.action == "wake" ->
+        match?(%{session_key: ^producer_key}, Wakes.get(db, wake_id))
+
+      %{session_key: ^producer_key} ->
+        true
+
+      _ ->
+        false
+    end
   end
 
   defp release_dispatch(db, statute, subject, token) do

@@ -1953,7 +1953,7 @@ defmodule Tightbeam.Gateway do
 
         cond do
           prior ->
-            %{stream: db |> Org.get(prior.session_key) |> Payloads.stream_session()}
+            spawn_replay(db, prior.session_key)
 
           length(Org.list_for_user(db, caller.owner_user_id, false)) >=
               config.max_live_sessions_per_user ->
@@ -2042,18 +2042,36 @@ defmodule Tightbeam.Gateway do
 
       session_result =
         DB.transaction(db, fn txn ->
-          session = Org.create_in_txn(txn, input)
+          case Idempotency.get_in_txn(
+                 txn,
+                 caller.owner_user_id,
+                 "spawn",
+                 p.idempotency_key
+               ) do
+            nil ->
+              session = Org.create_in_txn(txn, input)
 
-          if p[:handle] do
-            Roles.create_in_txn!(
-              txn,
-              p.handle,
-              caller.owner_user_id,
-              session.session_key
-            )
+              if p[:handle] do
+                Roles.create_in_txn!(
+                  txn,
+                  p.handle,
+                  caller.owner_user_id,
+                  session.session_key
+                )
+              end
+
+              Idempotency.put_in_txn(txn, %{
+                owner_user_id: caller.owner_user_id,
+                operation: "spawn",
+                idempotency_key: p.idempotency_key,
+                session_key: session.session_key
+              })
+
+              {:created, session}
+
+            prior ->
+              {:replayed, prior.session_key}
           end
-
-          session
         end)
 
       case session_result do
@@ -2063,8 +2081,11 @@ defmodule Tightbeam.Gateway do
         {:error, error} ->
           raise error
 
-        {:ok, session} ->
+        {:ok, {:created, session}} ->
           finish_spawn(db, call, caller, session)
+
+        {:ok, {:replayed, session_key}} ->
+          spawn_replay(db, session_key)
       end
     else
       {:error, denial} ->
@@ -2086,19 +2107,14 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp finish_spawn(db, call, caller, session) do
-    p = call.params
-
-    Idempotency.put(db, %{
-      owner_user_id: caller.owner_user_id,
-      operation: "spawn",
-      idempotency_key: p.idempotency_key,
-      session_key: session.session_key
-    })
-
+  defp finish_spawn(db, _call, caller, session) do
     stream = Payloads.stream_session(session)
     broadcast(db, caller.owner_user_id, Payloads.stream_created(stream))
     %{stream: stream, session_key: session.session_key, handle: session.handle}
+  end
+
+  defp spawn_replay(db, session_key) do
+    %{stream: db |> Org.get(session_key) |> Payloads.stream_session(), session_key: session_key}
   end
 
   defp tune_result(config, db, call) do
