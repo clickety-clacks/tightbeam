@@ -65,6 +65,7 @@ defmodule Tightbeam.WorkItemsTest do
              "title",
              "specRefName",
              "specRefSha256",
+             "isBug",
              "createdByUser",
              "createdBySession",
              "createdAt"
@@ -106,18 +107,24 @@ defmodule Tightbeam.WorkItemsTest do
     assert user.createdBySession == nil
     assert user.specRefName == nil
     assert user.specRefSha256 == nil
+    refute user.isBug
+
+    assert %{code: "invalid_is_bug"} =
+             create(ctx, {:user, "flynn"}, %{title: "Invalid bug", is_bug: "yes"})
 
     session =
       create(ctx, {:session, "holder"}, %{
         title: "Session item",
         spec_ref_name: "spec.md",
-        spec_ref_sha256: @sha
+        spec_ref_sha256: @sha,
+        is_bug: true
       })
 
     assert session.createdBySession == "holder"
     assert session.createdByUser == nil
     assert session.specRefName == "spec.md"
     assert session.specRefSha256 == @sha
+    assert session.isBug
   end
 
   test "update implements the complete PATCH matrix", ctx do
@@ -137,6 +144,13 @@ defmodule Tightbeam.WorkItemsTest do
     noop = update(ctx, {:user, "flynn"}, unpinned.id, %{})
     assert noop == unpinned
     assert update(ctx, {:user, "flynn"}, unpinned.id, %{}) == noop
+
+    assert %{code: "invalid_is_bug"} =
+             update(ctx, {:user, "flynn"}, unpinned.id, %{is_bug: nil})
+
+    bug = update(ctx, {:user, "flynn"}, unpinned.id, %{is_bug: true})
+    assert bug.isBug
+    refute update(ctx, {:user, "flynn"}, unpinned.id, %{is_bug: false}).isBug
 
     pinned =
       update(ctx, {:user, "flynn"}, unpinned.id, %{
@@ -188,6 +202,44 @@ defmodule Tightbeam.WorkItemsTest do
              "Retitled again"
 
     refute_received :work_item_change
+  end
+
+  test "schema migration adds the org-set bug attribute with a false default" do
+    legacy = :"legacy_work_items_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: legacy,
+      start: {DB, :start_link, [[path: ":memory:", name: legacy]]}
+    })
+
+    :ok =
+      DB.execute(
+        legacy,
+        """
+        CREATE TABLE work_items (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          specRefName TEXT,
+          specRefSha256 TEXT,
+          createdByUser TEXT,
+          createdBySession TEXT,
+          createdAt INTEGER NOT NULL
+        );
+        INSERT INTO work_items
+          (id, title, createdByUser, createdAt)
+        VALUES ('wi_legacy', 'Legacy', 'flynn', 1)
+        """
+      )
+
+    assert :ok = WorkItems.ensure_schema(legacy)
+    assert :ok = WorkItems.ensure_schema(legacy)
+    assert {:ok, [[0]]} = DB.query(legacy, "SELECT isBug FROM work_items WHERE id = 'wi_legacy'")
+
+    assert %{workItems: [%{id: "wi_legacy", isBug: false}]} =
+             WorkItems.__handle__(legacy, "work-item-list", %{
+               principal: {:user, "flynn"},
+               params: %{}
+             })
   end
 
   test "get and list return deterministic eras, aspects, and ordering", ctx do

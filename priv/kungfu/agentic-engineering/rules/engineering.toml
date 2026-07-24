@@ -20,3 +20,28 @@ target_role = "reviewer"
 [rule.remedy.params]
 subject = "review of assignment {assignment_id}"
 reviews = "{assignment_id}"
+
+# Re-entry twin of completion-requires-review: after one completed fix on a bug
+# work item, the next implementation dispatch first commissions an independent
+# recon. The recon archetype elects bug-provenance; its diagnosed verdict releases
+# the work-item-grain remedy episode and permits the re-fix dispatch.
+[[rule]]
+name = "refix-requires-diagnosis"
+verb = "dispatch"
+text = "a repeated bug fix requires an independent diagnosed verdict"
+external_producer = false
+edges = ["verb"]
+effect = "remedy"
+deny_when = [
+  { fact = "work_item.is_bug", op = "eq", value = true },
+  { fact = "assignment.prior_completed_fix_count", op = "gte", value = 1 },
+  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["diagnosed"] },
+]
+[rule.remedy]
+action = "assign"
+produces = "diagnosed"
+target_role = "recon"
+[rule.remedy.params]
+subject = "diagnosis of prior fix for work item {work_item_id}"
+reviews = "{assignment_id}"
+work_item = "{work_item_id}"

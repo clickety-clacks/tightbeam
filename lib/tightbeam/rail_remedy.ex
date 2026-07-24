@@ -545,6 +545,8 @@ defmodule Tightbeam.RailRemedy do
   end
 
   defp binding_context(db, subject, call) do
+    assignment_id = binding_assignment_id(db, subject, call)
+
     case DB.query(
            db,
            """
@@ -553,7 +555,7 @@ defmodule Tightbeam.RailRemedy do
            JOIN sessions s ON s.sessionKey = a.holderKey
            WHERE a.id = ?1
            """,
-           [subject]
+           [assignment_id]
          ) do
       {:ok, [[assignment_id, work_item_id, holder_key, holder_role, archetype, owner]]} ->
         {:ok,
@@ -569,6 +571,38 @@ defmodule Tightbeam.RailRemedy do
 
       _ ->
         {:error, :unbound_assignment}
+    end
+  end
+
+  defp binding_assignment_id(db, subject, call) do
+    case Map.get(call.params, :assignment_id) do
+      assignment_id when is_binary(assignment_id) ->
+        assignment_id
+
+      _ ->
+        case {call.verb, Map.get(call.params, :work_item_id)} do
+          {"dispatch", work_item_id} when is_binary(work_item_id) ->
+            case DB.query(
+                   db,
+                   """
+                   SELECT id
+                   FROM assignments
+                   WHERE workItemId = ?1
+                     AND reviewsAssignmentId IS NULL
+                     AND state = 'closed'
+                     AND outcome = 'completed'
+                   ORDER BY closedAt DESC, id DESC
+                   LIMIT 1
+                   """,
+                   [work_item_id]
+                 ) do
+              {:ok, [[assignment_id]]} -> assignment_id
+              _ -> subject
+            end
+
+          _ ->
+            subject
+        end
     end
   end
 

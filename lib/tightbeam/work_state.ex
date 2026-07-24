@@ -314,7 +314,7 @@ defmodule Tightbeam.WorkState do
   end
 
   defp item_columns,
-    do: "id, title, specRefName, specRefSha256, createdByUser, createdBySession, createdAt"
+    do: "id, title, specRefName, specRefSha256, isBug, createdByUser, createdBySession, createdAt"
 
   defp assignment([
          id,
@@ -356,12 +356,22 @@ defmodule Tightbeam.WorkState do
     }
   end
 
-  defp work_item([id, title, spec_ref_name, spec_ref_sha256, user, session, created_at]) do
+  defp work_item([
+         id,
+         title,
+         spec_ref_name,
+         spec_ref_sha256,
+         is_bug,
+         user,
+         session,
+         created_at
+       ]) do
     %{
       id: id,
       title: title,
       specRefName: spec_ref_name,
       specRefSha256: spec_ref_sha256,
+      isBug: is_bug == 1,
       createdByUser: user,
       createdBySession: session,
       createdAt: created_at
