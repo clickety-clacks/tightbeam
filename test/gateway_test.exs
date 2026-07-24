@@ -17,6 +17,7 @@ defmodule Tightbeam.GatewayTest do
     Org,
     Placement,
     Projection,
+    Rails,
     Roles,
     Wakes,
     WorkItems,
@@ -1345,6 +1346,92 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{skills: skills} = list.(%{origin: "user:flynn", params: %{}})
     assert Enum.any?(skills, &(&1.name == "review"))
+  end
+
+  test "kungfu-scaffold is admin-tier and commits a real starter that composes cleanly", ctx do
+    base_dir = role_test_base("kungfu-scaffold")
+    scaffold = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-scaffold"]
+
+    assert %{code: "forbidden", message: "admin required"} =
+             scaffold.(%{origin: "user:not-admin", params: %{name: "demo"}})
+
+    refute File.exists?(Path.join(base_dir, "identity"))
+
+    expected_relatives = [
+      "archetypes/demo-role.toml",
+      "guidance/demo-role.md",
+      "skills/demo-example/SKILL.md",
+      "rails/demo-example.toml",
+      "kungfu/demo/capabilities.md",
+      "kungfu/demo/preferred-models.md",
+      "kungfu/demo/intake.md",
+      "kungfu/demo/README.md"
+    ]
+
+    assert %{kungfu: "demo", paths: paths} =
+             scaffold.(%{origin: "user:flynn", params: %{name: "demo"}})
+
+    identity_dir = Path.join(base_dir, "identity")
+
+    assert Enum.map(paths, &Path.relative_to(&1, identity_dir)) == expected_relatives
+
+    for relative <- expected_relatives do
+      assert File.regular?(Path.join(identity_dir, relative))
+    end
+
+    manifest = Toml.decode!(File.read!(Path.join(identity_dir, "archetypes/demo-role.toml")))
+    assert manifest["name"] == "demo-role"
+    assert manifest["skills"] == []
+    refute Map.has_key?(manifest, "where")
+    assert manifest["guidance"]["text"] =~ ~s(#include "demo-role.md")
+
+    skill = File.read!(Path.join(identity_dir, "skills/demo-example/SKILL.md"))
+    assert skill =~ ~r/\A---\nname: demo-example\ndescription: .+\n---\n\n/s
+
+    capabilities = File.read!(Path.join(identity_dir, "kungfu/demo/capabilities.md"))
+    assert capabilities =~ "Root archetype: `demo-role`"
+    assert capabilities =~ "| Capability | What adoption provides | Conversation watch-fors |"
+
+    preferred_models = File.read!(Path.join(identity_dir, "kungfu/demo/preferred-models.md"))
+    assert preferred_models =~ "| Activity | Wants | Minds, in order (park if none) |"
+
+    intake = File.read!(Path.join(identity_dir, "kungfu/demo/intake.md"))
+    assert intake =~ "Destination: `identity/kungfu/demo/capabilities.md`"
+    assert intake =~ "Destination: `identity/kungfu/demo/preferred-models.md`"
+    assert intake =~ "`tightbeam config set default-archetype demo-role`"
+
+    readme = File.read!(Path.join(identity_dir, "kungfu/demo/README.md"))
+    assert readme =~ "tightbeam-kungfu-crafting"
+    assert readme =~ "identity/archetypes"
+
+    archetypes = Archetypes.load!(base_dir)
+    assert archetypes["demo-role"].skills == []
+    assert Archetypes.guidance(archetypes["demo-role"]) =~ "# demo role"
+
+    rail_manifest = Toml.decode!(File.read!(Path.join(identity_dir, "rails/demo-example.toml")))
+    assert [starter_statute] = rail_manifest["statute"]
+    assert starter_statute["name"] == "demo-example"
+
+    statutes = Rails.load!(base_dir)
+    statute = Enum.find(statutes, &(&1.name == "demo-example"))
+    assert statute.pattern == "TIGHTBEAM_KUNGFU_TEMPLATE_PLACEHOLDER_NEVER_MATCHES"
+
+    assert {"2\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
+
+    assert {"kungfu-scaffold: demo|user:flynn|user-flynn@tightbeam.local\n", 0} =
+             System.cmd("git", ["log", "-1", "--format=%s|%an|%ae"], cd: identity_dir)
+
+    before = Map.new(expected_relatives, &{&1, File.read!(Path.join(identity_dir, &1))})
+
+    assert_raise ArgumentError,
+                 "kungfu scaffold target already exists: identity/archetypes/demo-role.toml",
+                 fn ->
+                   scaffold.(%{origin: "user:flynn", params: %{name: "demo"}})
+                 end
+
+    assert Map.new(expected_relatives, &{&1, File.read!(Path.join(identity_dir, &1))}) == before
+    assert {"2\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
+    assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
   end
 
   test "invalid spawn overrides fail before spinup or any session side effect", ctx do

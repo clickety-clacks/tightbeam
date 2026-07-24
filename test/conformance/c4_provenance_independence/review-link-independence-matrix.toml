@@ -1,8 +1,8 @@
 [fixture]
 class = "C4"
 name = "review-link-independence-matrix"
-phase = "green"
-blocking_phase = ""
+phase = "pending"
+blocking_phase = "P3"
 kind = "dispatch-rule"
 source = "p3 §4A; guidance §6:independent-review; orchestrator:independence"
 legibility = "event:denied(rule=coder-completion-needs-independent-review)"

@@ -1,0 +1,14 @@
+name = "spec-writer"
+where = ["eezo", "racter"]
+skills = ["drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+
+[guidance]
+text = """
+#include "wisdom.md"
+
+#include "engineering-tenets.md"
+
+#include "preferred-models.md"
+
+#include "spec-writer.md"
+"""

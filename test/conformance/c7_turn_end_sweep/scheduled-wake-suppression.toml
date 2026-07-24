@@ -1,11 +1,11 @@
 [fixture]
 class = "C7"
 name = "scheduled-wake-suppression"
-phase = "green"
-blocking_phase = ""
+phase = "pending"
+blocking_phase = "P6"
 kind = "sweep"
-source = "mechanism §D; smoke spec C7 self-wake suppression"
-legibility = "lifecycle:rail_sweep(decision=run-remedy) for non-self wake"
+source = "supervision-impl-v1 r21 turn-end schedule (Flynn-ratified 2026-07-24)"
+legibility = "rail_enforcement precedes pending_wake_gate; lifecycle:rail_sweep(decision=run-remedy)"
 
 [[fixture.rule]]
 name = "scheduled-wake-suppression"

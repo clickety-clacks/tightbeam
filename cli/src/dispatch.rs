@@ -38,10 +38,6 @@ fn string_field(name: &str, value: &str) -> String {
     format!("\"{name}\":{}", quoted(value))
 }
 
-fn bool_field(name: &str, value: bool) -> String {
-    format!("\"{name}\":{value}")
-}
-
 fn params_field(fields: Vec<String>) -> String {
     format!("\"params\":{}", object(fields))
 }
@@ -68,7 +64,7 @@ fn request(
 /// Build the dispatch request without performing discovery or network I/O.
 pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
-        Command::Help | Command::Setup(_) | Command::Assimilate(_) => {
+        Command::Help | Command::Doctor { .. } | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
         Command::Wake {
@@ -327,37 +323,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("cancelWakeId", wake_id)],
         )),
-        Command::RoleCreate {
-            identity,
-            name,
-            bind,
-        } => {
-            let mut params = vec![string_field("name", name)];
-            if let Some(value) = bind {
-                params.push(string_field("bind", value));
-            }
-            Ok(request(identity, "role-create", vec![], params))
-        }
-        Command::RoleBind {
-            identity,
-            name,
-            session_key,
-        } => Ok(request(
-            identity,
-            "role-bind",
-            vec![],
-            vec![
-                string_field("name", name),
-                string_field("sessionKey", session_key),
-            ],
-        )),
-        Command::RoleRemove { identity, name } => Ok(request(
-            identity,
-            "role-rm",
-            vec![],
-            vec![string_field("name", name)],
-        )),
-        Command::RoleList { identity } => Ok(request(identity, "role-list", vec![], vec![])),
         Command::SkillList { identity } => Ok(request(identity, "skill-list", vec![], vec![])),
         Command::SkillPut {
             identity,
@@ -374,48 +339,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             "skill-rm",
             vec![],
             vec![string_field("name", name)],
-        )),
-        Command::ApproveDevice {
-            identity,
-            device_id,
-            user_id,
-        } => {
-            let mut params = vec![string_field("deviceId", device_id)];
-            if let Some(value) = user_id {
-                params.push(string_field("userId", value));
-            }
-            Ok(request(identity, "approve-device", vec![], params))
-        }
-        Command::DenyDevice {
-            identity,
-            device_id,
-        } => Ok(request(
-            identity,
-            "deny-device",
-            vec![],
-            vec![string_field("deviceId", device_id)],
-        )),
-        Command::RevokeDevice {
-            identity,
-            device_id,
-        } => Ok(request(
-            identity,
-            "revoke-device",
-            vec![],
-            vec![string_field("deviceId", device_id)],
-        )),
-        Command::PromoteUser {
-            identity,
-            user_id,
-            is_admin,
-        } => Ok(request(
-            identity,
-            "promote-user",
-            vec![],
-            vec![
-                string_field("userId", user_id),
-                bool_field("isAdmin", *is_admin),
-            ],
         )),
         Command::ConfigGet { identity, setting } => Ok(request(
             identity,
@@ -563,7 +486,7 @@ fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
 pub fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Help => unreachable!("help is handled before dispatch"),
-        Command::Setup(args) => crate::ceremonies::setup(args),
+        Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         command => {
             let request = build_request(&command)?;
@@ -672,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_byte_exact_spawn_role_skill_and_promote_bodies() {
+    fn builds_byte_exact_spawn_and_skill_put_bodies() {
         assert_eq!(
             body(&[
                 "spawn",
@@ -695,18 +618,6 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","handle":"reviewer","host":"eezo"}}"#
         );
-        assert_eq!(
-            body(&[
-                "role",
-                "bind",
-                "reviewer",
-                "agent:r",
-                "--as",
-                "orchestrator"
-            ]),
-            r#"{"as":"orchestrator","verb":"role-bind","params":{"name":"reviewer","sessionKey":"agent:r"}}"#
-        );
-
         let command = Command::SkillPut {
             identity: Identity::User("flynn".to_owned()),
             name: "swift/concurrency".to_owned(),
@@ -715,10 +626,6 @@ mod tests {
         assert_eq!(
             build_request(&command).unwrap().body_json,
             r#"{"asUser":"flynn","verb":"skill-put","params":{"name":"swift/concurrency","content":"line one\nline two"}}"#
-        );
-        assert_eq!(
-            body(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"promote-user","params":{"userId":"mike","isAdmin":false}}"#
         );
     }
 
@@ -926,55 +833,12 @@ mod tests {
                 r#"{"asProcess":"cron","verb":"wake","params":{"cancelWakeId":"wake-1"}}"#,
             ),
             (
-                &[
-                    "role",
-                    "create",
-                    "reviewer",
-                    "--bind",
-                    "agent:r",
-                    "--as-user",
-                    "flynn",
-                ][..],
-                r#"{"asUser":"flynn","verb":"role-create","params":{"name":"reviewer","bind":"agent:r"}}"#,
-            ),
-            (
-                &["role", "rm", "reviewer", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"role-rm","params":{"name":"reviewer"}}"#,
-            ),
-            (
-                &["role", "list", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"role-list","params":{}}"#,
-            ),
-            (
                 &["skill", "list", "--as-user", "flynn"][..],
                 r#"{"asUser":"flynn","verb":"skill-list","params":{}}"#,
             ),
             (
                 &["skill", "rm", "swift", "--as-user", "flynn"][..],
                 r#"{"asUser":"flynn","verb":"skill-rm","params":{"name":"swift"}}"#,
-            ),
-            (
-                &[
-                    "approve-device",
-                    "device-1",
-                    "--user",
-                    "mike",
-                    "--as-user",
-                    "flynn",
-                ][..],
-                r#"{"asUser":"flynn","verb":"approve-device","params":{"deviceId":"device-1","userId":"mike"}}"#,
-            ),
-            (
-                &["deny-device", "device-2", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"deny-device","params":{"deviceId":"device-2"}}"#,
-            ),
-            (
-                &["revoke-device", "device-3", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"revoke-device","params":{"deviceId":"device-3"}}"#,
-            ),
-            (
-                &["promote-user", "mike", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"promote-user","params":{"userId":"mike","isAdmin":true}}"#,
             ),
         ] {
             assert_eq!(body(args), expected);

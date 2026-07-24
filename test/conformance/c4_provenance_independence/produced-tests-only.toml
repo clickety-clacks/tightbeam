@@ -1,8 +1,8 @@
 [fixture]
 class = "C4"
 name = "produced-tests-only"
-phase = "green"
-blocking_phase = ""
+phase = "pending"
+blocking_phase = "P3"
 kind = "dispatch-rule"
 source = "p3 §5 producer_jobs; assignment.produced_verdict_kinds"
 legibility = "event:denied(rule=produced-tests-only)"

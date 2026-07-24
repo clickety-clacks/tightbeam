@@ -11,7 +11,8 @@ defmodule Tightbeam.HomesTest do
     "tightbeam-onboarding",
     "tightbeam-guidance-authoring",
     "tightbeam-law-minting",
-    "tightbeam-archetype-cultivation"
+    "tightbeam-archetype-cultivation",
+    "tightbeam-kungfu-crafting"
   ]
 
   setup do

@@ -1,8 +1,8 @@
 [fixture]
 class = "C6"
 name = "review-remedy-spawn"
-phase = "green"
-blocking_phase = ""
+phase = "pending"
+blocking_phase = "P5"
 kind = "remedy"
 source = "mechanism §C2; smoke spec C6 representative remedy"
 legibility = "event:denied(reason=remedy_fired,rule=review-remedy-spawn);lifecycle:rail_remedy(outcome=claimed-dispatched)"

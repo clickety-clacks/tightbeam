@@ -1,0 +1,15 @@
+[fixture]
+class = "C7"
+name = "parkwakeid-reuse"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism r8/r9 park idempotency"
+legibility = "lifecycle:rail_sweep(decision=escalate-park)"
+[[fixture.rule]]
+name = "parkwakeid-reuse"
+verb = "attest"
+text = "an open decision request reuses its park wake"
+edges = ["turn-end"]
+effect = "escalate"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]

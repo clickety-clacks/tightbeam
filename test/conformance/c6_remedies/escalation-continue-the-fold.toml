@@ -1,0 +1,25 @@
+[fixture]
+class = "C6"
+name = "escalation-continue-the-fold"
+phase = "pending-escalation-review"
+blocking_phase = "escalation-substrate-v1 review-clean"
+kind = "remedy"
+source = "mechanism r8 Rules.decide triple and per-ruling consume CAS"
+legibility = "event:denied(rule=later-statute)"
+[[fixture.rule]]
+name = "escalation-continue-the-fold"
+verb = "attest"
+text = "an allowed escalation never bypasses later statutes"
+edges = ["verb"]
+effect = "escalate"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+
+[[fixture.rule]]
+name = "later-statute"
+verb = "attest"
+text = "the statute after an allowed escalation still runs"
+edges = ["verb"]
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "caller.is_admin", op = "eq", value = false }
+]

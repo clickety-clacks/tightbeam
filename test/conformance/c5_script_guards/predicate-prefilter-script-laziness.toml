@@ -1,0 +1,21 @@
+[fixture]
+class = "C5"
+name = "predicate-prefilter-script-laziness"
+phase = "pending"
+blocking_phase = "P4"
+kind = "script-guard"
+source = "mechanism I1/§B D1 hybrid"
+legibility = "event:denied(reason=script_error,rule=predicate-prefilter-script-laziness);lifecycle:rail_script"
+
+[[fixture.rule]]
+name = "predicate-prefilter-script-laziness"
+verb = "attest"
+text = "the script runs only after the predicate matches"
+edges = ["verb"]
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.check]
+script = "predicate-prefilter-script-laziness"
+returns = ["allow"]
+timeout_ms = 5000
+[fixture.rule.check.effects]
+allow = "allow"

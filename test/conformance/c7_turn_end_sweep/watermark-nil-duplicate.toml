@@ -1,0 +1,14 @@
+[fixture]
+class = "C7"
+name = "watermark-nil-duplicate"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism r6 rail_step/4 terminal watermark"
+legibility = "lifecycle:rail_sweep(decision=none)"
+[[fixture.rule]]
+name = "watermark-nil-duplicate"
+verb = "attest"
+text = "terminal watermark acts once and never writes null"
+edges = ["turn-end"]
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]

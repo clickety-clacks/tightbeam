@@ -9,7 +9,8 @@ defmodule Tightbeam.PrivSkillsTest do
     "tightbeam-onboarding",
     "tightbeam-guidance-authoring",
     "tightbeam-law-minting",
-    "tightbeam-archetype-cultivation"
+    "tightbeam-archetype-cultivation",
+    "tightbeam-kungfu-crafting"
   ]
 
   test "all substrate baseline skills ship in priv and are non-empty" do

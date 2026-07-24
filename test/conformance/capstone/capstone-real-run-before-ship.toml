@@ -1,0 +1,15 @@
+[fixture]
+class = "Cap"
+name = "capstone-real-run-before-ship"
+phase = "pending"
+blocking_phase = "P7"
+kind = "capstone"
+source = "smoke §3 capstone real-run-before-ship"
+legibility = "event:denied(rule=capstone-real-run-before-ship);lifecycle:rail_sweep"
+[[fixture.rule]]
+name = "capstone-real-run-before-ship"
+verb = "attest"
+text = "shipping requires a mechanically produced real run"
+edges = ["verb", "turn-end"]
+deny_when = [{ fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["real-run-passed"] }]
+external_producer = true

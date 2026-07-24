@@ -1,0 +1,19 @@
+[fixture]
+class = "C6"
+name = "denied-dispatch-release-retry"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism r6 denied-dispatch retry"
+legibility = "lifecycle:rail_remedy(outcome=blocked)"
+[[fixture.rule]]
+name = "denied-dispatch-release-retry"
+verb = "attest"
+text = "a denied producer dispatch releases its lease for edge-driven retry"
+edges = ["verb", "turn-end"]
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"

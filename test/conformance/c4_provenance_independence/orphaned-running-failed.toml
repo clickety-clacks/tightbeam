@@ -1,8 +1,8 @@
 [fixture]
 class = "C4"
 name = "orphaned-running-failed"
-phase = "green"
-blocking_phase = ""
+phase = "pending"
+blocking_phase = "P3"
 kind = "dispatch-rule"
 source = "p3 r7 gateway boot recovery"
 legibility = "event:denied(rule=orphaned-running-failed)"

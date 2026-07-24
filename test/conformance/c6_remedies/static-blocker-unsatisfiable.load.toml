@@ -1,0 +1,9 @@
+[loadset]
+name = "static-blocker-unsatisfiable"
+class = "C6"
+phase = "pending"
+blocking_phase = "P5"
+outcome = "load-raise"
+must_name = ["produce-review", "block-assign"]
+error_match = "blocked"
+source = "mechanism §F2 pure static blocker"

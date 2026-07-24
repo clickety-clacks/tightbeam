@@ -1,0 +1,9 @@
+[loadset]
+name = "dead-gate"
+class = "C6"
+phase = "pending"
+blocking_phase = "P5"
+outcome = "load-raise"
+must_name = ["dead-gate", "unproduced-kind"]
+error_match = "no producer"
+source = "mechanism §F1 dead gate"

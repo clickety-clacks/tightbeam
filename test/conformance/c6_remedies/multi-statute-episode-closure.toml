@@ -1,0 +1,19 @@
+[fixture]
+class = "C6"
+name = "multi-statute-episode-closure"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism r7 Rules.decide triple"
+legibility = "lifecycle:rail_remedy(outcome=closed)"
+[[fixture.rule]]
+name = "multi-statute-episode-closure"
+verb = "attest"
+text = "actors close only the satisfied statute and subject episodes"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"

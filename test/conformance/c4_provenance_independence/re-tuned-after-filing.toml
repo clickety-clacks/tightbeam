@@ -1,8 +1,8 @@
 [fixture]
 class = "C4"
 name = "re-tuned-after-filing"
-phase = "green"
-blocking_phase = ""
+phase = "pending"
+blocking_phase = "P3"
 kind = "dispatch-rule"
 source = "p3 stamp-at-filing; review finding-14"
 legibility = "event:denied(rule=frozen-filing-harness)"

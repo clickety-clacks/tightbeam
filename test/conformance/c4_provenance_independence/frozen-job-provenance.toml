@@ -1,8 +1,8 @@
 [fixture]
 class = "C4"
 name = "frozen-job-provenance"
-phase = "green"
-blocking_phase = ""
+phase = "pending"
+blocking_phase = "P3"
 kind = "dispatch-rule"
 source = "p3 r7 producer_jobs frozen accept-time provenance"
 legibility = "event:denied(rule=frozen-job-provenance)"

@@ -1,0 +1,19 @@
+[fixture]
+class = "C6"
+name = "stale-claimant-fencing"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism r7 occurrence fencing"
+legibility = "lifecycle:rail_remedy(outcome=fenced)"
+[[fixture.rule]]
+name = "stale-claimant-fencing"
+verb = "attest"
+text = "external effects are fenced once per episode occurrence"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"

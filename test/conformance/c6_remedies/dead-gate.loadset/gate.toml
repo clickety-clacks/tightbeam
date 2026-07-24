@@ -1,0 +1,5 @@
+[[rule]]
+name = "dead-gate"
+verb = "attest"
+text = "requires an unproduced kind"
+deny_when = [{ fact = "assignment.verdicts", op = "not_in", value = ["unproduced-kind"] }]

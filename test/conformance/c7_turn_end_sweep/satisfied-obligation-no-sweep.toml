@@ -1,0 +1,15 @@
+[fixture]
+class = "C7"
+name = "satisfied-obligation-no-sweep"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism §D satisfied obligation"
+legibility = "lifecycle:rail_sweep(decision=none)"
+[[fixture.rule]]
+name = "satisfied-obligation-no-sweep"
+verb = "attest"
+text = "a satisfied obligation has no sweep action"
+edges = ["turn-end"]
+external_producer = true
+deny_when = [{ fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }]

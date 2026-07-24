@@ -1,3 +1,3 @@
 {"case":"non-admin-denied","kind":"positive","expect":"deny","reason":"admin-only-verb","world":{"users":[{"id":"admin","admin":true},{"id":"member","admin":false}]},"call":{"verb":"spawn","principal":["user","member"],"params":{}}}
 {"case":"admin-passes","kind":"negative","expect":"pass","world":{"users":[{"id":"admin","admin":true}]},"call":{"verb":"spawn","principal":["user","admin"],"params":{}}}
-{"case":"denial-is-legible","kind":"legibility","expect":"deny","reason":"admin-only-verb","emits":"event:denied(reason=admin-only-verb,rule=admin-only-verb)","world":{"users":[{"id":"member","admin":false}]},"call":{"verb":"spawn","principal":["user","member"],"params":{}}}
+{"case":"denial-is-legible","kind":"legibility","expect":"deny","reason":"admin-only-verb","emits":"event:denied(reason=rule_denied,rule=admin-only-verb)","world":{"users":[{"id":"member","admin":false}]},"call":{"verb":"spawn","principal":["user","member"],"params":{}}}

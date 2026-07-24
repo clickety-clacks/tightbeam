@@ -24,6 +24,10 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
+    Doctor {
+        json: bool,
+        base_dir: Option<String>,
+    },
     Wake {
         identity: Identity,
         target: Target,
@@ -118,23 +122,6 @@ pub enum Command {
         identity: Identity,
         wake_id: String,
     },
-    RoleCreate {
-        identity: Identity,
-        name: String,
-        bind: Option<String>,
-    },
-    RoleBind {
-        identity: Identity,
-        name: String,
-        session_key: String,
-    },
-    RoleRemove {
-        identity: Identity,
-        name: String,
-    },
-    RoleList {
-        identity: Identity,
-    },
     SkillList {
         identity: Identity,
     },
@@ -147,24 +134,6 @@ pub enum Command {
         identity: Identity,
         name: String,
     },
-    ApproveDevice {
-        identity: Identity,
-        device_id: String,
-        user_id: Option<String>,
-    },
-    DenyDevice {
-        identity: Identity,
-        device_id: String,
-    },
-    RevokeDevice {
-        identity: Identity,
-        device_id: String,
-    },
-    PromoteUser {
-        identity: Identity,
-        user_id: String,
-        is_admin: bool,
-    },
     ConfigGet {
         identity: Identity,
         setting: String,
@@ -174,7 +143,6 @@ pub enum Command {
         setting: String,
         value: String,
     },
-    Setup(SetupArgs),
     Assimilate(AssimilateArgs),
 }
 
@@ -293,11 +261,6 @@ COMMANDS:
       Cancel a pending (scheduled) wake by its id (from the wake command's
       output).
 
-  role create <name> [--bind <sessionKey>]       create a role
-  role bind <name> <sessionKey>                  bind a role to a session
-  role rm <name>                                 remove a role
-  role list                                      list roles
-
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
   skill list                                    every skill in the library
   skill put <name> --file <path>                create/update a skill (admin);
@@ -306,31 +269,19 @@ COMMANDS:
       library and pushes every satellite replica immediately.
   skill rm <name>                               remove a skill (admin); refused
       while any archetype elects it. Pruning inside a tree is an edit.
-
-  approve-device <deviceId> [--user <userId>]   approve a pending device
-  deny-device <deviceId>                         reject a pending device
-  revoke-device <deviceId>                       revoke a device's token
-  promote-user <userId> [--demote]               grant/remove admin on a user
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
 
-  setup [--base-dir p] [--harness claude,codex] [--force]
-      Onboard harness credentials for THIS machine's org (run once at
-      install, once per harness you want supported). Walks you through each
-      harness's own login flow with its config dir pointed at the org's
-      auth store, so the org gets its OWN grant — never a copy of your
-      personal login. Copies share a grant, and shared grants revoke each
-      other on refresh. Needs an interactive terminal.
-        tightbeam setup --base-dir ~/.tightbeam-beam
+  doctor [--json] [--base-dir p]
+      Check the local Tightbeam installation and report its health.
 
   assimilate <ssh-dest> [--name n] [--base-dir p] [--harness claude,codex]
              [--push-credentials] [--no-onboard] [--dry-run]
       Prepare a machine to run agent harnesses and register it as a host
       (admin). Probes ssh/node/rsync, creates the base dir, installs the
       ACP adapters and this CLI, records the host, and walks you through
-      onboarding a dedicated login per harness on the satellite (the
-      `setup` ceremony, over ssh -t; skipped without a terminal or with
-      --no-onboard). Harvesting the satellite's own login happens only if
+      onboarding a dedicated login per harness on the satellite (skipped
+      without a terminal or with --no-onboard). Harvesting the satellite's own login happens only if
       one is already present in place; pushing YOURS needs the explicit
       --push-credentials — both share a grant and can race on refresh.
       After: add the host to an archetype's `where`.
@@ -344,14 +295,7 @@ DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
 
   tightbeam help | --help | -h    show this text."#;
 
-const BOOLEAN_FLAGS: &[&str] = &[
-    "demote",
-    "dry-run",
-    "force",
-    "help",
-    "no-onboard",
-    "push-credentials",
-];
+const BOOLEAN_FLAGS: &[&str] = &["dry-run", "help", "json", "no-onboard", "push-credentials"];
 
 #[derive(Debug)]
 struct Flags {
@@ -548,6 +492,21 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
 
     let flags = &parsed.flags;
     match command.expect("checked above") {
+        "doctor" => {
+            let base_dir = nonempty(flags, "base-dir");
+            if parsed.positional.len() != 1
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "json" | "base-dir"))
+                || (flags.contains_key("base-dir") && base_dir.is_none())
+            {
+                return Err("usage: tightbeam doctor [--json] [--base-dir DIR]".to_owned());
+            }
+            Ok(Command::Doctor {
+                json: flags.contains_key("json"),
+                base_dir,
+            })
+        }
         "wake" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -797,53 +756,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 wake_id,
             })
         }
-        "role" => parse_role(&parsed, flags),
         "skill" => parse_skill(&parsed, flags),
-        "approve-device" => {
-            let device_id = parsed.positional.get(1).cloned().ok_or_else(|| {
-                "usage: tightbeam approve-device <deviceId> [--user <userId>]".to_owned()
-            })?;
-            Ok(Command::ApproveDevice {
-                identity: identity(flags)?,
-                device_id,
-                user_id: nonempty(flags, "user"),
-            })
-        }
-        "deny-device" => {
-            let device_id = device_id(&parsed, "deny-device")?;
-            Ok(Command::DenyDevice {
-                identity: identity(flags)?,
-                device_id,
-            })
-        }
-        "revoke-device" => {
-            let device_id = device_id(&parsed, "revoke-device")?;
-            Ok(Command::RevokeDevice {
-                identity: identity(flags)?,
-                device_id,
-            })
-        }
-        "promote-user" => {
-            let user_id =
-                parsed.positional.get(1).cloned().ok_or_else(|| {
-                    "usage: tightbeam promote-user <userId> [--demote]".to_owned()
-                })?;
-            Ok(Command::PromoteUser {
-                identity: identity(flags)?,
-                user_id,
-                is_admin: !flags.contains_key("demote"),
-            })
-        }
         "config" => parse_config(&parsed, flags),
-        "setup" => Ok(Command::Setup(SetupArgs {
-            base_dir: nonempty(flags, "base-dir"),
-            harnesses: nonempty(flags, "harness")
-                .unwrap_or_else(|| "claude,codex".to_owned())
-                .split(',')
-                .map(str::to_owned)
-                .collect(),
-            force: flags.contains_key("force"),
-        })),
         "assimilate" => {
             let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
                 "usage: tightbeam assimilate <ssh-dest> --as-user <adminUserId>".to_owned()
@@ -869,7 +783,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, artifact-record, artifacts, spawn, list, retire, work-item-create, work-item-get, assign, dispatch, run-tests, run-smoke, attest, attests, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, setup, assimilate"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, work-item-create, work-item-get, spawn, retire, list, skill, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -894,47 +808,6 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
             "usage: tightbeam config get default-archetype | config set default-archetype <name>"
                 .to_owned(),
         ),
-    }
-}
-
-fn parse_role(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    let action = parsed.positional.get(1).map(String::as_str);
-    let name = parsed.positional.get(2).cloned();
-    match action {
-        Some("create") => {
-            let name = name.ok_or_else(|| {
-                "usage: tightbeam role create <name> [--bind <sessionKey>]".to_owned()
-            })?;
-            Ok(Command::RoleCreate {
-                identity: identity(flags)?,
-                name,
-                bind: nonempty(flags, "bind"),
-            })
-        }
-        Some("bind") => {
-            let name = name.ok_or_else(|| {
-                "usage: tightbeam role bind <name> <sessionKey>".to_owned()
-            })?;
-            let session_key = parsed.positional.get(3).cloned().ok_or_else(|| {
-                "usage: tightbeam role bind <name> <sessionKey>".to_owned()
-            })?;
-            Ok(Command::RoleBind {
-                identity: identity(flags)?,
-                name,
-                session_key,
-            })
-        }
-        Some("rm") => {
-            let name = name.ok_or_else(|| "usage: tightbeam role rm <name>".to_owned())?;
-            Ok(Command::RoleRemove {
-                identity: identity(flags)?,
-                name,
-            })
-        }
-        Some("list") => Ok(Command::RoleList {
-            identity: identity(flags)?,
-        }),
-        _ => Err("usage: tightbeam role create <name> [--bind <sessionKey>] | bind <name> <sessionKey> | rm <name> | list".to_owned()),
     }
 }
 
@@ -970,14 +843,6 @@ fn parse_skill(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comman
     }
 }
 
-fn device_id(parsed: &Flags, command: &str) -> Result<String, String> {
-    parsed
-        .positional
-        .get(1)
-        .cloned()
-        .ok_or_else(|| format!("usage: tightbeam {command} <deviceId>"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,15 +864,66 @@ mod tests {
     }
 
     #[test]
-    fn help_matches_cli_surface_v1_snapshot() {
-        let hash = HELP
-            .bytes()
-            .fold(14_695_981_039_346_656_037_u64, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211)
-            });
+    fn help_enumerates_exactly_cli_surface_v1() {
+        let command_section = HELP
+            .split_once("COMMANDS:\n")
+            .unwrap()
+            .1
+            .split_once("\nDISCOVERY:")
+            .unwrap()
+            .0;
+        let headings = command_section
+            .lines()
+            .filter_map(|line| {
+                let line = line.strip_prefix("  ")?;
+                if line.starts_with(' ') {
+                    return None;
+                }
+                let command = line.split_whitespace().next()?;
+                command
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_lowercase())
+                    .then_some(command)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
 
-        assert_eq!(HELP.len(), 7_845);
-        assert_eq!(hash, 17_624_312_993_611_021_555);
+        assert_eq!(
+            headings,
+            [
+                "assimilate",
+                "assign",
+                "assignments",
+                "artifact-record",
+                "artifacts",
+                "attest",
+                "attests",
+                "cancel-wake",
+                "config",
+                "dispatch",
+                "doctor",
+                "list",
+                "retire",
+                "run-smoke",
+                "run-tests",
+                "skill",
+                "spawn",
+                "wake",
+                "work-item-create",
+                "work-item-get",
+            ]
+            .into_iter()
+            .collect()
+        );
+        for syntax in [
+            "skill list",
+            "skill put <name> --file <path>",
+            "skill rm <name>",
+            "config get default-archetype",
+            "config set default-archetype <name>",
+        ] {
+            assert!(HELP.contains(syntax), "missing HELP syntax: {syntax}");
+        }
     }
 
     #[test]
@@ -1094,7 +1010,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, artifact-record, artifacts, spawn, list, retire, work-item-create, work-item-get, assign, dispatch, run-tests, run-smoke, attest, attests, assignments, cancel-wake, role, skill, approve-device, deny-device, revoke-device, promote-user, config, setup, assimilate".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, work-item-create, work-item-get, spawn, retire, list, skill, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 
@@ -1120,11 +1036,44 @@ mod tests {
             "assignment-get",
             "revoke-assignment",
             "init",
+            "setup",
+            "role",
+            "kungfu-scaffold",
+            "approve-device",
+            "deny-device",
+            "revoke-device",
+            "promote-user",
         ] {
             assert!(
                 parse(strings(&[command]))
                     .unwrap_err()
                     .starts_with(&format!("unknown command: {command} —"))
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_parses_real_health_check_options_and_rejects_non_surface_shapes() {
+        assert_eq!(
+            parse(strings(&[
+                "doctor",
+                "--json",
+                "--base-dir",
+                "/tmp/tightbeam",
+            ])),
+            Ok(Command::Doctor {
+                json: true,
+                base_dir: Some("/tmp/tightbeam".to_owned()),
+            })
+        );
+        for args in [
+            strings(&["doctor", "extra"]),
+            strings(&["doctor", "--unknown", "value"]),
+            strings(&["doctor", "--base-dir"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam doctor [--json] [--base-dir DIR]".to_owned())
             );
         }
     }
@@ -1290,40 +1239,10 @@ mod tests {
                 },
             ),
             (
-                strings(&[
-                    "role",
-                    "create",
-                    "reviewer",
-                    "--bind",
-                    "agent:x",
-                    "--as-user",
-                    "flynn",
-                ]),
-                Command::RoleCreate {
-                    identity: Identity::User("flynn".to_owned()),
-                    name: "reviewer".to_owned(),
-                    bind: Some("agent:x".to_owned()),
-                },
-            ),
-            (
-                strings(&["role", "bind", "reviewer", "agent:y", "--as-user", "flynn"]),
-                Command::RoleBind {
-                    identity: Identity::User("flynn".to_owned()),
-                    name: "reviewer".to_owned(),
-                    session_key: "agent:y".to_owned(),
-                },
-            ),
-            (
-                strings(&["role", "rm", "reviewer", "--as-user", "flynn"]),
-                Command::RoleRemove {
-                    identity: Identity::User("flynn".to_owned()),
-                    name: "reviewer".to_owned(),
-                },
-            ),
-            (
-                strings(&["role", "list", "--as-user", "flynn"]),
-                Command::RoleList {
-                    identity: Identity::User("flynn".to_owned()),
+                strings(&["doctor", "--json", "--base-dir", "/tmp/tightbeam"]),
+                Command::Doctor {
+                    json: true,
+                    base_dir: Some("/tmp/tightbeam".to_owned()),
                 },
             ),
             (
@@ -1354,58 +1273,6 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     name: "swift".to_owned(),
                 },
-            ),
-            (
-                strings(&[
-                    "approve-device",
-                    "d1",
-                    "--user",
-                    "mike",
-                    "--as-user",
-                    "flynn",
-                ]),
-                Command::ApproveDevice {
-                    identity: Identity::User("flynn".to_owned()),
-                    device_id: "d1".to_owned(),
-                    user_id: Some("mike".to_owned()),
-                },
-            ),
-            (
-                strings(&["deny-device", "d2", "--as-user", "flynn"]),
-                Command::DenyDevice {
-                    identity: Identity::User("flynn".to_owned()),
-                    device_id: "d2".to_owned(),
-                },
-            ),
-            (
-                strings(&["revoke-device", "d3", "--as-user", "flynn"]),
-                Command::RevokeDevice {
-                    identity: Identity::User("flynn".to_owned()),
-                    device_id: "d3".to_owned(),
-                },
-            ),
-            (
-                strings(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),
-                Command::PromoteUser {
-                    identity: Identity::User("flynn".to_owned()),
-                    user_id: "mike".to_owned(),
-                    is_admin: false,
-                },
-            ),
-            (
-                strings(&[
-                    "setup",
-                    "--base-dir",
-                    "/tmp/tightbeam",
-                    "--harness",
-                    "claude,codex",
-                    "--force",
-                ]),
-                Command::Setup(SetupArgs {
-                    base_dir: Some("/tmp/tightbeam".to_owned()),
-                    harnesses: vec!["claude".to_owned(), "codex".to_owned()],
-                    force: true,
-                }),
             ),
             (
                 strings(&[

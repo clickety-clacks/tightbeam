@@ -1,0 +1,7 @@
+[loadset]
+name = "grammar-nested-accepted"
+class = "C6"
+phase = "pending"
+blocking_phase = "P5"
+outcome = "load-clean"
+source = "mechanism §A1 nested rule.check accepted"
