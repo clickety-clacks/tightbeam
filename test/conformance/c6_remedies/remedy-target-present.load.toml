@@ -1,0 +1,7 @@
+[loadset]
+name = "remedy-target-present"
+class = "C6"
+phase = "pending"
+blocking_phase = "P5"
+outcome = "load-clean"
+source = "mechanism §C1 complete remedy target"

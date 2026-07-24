@@ -1,0 +1,25 @@
+[fixture]
+class = "C7"
+name = "retired-holder-no-remedy"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism r7 pre-rail-step holder_state"
+legibility = "lifecycle:rail_sweep(decision=none,reason=stranded)"
+[[fixture.rule]]
+name = "retired-holder-no-remedy"
+verb = "attest"
+text = "retired holders strand before rail evaluation"
+edges = ["turn-end"]
+effect = "remedy"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }
+]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"
+[fixture.rule.remedy.params]
+subject = "review {assignment_id}"
+reviews = "{assignment_id}"

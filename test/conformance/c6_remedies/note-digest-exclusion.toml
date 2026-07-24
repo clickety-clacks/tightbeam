@@ -1,0 +1,19 @@
+[fixture]
+class = "C6"
+name = "note-digest-exclusion"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism lattice digest material"
+legibility = "lifecycle:rail_remedy(outcome=live)"
+[[fixture.rule]]
+name = "note-digest-exclusion"
+verb = "attest"
+text = "human notes do not perturb remedy occurrence identity"
+edges = ["verb"]
+effect = "remedy"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"

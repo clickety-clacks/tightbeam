@@ -1,0 +1,12 @@
+[[rule]]
+name = "dead-remedy"
+verb = "attest"
+text = "produces an unused kind"
+effect = "remedy"
+deny_when = [{ fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }]
+[rule.remedy]
+action = "assign"
+produces = "unused-kind"
+target_role = "reviewer"
+[rule.remedy.params]
+subject = "review {assignment_id}"

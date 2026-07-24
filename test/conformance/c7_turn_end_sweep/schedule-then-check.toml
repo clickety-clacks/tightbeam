@@ -1,0 +1,15 @@
+[fixture]
+class = "C7"
+name = "schedule-then-check"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism r11 schedule-then-check ordering"
+legibility = "lifecycle:rail_sweep(decision=escalate-park)"
+[[fixture.rule]]
+name = "schedule-then-check"
+verb = "attest"
+text = "park wake scheduling precedes the recovered ruling check"
+edges = ["turn-end"]
+effect = "escalate"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]

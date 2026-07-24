@@ -1,0 +1,26 @@
+[fixture]
+class = "C7"
+name = "escalation-return-sweep"
+phase = "pending-escalation-review"
+blocking_phase = "escalation-substrate-v1 review-clean"
+kind = "sweep"
+source = "mechanism §D2.4 r9; escalation-substrate-v1"
+legibility = "lifecycle:rail_sweep(decision=escalate-park)"
+[[fixture.rule]]
+name = "escalation-return-sweep"
+verb = "attest"
+text = "sweep actor maps the unified escalation resolution union"
+edges = ["turn-end"]
+effect = "escalate"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.verdicts", op = "not_in", value = ["owner-approved"] },
+]
+external_producer = true
+
+[[fixture.rule]]
+name = "later-sweep-statute"
+verb = "attest"
+text = "a later turn-end statute proves the escalation allow continued the fold"
+edges = ["turn-end"]
+deny_when = [{ fact = "assignment.holder_archetype", op = "eq", value = "allow-coder" }]

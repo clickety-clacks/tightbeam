@@ -1,0 +1,22 @@
+[fixture]
+class = "C5"
+name = "reconcile-with-main"
+phase = "pending"
+blocking_phase = "P4"
+kind = "script-guard"
+source = "mechanism §A; smoke §3 C5 reconcile-with-main"
+legibility = "event:denied(reason=rule_denied|script_out_of_set|script_error|script_timeout|script_contained_refused,rule=reconcile-with-main);lifecycle:rail_script"
+
+[[fixture.rule]]
+name = "reconcile-with-main"
+verb = "attest"
+text = "the holder branch must contain main before completion"
+edges = ["verb"]
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.check]
+script = "reconcile-with-main"
+returns = ["reconciled", "behind"]
+timeout_ms = 2000
+[fixture.rule.check.effects]
+reconciled = "allow"
+behind = "deny"

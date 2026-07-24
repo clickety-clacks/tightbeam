@@ -1,8 +1,8 @@
 [fixture]
 class = "C4"
 name = "cross-provider"
-phase = "green"
-blocking_phase = ""
+phase = "pending"
+blocking_phase = "P3"
 kind = "dispatch-rule"
 source = "p3 §4A assignment.cross_provider_verdict_kinds"
 legibility = "event:denied(rule=cross-provider-review)"

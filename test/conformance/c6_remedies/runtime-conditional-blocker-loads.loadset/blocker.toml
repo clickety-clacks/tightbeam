@@ -1,0 +1,5 @@
+[[rule]]
+name = "runtime-block-assign"
+verb = "assign"
+text = "runtime conditional blocker"
+deny_when = [{ fact = "caller.verb_count_24h", op = "gte", value = 3 }]

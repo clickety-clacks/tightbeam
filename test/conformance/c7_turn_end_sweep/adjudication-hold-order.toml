@@ -1,0 +1,14 @@
+[fixture]
+class = "C7"
+name = "adjudication-hold-order"
+phase = "pending"
+blocking_phase = "P6"
+kind = "sweep"
+source = "mechanism total-order position 4; model-adjudication"
+legibility = "lifecycle:rail_sweep(decision=none,reason=adjudication_hold)"
+[[fixture.rule]]
+name = "adjudication-hold-order"
+verb = "attest"
+text = "an open adjudication episode suppresses rail step and prod"
+edges = ["turn-end"]
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]

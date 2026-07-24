@@ -1,0 +1,26 @@
+[fixture]
+class = "C6"
+name = "script-result-remedy"
+phase = "pending"
+blocking_phase = "P5"
+kind = "remedy"
+source = "mechanism §A3/§C"
+legibility = "event:denied(rule=script-result-remedy);lifecycle:rail_script; lifecycle:rail_remedy"
+[[fixture.rule]]
+name = "script-result-remedy"
+verb = "attest"
+text = "a declared script token may select the remedy effect"
+edges = ["verb"]
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[fixture.rule.check]
+script = "reconcile-with-main"
+returns = ["reconciled", "behind"]
+[fixture.rule.check.effects]
+reconciled = "remedy"
+behind = "allow"
+[fixture.rule.remedy]
+action = "assign"
+target_role = "reviewer"
+[fixture.rule.remedy.params]
+subject = "review {assignment_id}"
+reviews = "{assignment_id}"

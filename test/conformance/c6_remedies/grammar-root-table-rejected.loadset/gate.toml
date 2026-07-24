@@ -1,0 +1,8 @@
+[[rule]]
+name = "grammar-root-table-rejected"
+verb = "attest"
+text = "bare root check must fail"
+deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+[check]
+script = "reconcile-with-main"
+returns = ["reconciled"]

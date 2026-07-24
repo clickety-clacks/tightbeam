@@ -1,0 +1,5 @@
+[[rule]]
+name = "block-assign"
+verb = "assign"
+text = "statically block assignment"
+deny_when = [{ fact = "caller.origin_class", op = "eq", value = "remedy" }]
