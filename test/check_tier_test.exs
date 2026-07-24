@@ -428,6 +428,55 @@ defmodule Tightbeam.CheckTierTest do
              )
   end
 
+  test "archetype-scoped completion gate is inert for other archetypes", ctx do
+    session(ctx.db, "writer", "flynn", "writer")
+
+    assignment =
+      Assignments.__handle__(
+        ctx.db,
+        "assign",
+        call("assign", {:user, "flynn"}, %{subject: "writing", idempotency_key: nil})
+        |> Map.merge(%{session_key: "writer", target_role: nil, role_fallback: false})
+      )
+
+    put_rules(ctx, """
+    [[rule]]
+    name = "coder-needs-tests"
+    verb = "attest"
+    text = "coder completion requires tests"
+    external_producer = true
+    deny_when = [
+      { fact = "attest.kind", op = "eq", value = "completion" },
+      { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
+      { fact = "assignment.verdicts", op = "not_in", value = ["tests-passed"] }
+    ]
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+
+    assert {:ok, %{assignment: %{state: "closed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               call("attest", {:session, "writer"}, %{
+                 assignment_id: assignment.id,
+                 kind: "completion"
+               })
+             )
+  end
+
+  test "verdict filing advances the supervision attest-count input", ctx do
+    assignment = assign(ctx)
+    assert Assignments.attest_count(ctx.db, assignment.id) == 0
+    assert Assignments.open_count(ctx.db, "holder") == 1
+
+    assert %{attest: %{kind: "verdict"}} =
+             verdict(ctx, {:session, "reviewer"}, assignment.id, "reviewed")
+
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+    assert Assignments.open_count(ctx.db, "holder") == 1
+  end
+
   defp assign(ctx, subject \\ "work") do
     Assignments.__handle__(
       ctx.db,
