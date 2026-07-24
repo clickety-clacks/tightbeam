@@ -87,9 +87,69 @@ defmodule Tightbeam.ArchetypesTest do
              "tightbeam-guidance-authoring"
            ]
 
+    assert seeded["recon"].skills == [
+             "recon-first-investigation",
+             "recon-lifecycle",
+             "bug-provenance",
+             "tightbeam-law-minting",
+             "tightbeam-guidance-authoring"
+           ]
+
+    bug_provenance_path =
+      Path.join([identity_dir, "skills", "bug-provenance", "SKILL.md"])
+
+    assert File.read!(bug_provenance_path) ==
+             File.read!("priv/kungfu/agentic-engineering/skills/bug-provenance/SKILL.md")
+
+    assert %{
+             name: "bug-provenance",
+             root: true,
+             elected_by: ["recon"]
+           } in Archetypes.list_skills(ctx.base_dir)
+
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"1\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+  end
+
+  test "shipped recon election and bug guidance match the canonical bundle content" do
+    manifest =
+      "priv/kungfu/agentic-engineering/archetypes/recon.toml"
+      |> File.read!()
+      |> Toml.decode!()
+
+    assert manifest["skills"] == [
+             "recon-first-investigation",
+             "recon-lifecycle",
+             "bug-provenance",
+             "tightbeam-law-minting",
+             "tightbeam-guidance-authoring"
+           ]
+
+    skill = File.read!("priv/kungfu/agentic-engineering/skills/bug-provenance/SKILL.md")
+
+    for cause_class <- [
+          "code-violates-spec",
+          "spec-hole",
+          "stale-spec",
+          "spec-conflict",
+          "wrong-proof",
+          "composition",
+          "environment-drift"
+        ] do
+      assert skill =~ "| `#{cause_class}` |"
+    end
+
+    assert skill =~ "Consult the attempt ledger — mandatory."
+    assert skill =~ "Re-classify before re-fix."
+    assert skill =~ "Deliver a verdict, never a patch"
+    assert skill =~ "--verdict diagnosed"
+
+    assert File.read!("priv/kungfu/agentic-engineering/archetypes/coder.md") =~
+             "Nontrivial bugs start with a causal verdict, not a patch"
+
+    assert File.read!("priv/kungfu/agentic-engineering/archetypes/orchestrator.md") =~
+             "A repeat-failure bug goes to a recon with `bug-provenance`"
   end
 
   test "skill mutations auto-init and commit with the caller identity", ctx do

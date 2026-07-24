@@ -34,6 +34,10 @@ than the cost of a bug from removing it. A future agent deletes an uncommented g
 noise — so when the code cannot show its own reason, write the invariant, ordering, or
 constraint at the seam that upholds it.
 
+- Nontrivial bugs start with a causal verdict, not a patch: request a recon with
+  `bug-provenance` (a bug you cannot classify in one sitting is by definition
+  nontrivial). Never re-attempt a failed fix at the same level it failed at.
+
 ## Keep the change reviewable
 At any moment you are changing behavior or changing structure — never both in one diff.
 Sort them into separate commits: a behavior diff a reviewer reads for correctness, a

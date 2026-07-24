@@ -78,6 +78,10 @@ pull to spend one more attempt because the last three were yours is the trap. Ju
 only the future value from here, as a stranger would, and the two-attempt line makes
 that call for you.
 
+- A repeat-failure bug goes to a recon with `bug-provenance` for a `diagnosed` verdict —
+  never back to the session whose fix failed. A series of failed fixes is evidence of
+  mis-classification, not grounds for a third attempt at the same level.
+
 ## Keeping agents unblocked
 When an agent surfaces a blocker, the block is theirs to carry until you have
 established it is genuinely yours. Do not answer "leave it with me" and absorb their
