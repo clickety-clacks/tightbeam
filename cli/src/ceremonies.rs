@@ -1,11 +1,10 @@
 //! Interactive `setup` and `assimilate` ceremonies.
 
-use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
-use crate::args::{AssimilateArgs, InitArgs, SetupArgs};
+use crate::args::AssimilateArgs;
 use crate::dispatch::{self, RequestSpec};
 
 #[derive(Clone, Copy)]
@@ -55,15 +54,6 @@ trait CeremonyIo {
     fn warn(&mut self, message: &str);
     fn terminal(&self) -> bool;
     fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure>;
-    fn exec_at(
-        &mut self,
-        directory: &Path,
-        file: &str,
-        args: &[String],
-    ) -> Result<String, ExecFailure> {
-        let _ = directory;
-        self.exec(file, args)
-    }
     fn exec_interactive(
         &mut self,
         file: &str,
@@ -92,35 +82,6 @@ impl CeremonyIo for SystemIo {
     fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure> {
         let result = ProcessCommand::new(file)
             .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| ExecFailure {
-                message: error.to_string(),
-                stdout: String::new(),
-                stderr: String::new(),
-            })?;
-        if result.status.success() {
-            Ok(String::from_utf8_lossy(&result.stdout).into_owned())
-        } else {
-            Err(ExecFailure {
-                message: format!("process exited with status {}", result.status),
-                stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
-            })
-        }
-    }
-
-    fn exec_at(
-        &mut self,
-        directory: &Path,
-        file: &str,
-        args: &[String],
-    ) -> Result<String, ExecFailure> {
-        let result = ProcessCommand::new(file)
-            .args(args)
-            .current_dir(directory)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -177,119 +138,6 @@ impl CeremonyIo for SystemIo {
     fn current_exe(&self) -> Result<PathBuf, String> {
         std::env::current_exe().map_err(|error| error.to_string())
     }
-}
-
-pub fn setup(args: SetupArgs) -> Result<(), String> {
-    let mut io = SystemIo;
-    setup_with(&mut io, args)
-}
-
-pub fn init(args: InitArgs) -> Result<(), String> {
-    let mut io = SystemIo;
-    init_with(&mut io, args)
-}
-
-fn init_with(io: &mut dyn CeremonyIo, args: InitArgs) -> Result<(), String> {
-    let base_dir = args.base_dir.unwrap_or_else(default_base_dir);
-    let project_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the CLI crate lives inside the Tightbeam project");
-    let command_args = vec![
-        "tightbeam.init".to_owned(),
-        "--base-dir".to_owned(),
-        base_dir,
-    ];
-    let output = io
-        .exec_at(project_dir, "mix", &command_args)
-        .map_err(|error| command_failure(&error))?;
-
-    if !output.trim().is_empty() {
-        io.log(output.trim());
-    }
-    Ok(())
-}
-
-fn setup_with(io: &mut dyn CeremonyIo, args: SetupArgs) -> Result<(), String> {
-    validate_harnesses(&args.harnesses)?;
-    let base_dir = args.base_dir.unwrap_or_else(default_base_dir);
-    if !io.terminal() {
-        return Err(setup_non_tty_message(&base_dir, &args.harnesses));
-    }
-
-    for harness in &args.harnesses {
-        let flow = login_flow(harness).expect("harnesses were validated");
-        let auth_dir = Path::new(&base_dir).join("auth").join(harness);
-        let credential_name = Path::new(flow.credential_file)
-            .file_name()
-            .expect("credential file has a basename");
-        let target = auth_dir.join(credential_name);
-        fs::create_dir_all(&auth_dir).map_err(|error| error.to_string())?;
-
-        if target.exists() && !args.force {
-            io.log(&format!(
-                "[setup] {harness}: credentials already present ({}); use --force to redo",
-                target.display()
-            ));
-            continue;
-        }
-
-        let command_text = std::iter::once(flow.executable)
-            .chain(flow.args.iter().copied())
-            .collect::<Vec<_>>()
-            .join(" ");
-        io.log(&format!(
-            "[setup] {harness}: starting the harness's own login ({command_text})..."
-        ));
-        let command_args = flow
-            .args
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>();
-        io.exec_interactive(
-            flow.executable,
-            &command_args,
-            &[(flow.env_var.to_owned(), auth_dir.display().to_string())],
-        )
-        .map_err(|error| command_failure(&error))?;
-        io.log(&format!(
-            "[setup] {harness}: done — this org now holds its own {harness} grant"
-        ));
-        if harness == "claude" {
-            io.log(&format!(
-                "[setup] {harness}: if a long-lived token was printed, save it: umask 077; pbpaste > {}/oauth-token  (or paste it into that file)",
-                auth_dir.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn default_base_dir() -> String {
-    std::env::var("TIGHTBEAM_HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join(".tightbeam")
-                .display()
-                .to_string()
-        })
-}
-
-pub fn setup_non_tty_message(base_dir: &str, harnesses: &[String]) -> String {
-    let commands = harnesses
-        .iter()
-        .filter_map(|harness| login_flow(harness).map(|flow| (harness, flow)))
-        .map(|(harness, flow)| {
-            let command = std::iter::once(flow.executable)
-                .chain(flow.args.iter().copied())
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("  {}={base_dir}/auth/{harness} {command}", flow.env_var)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("setup needs an interactive terminal. Run manually:\n{commands}")
 }
 
 fn credential_status(output: &str) -> String {
@@ -762,44 +610,11 @@ mod tests {
     }
 
     #[test]
-    fn validates_harnesses_and_returns_non_tty_setup_commands() {
-        assert_eq!(
-            setup_non_tty_message("/org", &["claude".to_owned(), "codex".to_owned()]),
-            "setup needs an interactive terminal. Run manually:\n  CLAUDE_CONFIG_DIR=/org/auth/claude claude setup-token\n  CODEX_HOME=/org/auth/codex codex login"
-        );
+    fn validates_harnesses() {
         assert_eq!(
             validate_harnesses(&["other".to_owned()]),
             Err("unsupported harness: other".to_owned())
         );
-    }
-
-    #[test]
-    fn init_invokes_the_elixir_seed_task() {
-        let mut io = FakeIo::default();
-        io.responses
-            .push(Ok("Initialized /org/identity\n".to_owned()));
-
-        assert_eq!(
-            init_with(
-                &mut io,
-                InitArgs {
-                    base_dir: Some("/org".to_owned()),
-                },
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            io.commands,
-            vec![(
-                "mix".to_owned(),
-                vec![
-                    "tightbeam.init".to_owned(),
-                    "--base-dir".to_owned(),
-                    "/org".to_owned(),
-                ],
-            )]
-        );
-        assert_eq!(io.logs, vec!["Initialized /org/identity"]);
     }
 
     #[test]
