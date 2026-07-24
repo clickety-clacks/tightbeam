@@ -10,6 +10,7 @@ defmodule Tightbeam.WorkItems do
     title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 2000),
     specRefName TEXT NULL CHECK(specRefName IS NULL OR length(trim(specRefName)) BETWEEN 1 AND 2000),
     specRefSha256 TEXT NULL CHECK(specRefSha256 IS NULL OR (length(specRefSha256) = 64 AND specRefSha256 NOT GLOB '*[^0-9a-f]*')),
+    isBug INTEGER NOT NULL DEFAULT 0 CHECK(isBug IN (0, 1)),
     createdByUser TEXT NULL,
     createdBySession TEXT NULL,
     createdAt INTEGER NOT NULL,
@@ -20,7 +21,10 @@ defmodule Tightbeam.WorkItems do
 
   @doc "Create the work-item schema."
   @spec ensure_schema(DB.server()) :: :ok
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    :ok = DB.execute(db, @ddl)
+    ensure_is_bug_column(db)
+  end
 
   @doc false
   def __handle__(db, "work-item-create", call), do: create_result(db, call)
@@ -29,9 +33,12 @@ defmodule Tightbeam.WorkItems do
   def __handle__(db, "work-item-update", call), do: update_result(db, call)
 
   defp create_result(db, call) do
+    is_bug = Map.get(call.params, :is_bug, false)
+
     with :ok <- principal_allowed(call.principal),
          :ok <- valid_title(call.params[:title]),
-         :ok <- valid_spec_ref(call.params[:spec_ref_name], call.params[:spec_ref_sha256]) do
+         :ok <- valid_spec_ref(call.params[:spec_ref_name], call.params[:spec_ref_sha256]),
+         :ok <- valid_is_bug(is_bug) do
       id = "wi_" <> Tightbeam.Id.uuid4()
       {created_by_user, created_by_session} = creator(call.principal)
 
@@ -40,14 +47,16 @@ defmodule Tightbeam.WorkItems do
           db,
           """
           INSERT INTO work_items
-            (id, title, specRefName, specRefSha256, createdByUser, createdBySession, createdAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            (id, title, specRefName, specRefSha256, isBug,
+             createdByUser, createdBySession, createdAt)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
           """,
           [
             id,
             call.params.title,
             call.params[:spec_ref_name],
             call.params[:spec_ref_sha256],
+            bool_to_int(is_bug),
             created_by_user,
             created_by_session,
             now()
@@ -92,18 +101,30 @@ defmodule Tightbeam.WorkItems do
         title = if Map.has_key?(params, :title), do: params.title, else: item.title
 
         {spec_ref_name, spec_ref_sha256} = patch_spec_ref(item, params)
-        updates = patch_updates(params, title, spec_ref_name, spec_ref_sha256)
+        is_bug = if Map.has_key?(params, :is_bug), do: params.is_bug, else: item.isBug
 
         with :ok <- valid_title(title),
-             :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256) do
+             :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256),
+             :ok <- valid_is_bug(is_bug) do
+          updates = patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug)
           updated = apply_updates(txn, item, updates)
           {:updated, updated, metadata(item) != metadata(updated)}
         end
     end
   end
 
-  defp patch_updates(params, title, spec_ref_name, spec_ref_sha256) do
-    updates = if Map.has_key?(params, :title), do: [{"title", title}], else: []
+  defp patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug) do
+    updates =
+      []
+      |> then(fn fields ->
+        if Map.has_key?(params, :title), do: fields ++ [{"title", title}], else: fields
+      end)
+      |> then(fn fields ->
+        if Map.has_key?(params, :is_bug),
+          do: fields ++ [{"isBug", bool_to_int(is_bug)}],
+          else: fields
+      end)
+
     name_present = Map.has_key?(params, :spec_ref_name)
     sha_present = Map.has_key?(params, :spec_ref_sha256)
 
@@ -220,6 +241,9 @@ defmodule Tightbeam.WorkItems do
   defp valid_spec_ref(_, _),
     do: error("invalid_spec_ref", "specRefName and specRefSha256 must both be set or null")
 
+  defp valid_is_bug(value) when is_boolean(value), do: :ok
+  defp valid_is_bug(_), do: error("invalid_is_bug", "isBug must be a boolean")
+
   defp principal_allowed({:process, _}),
     do: error("process_denied", "process principals cannot use work-item verbs")
 
@@ -237,7 +261,7 @@ defmodule Tightbeam.WorkItems do
   defp unknown(id), do: error("unknown_work_item", "unknown work item: #{id}")
   defp error(code, message), do: %{code: code, message: message}
 
-  defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256}
+  defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256, item.isBug}
 
   defp best_effort(fun) do
     try do
@@ -259,18 +283,41 @@ defmodule Tightbeam.WorkItems do
   defp now, do: System.system_time(:millisecond)
 
   defp columns do
-    "id, title, specRefName, specRefSha256, createdByUser, createdBySession, createdAt"
+    "id, title, specRefName, specRefSha256, isBug, createdByUser, createdBySession, createdAt"
   end
 
-  defp work_item([id, title, spec_ref_name, spec_ref_sha256, user, session, created_at]) do
+  defp work_item([
+         id,
+         title,
+         spec_ref_name,
+         spec_ref_sha256,
+         is_bug,
+         user,
+         session,
+         created_at
+       ]) do
     %{
       id: id,
       title: title,
       specRefName: spec_ref_name,
       specRefSha256: spec_ref_sha256,
+      isBug: is_bug == 1,
       createdByUser: user,
       createdBySession: session,
       createdAt: created_at
     }
   end
+
+  defp ensure_is_bug_column(db) do
+    case DB.query(
+           db,
+           "ALTER TABLE work_items ADD COLUMN isBug INTEGER NOT NULL DEFAULT 0 CHECK(isBug IN (0, 1))"
+         ) do
+      {:ok, _} -> :ok
+      {:error, reason} -> if inspect(reason) =~ "duplicate column", do: :ok, else: raise(reason)
+    end
+  end
+
+  defp bool_to_int(true), do: 1
+  defp bool_to_int(false), do: 0
 end

@@ -26,6 +26,13 @@ defmodule Tightbeam.Rules do
   assignment facts resolve from the call's assignmentId and are nil when that
   assignment cannot be resolved.
 
+  Work-item facts are `work_item.is_bug` (the org-set work-item attribute) and
+  `assignment.prior_completed_fix_count` (completed, non-review assignments on
+  the same work item, excluding the current assignment). On an implementation
+  `dispatch`, the assignment facts project the latest completed fix for the
+  supplied work item so a re-fix gate can inspect its commissioned verdicts
+  before the next assignment exists.
+
   Rule denials and fact errors are written as `kind = "denied"` events by
   dispatch. That audit write is best-effort: an unavailable event sink never
   turns a denial into an allowed call.
@@ -107,6 +114,8 @@ defmodule Tightbeam.Rules do
     "assignment.produced_verdict_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
+    "work_item.is_bug" => :bool,
+    "assignment.prior_completed_fix_count" => :int,
     "assign.declared_files_overlap_open" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
@@ -1060,6 +1069,53 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("work_item.is_bug", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case DB.query(db, "SELECT isBug FROM work_items WHERE id = ?1", [work_item_id]) do
+            {:ok, [[is_bug]]} -> is_bug == 1
+            {:ok, []} -> nil
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.prior_completed_fix_count", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        current_assignment_id =
+          case Map.get(call.params, :assignment_id) do
+            id when is_binary(id) -> id
+            _ -> nil
+          end
+
+        {:ok, [[count]]} =
+          DB.query(
+            db,
+            """
+            SELECT count(*)
+            FROM assignments
+            WHERE workItemId = ?1
+              AND reviewsAssignmentId IS NULL
+              AND state = 'closed'
+              AND outcome = 'completed'
+              AND (?2 IS NULL OR id != ?2)
+            """,
+            [work_item_id, current_assignment_id]
+          )
+
+        {count, cache}
+    end)
+  end
+
   defp compute_fact("assign.declared_files_overlap_open", db, call, cache) do
     value =
       case {call.verb, Map.get(call.params, :files)} do
@@ -1089,31 +1145,48 @@ defmodule Tightbeam.Rules do
     {target, cache}
   end
 
+  defp compute_fact("$work_item_id", db, call, cache) do
+    case Map.get(call.params, :work_item_id) do
+      work_item_id when is_binary(work_item_id) ->
+        {work_item_id, cache}
+
+      _ ->
+        with_dependency("$assignment", db, call, cache, fn
+          nil, cache -> {nil, cache}
+          assignment, cache -> {assignment.work_item_id, cache}
+        end)
+    end
+  end
+
   defp compute_fact("$assignment", db, call, cache) do
     assignment =
       case Map.get(call.params, :assignment_id) do
         id when is_binary(id) ->
-          case DB.query(
-                 db,
-                 "SELECT a.id, a.holderKey, s.archetype, a.holderHarness, a.holderProvider FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
-                 [id]
-               ) do
-            {:ok,
-             [[assignment_id, holder_key, holder_archetype, holder_harness, holder_provider]]} ->
-              %{
-                id: assignment_id,
-                holder_key: holder_key,
-                holder_archetype: holder_archetype,
-                holder_harness: holder_harness,
-                holder_provider: holder_provider
-              }
-
-            {:ok, []} ->
-              nil
-          end
+          assignment_context(
+            db,
+            "WHERE a.id = ?1",
+            [id]
+          )
 
         _ ->
-          nil
+          case {call.verb, Map.get(call.params, :work_item_id)} do
+            {"dispatch", work_item_id} when is_binary(work_item_id) ->
+              assignment_context(
+                db,
+                """
+                WHERE a.workItemId = ?1
+                  AND a.reviewsAssignmentId IS NULL
+                  AND a.state = 'closed'
+                  AND a.outcome = 'completed'
+                ORDER BY a.closedAt DESC, a.id DESC
+                LIMIT 1
+                """,
+                [work_item_id]
+              )
+
+            _ ->
+              nil
+          end
       end
 
     {assignment, cache}
@@ -1140,6 +1213,43 @@ defmodule Tightbeam.Rules do
     authors
     |> Enum.map(& &1.verdict_kind)
     |> Enum.uniq()
+  end
+
+  defp assignment_context(db, where, params) do
+    case DB.query(
+           db,
+           """
+           SELECT a.id, a.workItemId, a.holderKey, s.archetype,
+                  a.holderHarness, a.holderProvider
+           FROM assignments a
+           JOIN sessions s ON s.sessionKey = a.holderKey
+           #{where}
+           """,
+           params
+         ) do
+      {:ok,
+       [
+         [
+           assignment_id,
+           work_item_id,
+           holder_key,
+           holder_archetype,
+           holder_harness,
+           holder_provider
+         ]
+       ]} ->
+        %{
+          id: assignment_id,
+          work_item_id: work_item_id,
+          holder_key: holder_key,
+          holder_archetype: holder_archetype,
+          holder_harness: holder_harness,
+          holder_provider: holder_provider
+        }
+
+      {:ok, []} ->
+        nil
+    end
   end
 
   defp caller_user(db, call, cache) do

@@ -1,0 +1,315 @@
+defmodule Tightbeam.RefixRequiresDiagnosisTest do
+  use ExUnit.Case, async: false
+
+  alias Tightbeam.{
+    Archetypes,
+    Assignments,
+    ConditionFacts,
+    DB,
+    Devices,
+    Dispatch,
+    EventLog,
+    Gateway,
+    Idempotency,
+    Ledger,
+    Org,
+    Projection,
+    RailRemedy,
+    Roles,
+    Rules,
+    Wakes,
+    WorkItems,
+    WorkState
+  }
+
+  setup do
+    db = :"refix_diagnosis_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+
+    for module <- [
+          Devices,
+          ConditionFacts,
+          Idempotency,
+          Ledger,
+          Org,
+          Projection,
+          Roles,
+          Wakes,
+          WorkItems,
+          Assignments,
+          WorkState,
+          EventLog,
+          RailRemedy
+        ] do
+      :ok = module.ensure_schema(db)
+    end
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
+      )
+
+    holder = session(db, "fix-holder", "coder", "claude", "anthropic")
+    recon = session(db, "recon-holder", "recon", "codex", "openai")
+    Roles.create!(db, "recon", "flynn", recon.session_key)
+
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-refix-diagnosis-#{System.unique_integer([:positive])}"
+      )
+
+    assert :initialized = Archetypes.init_identity!(base_dir)
+    archetypes = Archetypes.load!(base_dir)
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/rules/engineering.toml",
+      Path.join([base_dir, "identity", "rules", "engineering.toml"])
+    )
+
+    handlers = Gateway.handlers(%{db: db})
+
+    rules = Rules.load!(base_dir, Map.keys(handlers), %{})
+
+    on_exit(fn ->
+      File.rm_rf!(base_dir)
+      :persistent_term.erase(Rules)
+      :persistent_term.erase(Archetypes)
+    end)
+
+    %{
+      archetypes: archetypes,
+      base_dir: base_dir,
+      db: db,
+      handlers: handlers,
+      holder: holder,
+      recon: recon,
+      rules: rules
+    }
+  end
+
+  test "shipped statute loads through satisfiability and first-attempt bugs proceed", ctx do
+    assert Enum.map(ctx.rules, & &1.name) == [
+             "completion-requires-review",
+             "refix-requires-diagnosis"
+           ]
+
+    item = work_item(ctx, true)
+
+    assert {:ok, assignment} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               dispatch_call(ctx.holder.session_key, item.id, "first fix")
+             )
+
+    assert assignment.subject == "first fix"
+    assert no_diagnosis_assignments(ctx.db, item.id)
+  end
+
+  test "completed prior bug fix redirects re-dispatch once to a bug-provenance recon", ctx do
+    item = work_item(ctx, true)
+    prior = completed_fix(ctx, item.id)
+    call = dispatch_call(ctx.holder.session_key, item.id, "repeat fix")
+
+    assert {:error,
+            %{
+              reason: "remedy_fired",
+              producer: diagnosis_id,
+              ref: work_item_id,
+              rule: "refix-requires-diagnosis"
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    assert work_item_id == item.id
+
+    diagnosis = assignment(ctx.db, diagnosis_id)
+    assert diagnosis.holderKey == ctx.recon.session_key
+    assert diagnosis.holderRole == "recon"
+    assert diagnosis.reviewsAssignmentId == prior.id
+    assert diagnosis.workItemId == item.id
+    assert diagnosis.subject == "diagnosis of prior fix for work item #{item.id}"
+    assert "bug-provenance" in ctx.archetypes["recon"].skills
+
+    assert %{status: "live", producer_key: ^diagnosis_id} =
+             RailRemedy.episode(ctx.db, "refix-requires-diagnosis", item.id)
+
+    assert {:error, %{reason: "remedy_fired", producer: ^diagnosis_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*)
+               FROM assignments
+               WHERE workItemId = ?1 AND reviewsAssignmentId = ?2
+               """,
+               [item.id, prior.id]
+             )
+  end
+
+  test "independent diagnosed verdict releases the re-fix dispatch", ctx do
+    item = work_item(ctx, true)
+    prior = completed_fix(ctx, item.id)
+    call = dispatch_call(ctx.holder.session_key, item.id, "diagnosed repeat fix")
+
+    assert {:error, %{producer: diagnosis_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    assert {:ok, %{attest: %{verdictKind: "diagnosed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.recon.session_key, diagnosis_id, "diagnosed")
+             )
+
+    assert {:ok, refix} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert refix.subject == "diagnosed repeat fix"
+    assert refix.id != prior.id
+
+    assert %{status: "closed", producer_key: ^diagnosis_id} =
+             RailRemedy.episode(ctx.db, "refix-requires-diagnosis", item.id)
+  end
+
+  test "non-bug work item with a completed prior fix is unaffected", ctx do
+    item = work_item(ctx, false)
+    prior = completed_fix(ctx, item.id)
+
+    assert {:ok, next} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               dispatch_call(ctx.holder.session_key, item.id, "ordinary follow-up")
+             )
+
+    assert next.id != prior.id
+    assert next.subject == "ordinary follow-up"
+    assert no_diagnosis_assignments(ctx.db, item.id)
+    assert RailRemedy.episode(ctx.db, "refix-requires-diagnosis", item.id) == nil
+  end
+
+  test "open fixes and completed review aspects do not count as completed prior fixes", ctx do
+    item = work_item(ctx, true)
+    open_fix = assign(ctx, ctx.holder.session_key, item.id, "open fix")
+
+    review =
+      assign(
+        ctx,
+        ctx.recon.session_key,
+        item.id,
+        "completed review aspect",
+        reviews_assignment_id: open_fix.id
+      )
+
+    complete(ctx, ctx.recon.session_key, review.id)
+
+    assert {:ok, next} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               dispatch_call(ctx.holder.session_key, item.id, "still first completed fix")
+             )
+
+    assert next.subject == "still first completed fix"
+    assert no_diagnosis_assignments(ctx.db, item.id)
+  end
+
+  defp work_item(ctx, is_bug) do
+    WorkItems.__handle__(ctx.db, "work-item-create", %{
+      principal: {:user, "flynn"},
+      params: %{title: "Bug #{System.unique_integer([:positive])}", is_bug: is_bug}
+    })
+  end
+
+  defp completed_fix(ctx, work_item_id) do
+    assignment = assign(ctx, ctx.holder.session_key, work_item_id, "completed fix")
+    complete(ctx, ctx.holder.session_key, assignment.id)
+    assignment
+  end
+
+  defp assign(ctx, holder_key, work_item_id, subject, opts \\ []) do
+    Assignments.__handle__(ctx.db, "assign", %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: holder_key,
+      target_role: nil,
+      role_fallback: false,
+      params: %{
+        subject: subject,
+        work_item_id: work_item_id,
+        reviews_assignment_id: opts[:reviews_assignment_id]
+      }
+    })
+  end
+
+  defp complete(ctx, holder_key, assignment_id) do
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:#{holder_key}",
+      principal: {:session, holder_key},
+      session_key: nil,
+      params: %{assignment_id: assignment_id, kind: "completion"}
+    })
+  end
+
+  defp dispatch_call(holder_key, work_item_id, subject) do
+    %{
+      verb: "dispatch",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: holder_key,
+      target_role: nil,
+      role_fallback: false,
+      params: %{
+        subject: subject,
+        brief: "Implement #{subject}.",
+        work_item_id: work_item_id
+      }
+    }
+  end
+
+  defp verdict_call(holder_key, assignment_id, kind) do
+    %{
+      verb: "attest",
+      origin: "agent:recon",
+      principal: {:session, holder_key},
+      session_key: nil,
+      params: %{assignment_id: assignment_id, kind: "verdict", verdict_kind: kind}
+    }
+  end
+
+  defp assignment(db, assignment_id) do
+    Assignments.__handle__(db, "assignment-get", %{
+      principal: {:user, "flynn"},
+      params: %{assignment_id: assignment_id}
+    })
+  end
+
+  defp no_diagnosis_assignments(db, work_item_id) do
+    match?(
+      {:ok, [[0]]},
+      DB.query(
+        db,
+        "SELECT count(*) FROM assignments WHERE workItemId = ?1 AND holderRole = 'recon'",
+        [work_item_id]
+      )
+    )
+  end
+
+  defp session(db, key, archetype, harness, provider) do
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      kind: "custom",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: archetype,
+      host: "eezo",
+      harness: harness,
+      provider: provider,
+      model: "test"
+    })
+  end
+end
