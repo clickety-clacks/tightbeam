@@ -238,6 +238,10 @@ pub enum Command {
         identity: Identity,
         name: String,
     },
+    KungfuScaffold {
+        identity: Identity,
+        name: String,
+    },
     ApproveDevice {
         identity: Identity,
         device_id: String,
@@ -439,6 +443,9 @@ COMMANDS:
       library and pushes every satellite replica immediately.
   skill rm <name>                               remove a skill (admin); refused
       while any archetype elects it. Pruning inside a tree is an edit.
+  kungfu-scaffold <name>                        create a valid kungfu starter
+      across its real identity homes in one attributed commit (admin). Refuses
+      if any target already exists.
 
   approve-device <deviceId> [--user <userId>]   approve a pending device
   deny-device <deviceId>                         reject a pending device
@@ -1167,6 +1174,15 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
         }
         "role" => parse_role(&parsed, flags),
         "skill" => parse_skill(&parsed, flags),
+        "kungfu-scaffold" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam kungfu-scaffold <name>".to_owned());
+            }
+            Ok(Command::KungfuScaffold {
+                identity: identity(flags)?,
+                name: parsed.positional[1].clone(),
+            })
+        }
         "approve-device" => {
             let device_id = parsed.positional.get(1).cloned().ok_or_else(|| {
                 "usage: tightbeam approve-device <deviceId> [--user <userId>]".to_owned()
@@ -1710,6 +1726,7 @@ mod tests {
             strings(&["role", "list", "--as-user", "flynn"]),
             strings(&["skill", "list", "--as-user", "flynn"]),
             strings(&["skill", "rm", "swift", "--as-user", "flynn"]),
+            strings(&["kungfu-scaffold", "demo", "--as-user", "flynn"]),
             strings(&["approve-device", "d1", "--as-user", "flynn"]),
             strings(&["deny-device", "d1", "--as-user", "flynn"]),
             strings(&["revoke-device", "d1", "--as-user", "flynn"]),
@@ -1753,6 +1770,19 @@ mod tests {
         ]);
         fs::remove_file(skill_path).unwrap();
         assert!(matches!(skill_put, Ok(Command::SkillPut { .. })));
+    }
+
+    #[test]
+    fn kungfu_scaffold_requires_exactly_one_name() {
+        for args in [
+            strings(&["kungfu-scaffold"]),
+            strings(&["kungfu-scaffold", "demo", "extra"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam kungfu-scaffold <name>".to_owned())
+            );
+        }
     }
 
     #[test]

@@ -112,6 +112,55 @@ defmodule Tightbeam.ArchetypesTest do
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
   end
 
+  test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
+    for name <- ["", "-demo", "Demo", "demo_name", "demo--name", "demo-"] do
+      assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
+        Archetypes.scaffold_kungfu!(ctx.base_dir, name, "user:flynn")
+      end
+
+      refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
+    end
+  end
+
+  test "kungfu scaffold refuses each occupied target without writing any sibling", ctx do
+    relative_templates = [
+      "archetypes/<name>-role.toml",
+      "guidance/<name>-role.md",
+      "skills/<name>-example/SKILL.md",
+      "rails/<name>-example.toml",
+      "kungfu/<name>/capabilities.md",
+      "kungfu/<name>/preferred-models.md",
+      "kungfu/<name>/intake.md",
+      "kungfu/<name>/README.md"
+    ]
+
+    for {occupied_template, index} <- Enum.with_index(relative_templates) do
+      name = "collision-#{index}"
+      base_dir = Path.join(ctx.base_dir, name)
+      assert Archetypes.init_identity!(base_dir) == :initialized
+      identity_dir = Path.join(base_dir, "identity")
+      occupied_relative = String.replace(occupied_template, "<name>", name)
+      occupied = Path.join(identity_dir, occupied_relative)
+      File.mkdir_p!(Path.dirname(occupied))
+      File.write!(occupied, "operator-owned")
+
+      assert_raise ArgumentError,
+                   "kungfu scaffold target already exists: identity/#{occupied_relative}",
+                   fn ->
+                     Archetypes.scaffold_kungfu!(base_dir, name, "user:flynn")
+                   end
+
+      assert File.read!(occupied) == "operator-owned"
+
+      for template <- relative_templates -- [occupied_template] do
+        sibling = template |> String.replace("<name>", name) |> then(&Path.join(identity_dir, &1))
+        refute File.exists?(sibling)
+      end
+
+      assert {"1\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
+    end
+  end
+
   test "loads all fields, merges the built-in default, and permits default override", ctx do
     File.write!(Path.join(ctx.manifests, "coder.toml"), """
     name = "coder"
