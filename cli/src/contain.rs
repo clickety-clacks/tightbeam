@@ -441,10 +441,10 @@ mod macos_custody {
     ) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if collected.is_none() {
-                if let Ok(Some(status)) = waitpid_nohang(pid) {
-                    *collected = Some(status);
-                }
+            if collected.is_none()
+                && let Ok(Some(status)) = waitpid_nohang(pid)
+            {
+                *collected = Some(status);
             }
             if group_absent(pid).unwrap_or(false) {
                 return true;

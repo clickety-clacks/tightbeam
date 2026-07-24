@@ -147,18 +147,6 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InitArgs {
-    pub base_dir: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SetupArgs {
-    pub base_dir: Option<String>,
-    pub harnesses: Vec<String>,
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssimilateArgs {
     pub ssh_dest: String,
     pub as_user: String,
