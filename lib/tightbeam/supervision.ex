@@ -10,6 +10,7 @@ defmodule Tightbeam.Supervision do
     Dispatch,
     Escalation,
     EventLog,
+    Gateway,
     Ledger,
     Org,
     RailRemedy,
@@ -159,7 +160,8 @@ defmodule Tightbeam.Supervision do
     state = %{
       db: Keyword.fetch!(opts, :db),
       handlers: Keyword.fetch!(opts, :handlers),
-      n: Keyword.fetch!(opts, :prod_limit)
+      n: Keyword.fetch!(opts, :prod_limit),
+      delivery_opts: Keyword.take(opts, [:conn_registry, :lane_manager])
     }
 
     {:ok, state, {:continue, :recovery_sweep}}
@@ -184,6 +186,7 @@ defmodule Tightbeam.Supervision do
     safe_evaluate(state, session_key, fn ->
       :ok = Escalation.withdraw_for_retired(state.db, session_key)
       doorbells_for_holder(state.db, session_key)
+      notify_stranded_ancestor(state, session_key)
     end)
 
     {:noreply, state}
@@ -751,6 +754,33 @@ defmodule Tightbeam.Supervision do
 
     if stamped, do: best_effort_lifecycle(db, "supervision_stranded", assignment_id, nil)
     :ok
+  end
+
+  defp notify_stranded_ancestor(state, session_key) do
+    case Assignments.open_count(state.db, session_key) do
+      0 ->
+        :ok
+
+      count ->
+        target = ladder_target(state.db, session_key, 1)
+        row_label = if count == 1, do: "row", else: "rows"
+
+        prompt =
+          "Session #{session_key} retired with #{count} open assignment #{row_label}. " <>
+            "The work is stranded and requires your attention."
+
+        Gateway.deliver_prompt(
+          target,
+          "process:tightbeam",
+          prompt,
+          [
+            db: state.db,
+            sender: "process:tightbeam",
+            device_id: "process:tightbeam",
+            client_message_id: "retired-strand:#{session_key}"
+          ] ++ state.delivery_opts
+        )
+    end
   end
 
   defp sweep(state) do

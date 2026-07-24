@@ -1,0 +1,9 @@
+# Replace this deliberately unmatchable starter statute with real law authored
+# under tightbeam-law-minting.
+[[statute]]
+name = "<name>-example"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+pattern = "TIGHTBEAM_KUNGFU_TEMPLATE_PLACEHOLDER_NEVER_MATCHES"
+text = "Replace this starter statute with the kungfu's real enforceable law."

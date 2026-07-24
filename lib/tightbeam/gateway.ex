@@ -499,6 +499,17 @@ defmodule Tightbeam.Gateway do
           root = p.name |> String.split("/") |> hd()
           %{skill: p.name, path: path, pushed: Placement.push_skill(config, root, :put)}
         end),
+      "kungfu-scaffold" =>
+        admin_call_handler(db, fn call ->
+          paths =
+            Archetypes.scaffold_kungfu!(
+              config.base_dir,
+              call.params.name,
+              call.origin
+            )
+
+          %{kungfu: call.params.name, paths: paths}
+        end),
       "skill-rm" =>
         admin_call_handler(db, fn call ->
           p = call.params

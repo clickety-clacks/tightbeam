@@ -781,6 +781,57 @@ defmodule Tightbeam.SupervisionTest do
     assert Process.alive?(pid)
   end
 
+  test "retiring a holder with open assignments delivers one notice to its first living ancestor",
+       ctx do
+    name = start_retirement_supervision(ctx)
+
+    Org.retire(ctx.db, "holder")
+    Supervision.notify_retired(name, "holder")
+    :sys.get_state(name)
+
+    assert [notice] = Projection.list_after(ctx.db, "supervisor", nil, 10)
+    assert notice.sender == "process:tightbeam"
+    assert notice.content =~ "Session holder retired with 1 open assignment row."
+    assert notice.content =~ "The work is stranded and requires your attention."
+    assert Ledger.pending_count(ctx.db, "supervisor") == 1
+    assert Projection.list_after(ctx.db, ctx.main.session_key, nil, 10) == []
+
+    Supervision.notify_retired(name, "holder")
+    :sys.get_state(name)
+
+    assert [_notice] = Projection.list_after(ctx.db, "supervisor", nil, 10)
+    assert Ledger.pending_count(ctx.db, "supervisor") == 1
+  end
+
+  test "dead ancestors are skipped and an open-assignment strand reaches the org owner root",
+       ctx do
+    name = start_retirement_supervision(ctx)
+
+    Org.retire(ctx.db, "supervisor")
+    Org.retire(ctx.db, "holder")
+    Supervision.notify_retired(name, "holder")
+    :sys.get_state(name)
+
+    assert Projection.list_after(ctx.db, "supervisor", nil, 10) == []
+    assert [notice] = Projection.list_after(ctx.db, ctx.main.session_key, nil, 10)
+    assert notice.content =~ "Session holder retired with 1 open assignment row."
+    assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 1
+  end
+
+  test "retiring a holder without open assignments delivers no strand notice", ctx do
+    idle = session(ctx.db, "idle-holder", ctx.supervisor.session_key)
+    name = start_retirement_supervision(ctx)
+
+    Org.retire(ctx.db, idle.session_key)
+    Supervision.notify_retired(name, idle.session_key)
+    :sys.get_state(name)
+
+    assert Projection.list_after(ctx.db, ctx.supervisor.session_key, nil, 10) == []
+    assert Projection.list_after(ctx.db, ctx.main.session_key, nil, 10) == []
+    assert Ledger.pending_count(ctx.db, ctx.supervisor.session_key) == 0
+    assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 0
+  end
+
   test "N=0 cross-assignment re-entry exceeds N+1 and then quiesces at Main", ctx do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET spawnedBy='holder' WHERE sessionKey='supervisor'")
@@ -998,6 +1049,28 @@ defmodule Tightbeam.SupervisionTest do
         lane_manager: lane
       )
     end
+  end
+
+  defp start_retirement_supervision(ctx) do
+    suffix = System.unique_integer([:positive])
+    registry = :"retirement_conn_registry_#{suffix}"
+    lane = :"retirement_lane_manager_#{suffix}"
+    name = :"retirement_supervision_#{suffix}"
+
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({LaneDoorbell, lane})
+
+    start_supervised!(
+      {Supervision,
+       db: ctx.db,
+       handlers: ctx.handlers,
+       prod_limit: 3,
+       conn_registry: registry,
+       lane_manager: lane,
+       name: name}
+    )
+
+    name
   end
 
   defp eventually(fun, tries \\ 100) do

@@ -1,0 +1,22 @@
+# Flagship enforced loop (roadmap P7): completion requires an independent review.
+# A coder attesting completion without a reviewed-clean verdict is not denied — the
+# substrate assigns a reviewer (the remedy), blocks the completion until the review
+# lands, and self-releases. This is the reviewer-loop worked example, enforced.
+[[rule]]
+name = "completion-requires-review"
+verb = "attest"
+text = "completion requires a reviewed-clean verdict from an independent reviewer"
+external_producer = false
+edges = ["verb"]
+effect = "remedy"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]
+[rule.remedy]
+action = "assign"
+produces = "reviewed-clean"
+target_role = "reviewer"
+[rule.remedy.params]
+subject = "review of assignment {assignment_id}"
+reviews = "{assignment_id}"

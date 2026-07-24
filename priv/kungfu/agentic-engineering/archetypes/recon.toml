@@ -1,0 +1,14 @@
+name = "recon"
+where = ["eezo", "racter"]
+skills = ["recon-first-investigation", "recon-lifecycle", "bug-provenance", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+
+[guidance]
+text = """
+#include "wisdom.md"
+
+#include "engineering-tenets.md"
+
+#include "preferred-models.md"
+
+#include "recon.md"
+"""

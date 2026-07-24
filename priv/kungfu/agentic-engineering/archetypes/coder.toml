@@ -1,0 +1,14 @@
+name = "coder"
+where = ["eezo", "racter"]
+skills = ["worktree-session", "committing-and-pushing", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+
+[guidance]
+text = """
+#include "wisdom.md"
+
+#include "engineering-tenets.md"
+
+#include "preferred-models.md"
+
+#include "coder.md"
+"""

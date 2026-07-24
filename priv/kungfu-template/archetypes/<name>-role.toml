@@ -1,0 +1,7 @@
+name = "<name>-role"
+skills = []
+
+[guidance]
+text = """
+#include "<name>-role.md"
+"""

@@ -600,6 +600,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("name", name)],
         )),
+        Command::KungfuScaffold { identity, name } => Ok(request(
+            identity,
+            "kungfu-scaffold",
+            vec![],
+            vec![string_field("name", name)],
+        )),
         Command::ApproveDevice {
             identity,
             device_id,
@@ -889,6 +895,7 @@ fn identity_omitted(command: &Command) -> bool {
         | Command::SkillList { identity }
         | Command::SkillPut { identity, .. }
         | Command::SkillRemove { identity, .. }
+        | Command::KungfuScaffold { identity, .. }
         | Command::ApproveDevice { identity, .. }
         | Command::DenyDevice { identity, .. }
         | Command::RevokeDevice { identity, .. }
@@ -1173,6 +1180,10 @@ mod tests {
         assert_eq!(
             build_request(&command).unwrap().body_json,
             r#"{"asUser":"flynn","verb":"skill-put","params":{"name":"swift/concurrency","content":"line one\nline two"}}"#
+        );
+        assert_eq!(
+            body(&["kungfu-scaffold", "demo", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"kungfu-scaffold","params":{"name":"demo"}}"#
         );
         assert_eq!(
             body(&["promote-user", "mike", "--demote", "--as-user", "flynn"]),

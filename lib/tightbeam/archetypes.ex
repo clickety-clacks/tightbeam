@@ -52,8 +52,8 @@ defmodule Tightbeam.Archetypes do
   recursively at compile time. Includes are parts-listing in-text and
   nothing more: no variables, no conditionals, no logic (a template that can
   compute is an agent that can't be audited). The substrate ships the
-  built-in "operating-manual.md" fragment to every home, and an operator
-  fragment of the same name OVERRIDES the built-in. Resolution is validated
+  built-in "operating-manual.md" fragment to every home. That fragment is
+  substrate-owned and cannot be overridden by an org file. Resolution is validated
   at load!: a missing fragment or an include cycle fails the boot. Because
   composition happens before the projection hash, editing a fragment
   regenerates exactly the homes that include it.
@@ -95,165 +95,6 @@ defmodule Tightbeam.Archetypes do
           source: %{file: String.t(), sha256: String.t()} | nil
         }
 
-  @builtin_operating_manual """
-  # Operating tightbeam
-
-  You run your work through the `tightbeam` command. Its output is JSON on stdout; a nonzero
-  exit is a failure, with the reason on stderr. Command examples in this manual use example
-  names — a user `mike`, a `reviewer` role, a model `gpt-5.6-sol[high]`; substitute the real
-  ids from your org and its catalog.
-
-  ## Where you are
-  You are an agent — one running session, with an address, an owner, and a job — inside
-  tightbeam, where AI agents coordinate to do work for a person (the user). Other agents are
-  your colleagues; you reach them and hire more. Tightbeam woke you because there is something
-  to do. It holds your identity, mailbox, and history across restarts and machine moves. When
-  tightbeam refuses a command, it names the rule that refused it. Read the reason.
-
-  ## See what is around you
-  Run `tightbeam list`. It returns the sessions you can address, the archetypes in this org,
-  the hosts (machines agents run on), and the model catalog (the model names you may use). Use
-  a model name from that catalog exactly.
-
-  ## Identity: who a command is attributed to
-  Tightbeam attributes every command to an identity — the accountability record of who acted.
-  In a session's own workdir, tightbeam derives the identity from the session credential and
-  no identity flag is required. Use `--as <role>` to attribute the command to a specific role
-  the session holds. Use `--as-user <id>` to attribute it to the human. An identity is who the
-  command is attributed to, not its target.
-
-  ## Talk to a colleague: wake
-  Agents communicate by waking each other — delivering a prompt to a mailbox:
-
-      tightbeam wake --role reviewer --prompt "review the auth change"
-
-  That delivers a message now. To deliver it later, add `--after 30m` or `--at <epochMs>`.
-  Every wake carries a prompt. To answer a prompt tagged `[from user:mike]`, run
-  `wake --user mike`; tagged `[from role:notetaker]`, run `wake --role notetaker`.
-
-  ## Wake yourself to work later
-  You run only when woken. To do deferred work — wait for a build, check back on a colleague,
-  retry after a delay, or resume a long task — schedule a wake to your own role and add
-  `--after`/`--at`:
-
-      tightbeam wake --role <your-role> --prompt "check if the build finished, then continue" --after 10m
-
-  The prompt you send yourself instructs the future you. Cancel a scheduled wake with
-  `tightbeam cancel-wake <wakeId>`, using the id the wake command returned.
-
-  ## Work with colleagues without disrupting them
-  Ask a colleague when that colleague can answer something you need to do your job. Do not send
-  idle status requests or nudges. Send routine progress to your owner.
-
-  ## Hire help: spawn and retire
-  Start a new session:
-
-      tightbeam spawn --display "Reviewer" --name reviewer --harness codex --model "gpt-5.6-sol[high]"
-
-  `--display` is the human label; `--name` registers a role bound to the new session so you can
-  address it. Add `--archetype <name>` to give the session that archetype's identity — its
-  guidance, skills, and allowed hosts; add `--host <name>` to place it on a machine the
-  archetype allows. End a session with `tightbeam retire --session <key>`; its history is kept.
-  Pass `--key <idempotencyKey>` on a spawn, assign, or wake you may retry, so the retry does not
-  create a duplicate.
-  Name what you hire so a directory of fifty reads at a glance. `--display` is
-  "<Role> — <specific purpose>" ("Reviewer — picker duplicate titles"), never a bare
-  role noun; `--name` is "<function>:<work-slug>" ("reviewer:picker-titles") so wakes
-  address it unambiguously and a second hire for other work gets a different slug. The
-  substrate already records who spawned what and why it exists; the name's job is what
-  it is FOR.
-
-
-  When you give work to anyone — a hire or a colleague — the assignment row IS the
-  dispatch: open it first (`tightbeam assign --subject "..." --work-item <id>`), then wake
-  the holder with at most one sentence plus the assignment id. The rows are the brief; a
-  wake without a card you opened is an expectation you chose not to record. Thread every
-  assignment to the work item it serves. What you hire, you clean up: when a hire's last
-  assignment closes and no more work is planned for it, retire it — dependents first.
-
-  ## Before you build what tightbeam already is
-  When work — yours or the user's ask — starts to look like one of these, tightbeam (or
-  an installed kungfu) already does it: guardrails/checks on agent behavior (rails);
-  ticketing or task tracking (work items + assignments); cron jobs, reminders, pollers
-  (wakes and condition wakes); running agents on other machines over ssh (assimilation);
-  per-agent prompt/config profiles (archetypes); accumulated playbooks and process docs
-  (kungfu bundles); dashboards or logs of agent activity (the event stream). The rule:
-  NAME the native feature to whoever commissioned the work before building a parallel
-  one — once, plainly — then build only if they still want their own. At the start of any
-  conversation with a USER, read each installed kungfu's `kungfu/<name>/capabilities.md`
-  — they carry the watch-for signals you cannot recognize unread; they are small by
-  design. Work wakes from agents need none of this.
-
-  ## Track work: work-items, assignments, facts
-  Work is tracked as durable records, not in chat.
-  - A work-item is the durable thread for one feature or bug:
-
-      tightbeam work-item-create --title "voice dictation crash on resume"
-
-  - An assignment is an obligation on that work, held by a session:
-
-      tightbeam assign --subject "fix the resume crash" --role coder --work-item <workItemId>
-
-  - Record what happens against your assignment with attest:
-
-      tightbeam attest <assignmentId> --kind progress   --note "root-caused to a nil token"
-      tightbeam attest <assignmentId> --kind completion --note "fixed; tests green"
-      tightbeam attest <assignmentId> --kind surrender  --note "blocked on device access"
-
-  - Record a judgment — a review, a test outcome, the user's decision — as a verdict:
-
-      tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "…"
-
-  These facts are the state of the work. The state is computed from the facts; there is no
-  status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
-  with `tightbeam assignments --role <your-role>`.
-
-  ## Recover after losing context
-  You can lose context to compaction or a restart. On waking, re-derive the state from the
-  facts — read the work-item and its attests. Read the facts; do not rely on prior scrollback.
-
-  ## Where your files live
-  Your workdir is your durable artifact space: it survives restarts, home regeneration, and
-  machine moves. Everything durable you produce — checkouts, drafts, evidence — belongs in
-  your workdir. Your home is substrate-owned identity: the substrate may regenerate it at any
-  time, and anything loose in it is forfeit. Keep work out of your home and out of system temp
-  directories.
-
-  ## Never end a turn with open work and nothing on the clock
-  While you hold an open assignment, end every turn with a filing — progress, completion, or
-  surrender — or a scheduled continuation wake to yourself. A turn that ends with neither is a
-  stall: the substrate prods you, naming the assignment, and prods that go unanswered escalate
-  to the session that spawned you.
-
-  ## Work alongside other agents
-  Other agents work in the same places at the same time. Another agent's in-progress material
-  is not yours to discard, and it is not a blocker to stall on. Reconcile it: identify who or
-  what created it, and either ask that owner to resolve it, or remove it yourself once you
-  have established it is safe to remove (abandoned, yours, or the owner agrees). Do your own
-  work in your own workspace. Examples: a git worktree holding uncommitted changes that are
-  not yours — do not stash, reset, or clean it; a shared document another session is
-  mid-edit on — do not overwrite or revert it.
-
-  ## When a rule stops a command
-  A rule can stop a command and name itself. Do not route around it. Take a path that does not
-  break the rule, or change what you are building. A rule that repeatedly stops you indicates
-  the approach is wrong.
-
-  ## When a decision is the user's
-  A decision that belongs to the user, and any vague point the work depends on (a spec hole on
-  a concept the work is built on), goes to the user. Do not guess and do not stall: ask. The
-  work waits until the user answers; the answer is recorded as a fact and releases the work.
-
-  ## Report so the user can act
-  - Support every claim with its source — a file and line, a log line, a specific commit.
-  - Report state the user can act on: what changed, what is ready, what remains, who acts next,
-    what decision you need.
-  - "Done" means the user can try it.
-  - State what an identifier means, not the bare identifier: "the fix that stops the resume
-    crash," not "abc123."
-  - To keep something, record it now (work-item, memory, or guidance). Do not defer it to
-    memory of your own.
-  """
 
   @doc """
   Load every manifest under `<base_dir>/identity/archetypes/*.toml`, validate,
@@ -305,7 +146,10 @@ defmodule Tightbeam.Archetypes do
       |> Path.wildcard()
       |> Enum.sort()
       |> Enum.reduce(builtin_fragments(), fn path, acc ->
-        Map.put(acc, Path.basename(path), File.read!(path))
+        case Path.basename(path) do
+          "operating-manual.md" -> acc
+          name -> Map.put(acc, name, File.read!(path))
+        end
       end)
 
     # Validate ALL law at load: every archetype's guidance must compose
@@ -339,7 +183,10 @@ defmodule Tightbeam.Archetypes do
     end
   end
 
-  @doc "The loaded fragment library — built-ins overridden by identity/guidance files."
+  @doc """
+  The loaded fragment library. Org identity files override elected bundle guidance;
+  the substrate operating manual remains built-in and immutable.
+  """
   @spec fragments() :: %{optional(String.t()) => String.t()}
   def fragments do
     # Before load!/1 has run (unit tests, tooling) the built-ins stand alone.
@@ -691,10 +538,105 @@ defmodule Tightbeam.Archetypes do
   @doc "The built-in guidance fragment library."
   @spec builtin_fragments() :: %{optional(String.t()) => String.t()}
   def builtin_fragments do
-    %{
-      "operating-manual.md" => @builtin_operating_manual
-    }
+    shared =
+      for name <- ["engineering-tenets.md", "harness-support.md", "preferred-models.md", "wisdom.md"],
+          into: %{} do
+        {name, shipped_guidance!(Path.join(["kungfu", "agentic-engineering", "guidance", name]))}
+      end
+
+    archetypes =
+      for name <- engineering_archetype_names(), into: %{} do
+        {"#{name}.md",
+         shipped_guidance!(
+           Path.join(["kungfu", "agentic-engineering", "archetypes", "#{name}.md"])
+         )}
+      end
+
+    shared
+    |> Map.merge(archetypes)
+    # The operating manual is shipped content (priv/guidance/operating-manual.md),
+    # the single source of truth — not a hardcoded literal that can drift from it.
+    |> Map.put("operating-manual.md", shipped_guidance!("guidance/operating-manual.md"))
   end
+
+  # Skill elections mirror the shipped archetype .toml manifests
+  # (priv/kungfu/agentic-engineering/archetypes/<name>.toml) verbatim — those
+  # manifests are the cultivated ground truth; this map must not drift from them.
+  @engineering_archetype_skills %{
+    "orchestrator" => [
+      "feature-cycle",
+      "work-tracking",
+      "unblocking",
+      "tightbeam-law-minting",
+      "tightbeam-guidance-authoring"
+    ],
+    "spec-writer" => [
+      "drafting-requirements",
+      "spec-homing",
+      "spec-handoff",
+      "tightbeam-law-minting",
+      "tightbeam-guidance-authoring"
+    ],
+    "coder" => [
+      "worktree-session",
+      "committing-and-pushing",
+      "tightbeam-law-minting",
+      "tightbeam-guidance-authoring"
+    ],
+    "reviewer" => [
+      "reviewing-code",
+      "reviewing-specs",
+      "spec-conformance",
+      "review-for-completeness",
+      "review-for-yagni",
+      "tightbeam-law-minting",
+      "tightbeam-guidance-authoring"
+    ],
+    "recon" => [
+      "recon-first-investigation",
+      "recon-lifecycle",
+      "bug-provenance",
+      "tightbeam-law-minting",
+      "tightbeam-guidance-authoring"
+    ],
+    "product-owner" => [
+      "tightbeam-dispatching",
+      "product-discovery",
+      "tightbeam-law-minting",
+      "tightbeam-guidance-authoring"
+    ]
+  }
+
+  @bundle_skill_names [
+    "feature-cycle",
+    "work-tracking",
+    "unblocking",
+    "spec-homing",
+    "spec-handoff",
+    "worktree-session",
+    "committing-and-pushing",
+    "reviewing-code",
+    "reviewing-specs",
+    "spec-conformance",
+    "review-for-completeness",
+    "review-for-yagni",
+    "recon-first-investigation",
+    "recon-lifecycle",
+    "bug-provenance",
+    "drafting-requirements",
+    "product-discovery"
+  ]
+
+  @kungfu_template_paths [
+    "archetypes/<name>-role.toml",
+    "guidance/<name>-role.md",
+    "skills/<name>-example/SKILL.md",
+    "rails/<name>-example.toml",
+    "kungfu/<name>/capabilities.md",
+    "kungfu/<name>/preferred-models.md",
+    "kungfu/<name>/intake.md",
+    "kungfu/<name>/README.md"
+  ]
 
   @doc """
   The org skills LIBRARY (spec §Agent identity: "skills chosen by name from
@@ -720,7 +662,14 @@ defmodule Tightbeam.Archetypes do
     if File.exists?(Path.join(identity_dir, ".git")) do
       :noop
     else
-      for directory <- ["archetypes", "guidance", "skills", "rails", "rules"] do
+      for directory <- [
+            "archetypes",
+            "guidance",
+            "skills",
+            "rails",
+            "rules",
+            "kungfu/agentic-engineering"
+          ] do
         File.mkdir_p!(Path.join(identity_dir, directory))
       end
 
@@ -729,13 +678,49 @@ defmodule Tightbeam.Archetypes do
         builtin_default_toml()
       )
 
-      for {name, content} <- builtin_fragments() do
+      for {name, content} <- Map.delete(builtin_fragments(), "operating-manual.md") do
         write_unless_exists!(Path.join([identity_dir, "guidance", name]), content)
       end
 
-      for directory <- ["rails", "rules"] do
-        write_unless_exists!(Path.join([identity_dir, directory, ".gitkeep"]), "")
+      for name <- engineering_archetype_names() do
+        write_unless_exists!(
+          Path.join([identity_dir, "archetypes", "#{name}.toml"]),
+          builtin_engineering_archetype_toml(name)
+        )
       end
+
+      for name <- builtin_skill_names() do
+        path = Path.join([identity_dir, "skills", name, "SKILL.md"])
+        File.mkdir_p!(Path.dirname(path))
+
+        write_unless_exists!(
+          path,
+          shipped_guidance!(
+            Path.join(["kungfu", "agentic-engineering", "skills", name, "SKILL.md"])
+          )
+        )
+      end
+
+      write_unless_exists!(
+        Path.join([identity_dir, "rails", "engineering.toml"]),
+        shipped_guidance!(
+          Path.join(["kungfu", "agentic-engineering", "rails", "engineering.toml"])
+        )
+      )
+
+      for name <- ["manifest.toml", "capabilities.md", "intake.md"] do
+        write_unless_exists!(
+          Path.join([identity_dir, "kungfu", "agentic-engineering", name]),
+          shipped_guidance!(Path.join(["kungfu", "agentic-engineering", name]))
+        )
+      end
+
+      write_unless_exists!(
+        Path.join(identity_dir, "tentpoles.md"),
+        shipped_guidance!("tentpoles.md")
+      )
+
+      write_unless_exists!(Path.join([identity_dir, "rules", ".gitkeep"]), "")
 
       git!(identity_dir, ["init"])
       git!(identity_dir, ["add", "-A"])
@@ -744,9 +729,36 @@ defmodule Tightbeam.Archetypes do
     end
   end
 
-  @doc "Built-in archetype skill election; substrate baseline skills project separately."
+  @doc "Skill files shipped by the built-in agentic-engineering bundle."
   @spec builtin_skill_names() :: [String.t()]
-  def builtin_skill_names, do: []
+  def builtin_skill_names, do: @bundle_skill_names
+
+  defp engineering_archetype_names do
+    ["orchestrator", "spec-writer", "coder", "reviewer", "recon", "product-owner"]
+  end
+
+  defp builtin_engineering_archetype_toml(name) do
+    skills = Map.fetch!(@engineering_archetype_skills, name)
+
+    """
+    name = #{JSON.encode!(name)}
+    skills = [#{Enum.map_join(skills, ", ", &JSON.encode!/1)}]
+
+    [guidance]
+    text = \"\"\"
+    #include "wisdom.md"
+    #include "engineering-tenets.md"
+    #include "preferred-models.md"
+    #include "#{name}.md"
+    \"\"\"
+    """
+  end
+
+  defp shipped_guidance!(relative_path) do
+    :tightbeam
+    |> Application.app_dir(Path.join("priv", relative_path))
+    |> File.read!()
+  end
 
   @doc """
   Library CRUD (the skill verbs' engine — mutation reaches here only
@@ -770,6 +782,49 @@ defmodule Tightbeam.Archetypes do
     File.write!(path, content)
     commit_identity!(base_dir, [path], "skill-put: #{name}", author)
     path
+  end
+
+  @doc """
+  Writes a valid, unelected kungfu starter into the identity repository's
+  scanned and bundle-local homes, then records the whole scaffold as one
+  attributed commit.
+  """
+  @spec scaffold_kungfu!(String.t(), String.t(), String.t()) :: [String.t()]
+  def scaffold_kungfu!(base_dir, name, author) do
+    name = validate_kungfu_name!(name)
+    init_identity!(base_dir)
+    identity_dir = Path.join(base_dir, "identity")
+
+    targets =
+      Enum.map(@kungfu_template_paths, fn template_relative ->
+        target_relative = String.replace(template_relative, "<name>", name)
+
+        content =
+          :tightbeam
+          |> Application.app_dir(Path.join("priv/kungfu-template", template_relative))
+          |> File.read!()
+          |> String.replace("<name>", name)
+
+        {Path.join(identity_dir, target_relative), content}
+      end)
+
+    case Enum.find(targets, fn {path, _content} -> File.exists?(path) end) do
+      {path, _content} ->
+        relative = Path.relative_to(path, identity_dir)
+        raise ArgumentError, "kungfu scaffold target already exists: identity/#{relative}"
+
+      nil ->
+        :ok
+    end
+
+    Enum.each(targets, fn {path, content} ->
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, content)
+    end)
+
+    paths = Enum.map(targets, &elem(&1, 0))
+    commit_identity!(base_dir, paths, "kungfu-scaffold: #{name}", author)
+    paths
   end
 
   @doc """
@@ -871,12 +926,21 @@ defmodule Tightbeam.Archetypes do
     Enum.join(segments, "/")
   end
 
+  defp validate_kungfu_name!(name) do
+    valid? =
+      is_binary(name) and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, name) and
+        not String.contains?(name, "--") and not String.ends_with?(name, "-")
+
+    unless valid?, do: raise(ArgumentError, "invalid kungfu name: #{inspect(name)}")
+    name
+  end
+
   @doc "The built-in default archetype (used when no manifest overrides it)."
   @spec builtin_default() :: t()
   def builtin_default do
     %{
       name: "default",
-      skills: builtin_skill_names(),
+      skills: [],
       where: [Tightbeam.Placement.local_host_name()],
       defaults: %{},
       references: [],
@@ -975,7 +1039,7 @@ defmodule Tightbeam.Archetypes do
     end
 
     where = Map.get(manifest, "where", [Tightbeam.Placement.local_host_name()])
-    skills = Map.get(manifest, "skills", builtin_skill_names())
+    skills = Map.get(manifest, "skills", [])
 
     unless is_list(skills) and Enum.all?(skills, &is_binary/1) do
       raise ArgumentError, "archetype skills must be a list of strings: #{path}"

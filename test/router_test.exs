@@ -95,6 +95,10 @@ defmodule Tightbeam.Wire.RouterTest do
       "artifacts" => fn call ->
         send(parent, {:call, call})
         %{artifacts: []}
+      end,
+      "kungfu-scaffold" => fn call ->
+        send(parent, {:call, call})
+        %{kungfu: call.params.name}
       end
     }
 
@@ -110,6 +114,25 @@ defmodule Tightbeam.Wire.RouterTest do
         session_status: fn _ -> nil end
       ]
     }
+  end
+
+  test "kungfu-scaffold crosses the closed CLI verb router with its attributed name", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "kungfu-scaffold",
+        asUser: "flynn",
+        params: %{name: "demo"}
+      })
+
+    assert response.status == 200
+    assert JSON.decode!(response.resp_body) == %{"result" => %{"kungfu" => "demo"}}
+
+    assert_receive {:call,
+                    %{
+                      verb: "kungfu-scaffold",
+                      origin: "user:flynn",
+                      params: %{name: "demo"}
+                    }}
   end
 
   test "work and work-item device routes expose owner-scoped random-access snapshots", ctx do
