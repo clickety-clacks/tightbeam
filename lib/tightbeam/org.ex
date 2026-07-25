@@ -71,7 +71,7 @@ defmodule Tightbeam.Org do
     identityName  TEXT,
     identityRevision TEXT,
     cliToken      TEXT,
-    harness       TEXT NOT NULL CHECK (harness IN ('claude','codex')),
+    harness       TEXT NOT NULL CHECK (harness IN (__TIGHTBEAM_HARNESSES__)),
     provider      TEXT NOT NULL CHECK (provider IN ('anthropic','openai')),
     model         TEXT NOT NULL,
     thinkingLevel TEXT,
@@ -103,7 +103,8 @@ defmodule Tightbeam.Org do
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
-    result = DB.execute(db, @ddl)
+    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+    result = DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
     # Additive migration for pre-placement databases (incl. TS-created ones,
     # adopt-in-place): a DEFAULT'd column is invisible to writers that name
     # their columns. Duplicate-column error means already migrated.

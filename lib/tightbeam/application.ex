@@ -28,7 +28,7 @@ defmodule Tightbeam.Application do
           base_dir: base_dir,
           cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
           port: Application.get_env(:tightbeam, :port, 4_321),
-          default_harness: Application.get_env(:tightbeam, :default_harness, :claude),
+          default_harness: Tightbeam.Harness.default().id(),
           default_model:
             Application.get_env(:tightbeam, :default_model, "claude-sonnet-5[medium]"),
           max_live_sessions_per_user:
@@ -70,7 +70,7 @@ defmodule Tightbeam.Application do
       # DB owner first — the serialization seam everything writes through.
       {Tightbeam.DB, path: db_path, name: Tightbeam.DB},
       # Schema + boot epoch as a transient one-shot after the DB is up.
-      Tightbeam.Boot,
+      {Tightbeam.Boot, base_dir},
       # Lane naming registry and the task supervisor for turn work.
       {Registry, keys: :unique, name: Tightbeam.LaneRegistry},
       {Task.Supervisor, name: Tightbeam.TurnTaskSupervisor},

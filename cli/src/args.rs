@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::harnesses::HarnessCatalog;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
     Role(String),
@@ -166,10 +168,11 @@ pub struct AssimilateArgs {
     pub name: Option<String>,
     pub base_dir: String,
     pub harnesses: Vec<String>,
+    pub catalog: HarnessCatalog,
     pub dry_run: bool,
 }
 
-pub const HELP: &str = r#"tightbeam — coordinate with other agent sessions in this org.
+const HELP_TEMPLATE: &str = r#"tightbeam — coordinate with other agent sessions in this org.
 
 Every command is one of the substrate's verbs; you invoke them exactly as the
 human operator does. Output is JSON on stdout; a nonzero exit means failure
@@ -212,7 +215,7 @@ COMMANDS:
       List artifact rows matching every supplied exact filter.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
-        [--harness claude|codex] [--model <ref>] [--host <host>]
+        [--harness {{HARNESSES_PIPE}}] [--model <ref>] [--host <host>]
         [--key <idempotencyKey>]
       Hire a new session (a worker). --display is its human label; --name
       registers a role bound to the new session — do NOT confuse it with --as,
@@ -220,7 +223,7 @@ COMMANDS:
       (same key returns the same session). Omitted fields inherit the
       archetype's defaults.
         tightbeam spawn --display "Reviewer" --name reviewer:x \
-          --harness codex --model "gpt-5.6-sol[high]" --as orchestrator:news
+          --harness {{EXAMPLE_HARNESS}} --model "<catalog-ref>" --as orchestrator:news
       --host picks a machine WITHIN the archetype's allowed set (see list's
       archetypes/hosts); omitted, the archetype's default placement applies.
       Model refs must come from list's model catalog — never invent one.
@@ -278,7 +281,7 @@ COMMANDS:
   doctor [--json] [--base-dir p]
       Check the local Tightbeam installation and report its health.
 
-  assimilate <ssh-dest> [--name n] [--base-dir p] [--harness claude,codex]
+  assimilate <ssh-dest> [--name n] [--base-dir p] [--harness {{HARNESSES_CSV}}]
              [--dry-run]
       Prepare a machine to run agent harnesses and register it as a host
       (admin). Probes ssh/node/rsync, creates the base dir, installs the
@@ -295,6 +298,28 @@ DISCOVERY: the CLI finds the gateway via TIGHTBEAM_URL + TIGHTBEAM_TOKEN, else
 DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
 
   tightbeam help | --help | -h    show this text."#;
+
+pub fn render_help(catalog: Option<&HarnessCatalog>) -> String {
+    let names = catalog.map(HarnessCatalog::names).unwrap_or_default();
+    let pointer = "<registered; run tightbeam doctor>";
+    let pipe = if names.is_empty() {
+        pointer.to_owned()
+    } else {
+        names.join("|")
+    };
+    let csv = if names.is_empty() {
+        pointer.to_owned()
+    } else {
+        names.join(",")
+    };
+    HELP_TEMPLATE
+        .replace("{{HARNESSES_PIPE}}", &pipe)
+        .replace("{{HARNESSES_CSV}}", &csv)
+        .replace(
+            "{{EXAMPLE_HARNESS}}",
+            names.first().map(String::as_str).unwrap_or(pointer),
+        )
+}
 
 const BOOLEAN_FLAGS: &[&str] = &[
     "abort", "all", "dry-run", "help", "json", "manifest", "resolve", "rm",
@@ -483,6 +508,18 @@ fn generated_key() -> String {
 }
 
 pub fn parse(args: Vec<String>) -> Result<Command, String> {
+    parse_with_optional_catalog(args, None)
+}
+
+#[cfg(test)]
+pub fn parse_with_catalog(args: Vec<String>, catalog: &HarnessCatalog) -> Result<Command, String> {
+    parse_with_optional_catalog(args, Some(catalog))
+}
+
+fn parse_with_optional_catalog(
+    args: Vec<String>,
+    supplied_catalog: Option<&HarnessCatalog>,
+) -> Result<Command, String> {
     let parsed = split_args(args);
     let command = parsed.positional.first().map(String::as_str);
     if command.is_none()
@@ -574,12 +611,22 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
         "spawn" => {
             let display_name =
                 nonempty(flags, "display").ok_or_else(|| "--display is required".to_owned())?;
+            let harness = nonempty(flags, "harness");
+            if let Some(name) = harness.as_deref() {
+                let catalog = match supplied_catalog {
+                    Some(catalog) => catalog.clone(),
+                    None => crate::harnesses::catalog()?,
+                };
+                if !catalog.contains(name) {
+                    return Err(format!("unsupported harness: {name}"));
+                }
+            }
             Ok(Command::Spawn {
                 identity: identity(flags)?,
                 display_name,
                 idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
                 archetype: nonempty(flags, "archetype"),
-                harness: nonempty(flags, "harness"),
+                harness,
                 model: nonempty(flags, "model"),
                 handle: nonempty(flags, "name"),
                 host: nonempty(flags, "host"),
@@ -771,16 +818,24 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             };
             let selected_identity = identity(flags)?;
             debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
+            let catalog = match supplied_catalog {
+                Some(catalog) => catalog.clone(),
+                None => crate::harnesses::catalog()?,
+            };
+            let harnesses = match nonempty(flags, "harness") {
+                Some(value) => value.split(',').map(str::to_owned).collect::<Vec<_>>(),
+                None => catalog.names(),
+            };
+            if let Some(name) = harnesses.iter().find(|name| !catalog.contains(name)) {
+                return Err(format!("unsupported harness: {name}"));
+            }
             Ok(Command::Assimilate(AssimilateArgs {
                 ssh_dest,
                 as_user,
                 name: nonempty(flags, "name"),
                 base_dir: nonempty(flags, "base-dir").unwrap_or_else(|| "~/.tightbeam".to_owned()),
-                harnesses: nonempty(flags, "harness")
-                    .unwrap_or_else(|| "claude,codex".to_owned())
-                    .split(',')
-                    .map(str::to_owned)
-                    .collect(),
+                harnesses,
+                catalog,
                 dry_run: flags.contains_key("dry-run"),
             }))
         }
@@ -932,7 +987,8 @@ mod tests {
 
     #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
-        let command_section = HELP
+        let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
+        let command_section = help
             .split_once("COMMANDS:\n")
             .unwrap()
             .1
@@ -992,8 +1048,85 @@ mod tests {
             "config get default-archetype",
             "config set default-archetype <name>",
         ] {
-            assert!(HELP.contains(syntax), "missing HELP syntax: {syntax}");
+            assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
         }
+    }
+
+    #[test]
+    fn help_uses_only_supplied_projection_names() {
+        let catalog = HarnessCatalog {
+            harnesses: vec![crate::harnesses::HarnessProjection {
+                id: "third".to_owned(),
+                wire_name: "third".to_owned(),
+                install_package: "third-package".to_owned(),
+                process_markers: vec!["third-marker".to_owned()],
+            }],
+        };
+        let help = render_help(Some(&catalog));
+        assert!(help.contains("third"));
+        assert!(!help.contains("claude"));
+        assert!(!help.contains("codex"));
+    }
+
+    #[test]
+    fn fixture_projection_drives_spawn_validation_and_assimilation_defaults() {
+        let catalog = HarnessCatalog {
+            harnesses: vec![crate::harnesses::HarnessProjection {
+                id: "fixture".to_owned(),
+                wire_name: "fixture".to_owned(),
+                install_package: "fixture-package".to_owned(),
+                process_markers: vec!["fixture-acp".to_owned()],
+            }],
+        };
+        assert!(matches!(
+            parse_with_catalog(strings(&[
+                "spawn",
+                "--display",
+                "Fixture",
+                "--key",
+                "fixture-key",
+                "--harness",
+                "fixture",
+                "--model",
+                "fixture-model",
+                "--as-user",
+                "flynn",
+            ]), &catalog),
+            Ok(Command::Spawn {
+                harness: Some(ref harness),
+                ..
+            }) if harness == "fixture"
+        ));
+
+        assert_eq!(
+            parse_with_catalog(
+                strings(&[
+                    "spawn",
+                    "--display",
+                    "Unknown",
+                    "--key",
+                    "unknown-key",
+                    "--harness",
+                    "codex",
+                    "--as-user",
+                    "flynn",
+                ]),
+                &catalog
+            ),
+            Err("unsupported harness: codex".to_owned())
+        );
+
+        assert!(matches!(
+            parse_with_catalog(strings(&[
+                "assimilate",
+                "flynn@host",
+                "--as-user",
+                "flynn",
+            ]), &catalog),
+            Ok(Command::Assimilate(AssimilateArgs { harnesses, catalog: parsed_catalog, .. }))
+                if harnesses == vec!["fixture".to_owned()]
+                    && parsed_catalog == catalog
+        ));
     }
 
     #[test]
@@ -1378,6 +1511,7 @@ mod tests {
                     name: Some("host".to_owned()),
                     base_dir: "/srv/tightbeam".to_owned(),
                     harnesses: vec!["codex".to_owned()],
+                    catalog: crate::harnesses::catalog().unwrap(),
                     dry_run: true,
                 }),
             ),

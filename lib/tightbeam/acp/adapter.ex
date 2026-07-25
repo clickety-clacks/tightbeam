@@ -16,6 +16,7 @@ defmodule Tightbeam.Acp.Adapter do
   """
 
   use GenServer
+  alias Tightbeam.{Harness}
   alias Tightbeam.Acp.Conn
 
   @gate_attestation_timeout 120_000
@@ -23,19 +24,6 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
-
-  @presets %{
-    claude: %{
-      home_env: "CLAUDE_CONFIG_DIR",
-      yolo_mode: "bypassPermissions",
-      effort_config: "effort"
-    },
-    codex: %{
-      home_env: "CODEX_HOME",
-      yolo_mode: "agent-full-access",
-      effort_config: "reasoning_effort"
-    }
-  }
 
   defstruct [
     :conn,
@@ -58,7 +46,7 @@ defmodule Tightbeam.Acp.Adapter do
   @type model_ref :: String.t()
 
   @doc """
-  Start the adapter. Required: `:harness` (:claude | :codex), `:cmd` (adapter
+  Start the adapter. Required: `:harness` (a registered harness id), `:cmd` (adapter
   argv), `:home` (agent-home dir, exported via the harness's home env var),
   `:cwd`. Optional: `:env`, `:stderr_path`, `:name`.
 
@@ -182,12 +170,13 @@ defmodule Tightbeam.Acp.Adapter do
 
   def handle_continue({:boot, opts}, nil) do
     harness = Keyword.fetch!(opts, :harness)
-    preset = Map.fetch!(@presets, harness)
+    module = Harness.module!(harness)
+    preset = module.session_config(%{}, "")
 
     {:ok, conn} =
       Conn.start_link(
         cmd: Keyword.fetch!(opts, :cmd),
-        env: [{preset.home_env, Keyword.fetch!(opts, :home)}] ++ Keyword.get(opts, :env, []),
+        env: Keyword.get(opts, :env, []),
         stderr_path: Keyword.get(opts, :stderr_path, "/dev/null"),
         subscriber: self()
       )
@@ -250,7 +239,7 @@ defmodule Tightbeam.Acp.Adapter do
            Conn.request(state.conn, "session/new", %{
              cwd: cwd,
              mcpServers: mcp_servers,
-             _meta: session_meta(state.harness, guidance)
+             _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            }),
          sid = result["sessionId"],
          :ok <- apply_model(state, sid, model),
@@ -269,7 +258,7 @@ defmodule Tightbeam.Acp.Adapter do
            sessionId: sid,
            cwd: cwd,
            mcpServers: mcp_servers,
-           _meta: session_meta(state.harness, guidance)
+           _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
          }) do
       {:ok, _} ->
         # Best-effort: a loaded session already HAS a model. The option's
@@ -353,10 +342,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   @impl true
   def handle_info({:acp_notification, "account/updated", params}, state) do
-    with handler when is_function(handler, 1) <- state.on_auth_event do
-      handler.(params)
-    end
-
+    emit_auth_classification(state, params)
     {:noreply, state}
   end
 
@@ -407,15 +393,17 @@ defmodule Tightbeam.Acp.Adapter do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  defp maybe_emit_account_update(state, %{
-         "_meta" => %{"codex" => %{"accountUpdated" => params}}
-       }) do
-    with handler when is_function(handler, 1) <- state.on_auth_event do
-      handler.(params)
-    end
+  defp maybe_emit_account_update(state, update) do
+    emit_auth_classification(state, update)
   end
 
-  defp maybe_emit_account_update(_state, _update), do: :ok
+  defp emit_auth_classification(state, event) do
+    with classification when classification != :unknown <-
+           Harness.module!(state.harness).classify_auth_event(event),
+         handler when is_function(handler, 1) <- state.on_auth_event do
+      handler.(classification)
+    end
+  end
 
   defp maybe_emit_subagent_event(state, sid, update) do
     with handler when is_function(handler, 2) <- state.on_subagent_event do
@@ -533,7 +521,7 @@ defmodule Tightbeam.Acp.Adapter do
     _ =
       Conn.request(state.conn, "session/set_mode", %{
         sessionId: sid,
-        modeId: state.preset.yolo_mode
+        modeId: state.preset.permission_mode
       })
 
     :ok
@@ -542,7 +530,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp set_mode(%{contained: true} = state, sid) do
     case Conn.request(state.conn, "session/set_mode", %{
            sessionId: sid,
-           modeId: state.preset.yolo_mode
+           modeId: state.preset.permission_mode
          }) do
       {:ok, _} -> :ok
       {:error, _} -> {:error, :contained_sandbox_disable_failed}
@@ -551,12 +539,6 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp set_mode_after_load(%{contained: false}, _sid), do: :ok
   defp set_mode_after_load(state, sid), do: set_mode(state, sid)
-
-  defp session_meta(:codex, guidance), do: %{developerInstructions: guidance}
-
-  defp session_meta(:claude, guidance) do
-    %{systemPrompt: %{type: "preset", preset: "claude_code", append: guidance}}
-  end
 
   defp adapter_ready(opts) do
     # Boot completed — the only trustworthy health signal under lazy boot
@@ -573,7 +555,7 @@ defmodule Tightbeam.Acp.Adapter do
          {:ok, _} <-
            request.("session/set_mode", %{
              sessionId: sid,
-             modeId: state.preset.yolo_mode
+             modeId: state.preset.permission_mode
            }) do
       gate_prompt(state.conn, sid, deadline)
     else

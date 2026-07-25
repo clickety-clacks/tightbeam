@@ -6,7 +6,6 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
   @shortdoc "Diff the live model catalog against the preferred-model working set"
 
-  @harnesses ["claude", "codex"]
   @poll_interval_ms 250
   @fetch_timeout_ms 20_000
 
@@ -108,7 +107,10 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   end
 
   defp poll_fresh(server, deadline) do
-    health = Map.new(@harnesses, fn harness -> {harness, ModelCatalog.get(harness, server)} end)
+    health =
+      Map.new(Tightbeam.Harness.all(), fn module ->
+        {module.wire_name(), ModelCatalog.get(module.wire_name(), server)}
+      end)
 
     if Enum.all?(health, fn {_harness, {_entries, state}} -> state == :fresh end) do
       {:ok, ModelCatalog.get(server)}

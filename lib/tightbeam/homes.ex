@@ -15,7 +15,10 @@ defmodule Tightbeam.Homes do
   Homes never mint or otherwise write credential contents.
   """
 
-  @type harness :: :claude | :codex
+  alias Tightbeam.Harness
+  alias Tightbeam.Harness.Support
+
+  @type harness :: atom()
   @type spec :: %{
           required(:harness) => harness(),
           required(:machine) => String.t(),
@@ -50,16 +53,50 @@ defmodule Tightbeam.Homes do
   @spec project(String.t(), spec()) :: projected_home()
   def project(base_dir, spec) do
     home = home_path(base_dir, spec.machine, spec.harness)
-    auth_dir = auth_dir(base_dir, spec.harness)
+    module = Harness.module!(spec.harness)
+
+    module.reconcile_home(
+      %{
+        base_dir: base_dir,
+        host_name: spec.machine,
+        host_config: %{ssh: nil, base_dir: base_dir},
+        sh: &Support.system_cmd/1
+      },
+      home,
+      %{
+        harness: spec.harness,
+        machine: spec.machine,
+        rails: Map.get(spec, :rails),
+        auth_dir: auth_dir(base_dir, module)
+      }
+    )
+  end
+
+  @doc false
+  def reconcile(target, home, desired, mechanics) do
+    if Support.local?(target) do
+      reconcile_local(home, desired, mechanics)
+    else
+      reconcile_remote(target, home, desired, mechanics)
+    end
+  end
+
+  defp reconcile_local(home, desired, mechanics) do
+    auth_dir = desired.auth_dir
     manifest_path = Path.join(home, @manifest_relative)
-    manifest = manifest_bytes(spec)
+    manifest = manifest_bytes(desired)
+    credential_names = Keyword.fetch!(mechanics, :credential_names)
+    rails_filename = Keyword.fetch!(mechanics, :rails_filename)
+    harvest_auth? = Map.get(desired, :harvest_auth, true)
 
     File.mkdir_p!(home)
 
+    if harvest_auth?, do: harvest_auth_back(auth_dir, home, credential_names)
+    Enum.each(credential_names, &File.rm(Path.join(home, &1)))
+
     unless File.read(manifest_path) == {:ok, manifest} do
-      harvest_auth_back(auth_dir, home, spec.harness)
-      remove_owned_projection(home, spec.harness)
-      write_rails(home, spec.harness, Map.get(spec, :rails))
+      remove_owned_projection(home, rails_filename)
+      write_rails(home, rails_filename, Map.get(desired, :rails))
       File.mkdir_p!(Path.dirname(manifest_path))
       File.write!(manifest_path, manifest)
     end
@@ -69,7 +106,91 @@ defmodule Tightbeam.Homes do
     %{
       home_path: home,
       manifest_path: manifest_path,
-      linked_auth_files: link_auth(auth_dir, home, spec.harness)
+      linked_auth_files: link_auth(auth_dir, home, credential_names)
+    }
+  end
+
+  defp reconcile_remote(target, remote_home, desired, mechanics) do
+    stage_base = Path.join([target.base_dir, "staging", target.host_name])
+    staged_home = home_path(stage_base, desired.machine, desired.harness)
+
+    staged =
+      reconcile_local(
+        staged_home,
+        desired
+        |> Map.put(
+          :auth_dir,
+          Path.join([stage_base, "auth", Atom.to_string(desired.harness)])
+        )
+        |> Map.put(:harvest_auth, false),
+        mechanics
+      )
+
+    remote_manifest = Path.join(remote_home, @manifest_relative)
+
+    {remote_stamp, stamp_exit} =
+      target.sh.(["ssh" | Support.ssh_opts()] ++ [target.host_config.ssh, "cat", remote_manifest])
+
+    if stamp_exit not in [0, 1], do: raise("remote stamp check failed with exit #{stamp_exit}")
+
+    staged_stamp = File.read!(staged.manifest_path)
+
+    credential = mechanics |> Keyword.fetch!(:credential_names) |> hd()
+    rails_filename = Keyword.fetch!(mechanics, :rails_filename)
+    entry = Path.join(remote_home, credential)
+    store = Path.join(desired.auth_dir, credential)
+    rails = Path.join(remote_home, rails_filename)
+    manifest_dir = Path.join(remote_home, ".tightbeam")
+
+    harvest =
+      if Map.get(desired, :harvest_auth, true) do
+        "if [ -f \"#{entry}\" ] && [ ! -L \"#{entry}\" ]; then " <>
+          "cp \"#{entry}\" \"#{store}\" && chmod 600 \"#{store}\"; fi; "
+      else
+        ""
+      end
+
+    changed_cleanup =
+      if remote_stamp != staged_stamp,
+        do: "rm -f \"#{rails}\"; rm -rf \"#{manifest_dir}\"; ",
+        else: ""
+
+    script =
+      "mkdir -p \"#{desired.auth_dir}\" \"#{remote_home}\"; " <>
+        harvest <> "rm -f \"#{entry}\"; " <> changed_cleanup
+
+    Support.run!(
+      target,
+      ["ssh" | Support.ssh_opts()] ++
+        [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+    )
+
+    Support.run!(target, [
+      "rsync",
+      "-a",
+      "-e",
+      Enum.join(["ssh" | Support.ssh_opts()], " "),
+      staged_home <> "/",
+      "#{target.host_config.ssh}:#{remote_home}/"
+    ])
+
+    source = Path.join(desired.auth_dir, credential)
+    destination = Path.join(remote_home, credential)
+
+    link_script =
+      "source=\"#{source}\"; target=\"#{destination}\"; " <>
+        "[ ! -e \"$source\" ] || [ -e \"$target\" ] || [ -L \"$target\" ] || ln -s \"$source\" \"$target\""
+
+    Support.run!(
+      target,
+      ["ssh" | Support.ssh_opts()] ++
+        [target.host_config.ssh, "sh", "-c", Support.shell_quote(link_script)]
+    )
+
+    %{
+      home_path: remote_home,
+      manifest_path: remote_manifest,
+      linked_auth_files: [credential]
     }
   end
 
@@ -91,13 +212,25 @@ defmodule Tightbeam.Homes do
   """
   @spec sweep_auth(String.t(), harness()) :: :ok
   def sweep_auth(base_dir, harness) do
-    auth_dir = auth_dir(base_dir, harness)
-    File.mkdir_p!(auth_dir)
+    module = Harness.module!(harness)
+    target = %{host_config: %{ssh: nil}, base_dir: base_dir}
 
     base_dir
     |> Path.join("homes/*/#{Atom.to_string(harness)}")
     |> Path.wildcard()
-    |> Enum.each(&harvest_auth_back(auth_dir, &1, harness))
+    |> Enum.each(fn home ->
+      case module.harvest_credential(target, home) do
+        nil ->
+          :ok
+
+        bytes ->
+          Tightbeam.Credentials.store_harvested(
+            base_dir,
+            module.credential_provider(),
+            bytes
+          )
+      end
+    end)
 
     :ok
   end
@@ -107,21 +240,18 @@ defmodule Tightbeam.Homes do
   def home_path(base_dir, machine, harness),
     do: Path.join([base_dir, "homes", machine, Atom.to_string(harness)])
 
-  defp auth_dir(base_dir, harness),
-    do: Path.join([base_dir, "auth", Atom.to_string(harness)])
+  defp auth_dir(base_dir, module),
+    do: Tightbeam.Credentials.store_dir(base_dir, module.credential_provider())
 
-  defp remove_owned_projection(home, harness) do
+  defp remove_owned_projection(home, rails_filename) do
     File.rm_rf!(Path.join(home, ".tightbeam"))
-    File.rm_rf!(Path.join(home, rails_filename(harness)))
-
-    credential_names(harness)
-    |> Enum.each(&File.rm(Path.join(home, &1)))
+    File.rm_rf!(Path.join(home, rails_filename))
   end
 
-  defp write_rails(_home, _harness, nil), do: :ok
+  defp write_rails(_home, _filename, nil), do: :ok
 
-  defp write_rails(home, harness, content) do
-    File.write!(Path.join(home, rails_filename(harness)), content)
+  defp write_rails(home, filename, content) do
+    File.write!(Path.join(home, filename), content)
   end
 
   defp project_baseline_skills(home) do
@@ -143,9 +273,9 @@ defmodule Tightbeam.Homes do
     end
   end
 
-  defp harvest_auth_back(auth_dir, home, harness) do
+  defp harvest_auth_back(auth_dir, home, credential_names) do
     auth_dir
-    |> credential_store_files(harness)
+    |> credential_store_files(credential_names)
     |> Enum.each(fn file ->
       entry = Path.join(home, file)
 
@@ -160,9 +290,9 @@ defmodule Tightbeam.Homes do
     end)
   end
 
-  defp link_auth(auth_dir, home, harness) do
+  defp link_auth(auth_dir, home, credential_names) do
     auth_dir
-    |> credential_store_files(harness)
+    |> credential_store_files(credential_names)
     |> Enum.map(fn file ->
       source = Path.join(auth_dir, file)
       target = Path.join(home, file)
@@ -176,18 +306,52 @@ defmodule Tightbeam.Homes do
     end)
   end
 
-  defp credential_store_files(auth_dir, harness) do
+  defp credential_store_files(auth_dir, credential_names) do
     case File.ls(auth_dir) do
-      {:ok, files} -> files |> Enum.filter(&(&1 in credential_names(harness))) |> Enum.sort()
+      {:ok, files} -> files |> Enum.filter(&(&1 in credential_names)) |> Enum.sort()
       {:error, :enoent} -> []
     end
   end
 
-  defp credential_names(:codex), do: ["auth.json"]
-  defp credential_names(:claude), do: ["oauth-token"]
+  @doc false
+  def credential_ready?(target, home, names) do
+    if Support.local?(target) do
+      Enum.any?(names, &File.exists?(Path.join(home, &1)))
+    else
+      script =
+        Enum.map_join(names, " || ", &"test -f #{Support.shell_quote(Path.join(home, &1))}")
 
-  defp rails_filename(:codex), do: "hooks.json"
-  defp rails_filename(:claude), do: "settings.json"
+      {_output, status} =
+        target.sh.(
+          ["ssh" | Support.ssh_opts()] ++
+            [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+        )
+
+      status == 0
+    end
+  end
+
+  @doc false
+  def harvest_credential(target, home, filename) do
+    path = Path.join(home, filename)
+
+    if Support.local?(target) do
+      case File.lstat(path) do
+        {:ok, %File.Stat{type: :regular}} -> File.read!(path)
+        _ -> nil
+      end
+    else
+      script = "[ -f \"#{path}\" ] && [ ! -L \"#{path}\" ] && cat \"#{path}\""
+
+      case target.sh.(
+             ["ssh" | Support.ssh_opts()] ++
+               [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+           ) do
+        {bytes, 0} -> bytes
+        {_bytes, _status} -> nil
+      end
+    end
+  end
 
   defp digest(nil), do: nil
 

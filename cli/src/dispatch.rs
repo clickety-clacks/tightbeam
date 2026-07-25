@@ -456,6 +456,10 @@ pub fn discover() -> Result<Endpoint, String> {
     discover_with(|name| std::env::var(name).ok(), &home)
 }
 
+pub fn discover_from(base_dir: &Path) -> Result<Endpoint, String> {
+    endpoint_from_file(&base_dir.join("gateway.json"))
+}
+
 fn gateway_config_path<F>(get_env: &F, home_dir: &Path) -> PathBuf
 where
     F: Fn(&str) -> Option<String>,
@@ -477,7 +481,11 @@ where
     }
 
     let path = gateway_config_path(&get_env, home_dir);
-    let encoded = fs::read_to_string(&path).map_err(|error| {
+    endpoint_from_file(&path)
+}
+
+fn endpoint_from_file(path: &Path) -> Result<Endpoint, String> {
+    let encoded = fs::read_to_string(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
                 "ENOENT: no such file or directory, open '{}'",
@@ -950,6 +958,14 @@ mod tests {
             r#"{"port":9876,"cliToken":"default"}"#,
         )
         .unwrap();
+
+        assert_eq!(
+            discover_from(&configured),
+            Ok(Endpoint {
+                base: "http://127.0.0.1:4321".to_owned(),
+                token: "configured".to_owned()
+            })
+        );
 
         let env = HashMap::from([
             ("TIGHTBEAM_URL".to_owned(), "https://gateway".to_owned()),

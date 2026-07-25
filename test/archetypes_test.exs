@@ -180,7 +180,7 @@ defmodule Tightbeam.ArchetypesTest do
     cases = [
       {"name = \"bad\"\nware = [\"local\"]\n", ~r/unknown top-level archetype keys.*ware/},
       {"name = \"bad\"\n[defaults]\nharness = \"other\"\n",
-       ~r/defaults.harness must be claude or codex/},
+       ~r/unknown harness "other"; expected one of: claude, codex, fixture/},
       {"name = \"bad\"\n[references]\nrepo = { access = \"read\" }\n",
        ~r/reference repo is missing location/}
     ]

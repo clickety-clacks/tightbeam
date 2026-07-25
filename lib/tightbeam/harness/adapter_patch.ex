@@ -1,0 +1,66 @@
+defmodule Tightbeam.Harness.AdapterPatch do
+  @moduledoc false
+
+  @doc false
+  def ensure!(binary_path, package_name, bundle_name, version, replacements, label) do
+    {package, bundle} = installed_paths(binary_path, package_name, bundle_name)
+    %{"version" => installed_version} = package |> File.read!() |> JSON.decode!()
+    ^version = installed_version
+    source = File.read!(bundle)
+    patched = patch(source, replacements, label, version)
+
+    if patched != source do
+      temporary = bundle <> ".tightbeam-patch"
+      File.write!(temporary, patched)
+      File.chmod!(temporary, 0o644)
+      File.rename!(temporary, bundle)
+    end
+
+    :ok
+  end
+
+  @doc false
+  def remote_script(binary_path, package_name, bundle_name, replacements, label) do
+    {_package, bundle} = installed_paths(binary_path, package_name, bundle_name)
+
+    encoded =
+      replacements
+      |> Enum.map(fn {before, replacement} -> [before, replacement] end)
+      |> JSON.encode!()
+      |> Base.encode64()
+
+    """
+    const fs=require('fs');const p=#{JSON.encode!(bundle)};
+    const rs=JSON.parse(Buffer.from(#{JSON.encode!(encoded)},'base64').toString());
+    let s=fs.readFileSync(p,'utf8');
+    for(const [a,b] of rs){if(!s.includes(a)&&!s.includes(b))throw new Error('unsupported #{label} adapter bundle');s=s.replace(a,b)}
+    fs.writeFileSync(p,s);
+    """
+    |> String.replace("\n", "")
+  end
+
+  @doc false
+  def patch(source, replacements, label, version) do
+    Enum.reduce(replacements, source, fn {before, replacement}, bytes ->
+      cond do
+        String.contains?(bytes, replacement) ->
+          bytes
+
+        String.contains?(bytes, before) ->
+          String.replace(bytes, before, replacement, global: false)
+
+        true ->
+          raise "unsupported #{label} adapter #{version} bundle; patch did not apply"
+      end
+    end)
+  end
+
+  defp installed_paths(binary_path, package_name, bundle_name) do
+    node_modules = binary_path |> Path.dirname() |> Path.dirname()
+
+    {
+      Path.join([node_modules, "@agentclientprotocol", package_name, "package.json"]),
+      Path.join([node_modules, "@agentclientprotocol", package_name, "dist", bundle_name])
+    }
+  end
+end

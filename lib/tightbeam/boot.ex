@@ -12,13 +12,18 @@ defmodule Tightbeam.Boot do
   alias Tightbeam.{Adjudication, Escalation, Ledger, EventLog}
 
   @spec child_spec(term()) :: Supervisor.child_spec()
-  def child_spec(_opts) do
-    %{id: __MODULE__, start: {__MODULE__, :start_link, []}, type: :worker, restart: :transient}
+  def child_spec(base_dir) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [base_dir]},
+      type: :worker,
+      restart: :transient
+    }
   end
 
   @doc "Run the boot sequence; returns :ignore so no process lingers."
-  @spec start_link() :: :ignore
-  def start_link do
+  @spec start_link(String.t()) :: :ignore
+  def start_link(base_dir) do
     :ok = Ledger.ensure_schema()
     :ok = EventLog.ensure_schema()
     :ok = Escalation.ensure_schema()
@@ -28,6 +33,11 @@ defmodule Tightbeam.Boot do
     # Boot recovery: any 'running' turn from a prior life is UNKNOWN-terminal.
     _ = Ledger.recover_running()
     :ok = Escalation.recover_retired()
+
+    projections =
+      "[" <> Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <> "]"
+
+    File.write!(Path.join(base_dir, "harnesses.json"), projections)
     :ignore
   end
 end

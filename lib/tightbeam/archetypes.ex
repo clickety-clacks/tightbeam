@@ -17,7 +17,7 @@ defmodule Tightbeam.Archetypes do
           name: String.t(),
           skills: [String.t()],
           where: [String.t()],
-          defaults: %{optional(:harness) => :claude | :codex, optional(:model) => String.t()},
+          defaults: %{optional(:harness) => atom(), optional(:model) => String.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [String.t()],
           containment: %{fs: :off | :workdir, network: :open},
@@ -698,13 +698,11 @@ defmodule Tightbeam.Archetypes do
     raw_defaults = Map.get(manifest, "defaults", %{})
     harness = raw_defaults["harness"]
 
-    if harness not in [nil, "claude", "codex"] do
-      raise ArgumentError, "archetype defaults.harness must be claude or codex: #{path}"
-    end
+    if is_binary(harness), do: Tightbeam.Harness.parse!(harness)
 
     defaults =
       %{}
-      |> maybe_put(:harness, harness && String.to_existing_atom(harness))
+      |> maybe_put(:harness, harness && Tightbeam.Harness.parse!(harness).id())
       |> maybe_put(:model, raw_defaults["model"])
 
     references =

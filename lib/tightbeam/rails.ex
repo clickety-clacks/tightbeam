@@ -25,16 +25,17 @@ defmodule Tightbeam.Rails do
   Codex has supported hooks since 0.124.0; 0.144.x is the tested floor for
   whichever executable codex-acp selects (its bundled executable, or a
   `CODEX_PATH` override). Codex receives the identical PreToolUse map in
-  `hooks.json`, while claude embeds it in `settings.json`. Both use the same
+  harness-owned rails artifact. Both implementations use the same
   stdin wire, report shell calls as tool_name "Bash", and refuse by exit 2;
   parity is scoped to Bash-tool statutes. Hooks fire under permission bypass
   on both harnesses: codex `agent-full-access` and claude `bypassPermissions`.
 
   DISTINCT from permission bypass, codex adds a hook-TRUST layer with no
   claude analog. Untrusted hooks are silently skipped headless, so placement
-  seeds `CODEX_CONFIG={"bypass_hook_trust":true}` whenever statutes exist;
-  codex-acp spreads that request override into every thread config and arms
-  the substrate-projected home's hooks.json. Because either seed or file can
+  seeds the harness trust override whenever statutes exist; the adapter
+  spreads that request override into every thread config and arms the
+  substrate-projected home's rails artifact. The seed is
+  `CODEX_CONFIG={"bypass_hook_trust":true}`. Because either seed or file can
   fail silently, the adapter drives the reserved probe at boot and fails
   closed unless it observes the refusal.
 
@@ -113,7 +114,7 @@ defmodule Tightbeam.Rails do
     statutes
   end
 
-  @doc "The compiled PreToolUse hook map embedded in claude settings.json and codex hooks.json, or nil for an empty statute set."
+  @doc "The compiled PreToolUse hook map embedded in each harness's rails artifact, or nil for an empty statute set."
   @spec hook_settings() :: map() | nil
   def hook_settings do
     case :persistent_term.get(@persist_key, []) do

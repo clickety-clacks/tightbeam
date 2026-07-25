@@ -30,7 +30,8 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
       {:ok,
        %{
          "claude" => [%{ref: "claude-live[medium]"}],
-         "codex" => [%{ref: "codex-live[high]"}]
+         "codex" => [%{ref: "codex-live[high]"}],
+         "fixture" => [%{ref: "fixture-model"}]
        }}
 
     %{base_dir: base_dir, catalog: catalog, inputs: inputs}
@@ -74,6 +75,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     probe = fn
       :claude, _cli_bin -> {:ok, %{bin: "/fake/claude", version: "claude 1.0"}}
       :codex, _cli_bin -> {:error, :not_found}
+      :fixture, _cli_bin -> {:error, :not_found}
     end
 
     {0, report} =

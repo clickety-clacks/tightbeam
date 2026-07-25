@@ -2,6 +2,7 @@ mod args;
 mod ceremonies;
 mod contain;
 mod dispatch;
+mod harnesses;
 mod probe;
 
 fn main() {
@@ -18,7 +19,9 @@ fn main() {
     }
 
     match args::parse(args) {
-        Ok(args::Command::Help) => println!("{}", args::HELP),
+        Ok(args::Command::Help) => {
+            println!("{}", args::render_help(harnesses::load_optional().as_ref()))
+        }
         Ok(command) => {
             if let Err(error) = dispatch::run(command) {
                 eprintln!("{error}");
