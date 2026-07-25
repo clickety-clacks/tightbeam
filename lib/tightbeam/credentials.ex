@@ -195,8 +195,8 @@ defmodule Tightbeam.Credentials do
       {:ok, path} ->
         result =
           with {:ok, credential} <- install_staged!(state, provider, path),
-               :ok <- mark_onboarded!(state, provider, credential),
                :ok <- state.start.(provider),
+               :ok <- mark_onboarded!(state, provider, credential),
                captured <- capture_sessions(state, provider),
                :ok <- state.resume.(provider) do
             publish_sessions(state, captured, :onboarded)
@@ -233,8 +233,8 @@ defmodule Tightbeam.Credentials do
            :ok <- state.stop.(provider),
            {:ok, credential} <- Map.fetch!(state.onboarders, provider).(state),
            :ok <- write_credential!(state, provider, credential),
-           :ok <- mark_onboarded!(state, provider, credential),
            :ok <- state.start.(provider),
+           :ok <- mark_onboarded!(state, provider, credential),
            captured <- capture_sessions(state, provider),
            :ok <- state.resume.(provider) do
         publish_sessions(state, captured, :onboarded)

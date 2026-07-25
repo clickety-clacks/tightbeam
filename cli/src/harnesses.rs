@@ -92,7 +92,10 @@ fn load_from_with(
 ) -> Result<HarnessCatalog, String> {
     let path = base_dir.join("harnesses.json");
     match fs::read_to_string(&path) {
-        Ok(encoded) => return parse(&encoded),
+        Ok(encoded) => match parse(&encoded) {
+            Ok(catalog) => return Ok(catalog),
+            Err(_) => {}
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
@@ -198,6 +201,26 @@ mod tests {
         let catalog = load_from_with(&root, || parse(encoded)).unwrap();
         assert_eq!(catalog.names(), vec!["route"]);
         assert_eq!(catalog.harnesses[0].install_package, "route-pkg");
+    }
+
+    #[test]
+    fn malformed_file_uses_the_live_route_loader_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-malformed-harnesses-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("harnesses.json"), r#"[{"id":"truncated""#).unwrap();
+
+        let encoded = r#"[{"id":"route","wire_name":"route","install_package":"route-pkg","process_markers":["route-marker"]}]"#;
+        let catalog = load_from_with(&root, || parse(encoded)).unwrap();
+
+        assert_eq!(catalog.names(), vec!["route"]);
+        assert_eq!(catalog.harnesses[0].install_package, "route-pkg");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
