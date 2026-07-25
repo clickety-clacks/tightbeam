@@ -7,7 +7,7 @@ defmodule Tightbeam.Spinup do
   changing them, and records the result as lifecycle history.
   """
 
-  alias Tightbeam.{EventLog, Placement}
+  alias Tightbeam.{CodexAcpPatch, EventLog, Placement}
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
@@ -107,7 +107,7 @@ defmodule Tightbeam.Spinup do
     path = Placement.adapter_binary_path(harness, host)
 
     if File.exists?(path) do
-      :ok
+      patch_local_adapter(harness, path)
     else
       message =
         "host #{host_name} is not ready for #{harness}: adapter missing at #{path} " <>
@@ -122,7 +122,7 @@ defmodule Tightbeam.Spinup do
 
     case sh.(remote_command(host.ssh, "test -x #{shell_quote(path)}")) do
       {_output, 0} ->
-        {:ok, "adapters present"}
+        patch_remote_adapter(host, harness, path, sh, "adapters present")
 
       {_output, _exit} ->
         install_dir = Path.join(host.base_dir, "adapters")
@@ -135,7 +135,7 @@ defmodule Tightbeam.Spinup do
           {_output, 0} ->
             case sh.(remote_command(host.ssh, "test -x #{shell_quote(path)}")) do
               {_output, 0} ->
-                {:ok, "deployed adapters"}
+                patch_remote_adapter(host, harness, path, sh, "deployed adapters")
 
               {output, _exit} ->
                 message =
@@ -155,6 +155,20 @@ defmodule Tightbeam.Spinup do
         end
     end
   end
+
+  defp patch_local_adapter(:codex, path), do: CodexAcpPatch.ensure!(path)
+  defp patch_local_adapter(:claude, _path), do: :ok
+
+  defp patch_remote_adapter(host, :codex, path, sh, detail) do
+    script = "node -e #{shell_quote(CodexAcpPatch.remote_script(path))}"
+
+    case sh.(remote_command(host.ssh, script)) do
+      {_output, 0} -> {:ok, detail <> "; codex passthrough patched"}
+      {output, _exit} -> {:error, host_unready(String.trim(output)), "DENIED: #{output}"}
+    end
+  end
+
+  defp patch_remote_adapter(_host, :claude, _path, _sh, detail), do: {:ok, detail}
 
   defp ensure_local_credentials(host, harness, host_name) do
     paths = credential_paths(host.base_dir, harness)
@@ -189,13 +203,12 @@ defmodule Tightbeam.Spinup do
     [
       Path.join([base_dir, "auth", Atom.to_string(harness)]),
       Path.join(base_dir, "work"),
-      Path.join([base_dir, "identity", "skills"])
+      Path.join([base_dir, "homes"])
     ]
   end
 
   defp credential_paths(base_dir, :claude) do
-    auth_dir = Path.join([base_dir, "auth", "claude"])
-    [Path.join(auth_dir, "oauth-token"), Path.join(auth_dir, ".credentials.json")]
+    [Path.join([base_dir, "auth", "claude", "oauth-token"])]
   end
 
   defp credential_paths(base_dir, :codex) do

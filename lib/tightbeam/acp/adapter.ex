@@ -40,7 +40,9 @@ defmodule Tightbeam.Acp.Adapter do
   defstruct [
     :conn,
     :preset,
+    :harness,
     :cwd,
+    :on_auth_event,
     contained: false,
     chunks: %{},
     progress: %{},
@@ -78,15 +80,21 @@ defmodule Tightbeam.Acp.Adapter do
   un-isolated cwd leaks the operator's own guidance and files into the
   agent). Returns {:ok, session_id}.
   """
-  @spec new_session(adapter(), model_ref(), String.t(), [map()]) :: {:ok, String.t()}
-  def new_session(adapter, model, cwd, mcp_servers),
-    do: GenServer.call(adapter, {:new_session, model, cwd, mcp_servers}, 30_000)
+  @spec new_session(adapter(), model_ref(), String.t(), [map()], String.t()) ::
+          {:ok, String.t()}
+  def new_session(adapter, model, cwd, mcp_servers, guidance),
+    do: GenServer.call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
 
   @doc "Adopt an existing harness session at its workdir — re-applies the model; never trusts the advertised one."
-  @spec load_session(adapter(), String.t(), model_ref(), String.t(), [map()]) ::
+  @spec load_session(adapter(), String.t(), model_ref(), String.t(), [map()], String.t()) ::
           :ok | {:error, term()}
-  def load_session(adapter, session_id, model, cwd, mcp_servers),
-    do: GenServer.call(adapter, {:load_session, session_id, model, cwd, mcp_servers}, 30_000)
+  def load_session(adapter, session_id, model, cwd, mcp_servers, guidance),
+    do:
+      GenServer.call(
+        adapter,
+        {:load_session, session_id, model, cwd, mcp_servers, guidance},
+        30_000
+      )
 
   @doc "Best-effort ACP teardown for one harness session; adapter failures never escape the caller."
   @spec close_session(adapter(), String.t()) :: :ok | {:error, term()}
@@ -192,7 +200,9 @@ defmodule Tightbeam.Acp.Adapter do
     state = %__MODULE__{
       conn: conn,
       preset: preset,
+      harness: harness,
       cwd: Keyword.fetch!(opts, :cwd),
+      on_auth_event: Keyword.get(opts, :on_auth_event),
       contained: Keyword.get(opts, :contained, false)
     }
 
@@ -233,9 +243,13 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
-  def handle_call({:new_session, model, cwd, mcp_servers}, _from, state) do
+  def handle_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
     with {:ok, result} <-
-           Conn.request(state.conn, "session/new", %{cwd: cwd, mcpServers: mcp_servers}),
+           Conn.request(state.conn, "session/new", %{
+             cwd: cwd,
+             mcpServers: mcp_servers,
+             _meta: session_meta(state.harness, guidance)
+           }),
          sid = result["sessionId"],
          :ok <- apply_model(state, sid, model),
          :ok <- set_mode(state, sid) do
@@ -248,11 +262,12 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:load_session, sid, model, cwd, mcp_servers}, _from, state) do
+  def handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
     case Conn.request(state.conn, "session/load", %{
            sessionId: sid,
            cwd: cwd,
-           mcpServers: mcp_servers
+           mcpServers: mcp_servers,
+           _meta: session_meta(state.harness, guidance)
          }) do
       {:ok, _} ->
         # Best-effort: a loaded session already HAS a model. The option's
@@ -335,9 +350,18 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
 
   @impl true
+  def handle_info({:acp_notification, "account/updated", params}, state) do
+    with handler when is_function(handler, 1) <- state.on_auth_event do
+      handler.(params)
+    end
+
+    {:noreply, state}
+  end
+
   def handle_info({:acp_notification, "session/update", params}, state) do
     sid = params["sessionId"]
     update = params["update"] || %{}
+    maybe_emit_account_update(state, update)
     state = emit_progress(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
@@ -379,6 +403,16 @@ defmodule Tightbeam.Acp.Adapter do
     do: {:stop, {:acp_exit, status}, state}
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp maybe_emit_account_update(state, %{
+         "_meta" => %{"codex" => %{"accountUpdated" => params}}
+       }) do
+    with handler when is_function(handler, 1) <- state.on_auth_event do
+      handler.(params)
+    end
+  end
+
+  defp maybe_emit_account_update(_state, _update), do: :ok
 
   # Invoke the per-turn progress fun on status CHANGE only. The fun is fast
   # by contract (an in-memory registry broadcast) — see PATTERNS on shared
@@ -508,6 +542,12 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp set_mode_after_load(%{contained: false}, _sid), do: :ok
   defp set_mode_after_load(state, sid), do: set_mode(state, sid)
+
+  defp session_meta(:codex, guidance), do: %{developerInstructions: guidance}
+
+  defp session_meta(:claude, guidance) do
+    %{systemPrompt: %{type: "preset", preset: "claude_code", append: guidance}}
+  end
 
   defp adapter_ready(opts) do
     # Boot completed — the only trustworthy health signal under lazy boot

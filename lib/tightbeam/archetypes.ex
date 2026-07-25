@@ -140,9 +140,8 @@ defmodule Tightbeam.Archetypes do
       end)
 
     fragments =
-      [base_dir, "identity", "guidance"]
-      |> Path.join()
-      |> Path.join("*.md")
+      base_dir
+      |> Path.join("identity/guidance/*.md")
       |> Path.wildcard()
       |> Enum.sort()
       |> Enum.reduce(builtin_fragments(), fn path, acc ->
@@ -216,6 +215,26 @@ defmodule Tightbeam.Archetypes do
       }
     end)
   end
+
+  @doc "Parse and validate one archetype manifest without mutating the loaded registry."
+  @spec parse_manifest!(binary(), String.t()) :: t()
+  def parse_manifest!(bytes, path) do
+    bytes
+    |> Toml.decode!()
+    |> validate!(path)
+    |> Map.put(:source, %{
+      file: path,
+      sha256: bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+    })
+  end
+
+  @doc "Compose guidance against an explicit immutable fragment set."
+  @spec guidance(t(), %{optional(String.t()) => String.t()}) :: String.t()
+  def guidance(archetype, fragments), do: guidance_with(archetype, fragments)
+
+  @doc "Resolve includes against an explicit immutable fragment set."
+  @spec resolve_guidance!(String.t(), %{optional(String.t()) => String.t()}) :: String.t()
+  def resolve_guidance!(text, fragments), do: resolve_includes(text, fragments, [])
 
   @doc "Validate and normalize spawn-time session overrides."
   @spec normalize_overrides(String.t(), t(), term()) ::
@@ -300,9 +319,7 @@ defmodule Tightbeam.Archetypes do
   defp guidance_with(archetype, fragments) do
     preamble =
       [
-        "# Tightbeam · #{archetype.name}",
-        "",
-        resolve_includes(~s(#include "operating-manual.md"), fragments, [])
+        "# Tightbeam · #{archetype.name}"
       ]
       |> Enum.join("\n")
 
@@ -554,7 +571,7 @@ defmodule Tightbeam.Archetypes do
       for name <- engineering_archetype_names(), into: %{} do
         {"#{name}.md",
          shipped_guidance!(
-           Path.join(["kungfu", "agentic-engineering", "archetypes", "#{name}.md"])
+           Path.join(["kungfu", "agentic-engineering", "guidance", "#{name}.md"])
          )}
       end
 
@@ -564,48 +581,6 @@ defmodule Tightbeam.Archetypes do
     # the single source of truth — not a hardcoded literal that can drift from it.
     |> Map.put("operating-manual.md", shipped_guidance!("guidance/operating-manual.md"))
   end
-
-  # Skill elections mirror the shipped archetype .toml manifests
-  # (priv/kungfu/agentic-engineering/archetypes/<name>.toml) verbatim — those
-  # manifests are the cultivated ground truth; this map must not drift from them.
-  @engineering_archetype_skills %{
-    "orchestrator" => [
-      "feature-cycle",
-      "work-tracking",
-      "unblocking",
-      "tightbeam-law-minting",
-      "tightbeam-guidance-authoring"
-    ],
-    "spec-writer" => [
-      "drafting-requirements",
-      "spec-homing",
-      "spec-handoff",
-      "tightbeam-law-minting",
-      "tightbeam-guidance-authoring"
-    ],
-    "coder" => [
-      "worktree-session",
-      "committing-and-pushing"
-    ],
-    "reviewer" => [
-      "reviewing-code",
-      "reviewing-specs",
-      "spec-conformance",
-      "review-for-completeness",
-      "review-for-yagni",
-      "tightbeam-law-minting",
-      "tightbeam-guidance-authoring"
-    ],
-    "recon" => [
-      "recon-first-investigation",
-      "recon-lifecycle",
-      "bug-provenance"
-    ],
-    "product-owner" => [
-      "tightbeam-dispatching",
-      "product-discovery"
-    ]
-  }
 
   @bundle_skill_names [
     "feature-cycle",
@@ -627,17 +602,6 @@ defmodule Tightbeam.Archetypes do
     "product-discovery"
   ]
 
-  @kungfu_template_paths [
-    "archetypes/<name>-role.toml",
-    "guidance/<name>-role.md",
-    "skills/<name>-example/SKILL.md",
-    "rails/<name>-example.toml",
-    "kungfu/<name>/capabilities.md",
-    "kungfu/<name>/preferred-models.md",
-    "kungfu/<name>/intake.md",
-    "kungfu/<name>/README.md"
-  ]
-
   @doc """
   The org skills LIBRARY (spec §Agent identity: "skills chosen by name from
   one shared library"): `<base_dir>/identity/skills/<name>/SKILL.md`.
@@ -654,80 +618,9 @@ defmodule Tightbeam.Archetypes do
   @spec skills_dir(String.t()) :: String.t()
   def skills_dir(base_dir), do: Path.join([base_dir, "identity", "skills"])
 
-  @doc "Seed the identity working tree and create its initial git commit."
+  @doc "Learn the shipped kungfu into the three-ref served-identity repository."
   @spec init_identity!(String.t()) :: :initialized | :noop
-  def init_identity!(base_dir) do
-    identity_dir = Path.join(base_dir, "identity")
-
-    if File.exists?(Path.join(identity_dir, ".git")) do
-      :noop
-    else
-      for directory <- [
-            "archetypes",
-            "guidance",
-            "skills",
-            "rails",
-            "rules",
-            "kungfu/agentic-engineering"
-          ] do
-        File.mkdir_p!(Path.join(identity_dir, directory))
-      end
-
-      write_unless_exists!(
-        Path.join([identity_dir, "archetypes", "default.toml"]),
-        builtin_default_toml()
-      )
-
-      for {name, content} <- Map.delete(builtin_fragments(), "operating-manual.md") do
-        write_unless_exists!(Path.join([identity_dir, "guidance", name]), content)
-      end
-
-      for name <- engineering_archetype_names() do
-        write_unless_exists!(
-          Path.join([identity_dir, "archetypes", "#{name}.toml"]),
-          builtin_engineering_archetype_toml(name)
-        )
-      end
-
-      for name <- builtin_skill_names() do
-        path = Path.join([identity_dir, "skills", name, "SKILL.md"])
-        File.mkdir_p!(Path.dirname(path))
-
-        write_unless_exists!(
-          path,
-          shipped_guidance!(
-            Path.join(["kungfu", "agentic-engineering", "skills", name, "SKILL.md"])
-          )
-        )
-      end
-
-      write_unless_exists!(
-        Path.join([identity_dir, "rails", "engineering.toml"]),
-        shipped_guidance!(
-          Path.join(["kungfu", "agentic-engineering", "rails", "engineering.toml"])
-        )
-      )
-
-      for name <- ["manifest.toml", "capabilities.md", "intake.md"] do
-        write_unless_exists!(
-          Path.join([identity_dir, "kungfu", "agentic-engineering", name]),
-          shipped_guidance!(Path.join(["kungfu", "agentic-engineering", name]))
-        )
-      end
-
-      write_unless_exists!(
-        Path.join(identity_dir, "tentpoles.md"),
-        shipped_guidance!("tentpoles.md")
-      )
-
-      write_unless_exists!(Path.join([identity_dir, "rules", ".gitkeep"]), "")
-
-      git!(identity_dir, ["init"])
-      git!(identity_dir, ["add", "-A"])
-      git!(identity_dir, ["commit", "-m", "seed: tightbeam defaults"], "tightbeam")
-      :initialized
-    end
-  end
+  def init_identity!(base_dir), do: Tightbeam.Identity.init!(base_dir)
 
   @doc "Skill files shipped by the built-in agentic-engineering bundle."
   @spec builtin_skill_names() :: [String.t()]
@@ -737,155 +630,10 @@ defmodule Tightbeam.Archetypes do
     ["orchestrator", "spec-writer", "coder", "reviewer", "recon", "product-owner"]
   end
 
-  defp builtin_engineering_archetype_toml(name) do
-    skills = Map.fetch!(@engineering_archetype_skills, name)
-
-    """
-    name = #{JSON.encode!(name)}
-    skills = [#{Enum.map_join(skills, ", ", &JSON.encode!/1)}]
-
-    [guidance]
-    text = \"\"\"
-    #{wisdom_includes(name)}
-    #include "engineering-tenets.md"
-    #include "preferred-models.md"
-    #include "#{name}.md"
-    \"\"\"
-    """
-  end
-
-  # Meta wisdom sections (enforcement, substrate-vs-inference, guidance authoring)
-  # ride only with the archetypes that mint law, review, or author guidance.
-  defp wisdom_includes(name) when name in ["orchestrator", "reviewer", "spec-writer"],
-    do: ~s(#include "wisdom-core.md"\n#include "wisdom-meta.md")
-
-  defp wisdom_includes(_name), do: ~s(#include "wisdom-core.md")
-
   defp shipped_guidance!(relative_path) do
     :tightbeam
     |> Application.app_dir(Path.join("priv", relative_path))
     |> File.read!()
-  end
-
-  @doc """
-  Library CRUD (the skill verbs' engine — mutation reaches here only
-  through the chokepoint). `name` is a relative path of plain segments:
-  a top-level name is a one-shot skill or a tree ROOT; a nested path
-  ("swift/concurrency") is a technique inside a subject tree. Only roots
-  are electable (election is atomic at the root — electing a subject takes
-  the whole tree); writing inside a tree is a content edit, visible to
-  every electing agent through the replica links, never a regeneration.
-  """
-  @spec put_skill!(String.t(), String.t(), String.t()) :: String.t()
-  def put_skill!(base_dir, name, content) do
-    put_skill!(base_dir, name, content, "tightbeam")
-  end
-
-  @spec put_skill!(String.t(), String.t(), String.t(), String.t()) :: String.t()
-  def put_skill!(base_dir, name, content, author) do
-    init_identity!(base_dir)
-    path = Path.join([skills_dir(base_dir), validate_skill_path!(name), "SKILL.md"])
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, content)
-    commit_identity!(base_dir, [path], "skill-put: #{name}", author)
-    path
-  end
-
-  @doc """
-  Writes a valid, unelected kungfu starter into the identity repository's
-  scanned and bundle-local homes, then records the whole scaffold as one
-  attributed commit.
-  """
-  @spec scaffold_kungfu!(String.t(), String.t(), String.t()) :: [String.t()]
-  def scaffold_kungfu!(base_dir, name, author) do
-    name = validate_kungfu_name!(name)
-    init_identity!(base_dir)
-    identity_dir = Path.join(base_dir, "identity")
-
-    targets =
-      Enum.map(@kungfu_template_paths, fn template_relative ->
-        target_relative = String.replace(template_relative, "<name>", name)
-
-        content =
-          :tightbeam
-          |> Application.app_dir(Path.join("priv/kungfu-template", template_relative))
-          |> File.read!()
-          |> String.replace("<name>", name)
-
-        {Path.join(identity_dir, target_relative), content}
-      end)
-
-    case Enum.find(targets, fn {path, _content} -> File.exists?(path) end) do
-      {path, _content} ->
-        relative = Path.relative_to(path, identity_dir)
-        raise ArgumentError, "kungfu scaffold target already exists: identity/#{relative}"
-
-      nil ->
-        :ok
-    end
-
-    Enum.each(targets, fn {path, content} ->
-      File.mkdir_p!(Path.dirname(path))
-      File.write!(path, content)
-    end)
-
-    paths = Enum.map(targets, &elem(&1, 0))
-    commit_identity!(base_dir, paths, "kungfu-scaffold: #{name}", author)
-    paths
-  end
-
-  @doc """
-  Remove a skill (or tree node). Removing an elected root is a transform:
-  the library content is deleted and the current manifest electors and
-  restart warnings are returned to the caller. Boot validation remains
-  fail-closed until those manifests are edited. Pruning inside a tree is a
-  content edit and has no electors.
-  """
-  @spec rm_skill(String.t(), String.t()) ::
-          {:ok, %{archetype_electors: [String.t()], manifest_warnings: [String.t()]}}
-          | {:error, %{code: String.t(), message: String.t()}}
-  def rm_skill(base_dir, name) do
-    rm_skill(base_dir, name, "tightbeam", [])
-  end
-
-  @spec rm_skill(String.t(), String.t(), String.t(), [String.t()]) ::
-          {:ok, %{archetype_electors: [String.t()], manifest_warnings: [String.t()]}}
-          | {:error, %{code: String.t(), message: String.t()}}
-  def rm_skill(base_dir, name, author, additional_paths) do
-    init_identity!(base_dir)
-    relative = validate_skill_path!(name)
-    path = Path.join(skills_dir(base_dir), relative)
-
-    if not File.exists?(path) do
-      {:error, %{code: "unknown_skill", message: "unknown skill: #{relative}"}}
-    else
-      {:ok, removal} = remove_skill(path, relative)
-      commit_identity!(base_dir, [path | additional_paths], "skill-rm: #{name}", author)
-      {:ok, removal}
-    end
-  end
-
-  defp remove_skill(path, relative) do
-    electors =
-      if relative =~ "/" do
-        []
-      else
-        for {arch_name, archetype} <- all(), relative in archetype.skills, do: arch_name
-      end
-
-    electors = Enum.sort(electors)
-
-    warnings =
-      Enum.map(electors, fn archetype_name ->
-        archetype = Map.fetch!(all(), archetype_name)
-        file = if archetype.source, do: archetype.source.file, else: "builtin default"
-
-        "archetype #{archetype_name} still elects #{relative} in #{file} — " <>
-          "edit it before the next restart (boot validation is fail-closed)"
-      end)
-
-    File.rm_rf!(path)
-    {:ok, %{archetype_electors: electors, manifest_warnings: warnings}}
   end
 
   @doc "Walk the library: every SKILL.md as %{name, root, elected_by (roots only)}."
@@ -916,32 +664,6 @@ defmodule Tightbeam.Archetypes do
     |> Enum.sort_by(& &1.name)
   end
 
-  # A skill path is dumb data with teeth: plain relative segments only —
-  # no traversal, no absolutes, no hidden files (the library is reachable
-  # by ssh-wrapped rsync; a crafted name must not escape it).
-  defp validate_skill_path!(name) do
-    segments = String.split(name, "/")
-
-    valid? =
-      segments != [] and
-        Enum.all?(segments, fn seg ->
-          seg != "" and seg != "." and seg != ".." and not String.starts_with?(seg, ".") and
-            seg =~ ~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/
-        end)
-
-    unless valid?, do: raise(ArgumentError, "invalid skill name: #{inspect(name)}")
-    Enum.join(segments, "/")
-  end
-
-  defp validate_kungfu_name!(name) do
-    valid? =
-      is_binary(name) and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, name) and
-        not String.contains?(name, "--") and not String.ends_with?(name, "-")
-
-    unless valid?, do: raise(ArgumentError, "invalid kungfu name: #{inspect(name)}")
-    name
-  end
-
   @doc "The built-in default archetype (used when no manifest overrides it)."
   @spec builtin_default() :: t()
   def builtin_default do
@@ -957,64 +679,6 @@ defmodule Tightbeam.Archetypes do
       guidance: nil,
       source: nil
     }
-  end
-
-  defp builtin_default_toml do
-    archetype = builtin_default()
-
-    [
-      "name = #{JSON.encode!(archetype.name)}",
-      "skills = [#{Enum.map_join(archetype.skills, ", ", &JSON.encode!/1)}]",
-      "where = [#{Enum.map_join(archetype.where, ", ", &JSON.encode!/1)}]",
-      "model_preferences = [#{Enum.map_join(archetype.model_preferences, ", ", &JSON.encode!/1)}]",
-      "",
-      "[defaults]",
-      "",
-      "[references]",
-      "",
-      "[guidance]",
-      "",
-      "[mcp]",
-      "",
-      "[containment]",
-      "fs = #{JSON.encode!(Atom.to_string(archetype.containment.fs))}",
-      "network = #{JSON.encode!(Atom.to_string(archetype.containment.network))}",
-      ""
-    ]
-    |> Enum.join("\n")
-  end
-
-  defp write_unless_exists!(path, content) do
-    unless File.exists?(path), do: File.write!(path, content)
-  end
-
-  defp commit_identity!(base_dir, paths, message, author) do
-    identity_dir = Path.join(base_dir, "identity")
-
-    relative_paths = Enum.map(paths, &Path.relative_to(&1, identity_dir))
-    git!(identity_dir, ["add", "-A", "--" | relative_paths])
-    git!(identity_dir, ["commit", "--allow-empty", "-m", message], author)
-  end
-
-  defp git!(identity_dir, args, author \\ nil) do
-    env =
-      if author do
-        email_local = String.replace(author, ~r/[^A-Za-z0-9_.+-]/, "-")
-
-        [
-          {"GIT_AUTHOR_NAME", author},
-          {"GIT_AUTHOR_EMAIL", "#{email_local}@tightbeam.local"},
-          {"GIT_COMMITTER_NAME", author},
-          {"GIT_COMMITTER_EMAIL", "#{email_local}@tightbeam.local"}
-        ]
-      else
-        []
-      end
-
-    case System.cmd("git", args, cd: identity_dir, stderr_to_stdout: true, env: env) do
-      {_output, 0} -> :ok
-      {output, status} -> raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
-    end
   end
 
   defp validate!(manifest, path) do

@@ -72,6 +72,7 @@ defmodule Tightbeam.Gateway do
     Escalation,
     EventLog,
     Homes,
+    Identity,
     Idempotency,
     LaneManager,
     Ledger,
@@ -221,6 +222,7 @@ defmodule Tightbeam.Gateway do
 
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
+    Identity.init!(config.base_dir)
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)
     assert_harness_binary_ready!(config, cli_bin)
@@ -279,7 +281,17 @@ defmodule Tightbeam.Gateway do
     end
 
     [
-      {ModelCatalog, base_dir: config.base_dir},
+      {Tightbeam.Credentials,
+       base_dir: config.base_dir,
+       machine: Placement.local_host_name(),
+       gate: fn _provider -> :ok end,
+       stop: &stop_provider_runtime/1,
+       park: &stop_provider_runtime/1,
+       start: &start_provider_runtime/1,
+       resume: fn _provider -> :ok end},
+      {ModelCatalog,
+       base_dir: config.base_dir,
+       codex_home: Homes.home_path(config.base_dir, Placement.local_host_name(), :codex)},
       {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
       {Tightbeam.Wakes,
        db: db, deliver: deliver, tick_ms: config.wake_tick_ms, name: Tightbeam.WakeScheduler},
@@ -482,96 +494,16 @@ defmodule Tightbeam.Gateway do
 
           %{host: p.name, config: entry}
         end),
-      "skill-put" =>
-        admin_call_handler(db, fn call ->
-          p = call.params
-          # Library mutation through the chokepoint (identity is law; law
-          # changes are audited verb rows). Push-on-write: every remote
-          # replica syncs now; a host that misses it heals at delivery.
-          path =
-            Archetypes.put_skill!(
-              config.base_dir,
-              p.name,
-              Map.fetch!(p, :content),
-              call.origin
-            )
-
-          root = p.name |> String.split("/") |> hd()
-          %{skill: p.name, path: path, pushed: Placement.push_skill(config, root, :put)}
-        end),
-      "kungfu-scaffold" =>
-        admin_call_handler(db, fn call ->
-          paths =
-            Archetypes.scaffold_kungfu!(
-              config.base_dir,
-              call.params.name,
-              call.origin
-            )
-
-          %{kungfu: call.params.name, paths: paths}
-        end),
-      "skill-rm" =>
-        admin_call_handler(db, fn call ->
-          p = call.params
-          root = p.name |> String.split("/") |> hd()
-
-          if Enum.any?(Archetypes.list_skills(config.base_dir), &(&1.name == p.name)) do
-            {pinned_sessions, staged_pins} =
-              if p.name == root,
-                do: stage_override_sessions(config.base_dir, db, root),
-                else: {[], []}
-
-            pinned_paths = commit_pinned_sessions(staged_pins)
-
-            {:ok, removal} =
-              Archetypes.rm_skill(config.base_dir, p.name, call.origin, pinned_paths)
-
-            reproject_pinned_sessions(config, pinned_sessions)
-            action = if p.name == root, do: :rm, else: :put
-            pushed = Placement.push_skill(config, root, action)
-
-            notified =
-              db
-              |> Org.list_for_user("", true)
-              |> Enum.flat_map(fn session ->
-                cond do
-                  Enum.any?(pinned_sessions, &(&1.session_key == session.session_key)) ->
-                    prompt =
-                      "The skill \"#{p.name}\" was removed from the library, but your session " <>
-                        "elected it at spawn, so your copy is preserved. Use \"tune\" override " <>
-                        "removal if you no longer want it."
-
-                    notify_session(config, db, session.session_key, prompt)
-                    [session.session_key]
-
-                  session.archetype in removal.archetype_electors ->
-                    prompt =
-                      "The skill \"#{p.name}\" has been removed from this org's library. " <>
-                        "Disregard it, including anything from it already in your context."
-
-                    notify_session(config, db, session.session_key, prompt)
-                    [session.session_key]
-
-                  true ->
-                    []
-                end
-              end)
-
-            %{
-              removed: p.name,
-              pushed: pushed,
-              notified: notified,
-              manifest_warnings: removal.manifest_warnings
-            }
-          else
-            {:error, error} = Archetypes.rm_skill(config.base_dir, p.name)
-            error
-          end
-        end),
-      "skill-list" =>
-        member_handler(db, fn _p ->
-          %{skills: Archetypes.list_skills(config.base_dir)}
-        end),
+      "identity-edit" =>
+        admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
+      "identity-status" =>
+        admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
+      "identity-relearn" =>
+        admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
+      "identity-apply" =>
+        admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
+      "onboard" =>
+        admin_call_handler(db, fn call -> onboard_result(call) end),
       "promote-user" =>
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
@@ -1304,7 +1236,7 @@ defmodule Tightbeam.Gateway do
   # changes nothing durable (the ledger row is already terminal).
   defp harness_cancel(db, session) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
-         key = {String.to_existing_atom(session.harness), session.identity_name, session.host},
+         key = {String.to_existing_atom(session.harness), "shared", session.host},
          {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
       Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
         sessionId: sid
@@ -1317,7 +1249,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp checkout_adapter(session) do
-    key = {String.to_existing_atom(session.harness), session.identity_name, session.host}
+    key = {String.to_existing_atom(session.harness), "shared", session.host}
 
     case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
       {:ok, adapter, generation} ->
@@ -1407,12 +1339,24 @@ defmodule Tightbeam.Gateway do
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
     cwd = Placement.holder_workdir(config, session)
     mcp_servers = session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
+    harness = String.to_existing_atom(session.harness)
 
     result =
       case Org.current_pointer(db, session.session_key) do
         nil ->
-          with {:ok, sid} <- Adapter.new_session(adapter, session.model, cwd, mcp_servers) do
+          revision = Identity.live_revision!(config.base_dir)
+          snapshot = served_snapshot(config, session, harness, revision)
+
+          with {:ok, sid} <-
+                 Adapter.new_session(
+                   adapter,
+                   session.model,
+                   cwd,
+                   mcp_servers,
+                   snapshot.guidance
+                 ) do
             Org.append_pointer(db, session.session_key, sid, "created")
+            Org.set_identity_revision(db, session.session_key, snapshot.revision)
             {:ok, sid}
           end
 
@@ -1422,13 +1366,18 @@ defmodule Tightbeam.Gateway do
           if Adapter.knows_session?(adapter, pointer.harness_session_id) do
             {:ok, pointer.harness_session_id}
           else
+            revision = session.identity_revision || Identity.live_revision!(config.base_dir)
+
+            snapshot = served_snapshot(config, session, harness, revision)
+
             AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, fn ->
               case Adapter.load_session(
                      adapter,
                      pointer.harness_session_id,
                      session.model,
                      cwd,
-                     mcp_servers
+                     mcp_servers,
+                     snapshot.guidance
                    ) do
                 :ok ->
                   Org.append_pointer(
@@ -1438,6 +1387,7 @@ defmodule Tightbeam.Gateway do
                     "loaded"
                   )
 
+                  Org.set_identity_revision(db, session.session_key, snapshot.revision)
                   {:ok, pointer.harness_session_id}
 
                 {:error, :contained_sandbox_disable_failed} = error ->
@@ -1456,8 +1406,15 @@ defmodule Tightbeam.Gateway do
                   )
 
                   with {:ok, sid} <-
-                         Adapter.new_session(adapter, session.model, cwd, mcp_servers) do
+                         Adapter.new_session(
+                           adapter,
+                           session.model,
+                           cwd,
+                           mcp_servers,
+                           snapshot.guidance
+                         ) do
                     Org.append_pointer(db, session.session_key, sid, "fallback")
+                    Org.set_identity_revision(db, session.session_key, snapshot.revision)
                     append_context_reset_marker(db, session)
                     {:ok, sid}
                   end
@@ -1470,6 +1427,13 @@ defmodule Tightbeam.Gateway do
       :ok = Ledger.stamp_adapter(db, turn_seq, generation)
       {:ok, sid}
     end
+  end
+
+  defp served_snapshot(config, session, harness, revision) do
+    snapshot =
+      Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
+
+    Placement.materialize_identity(config, session, snapshot)
   end
 
   defp role_create_result(db, call) do
@@ -1495,6 +1459,184 @@ defmodule Tightbeam.Gateway do
         else
           {:error, error} -> error
         end
+    end
+  end
+
+  defp identity_edit_result(config, call) do
+    p = call.params
+    target = identity_edit_target(p)
+
+    revision =
+      Identity.edit!(
+        config.base_dir,
+        p.archetype,
+        target,
+        p[:content],
+        call.origin
+      )
+
+    Archetypes.load!(config.base_dir)
+    %{live_revision: revision}
+  end
+
+  defp identity_edit_target(%{skill: name, remove: remove}) when is_binary(name),
+    do: {:skill, name, remove}
+
+  defp identity_edit_target(%{manifest: true}), do: :manifest
+  defp identity_edit_target(_params), do: :guidance
+
+  defp identity_relearn_result(config, %{params: %{action: "abort"}}) do
+    :ok = Identity.abort_relearn!(config.base_dir)
+    %{state: "aborted", live_revision: Identity.live_revision!(config.base_dir)}
+  end
+
+  defp identity_relearn_result(config, %{params: %{action: "resolve"}} = call) do
+    revision = Identity.resolve_relearn!(config.base_dir, call.origin)
+    Archetypes.load!(config.base_dir)
+    %{state: "published", live_revision: revision}
+  end
+
+  defp identity_relearn_result(config, _call) do
+    case Identity.relearn!(config.base_dir) do
+      {:ok, revision} ->
+        Archetypes.load!(config.base_dir)
+        %{state: "published", live_revision: revision}
+
+      {:conflict, paths} ->
+        %{
+          state: "relearn-conflicted",
+          conflicting_paths: paths,
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
+    end
+  end
+
+  defp identity_status_result(config, db, call) do
+    identity = Identity.status(config.base_dir)
+    live = identity.live_revision
+
+    sessions =
+      db
+      |> Org.list_for_user("", true)
+      |> Enum.map(fn session ->
+        %{
+          session_key: session.session_key,
+          identity_revision: session.identity_revision,
+          identity_stale: session.identity_revision != live
+        }
+      end)
+
+    guidance =
+      case call.params[:archetype] do
+        archetype when is_binary(archetype) ->
+          %{
+            codex: Identity.snapshot_at!(config.base_dir, live, archetype, :codex).guidance,
+            claude: Identity.snapshot_at!(config.base_dir, live, archetype, :claude).guidance
+          }
+
+        nil ->
+          nil
+      end
+
+    identity
+    |> Map.put(:sessions, sessions)
+    |> maybe_put_guidance(guidance)
+  end
+
+  defp maybe_put_guidance(status, nil), do: status
+  defp maybe_put_guidance(status, guidance), do: Map.put(status, :guidance, guidance)
+
+  defp identity_apply_result(config, db, %{params: %{all: true}}) do
+    sessions = Org.list_for_user(db, "", true)
+    identity_apply_sessions(config, db, sessions)
+  end
+
+  defp identity_apply_result(config, db, %{params: %{session_key: session_key}}) do
+    sessions =
+      case Org.get(db, session_key) do
+        nil -> []
+        session -> [session]
+      end
+
+    identity_apply_sessions(config, db, sessions)
+  end
+
+  defp identity_apply_sessions(_config, _db, []),
+    do: %{code: "not_found", message: "no matching session"}
+
+  defp identity_apply_sessions(config, db, sessions) do
+    busy =
+      sessions
+      |> Enum.filter(&(Ledger.pending_count(db, &1.session_key) > 0))
+      |> Enum.map(& &1.session_key)
+
+    identity_apply_at_boundary(config, db, sessions, busy)
+  end
+
+  defp identity_apply_at_boundary(_config, _db, _sessions, [_ | _] = busy) do
+    %{
+      code: "turn_in_progress",
+      message: "identity apply requires a turn boundary",
+      sessions: busy
+    }
+  end
+
+  defp identity_apply_at_boundary(config, db, sessions, []) do
+    live = Identity.live_revision!(config.base_dir)
+
+    applied =
+      Enum.map(sessions, fn session ->
+        identity_apply_session(config, db, session, live)
+        session.session_key
+      end)
+
+    %{applied: applied, identity_revision: live}
+  end
+
+  defp identity_apply_session(config, db, session, revision) do
+    pointer =
+      Org.current_pointer(db, session.session_key) ||
+        raise ArgumentError, "session #{session.session_key} has no harness history pointer"
+
+    harness = String.to_existing_atom(session.harness)
+    key = {harness, "shared", session.host}
+    cwd = Placement.holder_workdir(config, session)
+    snapshot = served_snapshot(config, session, harness, revision)
+    mcp_servers = session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
+
+    with {:ok, adapter, _generation} <-
+           AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key),
+         :ok <- Adapter.close_session(adapter, pointer.harness_session_id),
+         :ok <-
+           Adapter.load_session(
+             adapter,
+             pointer.harness_session_id,
+             session.model,
+             cwd,
+             mcp_servers,
+             snapshot.guidance
+           ) do
+      Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
+      Org.set_identity_revision(db, session.session_key, snapshot.revision)
+      :ok
+    else
+      {:error, reason} ->
+        raise "identity apply failed for #{session.session_key}: #{inspect(reason)}"
+    end
+  end
+
+  defp onboard_result(%{params: %{provider: "openai"}}) do
+    onboard_provider(:openai)
+  end
+
+  defp onboard_result(%{params: %{provider: "anthropic"}}) do
+    onboard_provider(:anthropic)
+  end
+
+  defp onboard_provider(provider) do
+    case Tightbeam.Credentials.onboard(provider) do
+      :ok -> %{provider: provider, status: "onboarded"}
+      {:error, reason} -> %{code: "needs_onboarding", message: inspect(reason)}
     end
   end
 
@@ -1661,15 +1803,6 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp member_handler(db, fun) do
-    fn call ->
-      case resolve_caller(db, call.origin) do
-        %{owner_user_id: user_id} when not is_nil(user_id) -> fun.(call.params)
-        _ -> %{code: "forbidden", message: "member required"}
-      end
-    end
-  end
-
   defp notify_session(config, db, session_key, prompt) do
     deliver_prompt(session_key, "process:tightbeam", prompt,
       db: db,
@@ -1677,64 +1810,6 @@ defmodule Tightbeam.Gateway do
       conn_registry: config[:conn_registry] || Tightbeam.ConnRegistry,
       lane_manager: config[:lane_manager] || Tightbeam.LaneManager
     )
-  end
-
-  defp stage_override_sessions(base_dir, db, skill) do
-    source = Path.join(Archetypes.skills_dir(base_dir), skill)
-
-    staging_root =
-      Path.join([base_dir, "staging", "pins-#{System.unique_integer([:positive])}"])
-
-    sessions =
-      db
-      |> Org.list_all()
-      |> Enum.filter(&(skill in override_skill_names(&1.overrides)))
-
-    staged_pins =
-      sessions
-      |> Enum.uniq_by(& &1.identity_name)
-      |> Enum.map(fn session ->
-        staged = Path.join([staging_root, session.identity_name, skill])
-
-        destination =
-          Path.join([base_dir, "identity", "pinned", session.identity_name, skill])
-
-        if File.exists?(source) do
-          File.mkdir_p!(Path.dirname(staged))
-          File.cp_r!(source, staged)
-        end
-
-        {staged, destination}
-      end)
-
-    {sessions, staged_pins}
-  end
-
-  defp commit_pinned_sessions(staged_pins) do
-    Enum.each(staged_pins, fn {staged, destination} ->
-      File.rm_rf!(destination)
-      File.mkdir_p!(Path.dirname(destination))
-      File.cp_r!(staged, destination)
-    end)
-
-    case List.first(staged_pins) do
-      nil -> :ok
-      {staged, _destination} -> File.rm_rf!(staged |> Path.dirname() |> Path.dirname())
-    end
-
-    Enum.map(staged_pins, fn {_staged, destination} -> destination end)
-  end
-
-  defp reproject_pinned_sessions(config, sessions) do
-    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
-
-    sessions
-    |> Enum.filter(&(&1.state == "active"))
-    |> Enum.map(fn session ->
-      {String.to_existing_atom(session.harness), session.identity_name, session.host}
-    end)
-    |> Enum.uniq()
-    |> Enum.each(&Placement.deliver_home(config, &1, deliver_opts))
   end
 
   defp override_skill_names(nil), do: []
@@ -2032,7 +2107,8 @@ defmodule Tightbeam.Gateway do
 
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
 
-    with :ok <- validate_catalog_model(harness_string, model, is_nil(p[:model])),
+    with :ok <- validate_credential(harness_string),
+         :ok <- validate_catalog_model(harness_string, model, is_nil(p[:model])),
          :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
       input = %{
         display_name: p.display_name,
@@ -2162,7 +2238,7 @@ defmodule Tightbeam.Gateway do
 
               Placement.deliver_home(
                 config,
-                {harness_atom, session.identity_name, session.host},
+                {harness_atom, "shared", session.host},
                 deliver_opts
               )
 
@@ -2306,18 +2382,23 @@ defmodule Tightbeam.Gateway do
         with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
              coordinator when is_pid(coordinator) <-
                Process.whereis(Tightbeam.AdapterCoordinator),
+             harness = String.to_existing_atom(session.harness),
+             cwd = Placement.holder_workdir(config, session),
+             revision = session.identity_revision || Identity.live_revision!(config.base_dir),
+             snapshot = served_snapshot(config, session, harness, revision),
              {:ok, adapter, _generation} <-
                AdapterCoordinator.adapter_for(
                  coordinator,
-                 {String.to_existing_atom(session.harness), session.identity_name, session.host}
+                 {harness, "shared", session.host}
                ) do
           AdapterCoordinator.with_load_slot(coordinator, fn ->
             Adapter.load_session(
               adapter,
               pointer.harness_session_id,
               new_ref,
-              Placement.holder_workdir(config, session),
-              session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
+              cwd,
+              session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers(),
+              snapshot.guidance
             )
           end)
         else
@@ -2362,6 +2443,44 @@ defmodule Tightbeam.Gateway do
       false ->
         warn_dead_default(harness, model, configured_default?)
         {:error, %{code: "model_unavailable", message: "model must be specified"}}
+    end
+  end
+
+  defp validate_credential(harness) do
+    provider = provider_for_harness(harness)
+
+    case Tightbeam.Credentials.status(provider) do
+      :onboarded ->
+        :ok
+
+      {:needs_onboarding, reason} ->
+        {:error,
+         %{
+           code: "needs_onboarding",
+           message:
+             "#{harness} on #{Placement.local_host_name()} needs onboarding: " <>
+               "#{inspect(reason)}; run tightbeam onboard #{provider}"
+         }}
+    end
+  end
+
+  defp provider_for_harness("codex"), do: :openai
+  defp provider_for_harness("claude"), do: :anthropic
+
+  defp harness_for_provider(:openai), do: :codex
+  defp harness_for_provider(:anthropic), do: :claude
+
+  defp stop_provider_runtime(provider) do
+    key = {harness_for_provider(provider), "shared", Placement.local_host_name()}
+    AdapterCoordinator.close_adapter(Tightbeam.AdapterCoordinator, key)
+  end
+
+  defp start_provider_runtime(provider) do
+    key = {harness_for_provider(provider), "shared", Placement.local_host_name()}
+
+    case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
+      {:ok, _pid, _generation} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -3104,7 +3223,7 @@ defmodule Tightbeam.Gateway do
           %{
             session_key: session_key,
             sid: sid,
-            key: {String.to_existing_atom(session.harness), session.identity_name, session.host}
+            key: {String.to_existing_atom(session.harness), "shared", session.host}
           }
         ]
       else
@@ -3168,12 +3287,12 @@ defmodule Tightbeam.Gateway do
     :exit, _ -> :ok
   end
 
-  defp live_session_on_adapter?(db, {harness, identity_name, host}) do
+  defp live_session_on_adapter?(db, {harness, "shared", host}) do
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM sessions WHERE state='active' AND harness=?1 AND identityName=?2 AND host=?3",
-        [Atom.to_string(harness), identity_name, host]
+        "SELECT COUNT(*) FROM sessions WHERE state='active' AND harness=?1 AND host=?2",
+        [Atom.to_string(harness), host]
       )
 
     count > 0
@@ -3211,7 +3330,7 @@ defmodule Tightbeam.Gateway do
          {:ok, adapter, _generation} <-
            AdapterCoordinator.adapter_for(
              coordinator,
-             {String.to_existing_atom(session.harness), session.identity_name, session.host}
+             {String.to_existing_atom(session.harness), "shared", session.host}
            ) do
       Adapter.apply_model_strict(adapter, sid, model, session.model)
     else
