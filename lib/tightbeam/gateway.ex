@@ -961,7 +961,7 @@ defmodule Tightbeam.Gateway do
       # spawn archetype is never replaced by organization policy.
       archetype: Org.get_setting(db, "default-archetype") || "default",
       harness: harness,
-      provider: fn -> catalog_provider!(module.wire_name(), model) end,
+      provider: fn -> default_seed_provider(module, model) end,
       model: model
     }
   end
@@ -2676,14 +2676,27 @@ defmodule Tightbeam.Gateway do
   end
 
   defp start_provider_runtime(provider, machine) do
-    Enum.reduce_while(harnesses_for_provider(provider), :ok, fn module, :ok ->
-      key = {module.id(), "shared", machine}
+    {started, failed} =
+      Enum.reduce(harnesses_for_provider(provider), {[], []}, fn module, {started, failed} ->
+        key = {module.id(), "shared", machine}
 
-      case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
-        {:ok, _pid, _generation} -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
+        case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
+          {:ok, _pid, _generation} ->
+            {[module.wire_name() | started], failed}
+
+          {:error, reason} ->
+            {started, [%{harness: module.wire_name(), reason: reason} | failed]}
+        end
+      end)
+
+    case Enum.reverse(failed) do
+      [] ->
+        :ok
+
+      failed ->
+        {:error,
+         {:provider_runtime_start_failed, %{started: Enum.reverse(started), failed: failed}}}
+    end
   end
 
   defp harnesses_for_provider(provider),
@@ -3535,6 +3548,13 @@ defmodule Tightbeam.Gateway do
     case ModelCatalog.entry(harness, ref) do
       {%{provider: provider}, _health} -> Atom.to_string(provider)
       {nil, _health} -> raise "catalog entry missing after validation: #{harness}/#{ref}"
+    end
+  end
+
+  defp default_seed_provider(module, ref) do
+    case ModelCatalog.entry(module.wire_name(), ref) do
+      {%{provider: provider}, _health} -> Atom.to_string(provider)
+      {nil, _health} -> Atom.to_string(module.credential_provider())
     end
   end
 

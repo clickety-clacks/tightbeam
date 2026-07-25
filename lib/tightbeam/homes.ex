@@ -150,20 +150,17 @@ defmodule Tightbeam.Homes do
         ""
       end
 
-    changed_cleanup =
-      if remote_stamp != staged_stamp,
-        do: "rm -f \"#{rails}\"; rm -rf \"#{manifest_dir}\"; ",
-        else: ""
+    if remote_stamp != staged_stamp do
+      script =
+        "mkdir -p \"#{desired.auth_dir}\" \"#{remote_home}\"; " <>
+          harvest <> "rm -f \"#{rails}\"; rm -rf \"#{manifest_dir}\"; "
 
-    script =
-      "mkdir -p \"#{desired.auth_dir}\" \"#{remote_home}\"; " <>
-        harvest <> "rm -f \"#{entry}\"; " <> changed_cleanup
-
-    Support.run!(
-      target,
-      ["ssh" | Support.ssh_opts()] ++
-        [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
-    )
+      Support.run!(
+        target,
+        ["ssh" | Support.ssh_opts()] ++
+          [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+      )
+    end
 
     Support.run!(target, [
       "rsync",
