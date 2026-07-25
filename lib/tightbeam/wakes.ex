@@ -32,7 +32,8 @@ defmodule Tightbeam.Wakes do
           session_key: String.t(),
           target_role: String.t() | nil,
           origin: String.t(),
-          prompt: String.t(),
+          prompt: String.t() | nil,
+          consumer: String.t(),
           due_at: integer(),
           state: String.t(),
           created_at: integer(),
@@ -58,7 +59,8 @@ defmodule Tightbeam.Wakes do
     sessionKey TEXT NOT NULL,
     targetRole TEXT,
     origin     TEXT NOT NULL,
-    prompt     TEXT NOT NULL,
+    prompt     TEXT,
+    consumer   TEXT NOT NULL DEFAULT 'prompt',
     dueAt      INTEGER NOT NULL,
     state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
     createdAt  INTEGER NOT NULL,
@@ -72,7 +74,8 @@ defmodule Tightbeam.Wakes do
     firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
     creatorSessionKey TEXT NULL,
     rumination INTEGER NOT NULL DEFAULT 0,
-    work_item_id TEXT
+    work_item_id TEXT,
+    CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
   );
   CREATE INDEX IF NOT EXISTS wakes_due ON wakes (state, dueAt);
   CREATE TABLE IF NOT EXISTS scheduler_state (
@@ -80,6 +83,32 @@ defmodule Tightbeam.Wakes do
     afterFact INTEGER NOT NULL DEFAULT 0
   );
   INSERT OR IGNORE INTO scheduler_state (id, afterFact) VALUES (0, 0);
+  """
+
+  @rebuild_ddl """
+  CREATE TABLE wakes_new (
+    wakeId TEXT PRIMARY KEY,
+    sessionKey TEXT NOT NULL,
+    targetRole TEXT,
+    origin TEXT NOT NULL,
+    prompt TEXT,
+    consumer TEXT NOT NULL DEFAULT 'prompt',
+    dueAt INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
+    createdAt INTEGER NOT NULL,
+    firedAt INTEGER,
+    reresolve TEXT NULL CHECK (reresolve IN ('lineage')),
+    reresolveSeed TEXT NULL,
+    reresolveRung INTEGER NULL,
+    conditionKind TEXT NULL,
+    conditionScope TEXT NULL,
+    conditionAfterId INTEGER NULL,
+    firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
+    creatorSessionKey TEXT NULL,
+    rumination INTEGER NOT NULL DEFAULT 0,
+    work_item_id TEXT,
+    CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
+  )
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -105,10 +134,15 @@ defmodule Tightbeam.Wakes do
       end
     end
 
+    ensure_wakes_shape(db)
+
     :ok =
       DB.execute(
         db,
-        "CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);"
+        """
+        CREATE INDEX IF NOT EXISTS wakes_due ON wakes (state, dueAt);
+        CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
+        """
       )
 
     result
@@ -144,7 +178,8 @@ defmodule Tightbeam.Wakes do
       session_key: Map.fetch!(input, :session_key),
       target_role: Map.get(input, :target_role),
       origin: Map.fetch!(input, :origin),
-      prompt: Map.fetch!(input, :prompt),
+      prompt: Map.get(input, :prompt),
+      consumer: Map.get(input, :consumer, "prompt"),
       due_at: Map.fetch!(input, :due_at),
       state: "pending",
       created_at: now(),
@@ -165,11 +200,11 @@ defmodule Tightbeam.Wakes do
       txn,
       """
         INSERT INTO wakes
-          (wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt,
+          (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt,
            reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope,
            conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, ?8, ?9, ?10,
-                ?11, ?12, ?13, NULL, ?14, ?15, ?16)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, ?9, ?10, ?11,
+                ?12, ?13, ?14, NULL, ?15, ?16, ?17)
       """,
       [
         wake.wake_id,
@@ -177,6 +212,7 @@ defmodule Tightbeam.Wakes do
         wake.target_role,
         wake.origin,
         wake.prompt,
+        wake.consumer,
         wake.due_at,
         wake.created_at,
         wake.reresolve,
@@ -207,16 +243,7 @@ defmodule Tightbeam.Wakes do
   @spec cancel(db(), String.t(), String.t()) :: boolean()
   def cancel(db \\ Tightbeam.DB, wake_id, origin) do
     transaction!(db, fn txn ->
-      Txn.q(
-        txn,
-        """
-          UPDATE wakes SET state = 'canceled'
-          WHERE wakeId = ?1 AND origin = ?2 AND state = 'pending'
-        """,
-        [wake_id, origin]
-      )
-
-      canceled = Txn.changes(txn) == 1
+      canceled = cancel_in_txn(txn, wake_id, origin)
 
       if canceled do
         case Txn.q(txn, "SELECT conditionKind FROM wakes WHERE wakeId = ?1", [wake_id]) do
@@ -237,6 +264,21 @@ defmodule Tightbeam.Wakes do
     end)
   end
 
+  @doc "Cancel a pending wake inside an existing transaction when its origin matches."
+  @spec cancel_in_txn(Txn.t(), String.t(), String.t()) :: boolean()
+  def cancel_in_txn(%Txn{} = txn, wake_id, origin) do
+    Txn.q(
+      txn,
+      """
+        UPDATE wakes SET state = 'canceled'
+        WHERE wakeId = ?1 AND origin = ?2 AND state = 'pending'
+      """,
+      [wake_id, origin]
+    )
+
+    Txn.changes(txn) == 1
+  end
+
   @spec get(db(), String.t()) :: wake() | nil
   def get(db \\ Tightbeam.DB, wake_id) do
     {:ok, rows} = DB.query(db, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id])
@@ -251,7 +293,11 @@ defmodule Tightbeam.Wakes do
   @spec list_pending(db()) :: [wake()]
   def list_pending(db \\ Tightbeam.DB) do
     {:ok, rows} =
-      DB.query(db, select_wake_sql() <> " WHERE state = 'pending' ORDER BY dueAt ASC")
+      DB.query(
+        db,
+        select_wake_sql() <>
+          " WHERE state = 'pending' AND consumer = 'prompt' ORDER BY dueAt ASC"
+      )
 
     Enum.map(rows, &to_wake/1)
   end
@@ -260,9 +306,11 @@ defmodule Tightbeam.Wakes do
   @spec pending_count(db(), String.t()) :: non_neg_integer()
   def pending_count(db \\ Tightbeam.DB, session_key) do
     {:ok, [[count]]} =
-      DB.query(db, "SELECT count(*) FROM wakes WHERE state = 'pending' AND sessionKey = ?1", [
-        session_key
-      ])
+      DB.query(
+        db,
+        "SELECT count(*) FROM wakes WHERE state = 'pending' AND consumer = 'prompt' AND sessionKey = ?1",
+        [session_key]
+      )
 
     count
   end
@@ -275,7 +323,8 @@ defmodule Tightbeam.Wakes do
         db,
         """
         SELECT count(*) FROM wakes
-        WHERE state = 'pending' AND sessionKey = ?1 AND creatorSessionKey = ?1
+        WHERE state = 'pending' AND consumer = 'prompt'
+          AND sessionKey = ?1 AND creatorSessionKey = ?1
         """,
         [session_key]
       )
@@ -351,7 +400,8 @@ defmodule Tightbeam.Wakes do
       deliver: Keyword.fetch!(opts, :deliver),
       db: Keyword.get(opts, :db, Tightbeam.DB),
       tick_ms: Keyword.get(opts, :tick_ms, 1_000),
-      batch: Keyword.get(opts, :batch, 100)
+      batch: Keyword.get(opts, :batch, 100),
+      internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
 
     schedule_tick(state.tick_ms)
@@ -420,7 +470,7 @@ defmodule Tightbeam.Wakes do
   # Deliver-then-mark (see moduledoc — never reorder): a raising deliver
   # leaves its wake pending for the next tick; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
-  defp deliver_due(%{db: db, deliver: deliver} = state) do
+  defp deliver_due(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
     {:ok, rows} =
       DB.query(
         db,
@@ -434,13 +484,17 @@ defmodule Tightbeam.Wakes do
 
       delivered =
         try do
-          deliver.(wake)
+          case wake.consumer do
+            "prompt" -> deliver.(wake)
+            consumer -> Map.fetch!(consumers, consumer).(wake)
+          end
+
           true
         rescue
           _ -> false
         end
 
-      if delivered do
+      if delivered and wake.consumer == "prompt" do
         transaction!(db, fn txn ->
           Txn.q(
             txn,
@@ -721,7 +775,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id FROM wakes"
   end
 
   defp to_wake([
@@ -730,6 +784,7 @@ defmodule Tightbeam.Wakes do
          target_role,
          origin,
          prompt,
+         consumer,
          due_at,
          state,
          created_at,
@@ -751,6 +806,7 @@ defmodule Tightbeam.Wakes do
       target_role: target_role,
       origin: origin,
       prompt: prompt,
+      consumer: consumer,
       due_at: due_at,
       state: state,
       created_at: created_at,
@@ -769,6 +825,36 @@ defmodule Tightbeam.Wakes do
   end
 
   defp schedule_tick(tick_ms), do: Process.send_after(self(), :tick, tick_ms)
+
+  defp ensure_wakes_shape(db) do
+    {:ok, [[sql]]} =
+      DB.query(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wakes'")
+
+    unless String.contains?(sql, "consumer") and
+             String.contains?(sql, "consumer != 'prompt' OR prompt IS NOT NULL") do
+      {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
+      names = Enum.map(columns, &Enum.at(&1, 1))
+
+      copied =
+        ~w(wakeId sessionKey targetRole origin prompt dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination work_item_id)
+        |> Enum.filter(&(&1 in names))
+
+      transaction!(db, fn txn ->
+        Txn.exec(txn, @rebuild_ddl)
+        columns_sql = Enum.join(copied, ", ")
+
+        Txn.exec(
+          txn,
+          "INSERT INTO wakes_new (#{columns_sql}, consumer) SELECT #{columns_sql}, 'prompt' FROM wakes"
+        )
+
+        Txn.exec(txn, "DROP TABLE wakes")
+        Txn.exec(txn, "ALTER TABLE wakes_new RENAME TO wakes")
+      end)
+    end
+
+    :ok
+  end
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do

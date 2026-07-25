@@ -83,8 +83,18 @@ pub enum Command {
         subject: String,
         holder: String,
         work_item_id: Option<String>,
+        workdir_root: Option<String>,
         brief: String,
         idempotency_key: Option<String>,
+    },
+    EffortRule {
+        identity: Identity,
+        request_id: String,
+        action: String,
+    },
+    RevokeAssignment {
+        identity: Identity,
+        assignment_id: String,
     },
     RunTests {
         identity: Identity,
@@ -245,8 +255,13 @@ COMMANDS:
       Open an obligation held by a session; a work item is the durable thread
       across assignments.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
-           --brief "<one sentence>" [--work-item <workItemId>] [--key <key>]
+           --brief "<one sentence>" [--work-item <workItemId>]
+           [--workdir-root <relativePath>] [--key <key>]
       Atomically open an assignment and wake its holder with the card id.
+  effort-rule --request <decisionRequestId> --action continue|dismiss
+      Rule an effort-without-effect check-in routed to your principal.
+  revoke-assignment <assignmentId>
+      Revoke when the assignment handler already authorizes your principal.
   run-tests <assignmentId>
   run-smoke <assignmentId>
       Queue the committed mechanical producer for an assignment.
@@ -695,8 +710,37 @@ fn parse_with_optional_catalog(
                 subject,
                 holder: holders.into_iter().next().expect("exactly one holder"),
                 work_item_id: nonempty(flags, "work-item"),
+                workdir_root: nonempty(flags, "workdir-root"),
                 brief,
                 idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "effort-rule" => {
+            let request_id = nonempty(flags, "request");
+            let action = nonempty(flags, "action");
+            if parsed.positional.get(1).is_some() || request_id.is_none() || action.is_none() {
+                return Err(
+                    "usage: tightbeam effort-rule --request <id> --action continue|dismiss"
+                        .to_owned(),
+                );
+            }
+            let action = action.expect("checked above");
+            if action != "continue" && action != "dismiss" {
+                return Err("--action must be continue or dismiss".to_owned());
+            }
+            Ok(Command::EffortRule {
+                identity: identity(flags)?,
+                request_id: request_id.expect("checked above"),
+                action,
+            })
+        }
+        "revoke-assignment" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam revoke-assignment <assignmentId>".to_owned());
+            }
+            Ok(Command::RevokeAssignment {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
             })
         }
         "run-tests" => {
@@ -840,7 +884,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, revoke-assignment, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -1025,10 +1069,12 @@ mod tests {
                 "config",
                 "dispatch",
                 "doctor",
+                "effort-rule",
                 "identity",
                 "list",
                 "onboard",
                 "retire",
+                "revoke-assignment",
                 "run-smoke",
                 "run-tests",
                 "spawn",
@@ -1213,7 +1259,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, revoke-assignment, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 
@@ -1237,7 +1283,6 @@ mod tests {
             "work-item-update",
             "work-item-list",
             "assignment-get",
-            "revoke-assignment",
             "init",
             "setup",
             "role",

@@ -2,15 +2,19 @@ defmodule Tightbeam.GatewayTest do
   use ExUnit.Case, async: false
 
   alias Tightbeam.{
+    Adjudication,
     Archetypes,
     Artifacts,
     Assignments,
     ConnRegistry,
+    ConditionFacts,
     Credentials,
     CriticalLeases,
     DB,
     Devices,
     EventLog,
+    Escalation,
+    EffortCheckin,
     Gateway,
     Identity,
     Idempotency,
@@ -258,6 +262,7 @@ defmodule Tightbeam.GatewayTest do
           Devices,
           Artifacts,
           EventLog,
+          ConditionFacts,
           Idempotency,
           Ledger,
           Org,
@@ -265,6 +270,8 @@ defmodule Tightbeam.GatewayTest do
           Projection,
           Roles,
           Wakes,
+          Escalation,
+          Adjudication,
           WorkItems,
           Assignments,
           WorkState
@@ -2341,6 +2348,195 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k1").host == "testhost"
   end
 
+  test "effort request survives park/swap and respawn supersedes then re-arms", ctx do
+    parent =
+      Org.create(ctx.db, %{
+        session_key: "effort-parent",
+        display_name: "Effort parent",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET spawnedBy='effort-parent' WHERE sessionKey='k1'"
+      )
+
+    base_dir = role_test_base("effort-adjudication")
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:effort_probe, fn _session, _root, _config ->
+        {:ok, %{repos: [%{path: ".", head: "same", tracked: "same"}], untracked: []}}
+      end)
+
+    item =
+      Assignments.__handle__(ctx.db, "dispatch", %{
+        verb: "dispatch",
+        origin: "agent:effort-parent",
+        principal: {:session, "effort-parent"},
+        session_key: "k1",
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "adjudication motion", brief: "adjudication motion"},
+        effort_config: config
+      })
+
+    {:ok, [[probe_wake_id]]} =
+      DB.query(
+        ctx.db,
+        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+        [item.id]
+      )
+
+    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, probe_wake_id))
+
+    {:ok, [[request_id]]} =
+      DB.query(
+        ctx.db,
+        "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1 AND status='open'",
+        [item.id]
+      )
+
+    {:appended, failed_message} =
+      Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "failed prompt",
+        sender: "user:flynn"
+      })
+
+    {:ok, failed_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: failed_message.id,
+        origin: "user:flynn",
+        prompt: "failed prompt"
+      })
+
+    :ok = DB.execute(ctx.db, "UPDATE turns SET status='running' WHERE seq=#{failed_seq}")
+    :ok = Ledger.finish(ctx.db, failed_seq, "failed", "quota")
+
+    handlers = Gateway.handlers(config)
+
+    for {action, model} <- [{"park", nil}, {"swap", "claude-sonnet-4-6"}] do
+      episode = notify_adjudication(ctx.db, "k1", parent.session_key)
+
+      call = %{
+        origin: "agent:effort-parent",
+        principal: {:session, parent.session_key},
+        session_key: "k1",
+        params: %{episode: episode.correlation_key, action: action, model: model}
+      }
+
+      if action == "swap" do
+        catch_exit(handlers["adjudicate"].(call))
+      else
+        assert %{ok: true, action: "park"} = handlers["adjudicate"].(call)
+      end
+
+      assert {:ok, [[^request_id, "open"]]} =
+               DB.query(ctx.db, "SELECT id,status FROM decision_requests WHERE id=?1", [
+                 request_id
+               ])
+    end
+
+    assert %{status: "ruled", decision: "dismiss"} =
+             EffortCheckin.rule(ctx.db, config, %{
+               origin: "agent:effort-parent",
+               principal: {:session, parent.session_key},
+               params: %{request_id: request_id, action: "dismiss"}
+             })
+
+    assert {:ok, [[ruleable_probe_wake]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [item.id]
+             )
+
+    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, ruleable_probe_wake))
+
+    assert {:ok, [[motion_request_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM decision_requests WHERE assignmentId=?1 AND status='open'",
+               [item.id]
+             )
+
+    episode = notify_adjudication(ctx.db, "k1", parent.session_key)
+
+    catch_exit(
+      handlers["adjudicate"].(%{
+        origin: "agent:effort-parent",
+        principal: {:session, parent.session_key},
+        session_key: "k1",
+        params: %{
+          episode: episode.correlation_key,
+          action: "respawn",
+          model: "claude-sonnet-4-6"
+        }
+      })
+    )
+
+    assert {:ok, [[new_holder, "superseded"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT a.holderKey,r.status
+               FROM assignments a JOIN decision_requests r ON r.assignmentId=a.id
+               WHERE a.id=?1 AND r.id=?2
+               """,
+               [item.id, motion_request_id]
+             )
+
+    refute new_holder == "k1"
+
+    assert {:ok, [[fresh_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [item.id]
+             )
+
+    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, fresh_wake_id))
+
+    assert {:ok, [[fresh_request_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1 AND status='open'",
+               [item.id]
+             )
+
+    stop_episode = notify_adjudication(ctx.db, new_holder, parent.session_key)
+
+    catch_exit(
+      handlers["adjudicate"].(%{
+        origin: "agent:effort-parent",
+        principal: {:session, parent.session_key},
+        session_key: new_holder,
+        params: %{episode: stop_episode.correlation_key, action: "stop"}
+      })
+    )
+
+    assert {:ok, [["closed", "superseded"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT a.state,r.status
+               FROM assignments a JOIN decision_requests r ON r.assignmentId=a.id
+               WHERE a.id=?1 AND r.id=?2
+               """,
+               [item.id, fresh_request_id]
+             )
+  end
+
   test "set_harness readiness denial leaves Org unchanged", ctx do
     base_dir = role_test_base("harness-unready", false)
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
@@ -3294,6 +3490,29 @@ defmodule Tightbeam.GatewayTest do
         {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
       end
     }
+  end
+
+  defp notify_adjudication(db, session_key, expected_owner) do
+    {:ok, episode} =
+      DB.transaction(db, fn txn ->
+        existing = Adjudication.get_in_txn(txn, session_key, "other")
+
+        episode =
+          case existing do
+            nil ->
+              Adjudication.claim_in_txn(txn, session_key, "other", claim_window_ms: 300_000)
+
+            %{status: "resolved"} ->
+              Adjudication.reopen_in_txn(txn, session_key, "other", claim_window_ms: 300_000)
+          end
+
+        assert {:ok, _wake_id, ^expected_owner} =
+                 Adjudication.notify_in_txn(txn, episode, "adjudicate", 86_400_000)
+
+        Adjudication.get_in_txn(txn, session_key, "other")
+      end)
+
+    episode
   end
 
   defp gateway_children_base! do

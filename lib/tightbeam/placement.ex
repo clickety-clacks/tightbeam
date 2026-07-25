@@ -186,6 +186,49 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
+  Read the observable git state for an assignment root without creating it.
+
+  Local and satellite holders use the same bounded shell probe. The returned
+  manifest is repository-scoped and retains the sorted untracked name list.
+  """
+  @spec effort_manifest(map(), map(), String.t(), term()) ::
+          {:ok, map()} | {:error, String.t()}
+  def effort_manifest(config, session, root, baseline \\ nil) do
+    case Map.get(config, :effort_probe) do
+      fun when is_function(fun, 3) ->
+        fun.(session, root, config)
+
+      _ ->
+        host = Map.fetch!(hosts(config.base_dir), session.host)
+        command = effort_manifest_command(root, baseline)
+        runner = Map.get(config, :sh, &system_cmd/1)
+
+        invocation =
+          if host.ssh == nil do
+            ["sh", "-lc", command]
+          else
+            ["ssh" | @ssh_opts] ++ [host.ssh, "sh", "-lc", shell_quote(command)]
+          end
+
+        result =
+          if host.ssh == nil do
+            run_probe(runner, invocation)
+          else
+            run_bounded(
+              runner,
+              invocation,
+              Map.get(config, :effort_probe_timeout_ms, 8_000)
+            )
+          end
+
+        case result do
+          {:ok, output} -> parse_effort_manifest(output)
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  @doc """
   Record (or update) a host in the instance registry — the DUMB half of
   assimilation: the CLI ceremony prepares the machine; this writes the fact.
   Admin gating happens in the verb handler, not here. Returns the stored
@@ -207,6 +250,159 @@ defmodule Tightbeam.Placement do
   end
 
   defp registry_path(base_dir), do: Path.join(base_dir, "hosts.json")
+
+  defp effort_manifest_command(root, baseline) do
+    quoted_root = shell_quote(root)
+
+    baseline_cases =
+      case baseline do
+        {:ok, %{repos: repos}} ->
+          Enum.map_join(repos, "\n", fn repo ->
+            "        #{shell_quote(repo.path)}) baseline=#{shell_quote(repo.head)} ;;"
+          end)
+
+        _ ->
+          ""
+      end
+
+    """
+    set -eu
+    root=#{quoted_root}
+    test -d "$root"
+    dotgits=$(find "$root" -name .git -print -prune)
+    test -n "$dotgits"
+    printf '%s\\n' "$dotgits" | while IFS= read -r dotgit; do
+      repo=${dotgit%/.git}
+      rel=${repo#"$root"}
+      rel=${rel#/}
+      test -n "$rel" || rel=.
+      head=$(git -C "$repo" rev-parse HEAD)
+      effort_index=$(mktemp)
+      trap 'rm -f "$effort_index"' EXIT HUP INT TERM
+      source_index=$(git -C "$repo" rev-parse --git-path index)
+      case "$source_index" in
+        /*) ;;
+        *) source_index="$repo/$source_index" ;;
+      esac
+      cp "$source_index" "$effort_index"
+      GIT_INDEX_FILE="$effort_index" git -C "$repo" add -u -- .
+      tracked=$(GIT_INDEX_FILE="$effort_index" git -C "$repo" write-tree)
+      rm -f "$effort_index"
+      baseline=
+      case "$rel" in
+    #{baseline_cases}
+        *) ;;
+      esac
+      new_commit=0
+      if test -n "$baseline" && test "$head" != "$baseline"; then
+        if ! git -C "$repo" merge-base --is-ancestor "$head" "$baseline"; then
+          new_commit=1
+        fi
+      fi
+      printf 'R\\t%s\\t%s\\t%s\\t%s\\n' "$rel" "$head" "$tracked" "$new_commit"
+      untracked=$(git -C "$repo" ls-files --others)
+      test -z "$untracked" || printf '%s\\n' "$untracked" | while IFS= read -r name; do
+        if test "$rel" = .; then full="$name"; else full="$rel/$name"; fi
+        printf 'U\\t%s\\n' "$full"
+      done
+    done
+    """
+  end
+
+  defp parse_effort_manifest(output) do
+    {repos, untracked} =
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.reduce({[], []}, fn line, {repos, untracked} ->
+        case String.split(line, "\t") do
+          ["R", path, head, tracked, new_commit] ->
+            {[
+               %{
+                 path: path,
+                 head: head,
+                 tracked: tracked,
+                 new_commit: new_commit == "1"
+               }
+               | repos
+             ], untracked}
+
+          ["R", path, head, tracked] ->
+            {[
+               %{path: path, head: head, tracked: tracked, new_commit: false}
+               | repos
+             ], untracked}
+
+          ["U", name] ->
+            {repos, [name | untracked]}
+
+          _ ->
+            {repos, untracked}
+        end
+      end)
+
+    if repos == [] do
+      {:error, "no git repository under effort root"}
+    else
+      {:ok,
+       %{
+         repos: Enum.sort_by(repos, & &1.path),
+         untracked: Enum.sort(Enum.uniq(untracked))
+       }}
+    end
+  end
+
+  defp run_bounded(runner, invocation, timeout_ms) do
+    caller = self()
+    tag = make_ref()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            case runner.(invocation) do
+              {output, 0} -> {:ok, output}
+              {output, status} -> {:error, "probe exited #{status}: #{String.trim(output)}"}
+            end
+          rescue
+            error -> {:error, "probe failed: #{Exception.message(error)}"}
+          catch
+            kind, reason -> {:error, "probe failed: #{kind}: #{inspect(reason)}"}
+          end
+
+        send(caller, {tag, result})
+      end)
+
+    receive do
+      {^tag, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        {:error, "probe failed: #{Exception.format_exit(reason)}"}
+    after
+      timeout_ms ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+        end
+
+        {:error, "probe timed out"}
+    end
+  end
+
+  defp run_probe(runner, invocation) do
+    try do
+      case runner.(invocation) do
+        {output, 0} -> {:ok, output}
+        {output, status} -> {:error, "probe exited #{status}: #{String.trim(output)}"}
+      end
+    rescue
+      error -> {:error, "probe failed: #{Exception.message(error)}"}
+    catch
+      kind, reason -> {:error, "probe failed: #{kind}: #{inspect(reason)}"}
+    end
+  end
 
   defp registry_hosts(base_dir) do
     base_dir |> registry_path() |> read_registry()

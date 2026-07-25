@@ -207,6 +207,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             subject,
             holder,
             work_item_id,
+            workdir_root,
             brief,
             idempotency_key,
         } => {
@@ -216,6 +217,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             ];
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
+            }
+            if let Some(value) = workdir_root {
+                params.push(string_field("workdirRoot", value));
             }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
@@ -227,6 +231,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::EffortRule {
+            identity,
+            request_id,
+            action,
+        } => Ok(request(
+            identity,
+            "effort-rule",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("action", action),
+            ],
+        )),
+        Command::RevokeAssignment {
+            identity,
+            assignment_id,
+        } => Ok(request(
+            identity,
+            "revoke-assignment",
+            vec![],
+            vec![string_field("assignmentId", assignment_id)],
+        )),
         Command::RunTests {
             identity,
             assignment_id,
@@ -772,12 +798,30 @@ mod tests {
                 "Please ship it.",
                 "--work-item",
                 "wi_1",
+                "--workdir-root",
+                "checkout",
                 "--key",
                 "idem",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","idempotencyKey":"idem"}}"#
+            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","workdirRoot":"checkout","idempotencyKey":"idem"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "effort-rule",
+                "--request",
+                "dr_1",
+                "--action",
+                "continue",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"effort-rule","params":{"request":"dr_1","action":"continue"}}"#
+        );
+        assert_eq!(
+            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
+            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
         );
         assert_eq!(
             body(&[

@@ -24,6 +24,7 @@ defmodule FeatureSmoke do
     |> check_config_default_archetype()
     |> check_work_item_and_assignment_get()
     |> check_dispatch_opens_assignment()
+    |> check_effort_without_effect()
     |> check_flagship_review_loop()
     |> check_escalation_to_owner()
     |> finish()
@@ -41,8 +42,11 @@ defmodule FeatureSmoke do
     {_, 0} = System.cmd("git", ["add", "--", "rules/smoke-escalation-probe.toml"], cd: dir)
 
     case System.cmd("git", ["diff", "--cached", "--quiet"], cd: dir) do
-      {_, 0} -> :ok
-      _ -> {_, 0} = System.cmd("git", ["commit", "-m", "feature-smoke: escalation probe"], cd: dir)
+      {_, 0} ->
+        :ok
+
+      _ ->
+        {_, 0} = System.cmd("git", ["commit", "-m", "feature-smoke: escalation probe"], cd: dir)
     end
   end
 
@@ -498,6 +502,144 @@ defmodule FeatureSmoke do
 
     retire(state, holder)
     pass(state, "dispatch opens an assignment (workItemId assign-only per spec)")
+  end
+
+  # --- effort-without-effect: durable parent check-in and reassignment ----------
+  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250 (or another
+  # short value). The child is never prompted by this probe; its unavailable/idle
+  # workdir is adjudicated only by the opening user.
+  defp check_effort_without_effect(state) do
+    u = unique()
+
+    parent =
+      ok!(state, "spawn", %{
+        "displayName" => "smoke-effort-parent-#{u}",
+        "idempotencyKey" => "effort-parent-#{u}"
+      })
+
+    parent_key = get_in(parent, ["stream", "sessionKey"]) || parent["sessionKey"]
+
+    parent_state =
+      %{state | token: session_token(state, parent_key)} |> Map.put(:as_session, true)
+
+    first_holder =
+      ok!(parent_state, "spawn", %{
+        "displayName" => "smoke-effort-a-#{u}",
+        "idempotencyKey" => "effort-a-#{u}"
+      })
+
+    first_holder_key =
+      get_in(first_holder, ["stream", "sessionKey"]) || first_holder["sessionKey"]
+
+    first =
+      ok!(parent_state, "dispatch", %{
+        "sessionKey" => first_holder_key,
+        "subject" => "effort smoke #{u}",
+        "brief" => "Hold position for the parent check-in."
+      })
+
+    first_id = first["id"] || first["assignmentId"]
+    request1 = await_effort_request!(parent_state, first_id, nil)
+    request1_id = request1["id"]
+
+    continued =
+      ok!(parent_state, "effort-rule", %{"request" => request1_id, "action" => "continue"})
+
+    assert(
+      state,
+      continued["decision"] == "continue",
+      "effort-rule continue did not rule request: #{inspect(continued)}"
+    )
+
+    request2 = await_effort_request!(parent_state, first_id, request1_id)
+    request2_id = request2["id"]
+
+    revoked = ok!(parent_state, "revoke-assignment", %{"assignmentId" => first_id})
+
+    assert(
+      state,
+      (revoked["state"] || get_in(revoked, ["assignment", "state"])) == "closed",
+      "effort smoke revoke did not close old assignment: #{inspect(revoked)}"
+    )
+
+    old_request = ok!(parent_state, "decision-request", %{"request" => request2_id})
+
+    assert(
+      state,
+      (old_request["decision_request"] || old_request["decisionRequest"])["status"] ==
+        "superseded",
+      "effort smoke revoke did not supersede old request: #{inspect(old_request)}"
+    )
+
+    second_holder =
+      ok!(parent_state, "spawn", %{
+        "displayName" => "smoke-effort-b-#{u}",
+        "idempotencyKey" => "effort-b-#{u}"
+      })
+
+    second_holder_key =
+      get_in(second_holder, ["stream", "sessionKey"]) || second_holder["sessionKey"]
+
+    second =
+      ok!(parent_state, "dispatch", %{
+        "sessionKey" => second_holder_key,
+        "subject" => "effort smoke replacement #{u}",
+        "brief" => "Take over the reassigned smoke obligation."
+      })
+
+    second_id = second["id"] || second["assignmentId"]
+    assert(state, second_id != first_id, "effort smoke re-dispatch reused the old assignment")
+
+    replacement_request = await_effort_request!(parent_state, second_id, nil)
+
+    assert(
+      state,
+      replacement_request["status"] == "open",
+      "replacement dispatch did not arm a fresh bracket: #{inspect(replacement_request)}"
+    )
+
+    ok!(parent_state, "revoke-assignment", %{"assignmentId" => second_id})
+    retire(state, first_holder)
+    retire(state, second_holder)
+    retire(state, parent)
+
+    pass(
+      state,
+      "effort check-in: idle request → continue widens → fresh request → revoke supersedes → re-dispatch"
+    )
+  end
+
+  defp await_effort_request!(state, assignment_id, prior_id) do
+    deadline = System.monotonic_time(:millisecond) + 30_000
+    await_effort_request!(state, assignment_id, prior_id, deadline)
+  end
+
+  defp await_effort_request!(state, assignment_id, prior_id, deadline) do
+    requests = ok!(state, "decision-requests", %{})
+
+    request =
+      (requests["decision_requests"] || requests["decisionRequests"] || requests)
+      |> List.wrap()
+      |> Enum.find(fn candidate ->
+        candidate["kind"] == "effort" and
+          (candidate["assignment_id"] || candidate["assignmentId"]) == assignment_id and
+          candidate["id"] != prior_id
+      end)
+
+    cond do
+      is_map(request) ->
+        request
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        raise(
+          "effort smoke timed out; run the gateway with a short " <>
+            "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (for example 250)"
+        )
+
+      true ->
+        Process.sleep(100)
+        await_effort_request!(state, assignment_id, prior_id, deadline)
+    end
   end
 
   # --- helpers ---------------------------------------------------------------

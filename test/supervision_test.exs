@@ -138,6 +138,19 @@ defmodule Tightbeam.SupervisionTest do
              rail_sweep_details(ctx.db, "holder")
   end
 
+  test "an internal effort wake does not suppress the no-filing prod", ctx do
+    Wakes.schedule(ctx.db, %{
+      session_key: "holder",
+      origin: "process:tightbeam",
+      consumer: "effort_probe",
+      due_at: System.system_time(:millisecond) + 60_000
+    })
+
+    assert Wakes.pending_count(ctx.db, "holder") == 0
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+  end
+
   test "progress resets delivered and attempted counters before the next claim", ctx do
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
