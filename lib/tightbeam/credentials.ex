@@ -110,6 +110,9 @@ defmodule Tightbeam.Credentials do
        park: Keyword.get(opts, :park, fn _provider -> :ok end),
        start: Keyword.get(opts, :start, fn _provider -> :ok end),
        resume: Keyword.get(opts, :resume, fn _provider -> :ok end),
+       capture_sessions: Keyword.get(opts, :capture_sessions, fn _provider -> [] end),
+       publish_sessions:
+         Keyword.get(opts, :publish_sessions, fn _payload, _transition -> :ok end),
        pending: %{}
      }}
   end
@@ -121,20 +124,28 @@ defmodule Tightbeam.Credentials do
 
   def handle_call({:mark_terminal, provider, evidence}, _from, state) do
     if terminal_evidence?(provider, evidence) do
-      state.gate.(provider)
-      state.park.(provider)
+      metadata = read_metadata(state, provider)
 
-      metadata =
-        state
-        |> read_metadata(provider)
-        |> Map.merge(%{
-          "provider" => Atom.to_string(provider),
-          "onboarded" => true,
-          "terminal" => true,
-          "last_health" => "revoked"
-        })
+      if metadata["terminal"] != true do
+        state.gate.(provider)
+        captured = capture_sessions(state, provider)
+        park_result = state.park.(provider)
 
-      write_metadata!(state, provider, metadata)
+        write_metadata!(
+          state,
+          provider,
+          Map.merge(metadata, %{
+            "provider" => Atom.to_string(provider),
+            "onboarded" => true,
+            "terminal" => true,
+            "last_health" => "revoked"
+          })
+        )
+
+        if park_result == :ok do
+          publish_sessions(state, captured, :terminal)
+        end
+      end
     end
 
     {:reply, :ok, state}
@@ -168,7 +179,9 @@ defmodule Tightbeam.Credentials do
           with {:ok, credential} <- install_staged!(state, provider, path),
                :ok <- mark_onboarded!(state, provider, credential),
                :ok <- state.start.(provider),
+               captured <- capture_sessions(state, provider),
                :ok <- state.resume.(provider) do
+            publish_sessions(state, captured, :onboarded)
             :ok
           end
 
@@ -204,7 +217,9 @@ defmodule Tightbeam.Credentials do
            :ok <- write_credential!(state, provider, credential),
            :ok <- mark_onboarded!(state, provider, credential),
            :ok <- state.start.(provider),
+           captured <- capture_sessions(state, provider),
            :ok <- state.resume.(provider) do
+        publish_sessions(state, captured, :onboarded)
         :ok
       else
         {:error, {:unsupported, :no_subscription}} = error ->
@@ -224,6 +239,26 @@ defmodule Tightbeam.Credentials do
       end
 
     {:reply, result, state}
+  end
+
+  defp capture_sessions(state, provider) do
+    try do
+      state.capture_sessions.(provider)
+    rescue
+      _ -> []
+    catch
+      _, _ -> []
+    end
+  end
+
+  defp publish_sessions(state, captured, transition) do
+    try do
+      state.publish_sessions.(captured, transition)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
   end
 
   defp record_onboarding_failure!(state, provider, :unsupported_no_subscription) do

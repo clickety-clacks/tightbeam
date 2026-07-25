@@ -282,7 +282,7 @@ defmodule Tightbeam.Gateway do
       end
     end
 
-    credential_children(config) ++
+    credential_children(config, db) ++
       [
         {ModelCatalog,
          base_dir: config.base_dir,
@@ -318,7 +318,7 @@ defmodule Tightbeam.Gateway do
       ]
   end
 
-  defp credential_children(config) do
+  defp credential_children(config, db) do
     Enum.map(Placement.hosts(config.base_dir), fn {machine, host} ->
       opts =
         [
@@ -330,7 +330,13 @@ defmodule Tightbeam.Gateway do
           stop: fn provider -> stop_provider_runtime(provider, machine) end,
           park: fn provider -> stop_provider_runtime(provider, machine) end,
           start: fn provider -> start_provider_runtime(provider, machine) end,
-          resume: fn _provider -> :ok end
+          resume: fn _provider -> :ok end,
+          capture_sessions: fn provider ->
+            capture_credential_sessions(db, provider, machine)
+          end,
+          publish_sessions: fn captured, transition ->
+            publish_credential_sessions(db, captured, transition)
+          end
         ]
         |> maybe_put_credential_runner(config)
 
@@ -1617,7 +1623,17 @@ defmodule Tightbeam.Gateway do
 
     applied =
       Enum.map(sessions, fn session ->
-        identity_apply_session(config, db, session, live)
+        case identity_apply_session(config, db, session, live) do
+          :applied ->
+            best_effort(fn ->
+              stream = db |> Org.get(session.session_key) |> Payloads.stream_session()
+              broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
+            end)
+
+          :noop ->
+            :ok
+        end
+
         session.session_key
       end)
 
@@ -1626,7 +1642,7 @@ defmodule Tightbeam.Gateway do
 
   defp identity_apply_session(config, db, session, revision) do
     case Org.current_pointer(db, session.session_key) do
-      nil -> :ok
+      nil -> :noop
       pointer -> identity_apply_started_session(config, db, session, revision, pointer)
     end
   end
@@ -1655,7 +1671,7 @@ defmodule Tightbeam.Gateway do
            ) do
       Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
       Org.set_identity_revision(db, session.session_key, snapshot.revision)
-      :ok
+      :applied
     else
       {:error, reason} ->
         raise "identity apply failed for #{session.session_key}: #{inspect(reason)}"
@@ -2620,6 +2636,52 @@ defmodule Tightbeam.Gateway do
   defp stop_provider_runtime(provider, machine) do
     key = {harness_for_provider(provider), "shared", machine}
     AdapterCoordinator.close_adapter(Tightbeam.AdapterCoordinator, key)
+  end
+
+  defp capture_credential_sessions(db, provider, machine) do
+    harness = provider |> harness_for_provider() |> Atom.to_string()
+
+    %{
+      provider: provider,
+      machine: machine,
+      sessions:
+        db
+        |> Org.list_for_user("", true)
+        |> Enum.filter(&(&1.harness == harness and &1.host == machine))
+    }
+  end
+
+  defp publish_credential_sessions(
+         db,
+         %{provider: provider, machine: machine, sessions: sessions},
+         transition
+       ) do
+    Enum.each(sessions, fn session ->
+      best_effort(fn ->
+        case Projection.append(db, %{
+               session_key: session.session_key,
+               role: "user",
+               content: credential_transition_message(provider, machine, transition),
+               sender: "process:tightbeam"
+             }) do
+          {:appended, message} -> publish_message(db, session.session_key, message)
+          _ -> :ok
+        end
+      end)
+
+      best_effort(fn ->
+        stream = session |> Payloads.stream_session()
+        broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
+      end)
+    end)
+  end
+
+  defp credential_transition_message(provider, machine, :terminal) do
+    "#{provider} credential on #{machine} is terminal; this session is parked pending re-onboarding."
+  end
+
+  defp credential_transition_message(provider, machine, :onboarded) do
+    "#{provider} credential on #{machine} was re-onboarded; this session may resume."
   end
 
   defp start_provider_runtime(provider, machine) do
