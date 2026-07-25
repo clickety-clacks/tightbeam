@@ -3,7 +3,7 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
-  alias Tightbeam.{Projection, Wakes}
+  alias Tightbeam.{EffortCheckin, Org, Projection, Wakes}
 
   defmodule TransitionRace do
     @moduledoc false
@@ -120,6 +120,7 @@ defmodule Tightbeam.Assignments do
     ensure_assignment_columns(db)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
+    Tightbeam.EffortCheckin.ensure_schema(db)
   end
 
   @doc "Close every open assignment held by a retiring session and record why."
@@ -162,6 +163,7 @@ defmodule Tightbeam.Assignments do
       )
 
       append_marker(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
+      EffortCheckin.cancel_in_txn(txn, assignment_id)
     end)
 
     assignments
@@ -418,28 +420,57 @@ defmodule Tightbeam.Assignments do
   end
 
   defp open_dispatch_result(db, call) do
-    open_assignment_result(
-      db,
-      call,
-      fn txn, assignment ->
-        prompt = "[assignment: #{assignment.id}]\n\n" <> call.params.brief
+    with :ok <- principal_allowed(call.principal, "dispatch"),
+         :ok <- valid_subject(call.params[:subject]),
+         :ok <- valid_idempotency_key(call.params[:idempotency_key]),
+         {:ok, _files} <- assignment_files("dispatch", call.params),
+         :ok <- valid_brief(call.params[:brief]),
+         :ok <- normalize_root_validation(call.params[:workdir_root]) do
+      case replayed_assignment(db, call) do
+        nil ->
+          case Org.get(db, call.session_key) do
+            %{state: "active"} = holder ->
+              config = effort_config(call)
+              prepared = EffortCheckin.prepare_arm(config, holder, call.params[:workdir_root])
 
-        delivery =
-          Tightbeam.Gateway.deliver_prompt_in_txn(
-            txn,
-            assignment.holderKey,
-            call.origin,
-            prompt,
-            sender: call.origin,
-            role_ref: assignment.holderRole,
-            role_fallback: assignment.holderFallback
-          )
+              open_assignment_result(
+                db,
+                call,
+                fn txn, assignment ->
+                  EffortCheckin.arm_in_txn(txn, config, assignment, prepared)
 
-        {:created, assignment, delivery}
-      end,
-      fn -> valid_brief(call.params[:brief]) end,
-      "dispatch"
-    )
+                  prompt = "[assignment: #{assignment.id}]\n\n" <> call.params.brief
+
+                  delivery =
+                    Tightbeam.Gateway.deliver_prompt_in_txn(
+                      txn,
+                      assignment.holderKey,
+                      call.origin,
+                      prompt,
+                      sender: call.origin,
+                      role_ref: assignment.holderRole,
+                      role_fallback: assignment.holderFallback
+                    )
+
+                  {:created, assignment, delivery}
+                end,
+                fn -> :ok end,
+                "dispatch"
+              )
+
+            nil ->
+              error("not_found", "unknown holder session")
+
+            %{state: "retired"} ->
+              error("session_retired", "assignments require an active holder session")
+          end
+
+        assignment ->
+          assignment
+      end
+    else
+      error -> error
+    end
   end
 
   defp open_assignment_result(
@@ -718,6 +749,7 @@ defmodule Tightbeam.Assignments do
                 )
 
                 if Txn.changes(txn) != 1, do: raise(TransitionRace)
+                EffortCheckin.cancel_in_txn(txn, assignment_id)
                 closed_assignment = fetch_assignment!(txn, assignment_id)
                 append_attest_marker(txn, attest)
                 append_assignment_marker(txn, closed_assignment, :closed)
@@ -785,6 +817,7 @@ defmodule Tightbeam.Assignments do
             )
 
             if Txn.changes(txn) != 1, do: raise(TransitionRace)
+            EffortCheckin.cancel_in_txn(txn, assignment_id)
             revoked_assignment = fetch_assignment!(txn, assignment_id)
             append_assignment_marker(txn, revoked_assignment, :revoked)
             revoked_assignment
@@ -926,6 +959,28 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  defp replayed_assignment(_db, %{params: %{idempotency_key: nil}}), do: nil
+
+  defp replayed_assignment(db, call) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT #{columns()} FROM assignments
+        WHERE id=(
+          SELECT sessionKey FROM wire_idempotency
+          WHERE ownerUserId=?1 AND operation='assign' AND idempotencyKey=?2
+        )
+        """,
+        [principal_id(call.principal), call.params[:idempotency_key]]
+      )
+
+    case rows do
+      [row] -> assignment(row)
+      [] -> nil
+    end
+  end
+
   defp fetch_assignment(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM assignments WHERE id = ?1", [id]) do
       [row] -> assignment(row)
@@ -963,6 +1018,24 @@ defmodule Tightbeam.Assignments do
 
   defp valid_brief(brief) when is_binary(brief) and brief != "", do: :ok
   defp valid_brief(_), do: error("invalid", "a dispatch must carry a brief")
+
+  defp normalize_root_validation(root) do
+    case EffortCheckin.valid_workdir_root(root) do
+      :ok -> :ok
+      {:error, error} -> error
+    end
+  end
+
+  defp effort_config(call) do
+    defaults = %{
+      base_dir: Application.get_env(:tightbeam, :base_dir, System.tmp_dir!()),
+      port: Application.get_env(:tightbeam, :port, 4_321),
+      effort_checkin_horizon_ms:
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000)
+    }
+
+    Map.merge(defaults, Map.get(call, :effort_config, %{}))
+  end
 
   defp valid_note(nil), do: :ok
 

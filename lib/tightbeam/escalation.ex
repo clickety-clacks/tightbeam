@@ -15,19 +15,25 @@ defmodule Tightbeam.Escalation do
   @ddl """
   CREATE TABLE IF NOT EXISTS decision_requests (
     id                TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort')),
     raiserId          TEXT NOT NULL,
     raiserSessionKey  TEXT,
     ownerUserId       TEXT NOT NULL,
     assignmentId      TEXT,
+    expecterSessionKey TEXT,
+    expecterUserId    TEXT,
+    lineageRung       INTEGER,
+    effortGeneration  INTEGER,
+    deadlineWakeId    TEXT,
     raisedAt          INTEGER NOT NULL,
     deadlineAt        INTEGER NOT NULL,
-    statuteName       TEXT NOT NULL,
-    actionKey         TEXT NOT NULL,
+    statuteName       TEXT,
+    actionKey         TEXT,
     question          TEXT NOT NULL,
     options           TEXT,
     context           TEXT NOT NULL,
-    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn')),
-    decision          TEXT CHECK (decision IN ('allow','deny','waived')),
+    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded')),
+    decision          TEXT,
     rationale         TEXT,
     ruledBy           TEXT,
     ruledAt           INTEGER,
@@ -36,14 +42,30 @@ defmodule Tightbeam.Escalation do
     parkWakeId        TEXT,
     withdrawnBy       TEXT,
     withdrawnReason   TEXT,
-    withdrawnAt       INTEGER
+    withdrawnAt       INTEGER,
+    CHECK (
+      (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND (decision IS NULL OR decision IN ('allow','deny','waived')))
+      OR
+      (kind = 'effort' AND raiserId = 'process:tightbeam'
+       AND raiserSessionKey IS NULL
+       AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
+       AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
+       AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
+       AND (decision IS NULL OR decision IN ('continue','dismiss')))
+    )
   );
   CREATE INDEX IF NOT EXISTS decision_requests_owner
     ON decision_requests (ownerUserId, status);
   CREATE INDEX IF NOT EXISTS decision_requests_key
     ON decision_requests (raiserId, statuteName, actionKey);
   CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_one_open
-    ON decision_requests (raiserId, statuteName, actionKey) WHERE status = 'open';
+    ON decision_requests (raiserId, statuteName, actionKey)
+    WHERE kind = 'statute' AND status = 'open';
+  CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_effort_generation
+    ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
 
   CREATE TABLE IF NOT EXISTS escalation_waivers (
     id                TEXT PRIMARY KEY,
@@ -59,15 +81,39 @@ defmodule Tightbeam.Escalation do
     ON escalation_waivers (raiserId, statuteName, revokedAt);
   """
 
+  @rebuild_ddl String.replace(
+                 @ddl
+                 |> String.split("CREATE INDEX IF NOT EXISTS decision_requests_owner")
+                 |> hd(),
+                 "IF NOT EXISTS decision_requests",
+                 "decision_requests_new"
+               )
+
   @request_columns """
-  id, raiserId, raiserSessionKey, ownerUserId, assignmentId, raisedAt, deadlineAt,
+  id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+  expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
+  raisedAt, deadlineAt,
   statuteName, actionKey, question, options, context, status, decision, rationale,
   ruledBy, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
   withdrawnReason, withdrawnAt
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    {:ok, [[exists]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'decision_requests'"
+      )
+
+    if exists == 0 do
+      DB.execute(db, @ddl)
+    else
+      ensure_request_shape(db)
+      :ok = DB.execute(db, indexes_ddl())
+      DB.execute(db, waivers_ddl())
+    end
+  end
 
   @doc "Effect-free consultation of waiver and current decision request."
   @spec resolve(DB.server(), map(), map()) ::
@@ -194,26 +240,31 @@ defmodule Tightbeam.Escalation do
   @spec rule(DB.server(), map(), keyword()) :: map()
   def rule(db, call, opts \\ []) do
     request_id = param(call, :request_id) || param(call, :request)
+    request = get_raw(db, request_id)
 
-    with true <- Keyword.get(opts, :authorized, false),
-         request when not is_nil(request) <- get_raw(db, request_id),
-         false <- raiser_id(call) == request.raiser_id,
-         {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
-      case request.status do
-        status when status in ["ruled", "consumed"] and request.decision == decision ->
-          request
-
-        "open" ->
-          rule_open(db, request, decision, param(call, :rationale), call.origin, opts)
-
-        _ ->
-          error("not_open", "decision request is not open")
-      end
+    if request && request.kind == "effort" do
+      error("invalid", "effort requests use effort-rule")
     else
-      false -> error("not_owner", "admin owner required")
-      true -> error("not_owner", "raiser cannot rule its own request")
-      nil -> error("not_found", "decision request not found")
-      {:error, error} -> error
+      with true <- Keyword.get(opts, :authorized, false),
+           request when not is_nil(request) <- request,
+           false <- raiser_id(call) == request.raiser_id,
+           {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
+        case request.status do
+          status when status in ["ruled", "consumed"] and request.decision == decision ->
+            request
+
+          "open" ->
+            rule_open(db, request, decision, param(call, :rationale), call.origin, opts)
+
+          _ ->
+            error("not_open", "decision request is not open")
+        end
+      else
+        false -> error("not_owner", "admin owner required")
+        true -> error("not_owner", "raiser cannot rule its own request")
+        nil -> error("not_found", "decision request not found")
+        {:error, error} -> error
+      end
     end
   end
 
@@ -239,6 +290,9 @@ defmodule Tightbeam.Escalation do
             true ->
               grant_waiver(db, target_raiser_id, statute_name, call, "preemptive", opts)
           end
+
+        %{kind: "effort"} ->
+          error("invalid", "effort requests cannot be waived")
 
         request ->
           if raiser_id(call) == request.raiser_id,
@@ -306,6 +360,9 @@ defmodule Tightbeam.Escalation do
         case get_raw(db, request_id) do
           nil ->
             error("not_found", "decision request not found")
+
+          %{kind: "effort"} ->
+            error("invalid", "effort requests require effort-rule")
 
           request when request.raiser_id != caller_raiser_id ->
             error("not_raiser", "raiser required")
@@ -675,10 +732,16 @@ defmodule Tightbeam.Escalation do
 
   defp request_from_row([
          id,
+         kind,
          raiser_id,
          raiser_session_key,
          owner_user_id,
          assignment_id,
+         expecter_session_key,
+         expecter_user_id,
+         lineage_rung,
+         effort_generation,
+         deadline_wake_id,
          raised_at,
          deadline_at,
          statute_name,
@@ -700,10 +763,16 @@ defmodule Tightbeam.Escalation do
        ]) do
     %{
       id: id,
+      kind: kind,
       raiser_id: raiser_id,
       raiser_session_key: raiser_session_key,
       owner_user_id: owner_user_id,
       assignment_id: assignment_id,
+      expecter_session_key: expecter_session_key,
+      expecter_user_id: expecter_user_id,
+      lineage_rung: lineage_rung,
+      effort_generation: effort_generation,
+      deadline_wake_id: deadline_wake_id,
       raised_at: raised_at,
       deadline_at: deadline_at,
       statute_name: statute_name,
@@ -760,17 +829,49 @@ defmodule Tightbeam.Escalation do
   defp visibility(call, owner_user_id) do
     raiser = raiser_id(call)
 
-    if is_binary(owner_user_id) do
-      {"ownerUserId = ?1 OR raiserId = ?2", [owner_user_id, raiser]}
-    else
-      {"raiserId = ?1", [raiser]}
-    end
+    effort =
+      case call.principal do
+        {:session, key} -> {"expecterSessionKey = ?", key}
+        {:user, user} -> {"expecterUserId = ?", user}
+        _ -> {"0", nil}
+      end
+
+    statute =
+      if is_binary(owner_user_id),
+        do: {"(ownerUserId = ? OR raiserId = ?)", [owner_user_id, raiser]},
+        else: {"raiserId = ?", [raiser]}
+
+    {effort_sql, effort_params} =
+      case effort do
+        {"0", nil} -> {"0", []}
+        {sql, value} -> {sql, [value]}
+      end
+
+    {statute_sql, statute_params} = statute
+    params = statute_params ++ effort_params
+
+    numbered =
+      "(kind = 'statute' AND #{statute_sql}) OR (kind = 'effort' AND #{effort_sql})"
+      |> number_placeholders()
+
+    {numbered, params}
   end
 
   defp shift_params(where) do
-    where
-    |> String.replace("?2", "?3")
-    |> String.replace("?1", "?2")
+    Regex.replace(~r/\?(\d+)/, where, fn _, number ->
+      "?" <> Integer.to_string(String.to_integer(number) + 1)
+    end)
+  end
+
+  defp number_placeholders(sql) do
+    {parts, _} =
+      String.split(sql, "?")
+      |> Enum.map_reduce(0, fn
+        part, 0 -> {part, 1}
+        part, index -> {"#{index}" <> part, index + 1}
+      end)
+
+    Enum.join(parts, "?")
   end
 
   defp raiser_id(%{principal: {:session, key}}), do: "session:" <> key
@@ -907,4 +1008,71 @@ defmodule Tightbeam.Escalation do
 
   defp error(code, message), do: %{code: code, message: message}
   defp now, do: System.system_time(:millisecond)
+
+  defp ensure_request_shape(db) do
+    {:ok, [[sql]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'decision_requests'"
+      )
+
+    unless String.contains?(sql, "kind") and String.contains?(sql, "superseded") and
+             String.contains?(sql, "effortGeneration") do
+      {:ok, columns} = DB.query(db, "PRAGMA table_info(decision_requests)")
+      names = Enum.map(columns, &Enum.at(&1, 1))
+
+      copied =
+        ~w(id raiserId raiserSessionKey ownerUserId assignmentId raisedAt deadlineAt statuteName actionKey question options context status decision rationale ruledBy ruledAt rulingFactId consumedAt parkWakeId withdrawnBy withdrawnReason withdrawnAt)
+        |> Enum.filter(&(&1 in names))
+
+      case DB.transaction(db, fn txn ->
+             Txn.exec(txn, @rebuild_ddl)
+             columns_sql = Enum.join(copied, ", ")
+
+             Txn.exec(
+               txn,
+               "INSERT INTO decision_requests_new (#{columns_sql}, kind) SELECT #{columns_sql}, 'statute' FROM decision_requests"
+             )
+
+             Txn.exec(txn, "DROP TABLE decision_requests")
+             Txn.exec(txn, "ALTER TABLE decision_requests_new RENAME TO decision_requests")
+           end) do
+        {:ok, _} -> :ok
+        {:error, error} -> raise error
+      end
+    end
+
+    :ok
+  end
+
+  defp indexes_ddl do
+    """
+    CREATE INDEX IF NOT EXISTS decision_requests_owner
+      ON decision_requests (ownerUserId, status);
+    CREATE INDEX IF NOT EXISTS decision_requests_key
+      ON decision_requests (raiserId, statuteName, actionKey);
+    CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_one_open
+      ON decision_requests (raiserId, statuteName, actionKey)
+      WHERE kind = 'statute' AND status = 'open';
+    CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_effort_generation
+      ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
+    """
+  end
+
+  defp waivers_ddl do
+    """
+    CREATE TABLE IF NOT EXISTS escalation_waivers (
+      id TEXT PRIMARY KEY,
+      raiserId TEXT NOT NULL,
+      statuteName TEXT NOT NULL,
+      grantedBy TEXT NOT NULL,
+      grantedAt INTEGER NOT NULL,
+      reason TEXT,
+      revokedBy TEXT,
+      revokedAt INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS escalation_waivers_lookup
+      ON escalation_waivers (raiserId, statuteName, revokedAt);
+    """
+  end
 end

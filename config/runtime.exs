@@ -36,6 +36,10 @@ if value = System.get_env("TIGHTBEAM_ESCALATION_DECISION_DEADLINE_MS") do
   config :tightbeam, :escalation_decision_deadline_ms, String.to_integer(value)
 end
 
+if value = System.get_env("TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS") do
+  config :tightbeam, :effort_checkin_horizon_ms, String.to_integer(value)
+end
+
 if value = System.get_env("TIGHTBEAM_ADJUDICATION_CLAIM_WINDOW_MS") do
   config :tightbeam, :adjudication_claim_window_ms, String.to_integer(value)
 end

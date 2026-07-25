@@ -1,0 +1,1165 @@
+defmodule Tightbeam.EffortCheckin do
+  @moduledoc """
+  Event-driven effort-without-effect brackets for dispatched assignments.
+
+  Filesystem observation is performed before the callback transaction. The
+  transaction then CASes the exact generation/wake pair and either re-arms or
+  opens one parent-routed decision request with its durable deadline wake.
+  """
+
+  alias Tightbeam.{DB, Org, Placement, Wakes}
+  alias Tightbeam.DB.Txn
+
+  @origin "process:tightbeam"
+  @default_horizon_ms 900_000
+  @default_deadline_ms 86_400_000
+
+  @ddl """
+  CREATE TABLE IF NOT EXISTS effort_checkin_generations (
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    generation INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('armed','probed','canceled')),
+    baseHorizonMs INTEGER NOT NULL,
+    multiplier INTEGER NOT NULL CHECK (multiplier IN (1,2,4)),
+    armedAt INTEGER NOT NULL,
+    terminalSeqWatermark INTEGER NOT NULL,
+    holderKey TEXT NOT NULL,
+    host TEXT NOT NULL,
+    root TEXT NOT NULL,
+    baseline TEXT NOT NULL,
+    wakeId TEXT NOT NULL,
+    evidence TEXT,
+    PRIMARY KEY (assignmentId, generation)
+  );
+  CREATE INDEX IF NOT EXISTS effort_checkin_wake
+    ON effort_checkin_generations (wakeId, state);
+  """
+
+  @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
+  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+
+  @spec valid_workdir_root(term()) :: :ok | {:error, map()}
+  def valid_workdir_root(nil), do: :ok
+  def valid_workdir_root(""), do: :ok
+
+  def valid_workdir_root(root) when is_binary(root) do
+    segments = Path.split(root)
+
+    cond do
+      Path.type(root) == :absolute ->
+        invalid_root()
+
+      ".." in segments ->
+        invalid_root()
+
+      true ->
+        :ok
+    end
+  end
+
+  def valid_workdir_root(_), do: invalid_root()
+
+  @doc "Capture an arm baseline without holding the DB transaction."
+  @spec prepare_arm(map(), map(), String.t() | nil) :: map()
+  def prepare_arm(config, session, workdir_root \\ nil) do
+    root = root_path(config, session, workdir_root)
+
+    %{
+      session_key: session.session_key,
+      host: session.host,
+      root: root,
+      baseline: observe(config, session, root)
+    }
+  end
+
+  @spec arm_in_txn(Txn.t(), map(), map(), map()) :: map()
+  def arm_in_txn(%Txn{} = txn, config, assignment, prepared) do
+    session = session_in_txn(txn, assignment.holderKey)
+
+    {root, baseline} =
+      case prepared do
+        %{session_key: key, host: host, root: root, baseline: baseline}
+        when key == session.session_key and host == session.host ->
+          {root, baseline}
+
+        %{session_key: _key} ->
+          raise "effort arm placement changed before commit"
+      end
+
+    [[generation]] =
+      Txn.q(
+        txn,
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM effort_checkin_generations WHERE assignmentId = ?1",
+        [assignment.id]
+      )
+
+    insert_generation(txn, config, assignment.id, session, root, baseline, generation, 1)
+  end
+
+  @doc "Capture monitored assignments on a holder against a destination placement."
+  @spec prepare_holder_rearms(DB.server(), map(), map()) :: [map()]
+  def prepare_holder_rearms(db, config, destination_session) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT a.id,g.generation,g.wakeId,g.root,g.holderKey,g.host
+        FROM assignments a
+        JOIN effort_checkin_generations g ON g.assignmentId=a.id
+        WHERE a.holderKey=?1 AND a.state='open'
+          AND g.generation=(
+            SELECT MAX(g2.generation) FROM effort_checkin_generations g2
+            WHERE g2.assignmentId=a.id
+          )
+        ORDER BY a.openedAt,a.id
+        """,
+        [destination_session.session_key]
+      )
+
+    Enum.map(rows, fn [assignment_id, generation, wake_id, root, holder_key, host] ->
+      prior = %{holder_key: holder_key, host: host, root: root}
+      relative = relative_root(config, prior)
+
+      %{
+        assignment_id: assignment_id,
+        prior_generation: generation,
+        prior_wake_id: wake_id,
+        arm: prepare_arm(config, destination_session, relative)
+      }
+    end)
+  end
+
+  @doc "Capture selected monitored assignments against a new holder."
+  @spec prepare_transferred_rearms(DB.server(), map(), map(), [String.t()]) :: [map()]
+  def prepare_transferred_rearms(db, config, destination_session, assignment_ids) do
+    Enum.flat_map(assignment_ids, fn assignment_id ->
+      case generation_for_assignment(db, assignment_id, :current) do
+        nil ->
+          []
+
+        prior ->
+          [
+            %{
+              assignment_id: assignment_id,
+              prior_generation: prior.generation,
+              prior_wake_id: prior.wake_id,
+              arm:
+                prepare_arm(
+                  config,
+                  destination_session,
+                  relative_root(config, prior)
+                )
+            }
+          ]
+      end
+    end)
+  end
+
+  @spec cancel_in_txn(Txn.t(), String.t()) :: :ok
+  def cancel_in_txn(%Txn{} = txn, assignment_id) do
+    case current_generation(txn, assignment_id) do
+      nil ->
+        :ok
+
+      generation ->
+        if generation.state == "armed" do
+          Wakes.cancel_in_txn(txn, generation.wake_id, @origin)
+        end
+
+        Txn.q(
+          txn,
+          "UPDATE effort_checkin_generations SET state = 'canceled' WHERE assignmentId = ?1 AND generation = ?2 AND state IN ('armed','probed')",
+          [assignment_id, generation.generation]
+        )
+
+        :ok
+    end
+
+    supersede_requests_in_txn(txn, assignment_id)
+    :ok
+  end
+
+  @spec apply_prepared_rearms_in_txn(Txn.t(), map(), String.t(), [map()]) :: :ok
+  def apply_prepared_rearms_in_txn(%Txn{} = txn, config, holder_key, prepared) do
+    Enum.each(prepared, fn item ->
+      case current_generation(txn, item.assignment_id) do
+        %{generation: generation, wake_id: wake_id}
+        when generation == item.prior_generation and wake_id == item.prior_wake_id ->
+          case Txn.q(
+                 txn,
+                 "SELECT 1 FROM assignments WHERE id=?1 AND holderKey=?2 AND state='open'",
+                 [item.assignment_id, holder_key]
+               ) do
+            [[1]] ->
+              cancel_in_txn(txn, item.assignment_id)
+
+              arm_in_txn(
+                txn,
+                config,
+                %{id: item.assignment_id, holderKey: holder_key},
+                item.arm
+              )
+
+            [] ->
+              :ok
+          end
+
+        _ ->
+          raise "effort generation changed before workspace-motion commit"
+      end
+    end)
+
+    :ok
+  end
+
+  @spec prepared_rearms_current?(Txn.t(), String.t(), [map()]) :: boolean()
+  def prepared_rearms_current?(%Txn{} = txn, holder_key, prepared) do
+    current =
+      Txn.q(
+        txn,
+        """
+        SELECT a.id,g.generation,g.wakeId
+        FROM assignments a
+        JOIN effort_checkin_generations g ON g.assignmentId=a.id
+        WHERE a.holderKey=?1 AND a.state='open'
+          AND g.generation=(
+            SELECT MAX(g2.generation) FROM effort_checkin_generations g2
+            WHERE g2.assignmentId=a.id
+          )
+        ORDER BY a.id
+        """,
+        [holder_key]
+      )
+
+    expected =
+      prepared
+      |> Enum.map(&[&1.assignment_id, &1.prior_generation, &1.prior_wake_id])
+      |> Enum.sort()
+
+    current == expected
+  end
+
+  @spec probe(DB.server(), map(), Wakes.wake()) :: :ok
+  def probe(db, config, wake) do
+    snapshot = generation_for_wake(db, wake.wake_id)
+
+    inspection =
+      case snapshot do
+        nil ->
+          {:error, "generation unavailable"}
+
+        generation ->
+          observe(
+            config,
+            %{session_key: generation.holder_key, host: generation.host},
+            generation.root,
+            generation.baseline
+          )
+      end
+
+    request =
+      case DB.transaction(db, fn txn -> probe_in_txn(txn, config, wake, inspection) end) do
+        {:ok, request} -> request
+        {:error, error} -> raise error
+      end
+
+    if is_map(request), do: notify_expecter(db, request, config)
+    :ok
+  end
+
+  @spec deadline(DB.server(), map(), Wakes.wake()) :: :ok
+  def deadline(db, config, wake) do
+    request =
+      case DB.transaction(db, fn txn -> deadline_in_txn(txn, config, wake) end) do
+        {:ok, request} -> request
+        {:error, error} -> raise error
+      end
+
+    if is_map(request), do: notify_expecter(db, request, config)
+    :ok
+  end
+
+  @spec rule(DB.server(), map(), map()) :: map()
+  def rule(db, config, call) do
+    request_id = call.params[:request_id] || call.params[:request]
+    action = call.params[:action]
+    request = request_row(db, request_id)
+
+    cond do
+      is_nil(request) ->
+        error("not_found", "decision request not found")
+
+      request.kind != "effort" ->
+        error("invalid", "effort-rule requires an effort request")
+
+      action not in ["continue", "dismiss"] ->
+        error("invalid_action", "action must be continue or dismiss")
+
+      not authorized?(call.principal, request) ->
+        error("not_authorized", "current expecter required")
+
+      request.status == "ruled" and request.decision == action ->
+        request
+
+      request.status != "open" ->
+        error("not_open", "decision request is not open")
+
+      true ->
+        fresh =
+          if action == "dismiss" do
+            generation =
+              generation_for_assignment(db, request.assignment_id, request.effort_generation)
+
+            session =
+              Org.get(db, generation.holder_key)
+
+            prepare_holder_rearms(
+              db,
+              config,
+              session
+            )
+          end
+
+        case DB.transaction(db, fn txn ->
+               rule_in_txn(
+                 txn,
+                 config,
+                 request,
+                 action,
+                 call.origin,
+                 call.principal,
+                 fresh
+               )
+             end) do
+          {:ok, result} -> result
+          {:error, error} -> raise error
+        end
+    end
+  end
+
+  @doc "Exact ordinary-power menu for the request's current expecter."
+  @spec menu_in_txn(Txn.t(), map(), map()) :: [String.t()]
+  def menu_in_txn(txn, assignment, expecter) do
+    base = ["wake", "continue", "dismiss"]
+
+    revocation =
+      cond do
+        expecter.session_key && assignment.opened_by_session == expecter.session_key ->
+          ["revoke-assignment", "dispatch"]
+
+        expecter.user_id && assignment.opened_by_user == expecter.user_id ->
+          ["revoke-assignment", "dispatch"]
+
+        expecter.user_id && admin_user?(txn, expecter.user_id) ->
+          ["revoke-assignment", "dispatch"]
+
+        true ->
+          []
+      end
+
+    retire =
+      if expecter.user_id &&
+           holder_owner(txn, assignment.holder_key) == expecter.principal_user_id &&
+           not built_in?(txn, assignment.holder_key),
+         do: ["retire"],
+         else: []
+
+    base ++ revocation ++ retire
+  end
+
+  defp probe_in_txn(txn, config, wake, inspection) do
+    case generation_for_wake_in_txn(txn, wake.wake_id) do
+      %{state: "armed"} = generation ->
+        open? =
+          Txn.q(
+            txn,
+            "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'",
+            [generation.assignment_id]
+          ) == [[1]]
+
+        if open? do
+          Txn.q(
+            txn,
+            "UPDATE effort_checkin_generations SET state = 'probed' WHERE assignmentId = ?1 AND generation = ?2 AND wakeId = ?3 AND state = 'armed'",
+            [generation.assignment_id, generation.generation, wake.wake_id]
+          )
+
+          if Txn.changes(txn) == 1 do
+            mark_wake_fired(txn, wake.wake_id)
+            outcome = compare(generation.baseline, inspection)
+
+            if outcome == :effect do
+              session = session_in_txn(txn, generation.holder_key)
+
+              insert_generation(
+                txn,
+                config,
+                generation.assignment_id,
+                session,
+                generation.root,
+                inspection,
+                generation.generation + 1,
+                1
+              )
+
+              nil
+            else
+              evidence = evidence(txn, generation, outcome)
+
+              Txn.q(
+                txn,
+                "UPDATE effort_checkin_generations SET evidence = ?3 WHERE assignmentId = ?1 AND generation = ?2",
+                [generation.assignment_id, generation.generation, JSON.encode!(evidence)]
+              )
+
+              open_request_in_txn(txn, config, generation, evidence)
+            end
+          end
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp deadline_in_txn(txn, config, wake) do
+    case request_for_deadline(txn, wake.wake_id) do
+      nil ->
+        nil
+
+      request ->
+        next = advance_expecter(txn, request)
+        deadline = now() + deadline_ms(config)
+        assignment = assignment_in_txn(txn, request.assignment_id)
+        menu = menu_in_txn(txn, assignment, next)
+        context = Map.put(request.context, "actions", menu)
+
+        replacement =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: next.session_key || Org.personal_session_key(next.user_id),
+            origin: @origin,
+            consumer: "effort_deadline",
+            due_at: deadline
+          })
+
+        Txn.q(
+          txn,
+          """
+          UPDATE decision_requests
+          SET expecterSessionKey = ?2, expecterUserId = ?3, lineageRung = ?4,
+              deadlineAt = ?5, deadlineWakeId = ?6, options = ?7, context = ?8
+          WHERE id = ?1 AND kind = 'effort' AND status = 'open' AND deadlineWakeId = ?9
+          """,
+          [
+            request.id,
+            next.session_key,
+            next.user_id,
+            next.rung,
+            deadline,
+            replacement.wake_id,
+            JSON.encode!(menu),
+            JSON.encode!(context),
+            wake.wake_id
+          ]
+        )
+
+        if Txn.changes(txn) == 1 do
+          mark_wake_fired(txn, wake.wake_id)
+          request_for_id(txn, request.id)
+        else
+          Wakes.cancel_in_txn(txn, replacement.wake_id, @origin)
+          nil
+        end
+    end
+  end
+
+  defp rule_in_txn(txn, config, request, action, origin, principal, fresh) do
+    current = request_for_id(txn, request.id)
+
+    cond do
+      not authorized?(principal, current) ->
+        error("not_authorized", "current expecter required")
+
+      action == "dismiss" and
+          not prepared_rearms_current?(
+            txn,
+            generation_for_assignment_in_txn(
+              txn,
+              current.assignment_id,
+              current.effort_generation
+            ).holder_key,
+            fresh
+          ) ->
+        error("stale_effort_snapshot", "holder effort state changed; retry the ruling")
+
+      current.status == "open" ->
+        Wakes.cancel_in_txn(txn, current.deadline_wake_id, @origin)
+
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET status = 'ruled', decision = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
+          [current.id, action, origin, now()]
+        )
+
+        if Txn.changes(txn) == 1 do
+          generation =
+            generation_for_assignment_in_txn(
+              txn,
+              current.assignment_id,
+              current.effort_generation
+            )
+
+          case action do
+            "continue" ->
+              session = session_in_txn(txn, generation.holder_key)
+
+              insert_generation(
+                txn,
+                config,
+                current.assignment_id,
+                session,
+                generation.root,
+                generation.baseline,
+                generation.generation + 1,
+                min(generation.multiplier * 2, 4)
+              )
+
+            "dismiss" ->
+              apply_prepared_rearms_in_txn(
+                txn,
+                config,
+                generation.holder_key,
+                fresh
+              )
+          end
+
+          request_for_id(txn, current.id)
+        else
+          error("not_open", "decision request is not open")
+        end
+
+      true ->
+        error("not_open", "decision request is not open")
+    end
+  end
+
+  defp open_request_in_txn(txn, config, generation, evidence) do
+    assignment = assignment_in_txn(txn, generation.assignment_id)
+    expecter = initial_expecter(txn, assignment)
+    menu = menu_in_txn(txn, assignment, expecter)
+    request_id = "dr_" <> Tightbeam.Id.uuid4()
+    deadline_at = now() + deadline_ms(config)
+
+    deadline =
+      Wakes.schedule_in_txn(txn, %{
+        session_key: expecter.session_key || Org.personal_session_key(expecter.user_id),
+        origin: @origin,
+        consumer: "effort_deadline",
+        due_at: deadline_at
+      })
+
+    context = Map.put(evidence, :actions, menu)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+         expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
+         raisedAt, deadlineAt, statuteName, actionKey, question, options,
+         context, status)
+      VALUES
+        (?1, 'effort', 'process:tightbeam', ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+         ?9, ?10, NULL, NULL, ?11, ?12, ?13, 'open')
+      ON CONFLICT DO NOTHING
+      """,
+      [
+        request_id,
+        expecter.owner_user_id,
+        generation.assignment_id,
+        expecter.session_key,
+        expecter.user_id,
+        expecter.rung,
+        generation.generation,
+        deadline.wake_id,
+        now(),
+        deadline_at,
+        "Assignment #{generation.assignment_id} effort check-in outcome: #{evidence.outcome}. " <>
+          "Terminal turns since arm: #{evidence.turnsSinceArmed}; minutes since arm: #{evidence.minutesSinceArmed}. " <>
+          "Choose continue or dismiss, or use an available ordinary power.",
+        JSON.encode!(menu),
+        JSON.encode!(context)
+      ]
+    )
+
+    if Txn.changes(txn) == 1 do
+      request_for_id(txn, request_id)
+    else
+      Wakes.cancel_in_txn(txn, deadline.wake_id, @origin)
+
+      case Txn.q(
+             txn,
+             "SELECT id FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND effortGeneration = ?2",
+             [generation.assignment_id, generation.generation]
+           ) do
+        [[id]] -> request_for_id(txn, id)
+        [] -> nil
+      end
+    end
+  end
+
+  defp insert_generation(
+         txn,
+         config,
+         assignment_id,
+         session,
+         root,
+         baseline,
+         generation,
+         multiplier
+       ) do
+    armed_at = now()
+    horizon = horizon_ms(config)
+
+    [[watermark]] =
+      Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE sessionKey = ?1", [
+        session.session_key
+      ])
+
+    wake =
+      Wakes.schedule_in_txn(txn, %{
+        session_key: session.session_key,
+        origin: @origin,
+        consumer: "effort_probe",
+        due_at: armed_at + horizon * multiplier
+      })
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO effort_checkin_generations
+        (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
+         terminalSeqWatermark, holderKey, host, root, baseline, wakeId)
+      VALUES (?1, ?2, 'armed', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+      """,
+      [
+        assignment_id,
+        generation,
+        horizon,
+        multiplier,
+        armed_at,
+        watermark,
+        session.session_key,
+        session.host,
+        root,
+        encode_observation(baseline),
+        wake.wake_id
+      ]
+    )
+
+    generation_for_assignment_in_txn(txn, assignment_id, generation)
+  end
+
+  defp supersede_requests_in_txn(txn, assignment_id) do
+    if Txn.q(
+         txn,
+         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'decision_requests'"
+       ) == [[1]] do
+      Txn.q(
+        txn,
+        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        [assignment_id]
+      )
+      |> Enum.each(fn [wake_id] -> Wakes.cancel_in_txn(txn, wake_id, @origin) end)
+
+      Txn.q(
+        txn,
+        "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        [assignment_id]
+      )
+    end
+  end
+
+  defp initial_expecter(txn, assignment) do
+    cond do
+      assignment.opened_by_user ->
+        %{
+          session_key: nil,
+          user_id: assignment.opened_by_user,
+          owner_user_id: assignment.opened_by_user,
+          principal_user_id: assignment.opened_by_user,
+          rung: 0
+        }
+
+      assignment.opened_by_session == assignment.holder_key ->
+        holder = session_in_txn(txn, assignment.holder_key)
+
+        if holder.spawned_by do
+          route_session(txn, holder.spawned_by, holder.owner_user_id, 1, assignment.holder_key)
+        else
+          %{
+            session_key: nil,
+            user_id: holder.owner_user_id,
+            owner_user_id: holder.owner_user_id,
+            principal_user_id: holder.owner_user_id,
+            rung: 1
+          }
+        end
+
+      true ->
+        opener = session_in_txn(txn, assignment.opened_by_session)
+        route_session(txn, opener.session_key, opener.owner_user_id, 0, assignment.holder_key)
+    end
+  end
+
+  defp advance_expecter(_txn, %{expecter_user_id: user, lineage_rung: rung})
+       when is_binary(user) do
+    %{
+      session_key: nil,
+      user_id: user,
+      owner_user_id: user,
+      principal_user_id: user,
+      rung: rung
+    }
+  end
+
+  defp advance_expecter(txn, request) do
+    current = session_in_txn(txn, request.expecter_session_key)
+    assignment = assignment_in_txn(txn, request.assignment_id)
+
+    if current.spawned_by do
+      route_session(
+        txn,
+        current.spawned_by,
+        request.owner_user_id,
+        request.lineage_rung + 1,
+        assignment.holder_key
+      )
+    else
+      %{
+        session_key: nil,
+        user_id: request.owner_user_id,
+        owner_user_id: request.owner_user_id,
+        principal_user_id: request.owner_user_id,
+        rung: request.lineage_rung + 1
+      }
+    end
+  end
+
+  defp route_session(txn, key, owner_user_id, rung, holder_key) do
+    session = session_in_txn(txn, key)
+
+    cond do
+      key == holder_key and session.spawned_by ->
+        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
+
+      key == holder_key ->
+        %{
+          session_key: nil,
+          user_id: owner_user_id,
+          owner_user_id: owner_user_id,
+          principal_user_id: owner_user_id,
+          rung: rung + 1
+        }
+
+      session.state == "active" and is_nil(session.adjudication_hold) ->
+        %{
+          session_key: key,
+          user_id: nil,
+          owner_user_id: owner_user_id,
+          principal_user_id: session.owner_user_id,
+          rung: rung
+        }
+
+      session.spawned_by ->
+        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
+
+      true ->
+        %{
+          session_key: nil,
+          user_id: owner_user_id,
+          owner_user_id: owner_user_id,
+          principal_user_id: owner_user_id,
+          rung: rung + 1
+        }
+    end
+  end
+
+  defp compare({:error, _}, _inspection), do: :unobservable
+  defp compare(_baseline, {:error, _}), do: :unobservable
+
+  defp compare({:ok, baseline}, {:ok, current}) do
+    baseline_repos = Map.new(baseline.repos, &{&1.path, &1})
+    current_paths = MapSet.new(current.repos, & &1.path)
+
+    repo_effect =
+      Enum.any?(baseline.repos, &(!MapSet.member?(current_paths, &1.path))) or
+        Enum.any?(current.repos, fn repo ->
+          case Map.get(baseline_repos, repo.path) do
+            nil -> true
+            prior -> repo[:new_commit] == true or prior.tracked != repo.tracked
+          end
+        end)
+
+    untracked_effect = current.untracked -- baseline.untracked != []
+    if repo_effect or untracked_effect, do: :effect, else: :zero_edits
+  end
+
+  defp evidence(txn, generation, outcome) do
+    [[turns]] =
+      Txn.q(
+        txn,
+        """
+        SELECT COUNT(*) FROM turns
+        WHERE sessionKey = ?1 AND seq > ?2
+          AND status IN ('delivered','failed','failed_unknown')
+        """,
+        [generation.holder_key, generation.terminal_seq_watermark]
+      )
+
+    %{
+      assignmentId: generation.assignment_id,
+      effortGeneration: generation.generation,
+      outcome: Atom.to_string(outcome),
+      turnsSinceArmed: turns,
+      minutesSinceArmed: div(max(now() - generation.armed_at, 0), 60_000)
+    }
+  end
+
+  defp observe(config, session, root, baseline \\ nil) do
+    case Placement.effort_manifest(config, session, root, baseline) do
+      {:ok, manifest} -> {:ok, manifest}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    error -> {:error, Exception.message(error)}
+  end
+
+  defp encode_observation({:ok, manifest}),
+    do: JSON.encode!(%{status: "available", manifest: manifest})
+
+  defp encode_observation({:error, reason}),
+    do: JSON.encode!(%{status: "unavailable", reason: reason})
+
+  defp decode_observation(encoded) do
+    case JSON.decode!(encoded) do
+      %{"status" => "available", "manifest" => manifest} ->
+        {:ok,
+         %{
+           repos:
+             Enum.map(manifest["repos"], fn repo ->
+               %{path: repo["path"], head: repo["head"], tracked: repo["tracked"]}
+             end),
+           untracked: manifest["untracked"]
+         }}
+
+      %{"reason" => reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp root_path(config, session, root) do
+    base = Placement.workdir_path(config, session)
+    if root in [nil, ""], do: base, else: Path.join(base, root)
+  end
+
+  defp relative_root(config, generation) do
+    base =
+      Placement.workdir_path(config, %{
+        session_key: generation.holder_key,
+        host: generation.host
+      })
+
+    case Path.relative_to(generation.root, base) do
+      "." -> nil
+      relative -> relative
+    end
+  end
+
+  defp notify_expecter(db, request, config) do
+    case Map.get(config, :effort_notify) do
+      fun when is_function(fun, 1) ->
+        fun.(request)
+
+      _ ->
+        deliver_notification(db, request)
+    end
+  end
+
+  defp deliver_notification(db, request) do
+    target = request.expecter_session_key || Org.personal_session_key(request.expecter_user_id)
+
+    prompt =
+      "Effort check-in #{request.id} for assignment #{request.assignment_id}.\n" <>
+        request.question <>
+        "\nActions: #{Enum.join(request.options || [], ", ")}"
+
+    try do
+      Tightbeam.Gateway.deliver_prompt(target, @origin, prompt, db: db, sender: @origin)
+    rescue
+      _ -> :ok
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  defp authorized?({:session, key}, request), do: request.expecter_session_key == key
+  defp authorized?({:user, user}, request), do: request.expecter_user_id == user
+  defp authorized?(_, _request), do: false
+
+  defp invalid_root,
+    do: {:error, error("invalid_workdir_root", "workdirRoot must be relative and contain no ..")}
+
+  defp horizon_ms(config),
+    do:
+      Map.get(
+        config,
+        :effort_checkin_horizon_ms,
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, @default_horizon_ms)
+      )
+
+  defp deadline_ms(config),
+    do:
+      Map.get(
+        config,
+        :escalation_decision_deadline_ms,
+        Application.get_env(
+          :tightbeam,
+          :escalation_decision_deadline_ms,
+          @default_deadline_ms
+        )
+      )
+
+  defp assignment_in_txn(txn, id) do
+    [[id, holder, opened_user, opened_session]] =
+      Txn.q(
+        txn,
+        "SELECT id, holderKey, openedByUser, openedBySession FROM assignments WHERE id = ?1",
+        [id]
+      )
+
+    %{
+      id: id,
+      holder_key: holder,
+      opened_by_user: opened_user,
+      opened_by_session: opened_session
+    }
+  end
+
+  defp session_in_txn(txn, key) do
+    [[key, owner, spawned_by, host, state, hold, built_in]] =
+      Txn.q(
+        txn,
+        "SELECT sessionKey, ownerUserId, spawnedBy, host, state, adjudicationHold, isBuiltIn FROM sessions WHERE sessionKey = ?1",
+        [key]
+      )
+
+    %{
+      session_key: key,
+      owner_user_id: owner,
+      spawned_by: spawned_by,
+      host: host,
+      state: state,
+      adjudication_hold: hold,
+      is_built_in: built_in == 1
+    }
+  end
+
+  defp holder_owner(txn, key) do
+    [[owner]] = Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [key])
+    owner
+  end
+
+  defp built_in?(txn, key) do
+    Txn.q(txn, "SELECT isBuiltIn FROM sessions WHERE sessionKey = ?1", [key]) == [[1]]
+  end
+
+  defp admin_user?(txn, user) do
+    Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) == [[1]]
+  end
+
+  defp current_generation(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           generation_select() <> " WHERE assignmentId = ?1 ORDER BY generation DESC LIMIT 1",
+           [assignment_id]
+         ) do
+      [row] -> generation(row)
+      [] -> nil
+    end
+  end
+
+  defp generation_for_wake(db, wake_id) do
+    {:ok, rows} = DB.query(db, generation_select() <> " WHERE wakeId = ?1", [wake_id])
+
+    case rows do
+      [row] -> generation(row)
+      [] -> nil
+    end
+  end
+
+  defp generation_for_wake_in_txn(txn, wake_id) do
+    case Txn.q(txn, generation_select() <> " WHERE wakeId = ?1", [wake_id]) do
+      [row] -> generation(row)
+      [] -> nil
+    end
+  end
+
+  defp generation_for_assignment(db, assignment_id, :current) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        generation_select() <>
+          " WHERE assignmentId = ?1 ORDER BY generation DESC LIMIT 1",
+        [assignment_id]
+      )
+
+    case rows do
+      [row] -> generation(row)
+      [] -> nil
+    end
+  end
+
+  defp generation_for_assignment(db, assignment_id, generation) do
+    {:ok, [row]} =
+      DB.query(
+        db,
+        generation_select() <> " WHERE assignmentId = ?1 AND generation = ?2",
+        [assignment_id, generation]
+      )
+
+    generation(row)
+  end
+
+  defp generation_for_assignment_in_txn(txn, assignment_id, generation_number) do
+    [row] =
+      Txn.q(
+        txn,
+        generation_select() <> " WHERE assignmentId = ?1 AND generation = ?2",
+        [assignment_id, generation_number]
+      )
+
+    generation(row)
+  end
+
+  defp generation_select do
+    "SELECT assignmentId, generation, state, baseHorizonMs, multiplier, armedAt, terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence FROM effort_checkin_generations"
+  end
+
+  defp generation([
+         assignment_id,
+         generation,
+         state,
+         base_horizon_ms,
+         multiplier,
+         armed_at,
+         watermark,
+         holder_key,
+         host,
+         root,
+         baseline,
+         wake_id,
+         evidence
+       ]) do
+    %{
+      assignment_id: assignment_id,
+      generation: generation,
+      state: state,
+      base_horizon_ms: base_horizon_ms,
+      multiplier: multiplier,
+      armed_at: armed_at,
+      terminal_seq_watermark: watermark,
+      holder_key: holder_key,
+      host: host,
+      root: root,
+      baseline: decode_observation(baseline),
+      wake_id: wake_id,
+      evidence: evidence && JSON.decode!(evidence)
+    }
+  end
+
+  defp request_for_deadline(txn, wake_id) do
+    case Txn.q(
+           txn,
+           request_select() <>
+             " WHERE kind = 'effort' AND status = 'open' AND deadlineWakeId = ?1",
+           [wake_id]
+         ) do
+      [row] -> request(row)
+      [] -> nil
+    end
+  end
+
+  defp request_for_id(txn, id) do
+    [row] = Txn.q(txn, request_select() <> " WHERE id = ?1", [id])
+    request(row)
+  end
+
+  defp request_row(_db, nil), do: nil
+
+  defp request_row(db, id) do
+    {:ok, rows} = DB.query(db, request_select() <> " WHERE id = ?1", [id])
+
+    case rows do
+      [row] -> request(row)
+      [] -> nil
+    end
+  end
+
+  defp request_select do
+    "SELECT id, kind, ownerUserId, assignmentId, expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt, question, options, context, status, decision, ruledBy, ruledAt FROM decision_requests"
+  end
+
+  defp request([
+         id,
+         kind,
+         owner,
+         assignment_id,
+         expecter_session,
+         expecter_user,
+         rung,
+         effort_generation,
+         deadline_wake_id,
+         raised_at,
+         deadline_at,
+         question,
+         options,
+         context,
+         status,
+         decision,
+         ruled_by,
+         ruled_at
+       ]) do
+    %{
+      id: id,
+      kind: kind,
+      owner_user_id: owner,
+      assignment_id: assignment_id,
+      expecter_session_key: expecter_session,
+      expecter_user_id: expecter_user,
+      lineage_rung: rung,
+      effort_generation: effort_generation,
+      deadline_wake_id: deadline_wake_id,
+      raised_at: raised_at,
+      deadline_at: deadline_at,
+      question: question,
+      options: options && JSON.decode!(options),
+      context: JSON.decode!(context),
+      status: status,
+      decision: decision,
+      ruled_by: ruled_by,
+      ruled_at: ruled_at
+    }
+  end
+
+  defp mark_wake_fired(txn, wake_id) do
+    Txn.q(
+      txn,
+      "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+      [wake_id, now()]
+    )
+  end
+
+  defp error(code, message), do: %{code: code, message: message}
+  defp now, do: System.system_time(:millisecond)
+end

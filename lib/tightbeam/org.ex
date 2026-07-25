@@ -433,6 +433,18 @@ defmodule Tightbeam.Org do
     update(db, session_key, "host = ?2", [host])
   end
 
+  @doc "Transaction-owned host recorder for workspace-motion compositions."
+  @spec set_host_in_txn(Txn.t(), String.t(), String.t()) :: session()
+  def set_host_in_txn(%Txn{} = txn, session_key, host) do
+    Txn.q(
+      txn,
+      "UPDATE sessions SET host = ?2, updatedAt = ?3 WHERE sessionKey = ?1",
+      [session_key, host, now()]
+    )
+
+    must_get(txn, session_key)
+  end
+
   @doc "Replace the normalized overrides and their derived identity name together."
   @spec set_identity(db(), String.t(), map() | nil, String.t()) :: session()
   def set_identity(db \\ Tightbeam.DB, session_key, overrides, identity_name) do

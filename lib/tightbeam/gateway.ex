@@ -69,6 +69,7 @@ defmodule Tightbeam.Gateway do
     Placement,
     DB,
     Devices,
+    EffortCheckin,
     Escalation,
     EventLog,
     Harness,
@@ -98,6 +99,11 @@ defmodule Tightbeam.Gateway do
   alias Tightbeam.Wire.Payloads
   require Logger
 
+  defmodule EffortRearmRace do
+    @moduledoc false
+    defexception message: "effort rearm snapshot changed"
+  end
+
   @typedoc "Gateway config (gateway.ts GatewayConfig)."
   @type config :: %{
           base_dir: String.t(),
@@ -109,6 +115,7 @@ defmodule Tightbeam.Gateway do
           wake_tick_ms: pos_integer(),
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
+          effort_checkin_horizon_ms: pos_integer(),
           adjudication_claim_window_ms: pos_integer(),
           adjudication_response_window_ms: pos_integer(),
           adjudication_park_fallback_ms: pos_integer(),
@@ -148,6 +155,7 @@ defmodule Tightbeam.Gateway do
           Roles,
           WorkItems,
           Assignments,
+          EffortCheckin,
           RailRemedy,
           Producers,
           Supervision,
@@ -287,7 +295,14 @@ defmodule Tightbeam.Gateway do
         {ModelCatalog, base_dir: config.base_dir},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
         {Tightbeam.Wakes,
-         db: db, deliver: deliver, tick_ms: config.wake_tick_ms, name: Tightbeam.WakeScheduler},
+         db: db,
+         deliver: deliver,
+         internal_consumers: %{
+           "effort_probe" => &EffortCheckin.probe(db, config, &1),
+           "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
+         },
+         tick_ms: config.wake_tick_ms,
+         name: Tightbeam.WakeScheduler},
         {Tightbeam.Supervision,
          db: db, handlers: handler_table, prod_limit: prod_limit, name: Tightbeam.Supervision},
         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
@@ -460,6 +475,7 @@ defmodule Tightbeam.Gateway do
           scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
         )
       end,
+      "effort-rule" => fn call -> EffortCheckin.rule(db, config, call) end,
       "waive" => fn call ->
         Escalation.waive(db, call,
           authorized: admin_origin?(db, call.origin),
@@ -571,6 +587,7 @@ defmodule Tightbeam.Gateway do
           call
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
+          |> Map.put(:effort_config, config)
           |> Map.put(:on_dispatch_delivery, fn delivery, _ -> complete_delivery(db, delivery) end)
 
         Assignments.__handle__(db, "dispatch", call)
@@ -2430,8 +2447,10 @@ defmodule Tightbeam.Gateway do
                   :ok ->
                     case Placement.move_workdir(config, call.session_key, session.host, host) do
                       :ok ->
-                        Org.set_host(db, call.session_key, host)
-                        %{ok: true, host: host}
+                        case commit_host_rearm(config, db, session, host, 8) do
+                          :ok -> %{ok: true, host: host}
+                          {:error, message} -> %{code: "workspace_move_race", message: message}
+                        end
 
                       {:error, message} ->
                         %{code: "workdir_move_failed", message: message}
@@ -3269,16 +3288,58 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp adjudicate_respawn(config, db, call, episode) do
+  defp adjudicate_respawn(config, db, call, episode),
+    do: adjudicate_respawn(config, db, call, episode, 8)
+
+  defp adjudicate_respawn(_config, _db, _call, _episode, 0),
+    do: %{code: "workspace_move_race", message: "assignments kept changing during respawn"}
+
+  defp adjudicate_respawn(config, db, call, episode, attempts) do
     with {:ok, harness, provider} <- harness_for_ref(call.params.model) do
       old = Org.get(db, episode.session_key)
+      new_session_key = "agent:" <> Tightbeam.Id.uuid4()
 
-      {:ok, {new_session, delivery, wake_id, marker}} =
+      {:ok, transferred_rows} =
+        DB.query(
+          db,
+          "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id",
+          [old.session_key]
+        )
+
+      transferred_assignment_ids = Enum.map(transferred_rows, &hd/1)
+
+      prepared_rearms =
+        EffortCheckin.prepare_transferred_rearms(
+          db,
+          config,
+          %{old | session_key: new_session_key},
+          transferred_assignment_ids
+        )
+
+      transaction_result =
         DB.transaction(db, fn txn ->
+          current_assignment_ids =
+            Txn.q(
+              txn,
+              "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id",
+              [old.session_key]
+            )
+            |> Enum.map(&hd/1)
+
+          unless current_assignment_ids == transferred_assignment_ids and
+                   EffortCheckin.prepared_rearms_current?(
+                     txn,
+                     old.session_key,
+                     prepared_rearms
+                   ) do
+            raise EffortRearmRace
+          end
+
           current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
           new_session =
             Org.create_in_txn(txn, %{
+              session_key: new_session_key,
               display_name: old.display_name,
               kind: old.kind,
               owner_user_id: old.owner_user_id,
@@ -3343,6 +3404,13 @@ defmodule Tightbeam.Gateway do
             new_session.session_key
           ])
 
+          EffortCheckin.apply_prepared_rearms_in_txn(
+            txn,
+            config,
+            new_session.session_key,
+            prepared_rearms
+          )
+
           retire_session_in_txn(
             txn,
             old.session_key,
@@ -3386,33 +3454,42 @@ defmodule Tightbeam.Gateway do
           {new_session, delivery, wake_id, marker}
         end)
 
-      publish_message(db, old.session_key, marker)
+      case transaction_result do
+        {:error, %EffortRearmRace{}} ->
+          adjudicate_respawn(config, db, call, episode, attempts - 1)
 
-      broadcast(
-        db,
-        old.owner_user_id,
-        Payloads.stream_history_cleared(old.session_key)
-      )
+        {:error, error} ->
+          raise error
 
-      complete_delivery(db, delivery)
+        {:ok, {new_session, delivery, wake_id, marker}} ->
+          publish_message(db, old.session_key, marker)
 
-      broadcast(db, old.owner_user_id, Payloads.stream_deleted(old.session_key))
+          broadcast(
+            db,
+            old.owner_user_id,
+            Payloads.stream_history_cleared(old.session_key)
+          )
 
-      broadcast(
-        db,
-        new_session.owner_user_id,
-        Payloads.stream_created(Payloads.stream_session(new_session))
-      )
+          complete_delivery(db, delivery)
 
-      reap_retired_sessions(config, db, [old.session_key])
+          broadcast(db, old.owner_user_id, Payloads.stream_deleted(old.session_key))
 
-      %{
-        ok: true,
-        action: "respawn",
-        retired_session_key: old.session_key,
-        session_key: new_session.session_key,
-        recovery_wake_id: wake_id
-      }
+          broadcast(
+            db,
+            new_session.owner_user_id,
+            Payloads.stream_created(Payloads.stream_session(new_session))
+          )
+
+          reap_retired_sessions(config, db, [old.session_key])
+
+          %{
+            ok: true,
+            action: "respawn",
+            retired_session_key: old.session_key,
+            session_key: new_session.session_key,
+            recovery_wake_id: wake_id
+          }
+      end
     else
       {:error, error} -> error
     end
@@ -3548,6 +3625,61 @@ defmodule Tightbeam.Gateway do
     case ModelCatalog.entry(harness, ref) do
       {%{provider: provider}, _health} -> Atom.to_string(provider)
       {nil, _health} -> raise "catalog entry missing after validation: #{harness}/#{ref}"
+    end
+  end
+
+  defp commit_host_rearm(_config, _db, _session, _host, 0),
+    do: {:error, "holder assignments kept changing while the workspace moved"}
+
+  defp commit_host_rearm(config, db, session, host, attempts) do
+    prepared =
+      EffortCheckin.prepare_holder_rearms(
+        db,
+        config,
+        %{session | host: host}
+      )
+
+    case DB.transaction(db, fn txn ->
+           [[current_host]] =
+             Txn.q(txn, "SELECT host FROM sessions WHERE sessionKey=?1", [
+               session.session_key
+             ])
+
+           cond do
+             current_host != session.host ->
+               :placement_changed
+
+             not EffortCheckin.prepared_rearms_current?(
+               txn,
+               session.session_key,
+               prepared
+             ) ->
+               :retry
+
+             true ->
+               Org.set_host_in_txn(txn, session.session_key, host)
+
+               EffortCheckin.apply_prepared_rearms_in_txn(
+                 txn,
+                 config,
+                 session.session_key,
+                 prepared
+               )
+
+               :ok
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:ok, :retry} ->
+        commit_host_rearm(config, db, session, host, attempts - 1)
+
+      {:ok, :placement_changed} ->
+        {:error, "holder placement changed concurrently"}
+
+      {:error, error} ->
+        {:error, Exception.message(error)}
     end
   end
 

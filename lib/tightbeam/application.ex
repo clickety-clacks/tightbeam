@@ -37,6 +37,8 @@ defmodule Tightbeam.Application do
           prod_limit: Application.get_env(:tightbeam, :prod_limit, 3),
           escalation_decision_deadline_ms:
             Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),
+          effort_checkin_horizon_ms:
+            Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000),
           adjudication_claim_window_ms:
             Application.get_env(:tightbeam, :adjudication_claim_window_ms, 300_000),
           adjudication_response_window_ms:
