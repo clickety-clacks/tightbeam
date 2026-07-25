@@ -16,17 +16,19 @@ pub struct RequestSpec {
 pub struct Endpoint {
     pub base: String,
     pub token: String,
+    pub session_file: Option<PathBuf>,
 }
 
 fn quoted(value: &str) -> String {
     serde_json::to_string(value).expect("strings are always JSON serializable")
 }
 
-fn identity_field(identity: &Identity) -> String {
+fn identity_field(identity: &Identity) -> Option<String> {
     match identity {
-        Identity::Role(value) => format!("\"as\":{}", quoted(value)),
-        Identity::User(value) => format!("\"asUser\":{}", quoted(value)),
-        Identity::Process(value) => format!("\"asProcess\":{}", quoted(value)),
+        Identity::Role(value) => Some(format!("\"as\":{}", quoted(value))),
+        Identity::User(value) => Some(format!("\"asUser\":{}", quoted(value))),
+        Identity::Process(value) => Some(format!("\"asProcess\":{}", quoted(value))),
+        Identity::Session => None,
     }
 }
 
@@ -48,7 +50,8 @@ fn request(
     mut fields: Vec<String>,
     params: Vec<String>,
 ) -> RequestSpec {
-    let mut body = vec![identity_field(identity), string_field("verb", verb)];
+    let mut body = identity_field(identity).into_iter().collect::<Vec<_>>();
+    body.push(string_field("verb", verb));
     body.append(&mut fields);
     body.push(params_field(params));
     RequestSpec {
@@ -244,6 +247,13 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("action", action),
             ],
         )),
+        Command::DecisionRequests { identity, status } => {
+            let mut params = Vec::new();
+            if let Some(value) = status {
+                params.push(string_field("status", value));
+            }
+            Ok(request(identity, "decision-requests", vec![], params))
+        }
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -479,11 +489,12 @@ pub fn build_register_host_request(
 pub fn discover() -> Result<Endpoint, String> {
     #[allow(deprecated)]
     let home = std::env::home_dir().unwrap_or_default();
-    discover_with(|name| std::env::var(name).ok(), &home)
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    discover_with(|name| std::env::var(name).ok(), &cwd, &home)
 }
 
 pub fn discover_from(base_dir: &Path) -> Result<Endpoint, String> {
-    endpoint_from_file(&base_dir.join("gateway.json"))
+    endpoint_from_gateway_file(&base_dir.join("gateway.json"))
 }
 
 fn gateway_config_path<F>(get_env: &F, home_dir: &Path) -> PathBuf
@@ -496,21 +507,58 @@ where
         .join("gateway.json")
 }
 
-fn discover_with<F>(get_env: F, home_dir: &Path) -> Result<Endpoint, String>
+fn discover_with<F>(get_env: F, cwd: &Path, home_dir: &Path) -> Result<Endpoint, String>
 where
     F: Fn(&str) -> Option<String>,
 {
+    if let Some(endpoint) = discover_session_from(cwd)? {
+        return Ok(endpoint);
+    }
+
     let url = get_env("TIGHTBEAM_URL").filter(|value| !value.is_empty());
     let token = get_env("TIGHTBEAM_TOKEN").filter(|value| !value.is_empty());
     if let (Some(base), Some(token)) = (url, token) {
-        return Ok(Endpoint { base, token });
+        return Ok(Endpoint {
+            base,
+            token,
+            session_file: None,
+        });
     }
 
     let path = gateway_config_path(&get_env, home_dir);
-    endpoint_from_file(&path)
+    endpoint_from_gateway_file(&path)
 }
 
-fn endpoint_from_file(path: &Path) -> Result<Endpoint, String> {
+fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
+    for directory in cwd.ancestors() {
+        let path = directory.join(".tightbeam-session");
+        if !path.exists() {
+            continue;
+        }
+
+        let encoded = fs::read_to_string(&path)
+            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+        let config: Value = serde_json::from_str(&encoded)
+            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+        let base = config
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("malformed session file '{}': missing url", path.display()))?;
+        let token = config
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("malformed session file '{}': missing token", path.display()))?;
+        return Ok(Some(Endpoint {
+            base: base.to_owned(),
+            token: token.to_owned(),
+            session_file: Some(path),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
     let encoded = fs::read_to_string(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -534,6 +582,7 @@ fn endpoint_from_file(path: &Path) -> Result<Endpoint, String> {
     Ok(Endpoint {
         base: format!("http://127.0.0.1:{port}"),
         token,
+        session_file: None,
     })
 }
 
@@ -580,14 +629,43 @@ fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
 }
 
 pub fn run(command: Command) -> Result<(), String> {
+    let session_identity =
+        command_identity(&command).is_some_and(|identity| matches!(identity, Identity::Session));
+    run_with(
+        command,
+        move || {
+            if session_identity {
+                let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+                discover_session_from(&cwd)?.ok_or_else(|| identity_required(&cwd))
+            } else {
+                discover()
+            }
+        },
+        send_to,
+    )
+}
+
+fn run_with<D, S>(command: Command, discover_endpoint: D, send_request: S) -> Result<(), String>
+where
+    D: FnOnce() -> Result<Endpoint, String>,
+    S: FnOnce(&Endpoint, &RequestSpec) -> Result<Option<Value>, String>,
+{
     match command {
         Command::Help => unreachable!("help is handled before dispatch"),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
-        Command::Onboard { identity, provider } => crate::ceremonies::onboard(&identity, &provider),
+        Command::Onboard { identity, provider } => {
+            let endpoint = discover_endpoint()?;
+            require_session_endpoint(&identity, &endpoint)?;
+            crate::ceremonies::onboard(&identity, &provider)
+        }
         command => {
+            let endpoint = discover_endpoint()?;
+            if let Some(identity) = command_identity(&command) {
+                require_session_endpoint(identity, &endpoint)?;
+            }
             let request = build_request(&command)?;
-            if let Some(result) = send(&request)? {
+            if let Some(result) = send_request(&endpoint, &request)? {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
@@ -598,18 +676,59 @@ pub fn run(command: Command) -> Result<(), String> {
     }
 }
 
+fn require_session_endpoint(identity: &Identity, endpoint: &Endpoint) -> Result<(), String> {
+    if matches!(identity, Identity::Session) && endpoint.session_file.is_none() {
+        let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        return Err(identity_required(&cwd));
+    }
+    Ok(())
+}
+
+fn identity_required(cwd: &Path) -> String {
+    format!(
+        "identity required: no explicit --as, --as-user, or --as-process flag was passed, and no .tightbeam-session was found walking up from '{}' to the filesystem root. Pass --as <your-agent-handle> (agent action) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'.",
+        cwd.display()
+    )
+}
+
+fn command_identity(command: &Command) -> Option<&Identity> {
+    match command {
+        Command::Wake { identity, .. }
+        | Command::ArtifactRecord { identity, .. }
+        | Command::Artifacts { identity, .. }
+        | Command::Spawn { identity, .. }
+        | Command::List { identity }
+        | Command::Retire { identity, .. }
+        | Command::Assign { identity, .. }
+        | Command::Dispatch { identity, .. }
+        | Command::EffortRule { identity, .. }
+        | Command::DecisionRequests { identity, .. }
+        | Command::RevokeAssignment { identity, .. }
+        | Command::RunTests { identity, .. }
+        | Command::RunSmoke { identity, .. }
+        | Command::WorkItemCreate { identity, .. }
+        | Command::WorkItemGet { identity, .. }
+        | Command::Attest { identity, .. }
+        | Command::Attests { identity, .. }
+        | Command::Assignments { identity, .. }
+        | Command::CancelWake { identity, .. }
+        | Command::IdentityEdit { identity, .. }
+        | Command::IdentityStatus { identity, .. }
+        | Command::IdentityRelearn { identity, .. }
+        | Command::IdentityApply { identity, .. }
+        | Command::Onboard { identity, .. }
+        | Command::ConfigGet { identity, .. }
+        | Command::ConfigSet { identity, .. } => Some(identity),
+        Command::Help | Command::Doctor { .. } | Command::Assimilate(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::args;
     use std::collections::HashMap;
-    use std::process::Command as ProcessCommand;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    const DISCOVERY_CHILD: &str = "TIGHTBEAM_TEST_DISCOVERY_CHILD";
-    const EXPECTED_BASE: &str = "TIGHTBEAM_TEST_EXPECTED_BASE";
-    const EXPECTED_TOKEN: &str = "TIGHTBEAM_TEST_EXPECTED_TOKEN";
-    const EXPECTED_ERROR: &str = "TIGHTBEAM_TEST_EXPECTED_ERROR";
 
     fn parse(values: &[&str]) -> Command {
         args::parse(values.iter().map(|value| (*value).to_owned()).collect()).unwrap()
@@ -820,6 +939,10 @@ mod tests {
             r#"{"as":"parent","verb":"effort-rule","params":{"request":"dr_1","action":"continue"}}"#
         );
         assert_eq!(
+            body(&["decision-requests", "--status", "open", "--as", "parent"]),
+            r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
+        );
+        assert_eq!(
             body(&["revoke-assignment", "asg_1", "--as", "parent",]),
             r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
         );
@@ -1007,7 +1130,8 @@ mod tests {
             discover_from(&configured),
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
-                token: "configured".to_owned()
+                token: "configured".to_owned(),
+                session_file: None,
             })
         );
 
@@ -1020,29 +1144,58 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            discover_with(|name| env.get(name).cloned(), &root),
+            discover_with(|name| env.get(name).cloned(), &root, &root),
             Ok(Endpoint {
                 base: "https://gateway".to_owned(),
-                token: "env-token".to_owned()
+                token: "env-token".to_owned(),
+                session_file: None,
             })
         );
+
+        for incomplete in [
+            HashMap::from([
+                ("TIGHTBEAM_URL".to_owned(), "https://incomplete".to_owned()),
+                (
+                    "TIGHTBEAM_HOME".to_owned(),
+                    configured.display().to_string(),
+                ),
+            ]),
+            HashMap::from([
+                ("TIGHTBEAM_TOKEN".to_owned(), "incomplete".to_owned()),
+                (
+                    "TIGHTBEAM_HOME".to_owned(),
+                    configured.display().to_string(),
+                ),
+            ]),
+        ] {
+            assert_eq!(
+                discover_with(|name| incomplete.get(name).cloned(), &root, &root),
+                Ok(Endpoint {
+                    base: "http://127.0.0.1:4321".to_owned(),
+                    token: "configured".to_owned(),
+                    session_file: None,
+                })
+            );
+        }
 
         let env = HashMap::from([(
             "TIGHTBEAM_HOME".to_owned(),
             configured.display().to_string(),
         )]);
         assert_eq!(
-            discover_with(|name| env.get(name).cloned(), &root),
+            discover_with(|name| env.get(name).cloned(), &root, &root),
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
-                token: "configured".to_owned()
+                token: "configured".to_owned(),
+                session_file: None,
             })
         );
         assert_eq!(
-            discover_with(|_| None, &root),
+            discover_with(|_| None, &root, &root),
             Ok(Endpoint {
                 base: "http://127.0.0.1:9876".to_owned(),
-                token: "default".to_owned()
+                token: "default".to_owned(),
+                session_file: None,
             })
         );
         let env = HashMap::from([("TIGHTBEAM_HOME".to_owned(), String::new())]);
@@ -1054,38 +1207,16 @@ mod tests {
     }
 
     #[test]
-    fn discovery_ignores_session_files_across_full_precedence_matrix() {
-        if std::env::var_os(DISCOVERY_CHILD).is_some() {
-            if let Ok(expected) = std::env::var(EXPECTED_ERROR) {
-                assert_eq!(discover(), Err(expected));
-            } else {
-                assert_eq!(
-                    discover(),
-                    Ok(Endpoint {
-                        base: std::env::var(EXPECTED_BASE).unwrap(),
-                        token: std::env::var(EXPECTED_TOKEN).unwrap(),
-                    })
-                );
-            }
-            return;
-        }
-
+    fn discovery_walks_up_to_the_nearest_session_file_before_env_or_gateway() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tightbeam_cli_session_ignored_{}_{}",
-            std::process::id(),
-            unique
-        ));
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_session_{unique}"));
         let ancestor = root.join("ancestor");
         let cwd = ancestor.join("work").join("nested");
         let configured = root.join("configured");
-        let home = root.join("home");
-        let empty_home = root.join("empty-home");
-
-        for directory in [&cwd, &configured, &home.join(".tightbeam"), &empty_home] {
+        for directory in [&cwd, &configured] {
             fs::create_dir_all(directory).unwrap();
         }
         fs::write(
@@ -1103,99 +1234,82 @@ mod tests {
             r#"{"port":4321,"cliToken":"configured"}"#,
         )
         .unwrap();
-        fs::write(
-            home.join(".tightbeam").join("gateway.json"),
-            r#"{"port":9876,"cliToken":"default"}"#,
+
+        let env = HashMap::from([
+            ("TIGHTBEAM_URL".to_owned(), "https://env-gateway".to_owned()),
+            ("TIGHTBEAM_TOKEN".to_owned(), "env-token".to_owned()),
+            (
+                "TIGHTBEAM_HOME".to_owned(),
+                configured.display().to_string(),
+            ),
+        ]);
+        assert_eq!(
+            discover_with(|name| env.get(name).cloned(), &cwd, &root),
+            Ok(Endpoint {
+                base: "https://nearest-session".to_owned(),
+                token: "nearest-token".to_owned(),
+                session_file: Some(ancestor.join("work").join(".tightbeam-session")),
+            })
+        );
+
+        fs::write(ancestor.join("work").join(".tightbeam-session"), "{").unwrap();
+        let error = discover_with(|name| env.get(name).cloned(), &cwd, &root).unwrap_err();
+        assert!(error.starts_with("malformed session file"));
+        assert!(
+            error.contains(
+                &ancestor
+                    .join("work")
+                    .join(".tightbeam-session")
+                    .display()
+                    .to_string()
+            )
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bare_identity_builds_no_override_and_requires_a_session_file_before_network() {
+        assert_eq!(body(&["list"]), r#"{"verb":"inspect","params":{}}"#);
+
+        run_with(
+            Command::List {
+                identity: Identity::Session,
+            },
+            || {
+                Ok(Endpoint {
+                    base: "https://session-gateway".to_owned(),
+                    token: "tbs_discovered".to_owned(),
+                    session_file: Some(PathBuf::from("/work/.tightbeam-session")),
+                })
+            },
+            |endpoint, request| {
+                assert_eq!(endpoint.token, "tbs_discovered");
+                assert_eq!(request.body_json, r#"{"verb":"inspect","params":{}}"#);
+                Ok(None)
+            },
         )
         .unwrap();
 
-        let configured_path = configured.display().to_string();
-        let home_path = home.display().to_string();
-        let empty_home_path = empty_home.display().to_string();
-        let missing_config = empty_home.join(".tightbeam").join("gateway.json");
-        let missing_error = format!(
-            "ENOENT: no such file or directory, open '{}'",
-            missing_config.display()
-        );
-        let cases = [
-            (
-                "complete env",
-                vec![
-                    ("HOME", home_path.as_str()),
-                    ("TIGHTBEAM_HOME", configured_path.as_str()),
-                    ("TIGHTBEAM_URL", "https://env-gateway"),
-                    ("TIGHTBEAM_TOKEN", "env-token"),
-                    (EXPECTED_BASE, "https://env-gateway"),
-                    (EXPECTED_TOKEN, "env-token"),
-                ],
-            ),
-            (
-                "url-only env falls back to configured home",
-                vec![
-                    ("HOME", home_path.as_str()),
-                    ("TIGHTBEAM_HOME", configured_path.as_str()),
-                    ("TIGHTBEAM_URL", "https://incomplete"),
-                    (EXPECTED_BASE, "http://127.0.0.1:4321"),
-                    (EXPECTED_TOKEN, "configured"),
-                ],
-            ),
-            (
-                "token-only env falls back to configured home",
-                vec![
-                    ("HOME", home_path.as_str()),
-                    ("TIGHTBEAM_HOME", configured_path.as_str()),
-                    ("TIGHTBEAM_TOKEN", "incomplete"),
-                    (EXPECTED_BASE, "http://127.0.0.1:4321"),
-                    (EXPECTED_TOKEN, "configured"),
-                ],
-            ),
-            (
-                "configured home without env credentials",
-                vec![
-                    ("HOME", home_path.as_str()),
-                    ("TIGHTBEAM_HOME", configured_path.as_str()),
-                    (EXPECTED_BASE, "http://127.0.0.1:4321"),
-                    (EXPECTED_TOKEN, "configured"),
-                ],
-            ),
-            (
-                "default home",
-                vec![
-                    ("HOME", home_path.as_str()),
-                    (EXPECTED_BASE, "http://127.0.0.1:9876"),
-                    (EXPECTED_TOKEN, "default"),
-                ],
-            ),
-            (
-                "session files alone are not discovery sources",
-                vec![
-                    ("HOME", empty_home_path.as_str()),
-                    (EXPECTED_ERROR, missing_error.as_str()),
-                ],
-            ),
-        ];
+        let cwd = PathBuf::from("/tmp/tightbeam-no-session");
+        let endpoint = Endpoint {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: None,
+        };
+        let error = run_with(
+            Command::List {
+                identity: Identity::Session,
+            },
+            || Ok(endpoint),
+            |_, _| panic!("network sender must not be called"),
+        )
+        .unwrap_err();
 
-        let current_exe = std::env::current_exe().unwrap();
-        for (name, environment) in cases {
-            let output = ProcessCommand::new(&current_exe)
-                .arg("--exact")
-                .arg("dispatch::tests::discovery_ignores_session_files_across_full_precedence_matrix")
-                .arg("--nocapture")
-                .current_dir(&cwd)
-                .env_clear()
-                .env(DISCOVERY_CHILD, "1")
-                .envs(environment)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{name} child failed\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(error, identity_required(&std::env::current_dir().unwrap()));
+        assert!(identity_required(&cwd).contains(
+            "no .tightbeam-session was found walking up from '/tmp/tightbeam-no-session' to the filesystem root"
+        ));
     }
 
     #[test]
