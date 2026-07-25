@@ -12,6 +12,7 @@ defmodule FeatureSmoke do
 
   def run do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
+    install_smoke_rule!(base_dir)
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
     state = %{port: gw["port"], token: gw["cliToken"], base_dir: base_dir, pass: 0}
@@ -26,6 +27,13 @@ defmodule FeatureSmoke do
     |> check_flagship_review_loop()
     |> check_escalation_to_owner()
     |> finish()
+  end
+
+  defp install_smoke_rule!(base_dir) do
+    source = Path.expand("fixtures/smoke-escalation-probe.toml", __DIR__)
+    target = Path.join([base_dir, "identity", "rules", "smoke-escalation-probe.toml"])
+    File.mkdir_p!(Path.dirname(target))
+    File.cp!(source, target)
   end
 
   # --- served identity: every public seam shape --------------------------------

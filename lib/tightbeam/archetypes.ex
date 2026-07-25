@@ -537,6 +537,17 @@ defmodule Tightbeam.Archetypes do
     "product-discovery"
   ]
 
+  @kungfu_template_paths [
+    "archetypes/<name>-role.toml",
+    "guidance/<name>-role.md",
+    "skills/<name>-example/SKILL.md",
+    "rails/<name>-example.toml",
+    "kungfu/<name>/capabilities.md",
+    "kungfu/<name>/preferred-models.md",
+    "kungfu/<name>/intake.md",
+    "kungfu/<name>/README.md"
+  ]
+
   @doc """
   The org skills LIBRARY (spec §Agent identity: "skills chosen by name from
   one shared library"): `<base_dir>/identity/skills/<name>/SKILL.md`.
@@ -560,6 +571,27 @@ defmodule Tightbeam.Archetypes do
   @doc "Skill files shipped by the built-in agentic-engineering bundle."
   @spec builtin_skill_names() :: [String.t()]
   def builtin_skill_names, do: @bundle_skill_names
+
+  @doc "Create a valid, unelected kungfu starter through the served-identity seam."
+  @spec scaffold_kungfu!(String.t(), String.t(), String.t()) :: [String.t()]
+  def scaffold_kungfu!(base_dir, name, author) do
+    name = validate_kungfu_name!(name)
+
+    entries =
+      Enum.map(@kungfu_template_paths, fn template_relative ->
+        relative = String.replace(template_relative, "<name>", name)
+
+        content =
+          :tightbeam
+          |> Application.app_dir(Path.join("priv/kungfu-template", template_relative))
+          |> File.read!()
+          |> String.replace("<name>", name)
+
+        {relative, content}
+      end)
+
+    Tightbeam.Identity.scaffold!(base_dir, name, entries, author)
+  end
 
   defp engineering_archetype_names do
     ["orchestrator", "spec-writer", "coder", "reviewer", "recon", "product-owner"]
@@ -782,6 +814,15 @@ defmodule Tightbeam.Archetypes do
 
       %{name: name, command: command, args: args, env: env}
     end)
+  end
+
+  defp validate_kungfu_name!(name) do
+    valid? =
+      is_binary(name) and Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, name) and
+        not String.contains?(name, "--") and not String.ends_with?(name, "-")
+
+    unless valid?, do: raise(ArgumentError, "invalid kungfu name: #{inspect(name)}")
+    name
   end
 
   defp maybe_put(map, _key, nil), do: map

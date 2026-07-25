@@ -14,7 +14,7 @@ defmodule Tightbeam.PrivSkillsTest do
   ]
 
   test "all substrate baseline skills ship in priv and are non-empty" do
-    assert Tightbeam.Homes.baseline_skill_names() == []
+    assert Tightbeam.Homes.baseline_skill_names() == @baseline_skill_names
 
     for name <- @baseline_skill_names do
       path = Application.app_dir(:tightbeam, "priv/skills/#{name}/SKILL.md")

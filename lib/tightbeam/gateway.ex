@@ -521,6 +521,17 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
       "identity-apply" =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
+      "kungfu-scaffold" =>
+        admin_call_handler(db, fn call ->
+          paths =
+            Archetypes.scaffold_kungfu!(
+              config.base_dir,
+              call.params.name,
+              call.origin
+            )
+
+          %{kungfu: call.params.name, paths: paths}
+        end),
       "onboard" => admin_call_handler(db, fn call -> onboard_result(config, call) end),
       "promote-user" =>
         admin_handler(db, fn p ->

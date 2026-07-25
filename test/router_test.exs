@@ -99,6 +99,10 @@ defmodule Tightbeam.Wire.RouterTest do
       "identity-status" => fn call ->
         send(parent, {:call, call})
         %{live: "abc123", conflict: false}
+      end,
+      "kungfu-scaffold" => fn call ->
+        send(parent, {:call, call})
+        %{kungfu: call.params.name}
       end
     }
 
@@ -134,6 +138,25 @@ defmodule Tightbeam.Wire.RouterTest do
                       verb: "identity-status",
                       origin: "user:flynn",
                       params: %{}
+                    }}
+  end
+
+  test "kungfu scaffold crosses the closed CLI verb router with its attributed name", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "kungfu-scaffold",
+        asUser: "flynn",
+        params: %{name: "demo"}
+      })
+
+    assert response.status == 200
+    assert JSON.decode!(response.resp_body) == %{"result" => %{"kungfu" => "demo"}}
+
+    assert_receive {:call,
+                    %{
+                      verb: "kungfu-scaffold",
+                      origin: "user:flynn",
+                      params: %{name: "demo"}
                     }}
   end
 

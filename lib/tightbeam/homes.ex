@@ -3,9 +3,11 @@ defmodule Tightbeam.Homes do
   Projects one generic shared home per `{harness, machine}`.
 
   Tight Beam owns exactly the credential entry, the harness rails artifact,
-  and `.tightbeam/`. Regeneration is ownership-scoped: it never removes the
-  home and therefore preserves harness-owned sessions, history, projects,
-  transcripts, and memory byte-for-byte.
+  `.tightbeam/`, and the substrate baseline skills. Regeneration is
+  ownership-scoped: it never removes the home and therefore preserves
+  harness-owned sessions, history, projects, transcripts, and memory
+  byte-for-byte. Substrate baseline skills project separately from org
+  identity and are never sourced from the org-editable skill library.
 
   Callers gate regeneration on a stopped runtime. Before replacing a
   credential entry, a regular file left by runtime rotation is harvested
@@ -28,9 +30,21 @@ defmodule Tightbeam.Homes do
 
   @manifest_relative Path.join(".tightbeam", "manifest")
 
-  @doc "The old home-skill baseline no longer projects into shared homes."
+  @baseline_skill_names [
+    "tightbeam-dispatching",
+    "tightbeam-assimilate",
+    "tightbeam-harnesses",
+    "tightbeam-skills",
+    "tightbeam-onboarding",
+    "tightbeam-guidance-authoring",
+    "tightbeam-law-minting",
+    "tightbeam-archetype-cultivation",
+    "tightbeam-kungfu-crafting"
+  ]
+
+  @doc "Ordered names reserved for the substrate skills baseline."
   @spec baseline_skill_names() :: [String.t()]
-  def baseline_skill_names, do: []
+  def baseline_skill_names, do: @baseline_skill_names
 
   @doc "Project or ownership-scope-regenerate a shared home."
   @spec project(String.t(), spec()) :: projected_home()
@@ -49,6 +63,8 @@ defmodule Tightbeam.Homes do
       File.mkdir_p!(Path.dirname(manifest_path))
       File.write!(manifest_path, manifest)
     end
+
+    project_baseline_skills(home)
 
     %{
       home_path: home,
@@ -106,6 +122,25 @@ defmodule Tightbeam.Homes do
 
   defp write_rails(home, harness, content) do
     File.write!(Path.join(home, rails_filename(harness)), content)
+  end
+
+  defp project_baseline_skills(home) do
+    skills_root = Path.join(home, "skills")
+    File.mkdir_p!(skills_root)
+
+    for name <- @baseline_skill_names do
+      source = Application.app_dir(:tightbeam, "priv/skills/#{name}")
+      target = Path.join(skills_root, name)
+
+      case File.read_link(target) do
+        {:ok, ^source} ->
+          :ok
+
+        _ ->
+          File.rm_rf!(target)
+          File.ln_s!(source, target)
+      end
+    end
   end
 
   defp harvest_auth_back(auth_dir, home, harness) do

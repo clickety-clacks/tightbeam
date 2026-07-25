@@ -65,9 +65,12 @@ defmodule Tightbeam.Identity do
     manifest_path = "archetypes/#{archetype_name}.toml"
     manifest = git_show!(identity_dir, revision, manifest_path)
     archetype = Archetypes.parse_manifest!(manifest, manifest_path)
+    substrate_skills = MapSet.new(Tightbeam.Homes.baseline_skill_names())
 
     skills =
-      Map.new(archetype.skills, fn name ->
+      archetype.skills
+      |> Enum.reject(&MapSet.member?(substrate_skills, &1))
+      |> Map.new(fn name ->
         {name, git_show!(identity_dir, revision, "skills/#{name}/SKILL.md")}
       end)
 
@@ -159,6 +162,47 @@ defmodule Tightbeam.Identity do
     publish_live!(dir)
   end
 
+  @doc "Create a complete kungfu scaffold as one main commit and publish it."
+  @spec scaffold!(String.t(), String.t(), [{String.t(), binary()}], String.t()) ::
+          [String.t()]
+  def scaffold!(base_dir, name, entries, author) do
+    init!(base_dir)
+    dir = identity_dir(base_dir)
+
+    case Enum.find(entries, fn {relative, _content} ->
+           File.exists?(Path.join(dir, relative))
+         end) do
+      {relative, _content} ->
+        raise ArgumentError, "kungfu scaffold target already exists: identity/#{relative}"
+
+      nil ->
+        :ok
+    end
+
+    require_clean_main!(dir)
+
+    paths =
+      Enum.map(entries, fn {relative, content} ->
+        path = Path.join(dir, relative)
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, content)
+        path
+      end)
+
+    try do
+      validate_tree!(dir)
+    rescue
+      error ->
+        Enum.each(paths, &File.rm/1)
+        reraise error, __STACKTRACE__
+    end
+
+    git!(dir, ["add", "-A", "--" | Enum.map(entries, &elem(&1, 0))])
+    git!(dir, ["commit", "-m", "kungfu-scaffold: #{name}"], author)
+    _revision = publish_live!(dir)
+    paths
+  end
+
   @doc "Import the next source snapshot and merge it into main."
   @spec relearn!(String.t()) :: {:ok, String.t()} | {:conflict, [String.t()]}
   def relearn!(base_dir) do
@@ -245,7 +289,6 @@ defmodule Tightbeam.Identity do
       destination = Path.join(identity_dir, entry)
       File.cp_r!(source, destination)
     end)
-
   end
 
   defp revision_fragments!(dir, revision) do
@@ -363,6 +406,8 @@ defmodule Tightbeam.Identity do
   defp validate_edit!(_dir, :guidance, _path), do: :ok
 
   defp validate_tree!(dir) do
+    refuse_reserved_substrate_skills!(dir)
+
     fragments =
       dir
       |> Path.join("guidance/*.md")
@@ -375,6 +420,7 @@ defmodule Tightbeam.Identity do
       |> Path.wildcard()
       |> Enum.map(&(&1 |> Path.dirname() |> Path.basename()))
       |> MapSet.new()
+      |> MapSet.union(MapSet.new(Tightbeam.Homes.baseline_skill_names()))
 
     dir
     |> Path.join("archetypes/*.toml")
@@ -389,6 +435,17 @@ defmodule Tightbeam.Identity do
               "archetype #{archetype.name} elects unknown skills: #{Enum.join(missing, ", ")}"
       end
     end)
+  end
+
+  defp refuse_reserved_substrate_skills!(dir) do
+    for name <- Tightbeam.Homes.baseline_skill_names() do
+      path = Path.join([dir, "skills", name, "SKILL.md"])
+
+      if File.regular?(path) do
+        raise ArgumentError,
+              "#{path}: rename or remove the org copy; substrate names are reserved"
+      end
+    end
   end
 
   defp skill_electors(dir, skill) do

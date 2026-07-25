@@ -1376,8 +1376,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.any?(skills, &(&1.name == "review"))
   end
 
-  @tag :skip
-  test "superseded kungfu-scaffold command", ctx do
+  test "kungfu-scaffold is admin-tier and commits a real starter that composes cleanly", ctx do
     base_dir = role_test_base("kungfu-scaffold")
     scaffold = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-scaffold"]
 

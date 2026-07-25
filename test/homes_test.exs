@@ -22,7 +22,14 @@ defmodule Tightbeam.HomesTest do
     assert File.read!(Path.join(coder.home_path, "hooks.json")) == "v1"
     assert File.lstat!(Path.join(coder.home_path, "auth.json")).type == :symlink
     refute File.exists?(Path.join(coder.home_path, "AGENTS.md"))
-    refute File.dir?(Path.join(coder.home_path, "skills"))
+
+    assert MapSet.new(File.ls!(Path.join(coder.home_path, "skills"))) ==
+             MapSet.new(Homes.baseline_skill_names())
+
+    for name <- Homes.baseline_skill_names() do
+      assert File.read_link!(Path.join([coder.home_path, "skills", name])) ==
+               Application.app_dir(:tightbeam, "priv/skills/#{name}")
+    end
   end
 
   test "regeneration replaces only owned paths and preserves durable Codex state", %{
