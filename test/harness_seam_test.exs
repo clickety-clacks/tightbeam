@@ -72,25 +72,24 @@ defmodule Tightbeam.HarnessSeamTest do
     assert {_output, 1} = System.cmd(scan, [], stderr_to_stdout: true)
     File.rm!(probe)
 
+    # grep, not rg: the test harness's System.cmd PATH carries no rg.
     {calls, 0} =
-      System.cmd("rg", [
-        "-l",
+      System.cmd("grep", [
+        "-RlE",
         "\\.wire_projection\\(\\)",
         "lib",
-        "--glob",
-        "!lib/tightbeam/harness/**"
+        "--exclude-dir=harness"
       ])
 
     assert calls |> String.split("\n", trim: true) |> Enum.sort() ==
              ["lib/tightbeam/boot.ex", "lib/tightbeam/wire/router.ex"]
 
     assert {"", 1} =
-             System.cmd("rg", [
-               "-n",
+             System.cmd("grep", [
+               "-RnE",
                "\"(wire_name|install_package|process_markers)\"",
                "lib",
-               "--glob",
-               "!lib/tightbeam/harness/**"
+               "--exclude-dir=harness"
              ])
   end
 end
