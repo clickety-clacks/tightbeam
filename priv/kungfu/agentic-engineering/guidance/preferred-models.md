@@ -38,6 +38,11 @@ if it is not. If NONE is available, PARK the work until one recovers — the end
 list IS the floor; nothing off-list may do the work. `any` = no floor: any available
 mind may do it.
 
+Adjudicate at spawn AND again whenever a mind fails you mid-work — a refused spawn
+names its reason, a harness out of tokens is a reason to step rightward; switch and
+continue rather than stop. A park is a decision on the record, never a silent stall:
+attest it with the reason and schedule a re-check wake or escalate to your owner.
+
 ## Substrate activities
 
 | Activity | Wants | Minds, in order (park if none) |

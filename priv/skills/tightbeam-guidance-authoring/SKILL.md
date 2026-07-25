@@ -23,6 +23,12 @@ canonical; cite by number there):
   the verb, the table. Cited-but-nonexistent machinery is the recorded failure mode. (21)
 - Batch your edits: every identity change taxes every live session's memory at
   reprojection. Accumulate, then land together. (22)
+- For every ratified capability spec, answer "what pattern does this teach?" The answer
+  is "none" or an operating-manual amendment that lands with the spec. Never add a pattern
+  section before the capability and its commands ship.
+- Role-refracted doctrine (a rule the spec-writer, coder, and reviewer each see from
+  their own side) is amended in ALL its refractions together, in the canonical guidance
+  spec — changing one refraction alone forks the doctrine.
 
 Before committing: reread as the target session would — cold, mid-task, no context
 but the projected home. If any line requires knowledge it does not carry or point to,
