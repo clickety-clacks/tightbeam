@@ -7,10 +7,12 @@ guidance authoring) — carried by orchestrator, reviewer, and spec-writer, home
 `tightbeam-law-minting` and `tightbeam-guidance-authoring` skills.
 
 ## Work and accountability — homes: operating manual; accountability-constitution-v1
-11. The expecter opens the card; wake with the pointer (manual, dispatch law)
+11. The expecter opens the assignment — assign first, wake second, wake carries the
+    pointer (manual, dispatch law)
 12. One work item, many assignments (manual + dispatching skill)
 13. Sessions are disposable projections; rows are the truth (constitution §3)
-14. No intent in limbo; filing arms the brackets (constitution §2)
+14. No intent in limbo — every filed intent carries an owner and a deadline, so absence
+    is detectable (constitution §2; lifecycle brackets are its unbuilt enforcement lane)
 
 ## Process — homes: engineering tenets; coder kernel; merge-gate rules
 23. Pause beats guess; unpinned defaults match the existing pattern (tenets + ringdown meta-ruling)
