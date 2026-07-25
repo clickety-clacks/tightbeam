@@ -1,15 +1,41 @@
 defmodule Tightbeam.Wire.SocketTest do
   use ExUnit.Case, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, EventLog, Org, Projection}
+  alias Tightbeam.{
+    ConnRegistry,
+    DB,
+    Devices,
+    EventLog,
+    Gateway,
+    Idempotency,
+    Ledger,
+    Org,
+    Projection,
+    Rules
+  }
+
   alias Tightbeam.Wire.Socket
+
+  defmodule LaneDoorbell do
+    use GenServer
+
+    def start_link({parent, name}), do: GenServer.start_link(__MODULE__, parent, name: name)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:ensure_lane, session_key}, _from, parent) do
+      send(parent, {:ensure_lane, session_key})
+      {:reply, :ok, parent}
+    end
+  end
 
   setup do
     db = :"socket_db_#{System.unique_integer([:positive])}"
     registry = :"socket_registry_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: registry})
-    for module <- [Devices, EventLog, Org, Projection], do: :ok = module.ensure_schema(db)
+
+    for module <- [Devices, EventLog, Idempotency, Ledger, Org, Projection],
+        do: :ok = module.ensure_schema(db)
 
     deps = %{
       db: db,
@@ -27,6 +53,153 @@ defmodule Tightbeam.Wire.SocketTest do
     }
 
     %{db: db, registry: registry, deps: deps}
+  end
+
+  test "chat ingress uses real Gateway handlers for ack, dedupe, conflict, and validation", ctx do
+    start_supervised!(%{
+      id: :socket_e2e_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    start_supervised!(%{
+      id: :socket_e2e_lane_manager,
+      start: {LaneDoorbell, :start_link, [{self(), Tightbeam.LaneManager}]}
+    })
+
+    config = %{db: ctx.db, base_dir: System.tmp_dir!(), port: 0}
+    handlers = Gateway.handlers(config)
+    Rules.load!(Path.join(System.tmp_dir!(), "missing-socket-e2e-rules"), Map.keys(handlers), %{})
+
+    on_exit(fn ->
+      Rules.load!(Path.join(System.tmp_dir!(), "missing-socket-e2e-reset"), [], %{})
+    end)
+
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "chat-e2e",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
+
+    Devices.set_user_admin(ctx.db, device.user_id, false)
+
+    deps = %{
+      ctx.deps
+      | conn_registry: Tightbeam.ConnRegistry,
+        handlers: handlers
+    }
+
+    {:ok, socket} = Socket.init(deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    {:push, _auth_frames, replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
+
+    {:push, _sync_frame, live} = Socket.handle_info(:finish_replay, replaying)
+    main = Org.personal_session_key(device.user_id)
+
+    message = %{
+      "type" => "message",
+      "id" => "c_once",
+      "content" => "hello",
+      "sessionKey" => main
+    }
+
+    {:push, {:text, ack}, live} =
+      Socket.handle_in({JSON.encode!(message), opcode: :text}, live)
+
+    assert JSON.decode!(ack) == %{"type" => "ack", "id" => "c_once"}
+
+    {:push, {:text, duplicate_ack}, live} =
+      Socket.handle_in({JSON.encode!(message), opcode: :text}, live)
+
+    assert JSON.decode!(duplicate_ack) == %{"type" => "ack", "id" => "c_once"}
+
+    {:push, {:text, conflict}, live} =
+      Socket.handle_in(
+        {JSON.encode!(%{message | "content" => "different"}), opcode: :text},
+        live
+      )
+
+    assert JSON.decode!(conflict) == %{
+             "type" => "error",
+             "code" => "invalid_message",
+             "message" => "clientMessageId reused with different content",
+             "messageId" => "c_once"
+           }
+
+    {:push, {:text, bad_prefix}, live} =
+      Socket.handle_in(
+        {JSON.encode!(%{message | "id" => "bad_prefix"}), opcode: :text},
+        live
+      )
+
+    assert JSON.decode!(bad_prefix) == %{
+             "type" => "error",
+             "code" => "invalid_message",
+             "message" => "message id must start with c_"
+           }
+
+    {:push, {:text, too_large}, live} =
+      Socket.handle_in(
+        {JSON.encode!(%{message | "id" => "c_big", "content" => String.duplicate("x", 65_537)}),
+         opcode: :text},
+        live
+      )
+
+    assert JSON.decode!(too_large) == %{
+             "type" => "error",
+             "code" => "payload_too_large",
+             "messageId" => "c_big"
+           }
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT OR IGNORE INTO users (userId,isAdmin,createdAt) VALUES ('other',0,1)"
+      )
+
+    Org.create(ctx.db, %{
+      session_key: "other-session",
+      display_name: "Other",
+      owner_user_id: "other",
+      origin: "user:other",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "fable"
+    })
+
+    {:push, {:text, not_found}, _live} =
+      Socket.handle_in(
+        {JSON.encode!(%{message | "id" => "c_foreign", "sessionKey" => "other-session"}),
+         opcode: :text},
+        live
+      )
+
+    assert JSON.decode!(not_found) == %{
+             "type" => "error",
+             "code" => "not_found",
+             "messageId" => "c_foreign"
+           }
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='c_once'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*)
+               FROM turns t JOIN messages m ON m.id=t.messageId
+               WHERE m.clientMessageId='c_once'
+               """
+             )
   end
 
   test "pair and auth failures use the contract reasons", ctx do

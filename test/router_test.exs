@@ -120,6 +120,17 @@ defmodule Tightbeam.Wire.RouterTest do
     }
   end
 
+  test "agent verb allowlist is covered by the real Gateway handler table", ctx do
+    agent_verbs =
+      Router.__info__(:attributes)
+      |> Keyword.fetch!(:agent_verbs)
+      |> List.flatten()
+
+    handler_keys = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir}) |> Map.keys()
+
+    assert agent_verbs -- handler_keys == []
+  end
+
   test "identity status crosses the closed CLI verb router", ctx do
     response =
       dispatch_cli(ctx, "tbc_test", %{

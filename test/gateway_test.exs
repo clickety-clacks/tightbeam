@@ -1118,6 +1118,84 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
+  test "Gateway.children effort consumer routes a due dispatch bracket through Wakes once", ctx do
+    base_dir = role_test_base("effort-wake-seam")
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:effort_checkin_horizon_ms, 1)
+      |> Map.put(:effort_notify, fn _request -> :ok end)
+      |> Map.put(:effort_probe, fn _session, _root, _config ->
+        {:ok, %{repos: [%{path: ".", head: "same", tracked: "same"}], untracked: []}}
+      end)
+
+    {Wakes, wake_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Wakes, _}, &1))
+
+    scheduler = :"effort_wakes_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: :effort_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    start_supervised!(%{
+      id: :effort_lane_manager,
+      start: {LaneDoorbell, :start_link, [{self(), Tightbeam.LaneManager}]}
+    })
+
+    start_supervised!({Wakes, Keyword.put(wake_opts, :name, scheduler)})
+
+    create_session(ctx.db, "effort-parent", "flynn")
+
+    :ok =
+      DB.execute(ctx.db, "UPDATE sessions SET spawnedBy='effort-parent' WHERE sessionKey='k1'")
+
+    assignment =
+      Gateway.handlers(config)["dispatch"].(%{
+        verb: "dispatch",
+        origin: "agent:effort-parent",
+        principal: {:session, "effort-parent"},
+        session_key: "k1",
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "scheduler seam", brief: "exercise the real effort wake route"}
+      })
+
+    {:ok, [[wake_id]]} =
+      DB.query(
+        ctx.db,
+        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+        [assignment.id]
+      )
+
+    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[request_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert is_binary(request_id)
+    assert Wakes.get(ctx.db, wake_id).state == "fired"
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
   test "spawn --name creates a bound role and role_exists rolls back the session", ctx do
     base_dir = role_test_base("spawn")
     Archetypes.load!(base_dir)

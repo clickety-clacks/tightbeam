@@ -22,6 +22,8 @@ defmodule Tightbeam.Wakes do
   """
 
   use GenServer
+  require Logger
+
   alias Tightbeam.{DB, EventLog, Gateway}
   alias Tightbeam.DB.Txn
 
@@ -483,32 +485,55 @@ defmodule Tightbeam.Wakes do
       wake = to_wake(row)
 
       delivered =
-        try do
-          case wake.consumer do
-            "prompt" -> deliver.(wake)
-            consumer -> Map.fetch!(consumers, consumer).(wake)
-          end
+        case wake.consumer do
+          "prompt" ->
+            attempt_delivery(fn -> deliver.(wake) end)
 
-          true
-        rescue
-          _ -> false
+          consumer ->
+            case Map.fetch(consumers, consumer) do
+              {:ok, internal_consumer} ->
+                attempt_delivery(fn -> internal_consumer.(wake) end)
+
+              :error ->
+                Logger.error(
+                  "dropping wake #{wake.wake_id} for unknown internal consumer #{inspect(consumer)}"
+                )
+
+                mark_fired(db, wake.wake_id)
+                false
+            end
         end
 
       if delivered and wake.consumer == "prompt" do
-        transaction!(db, fn txn ->
-          Txn.q(
-            txn,
-            "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-            [wake.wake_id, now()]
-          )
-
-          :ok
-        end)
+        mark_fired(db, wake.wake_id)
       end
     end
 
     evaluate_conditions(state, :tick)
     :ok
+  end
+
+  defp attempt_delivery(delivery) do
+    try do
+      delivery.()
+      true
+    rescue
+      _ -> false
+    catch
+      :exit, _ -> false
+    end
+  end
+
+  defp mark_fired(db, wake_id) do
+    transaction!(db, fn txn ->
+      Txn.q(
+        txn,
+        "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+        [wake_id, now()]
+      )
+
+      :ok
+    end)
   end
 
   defp evaluate_conditions(%{db: db, batch: batch}, mode) do
