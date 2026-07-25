@@ -878,8 +878,7 @@ defmodule Tightbeam.PlacementTest do
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
     assert opts[:contained] == true
 
-    assert ["/local/bin/tightbeam", "contain-exec", "--profile", profile, "--", binary] =
-             opts[:cmd]
+    assert ["/usr/bin/sandbox-exec", "-p", profile, binary] = opts[:cmd]
 
     assert binary == Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
 
@@ -889,7 +888,13 @@ defmodule Tightbeam.PlacementTest do
     assert profile =~
              ~s|(subpath "#{work_root}")\n  (subpath "#{home}")\n  (subpath "#{auth_dir}")|
 
-    assert_receive {:probe, ["/local/bin/tightbeam", "contain-exec", "--check"]}
+    assert_receive {:probe,
+                    [
+                      "/usr/bin/sandbox-exec",
+                      "-p",
+                      "(version 1)(allow default)",
+                      "/usr/bin/true"
+                    ]}
 
     refute_receive {:probe, _}
 
@@ -916,11 +921,11 @@ defmodule Tightbeam.PlacementTest do
       sh: fn _ -> {"no", 1} end
     }
 
-    assert_raise ArgumentError, ~r/testhost.*contain-exec probe failed with exit 1/, fn ->
+    assert_raise ArgumentError, ~r/testhost.*sandbox-exec probe failed with exit 1/, fn ->
       Placement.adapter_opts(config, {:claude, "default", "testhost"})
     end
 
-    assert [%{detail: "DENIED: contain-exec probe failed with exit 1"}] =
+    assert [%{detail: "DENIED: sandbox-exec probe failed with exit 1"}] =
              EventLog.lifecycle_events(db)
   end
 
@@ -941,11 +946,11 @@ defmodule Tightbeam.PlacementTest do
       sh: fn _ -> raise ErlangError, original: :enoent end
     }
 
-    assert_raise ArgumentError, ~r/contain-exec probe failed/, fn ->
+    assert_raise ArgumentError, ~r/sandbox-exec probe failed/, fn ->
       Placement.adapter_opts(config, {:codex, "default", "testhost"})
     end
 
-    assert [%{detail: "DENIED: contain-exec probe failed:" <> _}] =
+    assert [%{detail: "DENIED: sandbox-exec probe failed:" <> _}] =
              EventLog.lifecycle_events(db)
   end
 
@@ -977,7 +982,13 @@ defmodule Tightbeam.PlacementTest do
 
     opts = Placement.adapter_opts(config, {:codex, "default", "alias"})
     assert opts[:contained]
-    assert_receive {:command, ["/local/bin/tightbeam", "contain-exec", "--check"]}
+    assert_receive {:command,
+                    [
+                      "/usr/bin/sandbox-exec",
+                      "-p",
+                      "(version 1)(allow default)",
+                      "/usr/bin/true"
+                    ]}
 
     assert [%{detail: "assembled; fs=workdir network=open;" <> _}] =
              EventLog.lifecycle_events(db)

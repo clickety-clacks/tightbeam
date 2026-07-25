@@ -763,11 +763,9 @@ defmodule Tightbeam.Placement do
         )
       ]
 
-      wrapper = Path.join(config.cli_bin, "tightbeam")
-
       probe_result =
         try do
-          sh.([wrapper, "contain-exec", "--check"])
+          sh.(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"])
         rescue
           error -> {:raised, error}
         end
@@ -777,14 +775,14 @@ defmodule Tightbeam.Placement do
           containment_refused!(
             config,
             key,
-            "contain-exec probe failed: #{Exception.message(error)}"
+            "sandbox-exec probe failed: #{Exception.message(error)}"
           )
 
         {_output, 0} ->
           :ok
 
         {_output, exit} ->
-          containment_refused!(config, key, "contain-exec probe failed with exit #{exit}")
+          containment_refused!(config, key, "sandbox-exec probe failed with exit #{exit}")
       end
 
       profile =
@@ -805,7 +803,7 @@ defmodule Tightbeam.Placement do
       )
 
       opts
-      |> Keyword.put(:cmd, [wrapper, "contain-exec", "--profile", profile, "--", binary])
+      |> Keyword.put(:cmd, ["/usr/bin/sandbox-exec", "-p", profile, binary])
       |> Keyword.put(:contained, true)
     else
       opts
