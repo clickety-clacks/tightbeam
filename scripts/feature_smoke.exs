@@ -519,6 +519,11 @@ defmodule FeatureSmoke do
 
     parent_key = get_in(parent, ["stream", "sessionKey"]) || parent["sessionKey"]
 
+    # A session principal needs a role before it may spawn/dispatch (same
+    # pattern as the escalation check's coder).
+    post(state, "role-create", %{"name" => "effort-parent-#{u}"})
+    ok!(state, "role-bind", %{"name" => "effort-parent-#{u}", "sessionKey" => parent_key})
+
     parent_state =
       %{state | token: session_token(state, parent_key)} |> Map.put(:as_session, true)
 

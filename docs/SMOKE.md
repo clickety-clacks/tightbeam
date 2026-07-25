@@ -98,6 +98,9 @@ on 2026-07-25:
 - **The identity repo working tree must stay clean.** Anything hand-placed
   under `identity/` (e.g. a rules fixture) must be COMMITTED, or every
   identity verb wedges with "identity working tree is dirty".
+- **The effort check-in probe needs a short horizon**: boot the gateway with
+  `TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250` for smoke runs (the default is 30
+  minutes and the probe waits for a real idle horizon).
 - **`feature_smoke.exs` runs with `mix run --no-start`.** A plain `mix run`
   boots a second gateway that OVERWRITES `gateway.json` and silently redirects
   the smoke away from the gateway under test.
