@@ -131,14 +131,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       true ->
         case catalog do
           {:ok, inventories} ->
-            live? = Enum.any?(Map.get(inventories, harness, []), &(&1.ref == model))
+            default_model_inventory_check(inventories, harness, model, fix)
 
-            detail =
-              if live?,
-                do: "#{model} is live for #{harness}",
-                else: "#{model} is not live for #{harness}"
-
-            check("default_model", live?, detail, fix)
+          {:ok, inventories, _degraded} ->
+            default_model_inventory_check(inventories, harness, model, fix)
 
           {:error, degraded} ->
             check(
@@ -151,16 +147,23 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     end
   end
 
-  defp harness_auth_check({:ok, inventories}, harness) do
-    entries = Map.get(inventories, harness, [])
-    ok = entries != []
+  defp default_model_inventory_check(inventories, harness, model, fix) do
+    live? = Enum.any?(Map.get(inventories, harness, []), &(&1.ref == model))
 
     detail =
-      if ok,
-        do: "#{harness} fetched #{length(entries)} live refs",
-        else: "dead_sign_in: harness=#{harness} reason=:empty_inventory"
+      if live?,
+        do: "#{model} is live for #{harness}",
+        else: "#{model} is not live for #{harness}"
 
-    check("harness_auth:#{harness}", ok, detail, "Re-onboard the #{harness} harness credential.")
+    check("default_model", live?, detail, fix)
+  end
+
+  defp harness_auth_check({:ok, inventories}, harness) do
+    harness_auth_inventory_check(inventories, %{}, harness)
+  end
+
+  defp harness_auth_check({:ok, inventories, degraded}, harness) do
+    harness_auth_inventory_check(inventories, degraded, harness)
   end
 
   defp harness_auth_check({:error, degraded}, harness) do
@@ -172,6 +175,19 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       "dead_sign_in: harness=#{harness} reason=#{inspect(reason)}",
       "Re-onboard the #{harness} harness credential."
     )
+  end
+
+  defp harness_auth_inventory_check(inventories, degraded, harness) do
+    entries = Map.get(inventories, harness, [])
+    ok = entries != []
+
+    detail =
+      if ok,
+        do: "#{harness} fetched #{length(entries)} live refs",
+        else:
+          "dead_sign_in: harness=#{harness} reason=#{inspect(Map.get(degraded, harness, :empty_inventory))}"
+
+    check("harness_auth:#{harness}", ok, detail, "Re-onboard the #{harness} harness credential.")
   end
 
   defp harness_binary_check({:ok, %{version: version}}, harness) do
