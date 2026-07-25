@@ -13,21 +13,16 @@ defmodule Tightbeam.ModelCatalogTest do
     File.mkdir_p!(codex_home)
     File.write!(Path.join(token_dir, "oauth-token"), "fixture-token")
 
-    claude_json = File.read!(Path.join(@fixtures, "claude_models.json"))
-    codex_json = File.read!(Path.join(@fixtures, "codex_models_cache.json"))
+    claude_json = fixture_body("claude_models.jsonc")
+    claude_detail_json = fixture_body("claude_model_detail.jsonc")
+    codex_json = fixture_body("codex_models_cache.jsonc")
 
     claude_fetch = fn
       "/v1/models?limit=100", _headers ->
         {:ok, claude_json}
 
-      "/v1/models/claude-haiku-4-5", _headers ->
-        {:ok,
-         JSON.encode!(%{
-           id: "claude-haiku-4-5",
-           display_name: "Claude Haiku 4.5",
-           max_input_tokens: 200_000,
-           capabilities: %{}
-         })}
+      "/v1/models/claude-haiku-4-5-20251001", _headers ->
+        {:ok, claude_detail_json}
     end
 
     codex_read = fn _path -> {:ok, codex_json} end
@@ -45,7 +40,7 @@ defmodule Tightbeam.ModelCatalogTest do
     }
   end
 
-  test "derives full Claude and Codex inventories from provider fixtures", ctx do
+  test "derives consumed Claude and Codex fields from provider captures", ctx do
     catalog = start_catalog(ctx)
     await_fresh(catalog, "claude")
     await_fresh(catalog, "codex")
@@ -53,18 +48,10 @@ defmodule Tightbeam.ModelCatalogTest do
     {claude, :fresh} = ModelCatalog.get("claude", catalog)
     {codex, :fresh} = ModelCatalog.get("codex", catalog)
 
-    assert Enum.map(claude, & &1.ref) == [
-             "claude-opus-5[high]",
-             "claude-opus-5[low]",
-             "claude-opus-5[max]",
-             "claude-opus-5[medium]",
-             "claude-haiku-4-5"
-           ]
-
     opus = Enum.find(claude, &(&1.ref == "claude-opus-5[low]"))
     assert opus.display_name == "Claude Opus 5"
     assert opus.max_input_tokens == 1_000_000
-    assert opus.efforts == ["high", "low", "max", "medium"]
+    assert MapSet.new(opus.efforts) == MapSet.new(["low", "medium", "high", "xhigh", "max"])
 
     assert Enum.map(codex, & &1.ref) == [
              "gpt-5.6-sol[low]",
@@ -72,11 +59,48 @@ defmodule Tightbeam.ModelCatalogTest do
              "gpt-5.6-sol[high]",
              "gpt-5.6-sol[xhigh]",
              "gpt-5.6-sol[max]",
-             "gpt-5.6-sol[ultra]",
-             "gpt-5.6-mini"
+             "gpt-5.6-sol[ultra]"
            ]
 
+    codex_medium = Enum.find(codex, &(&1.ref == "gpt-5.6-sol[medium]"))
+    assert codex_medium.display_name == "GPT-5.6-Sol"
+    assert codex_medium.max_input_tokens == 272_000
+
+    assert get_in(codex_medium.capabilities, [
+             "supported_reasoning_levels",
+             Access.at(1),
+             "effort"
+           ]) ==
+             "medium"
+
     refute Enum.any?(claude ++ codex, &String.contains?(&1.ref, "[1m]"))
+  end
+
+  test "fills a summary row from the captured Claude detail body", ctx do
+    summary =
+      "claude_models.jsonc"
+      |> fixture_json()
+      |> Map.fetch!("data")
+      |> Enum.find(&(&1["id"] == "claude-haiku-4-5-20251001"))
+      |> Map.delete("capabilities")
+
+    list_body = JSON.encode!(%{"data" => [summary]})
+    detail_body = fixture_body("claude_model_detail.jsonc")
+
+    claude_fetch = fn
+      "/v1/models?limit=100", _headers -> {:ok, list_body}
+      "/v1/models/claude-haiku-4-5-20251001", _headers -> {:ok, detail_body}
+    end
+
+    catalog = start_catalog(ctx, claude_fetch: claude_fetch)
+    await_fresh(catalog, "claude")
+
+    assert {[%{ref: "claude-haiku-4-5-20251001"} = entry], :fresh} =
+             ModelCatalog.get("claude", catalog)
+
+    assert entry.display_name == "Claude Haiku 4.5"
+    assert entry.max_input_tokens == 200_000
+    assert get_in(entry.capabilities, ["thinking", "supported"])
   end
 
   test "claude preserves every provider capability without imposing a tier allowlist", ctx do
@@ -450,4 +474,15 @@ defmodule Tightbeam.ModelCatalogTest do
 
   defp await(_fun, 0), do: flunk("condition did not become true")
   defp unique_name(label), do: String.to_atom("#{label}_#{System.unique_integer([:positive])}")
+
+  defp fixture_json(name), do: name |> fixture_body() |> JSON.decode!()
+
+  defp fixture_body(name) do
+    @fixtures
+    |> Path.join(name)
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.drop_while(&String.starts_with?(&1, "//"))
+    |> Enum.join("\n")
+  end
 end

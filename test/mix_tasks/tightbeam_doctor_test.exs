@@ -61,7 +61,8 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert find(passing, "harness_auth:claude").ok
     assert find(passing, "harness_auth:codex").ok
 
-    fixture = Path.expand("../fixtures/model_catalog/codex_models_cache.json", __DIR__)
+    fixture = Path.expand("../fixtures/model_catalog/codex_models_cache.jsonc", __DIR__)
+    codex_json = fixture_body(fixture)
     started_at = System.monotonic_time(:millisecond)
 
     catalog =
@@ -71,7 +72,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
           :anthropic -> {:needs_onboarding, :dead_credential}
           _provider -> :onboarded
         end,
-        codex_read: fn _path -> File.read(fixture) end
+        codex_read: fn _path -> {:ok, codex_json} end
       )
 
     assert System.monotonic_time(:millisecond) - started_at < 1_000
@@ -192,4 +193,12 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
   defp put(inputs, key, value), do: Keyword.put(inputs, key, value)
   defp find(report, name), do: Enum.find(report.checks, &(&1.name == name))
+
+  defp fixture_body(path) do
+    path
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.drop_while(&String.starts_with?(&1, "//"))
+    |> Enum.join("\n")
+  end
 end

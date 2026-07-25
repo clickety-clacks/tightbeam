@@ -63,15 +63,15 @@ defmodule Tightbeam.SubagentMarkersTest do
       scheduler: scheduler,
       codex: codex,
       claude: claude,
-      codex_fixture: fixture("codex-acp-1.1.4.json"),
-      claude_fixture: fixture("claude-agent-acp-0.59.0.json")
+      codex_fixture: fixture("codex-acp-1.1.4.jsonc"),
+      claude_fixture: fixture("claude-agent-acp-0.59.0.jsonc")
     }
   end
 
   test "proof 1: codex fixture produces one parent-attributed start and one semantic stop",
        ctx do
     fixture = ctx.codex_fixture
-    assert fixture["version"] == "1.1.4"
+    assert fixture["version"] == Tightbeam.Harness.Codex.adapter_version()
     assert fixture["semantic"]["spawn_operation_terminal"] =~ "child thread remains"
     assert fixture["semantic"]["child_termination_terminal"] =~ "entering idle"
 
@@ -102,7 +102,7 @@ defmodule Tightbeam.SubagentMarkersTest do
   test "proof 4: claude fixture ignores spawn completion and stops at live task settlement",
        ctx do
     fixture = ctx.claude_fixture
-    assert fixture["version"] == "0.59.0"
+    assert fixture["version"] == Tightbeam.Harness.Claude.adapter_version()
     assert fixture["semantic"]["spawn_operation_terminal"] =~ "liveBackgroundTasks"
     assert fixture["semantic"]["child_termination_terminal"] =~ "settlement"
 
@@ -299,7 +299,13 @@ defmodule Tightbeam.SubagentMarkersTest do
 
   defp fixture(name) do
     path = Path.join([__DIR__, "fixtures", "subagent_markers", name])
-    path |> File.read!() |> JSON.decode!()
+
+    path
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.drop_while(&String.starts_with?(&1, "//"))
+    |> Enum.join("\n")
+    |> JSON.decode!()
   end
 
   defp turn_count(db) do

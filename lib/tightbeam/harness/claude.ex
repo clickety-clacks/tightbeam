@@ -18,6 +18,9 @@ defmodule Tightbeam.Harness.Claude do
     }
   ]
 
+  @doc false
+  def adapter_version, do: @adapter_version
+
   @impl true
   def id, do: :claude
 
