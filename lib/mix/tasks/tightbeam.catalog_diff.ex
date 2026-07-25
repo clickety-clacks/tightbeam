@@ -24,6 +24,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     inventories =
       case fetch_live(base_dir) do
         {:ok, inventories} -> inventories
+        {:ok, _inventories, degraded} -> Mix.raise(catalog_error(degraded))
         {:error, degraded} -> Mix.raise(catalog_error(degraded))
       end
 
@@ -43,10 +44,11 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   end
 
   @doc false
-  def fetch_live(base_dir, timeout_ms \\ @fetch_timeout_ms) do
-    name = :tightbeam_catalog_diff
+  def fetch_live(base_dir, timeout_ms \\ @fetch_timeout_ms, options \\ []) do
+    name = Keyword.get(options, :name, :tightbeam_catalog_diff)
+    options = Keyword.merge(options, base_dir: base_dir, name: name)
 
-    case ModelCatalog.start_link(base_dir: base_dir, name: name) do
+    case ModelCatalog.start_link(options) do
       {:ok, pid} ->
         try do
           await_fresh(name, timeout_ms)
@@ -112,8 +114,17 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
         {module.wire_name(), ModelCatalog.get(module.wire_name(), server)}
       end)
 
-    if Enum.all?(health, fn {_harness, {_entries, state}} -> state == :fresh end) do
-      {:ok, ModelCatalog.get(server)}
+    if Enum.all?(health, fn {_harness, {_entries, state}} -> settled?(state) end) do
+      inventories = ModelCatalog.get(server)
+
+      degraded =
+        health
+        |> Map.reject(fn {_harness, {_entries, state}} -> state == :fresh end)
+        |> Map.new(fn {harness, {_entries, state}} -> {harness, state} end)
+
+      if map_size(degraded) == 0,
+        do: {:ok, inventories},
+        else: {:ok, inventories, degraded}
     else
       if System.monotonic_time(:millisecond) >= deadline do
         degraded =
@@ -127,6 +138,10 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
       end
     end
   end
+
+  defp settled?(:fresh), do: true
+  defp settled?({:unavailable, reason}), do: reason != :not_derived
+  defp settled?(_state), do: false
 
   defp read_working_set!(guidance_path) do
     guidance_path

@@ -1,3 +1,5 @@
+// Captured 2026-07-25 from @agentclientprotocol/claude-agent-acp 0.59.0 ACP updates.
+// Right-sizing: assert only consumed fields and relied-on invariants; additive unconsumed fields must not fail.
 {
   "adapter": "@agentclientprotocol/claude-agent-acp",
   "version": "0.59.0",

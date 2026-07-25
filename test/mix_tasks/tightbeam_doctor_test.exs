@@ -56,19 +56,44 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     end
   end
 
-  test "each configured harness auth passes only with a fetched non-empty inventory", ctx do
+  test "fetch_live preserves ready harnesses and doctor warns for one dead credential", ctx do
     {_status, passing} = Doctor.evaluate(ctx.catalog, ctx.inputs)
     assert find(passing, "harness_auth:claude").ok
     assert find(passing, "harness_auth:codex").ok
 
-    catalog = put_in(ctx.catalog, [Access.elem(1), "codex"], [])
-    {0, report} = Doctor.evaluate(catalog, ctx.inputs)
-    failed = find(report, "harness_auth:codex")
+    fixture = Path.expand("../fixtures/model_catalog/codex_models_cache.jsonc", __DIR__)
+    codex_json = fixture_body(fixture)
 
+    catalog =
+      Mix.Tasks.Tightbeam.Catalog.Diff.fetch_live(ctx.base_dir, 1_000,
+        name: :"doctor_catalog_#{System.unique_integer([:positive])}",
+        credential_status: fn
+          :anthropic -> {:needs_onboarding, :dead_credential}
+          _provider -> :onboarded
+        end,
+        codex_read: fn _path -> {:ok, codex_json} end
+      )
+
+    assert {:ok, %{"claude" => [], "codex" => [_ | _]}, %{"claude" => reason}} = catalog
+    assert reason == {:unavailable, {:needs_onboarding, :dead_credential}}
+
+    inputs =
+      ctx.inputs
+      |> put(:default_harness, :codex)
+      |> put(:default_model, "gpt-5.6-sol[medium]")
+
+    {0, report} = Doctor.evaluate(catalog, inputs)
+    failed = find(report, "harness_auth:claude")
+
+    assert report.ready
     refute failed.ok
     assert failed.level == :warn
-    assert failed.detail =~ "dead_sign_in: harness=codex reason=:empty_inventory"
-    assert failed.fix =~ "Re-onboard the codex"
+    assert failed.detail =~ "dead_sign_in: harness=claude"
+    assert failed.detail =~ "dead_credential"
+    assert failed.fix =~ "Re-onboard the claude"
+    assert find(report, "base_dir_identity").ok
+    assert find(report, "advertised_url").ok
+    assert find(report, "hosts_registered").ok
   end
 
   test "one fully ready harness passes while the unavailable harness warns", ctx do
@@ -165,4 +190,12 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
   defp put(inputs, key, value), do: Keyword.put(inputs, key, value)
   defp find(report, name), do: Enum.find(report.checks, &(&1.name == name))
+
+  defp fixture_body(path) do
+    path
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.drop_while(&String.starts_with?(&1, "//"))
+    |> Enum.join("\n")
+  end
 end

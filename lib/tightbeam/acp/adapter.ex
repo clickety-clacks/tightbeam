@@ -400,8 +400,8 @@ defmodule Tightbeam.Acp.Adapter do
   defp emit_auth_classification(state, event) do
     with classification when classification != :unknown <-
            Harness.module!(state.harness).classify_auth_event(event),
-         handler when is_function(handler, 1) <- state.on_auth_event do
-      handler.(classification)
+         handler when is_function(handler, 2) <- state.on_auth_event do
+      handler.(classification, event)
     end
   end
 

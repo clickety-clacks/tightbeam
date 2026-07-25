@@ -1,3 +1,5 @@
+// Captured 2026-07-25 from @agentclientprotocol/codex-acp 1.1.4 ACP updates.
+// Right-sizing: assert only consumed fields and relied-on invariants; additive unconsumed fields must not fail.
 {
   "adapter": "@agentclientprotocol/codex-acp",
   "version": "1.1.4",
