@@ -34,4 +34,35 @@ defmodule Tightbeam.ApplicationTest do
     assert File.read!(Path.join(Application.fetch_env!(:tightbeam, :base_dir), "harnesses.json")) ==
              expected
   end
+
+  test "harness projection publication never exposes truncated bytes" do
+    base =
+      Path.join(System.tmp_dir!(), "tb_boot_atomic_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(base)
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    first = JSON.encode!([%{"id" => "first", "padding" => String.duplicate("a", 1_000_000)}])
+    second = JSON.encode!([%{"id" => "second", "padding" => String.duplicate("b", 1_000_000)}])
+    Tightbeam.Boot.write_harnesses!(base, first)
+
+    writer =
+      Task.async(fn ->
+        for encoded <- List.duplicate([second, first], 25) |> List.flatten() do
+          Tightbeam.Boot.write_harnesses!(base, encoded)
+        end
+      end)
+
+    path = Path.join(base, "harnesses.json")
+
+    Stream.repeatedly(fn -> File.read!(path) end)
+    |> Enum.reduce_while(:ok, fn observed, :ok ->
+      assert observed in [first, second]
+
+      case Task.yield(writer, 0) do
+        nil -> {:cont, :ok}
+        {:ok, _writes} -> {:halt, :ok}
+      end
+    end)
+  end
 end

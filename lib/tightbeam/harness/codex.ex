@@ -236,11 +236,13 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def classify_auth_event(%{
-        "_meta" => %{"codex" => %{"accountUpdated" => %{"authMode" => nil}}}
+        "_meta" => %{
+          "codex" => %{"accountUpdated" => %{"authMode" => nil, "planType" => nil}}
+        }
       }),
       do: :terminal
 
-  def classify_auth_event(%{"authMode" => nil}), do: :terminal
+  def classify_auth_event(%{"authMode" => nil, "planType" => nil}), do: :terminal
 
   def classify_auth_event(%{
         "_meta" => %{"codex" => %{"accountUpdated" => %{"authMode" => mode}}}

@@ -57,7 +57,8 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:adapter_for, key}, _from, {adapter, parent} = state) do
       if is_pid(parent), do: send(parent, {:adapter_key, key})
-      {:reply, {:ok, adapter, 1}, state}
+      reply = if is_function(adapter, 1), do: adapter.(key), else: {:ok, adapter, 1}
+      {:reply, reply, state}
     end
 
     def handle_call({:acquire_load_slot, _borrower}, _from, state),
@@ -665,6 +666,51 @@ defmodule Tightbeam.GatewayTest do
              base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
 
     assert token != ""
+  end
+
+  test "fresh auth seeds Main while the model catalog is genuinely empty", ctx do
+    base_dir = role_test_base("fresh-auth-empty-catalog")
+    children = Gateway.children(gateway_config(base_dir, ctx.db, 0))
+
+    {Bandit, bandit_opts} = List.last(children)
+    {Tightbeam.Wire.Router, socket_deps} = Keyword.fetch!(bandit_opts, :plug)
+    socket_deps = %{socket_deps | conn_registry: ctx.registry}
+
+    :sys.replace_state(ModelCatalog, fn state ->
+      harnesses =
+        Map.new(state.harnesses, fn {name, cache} ->
+          {name,
+           %{
+             cache
+             | entries: [],
+               derived_at: nil,
+               attempted_at: state.now.(),
+               reason: :not_derived,
+               refreshing: true
+           }}
+        end)
+
+      %{state | harnesses: harnesses}
+    end)
+
+    {:pending, pending} =
+      Devices.pair(ctx.db, %{
+        device_id: "fresh-empty",
+        claimed_name: "Fresh Empty",
+        platform: nil,
+        model: nil
+      })
+
+    device = Devices.approve(ctx.db, pending.device_id)
+
+    {:ok, socket} = Tightbeam.Wire.Socket.init(socket_deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    assert {:push, _frames, _state} =
+             Tightbeam.Wire.Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
+
+    assert %{harness: "claude", provider: "anthropic", model: "claude-fable-5"} =
+             Org.get(ctx.db, Org.personal_session_key(device.user_id))
   end
 
   test "children refuses to boot when no harness binary is usable", ctx do
@@ -3472,6 +3518,52 @@ defmodule Tightbeam.GatewayTest do
                fixture_session.session_key,
                "agent:credential-late"
              ])
+  end
+
+  test "provider onboarding starts every matching harness and aggregates runtime failures",
+       ctx do
+    base_dir = role_test_base("credential-runtime-aggregate")
+    config = gateway_config(base_dir, ctx.db, 0)
+    children = Gateway.children(config)
+
+    %{start: {Credentials, :start_link, [credential_opts]}} =
+      Enum.find(children, &match?(%{id: {Credentials, "testhost"}}, &1))
+
+    parent = self()
+
+    start_result = fn
+      {:codex, "shared", "testhost"} = key ->
+        send(parent, {:runtime_start, key})
+        {:error, :codex_failed}
+
+      {:fixture, "shared", "testhost"} = key ->
+        send(parent, {:runtime_start, key})
+        {:ok, parent, 1}
+    end
+
+    start_supervised!({CoordinatorStub, start_result})
+
+    opts =
+      credential_opts
+      |> Keyword.put(:name, nil)
+      |> Keyword.put(:stop, fn _provider -> :ok end)
+      |> Keyword.put(:resume, fn _provider -> :ok end)
+      |> Keyword.put(:onboarders, %{
+        openai: fn _state -> {:ok, %{bytes: ~S({"token":"replacement"}), expires_at: nil}} end
+      })
+
+    {:ok, server} = Credentials.start_link(opts)
+
+    assert {:error,
+            {:provider_runtime_start_failed,
+             %{
+               started: ["fixture"],
+               failed: [%{harness: "codex", reason: :codex_failed}]
+             }}} = Credentials.onboard(:openai, server)
+
+    assert_receive {:runtime_start, {:codex, "shared", "testhost"}}
+    assert_receive {:runtime_start, {:fixture, "shared", "testhost"}}
+    refute Credentials.status(:openai, server) == :onboarded
   end
 
   defp gateway_config(base_dir, db, port) do

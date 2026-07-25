@@ -181,7 +181,7 @@ defmodule Tightbeam.HomesTest do
       send(parent, {:command, command})
 
       if "cat" in command,
-        do: {Homes.manifest_bytes(desired), 0},
+        do: {"stale-manifest", 0},
         else: {"", 0}
     end
 
@@ -202,9 +202,7 @@ defmodule Tightbeam.HomesTest do
 
     cleanup_script = List.last(cleanup)
     assert cleanup_script =~ "cp \"/remote/tb/homes/worker/codex/auth.json\""
-    assert cleanup_script =~ "rm -f \"/remote/tb/homes/worker/codex/auth.json\""
-
-    assert :binary.match(cleanup_script, "cp") < :binary.match(cleanup_script, "rm -f")
+    refute cleanup_script =~ "rm -f \"/remote/tb/homes/worker/codex/auth.json\""
     refute cleanup_script =~ "rm -rf \"/remote/tb/homes/worker/codex\""
     refute cleanup_script =~ "sessions"
     refute cleanup_script =~ "history"
@@ -212,6 +210,53 @@ defmodule Tightbeam.HomesTest do
     refute cleanup_script =~ "memory"
     refute "--delete" in rsync
     assert List.last(link) =~ "ln -s"
+  end
+
+  test "unchanged remote reconciliation preserves the credential link when rsync fails", %{
+    base_dir: base_dir
+  } do
+    desired = %{
+      harness: :codex,
+      machine: "worker",
+      rails: "v1",
+      auth_dir: "/remote/tb/auth/codex"
+    }
+
+    {:ok, link_state} = Agent.start_link(fn -> true end)
+
+    sh = fn command ->
+      cond do
+        "cat" in command ->
+          {Homes.manifest_bytes(desired), 0}
+
+        hd(command) == "rsync" ->
+          {"transient failure", 23}
+
+        true ->
+          script = List.last(command)
+
+          if String.contains?(script, ~s(rm -f "/remote/tb/homes/worker/codex/auth.json")) do
+            Agent.update(link_state, fn _ -> false end)
+          end
+
+          {"", 0}
+      end
+    end
+
+    assert_raise RuntimeError, ~r/command failed/, fn ->
+      Tightbeam.Harness.Codex.reconcile_home(
+        %{
+          base_dir: base_dir,
+          host_name: "worker",
+          host_config: %{ssh: "worker", base_dir: "/remote/tb"},
+          sh: sh
+        },
+        "/remote/tb/homes/worker/codex",
+        desired
+      )
+    end
+
+    assert Agent.get(link_state, & &1)
   end
 
   defp collect_commands(acc) do

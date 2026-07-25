@@ -292,6 +292,58 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert_receive {:auth, :terminal}
   end
 
+  test "codex account updates preserve terminal parity through the credential path" do
+    owner = self()
+
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tb-auth-parity-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    {:ok, credentials} =
+      Tightbeam.Credentials.start_link(
+        name: nil,
+        base_dir: base,
+        machine: "testhost",
+        park: fn :openai ->
+          send(owner, :parked)
+          :ok
+        end
+      )
+
+    on_auth_event = fn
+      :terminal ->
+        Tightbeam.Credentials.mark_terminal(
+          :openai,
+          %{"classification" => "terminal"},
+          credentials
+        )
+
+      _classification ->
+        :ok
+    end
+
+    {adapter, _capture_path} =
+      start_adapter(harness: :codex, on_auth_event: on_auth_event)
+
+    send(
+      adapter,
+      {:acp_notification, "account/updated", %{"authMode" => nil, "planType" => "plus"}}
+    )
+
+    refute_receive :parked
+
+    send(
+      adapter,
+      {:acp_notification, "account/updated", %{"authMode" => nil, "planType" => nil}}
+    )
+
+    assert_receive :parked
+  end
+
   test "session updates reach the subagent marker callback with harness session identity" do
     owner = self()
 

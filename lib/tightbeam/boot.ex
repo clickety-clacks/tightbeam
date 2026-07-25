@@ -37,7 +37,15 @@ defmodule Tightbeam.Boot do
     projections =
       "[" <> Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <> "]"
 
-    File.write!(Path.join(base_dir, "harnesses.json"), projections)
+    write_harnesses!(base_dir, projections)
     :ignore
+  end
+
+  @doc false
+  def write_harnesses!(base_dir, projections) do
+    path = Path.join(base_dir, "harnesses.json")
+    temporary = path <> ".tmp-#{System.unique_integer([:positive])}"
+    File.write!(temporary, projections)
+    File.rename!(temporary, path)
   end
 end

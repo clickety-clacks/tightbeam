@@ -452,7 +452,11 @@ defmodule Tightbeam.Producers do
     case System.cmd("ps", ["-o", "pgid=,state=", "-p", pid], stderr_to_stdout: true) do
       {output, 0} ->
         case String.split(output) do
-          [^pid, state] when state in ["T", "Ts"] ->
+          # Stopped = state string BEGINS with T. macOS appends flag letters the
+          # exact-match missed: s (session leader), N (niced — true whenever the
+          # BEAM runs as a background job, which made this fail for every producer
+          # spawned from a niced session), + (foreground). Match the first letter.
+          [^pid, <<"T", _::binary>>] ->
             :ok
 
           [^pid, _state] ->
