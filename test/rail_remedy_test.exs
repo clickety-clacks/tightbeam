@@ -62,7 +62,13 @@ defmodule Tightbeam.RailRemedyTest do
       Path.join(tmp_base, "tightbeam-remedy-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join(base_dir, "identity/rules"))
-    handlers = Gateway.handlers(%{db: db})
+
+    handlers =
+      Gateway.handlers(%{
+        db: db,
+        credential_status: fn _provider -> :onboarded end,
+        patch_adapter: fn _harness, _path -> :ok end
+      })
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -976,7 +982,9 @@ defmodule Tightbeam.RailRemedyTest do
       default_model: "test",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
-      db: ctx.db
+      db: ctx.db,
+      credential_status: fn _provider -> :onboarded end,
+      patch_adapter: fn _harness, _path -> :ok end
     })
   end
 

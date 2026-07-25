@@ -29,6 +29,7 @@ defmodule Tightbeam.Org do
           archetype: String.t(),
           overrides: map() | nil,
           identity_name: String.t(),
+          identity_revision: String.t() | nil,
           cli_token: String.t() | nil,
           harness: String.t(),
           provider: String.t(),
@@ -65,6 +66,7 @@ defmodule Tightbeam.Org do
     archetype     TEXT NOT NULL,
     overrides     TEXT,
     identityName  TEXT,
+    identityRevision TEXT,
     cliToken      TEXT,
     harness       TEXT NOT NULL CHECK (harness IN ('claude','codex')),
     provider      TEXT NOT NULL CHECK (provider IN ('anthropic','openai')),
@@ -104,6 +106,7 @@ defmodule Tightbeam.Org do
           "ALTER TABLE sessions ADD COLUMN clearedThroughSeq INTEGER NOT NULL DEFAULT 0",
           "ALTER TABLE sessions ADD COLUMN overrides TEXT",
           "ALTER TABLE sessions ADD COLUMN identityName TEXT",
+          "ALTER TABLE sessions ADD COLUMN identityRevision TEXT",
           "ALTER TABLE sessions ADD COLUMN cliToken TEXT",
           "ALTER TABLE sessions ADD COLUMN adjudicationHold TEXT"
         ] do
@@ -178,10 +181,11 @@ defmodule Tightbeam.Org do
       txn,
       """
         INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-          ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName, cliToken,
+          ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
+          identityRevision, cliToken,
           harness, provider, model, thinkingLevel, host, state, createdAt, updatedAt)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-          ?15, ?16, ?17, ?18, ?19, 'active', ?20, ?20)
+          ?15, ?16, ?17, ?18, ?19, ?20, 'active', ?21, ?21)
       """,
       [
         session_key,
@@ -197,6 +201,7 @@ defmodule Tightbeam.Org do
         Map.fetch!(input, :archetype),
         encode_overrides(Map.get(input, :overrides)),
         Map.get(input, :identity_name, Map.fetch!(input, :archetype)),
+        Map.get(input, :identity_revision),
         cli_token,
         Map.fetch!(input, :harness),
         Map.fetch!(input, :provider),
@@ -409,6 +414,12 @@ defmodule Tightbeam.Org do
     ])
   end
 
+  @doc "Stamp the single immutable identity revision provisioned into a session."
+  @spec set_identity_revision(db(), String.t(), String.t()) :: session()
+  def set_identity_revision(db \\ Tightbeam.DB, session_key, revision) do
+    update(db, session_key, "identityRevision = ?2", [revision])
+  end
+
   @doc """
   Record the history barrier: replay serves only messages with seq > this.
   Rows are never deleted — the chat's past remains in the store (and in any
@@ -545,7 +556,8 @@ defmodule Tightbeam.Org do
   defp select_session_sql do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName, cliToken, harness, provider,
+           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
+           identityRevision, cliToken, harness, provider,
            model, thinkingLevel, host, clearedThroughSeq, adjudicationHold, state, createdAt, updatedAt
     FROM sessions
     """
@@ -565,6 +577,7 @@ defmodule Tightbeam.Org do
          archetype,
          overrides,
          identity_name,
+         identity_revision,
          cli_token,
          harness,
          provider,
@@ -591,6 +604,7 @@ defmodule Tightbeam.Org do
       archetype: archetype,
       overrides: decode_overrides(overrides),
       identity_name: identity_name || archetype,
+      identity_revision: identity_revision,
       cli_token: cli_token,
       harness: harness,
       provider: provider,

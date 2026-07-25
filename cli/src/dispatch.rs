@@ -323,22 +323,64 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("cancelWakeId", wake_id)],
         )),
-        Command::SkillList { identity } => Ok(request(identity, "skill-list", vec![], vec![])),
-        Command::SkillPut {
+        Command::IdentityEdit {
             identity,
-            name,
+            archetype,
+            manifest,
+            skill,
+            remove,
             content,
+        } => {
+            let mut params = vec![
+                string_field("archetype", archetype),
+                format!("\"manifest\":{manifest}"),
+                format!("\"remove\":{remove}"),
+            ];
+            if let Some(value) = skill {
+                params.push(string_field("skill", value));
+            }
+            if let Some(value) = content {
+                params.push(string_field("content", value));
+            }
+            Ok(request(identity, "identity-edit", vec![], params))
+        }
+        Command::IdentityStatus {
+            identity,
+            archetype,
         } => Ok(request(
             identity,
-            "skill-put",
+            "identity-status",
             vec![],
-            vec![string_field("name", name), string_field("content", content)],
+            archetype
+                .as_ref()
+                .map(|value| vec![string_field("archetype", value)])
+                .unwrap_or_default(),
         )),
-        Command::SkillRemove { identity, name } => Ok(request(
+        Command::IdentityRelearn { identity, action } => Ok(request(
             identity,
-            "skill-rm",
+            "identity-relearn",
             vec![],
-            vec![string_field("name", name)],
+            action
+                .as_ref()
+                .map(|value| vec![string_field("action", value)])
+                .unwrap_or_default(),
+        )),
+        Command::IdentityApply {
+            identity,
+            session_key,
+            all,
+        } => {
+            let mut params = vec![format!("\"all\":{all}")];
+            if let Some(value) = session_key {
+                params.push(string_field("sessionKey", value));
+            }
+            Ok(request(identity, "identity-apply", vec![], params))
+        }
+        Command::Onboard { identity, provider } => Ok(request(
+            identity,
+            "onboard",
+            vec![],
+            vec![string_field("provider", provider)],
         )),
         Command::ConfigGet { identity, setting } => Ok(request(
             identity,
@@ -364,6 +406,26 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             ],
         )),
     }
+}
+
+pub fn build_onboard_phase_request(
+    identity: &Identity,
+    provider: &str,
+    phase: &str,
+    machine: Option<&str>,
+    reason: Option<&str>,
+) -> RequestSpec {
+    let mut params = vec![
+        string_field("provider", provider),
+        string_field("phase", phase),
+    ];
+    if let Some(machine) = machine {
+        params.push(string_field("machine", machine));
+    }
+    if let Some(reason) = reason {
+        params.push(string_field("reason", reason));
+    }
+    request(identity, "onboard", vec![], params)
 }
 
 pub fn build_register_host_request(
@@ -488,6 +550,7 @@ pub fn run(command: Command) -> Result<(), String> {
         Command::Help => unreachable!("help is handled before dispatch"),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::Onboard { identity, provider } => crate::ceremonies::onboard(&identity, &provider),
         command => {
             let request = build_request(&command)?;
             if let Some(result) = send(&request)? {
@@ -595,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_byte_exact_spawn_and_skill_put_bodies() {
+    fn builds_byte_exact_spawn_and_identity_edit_bodies() {
         assert_eq!(
             body(&[
                 "spawn",
@@ -618,14 +681,17 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","handle":"reviewer","host":"eezo"}}"#
         );
-        let command = Command::SkillPut {
+        let command = Command::IdentityEdit {
             identity: Identity::User("flynn".to_owned()),
-            name: "swift/concurrency".to_owned(),
-            content: "line one\nline two".to_owned(),
+            archetype: "coder".to_owned(),
+            manifest: false,
+            skill: Some("swift".to_owned()),
+            remove: false,
+            content: Some("line one\nline two".to_owned()),
         };
         assert_eq!(
             build_request(&command).unwrap().body_json,
-            r#"{"asUser":"flynn","verb":"skill-put","params":{"name":"swift/concurrency","content":"line one\nline two"}}"#
+            r#"{"asUser":"flynn","verb":"identity-edit","params":{"archetype":"coder","manifest":false,"remove":false,"skill":"swift","content":"line one\nline two"}}"#
         );
     }
 
@@ -810,6 +876,24 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_phase_names_the_machine_without_transporting_credentials() {
+        let request = build_onboard_phase_request(
+            &Identity::User("flynn".to_owned()),
+            "openai",
+            "begin",
+            Some("work-1"),
+            None,
+        );
+
+        assert_eq!(
+            request.body_json,
+            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"openai","phase":"begin","machine":"work-1"}}"#
+        );
+        assert!(!request.body_json.contains("auth.json"));
+        assert!(!request.body_json.contains("token"));
+    }
+
+    #[test]
     fn builds_byte_exact_bodies_for_all_remaining_dispatch_commands() {
         for (args, expected) in [
             (
@@ -833,12 +917,12 @@ mod tests {
                 r#"{"asProcess":"cron","verb":"wake","params":{"cancelWakeId":"wake-1"}}"#,
             ),
             (
-                &["skill", "list", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"skill-list","params":{}}"#,
+                &["identity", "status", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"identity-status","params":{}}"#,
             ),
             (
-                &["skill", "rm", "swift", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"skill-rm","params":{"name":"swift"}}"#,
+                &["identity", "apply", "agent:coder:app", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"identity-apply","params":{"all":false,"sessionKey":"agent:coder:app"}}"#,
             ),
         ] {
             assert_eq!(body(args), expected);

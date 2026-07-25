@@ -64,6 +64,8 @@ defmodule Tightbeam.ModelCatalog do
       now: Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end),
       claude_fetch: Keyword.get(opts, :claude_fetch, &http_get/2),
       codex_read: Keyword.get(opts, :codex_read, &File.read/1),
+      credential_status:
+        Keyword.get(opts, :credential_status, &default_credential_status/1),
       harnesses:
         Map.new(@harnesses, fn harness ->
           {harness,
@@ -143,11 +145,25 @@ defmodule Tightbeam.ModelCatalog do
 
   defp safely_derive(harness, state) do
     try do
-      derive(harness, state)
+      with :onboarded <- state.credential_status.(provider(harness)) do
+        derive(harness, state)
+      else
+        {:needs_onboarding, reason} -> {:error, {:needs_onboarding, reason}}
+      end
     rescue
       error -> {:error, {:exception, Exception.message(error)}}
     catch
       kind, reason -> {:error, {kind, reason}}
+    end
+  end
+
+  defp provider("codex"), do: :openai
+  defp provider("claude"), do: :anthropic
+
+  defp default_credential_status(provider) do
+    case Process.whereis(Tightbeam.Credentials) do
+      nil -> :onboarded
+      _pid -> Tightbeam.Credentials.status(provider)
     end
   end
 

@@ -1,0 +1,9 @@
+name = "default"
+skills = []
+
+[guidance]
+text = """
+#include "wisdom-core.md"
+
+#include "default.md"
+"""

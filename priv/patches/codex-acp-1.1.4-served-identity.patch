@@ -1,0 +1,18 @@
+codex-acp 1.1.4 served-identity passthrough
+
+Upstreamable changes:
+
+1. In CodexACPAgent.newSession, pass
+   developerInstructions: request._meta?.developerInstructions
+   to codexClient.threadStart.
+2. In CodexACPAgent.loadSession, pass the same field to
+   codexClient.threadResume.
+3. In CodexEventHandler.createUpdateEvent, translate account/updated into:
+   {
+     sessionUpdate: "session_info_update",
+     _meta: { codex: { accountUpdated: notification.params } }
+   }
+
+The executable, idempotent form lives in Tightbeam.CodexAcpPatch because
+codex-acp is installed per host at runtime rather than committed in this
+repository.

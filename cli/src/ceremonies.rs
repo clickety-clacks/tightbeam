@@ -1,41 +1,158 @@
 //! Interactive `setup` and `assimilate` ceremonies.
 
-use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
-use crate::args::AssimilateArgs;
+use crate::args::{AssimilateArgs, Identity};
 use crate::dispatch::{self, RequestSpec};
 
-#[derive(Clone, Copy)]
-struct LoginFlow {
-    env_var: &'static str,
-    executable: &'static str,
-    args: &'static [&'static str],
-    credential_file: &'static str,
+pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
+    let machine = std::env::var("TIGHTBEAM_MACHINE").ok();
+    let begin = dispatch::build_onboard_phase_request(
+        identity,
+        provider,
+        "begin",
+        machine.as_deref(),
+        None,
+    );
+    let ready = dispatch::send(&begin)?
+        .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
+    let staging = ready
+        .get("staging_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
+
+    let interactive = run_provider_onboarding(provider, staging);
+
+    if let Err(reason) = interactive {
+        let _ = fs::remove_dir_all(staging);
+        let classified = if reason.contains("unsupported (no subscription)") {
+            Some("unsupported_no_subscription")
+        } else {
+            None
+        };
+        let cancel = dispatch::build_onboard_phase_request(
+            identity,
+            provider,
+            "cancel",
+            machine.as_deref(),
+            classified,
+        );
+        let _ = dispatch::send(&cancel);
+        return Err(reason);
+    }
+
+    let finish = dispatch::build_onboard_phase_request(
+        identity,
+        provider,
+        "finish",
+        machine.as_deref(),
+        None,
+    );
+    match dispatch::send(&finish) {
+        Ok(Some(result)) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).expect("JSON value serializes")
+            );
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            let _ = fs::remove_dir_all(staging);
+            let cancel = dispatch::build_onboard_phase_request(
+                identity,
+                provider,
+                "cancel",
+                machine.as_deref(),
+                None,
+            );
+            let _ = dispatch::send(&cancel);
+            return Err(reason);
+        }
+    }
+    Ok(())
 }
 
-fn login_flow(harness: &str) -> Option<LoginFlow> {
-    match harness {
-        "claude" => Some(LoginFlow {
-            env_var: "CLAUDE_CONFIG_DIR",
-            executable: "claude",
-            args: &["setup-token"],
-            credential_file: ".claude/.credentials.json",
-        }),
-        "codex" => Some(LoginFlow {
-            env_var: "CODEX_HOME",
-            executable: "codex",
-            args: &["login"],
-            credential_file: ".codex/auth.json",
-        }),
-        _ => None,
+fn run_provider_onboarding(provider: &str, staging: &str) -> Result<(), String> {
+    match provider {
+        "openai" => run_openai_onboarding(staging),
+        "anthropic" => run_anthropic_onboarding(staging),
+        _ => Err(format!("unsupported provider: {provider}")),
     }
+}
+
+fn run_openai_onboarding(staging: &str) -> Result<(), String> {
+    let status = ProcessCommand::new("codex")
+        .args(["login", "--device-auth"])
+        .env("CODEX_HOME", staging)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| error.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("OpenAI device-code onboarding failed: {status}"))
+    }
+}
+
+fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
+    let transcript = PathBuf::from(staging).join("setup-token.log");
+    let status = ProcessCommand::new("script")
+        .args([
+            "-q",
+            transcript
+                .to_str()
+                .ok_or_else(|| "invalid onboarding staging path".to_owned())?,
+            "claude",
+            "setup-token",
+        ])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| error.to_string())?;
+    let output = fs::read_to_string(&transcript).unwrap_or_default();
+
+    if !status.success() {
+        if output.to_ascii_lowercase().contains("subscription") {
+            return Err("needs_onboarding: unsupported (no subscription)".to_owned());
+        }
+        return Err(format!("Anthropic setup-token onboarding failed: {status}"));
+    }
+
+    let token = capture_setup_token(&output)
+        .ok_or_else(|| "Anthropic setup-token was not captured".to_owned())?;
+    let path = PathBuf::from(staging).join("oauth-token");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    writeln!(file, "{token}").map_err(|error| error.to_string())
+}
+
+fn capture_setup_token(output: &str) -> Option<String> {
+    output.split_whitespace().rev().find_map(|word| {
+        let token = word
+            .trim_matches(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            })
+            .to_owned();
+        token.starts_with("sk-ant-oat").then_some(token)
+    })
 }
 
 fn validate_harnesses(harnesses: &[String]) -> Result<(), String> {
     for harness in harnesses {
-        if login_flow(harness).is_none() {
+        if !matches!(harness.as_str(), "claude" | "codex") {
             return Err(format!("unsupported harness: {harness}"));
         }
     }
@@ -52,14 +169,7 @@ struct ExecFailure {
 trait CeremonyIo {
     fn log(&mut self, message: &str);
     fn warn(&mut self, message: &str);
-    fn terminal(&self) -> bool;
     fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure>;
-    fn exec_interactive(
-        &mut self,
-        file: &str,
-        args: &[String],
-        env: &[(String, String)],
-    ) -> Result<(), ExecFailure>;
     fn dispatch(&mut self, request: &RequestSpec) -> Result<(), String>;
     fn current_exe(&self) -> Result<PathBuf, String>;
 }
@@ -73,10 +183,6 @@ impl CeremonyIo for SystemIo {
 
     fn warn(&mut self, message: &str) {
         eprintln!("{message}");
-    }
-
-    fn terminal(&self) -> bool {
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
     }
 
     fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure> {
@@ -102,50 +208,12 @@ impl CeremonyIo for SystemIo {
         }
     }
 
-    fn exec_interactive(
-        &mut self,
-        file: &str,
-        args: &[String],
-        env: &[(String, String)],
-    ) -> Result<(), ExecFailure> {
-        let status = ProcessCommand::new(file)
-            .args(args)
-            .envs(env.iter().cloned())
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|error| ExecFailure {
-                message: error.to_string(),
-                stdout: String::new(),
-                stderr: String::new(),
-            })?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(ExecFailure {
-                message: format!("process exited with status {status}"),
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        }
-    }
-
     fn dispatch(&mut self, request: &RequestSpec) -> Result<(), String> {
         dispatch::send(request).map(|_| ())
     }
 
     fn current_exe(&self) -> Result<PathBuf, String> {
         std::env::current_exe().map_err(|error| error.to_string())
-    }
-}
-
-fn credential_status(output: &str) -> String {
-    let status = output.trim();
-    if status.is_empty() {
-        "missing".to_owned()
-    } else {
-        status.to_owned()
     }
 }
 
@@ -195,82 +263,6 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
             resolved.trim().to_owned()
         })
     })?;
-
-    let mut credentials = Vec::<(String, String)>::new();
-    step(io, "CREDENTIALS", command_failure, |io| {
-        for harness in &args.harnesses {
-            let flow = login_flow(harness).expect("harnesses were validated");
-            let source = remote_path(&format!("~/{}", flow.credential_file));
-            let credential_name = Path::new(flow.credential_file)
-                .file_name()
-                .expect("credential file has basename")
-                .to_string_lossy();
-            let target = remote_path(&format!("{resolved_base}/auth/{harness}/{credential_name}"));
-            let script = format!(
-                "if [ -f {source} ]; then if [ -e {target} ]; then printf 'present\\n'; else cp {source} {target}; printf 'harvested\\n'; fi; else printf 'missing\\n'; fi"
-            );
-            let output = ssh(io, dry_run, &args.ssh_dest, &script)?;
-            let mut status = credential_status(&output);
-            if status == "missing" && args.push_credentials {
-                let local_credential = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                    .join(flow.credential_file);
-                run_command(
-                    io,
-                    dry_run,
-                    "scp",
-                    &[
-                        "-o".to_owned(),
-                        "BatchMode=yes".to_owned(),
-                        local_credential.display().to_string(),
-                        format!("{}:{resolved_base}/auth/{harness}/", args.ssh_dest),
-                    ],
-                )?;
-                status = "pushed".to_owned();
-                io.log(&format!(
-                    "[assimilate] CREDENTIALS: PUSHED LOCAL {harness} credentials to {}",
-                    args.ssh_dest
-                ));
-            } else if status == "missing" && !dry_run {
-                io.warn(&format!(
-                    "[assimilate] WARNING: no {harness} credentials found on the satellite; continuing"
-                ));
-            }
-            credentials.push((harness.clone(), status));
-        }
-        Ok(())
-    })?;
-
-    if !dry_run && !args.no_onboard {
-        for (harness, status) in &mut credentials {
-            if status != "missing" {
-                continue;
-            }
-            let harness = harness.clone();
-            let flow = login_flow(&harness).expect("harnesses were validated");
-            let auth_dir = format!("{resolved_base}/auth/{harness}");
-            if io.terminal() {
-                let remote_command = format!(
-                    "env {}={} {}",
-                    flow.env_var,
-                    remote_path(&auth_dir),
-                    std::iter::once(flow.executable)
-                        .chain(flow.args.iter().copied())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                step(io, &format!("ONBOARD {harness}"), command_failure, |io| {
-                    io.exec_interactive(
-                        "ssh",
-                        &["-t".to_owned(), args.ssh_dest.clone(), remote_command],
-                        &[],
-                    )
-                })?;
-                *status = "onboarded".to_owned();
-            } else {
-                io.warn(&onboard_warning(&harness, &resolved_base));
-            }
-        }
-    }
 
     step(io, "ADAPTERS", command_failure, |io| {
         ssh(
@@ -352,22 +344,7 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
     io.log("Assimilation summary:");
     io.log(&format!("  host: {host_name}"));
     io.log(&format!("  base dir: {resolved_base}"));
-    if dry_run {
-        io.log("  credentials: dry run; not checked");
-    } else {
-        for (label, status) in [
-            ("onboarded (own grant)", "onboarded"),
-            ("harvested", "harvested"),
-            ("already present", "present"),
-            ("pushed", "pushed"),
-            ("missing", "missing"),
-        ] {
-            io.log(&format!(
-                "  credentials {label}: {}",
-                by_status(&credentials, status)
-            ));
-        }
-    }
+    io.log("  credentials: not transported; onboard independently on this host");
     io.log(&format!(
         "  next: add \"{host_name}\" to an archetype's `where`"
     ));
@@ -492,18 +469,6 @@ fn display_command(file: &str, args: &[String]) -> String {
         .join(" ")
 }
 
-pub fn onboard_warning(harness: &str, resolved_base: &str) -> String {
-    let flow = login_flow(harness).expect("warning requested for supported harness");
-    let command = std::iter::once(flow.executable)
-        .chain(flow.args.iter().copied())
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "[assimilate] no terminal for {harness} onboarding — run on the satellite: {}={resolved_base}/auth/{harness} {command}",
-        flow.env_var
-    )
-}
-
 fn local_target_triple() -> &'static str {
     env!("TIGHTBEAM_BUILD_TARGET")
 }
@@ -526,20 +491,6 @@ fn target_from_probe(output: &str) -> Option<String> {
     }
 }
 
-fn by_status(credentials: &[(String, String)], status: &str) -> String {
-    let names = credentials
-        .iter()
-        .filter(|(_, value)| value == status)
-        .map(|(harness, _)| harness.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if names.is_empty() {
-        "none".to_owned()
-    } else {
-        names
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,7 +501,6 @@ mod tests {
         warnings: Vec<String>,
         commands: Vec<(String, Vec<String>)>,
         responses: Vec<Result<String, ExecFailure>>,
-        terminal: bool,
         dispatched: Vec<String>,
     }
 
@@ -563,10 +513,6 @@ mod tests {
             self.warnings.push(message.to_owned());
         }
 
-        fn terminal(&self) -> bool {
-            self.terminal
-        }
-
         fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure> {
             self.commands.push((file.to_owned(), args.to_vec()));
             if self.responses.is_empty() {
@@ -574,16 +520,6 @@ mod tests {
             } else {
                 self.responses.remove(0)
             }
-        }
-
-        fn exec_interactive(
-            &mut self,
-            file: &str,
-            args: &[String],
-            _env: &[(String, String)],
-        ) -> Result<(), ExecFailure> {
-            self.commands.push((file.to_owned(), args.to_vec()));
-            Ok(())
         }
 
         fn dispatch(&mut self, request: &RequestSpec) -> Result<(), String> {
@@ -603,8 +539,6 @@ mod tests {
             name: None,
             base_dir: "~/.tightbeam".to_owned(),
             harnesses: vec!["claude".to_owned(), "codex".to_owned()],
-            push_credentials: false,
-            no_onboard: true,
             dry_run: false,
         }
     }
@@ -618,18 +552,12 @@ mod tests {
     }
 
     #[test]
-    fn non_tty_onboard_warning_names_manual_command() {
+    fn captures_the_non_rotating_claude_setup_token() {
         assert_eq!(
-            onboard_warning("codex", "/org"),
-            "[assimilate] no terminal for codex onboarding — run on the satellite: CODEX_HOME=/org/auth/codex codex login"
+            capture_setup_token("browser output\nsk-ant-oat01-example\r\n"),
+            Some("sk-ant-oat01-example".to_owned())
         );
-    }
-
-    #[test]
-    fn credential_status_defaults_only_empty_output_to_missing() {
-        assert_eq!(credential_status("\n"), "missing");
-        assert_eq!(credential_status("present\n"), "present");
-        assert_eq!(credential_status("unexpected\n"), "unexpected");
+        assert_eq!(capture_setup_token("no token here"), None);
     }
 
     #[test]
@@ -673,9 +601,7 @@ mod tests {
                 .iter()
                 .map(|(file, _)| file.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "ssh", "ssh", "ssh", "ssh", "ssh", "ssh", "ssh", "scp", "ssh"
-            ]
+            vec!["ssh", "ssh", "ssh", "ssh", "ssh", "scp", "ssh"]
         );
         assert_eq!(
             io.commands[0].1,
@@ -687,7 +613,7 @@ mod tests {
             ]
         );
         assert!(
-            io.commands[7]
+            io.commands[5]
                 .1
                 .last()
                 .unwrap()
@@ -714,7 +640,7 @@ mod tests {
                 .iter()
                 .filter(|line| line.starts_with("DRY "))
                 .count(),
-            9
+            7
         );
         assert!(
             io.logs

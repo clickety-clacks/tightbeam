@@ -2,22 +2,23 @@
 
 A satellite is a machine where agent *harnesses* run while the substrate,
 ledger, and stores stay on the gateway host (spec §Placement). There is no
-satellite daemon: sshd is the transport, rsync moves the identity capsule,
-and the gateway does the rest. Prerequisite: the gateway host can ssh to the
+satellite daemon: sshd is the transport, rsync materializes non-secret
+session identity, and the gateway does the rest. Prerequisite: the gateway host can ssh to the
 satellite non-interactively (shared keys — you bring these).
 
 ## On the satellite (one-time, by the operator)
 
 1. **Base dir** — `mkdir -p ~/.tightbeam/auth/<harness>` for each harness
    that will run here (`claude`, `codex`). `homes/` is created by delivery.
-2. **Credentials** — copy each harness's credential file into its auth dir
-   (e.g. `~/.claude/.credentials.json` → `~/.tightbeam/auth/claude/`,
-   `~/.codex/auth.json` → `~/.tightbeam/auth/codex/`). Credentials are
-   seeded by YOU, once, locally; the gateway never transmits them. Delivery
-   symlinks them into each projected home on this machine.
+2. **Credentials** — run Tight Beam onboarding independently on this
+   machine: `tightbeam onboard openai` for Codex device-code, and
+   `tightbeam onboard anthropic` for Claude setup-token. Never copy,
+   harvest, scp, or rsync credentials between machines. In an operator
+   shell, set `TIGHTBEAM_MACHINE` to this host's registered name alongside
+   the gateway discovery variables; agent shells receive it automatically.
 3. **Runtime + adapters** — install node and the ACP adapter packages
    (`@agentclientprotocol/claude-agent-acp`, `codex-acp`) at a path of your
-   choosing; note the bin dir. Also `rsync` (standard on macOS/Linux).
+   choosing. Also install `rsync` (standard on macOS/Linux).
 4. **Agent CLI** — put a `tightbeam` executable on a path of your choosing
    (the reference CLI is `node <checkout>/dist/cli/main.js`; a shim script
    suffices). Agents on this host reach the gateway via the TIGHTBEAM_URL /
@@ -33,8 +34,7 @@ export TIGHTBEAM_HOSTS='{
   "work-1": {
     "ssh": "work-1",
     "base_dir": "/Users/you/.tightbeam",
-    "cli_bin": "/Users/you/.tightbeam/bin",
-    "adapter_bin_dir": "/Users/you/src/adapters/node_modules/.bin"
+    "cli_bin": "/Users/you/.tightbeam/bin"
   }
 }'
 ```
@@ -59,6 +59,11 @@ Then `tightbeam spawn --display "Coder" --archetype coder ...` places the
 session on work-1; `tune set_host` moves sessions among the archetype's
 allowed hosts (fresh model context; chat history is substrate-side and
 unaffected). Spawning outside `where` is denied, citing the check.
+
+The shared home is `<base_dir>/homes/<machine>/<harness>`. Elected skills
+are copied only to the exact session cwd under `.codex/skills/tightbeam__*`
+or `.claude/skills/tightbeam__*`; guidance arrives in the harness instruction
+channel. Credentials remain in this machine's local auth store.
 
 ## What failure looks like
 

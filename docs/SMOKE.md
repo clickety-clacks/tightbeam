@@ -44,8 +44,8 @@ Per-harness annotations for the existing sections:
   `gpt-5.6-sol[low..xhigh]`, `gpt-5.6-luna[medium]`.
 - §9 rails (17–24): [divergent]. Claude asserts hooks in `settings.json`;
   codex asserts `hooks.json` with the org entries plus the trailing
-  `tightbeam-probe` entry, still NO `settings.json` in the codex home and no
-  statute text in `AGENTS.md`.
+  `tightbeam-probe` entry, still NO `settings.json` in the codex home.
+  Neither home contains archetype guidance.
 - Skills verification (when a step exercises one): [divergent] — claude
   invokes via its native Skill tool; codex must READ the skill file by the
   path the Operations pointer names. PASS for codex is the agent quoting
@@ -63,11 +63,10 @@ satellite a leg will place sessions on.
 P1. claude, per host (run ON the host; ssh for satellites):
     `env CLAUDE_CONFIG_DIR=<scratch dir> CLAUDE_CODE_OAUTH_TOKEN=$(cat
     <base_dir>/auth/claude/oauth-token) claude -p "reply with exactly: OK"`
-    — or, for file-credential installs, point CLAUDE_CONFIG_DIR at a
-    scratch copy of `<base_dir>/auth/claude` instead of the token env.
     PASS: the reply "OK". FAIL signatures: "OAuth session expired and
-    could not be refreshed" (dead lineage — re-run the setup ceremony;
-    do NOT re-harvest a shared login), 401s.
+    could not be refreshed" or persistent invalid-token 401s. Repair with
+    `tightbeam onboard anthropic` ON that host; never harvest or copy a
+    rotating Claude login.
 P2. codex, per host: `env CODEX_HOME=<base_dir>/auth/codex codex login
     status`. PASS: reports logged in. (If the codex leg is waived for a
     missing grant, say so here — the waiver is named at preflight, not
@@ -207,12 +206,12 @@ the tool call, with the statute text delivered only as the denial reason.
     `settings.json` decodes with one `hooks.PreToolUse` entry per statute
     (matcher "Bash"). The codex home's `hooks.json` decodes with one entry
     per statute plus `tightbeam-probe` LAST; the codex home still has NO
-    `settings.json`. EXPECTED COST: the statute change is an identity change
-    — affected sessions show the `[context reset]` marker once.
-18. The invariant: `grep` the projected `CLAUDE.md` and `AGENTS.md` for any
-    statute name or text.
-    PASS: zero matches — instruction files are byte-identical to a
-    lawless org's.
+    `settings.json`. Existing sessions are not refreshed automatically.
+18. The invariant: assert neither shared home contains `CLAUDE.md`,
+    `AGENTS.md`, nor archetype skill directories. Run `tightbeam identity
+    status <archetype>` and inspect both composed instruction channels.
+    PASS: statute names/text are absent from the composed guidance; guidance
+    arrives only through the Codex developer message / Claude system prompt.
 19. Live refusal [divergent]: in a scratch git repo, tell a real session to
     run exactly `git reset --hard HEAD`, then `git status`, and report what
     happened. The claude fallback is `claude -p
@@ -228,11 +227,10 @@ the tool call, with the statute text delivered only as the denial reason.
     projected home's `hooks.json` and restart the adapter.
     PASS: the adapter REFUSES to boot with `gate_attestation_failed`, and no
     codex session is served. Restore by changing MANIFEST BYTES: edit a
-    statute, or delete the home's `.tightbeam-manifest` stamp, then restart so
-    the full delete-and-reproject rewrites `hooks.json`. Merely touching a
-    file is a no-op because `Homes.project/2` regenerates only when stamp
-    bytes differ from manifest bytes. This demonstrates silent-misconfig
-    detection, NOT tamper resistance.
+    statute, or delete the home's `.tightbeam/manifest` stamp, then restart
+    so ownership-scoped regeneration rewrites `hooks.json`. Confirm the
+    home's `sessions/`, history, transcripts, and memory remain byte-identical.
+    This demonstrates silent-misconfig detection, NOT tamper resistance.
 21. Negative control: an adjacent, allowed command of the same tool
     (`git log`, `git diff`) runs without any refusal text appearing.
     PASS: normal output, no `[gate: ...]` anywhere.
@@ -244,14 +242,15 @@ the tool call, with the statute text delivered only as the denial reason.
     Restore the file; gateway boots.
 23. Law removal: delete the statutes file, restart, re-run step 19's
     forbidden command.
-    PASS: no refusal (the gate is gone, not lingering in a stale home —
-    the home regenerated on the law change); step 18 still passes.
+    PASS: no refusal (the gate is gone, not lingering in the shared home);
+    step 18 still passes and durable harness state survives.
 24. ⌥ Satellite propagation (needs an assimilated host with credentials for
     the harness leg): after step 17, deliver a home to the satellite (adapter
     boot there) and repeat steps 18–20 on the satellite's projected home.
-    PASS [divergent]: identical enforcement behavior; claude's staged
-    `settings.json` or codex's staged `hooks.json` rode rsync, and the codex
-    adapter emitted its boot wiring-check PASS line.
+    PASS [divergent]: identical enforcement behavior; the generic shared
+    home received `settings.json`/`hooks.json`, while elected archetype skills
+    were materialized separately at the exact remote session cwd. No
+    credential bytes appear in captured ssh/rsync commands.
 
 ## 10. Roles (offices: typed targets, binding, fallback, late binding)
 

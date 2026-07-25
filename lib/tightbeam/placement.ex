@@ -2,7 +2,7 @@ defmodule Tightbeam.Placement do
   @moduledoc """
   Placement mechanics (spec §Placement) — the ONE module that knows hosts
   exist. Everything else addresses identity; this module turns a host NAME
-  into an adapter command, a delivered home, and an allow/deny answer.
+  into an adapter command, a delivered shared home, and an allow/deny answer.
 
   Hosts are INSTANCE CONFIG, never DB rows: `Application.get_env(:tightbeam,
   :hosts)` maps name => %{ssh: destination-or-nil, base_dir: path, cli_bin:
@@ -26,7 +26,7 @@ defmodule Tightbeam.Placement do
      agents learn the law by hitting it.
 
   2. `adapter_opts/2` — build the Acp.Adapter start opts for an adapter key
-     {harness, archetype_name, host}:
+     {harness, "shared", host}:
      - local: exactly the previous behavior (local binary path, local home
        from Homes.project, env in the local Port).
      - remote: cmd is SSH-WRAPPED — ["ssh", dest, "exec", "env", "K=V"...,
@@ -40,27 +40,15 @@ defmodule Tightbeam.Placement do
        TIGHTBEAM_URL — never 127.0.0.1 — so the session-file-aware CLI reaches
        the gateway over the network; the org token is never placed in remote env.
 
-  3. `deliver_home/3` — materialize the projected home on the session's host:
-     Claude homes pin their session-facing default model in settings.json;
-     that pin participates in the projected identity, so the first deploy
-     regenerates each Claude home once and the expected context-reset
-     markers make that identity change visible.
-     - local: `Homes.project(base_dir, spec)` directly (unchanged path).
-     - remote: STAGE the projection on the gateway machine under
-       `<base_dir>/staging/<host>/` — the staging tree has NO auth/ dir, so
-       projection stages zero auth symlinks (credentials never transit; a
-       staged symlink would point at a gateway-local path anyway) — then:
-       (a) read the remote stamp (`ssh dest cat <remote_home>/.tightbeam-
-           manifest`, missing → ""),
-       (b) if it differs from the staged stamp: `ssh dest rm -rf <remote_
-           home> && mkdir -p` (identity change wipes, same rule as local),
-       (c) `rsync -a <staged>/ dest:<remote_home>/` WITHOUT --delete (an
-           unchanged identity must never destroy nested harness session
-           state — same invariant as Homes' hash gate, extended over the
-           wire),
-       (d) link auth remotely: one ssh sh-loop symlinking every file of
-           `<remote_base>/auth/<harness>/` into the home (ln -s, existing
-           links left alone).
+  3. `deliver_home/3` — materialize the generic `{harness, machine}` home on
+     the session's host. Regeneration owns only the credential entry, rails
+     artifact, and `.tightbeam/`; every other harness-owned byte survives.
+     Remote regeneration follows the same stop, harvest, replace, and relink
+     order without ever deleting the home. Credentials remain host-local.
+
+     `materialize_identity/4` separately projects elected skills into the
+     exact session cwd and writes the reserved git exclusion only when that
+     cwd is itself a repository checkout.
      Shell execution goes through an injectable runner (`:sh` opt, default
      System.cmd) so tests capture command lines instead of running ssh —
      same pattern as ConnRegistry's injected deliver.
@@ -77,7 +65,7 @@ defmodule Tightbeam.Placement do
   an unreachable host degrades exactly like a dead adapter, per spec.
   """
 
-  alias Tightbeam.{Archetypes, Containment, Homes, Org, Rails}
+  alias Tightbeam.{Archetypes, Containment, Homes, Identity, Org, Rails}
   import Bitwise
 
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
@@ -92,7 +80,7 @@ defmodule Tightbeam.Placement do
           optional(:cli_bin) => String.t() | nil
         }
 
-  @typedoc "Adapter key, widened for placement."
+  @typedoc "Adapter key. The reserved identity `shared` is the one runtime per harness+host."
   @type adapter_key :: {harness :: atom(), archetype :: String.t(), host :: String.t()}
 
   @doc """
@@ -157,6 +145,68 @@ defmodule Tightbeam.Placement do
 
     ensure_workdir(host, path, content, ensure_opts)
     path
+  end
+
+  @doc "Materialize one already-resolved identity snapshot at the session's exact cwd."
+  @spec materialize_identity(map(), map(), Identity.snapshot(), keyword()) :: Identity.snapshot()
+  def materialize_identity(config, session, snapshot, opts \\ []) do
+    host = Map.fetch!(hosts(config.base_dir), session.host)
+    cwd = holder_workdir(config, session)
+    materialize_identity(config, host, session, snapshot, cwd, opts)
+  end
+
+  defp materialize_identity(_config, %{ssh: nil}, session, snapshot, cwd, _opts) do
+    Identity.materialize!(snapshot, String.to_existing_atom(session.harness), cwd)
+  end
+
+  defp materialize_identity(config, %{ssh: destination}, session, snapshot, cwd, opts) do
+    harness = String.to_existing_atom(session.harness)
+    sh = Keyword.get(opts, :sh, Map.get(config, :sh, &system_cmd/1))
+
+    stage_cwd =
+      Path.join([
+        config.base_dir,
+        "staging",
+        session.host,
+        "session-identity",
+        session.session_key
+      ])
+
+    try do
+      Identity.materialize!(snapshot, harness, stage_cwd)
+      relative_skills = harness_skills_path(harness)
+      staged_skills = Path.join(stage_cwd, relative_skills)
+      remote_skills = Path.join(cwd, relative_skills)
+      exclude_pattern = Path.join(relative_skills, "tightbeam__*")
+
+      reconcile_script =
+        "mkdir -p #{shell_quote(remote_skills)}; " <>
+          "find #{shell_quote(remote_skills)} -mindepth 1 -maxdepth 1 -name 'tightbeam__*' -exec rm -rf {} +; " <>
+          "root=$(git -C #{shell_quote(cwd)} rev-parse --show-toplevel 2>/dev/null || true); " <>
+          "if [ \"$root\" = #{shell_quote(cwd)} ]; then " <>
+          "exclude=$(git -C #{shell_quote(cwd)} rev-parse --git-path info/exclude); " <>
+          "mkdir -p \"$(dirname \"$exclude\")\"; " <>
+          "grep -qxF #{shell_quote(exclude_pattern)} \"$exclude\" 2>/dev/null || " <>
+          "printf '%s\\n' #{shell_quote(exclude_pattern)} >> \"$exclude\"; fi"
+
+      run!(
+        sh,
+        ["ssh" | @ssh_opts] ++ [destination, "sh", "-c", shell_quote(reconcile_script)]
+      )
+
+      run!(sh, [
+        "rsync",
+        "-a",
+        "-e",
+        Enum.join(["ssh" | @ssh_opts], " "),
+        staged_skills <> "/",
+        "#{destination}:#{remote_skills}/"
+      ])
+
+      snapshot
+    after
+      File.rm_rf(stage_cwd)
+    end
   end
 
   @doc "Derive a session's durable workspace path without creating it."
@@ -475,18 +525,17 @@ defmodule Tightbeam.Placement do
   @spec adapter_opts(map(), adapter_key()) :: keyword()
   def adapter_opts(config, {harness, identity_name, host} = key) do
     lineage =
-      "tb1-" <> Base.url_encode64("#{identity_name}@#{host}", padding: false)
+      "tb1-" <> Base.url_encode64("#{harness}@#{host}", padding: false)
 
-    resolved = resolve_identity!(config, identity_name)
     host_config = Map.fetch!(hosts(config.base_dir), host)
-    contained? = elem(resolved, 0).containment.fs == :workdir
+    contained? = contained_runtime?(config, identity_name)
 
     if contained? and host_config.ssh != nil do
       containment_refused!(config, key, "contained_remote_unsupported")
     end
 
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
-    home = deliver_home_resolved(config, key, resolved, deliver_opts)
+    home = deliver_home(config, key, deliver_opts)
     binary = adapter_binary_path(harness, host_config)
     rails? = harness == :codex and Rails.hook_settings() != nil
 
@@ -543,9 +592,11 @@ defmodule Tightbeam.Placement do
         home: home,
         cwd: config.cwd,
         stderr_path: stderr_path,
+        on_auth_event: auth_event_handler(host, harness),
         env:
           [
             {"TIGHTBEAM_HOME", config.base_dir},
+            {"TIGHTBEAM_MACHINE", host},
             {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
             {"TIGHTBEAM_LINEAGE", lineage}
           ] ++
@@ -639,6 +690,7 @@ defmodule Tightbeam.Placement do
            [
              "#{home_env}=#{home}",
              "TIGHTBEAM_HOME=#{host_config.base_dir}",
+             "TIGHTBEAM_MACHINE=#{host}",
              "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
              "PATH=#{cli_bin}:$PATH",
              "TIGHTBEAM_LINEAGE=#{lineage}"
@@ -654,6 +706,7 @@ defmodule Tightbeam.Placement do
           home: home,
           cwd: config.cwd,
           stderr_path: stderr_path,
+          on_auth_event: auth_event_handler(host, harness),
           env: [{"TIGHTBEAM_LINEAGE", lineage}]
         ],
         probe_opts
@@ -813,9 +866,6 @@ defmodule Tightbeam.Placement do
   # refreshes, so there is no rotation and nothing to race. The file is
   # written by the operator from `tightbeam setup`'s output (0600); absent
   # file → the harness falls back to the auth store's credential file.
-  # Remote hosts are NOT covered here yet: the satellite's token file lives
-  # on the satellite, and the ssh env assembly can't read it locally —
-  # that's the remote-placement live-fire milestone's work.
   defp harness_token_env(base_dir, :claude) do
     case File.read(Path.join([base_dir, "auth", "claude", "oauth-token"])) do
       {:ok, token} -> [{"CLAUDE_CODE_OAUTH_TOKEN", String.trim(token)}]
@@ -825,59 +875,26 @@ defmodule Tightbeam.Placement do
 
   defp harness_token_env(_base_dir, _harness), do: []
 
-  @doc """
-  Push one library root (a one-shot skill or a whole subject tree) to every
-  REMOTE host's replica — the propagation half of the skill verbs. Per-host
-  results, never a raise: an unreachable host is a visible degradation
-  ("error: ..."), healed by the catch-up sync at its next home delivery.
-  For a removal the push is an rm -rf of the replica path.
-  """
-  @spec push_skill(map(), String.t(), :put | :rm, keyword()) :: %{
-          optional(String.t()) => String.t()
-        }
-  def push_skill(config, root, action, opts \\ []) do
-    sh = Keyword.get(opts, :sh, &system_cmd/1)
+  defp auth_event_handler(host, harness) do
+    provider = provider_for_harness(harness)
 
-    for {name, host_config} <- hosts(config.base_dir), host_config.ssh != nil, into: %{} do
-      remote_library = Archetypes.skills_dir(host_config.base_dir)
-
-      result =
-        try do
-          case action do
-            :put ->
-              run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "mkdir", "-p", remote_library])
-
-              run!(sh, [
-                "rsync",
-                "-a",
-                "--delete",
-                "-e",
-                Enum.join(["ssh" | @ssh_opts], " "),
-                Path.join(Archetypes.skills_dir(config.base_dir), root),
-                "#{host_config.ssh}:#{remote_library}/"
-              ])
-
-            :rm ->
-              run!(
-                sh,
-                ["ssh" | @ssh_opts] ++
-                  [
-                    host_config.ssh,
-                    "rm",
-                    "-rf",
-                    Path.join(remote_library, root)
-                  ]
-              )
-          end
-
-          "ok"
-        rescue
-          e -> "error: #{Exception.message(e)}"
-        end
-
-      {name, result}
+    fn params ->
+      Tightbeam.Credentials.mark_terminal(
+        provider,
+        %{
+          "method" => "account/updated",
+          "params" => params
+        },
+        Tightbeam.Credentials.server(host)
+      )
     end
   end
+
+  defp provider_for_harness(:codex), do: :openai
+  defp provider_for_harness(:claude), do: :anthropic
+
+  defp harness_skills_path(:codex), do: Path.join([".codex", "skills"])
+  defp harness_skills_path(:claude), do: Path.join([".claude", "skills"])
 
   @doc """
   Materialize the home for an adapter key on its host per the moduledoc.
@@ -886,95 +903,32 @@ defmodule Tightbeam.Placement do
   `(cmd :: [String.t()]) -> {output :: String.t(), exit :: integer()}`).
   """
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
-  def deliver_home(config, {harness, identity_name, host}, opts \\ []) do
-    resolved = resolve_identity!(config, identity_name)
-    deliver_home_resolved(config, {harness, identity_name, host}, resolved, opts)
-  end
-
-  defp deliver_home_resolved(
-         config,
-         {harness, identity_name, host},
-         {base_archetype, effective_archetype, overrides},
-         opts
-       ) do
+  def deliver_home(config, {harness, _identity_name, host}, opts \\ []) do
     host_config = Map.fetch!(hosts(config.base_dir), host)
+    spec = shared_projection_spec(config, harness, host)
 
     if host_config.ssh == nil do
-      refs =
-        skill_refs(config.base_dir, base_archetype, effective_archetype, overrides, identity_name)
-
-      spec =
-        projection_spec(
-          config,
-          harness,
-          identity_name,
-          base_archetype,
-          effective_archetype,
-          refs
-        )
-        |> with_identity_fingerprint(overrides)
-
       Homes.project(config.base_dir, spec).home_path
     else
       stage_base = Path.join([config.base_dir, "staging", host])
-      remote_library = Archetypes.skills_dir(host_config.base_dir)
-      remote_pinned = Path.join([host_config.base_dir, "identity", "pinned", identity_name])
-
-      refs =
-        skill_refs(
-          config.base_dir,
-          base_archetype,
-          effective_archetype,
-          overrides,
-          identity_name,
-          remote_library,
-          remote_pinned
-        )
-
-      spec =
-        projection_spec(
-          config,
-          harness,
-          identity_name,
-          base_archetype,
-          effective_archetype,
-          refs
-        )
-        |> with_identity_fingerprint(overrides)
-
-      staged_home =
-        Homes.project(stage_base, spec).home_path
-
-      remote_home =
-        Path.join([host_config.base_dir, "homes", identity_name, Atom.to_string(harness)])
+      staged_home = Homes.project(stage_base, spec).home_path
+      remote_home = Homes.home_path(host_config.base_dir, host, harness)
 
       sh = Keyword.get(opts, :sh, &system_cmd/1)
+      remote_manifest = Path.join([remote_home, ".tightbeam", "manifest"])
 
       {remote_stamp, stamp_exit} =
         sh.(
           ["ssh" | @ssh_opts] ++
-            [host_config.ssh, "cat", Path.join(remote_home, ".tightbeam-manifest")]
+            [host_config.ssh, "cat", remote_manifest]
         )
 
       if stamp_exit not in [0, 1], do: raise("remote stamp check failed with exit #{stamp_exit}")
 
-      staged_stamp = File.read!(Path.join(staged_home, ".tightbeam-manifest"))
+      staged_stamp = File.read!(Path.join([staged_home, ".tightbeam", "manifest"]))
 
       if remote_stamp != staged_stamp do
-        run!(
-          sh,
-          ["ssh" | @ssh_opts] ++
-            [
-              host_config.ssh,
-              "rm",
-              "-rf",
-              remote_home,
-              "&&",
-              "mkdir",
-              "-p",
-              remote_home
-            ]
-        )
+        regenerate_remote_owned!(sh, host_config, harness, remote_home)
       end
 
       run!(sh, [
@@ -986,50 +940,13 @@ defmodule Tightbeam.Placement do
         "#{host_config.ssh}:#{remote_home}/"
       ])
 
-      # Library replica catch-up: the staged home's skill links point into
-      # the satellite's replica; delivery makes them resolve even for a
-      # host that missed a skill-put push (degrade heals at next delivery).
-      linked = Enum.filter(refs, &(&1.linkage == "linked"))
-      pinned = Enum.filter(refs, &(&1.linkage == "pinned"))
-
-      if linked != [] do
-        run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "mkdir", "-p", remote_library])
-
-        for skill <- linked do
-          run!(sh, [
-            "rsync",
-            "-a",
-            "-e",
-            Enum.join(["ssh" | @ssh_opts], " "),
-            Path.join(Archetypes.skills_dir(config.base_dir), skill.name),
-            "#{host_config.ssh}:#{remote_library}/"
-          ])
-        end
-      end
-
-      if pinned != [] do
-        run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "mkdir", "-p", remote_pinned])
-
-        for skill <- pinned do
-          run!(sh, [
-            "rsync",
-            "-a",
-            "-e",
-            Enum.join(["ssh" | @ssh_opts], " "),
-            Path.join([config.base_dir, "identity", "pinned", identity_name, skill.name]),
-            "#{host_config.ssh}:#{remote_pinned}/"
-          ])
-        end
-      end
-
       auth_dir = Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
+      credential = credential_filename(harness)
 
       link_script =
-        "for source in \"#{auth_dir}\"/*; do " <>
-          "[ -e \"$source\" ] || continue; " <>
-          "target=\"#{remote_home}/$(basename \"$source\")\"; " <>
-          "[ -e \"$target\" ] || [ -L \"$target\" ] || ln -s \"$source\" \"$target\"; " <>
-          "done"
+        "source=\"#{Path.join(auth_dir, credential)}\"; " <>
+          "target=\"#{Path.join(remote_home, credential)}\"; " <>
+          "[ ! -e \"$source\" ] || [ -e \"$target\" ] || [ -L \"$target\" ] || ln -s \"$source\" \"$target\""
 
       # ssh JOINS its argv into one remote command line and the remote
       # shell RE-PARSES it — an unquoted compound script arrives as loose
@@ -1043,6 +960,26 @@ defmodule Tightbeam.Placement do
 
       remote_home
     end
+  end
+
+  defp regenerate_remote_owned!(sh, host_config, harness, remote_home) do
+    auth_dir = Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
+    credential = credential_filename(harness)
+    entry = Path.join(remote_home, credential)
+    store = Path.join(auth_dir, credential)
+    rails = Path.join(remote_home, rails_filename(harness))
+    manifest_dir = Path.join(remote_home, ".tightbeam")
+
+    script =
+      "mkdir -p \"#{auth_dir}\" \"#{remote_home}\"; " <>
+        "if [ -f \"#{entry}\" ] && [ ! -L \"#{entry}\" ]; then " <>
+        "cp \"#{entry}\" \"#{store}\" && chmod 600 \"#{store}\"; fi; " <>
+        "rm -f \"#{entry}\" \"#{rails}\"; rm -rf \"#{manifest_dir}\""
+
+    run!(
+      sh,
+      ["ssh" | @ssh_opts] ++ [host_config.ssh, "sh", "-c", shell_quote(script)]
+    )
   end
 
   defp containment_refused!(config, key, reason) do
@@ -1060,98 +997,48 @@ defmodule Tightbeam.Placement do
   defp adapter_key_name({harness, identity_name, host}),
     do: "#{harness}:#{identity_name}@#{host}"
 
-  defp projection_spec(config, harness, identity_name, base, effective, refs) do
-    spec = %{
-      harness: harness,
-      archetype: identity_name,
-      base_archetype: base.name,
-      parent_source: base.source,
-      guidance: Archetypes.guidance(effective),
-      skills: refs
+  defp effective_identity_fingerprint(effective) do
+    skill_names = effective.skills |> Enum.sort() |> Enum.intersperse(<<0>>)
+
+    :crypto.hash(:sha256, [Archetypes.guidance(effective), <<0>>, skill_names])
+    |> Base.encode16(case: :lower)
+  end
+
+  defp shared_projection_spec(_config, :claude, host) do
+    %{
+      harness: :claude,
+      machine: host,
+      rails: encode_settings(Rails.hook_settings())
     }
+  end
 
-    rails_settings = Rails.hook_settings()
-
+  defp shared_projection_spec(_config, :codex, host) do
     settings =
-      case harness do
-        :claude ->
-          merge_settings(rails_settings, model_settings(harness, base, config))
-
-        :codex when not is_nil(rails_settings) ->
-          update_in(rails_settings, ["hooks", "PreToolUse"], &(&1 ++ [Rails.probe_entry()]))
-
-        :codex ->
-          nil
+      case Rails.hook_settings() do
+        nil -> nil
+        hooks -> update_in(hooks, ["hooks", "PreToolUse"], &(&1 ++ [Rails.probe_entry()]))
       end
 
-    filename = if harness == :claude, do: "settings.json", else: "hooks.json"
-
-    if settings,
-      do: Map.put(spec, :extra_files, %{filename => JSON.encode!(settings)}),
-      else: spec
+    %{harness: :codex, machine: host, rails: encode_settings(settings)}
   end
 
-  defp with_identity_fingerprint(spec, nil), do: spec
+  defp encode_settings(nil), do: nil
+  defp encode_settings(settings), do: JSON.encode!(settings)
 
-  defp with_identity_fingerprint(spec, _overrides),
-    do: Map.put(spec, :identity_sha256, Homes.identity_fingerprint(spec))
+  defp contained_runtime?(_config, "shared"), do: false
 
-  defp effective_identity_fingerprint(effective) do
-    Homes.identity_fingerprint(%{
-      guidance: Archetypes.guidance(effective),
-      skills: Enum.map(effective.skills, &%{name: &1})
-    })
+  defp contained_runtime?(config, identity_name) do
+    config
+    |> resolve_identity!(identity_name)
+    |> elem(0)
+    |> then(&(&1.containment.fs == :workdir))
   end
 
-  defp skill_refs(base_dir, base, effective, overrides, identity_name) do
-    skill_refs(
-      base_dir,
-      base,
-      effective,
-      overrides,
-      identity_name,
-      Archetypes.skills_dir(base_dir),
-      Path.join([base_dir, "identity", "pinned", identity_name])
-    )
-  end
+  defp credential_filename(:codex), do: "auth.json"
+  defp credential_filename(:claude), do: "oauth-token"
 
-  defp skill_refs(
-         base_dir,
-         _base,
-         effective,
-         overrides,
-         identity_name,
-         library_dir,
-         pinned_dir
-       ) do
-    override_names = if overrides, do: Map.get(overrides, "skills_add", []), else: []
-
-    Enum.map(effective.skills, fn name ->
-      provenance = if name in override_names, do: "override", else: "template"
-      local_pinned = Path.join([base_dir, "identity", "pinned", identity_name, name])
-
-      {linkage, link_to} =
-        if provenance == "override" and File.exists?(local_pinned) do
-          {"pinned", Path.join(pinned_dir, name)}
-        else
-          {"linked", Path.join(library_dir, name)}
-        end
-
-      %{name: name, link_to: link_to, provenance: provenance, linkage: linkage}
-    end)
-  end
-
-  defp merge_settings(nil, nil), do: nil
-  defp merge_settings(settings, nil), do: settings
-  defp merge_settings(nil, additions), do: additions
-  defp merge_settings(settings, additions), do: Map.merge(settings, additions)
-
-  defp model_settings(:claude, archetype, config) do
-    default_ref = archetype.defaults[:model] || config.default_model
-    %{"model" => default_ref}
-  end
-
-  defp model_settings(_harness, _archetype, _config), do: nil
+  defp rails_filename(:codex), do: "hooks.json"
+  defp rails_filename(:claude), do: "settings.json"
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
 

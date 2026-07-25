@@ -122,17 +122,30 @@ pub enum Command {
         identity: Identity,
         wake_id: String,
     },
-    SkillList {
+    IdentityEdit {
         identity: Identity,
+        archetype: String,
+        manifest: bool,
+        skill: Option<String>,
+        remove: bool,
+        content: Option<String>,
     },
-    SkillPut {
+    IdentityStatus {
         identity: Identity,
-        name: String,
-        content: String,
+        archetype: Option<String>,
     },
-    SkillRemove {
+    IdentityRelearn {
         identity: Identity,
-        name: String,
+        action: Option<String>,
+    },
+    IdentityApply {
+        identity: Identity,
+        session_key: Option<String>,
+        all: bool,
+    },
+    Onboard {
+        identity: Identity,
+        provider: String,
     },
     ConfigGet {
         identity: Identity,
@@ -153,8 +166,6 @@ pub struct AssimilateArgs {
     pub name: Option<String>,
     pub base_dir: String,
     pub harnesses: Vec<String>,
-    pub push_credentials: bool,
-    pub no_onboard: bool,
     pub dry_run: bool,
 }
 
@@ -250,13 +261,17 @@ COMMANDS:
       output).
 
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
-  skill list                                    every skill in the library
-  skill put <name> --file <path>                create/update a skill (admin);
-      <name> may be a tree path ("swift/concurrency" — a technique inside the
-      "swift" subject tree; electing "swift" takes the whole tree). Writes the
-      library and pushes every satellite replica immediately.
-  skill rm <name>                               remove a skill (admin); refused
-      while any archetype elects it. Pruning inside a tree is an edit.
+  identity edit <archetype> [--manifest | --skill <name> [--rm]]
+                [--file <path>]
+      Edit the served identity. Without --file, content is read from stdin.
+  identity relearn [--abort | --resolve]
+      Import and merge the shipped kungfu; resolve or abort a conflict.
+  identity status [<archetype>]
+      Report the live revision, session revisions, staleness, and conflicts.
+  identity apply (<session> | --all)
+      Refresh selected sessions from the current live identity revision.
+  onboard openai|anthropic
+      Run this machine's guided credential onboarding flow.
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
 
@@ -264,14 +279,12 @@ COMMANDS:
       Check the local Tightbeam installation and report its health.
 
   assimilate <ssh-dest> [--name n] [--base-dir p] [--harness claude,codex]
-             [--push-credentials] [--no-onboard] [--dry-run]
+             [--dry-run]
       Prepare a machine to run agent harnesses and register it as a host
       (admin). Probes ssh/node/rsync, creates the base dir, installs the
-      ACP adapters and this CLI, records the host, and walks you through
-      onboarding a dedicated login per harness on the satellite (skipped
-      without a terminal or with --no-onboard). Harvesting the satellite's own login happens only if
-      one is already present in place; pushing YOURS needs the explicit
-      --push-credentials — both share a grant and can race on refresh.
+      ACP adapters and this CLI, and records the host. Credentials never
+      transit between machines; run `tightbeam onboard` independently on
+      the assimilated host.
       After: add the host to an archetype's `where`.
         tightbeam assimilate work-1.local --as-user flynn
 
@@ -283,7 +296,9 @@ DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
 
   tightbeam help | --help | -h    show this text."#;
 
-const BOOLEAN_FLAGS: &[&str] = &["dry-run", "help", "json", "no-onboard", "push-credentials"];
+const BOOLEAN_FLAGS: &[&str] = &[
+    "abort", "all", "dry-run", "help", "json", "manifest", "resolve", "rm",
+];
 
 #[derive(Debug)]
 struct Flags {
@@ -744,7 +759,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 wake_id,
             })
         }
-        "skill" => parse_skill(&parsed, flags),
+        "identity" => parse_identity_command(&parsed, flags),
+        "onboard" => parse_onboard(&parsed, flags),
         "config" => parse_config(&parsed, flags),
         "assimilate" => {
             let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
@@ -765,13 +781,11 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                     .split(',')
                     .map(str::to_owned)
                     .collect(),
-                push_credentials: flags.contains_key("push-credentials"),
-                no_onboard: flags.contains_key("no-onboard"),
                 dry_run: flags.contains_key("dry-run"),
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, work-item-create, work-item-get, spawn, retire, list, skill, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -799,36 +813,101 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
     }
 }
 
-fn parse_skill(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    let action = parsed.positional.get(1).map(String::as_str);
-    let name = parsed.positional.get(2).cloned();
-    match action {
-        Some("list") => Ok(Command::SkillList {
-            identity: identity(flags)?,
-        }),
-        Some("put") => {
-            let name =
-                name.ok_or_else(|| "usage: tightbeam skill put <name> --file <path>".to_owned())?;
-            let path = nonempty(flags, "file")
-                .ok_or_else(|| "usage: tightbeam skill put <name> --file <path>".to_owned())?;
-            let content = fs::read(path)
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .map_err(|error| error.to_string())?;
-            Ok(Command::SkillPut {
+fn parse_identity_command(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    match parsed.positional.get(1).map(String::as_str) {
+        Some("edit") => {
+            let archetype = parsed.positional.get(2).cloned().ok_or_else(|| {
+                "usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>]".to_owned()
+            })?;
+            if parsed.positional.len() != 3 {
+                return Err("usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>]".to_owned());
+            }
+            let manifest = flags.contains_key("manifest");
+            let skill = nonempty(flags, "skill");
+            let remove = flags.contains_key("rm");
+            if manifest && skill.is_some() {
+                return Err("--manifest and --skill are mutually exclusive".to_owned());
+            }
+            if remove && skill.is_none() {
+                return Err("--rm requires --skill <name>".to_owned());
+            }
+            if remove && flags.contains_key("file") {
+                return Err("--file is not valid with --rm".to_owned());
+            }
+            let content = if remove {
+                None
+            } else {
+                Some(match nonempty(flags, "file") {
+                    Some(path) => fs::read(path)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .map_err(|error| error.to_string())?,
+                    None => {
+                        use std::io::Read;
+                        let mut content = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut content)
+                            .map_err(|error| error.to_string())?;
+                        content
+                    }
+                })
+            };
+            Ok(Command::IdentityEdit {
                 identity: identity(flags)?,
-                name,
+                archetype,
+                manifest,
+                skill,
+                remove,
                 content,
             })
         }
-        Some("rm") => {
-            let name = name.ok_or_else(|| "usage: tightbeam skill rm <name>".to_owned())?;
-            Ok(Command::SkillRemove {
+        Some("status") if parsed.positional.len() <= 3 => Ok(Command::IdentityStatus {
+            identity: identity(flags)?,
+            archetype: parsed.positional.get(2).cloned(),
+        }),
+        Some("relearn") if parsed.positional.len() == 2 => {
+            let actions = ["abort", "resolve"]
+                .into_iter()
+                .filter(|name| flags.contains_key(*name))
+                .collect::<Vec<_>>();
+            if actions.len() > 1 {
+                return Err("--abort and --resolve are mutually exclusive".to_owned());
+            }
+            Ok(Command::IdentityRelearn {
                 identity: identity(flags)?,
-                name,
+                action: actions.first().map(|value| (*value).to_owned()),
             })
         }
-        _ => Err("usage: tightbeam skill list | put <name> --file <path> | rm <name>".to_owned()),
+        Some("apply") => {
+            let session_key = parsed.positional.get(2).cloned();
+            let all = flags.contains_key("all");
+            if parsed.positional.len() > 3 || all == session_key.is_some() {
+                return Err("usage: tightbeam identity apply (<session> | --all)".to_owned());
+            }
+            Ok(Command::IdentityApply {
+                identity: identity(flags)?,
+                session_key,
+                all,
+            })
+        }
+        _ => Err("usage: tightbeam identity edit|status|relearn|apply ...".to_owned()),
     }
+}
+
+fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    if parsed.positional.len() != 2 {
+        return Err("usage: tightbeam onboard openai|anthropic".to_owned());
+    }
+    let provider = parsed.positional[1].clone();
+    if !matches!(provider.as_str(), "openai" | "anthropic") {
+        return Err("provider must be openai or anthropic".to_owned());
+    }
+    Ok(Command::Onboard {
+        identity: identity(flags)?,
+        provider,
+    })
 }
 
 #[cfg(test)]
@@ -890,11 +969,12 @@ mod tests {
                 "config",
                 "dispatch",
                 "doctor",
+                "identity",
                 "list",
+                "onboard",
                 "retire",
                 "run-smoke",
                 "run-tests",
-                "skill",
                 "spawn",
                 "wake",
                 "work-item-create",
@@ -904,9 +984,11 @@ mod tests {
             .collect()
         );
         for syntax in [
-            "skill list",
-            "skill put <name> --file <path>",
-            "skill rm <name>",
+            "identity edit <archetype>",
+            "identity relearn [--abort | --resolve]",
+            "identity status [<archetype>]",
+            "identity apply (<session> | --all)",
+            "onboard openai|anthropic",
             "config get default-archetype",
             "config set default-archetype <name>",
         ] {
@@ -998,7 +1080,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, work-item-create, work-item-get, spawn, retire, list, skill, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 
@@ -1234,32 +1316,46 @@ mod tests {
                 },
             ),
             (
-                strings(&["skill", "list", "--as-user", "flynn"]),
-                Command::SkillList {
+                strings(&["identity", "status", "coder", "--as-user", "flynn"]),
+                Command::IdentityStatus {
                     identity: Identity::User("flynn".to_owned()),
+                    archetype: Some("coder".to_owned()),
                 },
             ),
             (
                 vec![
-                    "skill".to_owned(),
-                    "put".to_owned(),
+                    "identity".to_owned(),
+                    "edit".to_owned(),
+                    "coder".to_owned(),
+                    "--skill".to_owned(),
                     "swift".to_owned(),
                     "--file".to_owned(),
                     skill_path.clone(),
                     "--as-user".to_owned(),
                     "flynn".to_owned(),
                 ],
-                Command::SkillPut {
+                Command::IdentityEdit {
                     identity: Identity::User("flynn".to_owned()),
-                    name: "swift".to_owned(),
-                    content: "skill body".to_owned(),
+                    archetype: "coder".to_owned(),
+                    manifest: false,
+                    skill: Some("swift".to_owned()),
+                    remove: false,
+                    content: Some("skill body".to_owned()),
                 },
             ),
             (
-                strings(&["skill", "rm", "swift", "--as-user", "flynn"]),
-                Command::SkillRemove {
+                strings(&["identity", "apply", "--all", "--as-user", "flynn"]),
+                Command::IdentityApply {
                     identity: Identity::User("flynn".to_owned()),
-                    name: "swift".to_owned(),
+                    session_key: None,
+                    all: true,
+                },
+            ),
+            (
+                strings(&["onboard", "openai", "--as-user", "flynn"]),
+                Command::Onboard {
+                    identity: Identity::User("flynn".to_owned()),
+                    provider: "openai".to_owned(),
                 },
             ),
             (
@@ -1272,8 +1368,6 @@ mod tests {
                     "/srv/tightbeam",
                     "--harness",
                     "codex",
-                    "--push-credentials",
-                    "--no-onboard",
                     "--dry-run",
                     "--as-user",
                     "flynn",
@@ -1284,8 +1378,6 @@ mod tests {
                     name: Some("host".to_owned()),
                     base_dir: "/srv/tightbeam".to_owned(),
                     harnesses: vec!["codex".to_owned()],
-                    push_credentials: true,
-                    no_onboard: true,
                     dry_run: true,
                 }),
             ),
@@ -1299,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_put_decodes_invalid_utf8_with_replacement_characters() {
+    fn identity_edit_decodes_invalid_utf8_with_replacement_characters() {
         let skill_path = std::env::temp_dir().join(format!(
             "tightbeam_invalid_utf8_{}",
             SystemTime::now()
@@ -1309,8 +1401,10 @@ mod tests {
         ));
         fs::write(&skill_path, [b'a', 0xff, b'b']).unwrap();
         let command = parse(vec![
-            "skill".to_owned(),
-            "put".to_owned(),
+            "identity".to_owned(),
+            "edit".to_owned(),
+            "coder".to_owned(),
+            "--skill".to_owned(),
             "bytes".to_owned(),
             "--file".to_owned(),
             skill_path.display().to_string(),
@@ -1322,7 +1416,7 @@ mod tests {
 
         assert!(matches!(
             command,
-            Command::SkillPut { content, .. } if content == "a\u{fffd}b"
+            Command::IdentityEdit { content: Some(content), .. } if content == "a\u{fffd}b"
         ));
     }
 }
