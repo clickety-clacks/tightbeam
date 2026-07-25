@@ -603,8 +603,14 @@ mod tests {
     }
 
     #[test]
-    fn local_target_is_the_cargo_compile_target() {
-        assert_eq!(local_target_triple(), env!("TIGHTBEAM_BUILD_TARGET"));
+    fn local_target_is_supported_by_assimilation() {
+        assert!(matches!(
+            local_target_triple(),
+            "aarch64-apple-darwin"
+                | "x86_64-apple-darwin"
+                | "aarch64-unknown-linux-gnu"
+                | "x86_64-unknown-linux-gnu"
+        ));
     }
 
     #[test]

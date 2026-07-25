@@ -1125,7 +1125,8 @@ defmodule Tightbeam.ConformanceSupport do
               assert match?({:remedy, _, _, _}, decision)
 
             {"none", false, true} ->
-              assert decision != nil
+              assert {:deny, %{rule: name, reason: "rule_denied"}} = decision
+              assert name == (kase["reason"] || fixture_rule_name(fixture))
 
             {"none", false, false} ->
               assert decision == :allow

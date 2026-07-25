@@ -1723,6 +1723,8 @@ mod tests {
             "host".into(),
             inspect_base_dir(&SystemIo, Path::new("/missing"), &mut Vec::new()),
         );
+        assert_eq!(report.adapter_candidates.len(), 1);
+        assert_eq!(report.adapter_candidates[0].pid, 7);
         assert!(
             !serde_json::to_string(&report_value(&report))
                 .unwrap()
