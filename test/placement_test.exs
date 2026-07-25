@@ -682,7 +682,7 @@ defmodule Tightbeam.PlacementTest do
     assert opts[:cmd] == [expected_binary]
     assert opts[:home] == expected_home
     assert opts[:cwd] == "/work"
-    assert is_function(opts[:on_auth_event], 1)
+    assert is_function(opts[:on_auth_event], 2)
     assert {"TIGHTBEAM_LINEAGE", "tb1-Y29kZXhAdGVzdGhvc3Q"} in opts[:env]
 
     refute Keyword.has_key?(opts, :contained)
@@ -982,6 +982,7 @@ defmodule Tightbeam.PlacementTest do
 
     opts = Placement.adapter_opts(config, {:codex, "default", "alias"})
     assert opts[:contained]
+
     assert_receive {:command,
                     [
                       "/usr/bin/sandbox-exec",

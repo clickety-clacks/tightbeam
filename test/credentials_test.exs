@@ -140,14 +140,25 @@ defmodule Tightbeam.CredentialsTest do
     assert {:messages, []} = Process.info(server, :messages)
   end
 
-  test "only pinned fixtures are terminal", _ctx do
-    terminal = fixture("codex-account-updated-logged-out-0.145.0.json")
-    logged_in = fixture("codex-account-updated-chatgpt-0.145.0.json")
-    claude = fixture("claude-persisted-invalid-token.json")
+  test "terminal evidence delegates to the harness classifier", _ctx do
+    terminal_capture = fixture("codex-account-updated-logged-out-0.145.0.json")
+    terminal = terminal_capture["params"]
+    logged_in = fixture("codex-account-updated-chatgpt-0.145.0.json")["params"]
 
     assert Credentials.terminal_evidence?(:openai, terminal)
-    assert Credentials.terminal_evidence?(:anthropic, claude)
     refute Credentials.terminal_evidence?(:openai, logged_in)
+    refute Credentials.terminal_evidence?(:openai, terminal_capture)
+    refute Credentials.terminal_evidence?(:anthropic, terminal)
+    refute Credentials.terminal_evidence?(:openai, %{"classification" => "terminal"})
+
+    for {provider, harness, evidence} <- [
+          {:openai, Tightbeam.Harness.Codex, terminal},
+          {:openai, Tightbeam.Harness.Codex, logged_in},
+          {:anthropic, Tightbeam.Harness.Claude, terminal}
+        ] do
+      assert Credentials.terminal_evidence?(provider, evidence) ==
+               (harness.classify_auth_event(evidence) == :terminal)
+    end
 
     for name <- [
           "transient-401.json",
@@ -201,7 +212,7 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")
+    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")["params"]
     assert :ok = Credentials.mark_terminal(:openai, evidence, server)
     assert_receive :gate
     assert_receive {:capture, :openai}
@@ -247,7 +258,7 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")
+    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")["params"]
     assert :ok = Credentials.mark_terminal(:openai, evidence, server)
     assert_receive {:immutable_publish, [:before_one, :before_two], :terminal}
     assert Agent.get(membership, & &1) == [:after]
@@ -269,7 +280,7 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")
+    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")["params"]
     assert :ok = Credentials.mark_terminal(:openai, evidence, server)
     assert Credentials.status(:openai, server) == {:needs_onboarding, :revoked}
     assert :ok = Credentials.onboard(:openai, server)

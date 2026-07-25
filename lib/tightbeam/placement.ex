@@ -894,11 +894,11 @@ defmodule Tightbeam.Placement do
   end
 
   defp auth_event_handler(host, module) do
-    fn classification ->
+    fn classification, event ->
       if classification == :terminal do
         Tightbeam.Credentials.mark_terminal(
           module.credential_provider(),
-          %{"classification" => "terminal"},
+          event,
           Tightbeam.Credentials.server(host)
         )
       end

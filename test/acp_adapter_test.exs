@@ -278,7 +278,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     owner = self()
 
     {adapter, _capture_path} =
-      start_adapter(harness: :codex, on_auth_event: &send(owner, {:auth, &1}))
+      start_adapter(
+        harness: :codex,
+        on_auth_event: &send(owner, {:auth, &1, &2})
+      )
 
     send(
       adapter,
@@ -294,7 +297,14 @@ defmodule Tightbeam.Acp.AdapterTest do
        }}
     )
 
-    assert_receive {:auth, :terminal}
+    assert_receive {:auth, :terminal,
+                    %{
+                      "_meta" => %{
+                        "codex" => %{
+                          "accountUpdated" => %{"authMode" => nil, "planType" => nil}
+                        }
+                      }
+                    }}
   end
 
   test "model-selection divergence is negative-controlled without losing the loaded session" do
@@ -364,14 +374,14 @@ defmodule Tightbeam.Acp.AdapterTest do
       )
 
     on_auth_event = fn
-      :terminal ->
+      :terminal, event ->
         Tightbeam.Credentials.mark_terminal(
           :openai,
-          %{"classification" => "terminal"},
+          event,
           credentials
         )
 
-      _classification ->
+      _classification, _event ->
         :ok
     end
 

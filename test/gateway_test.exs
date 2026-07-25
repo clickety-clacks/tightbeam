@@ -3523,10 +3523,7 @@ defmodule Tightbeam.GatewayTest do
 
     {:ok, server} = Credentials.start_link(opts)
 
-    evidence = %{
-      "method" => "account/updated",
-      "params" => %{"authMode" => nil, "planType" => nil}
-    }
+    evidence = %{"authMode" => nil, "planType" => nil}
 
     assert :ok = Credentials.mark_terminal(:openai, evidence, server)
     assert_receive :parked

@@ -77,22 +77,12 @@ defmodule Tightbeam.Credentials do
 
   @doc "Classify only pinned terminal evidence. Unknown is always non-terminal."
   @spec terminal_evidence?(provider(), term()) :: boolean()
-  def terminal_evidence?(:openai, %{
-        "method" => "account/updated",
-        "params" => %{"authMode" => nil, "planType" => nil}
-      }),
-      do: true
-
-  def terminal_evidence?(:anthropic, %{
-        "persisted_rejection" => true,
-        "status" => 401,
-        "error" => "invalid-token"
-      }),
-      do: true
-
-  def terminal_evidence?(_provider, %{"classification" => "terminal"}), do: true
-
-  def terminal_evidence?(_provider, _evidence), do: false
+  def terminal_evidence?(provider, evidence) do
+    case Enum.find(Harness.all(), &(&1.credential_provider() == provider)) do
+      nil -> false
+      module -> module.classify_auth_event(evidence) == :terminal
+    end
+  end
 
   @doc false
   def store_harvested(base_dir, provider, bytes) do
