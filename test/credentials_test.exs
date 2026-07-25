@@ -84,6 +84,9 @@ defmodule Tightbeam.CredentialsTest do
         resume: fn _ ->
           send(owner, :forbidden_resume)
           :ok
+        end,
+        publish_sessions: fn _captured, transition ->
+          send(owner, {:forbidden_publish, transition})
         end
       )
 
@@ -92,6 +95,7 @@ defmodule Tightbeam.CredentialsTest do
     assert_receive :stop
     refute_receive :forbidden_start
     refute_receive :forbidden_resume
+    refute_receive {:forbidden_publish, _}
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
   end
 
@@ -186,22 +190,89 @@ defmodule Tightbeam.CredentialsTest do
         resume: fn _ ->
           send(owner, :resume)
           :ok
+        end,
+        capture_sessions: fn provider ->
+          send(owner, {:capture, provider})
+          [:captured_session]
+        end,
+        publish_sessions: fn captured, transition ->
+          send(owner, {:publish, captured, transition})
+          :ok
         end
       )
 
     evidence = fixture("codex-account-updated-logged-out-0.145.0.json")
     assert :ok = Credentials.mark_terminal(:openai, evidence, server)
     assert_receive :gate
+    assert_receive {:capture, :openai}
     assert_receive :park
+    assert_receive {:publish, [:captured_session], :terminal}
     refute_receive {:start, _}
     refute_receive :resume
     assert Credentials.status(:openai, server) == {:needs_onboarding, :revoked}
+
+    assert :ok = Credentials.mark_terminal(:openai, evidence, server)
+    refute_receive :gate
+    refute_receive {:capture, :openai}
+    refute_receive :park
+    refute_receive {:publish, _, :terminal}
 
     assert :ok = Credentials.onboard(:openai, server)
     assert_receive :gate
     assert_receive :stop
     assert_receive {:start, "replacement"}
+    assert_receive {:capture, :openai}
     assert_receive :resume
+    assert_receive {:publish, [:captured_session], :onboarded}
+    assert Credentials.status(:openai, server) == :onboarded
+  end
+
+  test "terminal capture remains immutable while the park mutates membership", ctx do
+    owner = self()
+    {:ok, membership} = Agent.start_link(fn -> [:before_one, :before_two] end)
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        capture_sessions: fn :openai -> Agent.get(membership, & &1) end,
+        park: fn :openai ->
+          Agent.update(membership, fn _ -> [:after] end)
+          :ok
+        end,
+        publish_sessions: fn captured, transition ->
+          send(owner, {:immutable_publish, captured, transition})
+          :ok
+        end
+      )
+
+    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")
+    assert :ok = Credentials.mark_terminal(:openai, evidence, server)
+    assert_receive {:immutable_publish, [:before_one, :before_two], :terminal}
+    assert Agent.get(membership, & &1) == [:after]
+  end
+
+  test "raising and exiting publishers do not change terminal or onboarding results", ctx do
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        onboarders: %{
+          openai: fn _state -> {:ok, %{bytes: "replacement", expires_at: nil}} end
+        },
+        capture_sessions: fn :openai -> [:session] end,
+        publish_sessions: fn
+          [:session], :terminal -> raise "publisher failed"
+          [:session], :onboarded -> exit(:publisher_failed)
+        end
+      )
+
+    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")
+    assert :ok = Credentials.mark_terminal(:openai, evidence, server)
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :revoked}
+    assert :ok = Credentials.onboard(:openai, server)
     assert Credentials.status(:openai, server) == :onboarded
   end
 
@@ -304,8 +375,17 @@ defmodule Tightbeam.CredentialsTest do
   end
 
   test "interactive Claude no-subscription cancellation persists unsupported health", ctx do
+    owner = self()
+
     {:ok, server} =
-      Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        publish_sessions: fn _captured, transition ->
+          send(owner, {:forbidden_cancel_publish, transition})
+        end
+      )
 
     assert {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
 
@@ -320,6 +400,8 @@ defmodule Tightbeam.CredentialsTest do
 
     assert Credentials.status(:anthropic, server) ==
              {:needs_onboarding, {:unsupported, :no_subscription}}
+
+    refute_receive {:forbidden_cancel_publish, _}
   end
 
   test "machine contexts never share credential bytes", ctx do

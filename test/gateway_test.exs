@@ -6,6 +6,7 @@ defmodule Tightbeam.GatewayTest do
     Artifacts,
     Assignments,
     ConnRegistry,
+    Credentials,
     CriticalLeases,
     DB,
     Devices,
@@ -2916,6 +2917,16 @@ defmodule Tightbeam.GatewayTest do
     runtime_pid = adapter
 
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "identity-apply-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
@@ -2936,6 +2947,9 @@ defmodule Tightbeam.GatewayTest do
     assert Org.current_pointer(ctx.db, session.session_key).harness_session_id == "thread-stable"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
 
+    assert_receive {:push,
+                    %{"type" => "stream_updated", "stream" => %{"sessionKey" => ^session_key}}}
+
     assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
              "new served skill"
 
@@ -2954,6 +2968,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert session_key == session.session_key
+    refute_receive {:push, %{"type" => "stream_updated"}}
   end
 
   # Regression: spawn creates the harness session LAZILY, so a freshly spawned session
@@ -2984,6 +2999,17 @@ defmodule Tightbeam.GatewayTest do
 
     # No pointer appended: the session has never started. No adapter stub either —
     # a no-op must not touch the adapter at all.
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "identity-apply-unstarted-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
     assert %{applied: [session_key], identity_revision: ^revision} =
@@ -2994,6 +3020,151 @@ defmodule Tightbeam.GatewayTest do
 
     assert session_key == session.session_key
     assert Org.current_pointer(ctx.db, session.session_key) == nil
+    refute_receive {:push, %{"type" => "stream_updated"}}
+  end
+
+  test "credential transitions publish the captured provider-session set exactly once", ctx do
+    base_dir = role_test_base("credential-emission")
+    config = gateway_config(base_dir, ctx.db, 0)
+    children = Gateway.children(config)
+
+    %{start: {Credentials, :start_link, [credential_opts]}} =
+      Enum.find(children, &match?(%{id: {Credentials, "testhost"}}, &1))
+
+    first =
+      Org.create(ctx.db, %{
+        session_key: "agent:credential-first",
+        display_name: "Credential first",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    second =
+      Org.create(ctx.db, %{
+        session_key: "agent:credential-second",
+        display_name: "Credential second",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "credential-emission-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    parent = self()
+
+    park = fn :openai ->
+      Org.retire(ctx.db, first.session_key)
+
+      Org.create(ctx.db, %{
+        session_key: "agent:credential-late",
+        display_name: "Credential late",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+      send(parent, :parked)
+      :ok
+    end
+
+    opts =
+      credential_opts
+      |> Keyword.put(:name, nil)
+      |> Keyword.put(:park, park)
+      |> Keyword.put(:stop, fn _provider -> :ok end)
+      |> Keyword.put(:start, fn _provider -> :ok end)
+      |> Keyword.put(:resume, fn _provider -> :ok end)
+      |> Keyword.put(:onboarders, %{
+        openai: fn _state -> {:ok, %{bytes: ~S({"token":"replacement"}), expires_at: nil}} end
+      })
+
+    {:ok, server} = Credentials.start_link(opts)
+
+    evidence = %{
+      "method" => "account/updated",
+      "params" => %{"authMode" => nil, "planType" => nil}
+    }
+
+    assert :ok = Credentials.mark_terminal(:openai, evidence, server)
+    assert_receive :parked
+
+    terminal_frames = collect_pushes(4, [])
+
+    assert Enum.frequencies_by(terminal_frames, & &1["type"]) == %{
+             "message" => 2,
+             "stream_updated" => 2
+           }
+
+    assert MapSet.new(
+             for %{
+                   "type" => "message",
+                   "role" => "user",
+                   "sessionKey" => key,
+                   "sender" => "process:tightbeam",
+                   "content" => content
+                 } <- terminal_frames,
+                 content =~ "credential" and content =~ "parked pending re-onboarding",
+                 do: key
+           ) == MapSet.new([first.session_key, second.session_key])
+
+    assert MapSet.new(
+             for %{"type" => "stream_updated", "stream" => %{"sessionKey" => key}} <-
+                   terminal_frames,
+                 do: key
+           ) == MapSet.new([first.session_key, second.session_key])
+
+    assert :ok = Credentials.mark_terminal(:openai, evidence, server)
+    refute_receive :parked
+    refute_receive {:push, _}
+    refute_receive {:push_message, _, _, _}
+
+    assert :ok = Credentials.onboard(:openai, server)
+    onboarded_frames = collect_pushes(4, [])
+
+    assert Enum.frequencies_by(onboarded_frames, & &1["type"]) == %{
+             "message" => 2,
+             "stream_updated" => 2
+           }
+
+    assert MapSet.new(
+             for %{
+                   "type" => "message",
+                   "role" => "user",
+                   "sessionKey" => key,
+                   "sender" => "process:tightbeam",
+                   "content" => content
+                 } <- onboarded_frames,
+                 content =~ "re-onboarded" and content =~ "may resume",
+                 do: key
+           ) == MapSet.new([second.session_key, "agent:credential-late"])
+
+    assert MapSet.new(
+             for %{"type" => "stream_updated", "stream" => %{"sessionKey" => key}} <-
+                   onboarded_frames,
+                 do: key
+           ) == MapSet.new([second.session_key, "agent:credential-late"])
   end
 
   defp gateway_config(base_dir, db, port) do
