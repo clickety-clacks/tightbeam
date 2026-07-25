@@ -1,10 +1,10 @@
 name = "coder"
 where = ["eezo", "racter"]
-skills = ["worktree-session", "committing-and-pushing", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+skills = ["worktree-session", "committing-and-pushing"]
 
 [guidance]
 text = """
-#include "wisdom.md"
+#include "wisdom-core.md"
 
 #include "engineering-tenets.md"
 

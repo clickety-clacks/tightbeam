@@ -82,17 +82,13 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert seeded["product-owner"].skills == [
              "tightbeam-dispatching",
-             "product-discovery",
-             "tightbeam-law-minting",
-             "tightbeam-guidance-authoring"
+             "product-discovery"
            ]
 
     assert seeded["recon"].skills == [
              "recon-first-investigation",
              "recon-lifecycle",
-             "bug-provenance",
-             "tightbeam-law-minting",
-             "tightbeam-guidance-authoring"
+             "bug-provenance"
            ]
 
     bug_provenance_path =
@@ -121,9 +117,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert manifest["skills"] == [
              "recon-first-investigation",
              "recon-lifecycle",
-             "bug-provenance",
-             "tightbeam-law-minting",
-             "tightbeam-guidance-authoring"
+             "bug-provenance"
            ]
 
     skill = File.read!("priv/kungfu/agentic-engineering/skills/bug-provenance/SKILL.md")
@@ -225,7 +219,7 @@ defmodule Tightbeam.ArchetypesTest do
     File.write!(Path.join(ctx.manifests, "coder.toml"), """
     name = "coder"
     where = ["work-1", "work-2"]
-    model_preferences = ["claude-opus-4-8"]
+    model_preferences = ["claude-opus-5"]
 
     [defaults]
     harness = "codex"
@@ -249,7 +243,7 @@ defmodule Tightbeam.ArchetypesTest do
              name: "coder",
              skills: [],
              where: ["work-1", "work-2"],
-             model_preferences: ["claude-opus-4-8"],
+             model_preferences: ["claude-opus-5"],
              containment: %{fs: :off, network: :open},
              defaults: %{harness: :codex, model: "gpt-5.6-sol[medium]"},
              references: [
@@ -700,7 +694,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert fragments["operating-manual.md"] == File.read!("priv/guidance/operating-manual.md")
 
-    for name <- ["engineering-tenets.md", "harness-support.md", "preferred-models.md", "wisdom.md"] do
+    for name <- ["engineering-tenets.md", "harness-support.md", "preferred-models.md", "wisdom-core.md", "wisdom-meta.md"] do
       assert fragments[name] ==
                File.read!("priv/kungfu/agentic-engineering/guidance/#{name}")
     end

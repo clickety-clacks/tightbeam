@@ -54,15 +54,15 @@ defmodule Tightbeam.ModelCatalogTest do
     {codex, :fresh} = ModelCatalog.get("codex", catalog)
 
     assert Enum.map(claude, & &1.ref) == [
-             "claude-opus-4-8[high]",
-             "claude-opus-4-8[low]",
-             "claude-opus-4-8[max]",
-             "claude-opus-4-8[medium]",
+             "claude-opus-5[high]",
+             "claude-opus-5[low]",
+             "claude-opus-5[max]",
+             "claude-opus-5[medium]",
              "claude-haiku-4-5"
            ]
 
-    opus = Enum.find(claude, &(&1.ref == "claude-opus-4-8[low]"))
-    assert opus.display_name == "Claude Opus 4.8"
+    opus = Enum.find(claude, &(&1.ref == "claude-opus-5[low]"))
+    assert opus.display_name == "Claude Opus 5"
     assert opus.max_input_tokens == 1_000_000
     assert opus.efforts == ["high", "low", "max", "medium"]
 
@@ -273,7 +273,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
     await_fresh(catalog, "claude")
 
-    assert ModelCatalog.member?("claude", "claude-opus-4-8[high]", catalog) == %{
+    assert ModelCatalog.member?("claude", "claude-opus-5[high]", catalog) == %{
              present?: true,
              health: :fresh
            }
@@ -286,7 +286,7 @@ defmodule Tightbeam.ModelCatalogTest do
     Agent.update(clock, fn _ -> 11 end)
     Agent.update(failures, fn _ -> true end)
 
-    assert ModelCatalog.member?("claude", "claude-opus-4-8[high]", catalog) == %{
+    assert ModelCatalog.member?("claude", "claude-opus-5[high]", catalog) == %{
              present?: true,
              health: :stale
            }

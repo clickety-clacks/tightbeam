@@ -9,9 +9,8 @@ a model not listed here is NOT IN USE — adding one is an intake/release-ceremo
 
 - **claude-fable-5** — deepest judgment and breadth; load-bearing rulings, adversarial
   whole-system review, wisdom-level authoring. Expensive; reserve for what needs it.
-- **claude-opus-4-8** — strong general reasoning and composition; coordination,
-  drafting under rulings, reviewing another model's code. Weak drive: stalls without
-  external prodding — pair with supervision.
+- **claude-opus-5** — strong general reasoning and composition; coordination,
+  drafting under rulings, reviewing another model's code.
 - **claude-sonnet-5** — the everyday mind: conversation, general agency, light
   analysis; the org default. Not for adversarial depth.
 - **claude-haiku-4-5-20251001** (nickname: haiku) — fast and cheap: classification, extraction, mechanical

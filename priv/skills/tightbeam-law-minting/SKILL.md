@@ -27,5 +27,6 @@ Designing a mechanism:
   verification — split exactly where mechanical merge gives up. (9)
 - Policy is org law over substrate facts; existence guarantees are constitutional.
   Never hardcode a topology. (10)
-- Design failures to compost: unclassified errors record raw envelopes; every
-  incident should leave a catalog row, fixture, or statute behind. (25)
+- Every failure leaves a durable artifact: unclassified errors record their raw
+  envelopes, and every incident ends with a catalog row, a fixture, or a statute
+  behind it — never just a fix. (25)

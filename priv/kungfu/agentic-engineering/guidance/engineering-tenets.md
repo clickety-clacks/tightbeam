@@ -18,3 +18,8 @@
 - Order changes that touch the same code; run only independent changes in parallel.
 - On every hand-off, state what is passed, what is expected back, and which session to wake
   with the result.
+- Make the wrong thing unrepresentable. Before writing a rule that forbids something, ask what
+  change makes it unsayable — a reserved name, a type, one seam. Rungs, weakest to strongest:
+  prose, guidance, review, test, lint, compile error, unrepresentable; take the highest you can
+  afford and say which you took. A rule only prose enforces is violated by the next agent that
+  pattern-matches on the surrounding code.

@@ -22,7 +22,7 @@ defmodule Tightbeam.Archetypes do
                                         # ["*"] alone = any configured host.
                                         # Empty = error, never a grant.
 
-      model_preferences = ["claude-opus-4-8"] # ordered preference data read
+      model_preferences = ["claude-opus-5"]   # ordered preference data read
                                                # by adjudicators; the substrate
                                                # never walks this list.
 
@@ -539,7 +539,13 @@ defmodule Tightbeam.Archetypes do
   @spec builtin_fragments() :: %{optional(String.t()) => String.t()}
   def builtin_fragments do
     shared =
-      for name <- ["engineering-tenets.md", "harness-support.md", "preferred-models.md", "wisdom.md"],
+      for name <- [
+            "engineering-tenets.md",
+            "harness-support.md",
+            "preferred-models.md",
+            "wisdom-core.md",
+            "wisdom-meta.md"
+          ],
           into: %{} do
         {name, shipped_guidance!(Path.join(["kungfu", "agentic-engineering", "guidance", name]))}
       end
@@ -579,9 +585,7 @@ defmodule Tightbeam.Archetypes do
     ],
     "coder" => [
       "worktree-session",
-      "committing-and-pushing",
-      "tightbeam-law-minting",
-      "tightbeam-guidance-authoring"
+      "committing-and-pushing"
     ],
     "reviewer" => [
       "reviewing-code",
@@ -595,15 +599,11 @@ defmodule Tightbeam.Archetypes do
     "recon" => [
       "recon-first-investigation",
       "recon-lifecycle",
-      "bug-provenance",
-      "tightbeam-law-minting",
-      "tightbeam-guidance-authoring"
+      "bug-provenance"
     ],
     "product-owner" => [
       "tightbeam-dispatching",
-      "product-discovery",
-      "tightbeam-law-minting",
-      "tightbeam-guidance-authoring"
+      "product-discovery"
     ]
   }
 
@@ -746,13 +746,20 @@ defmodule Tightbeam.Archetypes do
 
     [guidance]
     text = \"\"\"
-    #include "wisdom.md"
+    #{wisdom_includes(name)}
     #include "engineering-tenets.md"
     #include "preferred-models.md"
     #include "#{name}.md"
     \"\"\"
     """
   end
+
+  # Meta wisdom sections (enforcement, substrate-vs-inference, guidance authoring)
+  # ride only with the archetypes that mint law, review, or author guidance.
+  defp wisdom_includes(name) when name in ["orchestrator", "reviewer", "spec-writer"],
+    do: ~s(#include "wisdom-core.md"\n#include "wisdom-meta.md")
+
+  defp wisdom_includes(_name), do: ~s(#include "wisdom-core.md")
 
   defp shipped_guidance!(relative_path) do
     :tightbeam

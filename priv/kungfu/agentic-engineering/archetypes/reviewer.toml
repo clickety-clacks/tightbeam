@@ -4,7 +4,9 @@ skills = ["reviewing-code", "reviewing-specs", "spec-conformance", "review-for-c
 
 [guidance]
 text = """
-#include "wisdom.md"
+#include "wisdom-core.md"
+
+#include "wisdom-meta.md"
 
 #include "engineering-tenets.md"
 
