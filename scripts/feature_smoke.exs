@@ -34,12 +34,22 @@ defmodule FeatureSmoke do
     target = Path.join([base_dir, "identity", "rules", "smoke-escalation-probe.toml"])
     File.mkdir_p!(Path.dirname(target))
     File.cp!(source, target)
+
+    # rules/ lives inside the identity repo, and the identity seam requires a clean
+    # working tree. An uncommitted fixture wedges every identity verb, so commit it.
+    dir = Path.join(base_dir, "identity")
+    {_, 0} = System.cmd("git", ["add", "--", "rules/smoke-escalation-probe.toml"], cd: dir)
+
+    case System.cmd("git", ["diff", "--cached", "--quiet"], cd: dir) do
+      {_, 0} -> :ok
+      _ -> {_, 0} = System.cmd("git", ["commit", "-m", "feature-smoke: escalation probe"], cd: dir)
+    end
   end
 
   # --- served identity: every public seam shape --------------------------------
   defp check_identity_surface(state) do
     status = ok!(state, "identity-status", %{"archetype" => "default"})
-    assert(state, is_binary(status["live_revision"]), "identity-status returned no live revision")
+    assert(state, is_binary(status["liveRevision"]), "identity-status returned no live revision")
     assert(state, is_map(status["guidance"]), "identity-status returned no composed guidance")
 
     guidance_path = Path.join([state.base_dir, "identity", "guidance", "default.md"])
