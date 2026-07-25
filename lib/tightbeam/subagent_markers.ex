@@ -1,0 +1,328 @@
+defmodule Tightbeam.SubagentMarkers do
+  @moduledoc """
+  Durable parent-attributed observations of harness-internal subagent starts
+  and stops.
+  """
+
+  alias Tightbeam.{ConditionFacts, DB, Org, Wakes}
+  alias Tightbeam.DB.Txn
+
+  @type marker :: %{
+          kind: String.t(),
+          principal: String.t(),
+          subagent_ref: String.t(),
+          source_event_ref: String.t(),
+          harness: String.t(),
+          at: integer()
+        }
+
+  @ddl """
+  CREATE TABLE IF NOT EXISTS subagent_markers (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind           TEXT NOT NULL CHECK (kind IN ('subagent_start','subagent_stop')),
+    principal      TEXT NOT NULL REFERENCES sessions(sessionKey),
+    subagentRef    TEXT NOT NULL,
+    sourceEventRef TEXT NOT NULL,
+    harness        TEXT NOT NULL CHECK (harness IN ('claude','codex')),
+    at             INTEGER NOT NULL,
+    UNIQUE (kind, sourceEventRef)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS subagent_markers_one_stop
+    ON subagent_markers (subagentRef) WHERE kind = 'subagent_stop';
+  CREATE INDEX IF NOT EXISTS subagent_markers_principal
+    ON subagent_markers (principal, id);
+  """
+
+  @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
+  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+
+  @doc "Append one canonical marker and nudge a matching wake after commit."
+  @spec append(DB.server(), GenServer.server(), map()) :: map()
+  def append(db \\ DB, scheduler \\ Tightbeam.WakeScheduler, input) do
+    {result, fact_id} =
+      transaction!(db, fn txn ->
+        result = append_in_txn(txn, input)
+        {result, result[:fact_id]}
+      end)
+
+    if is_integer(fact_id), do: Wakes.fire_matching(scheduler, fact_id)
+    result
+  end
+
+  @doc "Append one canonical marker inside the caller's transaction."
+  @spec append_in_txn(Txn.t(), map()) :: map()
+  def append_in_txn(%Txn{} = txn, input) do
+    kind = Map.fetch!(input, :kind)
+    principal = Map.fetch!(input, :principal)
+    subagent_ref = Map.fetch!(input, :subagent_ref)
+    source_event_ref = Map.fetch!(input, :source_event_ref)
+    harness = input |> Map.fetch!(:harness) |> to_string()
+    at = Map.fetch!(input, :at)
+
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO subagent_markers
+        (kind, principal, subagentRef, sourceEventRef, harness, at)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      """,
+      [kind, principal, subagent_ref, source_event_ref, harness, at]
+    )
+
+    if Txn.changes(txn) == 1 do
+      marker = %{
+        kind: kind,
+        principal: principal,
+        subagent_ref: subagent_ref,
+        source_event_ref: source_event_ref,
+        harness: harness,
+        at: at
+      }
+
+      if kind == "subagent_stop" do
+        fact =
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "subagent_stop",
+            scope: subagent_ref,
+            origin: "process:tightbeam"
+          })
+
+        Map.merge(marker, %{appended: true, fact_id: fact.fact_id})
+      else
+        Map.merge(marker, %{appended: true, fact_id: nil})
+      end
+    else
+      existing =
+        if kind == "subagent_stop" do
+          marker_by_subagent_in_txn(txn, "subagent_stop", subagent_ref)
+        else
+          marker_by_source_in_txn(txn, kind, source_event_ref)
+        end
+
+      existing
+      |> Map.merge(%{appended: false, fact_id: nil})
+    end
+  end
+
+  @doc "Consume one pinned ACP update after resolving its persisted parent mapping."
+  @spec consume_update(
+          DB.server(),
+          GenServer.server(),
+          :claude | :codex,
+          String.t(),
+          String.t(),
+          map()
+        ) :: map() | :skip | {:error, map()}
+  def consume_update(db, scheduler, harness, machine, harness_session_id, update) do
+    case classify(harness, update) do
+      :skip ->
+        :skip
+
+      {:marker, kind, tool_call_id, child_id} ->
+        source_session_ref = Org.source_session_ref(harness, machine, harness_session_id)
+
+        result =
+          DB.transaction(db, fn txn ->
+            case parent_for_source_in_txn(txn, source_session_ref) do
+              nil ->
+                {:error,
+                 %{
+                   code: "unknown_source_session",
+                   message: "no parent mapping for harness session"
+                 }}
+
+              principal ->
+                append_in_txn(txn, %{
+                  kind: kind,
+                  principal: principal,
+                  subagent_ref: subagent_ref(source_session_ref, child_id),
+                  source_event_ref: source_event_ref(source_session_ref, tool_call_id),
+                  harness: harness,
+                  at: System.system_time(:millisecond)
+                })
+            end
+          end)
+
+        case result do
+          {:ok, %{fact_id: fact_id} = marker} when is_integer(fact_id) ->
+            Wakes.fire_matching(scheduler, fact_id)
+            marker
+
+          {:ok, value} ->
+            value
+
+          {:error, error} ->
+            raise error
+        end
+    end
+  end
+
+  @doc "Resolve a parent-visible tool-call handle to its canonical subagent ref."
+  @spec resolve_subagent_in_txn(Txn.t(), String.t(), String.t()) :: String.t() | nil
+  def resolve_subagent_in_txn(%Txn{} = txn, parent_session, tool_call_id) do
+    txn
+    |> Txn.q(
+      """
+      SELECT sourceSessionRef FROM harness_pointers
+      WHERE sessionKey = ?1 AND sourceSessionRef IS NOT NULL
+      ORDER BY id DESC
+      """,
+      [parent_session]
+    )
+    |> Enum.find_value(fn [source_session_ref] ->
+      case marker_by_source_in_txn(
+             txn,
+             "subagent_start",
+             source_event_ref(source_session_ref, tool_call_id)
+           ) do
+        nil -> nil
+        marker -> marker.subagent_ref
+      end
+    end)
+  end
+
+  @doc "Whether a canonical subagent stop already exists in this transaction."
+  @spec stopped_in_txn?(Txn.t(), String.t()) :: boolean()
+  def stopped_in_txn?(%Txn{} = txn, subagent_ref) do
+    marker_by_subagent_in_txn(txn, "subagent_stop", subagent_ref) != nil
+  end
+
+  @doc "All markers, oldest first."
+  @spec list(DB.server()) :: [marker()]
+  def list(db \\ DB) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT kind, principal, subagentRef, sourceEventRef, harness, at
+        FROM subagent_markers ORDER BY id
+        """
+      )
+
+    Enum.map(rows, &to_marker/1)
+  end
+
+  @doc "Canonical protocol-event reference."
+  @spec source_event_ref(String.t(), String.t()) :: String.t()
+  def source_event_ref(source_session_ref, tool_call_id),
+    do: encoded_ref("event", [source_session_ref, tool_call_id])
+
+  @doc "Canonical globally unique subagent reference."
+  @spec subagent_ref(String.t(), String.t()) :: String.t()
+  def subagent_ref(source_session_ref, child_id),
+    do: encoded_ref("subagent", [source_session_ref, child_id])
+
+  @doc false
+  def classify(:codex, %{
+        "toolCallId" => tool_call_id,
+        "_meta" => %{
+          "codex" => %{
+            "subagentTerminated" => %{"agentThreadId" => agent_thread_id}
+          }
+        }
+      }),
+      do: {:marker, "subagent_stop", tool_call_id, agent_thread_id}
+
+  def classify(:codex, %{
+        "toolCallId" => tool_call_id,
+        "_meta" => %{
+          "codex" => %{
+            "subagent" => %{"threadId" => agent_thread_id, "activity" => "started"}
+          }
+        }
+      }),
+      do: {:marker, "subagent_start", tool_call_id, agent_thread_id}
+
+  def classify(:codex, %{
+        "toolCallId" => tool_call_id,
+        "_meta" => %{
+          "codex" => %{
+            "subagent" => %{"threadId" => agent_thread_id, "activity" => "interrupted"}
+          }
+        }
+      }),
+      do: {:marker, "subagent_stop", tool_call_id, agent_thread_id}
+
+  def classify(:claude, %{
+        "toolCallId" => tool_call_id,
+        "_meta" => %{"claudeCode" => %{"subagentTerminated" => _termination}}
+      }),
+      do: {:marker, "subagent_stop", tool_call_id, tool_call_id}
+
+  def classify(:claude, %{
+        "sessionUpdate" => "tool_call",
+        "toolCallId" => tool_call_id,
+        "_meta" => %{"claudeCode" => %{"toolName" => tool_name}}
+      })
+      when tool_name in ["Agent", "Task"],
+      do: {:marker, "subagent_start", tool_call_id, tool_call_id}
+
+  def classify(_harness, _update), do: :skip
+
+  defp parent_for_source_in_txn(txn, source_session_ref) do
+    case Txn.q(
+           txn,
+           """
+           SELECT sessionKey FROM harness_pointers
+           WHERE sourceSessionRef = ?1 ORDER BY id DESC LIMIT 1
+           """,
+           [source_session_ref]
+         ) do
+      [[session_key]] -> session_key
+      [] -> nil
+    end
+  end
+
+  defp marker_by_source_in_txn(txn, kind, source_event_ref) do
+    case Txn.q(
+           txn,
+           """
+           SELECT kind, principal, subagentRef, sourceEventRef, harness, at
+           FROM subagent_markers WHERE kind = ?1 AND sourceEventRef = ?2
+           LIMIT 1
+           """,
+           [kind, source_event_ref]
+         ) do
+      [row] -> to_marker(row)
+      [] -> nil
+    end
+  end
+
+  defp marker_by_subagent_in_txn(txn, kind, subagent_ref) do
+    case Txn.q(
+           txn,
+           """
+           SELECT kind, principal, subagentRef, sourceEventRef, harness, at
+           FROM subagent_markers WHERE kind = ?1 AND subagentRef = ?2
+           LIMIT 1
+           """,
+           [kind, subagent_ref]
+         ) do
+      [row] -> to_marker(row)
+      [] -> nil
+    end
+  end
+
+  defp to_marker([kind, principal, subagent_ref, source_event_ref, harness, at]) do
+    %{
+      kind: kind,
+      principal: principal,
+      subagent_ref: subagent_ref,
+      source_event_ref: source_event_ref,
+      harness: harness,
+      at: at
+    }
+  end
+
+  defp encoded_ref(namespace, parts) do
+    encoded = parts |> JSON.encode!() |> Base.url_encode64(padding: false)
+    namespace <> ":" <> encoded
+  end
+
+  defp transaction!(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+end

@@ -43,6 +43,7 @@ defmodule Tightbeam.Acp.Adapter do
     :harness,
     :cwd,
     :on_auth_event,
+    :on_subagent_event,
     contained: false,
     chunks: %{},
     progress: %{},
@@ -203,6 +204,7 @@ defmodule Tightbeam.Acp.Adapter do
       harness: harness,
       cwd: Keyword.fetch!(opts, :cwd),
       on_auth_event: Keyword.get(opts, :on_auth_event),
+      on_subagent_event: Keyword.get(opts, :on_subagent_event),
       contained: Keyword.get(opts, :contained, false)
     }
 
@@ -362,6 +364,7 @@ defmodule Tightbeam.Acp.Adapter do
     sid = params["sessionId"]
     update = params["update"] || %{}
     maybe_emit_account_update(state, update)
+    maybe_emit_subagent_event(state, sid, update)
     state = emit_progress(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
@@ -413,6 +416,12 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp maybe_emit_account_update(_state, _update), do: :ok
+
+  defp maybe_emit_subagent_event(state, sid, update) do
+    with handler when is_function(handler, 2) <- state.on_subagent_event do
+      handler.(sid, update)
+    end
+  end
 
   # Invoke the per-turn progress fun on status CHANGE only. The fun is fast
   # by contract (an in-memory registry broadcast) — see PATTERNS on shared

@@ -17,6 +17,8 @@ claude (via claude-agent-acp):
   `CLAUDE_CODE_OAUTH_TOKEN`; rotating `.credentials.json` is not used.
 - Slash commands: /clear /compact /model verified as passthrough.
 - Emits per-turn context-usage telemetry.
+- Subagent starts and true task settlement are observable as parent-attributed
+  markers; wake-on-stop resolves the parent's Agent/Task tool-call id.
 
 codex (via codex-acp):
 - Skills: discovered from the session cwd's `.codex/skills/` under the
@@ -30,6 +32,9 @@ codex (via codex-acp):
 - Verified working: turns, tool use, developer-instruction identity,
   per-session skills, gpt-5.6-sol model selection. Headless login
   exists: codex login --device-auth.
+- Subagent starts and child-thread settlement are observable as
+  parent-attributed markers; wake-on-stop resolves the parent's spawn
+  tool-call id.
 
 Both: sessions/turns/cancel/load, model+effort selection, served instruction
 identity, generic shared homes with surviving session state, and harness

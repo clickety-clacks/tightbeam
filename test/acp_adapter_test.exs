@@ -151,6 +151,12 @@ defmodule Tightbeam.Acp.AdapterTest do
           handler -> Keyword.put(adapter_opts, :on_auth_event, handler)
         end
       end)
+      |> then(fn adapter_opts ->
+        case Keyword.get(opts, :on_subagent_event) do
+          nil -> adapter_opts
+          handler -> Keyword.put(adapter_opts, :on_subagent_event, handler)
+        end
+      end)
 
     adapter =
       start_supervised!(%{
@@ -244,6 +250,7 @@ defmodule Tightbeam.Acp.AdapterTest do
            }}
         ] do
       {adapter, capture_path} = start_adapter(harness: harness)
+
       assert {:ok, "sess-1"} =
                Adapter.new_session(adapter, "haiku", "/tmp", [], "served guidance")
 
@@ -280,6 +287,26 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     assert_receive {:auth, %{"authMode" => nil, "planType" => nil}}
+  end
+
+  test "session updates reach the subagent marker callback with harness session identity" do
+    owner = self()
+
+    {adapter, _capture_path} =
+      start_adapter(on_subagent_event: &send(owner, {:subagent, &1, &2}))
+
+    update = %{
+      "sessionUpdate" => "tool_call",
+      "toolCallId" => "call-1",
+      "_meta" => %{"claudeCode" => %{"toolName" => "Agent"}}
+    }
+
+    send(
+      adapter,
+      {:acp_notification, "session/update", %{"sessionId" => "sess-1", "update" => update}}
+    )
+
+    assert_receive {:subagent, "sess-1", ^update}
   end
 
   test "consecutive prompts reset the accumulator" do

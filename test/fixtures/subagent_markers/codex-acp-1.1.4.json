@@ -1,0 +1,98 @@
+{
+  "adapter": "@agentclientprotocol/codex-acp",
+  "version": "1.1.4",
+  "semantic": {
+    "spawn_operation_terminal": "item/completed for started subAgentActivity; child thread remains independently live",
+    "child_termination_terminal": "patched thread/status/changed for the correlated child thread entering idle"
+  },
+  "live_started": {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call-codex-1",
+    "status": "in_progress",
+    "rawInput": {
+      "agentThreadId": "thread-child-1",
+      "agentPath": "root/reviewer",
+      "activityKind": "started"
+    },
+    "_meta": {
+      "codex": {
+        "subagent": {
+          "threadId": "thread-child-1",
+          "path": "root/reviewer",
+          "activity": "started"
+        }
+      }
+    }
+  },
+  "spawn_operation_terminal": {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call-codex-1",
+    "status": "completed",
+    "_meta": {
+      "codex": {
+        "subagent": {
+          "threadId": "thread-child-1",
+          "path": "root/reviewer",
+          "activity": "started"
+        }
+      }
+    }
+  },
+  "live_interacted": {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call-codex-message-1",
+    "status": "in_progress",
+    "_meta": {
+      "codex": {
+        "subagent": {
+          "threadId": "thread-child-1",
+          "path": "root/reviewer",
+          "activity": "interacted"
+        }
+      }
+    }
+  },
+  "live_interrupted": {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call-codex-interrupt-1",
+    "status": "in_progress",
+    "_meta": {
+      "codex": {
+        "subagent": {
+          "threadId": "thread-child-1",
+          "path": "root/reviewer",
+          "activity": "interrupted"
+        }
+      }
+    }
+  },
+  "patched_termination": {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call-codex-1",
+    "status": "completed",
+    "_meta": {
+      "codex": {
+        "subagentTerminated": {
+          "agentThreadId": "thread-child-1",
+          "threadStatus": {
+            "type": "idle"
+          }
+        }
+      }
+    }
+  },
+  "load_replay_completed_started": {
+    "sessionUpdate": "tool_call",
+    "toolCallId": "call-codex-replayed",
+    "status": "completed",
+    "_meta": {
+      "codex": {
+        "subagent": {
+          "threadId": "thread-child-replayed",
+          "path": "root/replayed",
+          "activity": "started"
+        }
+      }
+    }
+  }
+}

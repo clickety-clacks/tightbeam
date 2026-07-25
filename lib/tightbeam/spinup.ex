@@ -157,19 +157,16 @@ defmodule Tightbeam.Spinup do
     end
   end
 
-  defp patch_local_adapter(:codex, path), do: CodexAcpPatch.ensure!(path)
-  defp patch_local_adapter(:claude, _path), do: :ok
+  defp patch_local_adapter(harness, path), do: CodexAcpPatch.ensure!(harness, path)
 
-  defp patch_remote_adapter(host, :codex, path, sh, detail) do
-    script = "node -e #{shell_quote(CodexAcpPatch.remote_script(path))}"
+  defp patch_remote_adapter(host, harness, path, sh, detail) do
+    script = "node -e #{shell_quote(CodexAcpPatch.remote_script(harness, path))}"
 
     case sh.(remote_command(host.ssh, script)) do
-      {_output, 0} -> {:ok, detail <> "; codex passthrough patched"}
+      {_output, 0} -> {:ok, detail <> "; #{harness} adapter patched"}
       {output, _exit} -> {:error, host_unready(String.trim(output)), "DENIED: #{output}"}
     end
   end
-
-  defp patch_remote_adapter(_host, :claude, _path, _sh, detail), do: {:ok, detail}
 
   defp ensure_local_credentials(host, harness, host_name) do
     paths = credential_paths(host.base_dir, harness)

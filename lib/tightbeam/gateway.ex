@@ -85,6 +85,7 @@ defmodule Tightbeam.Gateway do
     Rules,
     Roles,
     Spinup,
+    SubagentMarkers,
     Supervision,
     Wakes,
     WorkItems,
@@ -137,6 +138,7 @@ defmodule Tightbeam.Gateway do
           Devices,
           Idempotency,
           ConditionFacts,
+          SubagentMarkers,
           Escalation,
           Wakes,
           Projection,
@@ -2026,22 +2028,9 @@ defmodule Tightbeam.Gateway do
                 [] -> nil
               end
             else
-              wake =
-                Wakes.schedule_in_txn(txn, %{
-                  session_key: session_key,
-                  target_role: Map.get(call, :target_role),
-                  origin: call.origin,
-                  prompt: p.prompt,
-                  due_at: due_at,
-                  condition_kind: p[:condition_kind],
-                  condition_scope: p[:condition_scope],
-                  creator_session_key: creator_session_key(call[:principal]),
-                  reresolve: p[:reresolve],
-                  reresolve_seed: p[:reresolve_seed],
-                  reresolve_rung: p[:reresolve_rung]
-                })
+              wake = schedule_wake_in_txn(txn, call, session_key, due_at)
 
-              if p[:idempotency_key] do
+              if p[:idempotency_key] && is_binary(wake[:wake_id]) do
                 Idempotency.put_in_txn(txn, %{
                   owner_user_id: call.origin,
                   operation: "wake",
@@ -2060,14 +2049,85 @@ defmodule Tightbeam.Gateway do
             {:error, error} -> raise error
           end
 
-        if due_at <= System.system_time(:millisecond) and p[:nudge] != false,
-          do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
+        if is_binary(wake[:wake_id]) do
+          if due_at <= System.system_time(:millisecond) and p[:nudge] != false,
+            do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
 
-        wake_response(wake)
+          wake_response(wake)
+        else
+          wake
+        end
 
       _ ->
         %{code: "not_found"}
     end
+  end
+
+  defp schedule_wake_in_txn(txn, call, session_key, due_at) do
+    p = call.params
+
+    if p[:condition_kind] == "subagent_stop" do
+      caller_session = creator_session_key(call[:principal])
+
+      case SubagentMarkers.resolve_subagent_in_txn(txn, caller_session, p[:condition_scope]) do
+        nil ->
+          %{
+            code: "subagent_not_found",
+            message: "no subagent for this session and tool call"
+          }
+
+        subagent_ref ->
+          if SubagentMarkers.stopped_in_txn?(txn, subagent_ref) do
+            %{
+              code: "subagent_already_stopped",
+              subagent_ref: subagent_ref
+            }
+          else
+            schedule_wake_row_in_txn(
+              txn,
+              call,
+              session_key,
+              due_at,
+              "subagent_stop",
+              subagent_ref
+            )
+          end
+      end
+    else
+      schedule_wake_row_in_txn(
+        txn,
+        call,
+        session_key,
+        due_at,
+        p[:condition_kind],
+        p[:condition_scope]
+      )
+    end
+  end
+
+  defp schedule_wake_row_in_txn(
+         txn,
+         call,
+         session_key,
+         due_at,
+         condition_kind,
+         condition_scope
+       ) do
+    p = call.params
+
+    Wakes.schedule_in_txn(txn, %{
+      session_key: session_key,
+      target_role: Map.get(call, :target_role),
+      origin: call.origin,
+      prompt: p.prompt,
+      due_at: due_at,
+      condition_kind: condition_kind,
+      condition_scope: condition_scope,
+      creator_session_key: creator_session_key(call[:principal]),
+      reresolve: p[:reresolve],
+      reresolve_seed: p[:reresolve_seed],
+      reresolve_rung: p[:reresolve_rung]
+    })
   end
 
   defp creator_session_key({:session, key}), do: key
