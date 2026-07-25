@@ -525,13 +525,11 @@ defmodule Tightbeam.ConformanceSupport do
     end
 
     case {fixture["class"], fixture["kind"], fixture["name"]} do
-      {class, _, name}
-      when {class, name} in [
-             {"C2", "handoff-assign"},
-             {"C2", "handoff-wake"},
-             {"C3", "two-changes-requested-revert"}
-           ] ->
-        :ok
+      {"C2", _, name} when name in ~w(handoff-assign handoff-wake) ->
+        run_rules_fixture(fixture)
+
+      {"C3", _, "two-changes-requested-revert"} ->
+        run_rules_fixture(fixture)
 
       {"C4", _, "declared-files-overlap"} ->
         run_handler_refusal_fixture(fixture)
@@ -3570,36 +3568,54 @@ defmodule Tightbeam.ConformanceTest do
   @corpus Corpus.load_corpus!(@root)
   @fixtures @corpus.fixtures
   @classes @corpus.classes
+  @unsupported_fixtures %{
+    "C2/handoff-assign" =>
+      "missing Rules fact registration/evaluator for call.handoff_complete on assign",
+    "C2/handoff-wake" =>
+      "missing Rules fact registration/evaluator for call.handoff_complete on wake",
+    "C3/two-changes-requested-revert" =>
+      "missing Rules fact registration/evaluator for assignment.changes_requested_count"
+  }
 
-  test "pending census" do
-    green =
-      Enum.count(
-        @fixtures,
-        &(&1["phase"] == "green" and &1["class_phase"] == "green")
-      )
-
-    pending = length(@fixtures) - green
+  test "activation census" do
+    exact_skips = map_size(@unsupported_fixtures)
+    active_fixtures = length(@fixtures) - exact_skips
 
     structured =
       Enum.count(@fixtures, &(&1["phase"] == "green" and &1["kind"] == "dispatch-rule"))
 
-    class_pending = Enum.count(@classes, &(&1["phase"] == "pending"))
+    activated_fixture_tests =
+      Enum.count(@fixtures, fn fixture ->
+        name = "#{fixture["class"]}/#{fixture["name"]}"
+
+        (fixture["phase"] != "green" or fixture["class_phase"] != "green") and
+          not Map.has_key?(@unsupported_fixtures, name)
+      end)
+
+    activated_class_tests = Enum.count(@classes, &(&1["phase"] == "pending"))
+    activated_tests = activated_fixture_tests + activated_class_tests
 
     IO.puts(
-      "conformance census: #{green} green fixtures; #{pending} pending fixtures; " <>
-        "#{structured} structured-legibility assertion sets active; #{class_pending} pending classes"
+      "conformance activation census: #{active_fixtures} active fixture tests; " <>
+        "#{exact_skips} exact-mechanism fixture skips; #{activated_tests} formerly skipped tests " <>
+        "activated (#{activated_fixture_tests} fixtures + #{activated_class_tests} class registrations); " <>
+        "#{structured} structured-legibility assertion sets active"
     )
 
-    assert green == 13
-    assert pending == 59
+    assert length(@fixtures) == 72
+    assert active_fixtures == 69
+    assert exact_skips == 3
+    assert activated_fixture_tests == 56
+    assert activated_class_tests == 5
+    assert activated_tests == 61
   end
 
-  test "pending fixtures and case-level blockers are reported exactly" do
+  test "corpus phase annotations and case-level blockers are reported exactly" do
     entries = Corpus.pending_entries(@corpus)
 
     Enum.each(entries, fn entry ->
       IO.puts(
-        "conformance pending #{entry.scope}: #{entry.id} " <>
+        "conformance corpus annotation #{entry.scope}: #{entry.id} " <>
           "phase=#{entry.phase} blocker=#{entry.blocker}"
       )
     end)
@@ -3839,41 +3855,49 @@ defmodule Tightbeam.ConformanceTest do
 
   for fixture <- @fixtures do
     name = "#{fixture["class"]}/#{fixture["name"]}"
+    missing_mechanism = Map.get(@unsupported_fixtures, name)
 
-    if fixture["phase"] == "green" and fixture["class_phase"] == "green" do
-      test name do
-        fixture = unquote(Macro.escape(fixture))
-
-        Enum.each(fixture["runners"], fn
-          "compiled_hook_grep" -> Corpus.run_compiled_hook_fixture(fixture, @root)
-          "rail_exec" -> Corpus.run_rail_exec_fixture(fixture)
-          "rules_evaluate" -> Corpus.run_rules_fixture(fixture)
-          "handler_refusal" -> Corpus.run_handler_refusal_fixture(fixture)
-          "load_assert" -> Corpus.run_load_assert(fixture)
-          "rules_decide" -> Corpus.run_rules_decide(fixture)
-          "acting_layer" -> Corpus.run_acting_layer(fixture)
-        end)
-      end
-
-      if fixture["kind"] == "dispatch-rule" do
-        test "#{name} structured legibility" do
+    cond do
+      missing_mechanism ->
+        @tag skip: missing_mechanism
+        test name do
           fixture = unquote(Macro.escape(fixture))
-          Corpus.run_rules_fixture(fixture)
+          Corpus.run_pending_fixture(fixture, @fixtures, unquote(missing_mechanism))
         end
-      end
-    else
-      blocking_phase = fixture["blocking_phase"]
 
-      @tag skip: "#{fixture["phase"]}: #{blocking_phase}"
-      test name do
-        fixture = unquote(Macro.escape(fixture))
-        Corpus.run_pending_fixture(fixture, @fixtures, unquote(blocking_phase))
-      end
+      fixture["phase"] == "green" and fixture["class_phase"] == "green" ->
+        test name do
+          fixture = unquote(Macro.escape(fixture))
+
+          Enum.each(fixture["runners"], fn
+            "compiled_hook_grep" -> Corpus.run_compiled_hook_fixture(fixture, @root)
+            "rail_exec" -> Corpus.run_rail_exec_fixture(fixture)
+            "rules_evaluate" -> Corpus.run_rules_fixture(fixture)
+            "handler_refusal" -> Corpus.run_handler_refusal_fixture(fixture)
+            "load_assert" -> Corpus.run_load_assert(fixture)
+            "rules_decide" -> Corpus.run_rules_decide(fixture)
+            "acting_layer" -> Corpus.run_acting_layer(fixture)
+          end)
+        end
+
+        if fixture["kind"] == "dispatch-rule" do
+          test "#{name} structured legibility" do
+            fixture = unquote(Macro.escape(fixture))
+            Corpus.run_rules_fixture(fixture)
+          end
+        end
+
+      true ->
+        blocking_phase = fixture["blocking_phase"]
+
+        test name do
+          fixture = unquote(Macro.escape(fixture))
+          Corpus.run_pending_fixture(fixture, @fixtures, unquote(blocking_phase))
+        end
     end
   end
 
   for class <- @classes, class["phase"] == "pending" do
-    @tag skip: "#{class["blocking_phase"]}: #{class["title"]} fixtures land on their own lane"
     test "#{class["id"]} class registered pending" do
       class = unquote(Macro.escape(class))
       assert class["phase"] == "pending"
