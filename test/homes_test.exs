@@ -56,15 +56,14 @@ defmodule Tightbeam.HomesTest do
     File.write!(token, "token")
 
     projected = Homes.project(base_dir, %{machine: "eezo", harness: :claude, rails: "v1"})
-    File.mkdir_p!(Path.join(projected.home_path, "projects/repo"))
-    File.mkdir_p!(Path.join(projected.home_path, "memory"))
+    File.mkdir_p!(Path.join(projected.home_path, "projects/repo/memory"))
     File.write!(Path.join(projected.home_path, "projects/repo/transcript.jsonl"), "chat")
-    File.write!(Path.join(projected.home_path, "memory/notes.md"), "memory")
+    File.write!(Path.join(projected.home_path, "projects/repo/memory/notes.md"), "memory")
 
     Homes.project(base_dir, %{machine: "eezo", harness: :claude, rails: "v2"})
 
     assert File.read!(Path.join(projected.home_path, "projects/repo/transcript.jsonl")) == "chat"
-    assert File.read!(Path.join(projected.home_path, "memory/notes.md")) == "memory"
+    assert File.read!(Path.join(projected.home_path, "projects/repo/memory/notes.md")) == "memory"
     assert File.read!(Path.join(projected.home_path, "settings.json")) == "v2"
   end
 end

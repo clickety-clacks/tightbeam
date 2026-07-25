@@ -408,6 +408,26 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     }
 }
 
+pub fn build_onboard_phase_request(
+    identity: &Identity,
+    provider: &str,
+    phase: &str,
+    machine: Option<&str>,
+    reason: Option<&str>,
+) -> RequestSpec {
+    let mut params = vec![
+        string_field("provider", provider),
+        string_field("phase", phase),
+    ];
+    if let Some(machine) = machine {
+        params.push(string_field("machine", machine));
+    }
+    if let Some(reason) = reason {
+        params.push(string_field("reason", reason));
+    }
+    request(identity, "onboard", vec![], params)
+}
+
 pub fn build_register_host_request(
     as_user: &str,
     name: &str,
@@ -530,6 +550,7 @@ pub fn run(command: Command) -> Result<(), String> {
         Command::Help => unreachable!("help is handled before dispatch"),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::Onboard { identity, provider } => crate::ceremonies::onboard(&identity, &provider),
         command => {
             let request = build_request(&command)?;
             if let Some(result) = send(&request)? {
@@ -852,6 +873,24 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
         );
+    }
+
+    #[test]
+    fn onboarding_phase_names_the_machine_without_transporting_credentials() {
+        let request = build_onboard_phase_request(
+            &Identity::User("flynn".to_owned()),
+            "openai",
+            "begin",
+            Some("work-1"),
+            None,
+        );
+
+        assert_eq!(
+            request.body_json,
+            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"openai","phase":"begin","machine":"work-1"}}"#
+        );
+        assert!(!request.body_json.contains("auth.json"));
+        assert!(!request.body_json.contains("token"));
     }
 
     #[test]

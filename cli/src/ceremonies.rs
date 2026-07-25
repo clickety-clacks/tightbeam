@@ -1,10 +1,154 @@
 //! Interactive `setup` and `assimilate` ceremonies.
 
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
-use crate::args::AssimilateArgs;
+use crate::args::{AssimilateArgs, Identity};
 use crate::dispatch::{self, RequestSpec};
+
+pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
+    let machine = std::env::var("TIGHTBEAM_MACHINE").ok();
+    let begin = dispatch::build_onboard_phase_request(
+        identity,
+        provider,
+        "begin",
+        machine.as_deref(),
+        None,
+    );
+    let ready = dispatch::send(&begin)?
+        .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
+    let staging = ready
+        .get("staging_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
+
+    let interactive = run_provider_onboarding(provider, staging);
+
+    if let Err(reason) = interactive {
+        let _ = fs::remove_dir_all(staging);
+        let classified = if reason.contains("unsupported (no subscription)") {
+            Some("unsupported_no_subscription")
+        } else {
+            None
+        };
+        let cancel = dispatch::build_onboard_phase_request(
+            identity,
+            provider,
+            "cancel",
+            machine.as_deref(),
+            classified,
+        );
+        let _ = dispatch::send(&cancel);
+        return Err(reason);
+    }
+
+    let finish = dispatch::build_onboard_phase_request(
+        identity,
+        provider,
+        "finish",
+        machine.as_deref(),
+        None,
+    );
+    match dispatch::send(&finish) {
+        Ok(Some(result)) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).expect("JSON value serializes")
+            );
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            let _ = fs::remove_dir_all(staging);
+            let cancel = dispatch::build_onboard_phase_request(
+                identity,
+                provider,
+                "cancel",
+                machine.as_deref(),
+                None,
+            );
+            let _ = dispatch::send(&cancel);
+            return Err(reason);
+        }
+    }
+    Ok(())
+}
+
+fn run_provider_onboarding(provider: &str, staging: &str) -> Result<(), String> {
+    match provider {
+        "openai" => run_openai_onboarding(staging),
+        "anthropic" => run_anthropic_onboarding(staging),
+        _ => Err(format!("unsupported provider: {provider}")),
+    }
+}
+
+fn run_openai_onboarding(staging: &str) -> Result<(), String> {
+    let status = ProcessCommand::new("codex")
+        .args(["login", "--device-auth"])
+        .env("CODEX_HOME", staging)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| error.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("OpenAI device-code onboarding failed: {status}"))
+    }
+}
+
+fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
+    let transcript = PathBuf::from(staging).join("setup-token.log");
+    let status = ProcessCommand::new("script")
+        .args([
+            "-q",
+            transcript
+                .to_str()
+                .ok_or_else(|| "invalid onboarding staging path".to_owned())?,
+            "claude",
+            "setup-token",
+        ])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| error.to_string())?;
+    let output = fs::read_to_string(&transcript).unwrap_or_default();
+
+    if !status.success() {
+        if output.to_ascii_lowercase().contains("subscription") {
+            return Err("needs_onboarding: unsupported (no subscription)".to_owned());
+        }
+        return Err(format!("Anthropic setup-token onboarding failed: {status}"));
+    }
+
+    let token = capture_setup_token(&output)
+        .ok_or_else(|| "Anthropic setup-token was not captured".to_owned())?;
+    let path = PathBuf::from(staging).join("oauth-token");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    writeln!(file, "{token}").map_err(|error| error.to_string())
+}
+
+fn capture_setup_token(output: &str) -> Option<String> {
+    output.split_whitespace().rev().find_map(|word| {
+        let token = word
+            .trim_matches(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            })
+            .to_owned();
+        token.starts_with("sk-ant-oat").then_some(token)
+    })
+}
 
 fn validate_harnesses(harnesses: &[String]) -> Result<(), String> {
     for harness in harnesses {
@@ -405,6 +549,15 @@ mod tests {
             validate_harnesses(&["other".to_owned()]),
             Err("unsupported harness: other".to_owned())
         );
+    }
+
+    #[test]
+    fn captures_the_non_rotating_claude_setup_token() {
+        assert_eq!(
+            capture_setup_token("browser output\nsk-ant-oat01-example\r\n"),
+            Some("sk-ant-oat01-example".to_owned())
+        );
+        assert_eq!(capture_setup_token("no token here"), None);
     }
 
     #[test]

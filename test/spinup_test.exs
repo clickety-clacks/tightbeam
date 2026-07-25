@@ -41,7 +41,7 @@ defmodule Tightbeam.SpinupTest do
 
     refute_received {:unexpected_shell, _}
     assert File.dir?(Path.join(ctx.base_dir, "work"))
-    assert File.dir?(Path.join([ctx.base_dir, "identity", "skills"]))
+    assert File.dir?(Path.join(ctx.base_dir, "homes"))
 
     assert [%{kind: "spinup", subject: "claude@testhost", detail: detail}] =
              EventLog.lifecycle_events(ctx.db)
@@ -79,12 +79,12 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "missing credentials denies with path and setup ceremony", ctx do
-    auth_dir = Path.join([ctx.base_dir, "auth", "codex"])
+    auth_dir = Path.join([ctx.base_dir, "auth", "claude"])
 
     assert {:error, %{code: "host_unready", message: message}} =
-             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "testhost", db: ctx.db)
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :claude, "testhost", db: ctx.db)
 
-    assert message =~ "no codex credentials in #{auth_dir}"
+    assert message =~ "no claude credentials in #{auth_dir}"
     assert message =~ "run the setup ceremony on testhost"
     assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "DENIED"

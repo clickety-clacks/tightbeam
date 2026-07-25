@@ -1,75 +1,13 @@
 defmodule Tightbeam.Archetypes do
   @moduledoc """
-  The archetype registry — identity as data (T4), minimal cut. An archetype
-  is a declarative TOML manifest under `<base_dir>/identity/archetypes/
-  <name>.toml`; this module loads them at boot, validates them, and compiles
-  their guidance. This is deliberately NOT the full identity compiler (spec
-  §Agent identity: guidance fragments, skills library, MCP, content-hash
-  custom homes — the later milestone); it carries exactly the fields today's
-  design needs and nothing else:
+  Loads and validates archetype manifests from one immutable served-identity
+  revision. Manifests elect shared skill bodies by name, constrain placement,
+  define defaults and MCP servers, and compose auditable guidance fragments.
 
-      name = "coder"
-      skills = ["deploy"]          # election from the org skills library
-                                   # (identity/skills/<name>/SKILL.md).
-                                   # Omitted = no org elections; substrate
-                                   # baseline skills project separately.
-                                   # Unknown names fail the boot, while
-                                   # substrate names are valid but reserved
-                                   # from org library copies.
-      where = ["work-1", "work-2"]      # allowed host-set (§Placement).
-                                        # Optional; default: the gateway's
-                                        # own hostname.
-                                        # ["*"] alone = any configured host.
-                                        # Empty = error, never a grant.
-
-      model_preferences = ["claude-opus-5"]   # ordered preference data read
-                                               # by adjudicators; the substrate
-                                               # never walks this list.
-
-      [defaults]                        # optional spawn defaults
-      harness = "codex"                 # "claude" | "codex"
-      model   = "gpt-5.6-sol[medium]"
-
-      [references]                      # optional — named pointers to work
-                                        # materials; compile into guidance
-                                        # TEXT, never substrate machinery
-                                        # (point at the docs; copy the
-                                        # identity; move the credentials
-                                        # never).
-      repo = { location = "work-1:~/src/example-repo", access = "git; gate: run the tests" }
-
-      [guidance]                        # optional extra guidance, appended
-      text = \"\"\"...\"\"\"
-
-  A built-in "default" archetype always exists (where = the gateway's own
-  hostname, no references, no defaults) so a fresh install works with zero
-  manifests. A
-  manifest file named default.toml OVERRIDES the built-in.
-
-  GUIDANCE FRAGMENTS (spec §Agent identity): shared guidance lives as files
-  in `<base_dir>/identity/guidance/*.md` and is composed via an include
-  directive — a line of exactly `#include "fragment.md"` — resolved
-  recursively at compile time. Includes are parts-listing in-text and
-  nothing more: no variables, no conditionals, no logic (a template that can
-  compute is an agent that can't be audited). The substrate ships the
-  built-in "operating-manual.md" fragment to every home. That fragment is
-  substrate-owned and cannot be overridden by an org file. Resolution is validated
-  at load!: a missing fragment or an include cycle fails the boot. Because
-  composition happens before the projection hash, editing a fragment
-  regenerates exactly the homes that include it.
-
-  Loading is boot-time and whole-set: `load!/1` parses every manifest,
-  validates (unknown top-level keys are ERRORS — a typo'd field must not
-  silently become no-op law), and stores the set in `:persistent_term`
-  (read-heavy, write-once-per-boot; identity changes re-load on restart —
-  live reload is a later concern). A malformed manifest fails the boot: bad
-  law should stop the boot, not limp.
-
-  Guidance compilation produces the FULL instructions file content for a
-  home: the archetype header, the standing operating manual, the references
-  section rendered as "## Your materials" (name, location, access notes),
-  then any manifest guidance text. Compilation is pure — same manifest, same
-  bytes — because home projection is hash-gated on its output.
+  `Tightbeam.Identity` owns the three-ref repository and is the one final
+  composer. It reads the archetype, elected skills, and operating-model
+  fragment through one revision, then renders the harness-accurate session
+  instructions. No archetype identity is projected into a harness home.
   """
 
   @persist_key __MODULE__
@@ -94,7 +32,6 @@ defmodule Tightbeam.Archetypes do
           guidance: String.t() | nil,
           source: %{file: String.t(), sha256: String.t()} | nil
         }
-
 
   @doc """
   Load every manifest under `<base_dir>/identity/archetypes/*.toml`, validate,
@@ -570,9 +507,7 @@ defmodule Tightbeam.Archetypes do
     archetypes =
       for name <- engineering_archetype_names(), into: %{} do
         {"#{name}.md",
-         shipped_guidance!(
-           Path.join(["kungfu", "agentic-engineering", "guidance", "#{name}.md"])
-         )}
+         shipped_guidance!(Path.join(["kungfu", "agentic-engineering", "guidance", "#{name}.md"]))}
       end
 
     shared

@@ -297,14 +297,7 @@ DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
   tightbeam help | --help | -h    show this text."#;
 
 const BOOLEAN_FLAGS: &[&str] = &[
-    "abort",
-    "all",
-    "dry-run",
-    "help",
-    "json",
-    "manifest",
-    "resolve",
-    "rm",
+    "abort", "all", "dry-run", "help", "json", "manifest", "resolve", "rm",
 ];
 
 #[derive(Debug)]
@@ -891,9 +884,7 @@ fn parse_identity_command(
             let session_key = parsed.positional.get(2).cloned();
             let all = flags.contains_key("all");
             if parsed.positional.len() > 3 || all == session_key.is_some() {
-                return Err(
-                    "usage: tightbeam identity apply (<session> | --all)".to_owned(),
-                );
+                return Err("usage: tightbeam identity apply (<session> | --all)".to_owned());
             }
             Ok(Command::IdentityApply {
                 identity: identity(flags)?,

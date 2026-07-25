@@ -17,6 +17,8 @@ defmodule FeatureSmoke do
     state = %{port: gw["port"], token: gw["cliToken"], base_dir: base_dir, pass: 0}
 
     state
+    |> check_identity_surface()
+    |> check_onboard_surface()
     |> check_facts_read()
     |> check_config_default_archetype()
     |> check_work_item_and_assignment_get()
@@ -26,6 +28,106 @@ defmodule FeatureSmoke do
     |> finish()
   end
 
+  # --- served identity: every public seam shape --------------------------------
+  defp check_identity_surface(state) do
+    status = ok!(state, "identity-status", %{"archetype" => "default"})
+    assert(state, is_binary(status["live_revision"]), "identity-status returned no live revision")
+    assert(state, is_map(status["guidance"]), "identity-status returned no composed guidance")
+
+    guidance_path = Path.join([state.base_dir, "identity", "guidance", "default.md"])
+    original_guidance = File.read!(guidance_path)
+    marker = "\n\nfeature-smoke #{unique()}\n"
+
+    ok!(state, "identity-edit", %{
+      "archetype" => "default",
+      "manifest" => false,
+      "remove" => false,
+      "content" => original_guidance <> marker
+    })
+
+    ok!(state, "identity-edit", %{
+      "archetype" => "default",
+      "manifest" => false,
+      "remove" => false,
+      "content" => original_guidance
+    })
+
+    manifest_path = Path.join([state.base_dir, "identity", "archetypes", "default.toml"])
+    original_manifest = File.read!(manifest_path)
+
+    ok!(state, "identity-edit", %{
+      "archetype" => "default",
+      "manifest" => true,
+      "remove" => false,
+      "content" => original_manifest <> "\n# feature-smoke #{unique()}\n"
+    })
+
+    ok!(state, "identity-edit", %{
+      "archetype" => "default",
+      "manifest" => true,
+      "remove" => false,
+      "content" => original_manifest
+    })
+
+    skill = "feature-smoke-#{unique()}"
+
+    ok!(state, "identity-edit", %{
+      "archetype" => "default",
+      "manifest" => false,
+      "skill" => skill,
+      "remove" => false,
+      "content" => "# #{skill}\n"
+    })
+
+    ok!(state, "identity-edit", %{
+      "archetype" => "default",
+      "manifest" => false,
+      "skill" => skill,
+      "remove" => true
+    })
+
+    relearn = ok!(state, "identity-relearn", %{})
+
+    assert(
+      state,
+      relearn["state"] in ["published", "relearn-conflicted"],
+      "identity-relearn returned #{inspect(relearn)}"
+    )
+
+    session =
+      ok!(state, "spawn", %{
+        "displayName" => "smoke-identity-#{unique()}",
+        "idempotencyKey" => "identity-#{unique()}"
+      })
+
+    session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
+    applied = ok!(state, "identity-apply", %{"sessionKey" => session_key, "all" => false})
+    assert(state, session_key in (applied["applied"] || []), "identity-apply missed its session")
+    _all = ok!(state, "identity-apply", %{"all" => true})
+    retire(state, session)
+
+    pass(
+      state,
+      "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply session+all"
+    )
+  end
+
+  # Exercise the public entry without beginning a credential mutation. The
+  # phase-less request must direct the operator to the interactive CLI.
+  defp check_onboard_surface(state) do
+    for provider <- ["openai", "anthropic"] do
+      result = ok!(state, "onboard", %{"provider" => provider})
+
+      assert(
+        state,
+        result["code"] == "interactive_required",
+        "onboard #{provider} did not direct to the interactive CLI: #{inspect(result)}"
+      )
+    end
+
+    pass(state, "onboard openai|anthropic interactive entry")
+  end
+
   # --- #3 escalation: a gated verb escalates to the owner for a decision --------
   # Requires the `surrender-escalates-to-owner` rail. Proves the escalate effect live:
   # attest surrender → decision-request opened to the owner → owner rules allow → proceeds.
@@ -33,12 +135,26 @@ defmodule FeatureSmoke do
     u = unique()
     wi = ok!(state, "work-item-create", %{"title" => "esc #{u}", "idempotencyKey" => "ewi-#{u}"})
     wi_id = wi["workItemId"] || wi["id"]
-    coder = ok!(state, "spawn", %{"displayName" => "smoke-esc-coder-#{u}", "idempotencyKey" => "ec-#{u}"})
+
+    coder =
+      ok!(state, "spawn", %{
+        "displayName" => "smoke-esc-coder-#{u}",
+        "idempotencyKey" => "ec-#{u}"
+      })
+
     coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
     post(state, "role-create", %{"name" => "coder-esc-#{u}"})
     ok!(state, "role-bind", %{"name" => "coder-esc-#{u}", "sessionKey" => coder_key})
     coder_tok = session_token(state, coder_key)
-    asg = ok!(state, "assign", %{"sessionKey" => coder_key, "subject" => "esc impl #{u}", "workItemId" => wi_id, "idempotencyKey" => "ea-#{u}"})
+
+    asg =
+      ok!(state, "assign", %{
+        "sessionKey" => coder_key,
+        "subject" => "esc impl #{u}",
+        "workItemId" => wi_id,
+        "idempotencyKey" => "ea-#{u}"
+      })
+
     asg_id = asg["id"] || asg["assignmentId"]
 
     # 1. Coder attests surrender → escalates (does NOT proceed; a decision-request opens).
@@ -46,6 +162,7 @@ defmodule FeatureSmoke do
 
     # 2. The owner sees an open decision-request for this escalation.
     drs = ok!(state, "decision-requests", %{})
+
     dr =
       (drs["requests"] || drs["decisionRequests"] || drs)
       |> List.wrap()
@@ -53,7 +170,13 @@ defmodule FeatureSmoke do
         (d["statute"] || d["statuteName"]) == "surrender-escalates-to-owner" or
           (d["ref"] || d["subject"] || "") =~ asg_id
       end)
-    assert(state, is_map(dr), "escalation: no decision-request opened for the surrender; got #{inspect(drs)}")
+
+    assert(
+      state,
+      is_map(dr),
+      "escalation: no decision-request opened for the surrender; got #{inspect(drs)}"
+    )
+
     dr_id = dr["id"] || dr["requestId"] || dr["decisionRequestId"]
 
     # 3. Owner rules allow.
@@ -61,11 +184,19 @@ defmodule FeatureSmoke do
 
     # 4. Coder re-attests surrender → the ruling is consumed → the verb proceeds.
     done = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "surrender"})
-    assert(state, not (is_map(done) and Map.has_key?(done, "error")),
-      "escalation: surrender after the owner's allow should proceed, got #{inspect(done)}")
+
+    assert(
+      state,
+      not (is_map(done) and Map.has_key?(done, "error")),
+      "escalation: surrender after the owner's allow should proceed, got #{inspect(done)}"
+    )
 
     retire(state, coder)
-    pass(state, "escalation to owner: surrender → decision-request → owner rules allow → proceeds")
+
+    pass(
+      state,
+      "escalation to owner: surrender → decision-request → owner rules allow → proceeds"
+    )
   end
 
   # --- P7 flagship enforced loop: completion requires an independent review ---
@@ -77,59 +208,112 @@ defmodule FeatureSmoke do
     u = unique()
     # A reviewer role bound to a live reviewer session (the remedy's assign target).
     post(state, "role-create", %{"name" => "reviewer"})
-    reviewer = ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
+
+    reviewer =
+      ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
+
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
     ok!(state, "role-bind", %{"name" => "reviewer", "sessionKey" => reviewer_key})
     reviewer_tok = session_token(state, reviewer_key)
 
     # A coder holding a work assignment.
-    wi = ok!(state, "work-item-create", %{"title" => "flagship #{u}", "idempotencyKey" => "fwi-#{u}"})
+    wi =
+      ok!(state, "work-item-create", %{"title" => "flagship #{u}", "idempotencyKey" => "fwi-#{u}"})
+
     wi_id = wi["workItemId"] || wi["id"]
-    coder = ok!(state, "spawn", %{"displayName" => "smoke-coder-#{u}", "idempotencyKey" => "cd-#{u}"})
+
+    coder =
+      ok!(state, "spawn", %{"displayName" => "smoke-coder-#{u}", "idempotencyKey" => "cd-#{u}"})
+
     coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
     # A session needs a role bound to act (attest) under its own credential.
     post(state, "role-create", %{"name" => "coder-#{u}"})
     ok!(state, "role-bind", %{"name" => "coder-#{u}", "sessionKey" => coder_key})
     coder_tok = session_token(state, coder_key)
-    asg = ok!(state, "assign", %{"sessionKey" => coder_key, "subject" => "impl #{u}", "workItemId" => wi_id, "idempotencyKey" => "fa-#{u}"})
+
+    asg =
+      ok!(state, "assign", %{
+        "sessionKey" => coder_key,
+        "subject" => "impl #{u}",
+        "workItemId" => wi_id,
+        "idempotencyKey" => "fa-#{u}"
+      })
+
     asg_id = asg["id"] || asg["assignmentId"]
 
     # 1. Coder attests completion with NO review on record → BLOCKED by the rule.
     # (The wire exposes only code+message; a remedy and a plain deny both carry
     # code=rule_denied — the remedy's `reason=remedy_fired` is stripped. Proof that
     # it was a REMEDY, not a bare deny, is step 2: the reviewer gets assigned.)
-    blocked = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
-    assert(state, get_in(blocked, ["error", "rule"]) == "completion-requires-review" or
-                  (get_in(blocked, ["error", "message"]) || "") =~ "completion-requires-review",
-      "flagship: completion without review should be blocked by the rule, got #{inspect(blocked)}")
+    blocked =
+      post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+
+    assert(
+      state,
+      get_in(blocked, ["error", "rule"]) == "completion-requires-review" or
+        (get_in(blocked, ["error", "message"]) || "") =~ "completion-requires-review",
+      "flagship: completion without review should be blocked by the rule, got #{inspect(blocked)}"
+    )
 
     # 2. The remedy assigned the reviewer a review of the coder's assignment.
     reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+
     review_asg =
       (reviews["assignments"] || reviews)
       |> List.wrap()
       |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
-    assert(state, is_map(review_asg), "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{inspect(reviews)}")
+
+    assert(
+      state,
+      is_map(review_asg),
+      "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{inspect(reviews)}"
+    )
+
     review_id = review_asg["id"] || review_asg["assignmentId"]
 
     # 3. Reviewer files the reviewed-clean verdict on the review assignment.
-    v = post_as(state, reviewer_tok, "attest", %{"assignmentId" => review_id, "kind" => "verdict", "verdictKind" => "reviewed-clean"})
-    assert(state, not (is_map(v) and Map.has_key?(v, "error")), "flagship: reviewer verdict failed: #{inspect(v)}")
+    v =
+      post_as(state, reviewer_tok, "attest", %{
+        "assignmentId" => review_id,
+        "kind" => "verdict",
+        "verdictKind" => "reviewed-clean"
+      })
+
+    assert(
+      state,
+      not (is_map(v) and Map.has_key?(v, "error")),
+      "flagship: reviewer verdict failed: #{inspect(v)}"
+    )
 
     # 4. Coder re-attests completion → the verdict is present → the gate passes.
-    done = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
-    assert(state, not (is_map(done) and Map.has_key?(done, "error")),
-      "flagship: completion after review should PASS the gate, got #{inspect(done)}")
+    done =
+      post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+
+    assert(
+      state,
+      not (is_map(done) and Map.has_key?(done, "error")),
+      "flagship: completion after review should PASS the gate, got #{inspect(done)}"
+    )
 
     retire(state, reviewer)
     retire(state, coder)
-    pass(state, "flagship reviewer-loop enforced end-to-end: blocked → reviewer assigned → verdict → completes")
+
+    pass(
+      state,
+      "flagship reviewer-loop enforced end-to-end: blocked → reviewer assigned → verdict → completes"
+    )
   end
 
   # Fetch a session's own CLI bearer token from the state DB (local test harness only).
   defp session_token(state, session_key) do
     db = Path.join(state.base_dir, "state.db")
-    {out, 0} = System.cmd("sqlite3", [db, "SELECT cliToken FROM sessions WHERE sessionKey = #{sql_quote(session_key)}"])
+
+    {out, 0} =
+      System.cmd("sqlite3", [
+        db,
+        "SELECT cliToken FROM sessions WHERE sessionKey = #{sql_quote(session_key)}"
+      ])
+
     token = String.trim(out)
     if token == "", do: fail(state, "no cliToken for session #{session_key}"), else: token
   end
@@ -145,7 +329,12 @@ defmodule FeatureSmoke do
     kind = "smoke-fact-#{unique()}"
     scope = "smoke:scope:#{unique()}"
 
-    ok!(state, "condition", %{"kind" => kind, "scope" => scope, "idempotencyKey" => "fk-#{unique()}"})
+    ok!(state, "condition", %{
+      "kind" => kind,
+      "scope" => scope,
+      "idempotencyKey" => "fk-#{unique()}"
+    })
+
     res = ok!(state, "facts-read", %{"kind" => kind, "scope" => scope})
 
     assert(state, res["exists"] == true, "facts-read: fact not found after condition")
@@ -158,17 +347,28 @@ defmodule FeatureSmoke do
     original =
       ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
 
-    ok!(state, "config", %{"action" => "set", "setting" => "default-archetype", "value" => "reviewer"})
+    ok!(state, "config", %{
+      "action" => "set",
+      "setting" => "default-archetype",
+      "value" => "reviewer"
+    })
+
     got = ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
     assert(state, got == "reviewer", "config: set did not persist (#{inspect(got)})")
 
-    spawn = ok!(state, "spawn", %{
-      "displayName" => "smoke-cfg-#{unique()}",
-      "idempotencyKey" => "cfg-#{unique()}"
-    })
+    spawn =
+      ok!(state, "spawn", %{
+        "displayName" => "smoke-cfg-#{unique()}",
+        "idempotencyKey" => "cfg-#{unique()}"
+      })
+
     arch = get_in(spawn, ["stream", "archetype"]) || spawn["archetype"]
     # reset before asserting so a failure can't leave the org mutated
-    ok!(state, "config", %{"action" => "set", "setting" => "default-archetype", "value" => original || "default"})
+    ok!(state, "config", %{
+      "action" => "set",
+      "setting" => "default-archetype",
+      "value" => original || "default"
+    })
 
     assert(state, arch in ["reviewer", nil], "config: spawn archetype was #{inspect(arch)}")
     retire(state, spawn)
@@ -177,28 +377,49 @@ defmodule FeatureSmoke do
 
   # --- work-item + assignment-get --------------------------------------------
   defp check_work_item_and_assignment_get(state) do
-    wi = ok!(state, "work-item-create", %{"title" => "smoke wi #{unique()}", "idempotencyKey" => "wi-#{unique()}"})
+    wi =
+      ok!(state, "work-item-create", %{
+        "title" => "smoke wi #{unique()}",
+        "idempotencyKey" => "wi-#{unique()}"
+      })
+
     wi_id = wi["workItemId"] || wi["id"]
     assert(state, is_binary(wi_id), "work-item-create returned no id: #{inspect(wi)}")
 
-    holder = ok!(state, "spawn", %{"displayName" => "smoke-holder-#{unique()}", "idempotencyKey" => "h-#{unique()}"})
+    holder =
+      ok!(state, "spawn", %{
+        "displayName" => "smoke-holder-#{unique()}",
+        "idempotencyKey" => "h-#{unique()}"
+      })
+
     holder_key = get_in(holder, ["stream", "sessionKey"]) || holder["sessionKey"]
 
-    asg = ok!(state, "assign", %{
-      "sessionKey" => holder_key,
-      "subject" => "smoke assignment #{unique()}",
-      "workItemId" => wi_id,
-      "idempotencyKey" => "a-#{unique()}"
-    })
+    asg =
+      ok!(state, "assign", %{
+        "sessionKey" => holder_key,
+        "subject" => "smoke assignment #{unique()}",
+        "workItemId" => wi_id,
+        "idempotencyKey" => "a-#{unique()}"
+      })
+
     asg_id = asg["id"] || asg["assignmentId"]
     assert(state, is_binary(asg_id), "assign returned no id: #{inspect(asg)}")
 
     got = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
-    assert(state, (got["id"] || got["assignmentId"]) == asg_id, "assignment-get mismatch: #{inspect(got)}")
+
+    assert(
+      state,
+      (got["id"] || got["assignmentId"]) == asg_id,
+      "assignment-get mismatch: #{inspect(got)}"
+    )
 
     missing = post(state, "assignment-get", %{"assignmentId" => "asg_does_not_exist"})
-    assert(state, get_in(missing, ["error", "code"]) == "not_found" or missing["code"] == "not_found",
-      "assignment-get unknown id should be not_found, got #{inspect(missing)}")
+
+    assert(
+      state,
+      get_in(missing, ["error", "code"]) == "not_found" or missing["code"] == "not_found",
+      "assignment-get unknown id should be not_found, got #{inspect(missing)}"
+    )
 
     retire(state, holder)
     pass(state, "work-item-create + assign + assignment-get round-trip (and not_found)")
@@ -211,25 +432,46 @@ defmodule FeatureSmoke do
   # (assignments_test.exs). Here we drive dispatch as the user and assert it opens
   # the assignment atomically (the verb's wiring through router→dispatch→handler).
   defp check_dispatch_opens_assignment(state) do
-    wi = ok!(state, "work-item-create", %{"title" => "smoke disp wi #{unique()}", "idempotencyKey" => "dwi-#{unique()}"})
+    wi =
+      ok!(state, "work-item-create", %{
+        "title" => "smoke disp wi #{unique()}",
+        "idempotencyKey" => "dwi-#{unique()}"
+      })
+
     wi_id = wi["workItemId"] || wi["id"]
 
-    holder = ok!(state, "spawn", %{"displayName" => "smoke-dh-#{unique()}", "idempotencyKey" => "dh-#{unique()}"})
+    holder =
+      ok!(state, "spawn", %{
+        "displayName" => "smoke-dh-#{unique()}",
+        "idempotencyKey" => "dh-#{unique()}"
+      })
+
     holder_key = get_in(holder, ["stream", "sessionKey"]) || holder["sessionKey"]
 
-    res = ok!(state, "dispatch", %{
-      "sessionKey" => holder_key,
-      "subject" => "smoke fanout #{unique()}",
-      "brief" => "ship the smoke feature",
-      "workItemId" => wi_id,
-      "idempotencyKey" => "d-#{unique()}"
-    })
+    res =
+      ok!(state, "dispatch", %{
+        "sessionKey" => holder_key,
+        "subject" => "smoke fanout #{unique()}",
+        "brief" => "ship the smoke feature",
+        "workItemId" => wi_id,
+        "idempotencyKey" => "d-#{unique()}"
+      })
+
     asg_id = res["id"] || res["assignmentId"]
-    assert(state, is_binary(asg_id), "dispatch (user caller) should open an assignment, got #{inspect(res)}")
+
+    assert(
+      state,
+      is_binary(asg_id),
+      "dispatch (user caller) should open an assignment, got #{inspect(res)}"
+    )
 
     got = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
-    assert(state, (got["workItemId"] || got["work_item_id"]) == wi_id,
-      "dispatched assignment not linked to its work-item: #{inspect(got)}")
+
+    assert(
+      state,
+      (got["workItemId"] || got["work_item_id"]) == wi_id,
+      "dispatched assignment not linked to its work-item: #{inspect(got)}"
+    )
 
     retire(state, holder)
     pass(state, "dispatch opens an assignment linked to its work-item (reroute unit-covered)")
@@ -273,16 +515,29 @@ defmodule FeatureSmoke do
     url = "http://127.0.0.1:#{state.port}/agent/dispatch"
 
     args = [
-      "-sS", "--max-time", "30", "-o", "-", "-w", "\n%{http_code}",
-      "-H", "Authorization: Bearer #{state.token}",
-      "-X", "POST", "-H", "Content-Type: application/json",
-      "-d", JSON.encode!(body), url
+      "-sS",
+      "--max-time",
+      "30",
+      "-o",
+      "-",
+      "-w",
+      "\n%{http_code}",
+      "-H",
+      "Authorization: Bearer #{state.token}",
+      "-X",
+      "POST",
+      "-H",
+      "Content-Type: application/json",
+      "-d",
+      JSON.encode!(body),
+      url
     ]
 
     case System.cmd("curl", args, stderr_to_stdout: true) do
       {out, 0} ->
         {head, [code]} = out |> String.split("\n") |> Enum.split(-1)
         payload = Enum.join(head, "\n")
+
         case JSON.decode(payload) do
           {:ok, v} -> v
           _ -> %{"error" => %{"code" => "bad_json", "http" => code, "raw" => payload}}

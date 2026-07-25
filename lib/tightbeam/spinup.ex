@@ -18,6 +18,7 @@ defmodule Tightbeam.Spinup do
   def ensure_ready(config, harness, host_name, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
     sh = Keyword.get(opts, :sh, &system_cmd/1)
+    patch_adapter = Keyword.get(opts, :patch_adapter, &patch_local_adapter/2)
 
     {result, detail} =
       case Map.fetch(Placement.hosts(config.base_dir), host_name) do
@@ -26,16 +27,16 @@ defmodule Tightbeam.Spinup do
           {{:error, denial}, "DENIED: #{denial.message}"}
 
         {:ok, host} ->
-          ensure_host(host, harness, host_name, sh)
+          ensure_host(host, harness, host_name, sh, patch_adapter)
       end
 
     :ok = EventLog.lifecycle(db, "spinup", "#{harness}@#{host_name}", detail)
     result
   end
 
-  defp ensure_host(%{ssh: nil} = host, harness, host_name, _sh) do
+  defp ensure_host(%{ssh: nil} = host, harness, host_name, _sh, patch_adapter) do
     with :ok <- ensure_local_dirs(host, harness, host_name),
-         :ok <- ensure_local_adapter(host, harness, host_name),
+         :ok <- ensure_local_adapter(host, harness, host_name, patch_adapter),
          :ok <- ensure_local_credentials(host, harness, host_name) do
       {:ok, "reached; directories ensured; adapters present; credentials present"}
     else
@@ -43,7 +44,7 @@ defmodule Tightbeam.Spinup do
     end
   end
 
-  defp ensure_host(%{ssh: destination} = host, harness, host_name, sh) do
+  defp ensure_host(%{ssh: destination} = host, harness, host_name, sh, _patch_adapter) do
     case sh.(["ssh" | @ssh_opts] ++ [destination, "true"]) do
       {_output, 0} ->
         ensure_remote_host(host, harness, host_name, sh)
@@ -103,11 +104,11 @@ defmodule Tightbeam.Spinup do
     end)
   end
 
-  defp ensure_local_adapter(host, harness, host_name) do
+  defp ensure_local_adapter(host, harness, host_name, patch_adapter) do
     path = Placement.adapter_binary_path(harness, host)
 
     if File.exists?(path) do
-      patch_local_adapter(harness, path)
+      patch_adapter.(harness, path)
     else
       message =
         "host #{host_name} is not ready for #{harness}: adapter missing at #{path} " <>

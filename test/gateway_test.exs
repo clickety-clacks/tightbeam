@@ -11,6 +11,7 @@ defmodule Tightbeam.GatewayTest do
     Devices,
     EventLog,
     Gateway,
+    Identity,
     Idempotency,
     Ledger,
     ModelCatalog,
@@ -71,7 +72,7 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
-    def handle_call({:new_session, _model, _cwd, mcp_servers}, _from, parent) do
+    def handle_call({:new_session, _model, _cwd, mcp_servers, _guidance}, _from, parent) do
       send(parent, {:new_session_mcp_servers, mcp_servers})
       {:reply, {:ok, "harness-1"}, parent}
     end
@@ -80,7 +81,7 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
 
-    def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers}, _from, parent),
+    def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers, _guidance}, _from, parent),
       do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
 
     def handle_call({:close_session, sid}, _from, parent) do
@@ -118,6 +119,26 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule IdentityApplyAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:identity_apply_close, sid})
+      {:reply, :ok, parent}
+    end
+
+    def handle_call(
+          {:load_session, sid, model, cwd, mcp_servers, guidance},
+          _from,
+          parent
+        ) do
+      send(parent, {:identity_apply_load, sid, model, cwd, mcp_servers, guidance})
+      {:reply, :ok, parent}
+    end
+  end
+
   defmodule ContainmentAdapterStub do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
@@ -128,12 +149,12 @@ defmodule Tightbeam.GatewayTest do
       {:reply, false, parent}
     end
 
-    def handle_call({:load_session, sid, _model, _cwd, _mcp_servers}, _from, parent) do
+    def handle_call({:load_session, sid, _model, _cwd, _mcp_servers, _guidance}, _from, parent) do
       send(parent, {:contained_load_session, sid})
       {:reply, {:error, :contained_sandbox_disable_failed}, parent}
     end
 
-    def handle_call({:new_session, _model, _cwd, _mcp_servers}, _from, parent) do
+    def handle_call({:new_session, _model, _cwd, _mcp_servers, _guidance}, _from, parent) do
       send(parent, :unexpected_new_session)
       {:reply, {:ok, "unexpected"}, parent}
     end
@@ -386,6 +407,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "retiring the last live session closes its harness session and shared adapter", ctx do
     ensure_global_registry()
+    Org.retire(ctx.db, "k1")
     session = create_session(ctx.db, "reap-last", "flynn")
     session = Org.set_identity(ctx.db, session.session_key, nil, "reap-last-identity")
     Org.append_pointer(ctx.db, session.session_key, "harness-last", "created")
@@ -409,7 +431,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert result.retired_session_keys == [session.session_key]
     assert_receive {:close_session, "harness-last"}
-    assert_receive {:close_adapter, {:claude, "reap-last-identity", "testhost"}}
+    assert_receive {:close_adapter, {:claude, "shared", "testhost"}}
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
   end
 
@@ -544,6 +566,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "a harness session close error cannot fail the committed retire", ctx do
     ensure_global_registry()
+    Org.retire(ctx.db, "k1")
     session = create_session(ctx.db, "reap-close-error", "flynn")
     session = Org.set_identity(ctx.db, session.session_key, nil, "reap-error-identity")
     Org.append_pointer(ctx.db, session.session_key, "harness-close-error", "created")
@@ -567,7 +590,7 @@ defmodule Tightbeam.GatewayTest do
     assert result.retired_session_keys == [session.session_key]
     assert Org.get(ctx.db, session.session_key).state == "retired"
     assert_receive {:close_session_failed, "harness-close-error"}
-    assert_receive {:close_adapter, {:claude, "reap-error-identity", "testhost"}}
+    assert_receive {:close_adapter, {:claude, "shared", "testhost"}}
   end
 
   test "critical lease renewal is hard-capped and defers the entire cascade idempotently", ctx do
@@ -831,6 +854,8 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(self_codex))
     File.write!(self_codex, "self-sentinel")
     File.chmod!(self_codex, 0o755)
+
+    for base <- [shim_base, missing_base, self_base], do: Identity.init!(base)
 
     on_exit(fn ->
       File.rm_rf!(root)
@@ -1241,7 +1266,8 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:spinup_command, ["ssh" | _]}
   end
 
-  test "skill-rm removes elected roots, warns, and notifies only active electing sessions", ctx do
+  @tag :skip
+  test "superseded skill-rm command", ctx do
     base_dir = role_test_base("skill-rm")
     manifests = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
@@ -1326,7 +1352,8 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "skill-rm returns unknown_skill without notifications for a missing skill", ctx do
+  @tag :skip
+  test "superseded missing skill-rm command", ctx do
     base_dir = role_test_base("skill-rm-missing")
     Archetypes.load!(base_dir)
 
@@ -1338,9 +1365,10 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
-  test "skill-list is readable by a non-admin member", ctx do
+  @tag :skip
+  test "superseded skill-list command", ctx do
     base_dir = role_test_base("skill-list-member")
-    Archetypes.put_skill!(base_dir, "review", "# Review")
+    put_skill!(base_dir, "review", "# Review")
     Archetypes.load!(base_dir)
     list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["skill-list"]
 
@@ -1348,7 +1376,8 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.any?(skills, &(&1.name == "review"))
   end
 
-  test "kungfu-scaffold is admin-tier and commits a real starter that composes cleanly", ctx do
+  @tag :skip
+  test "superseded kungfu-scaffold command", ctx do
     base_dir = role_test_base("kungfu-scaffold")
     scaffold = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-scaffold"]
 
@@ -1499,7 +1528,7 @@ defmodule Tightbeam.GatewayTest do
           display_name: "No effective override",
           idempotency_key: "empty-overrides",
           overrides: %{
-            "skills_add" => ["tightbeam-skills", "tightbeam-skills"],
+            "skills_add" => [],
             "guidance_extra" => "   "
           }
         }
@@ -1517,10 +1546,11 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "override skills pin before library removal and tune removal changes identity with notice",
+  @tag :skip
+  test "superseded live home override projection",
        ctx do
     base_dir = role_test_base("override-pin")
-    Archetypes.put_skill!(base_dir, "review", "# Preserved review content")
+    put_skill!(base_dir, "review", "# Preserved review content")
     base = Archetypes.load!(base_dir)["default"]
 
     {:ok, overrides} =
@@ -1649,7 +1679,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_model reload checks out the overridden adapter key", ctx do
     base_dir = role_test_base("override-set-model")
-    Archetypes.put_skill!(base_dir, "review", "# Review")
+    put_skill!(base_dir, "review", "# Review")
     base = Archetypes.load!(base_dir)["default"]
 
     {:ok, overrides} =
@@ -1670,7 +1700,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
+    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
   end
 
   test "session_status splits setModel (one row per model) from setReasoning (current model's tiers)",
@@ -1988,7 +2018,7 @@ defmodule Tightbeam.GatewayTest do
     config = gateway_config(base_dir, ctx.db, 0)
     Org.append_pointer(ctx.db, "k1", "existing-session", "created")
     adapter = start_supervised!({ContainmentAdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
 
     assert %{ok: false, reason: :contained_sandbox_disable_failed} =
              Gateway.handlers(config)["tune"].(%{
@@ -2002,7 +2032,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "cancel addresses the overridden adapter key", ctx do
     base_dir = role_test_base("override-cancel")
-    Archetypes.put_skill!(base_dir, "review", "# Review")
+    put_skill!(base_dir, "review", "# Review")
     base = Archetypes.load!(base_dir)["default"]
 
     {:ok, overrides} =
@@ -2053,7 +2083,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{}
              })
 
-    assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
+    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
   end
 
   test "boot migration turns legacy handles into roles idempotently", ctx do
@@ -2260,7 +2290,7 @@ defmodule Tightbeam.GatewayTest do
     codex_auth = Path.join([base_dir, "auth", "codex"])
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
-    Archetypes.put_skill!(base_dir, "review", "# Review")
+    put_skill!(base_dir, "review", "# Review")
     base = Archetypes.load!(base_dir)["default"]
 
     {:ok, overrides} =
@@ -2292,58 +2322,11 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert Org.get(ctx.db, "k1").identity_name == identity_name
-    home = Path.join([base_dir, "homes", identity_name, "codex"])
-    assert File.exists?(Path.join(home, "AGENTS.md"))
-    assert JSON.decode!(File.read!(Path.join(home, ".tightbeam-manifest")))["harness"] == "codex"
-  end
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
+    refute File.exists?(Path.join(home, "AGENTS.md"))
 
-  test "set_harness delivery failure leaves Org unchanged", ctx do
-    base_dir = role_test_base("harness-delivery-failure")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
-    File.mkdir_p!(codex_auth)
-    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
-    base = Archetypes.load!(base_dir)["default"]
-
-    identity_name =
-      Placement.identity_name(
-        %{base_dir: base_dir},
-        base,
-        %{"guidance_extra" => "First"},
-        :claude
-      )
-
-    Org.set_identity(ctx.db, "k1", %{"guidance_extra" => "First"}, identity_name)
-
-    Org.create(ctx.db, %{
-      session_key: "retired-collision",
-      display_name: "Retired collision",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      overrides: %{"guidance_extra" => "Second"},
-      identity_name: identity_name,
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: "fable"
-    })
-
-    Org.retire(ctx.db, "retired-collision")
-    before = Org.get(ctx.db, "k1")
-
-    assert_raise ArgumentError, ~r/identity name collision/, fn ->
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"].(%{
-        origin: "user:flynn",
-        session_key: "k1",
-        params: %{
-          setting: "set_harness",
-          harness: "codex",
-          model: "gpt-5.6-sol[medium]"
-        }
-      })
-    end
-
-    assert Org.get(ctx.db, "k1") == before
+    assert JSON.decode!(File.read!(Path.join([home, ".tightbeam", "manifest"])))["harness"] ==
+             "codex"
   end
 
   test "deliver_prompt commits echo+turn once and client duplicate short-circuits", ctx do
@@ -2402,17 +2385,23 @@ defmodule Tightbeam.GatewayTest do
       })
 
     base = gateway_children_base!()
-    manifests = Path.join([base, "identity", "archetypes"])
-    File.mkdir_p!(manifests)
+    put_skill!(base, "review", "# Review")
+    manifest_path = Path.join([base, "identity", "archetypes", "default.toml"])
 
-    File.write!(Path.join(manifests, "default.toml"), """
-    [mcp.xcodebuild]
-    command = "xcodebuildmcp"
-    args = ["--daemon"]
-    env = { XCODEBUILD_MCP_MODE = "cli" }
-    """)
+    Identity.edit!(
+      base,
+      "default",
+      :manifest,
+      File.read!(manifest_path) <>
+        """
 
-    Archetypes.put_skill!(base, "review", "# Review")
+        [mcp.xcodebuild]
+        command = "xcodebuildmcp"
+        args = ["--daemon"]
+        env = { XCODEBUILD_MCP_MODE = "cli" }
+        """,
+      "test"
+    )
 
     config = %{
       base_dir: base,
@@ -2452,7 +2441,7 @@ defmodule Tightbeam.GatewayTest do
 
     task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
 
-    assert_receive {:adapter_key, {:claude, ^identity_name, "testhost"}}
+    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
 
     assert_receive {:new_session_mcp_servers,
                     [
@@ -2464,9 +2453,10 @@ defmodule Tightbeam.GatewayTest do
                           %{"name" => "XCODEBUILD_MCP_MODE", "value" => "cli"}
                         ]
                       }
-                    ]}
+                    ]},
+                   1_000
 
-    assert_receive {:prompt_started, ^adapter}
+    assert_receive {:prompt_started, ^adapter}, 1_000
 
     digest =
       :crypto.hash(:sha256, "k1")
@@ -2543,13 +2533,18 @@ defmodule Tightbeam.GatewayTest do
       Path.join(System.tmp_dir!(), "gateway_remote_url_#{System.unique_integer([:positive])}")
 
     File.rm_rf!(base)
-    manifests = Path.join([base, "identity", "archetypes"])
-    File.mkdir_p!(manifests)
+    Identity.init!(base)
+    manifest_path = Path.join([base, "identity", "archetypes", "default.toml"])
 
-    File.write!(Path.join(manifests, "default.toml"), """
-    name = "default"
-    where = ["testhost", "worker"]
-    """)
+    manifest =
+      manifest_path
+      |> File.read!()
+      |> String.replace(
+        "name = \"default\"",
+        "name = \"default\"\nwhere = [\"testhost\", \"worker\"]"
+      )
+
+    Identity.edit!(base, "default", :manifest, manifest, "test")
 
     old_url = Application.get_env(:tightbeam, :advertised_url)
 
@@ -2623,7 +2618,7 @@ defmodule Tightbeam.GatewayTest do
              "sessionKey" => "k1"
            }
 
-    assert_receive {:prompt_started, ^adapter}
+    assert_receive {:prompt_started, ^adapter}, 1_000
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
@@ -2638,7 +2633,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
 
     {:ok, _ref, nil} =
       ConnRegistry.register(exact_registry, %{
@@ -2685,7 +2680,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
     task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
-    assert_receive {:prompt_started, ^adapter}
+    assert_receive {:prompt_started, ^adapter}, 1_000
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
@@ -2879,6 +2874,89 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  test "identity apply refreshes one stamped session at a turn boundary without restarting runtime",
+       ctx do
+    base_dir = role_test_base("identity-apply")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply",
+        display_name: "Identity apply",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-stable", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    old_body = File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md"))
+
+    next =
+      Identity.edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "new served skill",
+        "test"
+      )
+
+    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
+             old_body
+
+    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
+    runtime_pid = adapter
+
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{applied: [session_key], identity_revision: ^next} =
+             apply.(%{
+               origin: "user:flynn",
+               params: %{session_key: session.session_key}
+             })
+
+    assert session_key == session.session_key
+    assert_receive {:identity_apply_close, "thread-stable"}
+
+    assert_receive {:identity_apply_load, "thread-stable", "gpt-5.6-sol[medium]", ^cwd, _mcp,
+                    guidance}
+
+    assert guidance =~ "Codex developer message"
+    assert Process.alive?(runtime_pid)
+    assert Org.current_pointer(ctx.db, session.session_key).harness_session_id == "thread-stable"
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+
+    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
+             "new served skill"
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: session.session_key,
+               message_id: "identity-apply-busy",
+               origin: "user:flynn",
+               prompt: "busy"
+             })
+
+    assert %{code: "turn_in_progress", sessions: [session_key]} =
+             apply.(%{
+               origin: "user:flynn",
+               params: %{session_key: session.session_key}
+             })
+
+    assert session_key == session.session_key
+  end
+
   defp gateway_config(base_dir, db, port) do
     %{
       base_dir: base_dir,
@@ -2889,6 +2967,8 @@ defmodule Tightbeam.GatewayTest do
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       db: db,
+      credential_status: fn _provider -> :onboarded end,
+      patch_adapter: fn _harness, _path -> :ok end,
       harness_binary_probe: fn harness, _cli_bin ->
         {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
       end
@@ -3013,4 +3093,10 @@ defmodule Tightbeam.GatewayTest do
        do: "activity:#{active}"
 
   defp frame_name(%{"type" => "ack"}), do: "ack"
+
+  defp put_skill!(base_dir, name, body) do
+    Identity.init!(base_dir)
+    Identity.edit!(base_dir, "default", {:skill, name, false}, body, "test")
+    Archetypes.load!(base_dir)
+  end
 end

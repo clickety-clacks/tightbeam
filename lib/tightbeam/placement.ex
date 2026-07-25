@@ -596,6 +596,7 @@ defmodule Tightbeam.Placement do
         env:
           [
             {"TIGHTBEAM_HOME", config.base_dir},
+            {"TIGHTBEAM_MACHINE", host},
             {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
             {"TIGHTBEAM_LINEAGE", lineage}
           ] ++
@@ -689,6 +690,7 @@ defmodule Tightbeam.Placement do
            [
              "#{home_env}=#{home}",
              "TIGHTBEAM_HOME=#{host_config.base_dir}",
+             "TIGHTBEAM_MACHINE=#{host}",
              "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
              "PATH=#{cli_bin}:$PATH",
              "TIGHTBEAM_LINEAGE=#{lineage}"
@@ -864,9 +866,6 @@ defmodule Tightbeam.Placement do
   # refreshes, so there is no rotation and nothing to race. The file is
   # written by the operator from `tightbeam setup`'s output (0600); absent
   # file → the harness falls back to the auth store's credential file.
-  # Remote hosts are NOT covered here yet: the satellite's token file lives
-  # on the satellite, and the ssh env assembly can't read it locally —
-  # that's the remote-placement live-fire milestone's work.
   defp harness_token_env(base_dir, :claude) do
     case File.read(Path.join([base_dir, "auth", "claude", "oauth-token"])) do
       {:ok, token} -> [{"CLAUDE_CODE_OAUTH_TOKEN", String.trim(token)}]
@@ -877,19 +876,17 @@ defmodule Tightbeam.Placement do
   defp harness_token_env(_base_dir, _harness), do: []
 
   defp auth_event_handler(host, harness) do
-    case host == local_host_name() do
-      true ->
-        provider = provider_for_harness(harness)
+    provider = provider_for_harness(harness)
 
-        fn params ->
-          Tightbeam.Credentials.mark_terminal(provider, %{
-            "method" => "account/updated",
-            "params" => params
-          })
-        end
-
-      false ->
-        nil
+    fn params ->
+      Tightbeam.Credentials.mark_terminal(
+        provider,
+        %{
+          "method" => "account/updated",
+          "params" => params
+        },
+        Tightbeam.Credentials.server(host)
+      )
     end
   end
 
@@ -898,60 +895,6 @@ defmodule Tightbeam.Placement do
 
   defp harness_skills_path(:codex), do: Path.join([".codex", "skills"])
   defp harness_skills_path(:claude), do: Path.join([".claude", "skills"])
-
-  @doc """
-  Push one library root (a one-shot skill or a whole subject tree) to every
-  REMOTE host's replica — the propagation half of the skill verbs. Per-host
-  results, never a raise: an unreachable host is a visible degradation
-  ("error: ..."), healed by the catch-up sync at its next home delivery.
-  For a removal the push is an rm -rf of the replica path.
-  """
-  @spec push_skill(map(), String.t(), :put | :rm, keyword()) :: %{
-          optional(String.t()) => String.t()
-        }
-  def push_skill(config, root, action, opts \\ []) do
-    sh = Keyword.get(opts, :sh, &system_cmd/1)
-
-    for {name, host_config} <- hosts(config.base_dir), host_config.ssh != nil, into: %{} do
-      remote_library = Archetypes.skills_dir(host_config.base_dir)
-
-      result =
-        try do
-          case action do
-            :put ->
-              run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "mkdir", "-p", remote_library])
-
-              run!(sh, [
-                "rsync",
-                "-a",
-                "--delete",
-                "-e",
-                Enum.join(["ssh" | @ssh_opts], " "),
-                Path.join(Archetypes.skills_dir(config.base_dir), root),
-                "#{host_config.ssh}:#{remote_library}/"
-              ])
-
-            :rm ->
-              run!(
-                sh,
-                ["ssh" | @ssh_opts] ++
-                  [
-                    host_config.ssh,
-                    "rm",
-                    "-rf",
-                    Path.join(remote_library, root)
-                  ]
-              )
-          end
-
-          "ok"
-        rescue
-          e -> "error: #{Exception.message(e)}"
-        end
-
-      {name, result}
-    end
-  end
 
   @doc """
   Materialize the home for an adapter key on its host per the moduledoc.

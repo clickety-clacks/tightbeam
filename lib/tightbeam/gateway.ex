@@ -217,12 +217,12 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:producer_runner, producer_runner)
       |> handlers()
 
+    Identity.init!(config.base_dir)
     Rules.load!(config.base_dir, Map.keys(handler_table), producer_config)
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
-    Identity.init!(config.base_dir)
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)
     assert_harness_binary_ready!(config, cli_bin)
@@ -280,48 +280,67 @@ defmodule Tightbeam.Gateway do
       end
     end
 
-    [
-      {Tightbeam.Credentials,
-       base_dir: config.base_dir,
-       machine: Placement.local_host_name(),
-       gate: fn _provider -> :ok end,
-       stop: &stop_provider_runtime/1,
-       park: &stop_provider_runtime/1,
-       start: &start_provider_runtime/1,
-       resume: fn _provider -> :ok end},
-      {ModelCatalog,
-       base_dir: config.base_dir,
-       codex_home: Homes.home_path(config.base_dir, Placement.local_host_name(), :codex)},
-      {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
-      {Tightbeam.Wakes,
-       db: db, deliver: deliver, tick_ms: config.wake_tick_ms, name: Tightbeam.WakeScheduler},
-      {Tightbeam.Supervision,
-       db: db, handlers: handler_table, prod_limit: prod_limit, name: Tightbeam.Supervision},
-      {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
-      %{
-        id: Tightbeam.ProducerSupervisor,
-        start:
-          {DynamicSupervisor, :start_link,
-           [[strategy: :one_for_one, name: Tightbeam.ProducerSupervisor]]}
-      },
-      {Tightbeam.ProducerRunner,
-       db: db, config: config, supervisor: Tightbeam.ProducerSupervisor, name: producer_runner},
-      {Tightbeam.AdapterCoordinator,
-       adapter_sup: Tightbeam.AdapterSupervisor,
-       adapter_opts: adapter_opts,
-       db: db,
-       name: Tightbeam.AdapterCoordinator},
-      {Tightbeam.LaneManager,
-       db: db,
-       lane_sup: Tightbeam.LaneSupervisor,
-       task_sup: Tightbeam.TurnTaskSupervisor,
-       runner: runner,
-       terminal_publisher: terminal_publisher(db),
-       on_terminal: on_terminal,
-       name: Tightbeam.LaneManager},
-      {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
-    ]
+    credential_children(config) ++
+      [
+        {ModelCatalog,
+         base_dir: config.base_dir,
+         codex_home: Homes.home_path(config.base_dir, Placement.local_host_name(), :codex)},
+        {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+        {Tightbeam.Wakes,
+         db: db, deliver: deliver, tick_ms: config.wake_tick_ms, name: Tightbeam.WakeScheduler},
+        {Tightbeam.Supervision,
+         db: db, handlers: handler_table, prod_limit: prod_limit, name: Tightbeam.Supervision},
+        {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
+        %{
+          id: Tightbeam.ProducerSupervisor,
+          start:
+            {DynamicSupervisor, :start_link,
+             [[strategy: :one_for_one, name: Tightbeam.ProducerSupervisor]]}
+        },
+        {Tightbeam.ProducerRunner,
+         db: db, config: config, supervisor: Tightbeam.ProducerSupervisor, name: producer_runner},
+        {Tightbeam.AdapterCoordinator,
+         adapter_sup: Tightbeam.AdapterSupervisor,
+         adapter_opts: adapter_opts,
+         db: db,
+         name: Tightbeam.AdapterCoordinator},
+        {Tightbeam.LaneManager,
+         db: db,
+         lane_sup: Tightbeam.LaneSupervisor,
+         task_sup: Tightbeam.TurnTaskSupervisor,
+         runner: runner,
+         terminal_publisher: terminal_publisher(db),
+         on_terminal: on_terminal,
+         name: Tightbeam.LaneManager},
+        {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
+      ]
   end
+
+  defp credential_children(config) do
+    Enum.map(Placement.hosts(config.base_dir), fn {machine, host} ->
+      opts =
+        [
+          name: Tightbeam.Credentials.server(machine),
+          base_dir: host.base_dir,
+          machine: machine,
+          ssh: host.ssh,
+          gate: fn _provider -> :ok end,
+          stop: fn provider -> stop_provider_runtime(provider, machine) end,
+          park: fn provider -> stop_provider_runtime(provider, machine) end,
+          start: fn provider -> start_provider_runtime(provider, machine) end,
+          resume: fn _provider -> :ok end
+        ]
+        |> maybe_put_credential_runner(config)
+
+      %{
+        id: {Tightbeam.Credentials, machine},
+        start: {Tightbeam.Credentials, :start_link, [opts]}
+      }
+    end)
+  end
+
+  defp maybe_put_credential_runner(opts, %{sh: sh}), do: Keyword.put(opts, :sh, sh)
+  defp maybe_put_credential_runner(opts, _config), do: opts
 
   defp assert_harness_binary_ready!(config, cli_bin) do
     probe = Map.get(config, :harness_binary_probe, &Placement.harness_binary_probe/2)
@@ -502,8 +521,7 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
       "identity-apply" =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
-      "onboard" =>
-        admin_call_handler(db, fn call -> onboard_result(call) end),
+      "onboard" => admin_call_handler(db, fn call -> onboard_result(config, call) end),
       "promote-user" =>
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
@@ -1625,20 +1643,53 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_result(%{params: %{provider: "openai"}}) do
-    onboard_provider(:openai)
+  defp onboard_result(config, %{params: %{provider: provider, phase: phase} = params})
+       when provider in ["openai", "anthropic"] and phase in ["begin", "finish", "cancel"] do
+    machine = params[:machine] || Placement.local_host_name()
+
+    case Map.has_key?(Placement.hosts(config.base_dir), machine) do
+      true -> onboard_phase(provider_atom(provider), phase, machine, params[:reason])
+      false -> %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
+    end
   end
 
-  defp onboard_result(%{params: %{provider: "anthropic"}}) do
-    onboard_provider(:anthropic)
+  defp onboard_result(_config, %{params: %{provider: provider}}) do
+    %{
+      code: "interactive_required",
+      message: "run tightbeam onboard #{provider} from a terminal on this machine"
+    }
   end
 
-  defp onboard_provider(provider) do
-    case Tightbeam.Credentials.onboard(provider) do
+  defp onboard_phase(provider, "begin", machine, _reason) do
+    case Tightbeam.Credentials.begin_onboard(provider, Tightbeam.Credentials.server(machine)) do
+      {:ok, path} -> %{provider: provider, status: "ready", staging_path: path}
+      {:error, reason} -> %{code: "needs_onboarding", message: inspect(reason)}
+    end
+  end
+
+  defp onboard_phase(provider, "finish", machine, _reason) do
+    case Tightbeam.Credentials.finish_onboard(provider, Tightbeam.Credentials.server(machine)) do
       :ok -> %{provider: provider, status: "onboarded"}
       {:error, reason} -> %{code: "needs_onboarding", message: inspect(reason)}
     end
   end
+
+  defp onboard_phase(provider, "cancel", machine, reason) do
+    :ok =
+      Tightbeam.Credentials.cancel_onboard(
+        provider,
+        onboarding_failure(reason),
+        Tightbeam.Credentials.server(machine)
+      )
+
+    %{provider: provider, status: "canceled"}
+  end
+
+  defp onboarding_failure("unsupported_no_subscription"), do: :unsupported_no_subscription
+  defp onboarding_failure(_reason), do: nil
+
+  defp provider_atom("openai"), do: :openai
+  defp provider_atom("anthropic"), do: :anthropic
 
   defp role_bind_result(db, call) do
     name = call.params[:name]
@@ -2107,7 +2158,7 @@ defmodule Tightbeam.Gateway do
 
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
 
-    with :ok <- validate_credential(harness_string),
+    with :ok <- validate_credential(config, harness_string, host),
          :ok <- validate_catalog_model(harness_string, model, is_nil(p[:model])),
          :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
       input = %{
@@ -2226,7 +2277,8 @@ defmodule Tightbeam.Gateway do
 
             model = p[:model] || config.default_model
 
-            with :ok <- validate_catalog_model(harness, model, is_nil(p[:model])),
+            with :ok <- validate_credential(config, harness, session.host),
+                 :ok <- validate_catalog_model(harness, model, is_nil(p[:model])),
                  :ok <-
                    Spinup.ensure_ready(
                      config,
@@ -2446,10 +2498,11 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp validate_credential(harness) do
+  defp validate_credential(config, harness, machine) do
     provider = provider_for_harness(harness)
+    status = credential_status(config, provider, machine)
 
-    case Tightbeam.Credentials.status(provider) do
+    case status do
       :onboarded ->
         :ok
 
@@ -2458,9 +2511,26 @@ defmodule Tightbeam.Gateway do
          %{
            code: "needs_onboarding",
            message:
-             "#{harness} on #{Placement.local_host_name()} needs onboarding: " <>
-               "#{inspect(reason)}; run tightbeam onboard #{provider}"
+             "#{harness} on #{machine} needs onboarding: " <>
+               "#{inspect(reason)}; run tightbeam onboard #{provider} on #{machine}"
          }}
+    end
+  end
+
+  defp credential_status(%{credential_status: status}, provider, _machine)
+       when is_function(status, 1),
+       do: status.(provider)
+
+  defp credential_status(%{credential_status: status}, provider, machine)
+       when is_function(status, 2),
+       do: status.(provider, machine)
+
+  defp credential_status(_config, provider, machine) do
+    server = Tightbeam.Credentials.server(machine)
+
+    case GenServer.whereis(server) do
+      nil -> :onboarded
+      _pid -> Tightbeam.Credentials.status(provider, server)
     end
   end
 
@@ -2470,13 +2540,13 @@ defmodule Tightbeam.Gateway do
   defp harness_for_provider(:openai), do: :codex
   defp harness_for_provider(:anthropic), do: :claude
 
-  defp stop_provider_runtime(provider) do
-    key = {harness_for_provider(provider), "shared", Placement.local_host_name()}
+  defp stop_provider_runtime(provider, machine) do
+    key = {harness_for_provider(provider), "shared", machine}
     AdapterCoordinator.close_adapter(Tightbeam.AdapterCoordinator, key)
   end
 
-  defp start_provider_runtime(provider) do
-    key = {harness_for_provider(provider), "shared", Placement.local_host_name()}
+  defp start_provider_runtime(provider, machine) do
+    key = {harness_for_provider(provider), "shared", machine}
 
     case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
       {:ok, _pid, _generation} -> :ok
@@ -2568,8 +2638,13 @@ defmodule Tightbeam.Gateway do
   defp empty_override_to_nil(map), do: map
 
   defp spinup_opts(config, db) do
-    if config[:sh], do: [db: db, sh: config.sh], else: [db: db]
+    [db: db]
+    |> maybe_put_opt(:sh, config[:sh])
+    |> maybe_put_opt(:patch_adapter, config[:patch_adapter])
   end
+
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp retire_result(config, db, call) do
     p = call.params

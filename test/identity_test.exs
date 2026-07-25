@@ -27,6 +27,7 @@ defmodule Tightbeam.IdentityTest do
   test "learn creates the exact three refs and live snapshots compose both channels", ctx do
     assert :initialized = Identity.init!(ctx.base)
     refs = git!(Path.join(ctx.base, "identity"), ["branch", "--format=%(refname:short)"])
+
     assert MapSet.new(String.split(refs, "\n", trim: true)) ==
              MapSet.new(["main", "tightbeam/live", "tightbeam/upstream"])
 
@@ -52,8 +53,10 @@ defmodule Tightbeam.IdentityTest do
     Identity.provision!(ctx.base, "coder", :codex, cwd)
 
     assert File.read!(Path.join(cwd, ".codex/skills/role-skill/SKILL.md")) == "product"
+
     assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__role-skill/SKILL.md")) ==
              "skill-v1"
+
     refute File.exists?(Path.join(nested, ".codex"))
     assert File.read!(Path.join(nested, ".git/info/exclude")) == nested_exclude
 
@@ -84,8 +87,67 @@ defmodule Tightbeam.IdentityTest do
 
     assert git!(repo, ["status", "--porcelain"]) == ""
     assert File.read!(Path.join(repo, ".codex/skills/product/SKILL.md")) == "product"
+
     assert File.read!(Path.join(repo, ".git/info/exclude")) =~
              ".codex/skills/tightbeam__*"
+  end
+
+  test "linked worktrees keep product collisions visible and reserved skills hidden", ctx do
+    Identity.init!(ctx.base)
+    repo = Path.join(ctx.root, "linked-source")
+    linked = Path.join(ctx.root, "linked-worktree")
+    File.mkdir_p!(Path.join(repo, ".codex/skills/role-skill"))
+    File.write!(Path.join(repo, ".codex/skills/role-skill/SKILL.md"), "product")
+    git!(repo, ["init"])
+    git!(repo, ["add", "."])
+    git!(repo, ["commit", "-m", "product"], "product")
+    git!(repo, ["worktree", "add", "-b", "linked", linked])
+
+    Identity.provision!(ctx.base, "coder", :codex, linked)
+    File.write!(Path.join(linked, ".codex/skills/role-skill/SKILL.md"), "product changed")
+
+    status = git!(linked, ["status", "--porcelain"])
+    assert status =~ ".codex/skills/role-skill/SKILL.md"
+    refute status =~ "tightbeam__role-skill"
+
+    assert File.read!(Path.join(linked, ".codex/skills/tightbeam__role-skill/SKILL.md")) ==
+             "skill-v1"
+  end
+
+  test "plain workdirs materialize at exact cwd for both harnesses and never touch nested repos",
+       ctx do
+    Identity.init!(ctx.base)
+
+    for harness <- [:codex, :claude] do
+      cwd = Path.join(ctx.root, "plain-#{harness}")
+      nested = Path.join(cwd, "product")
+      File.mkdir_p!(nested)
+      git!(nested, ["init"])
+      exclude = File.read!(Path.join(nested, ".git/info/exclude"))
+
+      Identity.provision!(ctx.base, "coder", harness, cwd)
+      prefix = skills_prefix(harness)
+
+      assert File.read!(Path.join([cwd, prefix, "skills", "tightbeam__role-skill", "SKILL.md"])) ==
+               "skill-v1"
+
+      refute File.exists?(Path.join(nested, prefix))
+      assert File.read!(Path.join(nested, ".git/info/exclude")) == exclude
+    end
+  end
+
+  defp skills_prefix(:codex), do: ".codex"
+  defp skills_prefix(:claude), do: ".claude"
+
+  test "personal skills are outside the elected served snapshot", ctx do
+    Identity.init!(ctx.base)
+    personal = Path.join(ctx.root, "personal/.codex/skills/personal/SKILL.md")
+    File.mkdir_p!(Path.dirname(personal))
+    File.write!(personal, "personal")
+
+    snapshot = Identity.snapshot!(ctx.base, "coder", :codex)
+    assert snapshot.skills == %{"role-skill" => "skill-v1"}
+    refute Map.has_key?(snapshot.skills, "personal")
   end
 
   test "invalid manifest is refused without a commit or dirty tree", ctx do
@@ -111,6 +173,8 @@ defmodule Tightbeam.IdentityTest do
 
   test "customization leaves source untouched and relearn preserves changes and deletions", ctx do
     Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    prior_upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
     source_before = tree_digest(ctx.source)
     Identity.edit!(ctx.base, "coder", :guidance, "local-role", "test")
     assert tree_digest(ctx.source) == source_before
@@ -118,6 +182,7 @@ defmodule Tightbeam.IdentityTest do
     File.write!(Path.join(ctx.source, "guidance/new.md"), "new-source")
     File.rm!(Path.join(ctx.source, "skills/role-skill/SKILL.md"))
     File.rmdir!(Path.join(ctx.source, "skills/role-skill"))
+
     File.write!(Path.join(ctx.source, "archetypes/coder.toml"), """
     name = "coder"
     skills = []
@@ -128,6 +193,8 @@ defmodule Tightbeam.IdentityTest do
 
     assert {:ok, revision} = Identity.relearn!(ctx.base)
     assert revision == Identity.live_revision!(ctx.base)
+    next_upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
+    assert git!(dir, ["rev-parse", "#{next_upstream}^"]) == prior_upstream
     assert File.read!(Path.join(ctx.base, "identity/guidance/coder.md")) == "local-role"
     refute File.exists?(Path.join(ctx.base, "identity/skills/role-skill"))
   end
@@ -151,10 +218,50 @@ defmodule Tightbeam.IdentityTest do
     assert Identity.live_revision!(ctx.base) == stable
   end
 
+  test "live is the only publication and one stamped OID cannot mix revisions", ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    live = Identity.live_revision!(ctx.base)
+    cwd = Path.join(ctx.root, "published")
+    before = Identity.provision_at!(ctx.base, live, "coder", :codex, cwd)
+
+    File.write!(Path.join(dir, "guidance/coder.md"), "main-only")
+    File.write!(Path.join(dir, "skills/role-skill/SKILL.md"), "skill-main")
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "-m", "unpublished main"], "test")
+
+    from_live = Identity.provision!(ctx.base, "coder", :codex, cwd)
+    assert from_live.revision == live
+    assert from_live.guidance =~ "role-v1"
+    assert from_live.skills == %{"role-skill" => "skill-v1"}
+
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", git!(dir, ["rev-parse", "main"]), live])
+    advanced = Identity.live_revision!(ctx.base)
+    assert advanced != live
+
+    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__role-skill/SKILL.md")) ==
+             "skill-v1"
+
+    assert before.revision == live
+    assert before.guidance =~ "role-v1"
+    assert before.skills == %{"role-skill" => "skill-v1"}
+
+    pinned = Identity.provision_at!(ctx.base, live, "coder", :codex, cwd)
+    assert pinned.revision == live
+    assert pinned.guidance =~ "role-v1"
+    assert pinned.skills == %{"role-skill" => "skill-v1"}
+
+    refreshed = Identity.provision!(ctx.base, "coder", :codex, cwd)
+    assert refreshed.revision == advanced
+    assert refreshed.guidance =~ "main-only"
+    assert refreshed.skills == %{"role-skill" => "skill-main"}
+  end
+
   defp write_source!(source, role, skill) do
     File.mkdir_p!(Path.join(source, "archetypes"))
     File.mkdir_p!(Path.join(source, "guidance"))
     File.mkdir_p!(Path.join(source, "skills/role-skill"))
+
     File.write!(Path.join(source, "archetypes/coder.toml"), """
     name = "coder"
     skills = ["role-skill"]
@@ -162,6 +269,7 @@ defmodule Tightbeam.IdentityTest do
     [guidance]
     text = '#include "coder.md"'
     """)
+
     File.write!(Path.join(source, "guidance/coder.md"), role)
     File.write!(Path.join(source, "guidance/operating-model.md"), "tightbeam identity edit")
     File.write!(Path.join(source, "skills/role-skill/SKILL.md"), skill)
