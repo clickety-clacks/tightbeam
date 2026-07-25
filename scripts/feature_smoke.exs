@@ -638,7 +638,9 @@ defmodule FeatureSmoke do
       System.monotonic_time(:millisecond) >= deadline ->
         raise(
           "effort smoke timed out; run the gateway with a short " <>
-            "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (for example 250)"
+            "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (2500 works; the deadline " <>
+            "shares this config, so 250 rung-rotates requests away from the " <>
+            "parent before it can rule)"
         )
 
       true ->
