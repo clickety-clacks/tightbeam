@@ -593,6 +593,7 @@ defmodule Tightbeam.Placement do
         cwd: config.cwd,
         stderr_path: stderr_path,
         on_auth_event: auth_event_handler(host, harness),
+        on_subagent_event: subagent_event_handler(config, host, harness),
         env:
           [
             {"TIGHTBEAM_HOME", config.base_dir},
@@ -707,6 +708,7 @@ defmodule Tightbeam.Placement do
           cwd: config.cwd,
           stderr_path: stderr_path,
           on_auth_event: auth_event_handler(host, harness),
+          on_subagent_event: subagent_event_handler(config, host, harness),
           env: [{"TIGHTBEAM_LINEAGE", lineage}]
         ],
         probe_opts
@@ -886,6 +888,21 @@ defmodule Tightbeam.Placement do
           "params" => params
         },
         Tightbeam.Credentials.server(host)
+      )
+    end
+  end
+
+  defp subagent_event_handler(config, host, harness) do
+    db = Map.get(config, :db, Tightbeam.DB)
+
+    fn harness_session_id, update ->
+      Tightbeam.SubagentMarkers.consume_update(
+        db,
+        Tightbeam.WakeScheduler,
+        harness,
+        host,
+        harness_session_id,
+        update
       )
     end
   end

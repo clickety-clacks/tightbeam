@@ -135,8 +135,10 @@ defmodule Tightbeam.ConditionFacts do
     end
   end
 
-  defp reserved_ok?(kind, origin),
-    do: kind not in @reserved_kinds or origin == "process:tightbeam"
+  defp reserved_ok?(kind, origin) do
+    reserved? = kind in @reserved_kinds or String.starts_with?(kind, "subagent_")
+    not reserved? or origin == "process:tightbeam"
+  end
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do

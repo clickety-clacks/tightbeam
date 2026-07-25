@@ -279,6 +279,24 @@ defmodule Tightbeam.OrgTest do
     assert count == 3
   end
 
+  test "pointer persists canonical source session identity with reverse uniqueness", %{db: db} do
+    Org.create(db, base(%{session_key: "k1"}))
+    pointer = Org.append_pointer(db, "k1", "shared-harness-id", "created")
+
+    assert pointer.harness == "claude"
+    assert pointer.machine == "testhost"
+
+    assert pointer.source_session_ref ==
+             Org.source_session_ref("claude", "testhost", "shared-harness-id")
+
+    Org.append_pointer(db, "k1", "shared-harness-id", "loaded")
+    Org.create(db, base(%{session_key: "k2"}))
+
+    assert_raise Tightbeam.DB.Error, ~r/already belongs to another parent/, fn ->
+      Org.append_pointer(db, "k2", "shared-harness-id", "created")
+    end
+  end
+
   test "schema constraints reject invalid enums and duplicate handles", %{db: db} do
     assert_raise Tightbeam.DB.Error, ~r/CHECK constraint/, fn ->
       Org.create(db, base(%{session_key: "bad", harness: "other"}))

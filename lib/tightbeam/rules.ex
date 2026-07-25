@@ -44,6 +44,7 @@ defmodule Tightbeam.Rules do
     Devices,
     Escalation,
     EventLog,
+    ObligationFacts,
     Org,
     RailRemedy,
     RailScript,
@@ -532,6 +533,15 @@ defmodule Tightbeam.Rules do
     fact = Map.get(condition, "fact")
     op = Map.get(condition, "op")
     value = Map.get(condition, "value")
+
+    if is_binary(fact) do
+      try do
+        ObligationFacts.register!(fact)
+      rescue
+        error in ArgumentError -> fail.(error.message)
+      end
+    end
+
     type = Map.get(@facts, fact)
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")

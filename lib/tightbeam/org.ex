@@ -47,6 +47,9 @@ defmodule Tightbeam.Org do
   @type pointer :: %{
           session_key: String.t(),
           harness_session_id: String.t(),
+          source_session_ref: String.t(),
+          harness: String.t(),
+          machine: String.t(),
           reason: String.t(),
           created_at: integer()
         }
@@ -84,6 +87,9 @@ defmodule Tightbeam.Org do
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     sessionKey       TEXT NOT NULL REFERENCES sessions(sessionKey),
     harnessSessionId TEXT NOT NULL,
+    sourceSessionRef TEXT NOT NULL,
+    harness          TEXT NOT NULL,
+    machine          TEXT NOT NULL,
     reason           TEXT NOT NULL CHECK (reason IN ('created','loaded','fallback')),
     createdAt        INTEGER NOT NULL
   );
@@ -108,7 +114,10 @@ defmodule Tightbeam.Org do
           "ALTER TABLE sessions ADD COLUMN identityName TEXT",
           "ALTER TABLE sessions ADD COLUMN identityRevision TEXT",
           "ALTER TABLE sessions ADD COLUMN cliToken TEXT",
-          "ALTER TABLE sessions ADD COLUMN adjudicationHold TEXT"
+          "ALTER TABLE sessions ADD COLUMN adjudicationHold TEXT",
+          "ALTER TABLE harness_pointers ADD COLUMN sourceSessionRef TEXT",
+          "ALTER TABLE harness_pointers ADD COLUMN harness TEXT",
+          "ALTER TABLE harness_pointers ADD COLUMN machine TEXT"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
@@ -121,6 +130,24 @@ defmodule Tightbeam.Org do
 
     {:ok, _} =
       DB.query(db, "UPDATE sessions SET identityName = archetype WHERE identityName IS NULL")
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        CREATE INDEX IF NOT EXISTS pointers_source ON harness_pointers (sourceSessionRef, id);
+        CREATE TRIGGER IF NOT EXISTS harness_pointer_reverse_unique
+        BEFORE INSERT ON harness_pointers
+        WHEN EXISTS (
+          SELECT 1 FROM harness_pointers
+          WHERE sourceSessionRef = NEW.sourceSessionRef
+            AND sessionKey != NEW.sessionKey
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'harness source session already belongs to another parent');
+        END;
+        """
+      )
 
     result
   end
@@ -461,21 +488,36 @@ defmodule Tightbeam.Org do
   @spec append_pointer(db(), String.t(), String.t(), String.t()) :: pointer()
   def append_pointer(db \\ Tightbeam.DB, session_key, harness_session_id, reason) do
     transaction!(db, fn txn ->
-      must_get(txn, session_key)
+      session = must_get(txn, session_key)
       created_at = now()
+
+      source_session_ref =
+        source_session_ref(session.harness, session.host, harness_session_id)
 
       Txn.q(
         txn,
         """
-          INSERT INTO harness_pointers (sessionKey, harnessSessionId, reason, createdAt)
-          VALUES (?1, ?2, ?3, ?4)
+          INSERT INTO harness_pointers
+            (sessionKey, harnessSessionId, sourceSessionRef, harness, machine, reason, createdAt)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         """,
-        [session_key, harness_session_id, reason, created_at]
+        [
+          session_key,
+          harness_session_id,
+          source_session_ref,
+          session.harness,
+          session.host,
+          reason,
+          created_at
+        ]
       )
 
       %{
         session_key: session_key,
         harness_session_id: harness_session_id,
+        source_session_ref: source_session_ref,
+        harness: session.harness,
+        machine: session.host,
         reason: reason,
         created_at: created_at
       }
@@ -498,20 +540,42 @@ defmodule Tightbeam.Org do
       DB.query(
         db,
         """
-          SELECT sessionKey, harnessSessionId, reason, createdAt
+          SELECT sessionKey, harnessSessionId, sourceSessionRef, harness, machine, reason, createdAt
           FROM harness_pointers WHERE sessionKey = ?1 ORDER BY id ASC
         """,
         [session_key]
       )
 
-    Enum.map(rows, fn [key, harness_session_id, reason, created_at] ->
+    Enum.map(rows, fn [
+                        key,
+                        harness_session_id,
+                        source_session_ref,
+                        harness,
+                        machine,
+                        reason,
+                        created_at
+                      ] ->
       %{
         session_key: key,
         harness_session_id: harness_session_id,
+        source_session_ref: source_session_ref,
+        harness: harness,
+        machine: machine,
         reason: reason,
         created_at: created_at
       }
     end)
+  end
+
+  @doc "Canonical adapter-source reference for one harness session."
+  @spec source_session_ref(atom() | String.t(), String.t(), String.t()) :: String.t()
+  def source_session_ref(harness, machine, harness_session_id) do
+    encoded =
+      [to_string(harness), machine, harness_session_id]
+      |> JSON.encode!()
+      |> Base.url_encode64(padding: false)
+
+    "acp:" <> encoded
   end
 
   @doc """
