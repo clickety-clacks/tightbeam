@@ -10,9 +10,13 @@ defmodule Tightbeam.Harness.AdapterPatch do
     patched = patch(source, replacements, label, version)
 
     if patched != source do
+      # Preserve the bundle's own mode: npm marks bin-target bundles executable,
+      # and node_modules/.bin symlinks exec them directly — a hardcoded 644 here
+      # stripped the x-bit and broke every codex adapter spawn (Permission denied).
+      %File.Stat{mode: mode} = File.stat!(bundle)
       temporary = bundle <> ".tightbeam-patch"
       File.write!(temporary, patched)
-      File.chmod!(temporary, 0o644)
+      File.chmod!(temporary, mode)
       File.rename!(temporary, bundle)
     end
 
