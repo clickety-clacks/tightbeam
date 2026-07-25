@@ -5,7 +5,14 @@ defmodule Tightbeam.ApplicationTest do
   setup do
     base = Path.join(System.tmp_dir!(), "tb_app_#{System.unique_integer([:positive])}")
     Application.put_env(:tightbeam, :base_dir, base)
-    sup = start_supervised!(%{id: :app_tree, start: {Supervisor, :start_link, [Tightbeam.Application.children(), [strategy: :rest_for_one]]}})
+
+    sup =
+      start_supervised!(%{
+        id: :app_tree,
+        start:
+          {Supervisor, :start_link, [Tightbeam.Application.children(), [strategy: :rest_for_one]]}
+      })
+
     %{sup: sup}
   end
 
@@ -20,5 +27,11 @@ defmodule Tightbeam.ApplicationTest do
     assert is_integer(Application.get_env(:tightbeam, :boot_epoch))
     assert Ledger.pending_sessions(DB) == []
     assert EventLog.events_after(DB, 0, 10) == []
+
+    expected =
+      "[" <> Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <> "]"
+
+    assert File.read!(Path.join(Application.fetch_env!(:tightbeam, :base_dir), "harnesses.json")) ==
+             expected
   end
 end

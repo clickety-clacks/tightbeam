@@ -71,6 +71,7 @@ defmodule Tightbeam.Gateway do
     Devices,
     Escalation,
     EventLog,
+    Harness,
     Homes,
     Identity,
     Idempotency,
@@ -228,8 +229,7 @@ defmodule Tightbeam.Gateway do
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)
     assert_harness_binary_ready!(config, cli_bin)
-    Homes.sweep_auth(config.base_dir, :claude)
-    Homes.sweep_auth(config.base_dir, :codex)
+    Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
     adapter_opts = fn key -> Placement.adapter_opts(adapter_config, key) end
@@ -284,9 +284,7 @@ defmodule Tightbeam.Gateway do
 
     credential_children(config, db) ++
       [
-        {ModelCatalog,
-         base_dir: config.base_dir,
-         codex_home: Homes.home_path(config.base_dir, Placement.local_host_name(), :codex)},
+        {ModelCatalog, base_dir: config.base_dir},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
         {Tightbeam.Wakes,
          db: db, deliver: deliver, tick_ms: config.wake_tick_ms, name: Tightbeam.WakeScheduler},
@@ -324,6 +322,7 @@ defmodule Tightbeam.Gateway do
         [
           name: Tightbeam.Credentials.server(machine),
           base_dir: host.base_dir,
+          staging_base_dir: config.base_dir,
           machine: machine,
           ssh: host.ssh,
           gate: fn _provider -> :ok end,
@@ -354,8 +353,8 @@ defmodule Tightbeam.Gateway do
     probe = Map.get(config, :harness_binary_probe, &Placement.harness_binary_probe/2)
 
     results =
-      Enum.map([:claude, :codex], fn harness ->
-        {harness, probe.(harness, cli_bin)}
+      Enum.map(Harness.all(), fn module ->
+        {module.id(), probe.(module.id(), cli_bin)}
       end)
 
     unless Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) do
@@ -370,8 +369,7 @@ defmodule Tightbeam.Gateway do
           "#{harness}: #{reason}"
         end)
 
-      raise "no usable harness CLI is installed (#{detail}). " <>
-              "Install the claude or codex CLI and ensure it is on PATH."
+      raise "no usable harness CLI is installed (#{detail}). Install a registered harness CLI and ensure it is on PATH."
     end
   end
 
@@ -806,17 +804,15 @@ defmodule Tightbeam.Gateway do
       Application.get_env(:tightbeam, :base_dir, Path.join(System.user_home!(), ".tightbeam"))
 
     %{
-      harnesses: ["claude", "codex"],
+      harnesses: Enum.map(Harness.all(), & &1.wire_name()),
       models:
         Map.new(ModelCatalog.get(), fn {harness, models} ->
-          provider = if harness == "codex", do: "openai", else: "anthropic"
-
           {harness,
            Enum.map(models, fn model ->
              model
              |> Map.put(:id, model.ref)
              |> Map.put(:name, model.display_name)
-             |> Map.put(:provider, provider)
+             |> Map.put(:provider, model.provider)
            end)}
         end),
       hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
@@ -956,15 +952,17 @@ defmodule Tightbeam.Gateway do
   defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
 
   defp defaults(config, db) do
-    harness = config.default_harness
+    module = Harness.module!(config.default_harness)
+    harness = module.id()
+    model = config.default_model
 
     %{
       # Invariant: only omitted archetypes consult the org default; an explicit
       # spawn archetype is never replaced by organization policy.
       archetype: Org.get_setting(db, "default-archetype") || "default",
       harness: harness,
-      provider: if(harness == :codex, do: :openai, else: :anthropic),
-      model: config.default_model
+      provider: fn -> catalog_provider!(module.wire_name(), model) end,
+      model: model
     }
   end
 
@@ -982,24 +980,6 @@ defmodule Tightbeam.Gateway do
     end
 
     File.chmod!(wrapper, 0o755)
-
-    case System.find_executable("codex") do
-      nil ->
-        :ok
-
-      codex ->
-        # Invariant: the shim must exec a codex that is not itself; otherwise it loops forever.
-        if Path.dirname(codex) != bin_dir do
-          codex_shim = Path.join(bin_dir, "codex")
-
-          File.write!(
-            codex_shim,
-            "#!/bin/sh\nexec \"#{codex}\" --dangerously-bypass-hook-trust \"$@\"\n"
-          )
-
-          File.chmod!(codex_shim, 0o755)
-        end
-    end
 
     bin_dir
   end
@@ -1155,9 +1135,9 @@ defmodule Tightbeam.Gateway do
     archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
     inventories =
-      Map.new(["claude", "codex"], fn harness ->
-        {models, health} = ModelCatalog.get(harness, ModelCatalog)
-        {harness, %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
+      Map.new(Harness.all(), fn module ->
+        {models, health} = ModelCatalog.get(module.wire_name(), ModelCatalog)
+        {module.wire_name(), %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
       end)
 
     """
@@ -1273,7 +1253,7 @@ defmodule Tightbeam.Gateway do
   # changes nothing durable (the ledger row is already terminal).
   defp harness_cancel(db, session) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
-         key = {String.to_existing_atom(session.harness), "shared", session.host},
+         key = {Harness.parse!(session.harness).id(), "shared", session.host},
          {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
       Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
         sessionId: sid
@@ -1286,7 +1266,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp checkout_adapter(session) do
-    key = {String.to_existing_atom(session.harness), "shared", session.host}
+    key = {Harness.parse!(session.harness).id(), "shared", session.host}
 
     case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
       {:ok, adapter, generation} ->
@@ -1376,7 +1356,7 @@ defmodule Tightbeam.Gateway do
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
     cwd = Placement.holder_workdir(config, session)
     mcp_servers = session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
-    harness = String.to_existing_atom(session.harness)
+    harness = Harness.parse!(session.harness).id()
 
     result =
       case Org.current_pointer(db, session.session_key) do
@@ -1566,10 +1546,10 @@ defmodule Tightbeam.Gateway do
     guidance =
       case call.params[:archetype] do
         archetype when is_binary(archetype) ->
-          %{
-            codex: Identity.snapshot_at!(config.base_dir, live, archetype, :codex).guidance,
-            claude: Identity.snapshot_at!(config.base_dir, live, archetype, :claude).guidance
-          }
+          Map.new(Harness.all(), fn module ->
+            snapshot = Identity.snapshot_at!(config.base_dir, live, archetype, module.id())
+            {module.id(), module.session_config(%{}, snapshot.guidance).guidance}
+          end)
 
         nil ->
           nil
@@ -1651,7 +1631,7 @@ defmodule Tightbeam.Gateway do
   # from `tightbeam/live` at its first start (§Sessions stamp the revision they
   # materialized from), so it is already on the applied revision by construction.
   defp identity_apply_started_session(config, db, session, revision, pointer) do
-    harness = String.to_existing_atom(session.harness)
+    harness = Harness.parse!(session.harness).id()
     key = {harness, "shared", session.host}
     cwd = Placement.holder_workdir(config, session)
     snapshot = served_snapshot(config, session, harness, revision)
@@ -2241,8 +2221,9 @@ defmodule Tightbeam.Gateway do
     p = call.params
     defaults = defaults(config, db)
     harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
-    harness_string = to_string(harness)
-    harness_atom = if harness_string == "codex", do: :codex, else: :claude
+    module = if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
+    harness_string = module.wire_name()
+    harness_atom = module.id()
     sessions = Org.list_for_user(db, caller.owner_user_id, false)
 
     model =
@@ -2267,7 +2248,7 @@ defmodule Tightbeam.Gateway do
         identity_name: identity_name,
         host: host,
         harness: harness_string,
-        provider: if(harness_string == "codex", do: "openai", else: "anthropic"),
+        provider: catalog_provider!(harness_string, model),
         model: model
       }
 
@@ -2358,15 +2339,15 @@ defmodule Tightbeam.Gateway do
         broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
         %{stream: stream}
 
-      p[:setting] == "set_harness" and p[:harness] in ["claude", "codex"] ->
+      p[:setting] == "set_harness" and is_binary(p[:harness]) ->
         case Org.get(db, call.session_key) do
           nil ->
             %{ok: false, code: "not_found"}
 
           session ->
             harness = p.harness
-            harness_atom = if harness == "codex", do: :codex, else: :claude
-            provider = if harness == "codex", do: "openai", else: "anthropic"
+            module = Harness.parse!(harness)
+            harness_atom = module.id()
 
             model = p[:model] || config.default_model
 
@@ -2387,7 +2368,13 @@ defmodule Tightbeam.Gateway do
                 deliver_opts
               )
 
-              Org.set_harness(db, call.session_key, harness, provider, model)
+              Org.set_harness(
+                db,
+                call.session_key,
+                harness,
+                catalog_provider!(harness, model),
+                model
+              )
 
               # History barrier (product ruling): a new engine gets a fresh
               # visible slate. Rows are RETAINED (never deleted) but replay
@@ -2434,7 +2421,7 @@ defmodule Tightbeam.Gateway do
                 Map.put(denial, :ok, false)
 
               {:ok, host} ->
-                harness = if session.harness == "codex", do: :codex, else: :claude
+                harness = Harness.parse!(session.harness).id()
 
                 case Spinup.ensure_ready(config, harness, host, spinup_opts(config, db)) do
                   {:error, denial} ->
@@ -2520,14 +2507,16 @@ defmodule Tightbeam.Gateway do
   end
 
   defp apply_model_change(config, db, call, session, new_ref) do
-    with :ok <- validate_catalog_model(session.harness, new_ref, false) do
-      Org.set_model(db, call.session_key, new_ref, session.provider)
+    with :ok <- validate_catalog_model(session.harness, new_ref, false),
+         {%{provider: provider}, _health} <-
+           ModelCatalog.entry(session.harness, new_ref, ModelCatalog) do
+      Org.set_model(db, call.session_key, new_ref, Atom.to_string(provider))
 
       load_result =
         with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
              coordinator when is_pid(coordinator) <-
                Process.whereis(Tightbeam.AdapterCoordinator),
-             harness = String.to_existing_atom(session.harness),
+             harness = Harness.parse!(session.harness).id(),
              cwd = Placement.holder_workdir(config, session),
              revision = session.identity_revision || Identity.live_revision!(config.base_dir),
              snapshot = served_snapshot(config, session, harness, revision),
@@ -2592,7 +2581,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp validate_credential(config, harness, machine) do
-    provider = provider_for_harness(harness)
+    provider = Harness.parse!(harness).credential_provider()
     status = credential_status(config, provider, machine)
 
     case status do
@@ -2627,19 +2616,21 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp provider_for_harness("codex"), do: :openai
-  defp provider_for_harness("claude"), do: :anthropic
-
-  defp harness_for_provider(:openai), do: :codex
-  defp harness_for_provider(:anthropic), do: :claude
-
   defp stop_provider_runtime(provider, machine) do
-    key = {harness_for_provider(provider), "shared", machine}
-    AdapterCoordinator.close_adapter(Tightbeam.AdapterCoordinator, key)
+    provider
+    |> harnesses_for_provider()
+    |> Enum.each(fn module ->
+      AdapterCoordinator.close_adapter(
+        Tightbeam.AdapterCoordinator,
+        {module.id(), "shared", machine}
+      )
+    end)
+
+    :ok
   end
 
   defp capture_credential_sessions(db, provider, machine) do
-    harness = provider |> harness_for_provider() |> Atom.to_string()
+    harnesses = provider |> harnesses_for_provider() |> MapSet.new(& &1.wire_name())
 
     %{
       provider: provider,
@@ -2647,7 +2638,7 @@ defmodule Tightbeam.Gateway do
       sessions:
         db
         |> Org.list_for_user("", true)
-        |> Enum.filter(&(&1.harness == harness and &1.host == machine))
+        |> Enum.filter(&(MapSet.member?(harnesses, &1.harness) and &1.host == machine))
     }
   end
 
@@ -2685,13 +2676,18 @@ defmodule Tightbeam.Gateway do
   end
 
   defp start_provider_runtime(provider, machine) do
-    key = {harness_for_provider(provider), "shared", machine}
+    Enum.reduce_while(harnesses_for_provider(provider), :ok, fn module, :ok ->
+      key = {module.id(), "shared", machine}
 
-    case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
-      {:ok, _pid, _generation} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+      case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
+        {:ok, _pid, _generation} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
+
+  defp harnesses_for_provider(provider),
+    do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
 
   defp warn_dead_default(_harness, _model, false), do: :ok
 
@@ -2708,7 +2704,7 @@ defmodule Tightbeam.Gateway do
          :ok <- session_mutation_allowed(db, call.origin, session),
          {:ok, overrides, removed} <- remove_override_value(session.overrides, p) do
       base = Archetypes.get(session.archetype) || Archetypes.builtin_default()
-      harness = String.to_existing_atom(session.harness)
+      harness = Harness.parse!(session.harness).id()
 
       identity_name =
         Placement.identity_name(
@@ -3437,7 +3433,7 @@ defmodule Tightbeam.Gateway do
           %{
             session_key: session_key,
             sid: sid,
-            key: {String.to_existing_atom(session.harness), "shared", session.host}
+            key: {Harness.parse!(session.harness).id(), "shared", session.host}
           }
         ]
       else
@@ -3514,19 +3510,16 @@ defmodule Tightbeam.Gateway do
 
   defp harness_for_ref(ref) do
     matches =
-      Enum.filter(["claude", "codex"], fn harness ->
-        case ModelCatalog.member?(harness, ref) do
-          %{present?: true, health: :fresh} -> true
-          _ -> false
+      Enum.flat_map(Harness.all(), fn module ->
+        case ModelCatalog.entry(module.wire_name(), ref) do
+          {%{} = entry, :fresh} -> [{module, entry}]
+          _ -> []
         end
       end)
 
     case matches do
-      ["claude"] ->
-        {:ok, "claude", "anthropic"}
-
-      ["codex"] ->
-        {:ok, "codex", "openai"}
+      [{module, entry}] ->
+        {:ok, module.wire_name(), Atom.to_string(entry.provider)}
 
       [] ->
         {:error,
@@ -3538,13 +3531,20 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp catalog_provider!(harness, ref) do
+    case ModelCatalog.entry(harness, ref) do
+      {%{provider: provider}, _health} -> Atom.to_string(provider)
+      {nil, _health} -> raise "catalog entry missing after validation: #{harness}/#{ref}"
+    end
+  end
+
   defp strict_apply_current_model(db, session, model) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
          coordinator when is_pid(coordinator) <- Process.whereis(Tightbeam.AdapterCoordinator),
          {:ok, adapter, _generation} <-
            AdapterCoordinator.adapter_for(
              coordinator,
-             {String.to_existing_atom(session.harness), "shared", session.host}
+             {Harness.parse!(session.harness).id(), "shared", session.host}
            ) do
       Adapter.apply_model_strict(adapter, sid, model, session.model)
     else

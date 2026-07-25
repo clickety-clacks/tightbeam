@@ -90,6 +90,21 @@ defmodule Tightbeam.Wire.Router do
     json(conn, 200, %{"protocolVersion" => 1, "server" => "tightbeam", "adapters" => health})
   end
 
+  get "/harnesses" do
+    with {:ok, _auth} <- cli_auth(conn) do
+      bytes =
+        "[" <>
+          Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <>
+          "]"
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.send_resp(200, bytes)
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
   post "/agent/dispatch" do
     with {:ok, auth} <- cli_auth(conn),
          {:ok, body, conn} <- read_json(conn),

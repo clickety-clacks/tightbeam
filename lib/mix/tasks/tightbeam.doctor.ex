@@ -7,7 +7,6 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
   @shortdoc "Check inference-free Tightbeam bootstrap readiness"
 
-  @harnesses ["claude", "codex"]
   @default_model "claude-sonnet-5[medium]"
 
   @impl Mix.Task
@@ -31,7 +30,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
           Application.get_env(:tightbeam, :default_model) || @default_model,
       default_harness:
         System.get_env("TIGHTBEAM_DEFAULT_HARNESS") ||
-          Application.get_env(:tightbeam, :default_harness) || :claude,
+          Tightbeam.Harness.default().wire_name(),
       advertised_url:
         System.get_env("TIGHTBEAM_ADVERTISED_URL") ||
           Application.get_env(:tightbeam, :advertised_url),
@@ -58,23 +57,27 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     local_host_name = Keyword.fetch!(inputs, :local_host_name)
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
     binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
+    harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
 
     harness_checks =
-      Map.new(@harnesses, fn harness ->
+      Map.new(harnesses, fn harness ->
         {harness,
          [
-           harness_binary_check(binary_probe.(String.to_atom(harness), cli_bin), harness),
+           harness_binary_check(
+             binary_probe.(Tightbeam.Harness.parse!(harness).id(), cli_bin),
+             harness
+           ),
            harness_auth_check(catalog, harness)
          ]}
       end)
 
     ready_harnesses =
-      Enum.filter(@harnesses, fn harness ->
+      Enum.filter(harnesses, fn harness ->
         Enum.all?(Map.fetch!(harness_checks, harness), & &1.ok)
       end)
 
     harness_checks =
-      Enum.flat_map(@harnesses, fn harness ->
+      Enum.flat_map(harnesses, fn harness ->
         Enum.map(Map.fetch!(harness_checks, harness), fn check ->
           cond do
             check.ok -> check

@@ -13,15 +13,7 @@ if value = System.get_env("TIGHTBEAM_CWD") do
 end
 
 if value = System.get_env("TIGHTBEAM_DEFAULT_HARNESS") do
-  _ = [:claude, :codex]
-
-  harness =
-    case value do
-      "claude" -> String.to_existing_atom("claude")
-      "codex" -> String.to_existing_atom("codex")
-    end
-
-  config :tightbeam, :default_harness, harness
+  config :tightbeam, :default_harness, Tightbeam.Harness.parse!(value).id()
 end
 
 if value = System.get_env("TIGHTBEAM_DEFAULT_MODEL") do

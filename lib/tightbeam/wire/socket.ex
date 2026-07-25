@@ -455,6 +455,8 @@ defmodule Tightbeam.Wire.Socket do
 
     unless Org.get(db(state), key) do
       defaults = Map.fetch!(state.deps, :defaults)
+      provider = Map.fetch!(defaults, :provider)
+      provider = if is_function(provider, 0), do: provider.(), else: provider
 
       Org.create(db(state), %{
         session_key: key,
@@ -467,7 +469,7 @@ defmodule Tightbeam.Wire.Socket do
         archetype: Map.fetch!(defaults, :archetype),
         host: Tightbeam.Placement.local_host_name(),
         harness: defaults |> Map.fetch!(:harness) |> to_string(),
-        provider: defaults |> Map.fetch!(:provider) |> to_string(),
+        provider: to_string(provider),
         model: Map.fetch!(defaults, :model)
       })
     end

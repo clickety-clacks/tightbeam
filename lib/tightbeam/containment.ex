@@ -10,7 +10,21 @@ defmodule Tightbeam.Containment do
   def profile(write_roots) do
     validate_roots!(write_roots)
 
-    roots = Enum.map_join(write_roots, "\n", &~s|  (subpath "#{&1}")|)
+    additions =
+      Tightbeam.Harness.all()
+      |> Enum.flat_map(& &1.containment_additions())
+      |> Enum.uniq()
+
+    grants =
+      write_roots
+      |> Enum.map(&{&1, nil})
+      |> Kernel.++(additions)
+      |> Enum.with_index()
+      |> Enum.map_join("\n", fn {{path, comment}, index} ->
+        closing = if index == length(write_roots) + length(additions) - 1, do: ")", else: ""
+        line = ~s|  (subpath "#{path}")#{closing}|
+        if comment, do: String.pad_trailing(line, 34) <> ";; " <> comment, else: line
+      end)
 
     """
     (version 1)
@@ -21,9 +35,7 @@ defmodule Tightbeam.Containment do
 
     ;; writes: deny-by-default; org trees + spike-required system paths
     (allow file-write*
-    #{roots}
-      (subpath "/private/tmp")        ;; claude Terminal per-command workdir
-      (subpath "/dev"))               ;; claude session-new PTY allocation
+    #{grants}
 
     ;; process lifecycle
     (allow process-fork)

@@ -247,7 +247,8 @@ defmodule Tightbeam.Acp.AdapterTest do
                "preset" => "claude_code",
                "append" => "served guidance"
              }
-           }}
+           }},
+          {:fixture, %{"instructions" => "served guidance"}}
         ] do
       {adapter, capture_path} = start_adapter(harness: harness)
 
@@ -270,7 +271,9 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "surfaced codex account update reaches the credential callback" do
     owner = self()
-    {adapter, _capture_path} = start_adapter(on_auth_event: &send(owner, {:auth, &1}))
+
+    {adapter, _capture_path} =
+      start_adapter(harness: :codex, on_auth_event: &send(owner, {:auth, &1}))
 
     send(
       adapter,
@@ -286,7 +289,7 @@ defmodule Tightbeam.Acp.AdapterTest do
        }}
     )
 
-    assert_receive {:auth, %{"authMode" => nil, "planType" => nil}}
+    assert_receive {:auth, :terminal}
   end
 
   test "session updates reach the subagent marker callback with harness session identity" do

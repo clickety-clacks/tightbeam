@@ -19,7 +19,7 @@ defmodule Tightbeam.Wire.SocketTest do
         archetype: "default",
         host: "testhost",
         harness: :claude,
-        provider: :anthropic,
+        provider: fn -> :anthropic end,
         model: "fable"
       },
       ping_interval_ms: 60_000,

@@ -152,7 +152,7 @@ struct RawProcess {
     executable: Option<Vec<u8>>,
     cwd: Option<Vec<u8>>,
     elapsed_s: Option<u64>,
-    harnesses: Vec<&'static str>,
+    harnesses: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +212,7 @@ struct Candidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AdapterCandidate {
     pid: u32,
-    harness: &'static str,
+    harness: String,
     ppid: Option<u32>,
     pgid: Option<u32>,
     lineage: Option<String>,
@@ -335,21 +335,25 @@ fn exact_environ_token(bytes: &[u8]) -> Option<Vec<u8>> {
         .find_map(|entry| entry.strip_prefix(LINEAGE_KEY).map(ToOwned::to_owned))
 }
 
-fn adapter_harnesses(bytes: &[u8]) -> Vec<&'static str> {
-    let mut harnesses = Vec::new();
-    if bytes
-        .windows(b"claude-agent-acp".len())
-        .any(|window| window == b"claude-agent-acp")
-    {
-        harnesses.push("claude");
-    }
-    if bytes
-        .windows(b"codex-acp".len())
-        .any(|window| window == b"codex-acp")
-    {
-        harnesses.push("codex");
-    }
-    harnesses
+fn adapter_harnesses(
+    bytes: &[u8],
+    catalog: Option<&crate::harnesses::HarnessCatalog>,
+) -> Vec<String> {
+    catalog
+        .map(|catalog| {
+            catalog
+                .harnesses
+                .iter()
+                .filter(|harness| {
+                    harness.process_markers.iter().any(|marker| {
+                        let marker = marker.as_bytes();
+                        bytes.windows(marker.len()).any(|window| window == marker)
+                    })
+                })
+                .map(|harness| harness.wire_name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_stat(bytes: &[u8]) -> Option<(u32, u32, u64)> {
@@ -370,7 +374,11 @@ fn is_not_found(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound
 }
 
-fn collect_linux(io: &impl ProbeIo, own_pid: u32) -> Result<RawFacts, String> {
+fn collect_linux(
+    io: &impl ProbeIo,
+    own_pid: u32,
+    catalog: Option<&crate::harnesses::HarnessCatalog>,
+) -> Result<RawFacts, String> {
     let pids = io
         .proc_pids()
         .map_err(|_| "probe: process enumeration failed".to_owned())?;
@@ -412,7 +420,7 @@ fn collect_linux(io: &impl ProbeIo, own_pid: u32) -> Result<RawFacts, String> {
         };
         let harnesses = cmdline
             .as_deref()
-            .map(adapter_harnesses)
+            .map(|bytes| adapter_harnesses(bytes, catalog))
             .unwrap_or_default();
         if token.is_none() && harnesses.is_empty() {
             continue;
@@ -479,7 +487,11 @@ fn preferred_token(line: &[u8]) -> Option<Vec<u8>> {
         .or_else(|| tokens.into_iter().next())
 }
 
-fn parse_darwin_pass1(bytes: &[u8], own_pid: u32) -> Vec<RawProcess> {
+fn parse_darwin_pass1(
+    bytes: &[u8],
+    own_pid: u32,
+    catalog: Option<&crate::harnesses::HarnessCatalog>,
+) -> Vec<RawProcess> {
     let mut processes = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         let trimmed = line
@@ -501,7 +513,7 @@ fn parse_darwin_pass1(bytes: &[u8], own_pid: u32) -> Vec<RawProcess> {
         }
         let command = &trimmed[pid_end..];
         let token = preferred_token(command);
-        let harnesses = adapter_harnesses(command);
+        let harnesses = adapter_harnesses(command, catalog);
         if token.is_none() && harnesses.is_empty() {
             continue;
         }
@@ -643,7 +655,11 @@ fn note_failure(notes: &mut Vec<String>, command: &str, failure: CommandFailure)
     notes.push(format!("{command} {suffix}"));
 }
 
-fn collect_darwin(io: &impl ProbeIo, own_pid: u32) -> Result<RawFacts, String> {
+fn collect_darwin(
+    io: &impl ProbeIo,
+    own_pid: u32,
+    catalog: Option<&crate::harnesses::HarnessCatalog>,
+) -> Result<RawFacts, String> {
     let pass1 = io
         .command(
             "ps",
@@ -658,7 +674,7 @@ fn collect_darwin(io: &impl ProbeIo, own_pid: u32) -> Result<RawFacts, String> {
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.iter().all(|byte| byte.is_ascii_whitespace()))
         .count();
-    let mut processes = parse_darwin_pass1(&pass1, own_pid);
+    let mut processes = parse_darwin_pass1(&pass1, own_pid, catalog);
     let mut notes = Vec::new();
     if !processes.is_empty() {
         let list = pid_list(&processes);
@@ -884,7 +900,7 @@ fn assemble(
         for harness in process.harnesses {
             adapter_candidates.push(AdapterCandidate {
                 pid: common.pid,
-                harness,
+                harness: harness.clone(),
                 ppid: common.ppid,
                 pgid: common.pgid,
                 lineage: common.lineage.clone(),
@@ -899,7 +915,7 @@ fn assemble(
         }
     }
     marked_candidates.sort_by_key(|candidate| candidate.pid);
-    adapter_candidates.sort_by_key(|candidate| (candidate.pid, candidate.harness));
+    adapter_candidates.sort_by_key(|candidate| (candidate.pid, candidate.harness.clone()));
     let mut identity_candidates: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for candidate in &marked_candidates {
         if let Some(identity) = candidate
@@ -1050,7 +1066,7 @@ fn candidate_value(candidate: &Candidate) -> Value {
 fn adapter_candidate_value(candidate: &AdapterCandidate) -> Value {
     object([
         ("pid", Value::from(u64::from(candidate.pid))),
-        ("harness", Value::from(candidate.harness)),
+        ("harness", Value::from(candidate.harness.clone())),
         ("ppid", optional_u32(candidate.ppid)),
         ("pgid", optional_u32(candidate.pgid)),
         ("lineage", optional_string(&candidate.lineage)),
@@ -1332,14 +1348,21 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let probed_at_ms = u64::try_from(wall.as_millis()).unwrap_or(u64::MAX);
     let monotonic = Instant::now();
     let io = SystemIo;
+    let resolved_base_dir = resolve_base_dir(base_dir);
+    let harness_result = crate::harnesses::load_from(&resolved_base_dir);
+    let harness_error = harness_result.as_ref().err().cloned();
+    let harness_catalog = harness_result.as_ref().ok();
     let mut raw = match std::env::consts::OS {
-        "linux" => collect_linux(&io, std::process::id())?,
-        "macos" => collect_darwin(&io, std::process::id())?,
+        "linux" => collect_linux(&io, std::process::id(), harness_catalog)?,
+        "macos" => collect_darwin(&io, std::process::id(), harness_catalog)?,
         _ => return Err("probe: unsupported platform".to_owned()),
     };
+    if let Some(reason) = harness_error {
+        raw.notes.push(reason);
+    }
     add_elapsed(&io, &mut raw);
     let hostname = hostname(&io, &mut raw.notes);
-    let base_dir = inspect_base_dir(&io, &resolve_base_dir(base_dir), &mut raw.notes);
+    let base_dir = inspect_base_dir(&io, &resolved_base_dir, &mut raw.notes);
     let mut report = assemble(raw, probed_at_ms, 0, hostname, base_dir);
     report.collection_ms = u64::try_from(monotonic.elapsed().as_millis()).unwrap_or(u64::MAX);
     if json {
@@ -1430,6 +1453,24 @@ mod tests {
     }
 
     #[test]
+    fn fixture_process_marker_comes_from_the_projection() {
+        assert_eq!(
+            adapter_harnesses(
+                b"node fixture-acp",
+                Some(&crate::harnesses::catalog().unwrap())
+            ),
+            vec!["fixture".to_owned()]
+        );
+        assert!(
+            adapter_harnesses(
+                b"node absent-acp",
+                Some(&crate::harnesses::catalog().unwrap())
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn environ_is_exact_and_stat_uses_last_paren() {
         assert_eq!(
             exact_environ_token(b"X_TIGHTBEAM_LINEAGE=no\0TIGHTBEAM_LINEAGE=yes\0"),
@@ -1455,7 +1496,11 @@ mod tests {
 
     #[test]
     fn darwin_rows_distinguish_spoofable_marker_and_unmarked_adapter_evidence() {
-        let rows = parse_darwin_pass1(b"7 node TIGHTBEAM_LINEAGE=tb1-YUBi\n8 codex-acp\n", 999);
+        let rows = parse_darwin_pass1(
+            b"7 node TIGHTBEAM_LINEAGE=tb1-YUBi\n8 codex-acp\n",
+            999,
+            Some(&crate::harnesses::catalog().unwrap()),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].evidence, "argv_or_env_indistinguishable");
         assert_eq!(rows[1].evidence, "none_observed");
@@ -1505,7 +1550,7 @@ mod tests {
             .insert((12, "environ".into()), Err(io::ErrorKind::PermissionDenied));
         io.reads
             .insert((12, "cmdline".into()), Ok(b"other".to_vec()));
-        let raw = collect_linux(&io, 999).unwrap();
+        let raw = collect_linux(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
         assert_eq!(raw.pids_scanned, 3);
         assert_eq!(raw.pids_env_unreadable, Some(2));
         assert_eq!(raw.processes.len(), 2);
@@ -1538,7 +1583,7 @@ mod tests {
         );
         io.reads
             .insert((22, "cmdline".into()), Err(io::ErrorKind::PermissionDenied));
-        let raw = collect_linux(&io, 999).unwrap();
+        let raw = collect_linux(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
         assert_eq!(raw.pids_scanned, 3);
         assert_eq!(raw.processes.len(), 1);
         assert_eq!(raw.processes[0].pid, 22);
@@ -1560,7 +1605,12 @@ mod tests {
             Ok(b"TIGHTBEAM_LINEAGE=tb1-YUBi\0".to_vec()),
         );
         io.reads.insert((30, "cmdline".into()), Ok(Vec::new()));
-        assert!(collect_linux(&io, 999).unwrap().processes.is_empty());
+        assert!(
+            collect_linux(&io, 999, Some(&crate::harnesses::catalog().unwrap()))
+                .unwrap()
+                .processes
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1578,7 +1628,12 @@ mod tests {
             Ok(b"TIGHTBEAM_LINEAGE=tb1-YUBi\0".to_vec()),
         );
         io.reads.insert((31, "cmdline".into()), Ok(Vec::new()));
-        assert!(collect_linux(&io, 999).unwrap().processes.is_empty());
+        assert!(
+            collect_linux(&io, 999, Some(&crate::harnesses::catalog().unwrap()))
+                .unwrap()
+                .processes
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1595,7 +1650,7 @@ mod tests {
             );
             io.reads.insert((pid, "cmdline".into()), Ok(Vec::new()));
         }
-        let raw = collect_linux(&io, 40).unwrap();
+        let raw = collect_linux(&io, 40, Some(&crate::harnesses::catalog().unwrap())).unwrap();
         assert_eq!(raw.pids_scanned, 2);
         assert_eq!(
             raw.processes.iter().map(|row| row.pid).collect::<Vec<_>>(),
@@ -1614,7 +1669,7 @@ mod tests {
             ]),
             ..FakeIo::default()
         };
-        let raw = collect_darwin(&io, 999).unwrap();
+        let raw = collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
         assert_eq!(raw.processes.len(), 1);
         assert_eq!(raw.processes[0].ppid, None);
         assert_eq!(raw.processes[0].executable, None);
@@ -1625,7 +1680,12 @@ mod tests {
             commands: std::cell::RefCell::new(vec![Ok(pass1), Ok(Vec::new()), Ok(Vec::new())]),
             ..FakeIo::default()
         };
-        assert!(collect_darwin(&io, 999).unwrap().processes.is_empty());
+        assert!(
+            collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap()))
+                .unwrap()
+                .processes
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1638,7 +1698,10 @@ mod tests {
                 commands: std::cell::RefCell::new(vec![Err(failure)]),
                 ..FakeIo::default()
             };
-            assert_eq!(collect_darwin(&io, 999).unwrap_err(), expected);
+            assert_eq!(
+                collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap_err(),
+                expected
+            );
         }
     }
 
@@ -1652,7 +1715,7 @@ mod tests {
             ]),
             ..FakeIo::default()
         };
-        let raw = collect_darwin(&io, 999).unwrap();
+        let raw = collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
         let report = assemble(
             raw,
             1,
@@ -1682,7 +1745,7 @@ mod tests {
                 executable: Some(b"/x/\xff".to_vec()),
                 cwd: Some(b"/c/\xff".to_vec()),
                 elapsed_s: Some(3),
-                harnesses: vec!["codex"],
+                harnesses: vec!["codex".to_owned()],
             }],
             notes: Vec::new(),
         };
@@ -1850,7 +1913,7 @@ mod tests {
                     executable: Some(b"/bin/codex".to_vec()),
                     cwd: Some(b"/tmp/codex".to_vec()),
                     elapsed_s: Some(5),
-                    harnesses: vec!["codex"],
+                    harnesses: vec!["codex".to_owned()],
                 },
                 RawProcess {
                     pid: 4,
@@ -1861,7 +1924,7 @@ mod tests {
                     executable: Some(b"/bin/node".to_vec()),
                     cwd: Some(b"/work".to_vec()),
                     elapsed_s: Some(3),
-                    harnesses: vec!["claude", "codex"],
+                    harnesses: vec!["claude".to_owned(), "codex".to_owned()],
                 },
             ],
             notes: vec!["ps etime timed out".to_owned()],

@@ -141,6 +141,18 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
   end
 
+  test "authenticated harness projection route returns the registry bytes", ctx do
+    request =
+      conn(:get, "/harnesses")
+      |> put_req_header("authorization", "Bearer tbc_test")
+
+    response = Router.call(request, Router.init(ctx.opts))
+    expected = "[" <> Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <> "]"
+
+    assert response.status == 200
+    assert response.resp_body == expected
+  end
+
   test "kungfu scaffold crosses the closed CLI verb router with its attributed name", ctx do
     response =
       dispatch_cli(ctx, "tbc_test", %{

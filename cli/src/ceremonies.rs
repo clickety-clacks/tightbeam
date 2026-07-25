@@ -8,6 +8,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::args::{AssimilateArgs, Identity};
 use crate::dispatch::{self, RequestSpec};
+use crate::harnesses::HarnessCatalog;
 
 pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
     let machine = std::env::var("TIGHTBEAM_MACHINE").ok();
@@ -150,9 +151,9 @@ fn capture_setup_token(output: &str) -> Option<String> {
     })
 }
 
-fn validate_harnesses(harnesses: &[String]) -> Result<(), String> {
+fn validate_harnesses(harnesses: &[String], catalog: &HarnessCatalog) -> Result<(), String> {
     for harness in harnesses {
-        if !matches!(harness.as_str(), "claude" | "codex") {
+        if !catalog.contains(harness) {
             return Err(format!("unsupported harness: {harness}"));
         }
     }
@@ -223,7 +224,8 @@ pub fn assimilate(args: AssimilateArgs) -> Result<(), String> {
 }
 
 fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), String> {
-    validate_harnesses(&args.harnesses)?;
+    let catalog = &args.catalog;
+    validate_harnesses(&args.harnesses, &catalog)?;
     let host_name = args
         .name
         .clone()
@@ -270,8 +272,14 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
             dry_run,
             &args.ssh_dest,
             &format!(
-                "cd {} && npm install --prefix adapters @agentclientprotocol/claude-agent-acp @agentclientprotocol/codex-acp",
-                remote_path(&resolved_base)
+                "cd {} && npm install --prefix adapters {}",
+                remote_path(&resolved_base),
+                catalog
+                    .harnesses
+                    .iter()
+                    .map(|harness| harness.install_package.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
         )
         .map(|_| ())
@@ -539,16 +547,44 @@ mod tests {
             name: None,
             base_dir: "~/.tightbeam".to_owned(),
             harnesses: vec!["claude".to_owned(), "codex".to_owned()],
+            catalog: crate::harnesses::catalog().unwrap(),
             dry_run: false,
         }
     }
 
     #[test]
     fn validates_harnesses() {
+        let catalog = crate::harnesses::catalog().unwrap();
         assert_eq!(
-            validate_harnesses(&["other".to_owned()]),
+            validate_harnesses(&["fixture".to_owned()], &catalog),
+            Ok(())
+        );
+        assert_eq!(
+            validate_harnesses(&["other".to_owned()], &catalog),
             Err("unsupported harness: other".to_owned())
         );
+    }
+
+    #[test]
+    fn fixture_only_projection_drives_assimilation_provisioning() {
+        let mut io = FakeIo::default();
+        let mut fixture_args = args();
+        fixture_args.dry_run = true;
+        fixture_args.harnesses = vec!["fixture".to_owned()];
+        fixture_args.catalog = HarnessCatalog {
+            harnesses: vec![crate::harnesses::HarnessProjection {
+                id: "fixture".to_owned(),
+                wire_name: "fixture".to_owned(),
+                install_package: "fixture-package".to_owned(),
+                process_markers: vec!["fixture-acp".to_owned()],
+            }],
+        };
+
+        assimilate_with(&mut io, fixture_args).unwrap();
+        let transcript = io.logs.join("\n");
+        assert!(transcript.contains("fixture-package"));
+        assert!(!transcript.contains("claude-package"));
+        assert!(!transcript.contains("codex-package"));
     }
 
     #[test]
@@ -619,6 +655,11 @@ mod tests {
                 .unwrap()
                 .ends_with(":/Users/remote/.tightbeam/bin/tightbeam")
         );
+        let adapter_install = io.commands[3].1.last().unwrap();
+        assert!(adapter_install.contains("claude-package"));
+        assert!(adapter_install.contains("codex-package"));
+        assert!(adapter_install.contains("fixture-package"));
+        assert!(!adapter_install.contains("absent-package"));
         assert_eq!(
             io.dispatched,
             vec![

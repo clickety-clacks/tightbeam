@@ -23,7 +23,7 @@ defmodule Tightbeam.SubagentMarkers do
     principal      TEXT NOT NULL REFERENCES sessions(sessionKey),
     subagentRef    TEXT NOT NULL,
     sourceEventRef TEXT NOT NULL,
-    harness        TEXT NOT NULL CHECK (harness IN ('claude','codex')),
+    harness        TEXT NOT NULL CHECK (harness IN (__TIGHTBEAM_HARNESSES__)),
     at             INTEGER NOT NULL,
     UNIQUE (kind, sourceEventRef)
   );
@@ -34,7 +34,10 @@ defmodule Tightbeam.SubagentMarkers do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+    DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
+  end
 
   @doc "Append one canonical marker and nudge a matching wake after commit."
   @spec append(DB.server(), GenServer.server(), map()) :: map()
@@ -108,7 +111,7 @@ defmodule Tightbeam.SubagentMarkers do
   @spec consume_update(
           DB.server(),
           GenServer.server(),
-          :claude | :codex,
+          atom(),
           String.t(),
           String.t(),
           map()
@@ -213,51 +216,18 @@ defmodule Tightbeam.SubagentMarkers do
     do: encoded_ref("subagent", [source_session_ref, child_id])
 
   @doc false
-  def classify(:codex, %{
-        "toolCallId" => tool_call_id,
-        "_meta" => %{
-          "codex" => %{
-            "subagentTerminated" => %{"agentThreadId" => agent_thread_id}
-          }
-        }
-      }),
-      do: {:marker, "subagent_stop", tool_call_id, agent_thread_id}
+  def classify(harness, update) do
+    case Tightbeam.Harness.module!(harness).classify_subagent_event(update) do
+      {:subagent_start, refs} ->
+        {:marker, "subagent_start", refs.source_event_ref, refs.subagent_ref}
 
-  def classify(:codex, %{
-        "toolCallId" => tool_call_id,
-        "_meta" => %{
-          "codex" => %{
-            "subagent" => %{"threadId" => agent_thread_id, "activity" => "started"}
-          }
-        }
-      }),
-      do: {:marker, "subagent_start", tool_call_id, agent_thread_id}
+      {:subagent_stop, refs} ->
+        {:marker, "subagent_stop", refs.source_event_ref, refs.subagent_ref}
 
-  def classify(:codex, %{
-        "toolCallId" => tool_call_id,
-        "_meta" => %{
-          "codex" => %{
-            "subagent" => %{"threadId" => agent_thread_id, "activity" => "interrupted"}
-          }
-        }
-      }),
-      do: {:marker, "subagent_stop", tool_call_id, agent_thread_id}
-
-  def classify(:claude, %{
-        "toolCallId" => tool_call_id,
-        "_meta" => %{"claudeCode" => %{"subagentTerminated" => _termination}}
-      }),
-      do: {:marker, "subagent_stop", tool_call_id, tool_call_id}
-
-  def classify(:claude, %{
-        "sessionUpdate" => "tool_call",
-        "toolCallId" => tool_call_id,
-        "_meta" => %{"claudeCode" => %{"toolName" => tool_name}}
-      })
-      when tool_name in ["Agent", "Task"],
-      do: {:marker, "subagent_start", tool_call_id, tool_call_id}
-
-  def classify(_harness, _update), do: :skip
+      :skip ->
+        :skip
+    end
+  end
 
   defp parent_for_source_in_txn(txn, source_session_ref) do
     case Txn.q(

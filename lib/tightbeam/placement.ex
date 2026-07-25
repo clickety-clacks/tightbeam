@@ -65,7 +65,7 @@ defmodule Tightbeam.Placement do
   an unreachable host degrades exactly like a dead adapter, per spec.
   """
 
-  alias Tightbeam.{Archetypes, Containment, Homes, Identity, Org, Rails}
+  alias Tightbeam.{Archetypes, Containment, Harness, Homes, Identity, Org, Rails}
   import Bitwise
 
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
@@ -155,58 +155,21 @@ defmodule Tightbeam.Placement do
     materialize_identity(config, host, session, snapshot, cwd, opts)
   end
 
-  defp materialize_identity(_config, %{ssh: nil}, session, snapshot, cwd, _opts) do
-    Identity.materialize!(snapshot, String.to_existing_atom(session.harness), cwd)
-  end
-
-  defp materialize_identity(config, %{ssh: destination}, session, snapshot, cwd, opts) do
-    harness = String.to_existing_atom(session.harness)
+  defp materialize_identity(config, host, session, snapshot, cwd, opts) do
+    module = Harness.parse!(session.harness)
     sh = Keyword.get(opts, :sh, Map.get(config, :sh, &system_cmd/1))
 
-    stage_cwd =
-      Path.join([
-        config.base_dir,
-        "staging",
-        session.host,
-        "session-identity",
-        session.session_key
-      ])
-
-    try do
-      Identity.materialize!(snapshot, harness, stage_cwd)
-      relative_skills = harness_skills_path(harness)
-      staged_skills = Path.join(stage_cwd, relative_skills)
-      remote_skills = Path.join(cwd, relative_skills)
-      exclude_pattern = Path.join(relative_skills, "tightbeam__*")
-
-      reconcile_script =
-        "mkdir -p #{shell_quote(remote_skills)}; " <>
-          "find #{shell_quote(remote_skills)} -mindepth 1 -maxdepth 1 -name 'tightbeam__*' -exec rm -rf {} +; " <>
-          "root=$(git -C #{shell_quote(cwd)} rev-parse --show-toplevel 2>/dev/null || true); " <>
-          "if [ \"$root\" = #{shell_quote(cwd)} ]; then " <>
-          "exclude=$(git -C #{shell_quote(cwd)} rev-parse --git-path info/exclude); " <>
-          "mkdir -p \"$(dirname \"$exclude\")\"; " <>
-          "grep -qxF #{shell_quote(exclude_pattern)} \"$exclude\" 2>/dev/null || " <>
-          "printf '%s\\n' #{shell_quote(exclude_pattern)} >> \"$exclude\"; fi"
-
-      run!(
-        sh,
-        ["ssh" | @ssh_opts] ++ [destination, "sh", "-c", shell_quote(reconcile_script)]
-      )
-
-      run!(sh, [
-        "rsync",
-        "-a",
-        "-e",
-        Enum.join(["ssh" | @ssh_opts], " "),
-        staged_skills <> "/",
-        "#{destination}:#{remote_skills}/"
-      ])
-
+    module.materialize_skills(
+      %{
+        base_dir: config.base_dir,
+        host_config: host,
+        host_name: session.host,
+        session_key: session.session_key,
+        sh: sh
+      },
+      cwd,
       snapshot
-    after
-      File.rm_rf(stage_cwd)
-    end
+    )
   end
 
   @doc "Derive a session's durable workspace path without creating it."
@@ -524,10 +487,22 @@ defmodule Tightbeam.Placement do
   """
   @spec adapter_opts(map(), adapter_key()) :: keyword()
   def adapter_opts(config, {harness, identity_name, host} = key) do
+    module = Harness.module!(harness)
+
     lineage =
       "tb1-" <> Base.url_encode64("#{harness}@#{host}", padding: false)
 
     host_config = Map.fetch!(hosts(config.base_dir), host)
+    sh = Map.get(config, :sh, &system_cmd/1)
+
+    target = %{
+      base_dir: config.base_dir,
+      host_config: host_config,
+      host_name: host,
+      sh: sh,
+      cli_bin: config.cli_bin
+    }
+
     contained? = contained_runtime?(config, identity_name)
 
     if contained? and host_config.ssh != nil do
@@ -536,188 +511,113 @@ defmodule Tightbeam.Placement do
 
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
     home = deliver_home(config, key, deliver_opts)
-    binary = adapter_binary_path(harness, host_config)
-    rails? = harness == :codex and Rails.hook_settings() != nil
-
-    probe_opts =
-      if rails? do
-        probe_cwd = Path.join(host_config.base_dir, "work/gate-probe")
-        sh = Map.get(config, :sh, &system_cmd/1)
-
-        if host_config.ssh == nil do
-          File.rm_rf!(probe_cwd)
-        else
-          run!(sh, ["ssh" | @ssh_opts] ++ [host_config.ssh, "rm", "-rf", probe_cwd])
-        end
-
-        ensure_opts = [base_dir: config.base_dir]
-
-        ensure_opts =
-          if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
-
-        ensure_opts =
-          cond do
-            config[:sh_out] -> Keyword.put(ensure_opts, :sh_out, config.sh_out)
-            config[:sh] -> Keyword.put(ensure_opts, :sh_out, config.sh)
-            true -> ensure_opts
-          end
-
-        ensure_workdir(host_config, probe_cwd, "", ensure_opts)
-        [probe_cwd: probe_cwd, probe_model: "gpt-5.6-sol[medium]"]
-      else
-        []
-      end
 
     stderr_path =
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
 
-    if host_config.ssh == nil do
-      # Invariant: codex hooks are TRUST-gated under app-server; `bypass_hook_trust`
-      # is a thread/start request override only. codex-acp reads CODEX_CONFIG JSON
-      # from its environment and spreads it into every thread/start and thread/resume
-      # config map. The app-server emits the bypass warning both on stderr and as a
-      # per-thread config-warning session update; both are benign harness noise,
-      # contribute zero model-context bytes, and are never a boot or turn failure.
-      # Config.toml and `-c` cannot seed hook trust, app-server rejects the
-      # `--dangerously-bypass-hook-trust` flag, and the persisted trust store has no
-      # writable automation seam. CODEX_CONFIG is therefore the sole production seed.
-      codex_config_env =
-        if rails?,
-          do: [{"CODEX_CONFIG", codex_bypass_hook_trust_json()}],
-          else: []
+    common_env = [
+      {"TIGHTBEAM_HOME", config.base_dir},
+      {"TIGHTBEAM_MACHINE", host},
+      {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
+      {"TIGHTBEAM_LINEAGE", lineage}
+    ]
 
-      opts = [
+    remote_env =
+      if host_config.ssh do
+        [
+          "TIGHTBEAM_HOME=#{host_config.base_dir}",
+          "TIGHTBEAM_MACHINE=#{host}",
+          "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
+          "PATH=#{host_config[:cli_bin] || ""}:$PATH",
+          "TIGHTBEAM_LINEAGE=#{lineage}"
+        ]
+      else
+        []
+      end
+
+    plan =
+      module.prepare_launch(target, home,
+        common_env: common_env,
+        remote_env: remote_env,
+        lineage: lineage,
+        rails: Rails.hook_settings(),
+        ensure_workdir: &ensure_workdir/4,
+        sh_out: Map.get(config, :sh_out)
+      )
+
+    opts =
+      [
         harness: harness,
-        cmd: [binary],
         home: home,
         cwd: config.cwd,
         stderr_path: stderr_path,
-        on_auth_event: auth_event_handler(host, harness),
-        on_subagent_event: subagent_event_handler(config, host, harness),
-        env:
-          [
-            {"TIGHTBEAM_HOME", config.base_dir},
-            {"TIGHTBEAM_MACHINE", host},
-            {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
-            {"TIGHTBEAM_LINEAGE", lineage}
-          ] ++
-            harness_token_env(config.base_dir, harness) ++ codex_config_env
+        on_auth_event: auth_event_handler(host, module),
+        on_subagent_event: subagent_event_handler(config, host, module),
+        env: []
+      ]
+      |> Keyword.merge(plan)
+
+    if contained? do
+      write_roots = [
+        Path.join(host_config.base_dir, "work"),
+        home,
+        Tightbeam.Credentials.store_dir(
+          host_config.base_dir,
+          module.credential_provider()
+        )
       ]
 
-      if contained? do
-        write_roots = [
-          Path.join(host_config.base_dir, "work"),
-          home,
-          Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
-        ]
+      wrapper = Path.join(config.cli_bin, "tightbeam")
 
-        sh = Map.get(config, :sh, &system_cmd/1)
-        wrapper = Path.join(config.cli_bin, "tightbeam")
-
-        probe_result =
-          try do
-            sh.([wrapper, "contain-exec", "--check"])
-          rescue
-            error -> {:raised, error}
-          end
-
-        case probe_result do
-          {:raised, error} ->
-            containment_refused!(
-              config,
-              key,
-              "contain-exec probe failed: #{Exception.message(error)}"
-            )
-
-          {_output, 0} ->
-            :ok
-
-          {_output, exit} ->
-            containment_refused!(config, key, "contain-exec probe failed with exit #{exit}")
+      probe_result =
+        try do
+          sh.([wrapper, "contain-exec", "--check"])
+        rescue
+          error -> {:raised, error}
         end
 
-        profile =
-          try do
-            Containment.profile(write_roots)
-          rescue
-            error in [ArgumentError] ->
-              containment_refused!(config, key, Exception.message(error))
-          end
+      case probe_result do
+        {:raised, error} ->
+          containment_refused!(
+            config,
+            key,
+            "contain-exec probe failed: #{Exception.message(error)}"
+          )
 
-        Tightbeam.EventLog.lifecycle(
-          config.db,
-          "containment",
-          adapter_key_name(key),
-          "assembled; fs=workdir network=open; write-roots=#{Enum.join(write_roots, ",")}"
-        )
+        {_output, 0} ->
+          :ok
 
-        opts
-        |> Keyword.merge(probe_opts)
-        |> Keyword.put(:cmd, [wrapper, "contain-exec", "--profile", profile, "--", binary])
-        |> Keyword.put(:contained, true)
-      else
-        Keyword.merge(opts, probe_opts)
+        {_output, exit} ->
+          containment_refused!(config, key, "contain-exec probe failed with exit #{exit}")
       end
-    else
-      cli_bin = host_config[:cli_bin] || ""
-      home_env = if harness == :codex, do: "CODEX_HOME", else: "CLAUDE_CONFIG_DIR"
 
-      # The org token env, satellite edition: the token file lives on the
-      # SATELLITE (its auth store), unreadable at env-assembly time — so the
-      # value is a shell expansion evaluated remotely, the same
-      # remote-expansion trick as PATH=$PATH below. A missing file expands
-      # empty and the harness falls back to the auth store's credential
-      # file, exactly like the local branch.
-      token_env =
-        if harness == :claude do
-          token_path = Path.join([host_config.base_dir, "auth", "claude", "oauth-token"])
-          ["CLAUDE_CODE_OAUTH_TOKEN=$(cat #{token_path} 2>/dev/null)"]
-        else
-          []
+      profile =
+        try do
+          Containment.profile(write_roots)
+        rescue
+          error in [ArgumentError] ->
+            containment_refused!(config, key, Exception.message(error))
         end
 
-      # Same sole production trust-bypass seed as the local branch; single-quoted so
-      # the JSON survives the remote shell's second parse. codex-acp spreads it into
-      # thread/start and thread/resume; the stderr and per-thread config-warning
-      # notifications are benign, zero-context harness noise. Config.toml, `-c`, the
-      # rejected app-server flag, and the persisted trust store cannot seed this path.
-      codex_config_env =
-        if rails?,
-          do: ["CODEX_CONFIG='#{codex_bypass_hook_trust_json()}'"],
-          else: []
+      [binary] = Keyword.fetch!(opts, :cmd)
 
-      remote_env =
-        (token_env ++
-           [
-             "#{home_env}=#{home}",
-             "TIGHTBEAM_HOME=#{host_config.base_dir}",
-             "TIGHTBEAM_MACHINE=#{host}",
-             "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
-             "PATH=#{cli_bin}:$PATH",
-             "TIGHTBEAM_LINEAGE=#{lineage}"
-           ] ++ codex_config_env)
-        |> Enum.reject(&is_nil/1)
-
-      Keyword.merge(
-        [
-          harness: harness,
-          cmd:
-            ["ssh" | @ssh_opts] ++
-              [host_config.ssh, "exec", "env" | remote_env] ++ [binary],
-          home: home,
-          cwd: config.cwd,
-          stderr_path: stderr_path,
-          on_auth_event: auth_event_handler(host, harness),
-          on_subagent_event: subagent_event_handler(config, host, harness),
-          env: [{"TIGHTBEAM_LINEAGE", lineage}]
-        ],
-        probe_opts
+      Tightbeam.EventLog.lifecycle(
+        config.db,
+        "containment",
+        adapter_key_name(key),
+        "assembled; fs=workdir network=open; write-roots=#{Enum.join(write_roots, ",")}"
       )
+
+      opts
+      |> Keyword.put(:cmd, [wrapper, "contain-exec", "--profile", profile, "--", binary])
+      |> Keyword.put(:contained, true)
+    else
+      opts
     end
   end
 
   @doc "Derive the stored name for a normalized overridden identity."
-  @spec identity_name(map(), Archetypes.t(), map() | nil, :claude | :codex) :: String.t()
+  @spec identity_name(map(), Archetypes.t(), map() | nil, atom()) :: String.t()
   def identity_name(_config, archetype, nil, _harness), do: archetype.name
 
   def identity_name(config, archetype, overrides, harness) do
@@ -725,7 +625,7 @@ defmodule Tightbeam.Placement do
   end
 
   @doc false
-  @spec identity_name(map(), Archetypes.t(), map(), :claude | :codex, String.t()) :: String.t()
+  @spec identity_name(map(), Archetypes.t(), map(), atom(), String.t()) :: String.t()
   def identity_name(_config, archetype, nil, _harness, _source_identity_name), do: archetype.name
 
   def identity_name(config, archetype, overrides, _harness, source_identity_name) do
@@ -783,135 +683,48 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
-  Where a harness's ACP adapter lives on a host. Remote hosts have exactly
-  ONE answer — `<base_dir>/adapters/node_modules/.bin` — because adapters
-  are org-owned artifacts deployed by spinup to the org's lease; the old
-  per-host `adapter_bin_dir` hint was a drift-capable record of the kind
-  the topology ruling outlaws, and is no longer consulted (field removal
-  rides the assimilate-reduction follow-up). Local resolution is the
-  operator's repo checkout, unchanged.
-  """
-  @spec adapter_binary_path(:claude | :codex, host_config()) :: String.t()
-  def adapter_binary_path(harness, host_config) do
-    adapter = if harness == :codex, do: "codex-acp", else: "claude-agent-acp"
-
-    if host_config.ssh == nil do
-      Path.expand("../tightbeam/node_modules/.bin/#{adapter}", File.cwd!())
-    else
-      Path.join([host_config.base_dir, "adapters", "node_modules", ".bin", adapter])
-    end
-  end
-
-  @doc """
   Resolve and execute a harness CLI's version command without contacting the
   harness service. Codex prefers the projected operator-controlled shim.
   """
-  @spec harness_binary_probe(:claude | :codex, String.t(), keyword()) ::
+  @spec harness_binary_probe(atom(), String.t(), keyword()) ::
           {:ok, %{bin: String.t(), version: String.t()}}
           | {:error, :not_found}
           | {:error, {:exec_failed, String.t()}}
   def harness_binary_probe(harness, cli_bin, opts \\ []) do
-    find_executable = Keyword.get(opts, :find_executable, &System.find_executable/1)
-    timeout = Keyword.get(opts, :timeout, 2_000)
-    run = Keyword.get(opts, :run, &system_cmd/1)
+    Harness.module!(harness).probe_cli(%{
+      cli_bin: cli_bin,
+      find_executable: Keyword.get(opts, :find_executable, &System.find_executable/1),
+      timeout: Keyword.get(opts, :timeout, 2_000),
+      run: Keyword.get(opts, :run, &system_cmd/1)
+    })
+  end
 
-    with bin when is_binary(bin) <- harness_binary_path(harness, cli_bin, find_executable),
-         {:ok, {output, 0}} <- bounded_run(run, [bin, "--version"], timeout) do
-      {:ok, %{bin: bin, version: String.trim(output)}}
-    else
-      nil ->
-        {:error, :not_found}
-
-      {:ok, {output, status}} ->
-        {:error,
-         {:exec_failed, "exit=#{status} output=#{inspect(String.trim(to_string(output)))}"}}
-
-      {:error, detail} ->
-        {:error, {:exec_failed, detail}}
+  defp auth_event_handler(host, module) do
+    fn classification ->
+      if classification == :terminal do
+        Tightbeam.Credentials.mark_terminal(
+          module.credential_provider(),
+          %{"classification" => "terminal"},
+          Tightbeam.Credentials.server(host)
+        )
+      end
     end
   end
 
-  defp harness_binary_path(:codex, cli_bin, find_executable) do
-    shim = Path.join(cli_bin, "codex")
-    if File.exists?(shim), do: shim, else: find_executable.("codex")
-  end
-
-  defp harness_binary_path(:claude, _cli_bin, find_executable),
-    do: find_executable.("claude")
-
-  defp bounded_run(run, command, timeout) do
-    task =
-      Task.async(fn ->
-        try do
-          {:ok, run.(command)}
-        rescue
-          error -> {:error, Exception.message(error)}
-        catch
-          kind, reason -> {:error, "#{kind}: #{inspect(reason)}"}
-        end
-      end)
-
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, result} -> result
-      {:exit, reason} -> {:error, "runner exited: #{inspect(reason)}"}
-      nil -> {:error, "timed out after #{timeout}ms"}
-    end
-  end
-
-  # The thread/start and thread/resume trust-bypass override, as the one JSON object
-  # codex-acp expects in CODEX_CONFIG. Future CODEX_CONFIG values must merge here,
-  # never create a second exporter.
-  defp codex_bypass_hook_trust_json, do: ~s({"bypass_hook_trust":true})
-
-  # The org's own long-lived grant, injected as the harness's token env —
-  # the strongest form of the credential doctrine: an env token never
-  # refreshes, so there is no rotation and nothing to race. The file is
-  # written by the operator from `tightbeam setup`'s output (0600); absent
-  # file → the harness falls back to the auth store's credential file.
-  defp harness_token_env(base_dir, :claude) do
-    case File.read(Path.join([base_dir, "auth", "claude", "oauth-token"])) do
-      {:ok, token} -> [{"CLAUDE_CODE_OAUTH_TOKEN", String.trim(token)}]
-      _ -> []
-    end
-  end
-
-  defp harness_token_env(_base_dir, _harness), do: []
-
-  defp auth_event_handler(host, harness) do
-    provider = provider_for_harness(harness)
-
-    fn params ->
-      Tightbeam.Credentials.mark_terminal(
-        provider,
-        %{
-          "method" => "account/updated",
-          "params" => params
-        },
-        Tightbeam.Credentials.server(host)
-      )
-    end
-  end
-
-  defp subagent_event_handler(config, host, harness) do
+  defp subagent_event_handler(config, host, module) do
     db = Map.get(config, :db, Tightbeam.DB)
 
     fn harness_session_id, update ->
       Tightbeam.SubagentMarkers.consume_update(
         db,
         Tightbeam.WakeScheduler,
-        harness,
+        module.id(),
         host,
         harness_session_id,
         update
       )
     end
   end
-
-  defp provider_for_harness(:codex), do: :openai
-  defp provider_for_harness(:claude), do: :anthropic
-
-  defp harness_skills_path(:codex), do: Path.join([".codex", "skills"])
-  defp harness_skills_path(:claude), do: Path.join([".claude", "skills"])
 
   @doc """
   Materialize the home for an adapter key on its host per the moduledoc.
@@ -922,81 +735,30 @@ defmodule Tightbeam.Placement do
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
   def deliver_home(config, {harness, _identity_name, host}, opts \\ []) do
     host_config = Map.fetch!(hosts(config.base_dir), host)
-    spec = shared_projection_spec(config, harness, host)
+    module = Harness.module!(harness)
+    home = Homes.home_path(host_config.base_dir, host, harness)
+    sh = Keyword.get(opts, :sh, &system_cmd/1)
 
-    if host_config.ssh == nil do
-      Homes.project(config.base_dir, spec).home_path
-    else
-      stage_base = Path.join([config.base_dir, "staging", host])
-      staged_home = Homes.project(stage_base, spec).home_path
-      remote_home = Homes.home_path(host_config.base_dir, host, harness)
-
-      sh = Keyword.get(opts, :sh, &system_cmd/1)
-      remote_manifest = Path.join([remote_home, ".tightbeam", "manifest"])
-
-      {remote_stamp, stamp_exit} =
-        sh.(
-          ["ssh" | @ssh_opts] ++
-            [host_config.ssh, "cat", remote_manifest]
-        )
-
-      if stamp_exit not in [0, 1], do: raise("remote stamp check failed with exit #{stamp_exit}")
-
-      staged_stamp = File.read!(Path.join([staged_home, ".tightbeam", "manifest"]))
-
-      if remote_stamp != staged_stamp do
-        regenerate_remote_owned!(sh, host_config, harness, remote_home)
-      end
-
-      run!(sh, [
-        "rsync",
-        "-a",
-        "-e",
-        Enum.join(["ssh" | @ssh_opts], " "),
-        staged_home <> "/",
-        "#{host_config.ssh}:#{remote_home}/"
-      ])
-
-      auth_dir = Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
-      credential = credential_filename(harness)
-
-      link_script =
-        "source=\"#{Path.join(auth_dir, credential)}\"; " <>
-          "target=\"#{Path.join(remote_home, credential)}\"; " <>
-          "[ ! -e \"$source\" ] || [ -e \"$target\" ] || [ -L \"$target\" ] || ln -s \"$source\" \"$target\""
-
-      # ssh JOINS its argv into one remote command line and the remote
-      # shell RE-PARSES it — an unquoted compound script arrives as loose
-      # words and `sh -c` gets only the first. Quote for the second parse.
-      # (Caught live by the loopback satellite; invisible to injected-sh
-      # tests, which capture argv without executing it.)
-      run!(
-        sh,
-        ["ssh" | @ssh_opts] ++ [host_config.ssh, "sh", "-c", shell_quote(link_script)]
-      )
-
-      remote_home
-    end
-  end
-
-  defp regenerate_remote_owned!(sh, host_config, harness, remote_home) do
-    auth_dir = Path.join([host_config.base_dir, "auth", Atom.to_string(harness)])
-    credential = credential_filename(harness)
-    entry = Path.join(remote_home, credential)
-    store = Path.join(auth_dir, credential)
-    rails = Path.join(remote_home, rails_filename(harness))
-    manifest_dir = Path.join(remote_home, ".tightbeam")
-
-    script =
-      "mkdir -p \"#{auth_dir}\" \"#{remote_home}\"; " <>
-        "if [ -f \"#{entry}\" ] && [ ! -L \"#{entry}\" ]; then " <>
-        "cp \"#{entry}\" \"#{store}\" && chmod 600 \"#{store}\"; fi; " <>
-        "rm -f \"#{entry}\" \"#{rails}\"; rm -rf \"#{manifest_dir}\""
-
-    run!(
-      sh,
-      ["ssh" | @ssh_opts] ++ [host_config.ssh, "sh", "-c", shell_quote(script)]
+    module.reconcile_home(
+      %{
+        base_dir: config.base_dir,
+        host_config: host_config,
+        host_name: host,
+        sh: sh
+      },
+      home,
+      %{
+        harness: harness,
+        machine: host,
+        rails: Rails.hook_settings(),
+        auth_dir:
+          Tightbeam.Credentials.store_dir(
+            host_config.base_dir,
+            module.credential_provider()
+          )
+      }
     )
+    |> Map.fetch!(:home_path)
   end
 
   defp containment_refused!(config, key, reason) do
@@ -1021,27 +783,6 @@ defmodule Tightbeam.Placement do
     |> Base.encode16(case: :lower)
   end
 
-  defp shared_projection_spec(_config, :claude, host) do
-    %{
-      harness: :claude,
-      machine: host,
-      rails: encode_settings(Rails.hook_settings())
-    }
-  end
-
-  defp shared_projection_spec(_config, :codex, host) do
-    settings =
-      case Rails.hook_settings() do
-        nil -> nil
-        hooks -> update_in(hooks, ["hooks", "PreToolUse"], &(&1 ++ [Rails.probe_entry()]))
-      end
-
-    %{harness: :codex, machine: host, rails: encode_settings(settings)}
-  end
-
-  defp encode_settings(nil), do: nil
-  defp encode_settings(settings), do: JSON.encode!(settings)
-
   defp contained_runtime?(_config, "shared"), do: false
 
   defp contained_runtime?(config, identity_name) do
@@ -1050,12 +791,6 @@ defmodule Tightbeam.Placement do
     |> elem(0)
     |> then(&(&1.containment.fs == :workdir))
   end
-
-  defp credential_filename(:codex), do: "auth.json"
-  defp credential_filename(:claude), do: "oauth-token"
-
-  defp rails_filename(:codex), do: "hooks.json"
-  defp rails_filename(:claude), do: "settings.json"
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
 

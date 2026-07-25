@@ -10,7 +10,7 @@ defmodule Tightbeam.Credentials do
 
   use GenServer
 
-  alias Tightbeam.Homes
+  alias Tightbeam.{Harness, Homes, Rails}
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
@@ -89,13 +89,31 @@ defmodule Tightbeam.Credentials do
       }),
       do: true
 
+  def terminal_evidence?(_provider, %{"classification" => "terminal"}), do: true
+
   def terminal_evidence?(_provider, _evidence), do: false
+
+  @doc false
+  def store_harvested(base_dir, provider, bytes) do
+    path =
+      case provider do
+        :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
+        :anthropic -> Path.join([base_dir, "auth", "claude", "oauth-token"])
+      end
+
+    atomic_write!(path, bytes)
+    :ok
+  end
+
+  @doc false
+  def store_dir(base_dir, provider), do: Path.join([base_dir, "auth", harness_name(provider)])
 
   @impl true
   def init(opts) do
     {:ok,
      %{
        base_dir: Keyword.fetch!(opts, :base_dir),
+       staging_base_dir: Keyword.get(opts, :staging_base_dir, Keyword.fetch!(opts, :base_dir)),
        machine: Keyword.fetch!(opts, :machine),
        ssh: Keyword.get(opts, :ssh),
        sh: Keyword.get(opts, :sh, &system_cmd/1),
@@ -302,42 +320,61 @@ defmodule Tightbeam.Credentials do
   defp expired?(expires_at, now) when is_integer(expires_at), do: expires_at <= now
   defp expired?(_unknown, _now), do: false
 
-  defp credential_present?(%{ssh: nil} = state, :openai) do
-    state.base_dir
-    |> Homes.home_path(state.machine, :codex)
-    |> Path.join("auth.json")
-    |> File.exists?()
-  end
-
-  defp credential_present?(%{ssh: nil} = state, :anthropic) do
-    File.regular?(credential_store_path(state, :anthropic))
-  end
-
   defp credential_present?(state, provider) do
-    remote_success?(state, ["test", "-e", canonical_path(state, provider)])
+    target = credential_target(state)
+
+    provider
+    |> harnesses_for_provider()
+    |> Enum.any?(fn module ->
+      module.credential_ready?(
+        target,
+        Homes.home_path(state.base_dir, state.machine, module.id())
+      )
+    end)
   end
 
   defp write_credential!(state, :openai, credential) do
     path = credential_store_path(state, :openai)
     atomic_write!(path, credential.bytes)
-    relink_home_entry!(state, :codex, path, "auth.json")
+    reconcile_provider_homes(state, :openai)
     :ok
   end
 
   defp write_credential!(state, :anthropic, credential) do
     path = credential_store_path(state, :anthropic)
     atomic_write!(path, String.trim(credential.bytes) <> "\n")
-    relink_home_entry!(state, :claude, path, "oauth-token")
+    reconcile_provider_homes(state, :anthropic)
     :ok
   end
 
-  defp relink_home_entry!(state, harness, source, filename) do
-    home = Homes.home_path(state.base_dir, state.machine, harness)
-    File.mkdir_p!(home)
-    target = Path.join(home, filename)
-    File.rm(target)
-    File.ln_s!(source, target)
+  defp reconcile_provider_homes(state, provider) do
+    target = credential_target(state)
+
+    Enum.each(harnesses_for_provider(provider), fn module ->
+      module.reconcile_home(
+        target,
+        Homes.home_path(state.base_dir, state.machine, module.id()),
+        %{
+          harness: module.id(),
+          machine: state.machine,
+          rails: Rails.hook_settings(),
+          auth_dir: Path.dirname(credential_store_path(state, provider)),
+          harvest_auth: false
+        }
+      )
+    end)
   end
+
+  defp credential_target(state),
+    do: %{
+      base_dir: state.staging_base_dir,
+      host_config: %{ssh: state.ssh, base_dir: state.base_dir},
+      host_name: state.machine,
+      sh: state.sh
+    }
+
+  defp harnesses_for_provider(provider),
+    do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
 
   defp mark_onboarded!(state, provider, credential) do
     write_metadata!(state, provider, %{
@@ -412,11 +449,6 @@ defmodule Tightbeam.Credentials do
 
   defp credential_store_path(state, :anthropic),
     do: Path.join([state.base_dir, "auth", "claude", "oauth-token"])
-
-  defp canonical_path(state, :openai),
-    do: Path.join(Homes.home_path(state.base_dir, state.machine, :codex), "auth.json")
-
-  defp canonical_path(state, :anthropic), do: credential_store_path(state, :anthropic)
 
   defp harness_name(:openai), do: "codex"
   defp harness_name(:anthropic), do: "claude"
@@ -537,20 +569,21 @@ defmodule Tightbeam.Credentials do
   defp install_staged!(state, provider, path) do
     source = staged_path(provider, path)
     store = credential_store_path(state, provider)
-    home_entry = canonical_path(state, provider)
 
     script =
       "test -f #{shell_quote(source)} && " <>
-        "mkdir -p #{shell_quote(Path.dirname(store))} #{shell_quote(Path.dirname(home_entry))} && " <>
+        "mkdir -p #{shell_quote(Path.dirname(store))} && " <>
         "chmod 600 #{shell_quote(source)} && " <>
         "mv #{shell_quote(source)} #{shell_quote(store)} && " <>
-        "chmod 600 #{shell_quote(store)} && " <>
-        "rm -f #{shell_quote(home_entry)} && " <>
-        "ln -s #{shell_quote(store)} #{shell_quote(home_entry)}"
+        "chmod 600 #{shell_quote(store)}"
 
     case remote_command(state, ["sh", "-c", shell_quote(script)]) do
-      {_output, 0} -> {:ok, installed_metadata(provider)}
-      {output, status} -> {:error, {:credential_install_failed, status, String.trim(output)}}
+      {_output, 0} ->
+        reconcile_provider_homes(state, provider)
+        {:ok, installed_metadata(provider)}
+
+      {output, status} ->
+        {:error, {:credential_install_failed, status, String.trim(output)}}
     end
   end
 
@@ -598,10 +631,6 @@ defmodule Tightbeam.Credentials do
 
   defp cleanup_staging!(state, path) do
     remote_ok!(state, ["rm", "-rf", "--", path])
-  end
-
-  defp remote_success?(state, command) do
-    match?({_output, 0}, remote_command(state, command))
   end
 
   defp remote_ok!(state, command) do

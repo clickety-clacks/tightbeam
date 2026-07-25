@@ -10,13 +10,14 @@ defmodule Tightbeam.Identity do
   session cwd, and returns the OID to stamp on the session row.
   """
 
-  alias Tightbeam.Archetypes
+  alias Tightbeam.{Archetypes, Harness}
+  alias Tightbeam.Harness.Support
 
   @upstream "tightbeam/upstream"
   @live "tightbeam/live"
   @reserved_prefix "tightbeam__"
 
-  @type harness :: :claude | :codex
+  @type harness :: atom()
   @type snapshot :: %{
           revision: String.t(),
           archetype: Archetypes.t(),
@@ -76,11 +77,11 @@ defmodule Tightbeam.Identity do
 
     guidance =
       [
-        channel_guidance(harness),
         Archetypes.guidance(archetype, fragments),
         Map.fetch!(fragments, "operating-model.md")
       ]
       |> Enum.join("\n\n")
+      |> then(&Harness.module!(harness).session_config(%{identity: true}, &1).guidance)
 
     %{revision: revision, archetype: archetype, guidance: guidance, skills: skills}
   end
@@ -94,7 +95,67 @@ defmodule Tightbeam.Identity do
   """
   @spec materialize!(snapshot(), harness(), String.t()) :: snapshot()
   def materialize!(snapshot, harness, cwd) do
-    skills_root = Path.join(cwd, harness_skills_path(harness))
+    Harness.module!(harness).materialize_skills(
+      %{host_config: %{ssh: nil}, base_dir: cwd},
+      cwd,
+      snapshot
+    )
+  end
+
+  @doc false
+  def materialize_for_harness!(target, snapshot, cwd, relative_skills) do
+    if Support.local?(target) do
+      materialize_local!(snapshot, cwd, relative_skills)
+    else
+      stage_cwd =
+        Path.join([
+          target.base_dir,
+          "staging",
+          target.host_name,
+          "session-identity",
+          Map.fetch!(target, :session_key)
+        ])
+
+      try do
+        materialize_local!(snapshot, stage_cwd, relative_skills)
+        staged_skills = Path.join(stage_cwd, relative_skills)
+        remote_skills = Path.join(cwd, relative_skills)
+        exclude_pattern = Path.join(relative_skills, "#{@reserved_prefix}*")
+
+        script =
+          "mkdir -p #{Support.shell_quote(remote_skills)}; " <>
+            "find #{Support.shell_quote(remote_skills)} -mindepth 1 -maxdepth 1 -name 'tightbeam__*' -exec rm -rf {} +; " <>
+            "root=$(git -C #{Support.shell_quote(cwd)} rev-parse --show-toplevel 2>/dev/null || true); " <>
+            "if [ \"$root\" = #{Support.shell_quote(cwd)} ]; then " <>
+            "exclude=$(git -C #{Support.shell_quote(cwd)} rev-parse --git-path info/exclude); " <>
+            "mkdir -p \"$(dirname \"$exclude\")\"; " <>
+            "grep -qxF #{Support.shell_quote(exclude_pattern)} \"$exclude\" 2>/dev/null || " <>
+            "printf '%s\\n' #{Support.shell_quote(exclude_pattern)} >> \"$exclude\"; fi"
+
+        Support.run!(
+          target,
+          ["ssh" | Support.ssh_opts()] ++
+            [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+        )
+
+        Support.run!(target, [
+          "rsync",
+          "-a",
+          "-e",
+          Enum.join(["ssh" | Support.ssh_opts()], " "),
+          staged_skills <> "/",
+          "#{target.host_config.ssh}:#{remote_skills}/"
+        ])
+
+        snapshot
+      after
+        File.rm_rf(stage_cwd)
+      end
+    end
+  end
+
+  defp materialize_local!(snapshot, cwd, relative_skills) do
+    skills_root = Path.join(cwd, relative_skills)
     File.mkdir_p!(skills_root)
 
     elected =
@@ -113,7 +174,7 @@ defmodule Tightbeam.Identity do
     |> Enum.reject(&Map.has_key?(elected, &1))
     |> Enum.each(fn entry -> File.rm_rf!(Path.join(skills_root, entry)) end)
 
-    maybe_exclude_materialized_skills(cwd, harness)
+    maybe_exclude_materialized_skills(cwd, relative_skills)
     snapshot
   end
 
@@ -309,24 +370,11 @@ defmodule Tightbeam.Identity do
     end)
   end
 
-  defp channel_guidance(:codex) do
-    "Your Tight Beam archetype identity arrives as this Codex developer message. " <>
-      "It is authoritative and outranks product AGENTS.md instructions on conflict."
-  end
-
-  defp channel_guidance(:claude) do
-    "Your Tight Beam archetype identity arrives as this Claude system prompt. " <>
-      "It is authoritative and outranks product CLAUDE.md instructions on conflict."
-  end
-
-  defp harness_skills_path(:codex), do: Path.join([".codex", "skills"])
-  defp harness_skills_path(:claude), do: Path.join([".claude", "skills"])
-
-  defp maybe_exclude_materialized_skills(cwd, harness) do
+  defp maybe_exclude_materialized_skills(cwd, relative_skills) do
     case repo_root(cwd) do
       {:ok, root} ->
         if same_directory?(cwd, root) do
-          relative = Path.join(harness_skills_path(harness), "#{@reserved_prefix}*")
+          relative = Path.join(relative_skills, "#{@reserved_prefix}*")
           exclude = git_path!(cwd, "info/exclude")
           File.mkdir_p!(Path.dirname(exclude))
           append_line_once!(exclude, relative)

@@ -13,6 +13,6 @@ Upstreamable changes:
      _meta: { codex: { accountUpdated: notification.params } }
    }
 
-The executable, idempotent form lives in Tightbeam.CodexAcpPatch because
+The executable, idempotent form lives in Tightbeam.Harness.Codex because
 codex-acp is installed per host at runtime rather than committed in this
 repository.

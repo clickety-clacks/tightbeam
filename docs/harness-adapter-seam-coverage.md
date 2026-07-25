@@ -51,7 +51,7 @@ closed-world tests were inspected separately.
 | `lib/tightbeam/gateway.ex:287-290` | Codex-specific catalog option | `fetch_catalog/1` state owned by harness module | catalog startup parity |
 | `lib/tightbeam/gateway.ex:353-361` | hard-coded CLI readiness sweep | registry plus `probe_cli/1` | all registered harnesses probed; at least one required |
 | `lib/tightbeam/gateway.ex:808-817` | hard-coded org options and provider inference | registry; provider stamped on catalog entry | returned catalog/provider parity |
-| `lib/tightbeam/gateway.ex:958-967` | default harness provider mapping | `Harness.default/0` + `credential_provider/0` | default session parity |
+| `lib/tightbeam/gateway.ex:958-967` | default harness provider mapping | `Harness.default/0`; deferred default-session provider comes from the selected catalog entry | default session parity |
 | `lib/tightbeam/gateway.ex:986-1004` | Codex shim construction | `probe_cli/1` / harness-owned launch mechanics | pinned CLI/shim behavior parity |
 | `lib/tightbeam/gateway.ex:1158-1162` | hard-coded health inventory | registry | list response contains every registered harness |
 | `lib/tightbeam/gateway.ex:1568-1572` | two-field guidance snapshot | registry map | served guidance covers every harness |
@@ -69,7 +69,7 @@ closed-world tests were inspected separately.
 | `lib/tightbeam/placement.ex:526-704` | probe provisioning and complete local/remote launch recipes | `prepare_launch/3`, `probe_cli/1`, `session_config/2` | probe destruction/config/model/attestation; local/remote token injection |
 | `lib/tightbeam/placement.ex:794-914` | adapter/CLI lookup, token env, provider mapping, skill paths | `ensure_adapter/1`, `probe_cli/1`, `credential_provider/0`, `materialize_skills/3` | requested adapter re-check, CLI pinning, auth/subagent handlers |
 | `lib/tightbeam/placement.ex:923-1060` | local/remote home projection, remote preservation, rails/auth filenames | `reconcile_home/3` owns local and remote effects | railed/lawless and local/remote preservation parity |
-| `lib/tightbeam/rails.ex:26-37,116` | descriptive harness mechanics literals | production prose is rewritten generically; mechanics remain private to harness modules | literal scan |
+| `lib/tightbeam/rails.ex:26-37,116` | descriptive harness mechanics literals | documentation carve-out; the scan strips docs and checks the executable remainder | literal scan |
 | `lib/tightbeam/spinup.ex:16-214` | per-harness readiness, combined install literal, credential paths | harness `ensure_adapter/1` and `credential_ready?/2`; registry-wide `install_package/0` combiner | combined one-command install and requested executable re-check |
 | `lib/tightbeam/subagent_markers.ex:111,116-260` | closed type and private envelope decode | dispatch to `classify_subagent_event/1`; module consumes neutral result | both harness classification fixtures |
 | `lib/tightbeam/subagent_markers.ex:26` | persisted harness `CHECK` enum | persisted-enum carve-out; registry-derived DDL literal at schema construction | fixture marker persists |
