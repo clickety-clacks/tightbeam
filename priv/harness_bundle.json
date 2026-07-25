@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "authority": "harness-adapter-seam-v1.md#adding-a-harness-the-bundle-ready-r3",
+  "obligations": [
+    {
+      "id": "HB-01-BEHAVIOUR-CONFORMANCE",
+      "title": "Behaviour module and conformance vectors",
+      "description": "Implement every Tightbeam.Harness callback and supply every standardized conformance vector or an explicit named-divergence unsupported vector."
+    },
+    {
+      "id": "HB-02-REGISTRY",
+      "title": "Registry entry",
+      "description": "Add exactly one Harness.all/0 registry entry and no other harness dispatch in Elixir."
+    },
+    {
+      "id": "HB-03-ADAPTER",
+      "title": "ACP adapter and patches",
+      "description": "Vendor or identify the ACP adapter and keep pinned-version patch anchors for every required carrier missing from its wire."
+    },
+    {
+      "id": "HB-04-CATALOG",
+      "title": "Catalog source and bootstrap",
+      "description": "Supply a provider-stamped catalog source, its readiness bootstrap, and its doctor or preflight check."
+    },
+    {
+      "id": "HB-05-CAPABILITY-MATRIX",
+      "title": "Capability matrix and skill mirror",
+      "description": "Record every capability as parity or a named, negative-tested divergence and update the shipped tightbeam-harnesses skill in the same change."
+    },
+    {
+      "id": "HB-06-SMOKE",
+      "title": "Provisioned smoke leg",
+      "description": "Join the registry-driven smoke matrix with credential, catalog, model, and timing provisioning."
+    },
+    {
+      "id": "HB-07-CONFORMANCE-SUITE",
+      "title": "Shared conformance suite",
+      "description": "Pass the single branch-free parameterized suite for every registered harness and the permanent fixture harness."
+    }
+  ],
+  "vector_contract": {
+    "prepare_launch": {
+      "required_cases": [
+        "local_railed",
+        "local_lawless",
+        "remote_railed",
+        "remote_lawless"
+      ],
+      "oracle": "rendered plan env, argv, and serialized command equal the vector's expected form"
+    },
+    "ensure_adapter": {
+      "required_cases": [
+        "local_present",
+        "local_absent",
+        "remote_present",
+        "remote_absent"
+      ],
+      "oracle": "local absence refusal, remote install contribution string, patched fake-bundle bytes, and preserved bundle mode equal the vector's expected form"
+    },
+    "session_config": {
+      "required_cases": [
+        "session"
+      ],
+      "oracle": "exact _meta map equals the vector's expected map"
+    },
+    "reconcile_home": {
+      "required_cases": [
+        "sentinel_seeded_desired_set"
+      ],
+      "oracle": "observed write-set equals the expected write-set and sentinels outside it remain byte-identical"
+    },
+    "materialize_skills": {
+      "required_cases": [
+        "snapshot"
+      ],
+      "oracle": "cwd entries under the reserved namespace equal the expected entries"
+    },
+    "credential_ready?/harvest_credential": {
+      "required_cases": [
+        "present",
+        "absent",
+        "rotated"
+      ],
+      "oracle": "credential readiness boolean and harvested bytes equal the vector's expected values"
+    },
+    "probe_cli": {
+      "required_cases": [
+        "fake_cli"
+      ],
+      "oracle": "pinned CLI version and path decision equal the vector's expected values"
+    },
+    "containment_additions": {
+      "required_cases": [
+        "exact_grants"
+      ],
+      "oracle": "exact grant list equals the vector's expected list"
+    },
+    "classify_auth_event": {
+      "required_cases": [
+        "positive",
+        "negative"
+      ],
+      "oracle": "exact classification equals the expected classification; a missing positive envelope is an explicit named-divergence unsupported case"
+    },
+    "classify_subagent_event": {
+      "required_cases": [
+        "positive_start",
+        "positive_stop",
+        "negative"
+      ],
+      "oracle": "exact classification equals the expected classification; a missing positive envelope is an explicit named-divergence unsupported case"
+    },
+    "fetch_catalog": {
+      "required_cases": [
+        "valid",
+        "malformed",
+        "unavailable"
+      ],
+      "oracle": "provider-stamped entries or the exact source error equal the vector's expected result"
+    },
+    "wire_projection": {
+      "required_cases": [
+        "round_trip"
+      ],
+      "oracle": "decoded fields round-trip the manifest field list exactly"
+    }
+  },
+  "wire_projection_fields": [
+    "id",
+    "wire_name",
+    "install_package",
+    "process_markers"
+  ]
+}

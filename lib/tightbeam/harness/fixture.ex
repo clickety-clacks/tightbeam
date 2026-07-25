@@ -4,6 +4,11 @@ defmodule Tightbeam.Harness.Fixture do
 
   alias Tightbeam.Harness.Support
 
+  @adapter_version "1.0.0"
+  @adapter_package "fixture-acp"
+  @adapter_bundle "fixture.js"
+  @adapter_replacements [{"fixture-anchor", "fixture-patched"}]
+
   @impl true
   def id, do: :fixture
 
@@ -11,7 +16,7 @@ defmodule Tightbeam.Harness.Fixture do
   def wire_name, do: "fixture"
 
   @impl true
-  def credential_provider, do: :openai
+  def credential_provider, do: :fixture_provider
 
   @impl true
   def install_package, do: "@tightbeam/fixture-acp"
@@ -48,8 +53,10 @@ defmodule Tightbeam.Harness.Fixture do
   def ensure_adapter(target) do
     target =
       target
-      |> Map.put_new(:patch_adapter, fn _path -> :ok end)
-      |> Map.put(:remote_patch, fn _path, detail -> {:ok, detail} end)
+      |> Map.put_new(:patch_adapter, &patch_local/1)
+      |> Map.put_new(:remote_patch, fn _path, detail ->
+        {:ok, detail <> "; fixture adapter patched"}
+      end)
 
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
@@ -69,7 +76,7 @@ defmodule Tightbeam.Harness.Fixture do
     rails = if is_map(desired.rails), do: JSON.encode!(desired.rails), else: desired.rails
 
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
-      credential_names: ["auth.json"],
+      credential_names: ["fixture.json"],
       rails_filename: "fixture.rails"
     )
   end
@@ -92,12 +99,12 @@ defmodule Tightbeam.Harness.Fixture do
         credential_provider()
       )
 
-    Tightbeam.Homes.credential_ready?(target, store, ["auth.json"])
+    Tightbeam.Homes.credential_ready?(target, store, ["fixture.json"])
   end
 
   @impl true
   def harvest_credential(target, home),
-    do: Tightbeam.Homes.harvest_credential(target, home, "auth.json")
+    do: Tightbeam.Homes.harvest_credential(target, home, "fixture.json")
 
   @impl true
   def probe_cli(target) do
@@ -115,28 +122,150 @@ defmodule Tightbeam.Harness.Fixture do
   def classify_subagent_event(_event), do: :skip
 
   @impl true
-  def fetch_catalog(_state) do
-    {:ok,
-     [
-       %{
-         ref: "fixture-model",
-         display_name: "Fixture Model",
-         name: "Fixture Model",
-         efforts: [],
-         max_input_tokens: 1_024,
-         capabilities: %{},
-         provider: :openai
-       }
-     ]}
+  def fetch_catalog(state) do
+    fetch = get_in(state, [:options, :fixture_fetch]) || fn -> {:ok, :valid} end
+
+    case fetch.() do
+      {:ok, :valid} ->
+        {:ok,
+         [
+           %{
+             ref: "fixture-model",
+             display_name: "Fixture Model",
+             name: "Fixture Model",
+             efforts: [],
+             max_input_tokens: 1_024,
+             capabilities: %{},
+             provider: credential_provider()
+           }
+         ]}
+
+      {:ok, _malformed} ->
+        {:error, :malformed_catalog}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
+  def conformance_vectors do
+    source = "fixture-anchor"
+
+    valid_entry = %{
+      ref: "fixture-model",
+      display_name: "Fixture Model",
+      name: "Fixture Model",
+      efforts: [],
+      max_input_tokens: 1_024,
+      capabilities: %{},
+      provider: credential_provider()
+    }
+
+    Support.conformance_vectors(__MODULE__, %{
+      wire_name: wire_name(),
+      provider: credential_provider(),
+      home_scope: wire_name(),
+      home_env: "FIXTURE_HOME",
+      credential_file: "fixture.json",
+      rails_file: "fixture.rails",
+      rails: %{"fixture" => true},
+      skills_path: Path.join([".fixture", "skills"]),
+      local_extra_env: [],
+      rails_env: nil,
+      remote_prefix: fn _base, home -> ["FIXTURE_HOME=#{home}"] end,
+      remote_rails_env: nil,
+      railed_probe: false,
+      adapter_bin: "fixture-acp",
+      adapter_package: @adapter_package,
+      adapter_bundle: @adapter_bundle,
+      adapter_version: @adapter_version,
+      source: source,
+      patched: patch_adapter_source(source),
+      remote_patch_detail: "; fixture adapter patched",
+      session_meta: %{instructions: "vector guidance"},
+      containment: [],
+      cli_name: "fixture",
+      cli_version: "fixture vector 1.0",
+      probe_path: :discovered,
+      auth_events: [
+        %{
+          case: "positive",
+          envelope: %{"authMode" => nil, "planType" => nil},
+          expected: :unknown,
+          divergence: "DIV-AUTH-FIXTURE-UNSUPPORTED"
+        },
+        %{case: "negative", envelope: %{"unrelated" => true}, expected: :unknown}
+      ],
+      subagent_events: [
+        %{
+          case: "positive_start",
+          envelope: %{"fixture" => "start"},
+          expected: :skip,
+          divergence: "DIV-SUBAGENT-FIXTURE-UNSUPPORTED"
+        },
+        %{
+          case: "positive_stop",
+          envelope: %{"fixture" => "stop"},
+          expected: :skip,
+          divergence: "DIV-SUBAGENT-FIXTURE-UNSUPPORTED"
+        },
+        %{case: "negative", envelope: %{"unrelated" => true}, expected: :skip}
+      ],
+      catalog_expected: %{
+        "valid" => {:ok, [valid_entry]},
+        "malformed" => {:error, :malformed_catalog},
+        "unavailable" => {:error, :fixture_unavailable}
+      },
+      catalog_state: fn case_name, _base ->
+        fetch = fn ->
+          case case_name do
+            "valid" -> {:ok, :valid}
+            "malformed" -> {:ok, :malformed}
+            "unavailable" -> {:error, :fixture_unavailable}
+          end
+        end
+
+        %{options: %{fixture_fetch: fetch}}
+      end,
+      wire_projection: %{
+        "id" => "fixture",
+        "wire_name" => "fixture",
+        "install_package" => "@tightbeam/fixture-acp",
+        "process_markers" => ["fixture-acp"]
+      }
+    })
+  end
+
+  @doc false
+  def patch_adapter_source(source) do
+    Tightbeam.Harness.AdapterPatch.patch(
+      source,
+      @adapter_replacements,
+      wire_name(),
+      @adapter_version
+    )
   end
 
   defp adapter_binary(target) do
-    Path.join([
-      target.host_config.base_dir,
-      "adapters",
-      "node_modules",
-      ".bin",
-      "fixture-acp"
-    ])
+    Map.get(target, :adapter_binary) ||
+      Path.join([
+        target.host_config.base_dir,
+        "adapters",
+        "node_modules",
+        ".bin",
+        "fixture-acp"
+      ])
+  end
+
+  defp patch_local(path) do
+    Tightbeam.Harness.AdapterPatch.ensure!(
+      path,
+      @adapter_package,
+      @adapter_bundle,
+      @adapter_version,
+      @adapter_replacements,
+      wire_name()
+    )
   end
 end

@@ -1245,10 +1245,10 @@ defmodule Tightbeam.GatewayTest do
 
   test "registered fixture is selectable as the default spawn path and by tune", ctx do
     base_dir = role_test_base("fixture-default")
-    auth_dir = Path.join([base_dir, "auth", "codex"])
+    auth_dir = Path.join([base_dir, "auth", "fixture"])
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
-    File.write!(Path.join(auth_dir, "auth.json"), "fixture-token")
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
     File.mkdir_p!(Path.dirname(adapter))
     File.write!(adapter, "#!/bin/sh\n")
     File.chmod!(adapter, 0o755)
@@ -1273,7 +1273,7 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert %{harness: "fixture", provider: "openai", model: "fixture-model"} =
+    assert %{harness: "fixture", provider: "fixture_provider", model: "fixture-model"} =
              Org.get(ctx.db, spawned_key)
 
     assert %{ok: true, harness: "fixture", model: "fixture-model"} =
@@ -1287,12 +1287,12 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert %{harness: "fixture", provider: "openai"} = Org.get(ctx.db, "k1")
+    assert %{harness: "fixture", provider: "fixture_provider"} = Org.get(ctx.db, "k1")
 
     fixture_home = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
 
-    assert File.read_link!(Path.join(fixture_home, "auth.json")) ==
-             Path.join(auth_dir, "auth.json")
+    assert File.read_link!(Path.join(fixture_home, "fixture.json")) ==
+             Path.join(auth_dir, "fixture.json")
   end
 
   test "spawn admits only its matching reserved remedy principal", ctx do
@@ -3462,7 +3462,7 @@ defmodule Tightbeam.GatewayTest do
         archetype: "default",
         host: "testhost",
         harness: "fixture",
-        provider: "openai",
+        provider: "fixture_provider",
         model: "fixture-model"
       })
 
@@ -3531,11 +3531,11 @@ defmodule Tightbeam.GatewayTest do
     assert :ok = Credentials.mark_terminal(:openai, evidence, server)
     assert_receive :parked
 
-    terminal_frames = collect_pushes(6, [])
+    terminal_frames = collect_pushes(4, [])
 
     assert Enum.frequencies_by(terminal_frames, & &1["type"]) == %{
-             "message" => 3,
-             "stream_updated" => 3
+             "message" => 2,
+             "stream_updated" => 2
            }
 
     assert MapSet.new(
@@ -3548,13 +3548,13 @@ defmodule Tightbeam.GatewayTest do
                  } <- terminal_frames,
                  content =~ "credential" and content =~ "parked pending re-onboarding",
                  do: key
-           ) == MapSet.new([first.session_key, second.session_key, fixture_session.session_key])
+           ) == MapSet.new([first.session_key, second.session_key])
 
     assert MapSet.new(
              for %{"type" => "stream_updated", "stream" => %{"sessionKey" => key}} <-
                    terminal_frames,
                  do: key
-           ) == MapSet.new([first.session_key, second.session_key, fixture_session.session_key])
+           ) == MapSet.new([first.session_key, second.session_key])
 
     assert :ok = Credentials.mark_terminal(:openai, evidence, server)
     refute_receive :parked
@@ -3562,11 +3562,11 @@ defmodule Tightbeam.GatewayTest do
     refute_receive {:push_message, _, _, _}
 
     assert :ok = Credentials.onboard(:openai, server)
-    onboarded_frames = collect_pushes(6, [])
+    onboarded_frames = collect_pushes(4, [])
 
     assert Enum.frequencies_by(onboarded_frames, & &1["type"]) == %{
-             "message" => 3,
-             "stream_updated" => 3
+             "message" => 2,
+             "stream_updated" => 2
            }
 
     assert MapSet.new(
@@ -3582,7 +3582,6 @@ defmodule Tightbeam.GatewayTest do
            ) ==
              MapSet.new([
                second.session_key,
-               fixture_session.session_key,
                "agent:credential-late"
              ])
 
@@ -3593,9 +3592,10 @@ defmodule Tightbeam.GatewayTest do
            ) ==
              MapSet.new([
                second.session_key,
-               fixture_session.session_key,
                "agent:credential-late"
              ])
+
+    assert Org.get(ctx.db, fixture_session.session_key).provider == "fixture_provider"
   end
 
   test "provider onboarding starts every matching harness and aggregates runtime failures",
@@ -3635,13 +3635,28 @@ defmodule Tightbeam.GatewayTest do
     assert {:error,
             {:provider_runtime_start_failed,
              %{
-               started: ["fixture"],
+               started: [],
                failed: [%{harness: "codex", reason: :codex_failed}]
              }}} = Credentials.onboard(:openai, server)
 
     assert_receive {:runtime_start, {:codex, "shared", "testhost"}}
-    assert_receive {:runtime_start, {:fixture, "shared", "testhost"}}
+    refute_receive {:runtime_start, {:fixture, "shared", "testhost"}}
     refute Credentials.status(:openai, server) == :onboarded
+
+    fixture_opts =
+      credential_opts
+      |> Keyword.put(:name, nil)
+      |> Keyword.put(:stop, fn _provider -> :ok end)
+      |> Keyword.put(:resume, fn _provider -> :ok end)
+      |> Keyword.put(:onboarders, %{
+        fixture_provider: fn _state ->
+          {:ok, %{bytes: "fixture-provider-credential", expires_at: nil}}
+        end
+      })
+
+    {:ok, fixture_server} = Credentials.start_link(fixture_opts)
+    assert :ok = Credentials.onboard(:fixture_provider, fixture_server)
+    assert_receive {:runtime_start, {:fixture, "shared", "testhost"}}
   end
 
   defp gateway_config(base_dir, db, port) do

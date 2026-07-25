@@ -1675,8 +1675,14 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  @onboarding_providers ["openai", "anthropic"] ++
+                          if(Application.compile_env(:tightbeam, :fixture_harness, false),
+                            do: ["fixture-provider"],
+                            else: []
+                          )
+
   defp onboard_result(config, %{params: %{provider: provider, phase: phase} = params})
-       when provider in ["openai", "anthropic"] and phase in ["begin", "finish", "cancel"] do
+       when provider in @onboarding_providers and phase in ["begin", "finish", "cancel"] do
     machine = params[:machine] || Placement.local_host_name()
 
     case Map.has_key?(Placement.hosts(config.base_dir), machine) do
@@ -1722,6 +1728,7 @@ defmodule Tightbeam.Gateway do
 
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic
+  defp provider_atom("fixture-provider"), do: :fixture_provider
 
   defp role_bind_result(db, call) do
     name = call.params[:name]

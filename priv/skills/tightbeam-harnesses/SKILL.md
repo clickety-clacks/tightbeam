@@ -7,39 +7,41 @@ Per-harness feature support: FACTS, not guesses. Consult this before
 promising any feature on a specific harness; a feature not listed here
 diverges nowhere. Never say "probably" about a row below.
 
-claude (via claude-agent-acp):
-- Skills: NATIVE — discovered from the session cwd's `.claude/skills/`, invoked via
-  the Skill tool.
-- Rails gates: ENFORCED — PreToolUse hooks refuse matching tool calls
-  before execution; a refusal quoting "[gate: <name>]" is the runtime
-  acting, not the model declining.
-- Credentials: REQUIRED long-lived setup-token grant injected through
-  `CLAUDE_CODE_OAUTH_TOKEN`; rotating `.credentials.json` is not used.
-- Slash commands: /clear /compact /model verified as passthrough.
-- Emits per-turn context-usage telemetry.
-- Subagent starts and true task settlement are observable as parent-attributed
-  markers; wake-on-stop resolves the parent's Agent/Task tool-call id.
+Canonical capability IDs (the full proof references live in
+`harness-support.md`):
 
-codex (via codex-acp):
-- Skills: discovered from the session cwd's `.codex/skills/` under the
-  reserved `tightbeam__*` namespace.
-- Rails gates: ENFORCED through Codex PreToolUse hooks after the adapter's
-  boot wiring-check passes.
-- Credentials: one shared `auth.json`; the one shared Codex runtime is its
-  sole refresher/writer while live.
-- Slash-command vocabulary differs from claude and is unverified — do
-  not promise specific commands.
-- Verified working: turns, tool use, developer-instruction identity,
-  per-session skills, gpt-5.6-sol model selection. Headless login
-  exists: codex login --device-auth.
-- Subagent starts and child-thread settlement are observable as
-  parent-attributed markers; wake-on-stop resolves the parent's spawn
-  tool-call id.
+- CAP-001 sessions/turns/cancel/load: PARITY.
+- CAP-002 model+effort: Codex PARITY; Claude
+  `DIV-MODEL-CLAUDE-ENVIRONMENT` because its offered set can depend on cwd and
+  settings. A refusal must preserve a loaded session.
+- CAP-003 slash commands: PARITY passthrough. Claude `/clear /compact /model`
+  are verified. Codex vocabulary is known:
+  `/status /mcp /skills /review /review-branch /review-commit /compact
+  /logout /new /clear`, plus configured skills.
+- CAP-004 projected identity: PARITY through Claude system-prompt metadata and
+  Codex developer-instruction metadata.
+- CAP-005 native skills: PARITY progressive disclosure under
+  `.claude/skills` / `.codex/skills`; Tightbeam owns `tightbeam__*` only.
+- CAP-006 vendor-native skills/commands: PARITY and preserved additively.
+- CAP-007 gate statutes: PARITY; Claude PreToolUse settings and Codex
+  PreToolUse hooks after the fail-closed boot wiring-check.
+- CAP-008 future block/check tiers: reserved named divergence on both; do not
+  claim allow/ask/rewrite support.
+- CAP-009 credential file lifecycle: PARITY, including stopped-runtime harvest.
+- CAP-010 token environment: PARITY mechanisms; no subscription-longevity
+  equivalence is claimed.
+- CAP-011 onboarding: PARITY through `tightbeam onboard <provider>`.
+- CAP-012 progress: PARITY rich ACP updates.
+- CAP-013 usage telemetry: PARITY emission.
+- CAP-014 compaction: Claude `DIV-COMPACTION-CLAUDE-ABSENT`; Codex emits a
+  structured event but Tightbeam does not project it, so
+  `DIV-COMPACTION-CODEX-UNPROJECTED` is an explicit Tightbeam gap.
+- CAP-015 hash-gated homes: PARITY preservation.
+- CAP-016 harness switching: PARITY with the history barrier.
+- CAP-017 auth-event classification: Claude
+  `DIV-AUTH-CLAUDE-UNKNOWN` (always `:unknown`); Codex classifies terminal and
+  transient account updates.
 
-Both: sessions/turns/cancel/load, model+effort selection, served instruction
-identity, generic shared homes with surviving session state, and harness
-switching with the history barrier. Neither:
-structured compaction events — compaction is invisible to the substrate
-today. The full matrix with mechanisms lives in the spec repo
-(harness-support.md); if reality disagrees with this skill, say so and
-flag the operator — this file is maintained law, not folklore.
+No capability may be described as unverified: a missing proof blocks the
+claim. If reality disagrees with the canonical matrix, flag the operator and
+amend the matrix, its negative test, and this mirror together.

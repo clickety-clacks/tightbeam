@@ -131,7 +131,7 @@ defmodule Tightbeam.Harness.Codex do
     target =
       target
       |> Map.put_new(:patch_adapter, &patch_local/1)
-      |> Map.put(:remote_patch, &patch_remote(target, &1, &2))
+      |> Map.put_new(:remote_patch, &patch_remote(target, &1, &2))
 
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
@@ -309,6 +309,133 @@ defmodule Tightbeam.Harness.Codex do
     end
   end
 
+  @impl true
+  def conformance_vectors do
+    source = Enum.map_join(@adapter_replacements, "\n", &elem(&1, 0))
+    levels = [%{"effort" => "medium"}]
+
+    valid_entry = %{
+      ref: "codex-vector[medium]",
+      display_name: "Codex Vector",
+      name: "Codex Vector",
+      efforts: ["medium"],
+      max_input_tokens: 2_000,
+      capabilities: %{"supported_reasoning_levels" => levels},
+      provider: :openai
+    }
+
+    Support.conformance_vectors(__MODULE__, %{
+      wire_name: wire_name(),
+      provider: credential_provider(),
+      home_scope: wire_name(),
+      home_env: "CODEX_HOME",
+      credential_file: "auth.json",
+      rails_file: "hooks.json",
+      rails: %{"hooks" => %{"PreToolUse" => []}},
+      skills_path: Path.join([".codex", "skills"]),
+      local_extra_env: [],
+      rails_env: {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})},
+      remote_prefix: fn _base, home -> ["CODEX_HOME=#{home}"] end,
+      remote_rails_env: "CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'",
+      railed_probe: true,
+      adapter_bin: "codex-acp",
+      adapter_package: @adapter_package,
+      adapter_bundle: @adapter_bundle,
+      adapter_version: @adapter_version,
+      source: source,
+      patched: patch_adapter_source(source),
+      remote_patch_detail: "; codex adapter patched",
+      session_meta: %{developerInstructions: "vector guidance"},
+      containment: [],
+      cli_name: "codex",
+      cli_version: "codex vector 1.0",
+      probe_path: :shim,
+      auth_events: [
+        %{
+          case: "positive",
+          envelope: %{
+            "_meta" => %{
+              "codex" => %{
+                "accountUpdated" => %{"authMode" => nil, "planType" => nil}
+              }
+            }
+          },
+          expected: :terminal
+        },
+        %{case: "negative", envelope: %{"unrelated" => true}, expected: :unknown}
+      ],
+      subagent_events: [
+        %{
+          case: "positive_start",
+          envelope: %{
+            "toolCallId" => "codex-call",
+            "_meta" => %{
+              "codex" => %{
+                "subagent" => %{
+                  "threadId" => "codex-thread",
+                  "activity" => "started"
+                }
+              }
+            }
+          },
+          expected:
+            {:subagent_start, %{source_event_ref: "codex-call", subagent_ref: "codex-thread"}}
+        },
+        %{
+          case: "positive_stop",
+          envelope: %{
+            "toolCallId" => "codex-call",
+            "_meta" => %{
+              "codex" => %{
+                "subagentTerminated" => %{"agentThreadId" => "codex-thread"}
+              }
+            }
+          },
+          expected:
+            {:subagent_stop, %{source_event_ref: "codex-call", subagent_ref: "codex-thread"}}
+        },
+        %{case: "negative", envelope: %{"toolCallId" => "codex-call"}, expected: :skip}
+      ],
+      catalog_expected: %{
+        "valid" => {:ok, [valid_entry]},
+        "malformed" => {:error, :malformed_catalog},
+        "unavailable" => {:error, :missing_cache}
+      },
+      catalog_state: fn case_name, base ->
+        body =
+          JSON.encode!(%{
+            "models" => [
+              %{
+                "slug" => "codex-vector",
+                "display_name" => "Codex Vector",
+                "supported_reasoning_levels" => levels,
+                "max_input_tokens" => 2_000
+              }
+            ]
+          })
+
+        read = fn _path ->
+          case case_name do
+            "valid" -> {:ok, body}
+            "malformed" -> {:ok, "{}"}
+            "unavailable" -> {:error, :enoent}
+          end
+        end
+
+        %{
+          base_dir: base,
+          options: %{codex_home: Path.join(base, "home"), codex_read: read}
+        }
+      end,
+      wire_projection: %{
+        "id" => "codex",
+        "wire_name" => "codex",
+        "install_package" => "@agentclientprotocol/codex-acp",
+        "process_markers" => ["codex-acp"]
+      }
+    })
+  end
+
   defp decode_catalog(body) when is_binary(body) do
     case JSON.decode(body) do
       {:ok, %{"models" => models}} when is_list(models) -> {:ok, models}
@@ -365,17 +492,18 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   defp adapter_binary(target) do
-    if Support.local?(target) do
-      Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
-    else
-      Path.join([
-        target.host_config.base_dir,
-        "adapters",
-        "node_modules",
-        ".bin",
-        "codex-acp"
-      ])
-    end
+    Map.get(target, :adapter_binary) ||
+      if Support.local?(target) do
+        Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
+      else
+        Path.join([
+          target.host_config.base_dir,
+          "adapters",
+          "node_modules",
+          ".bin",
+          "codex-acp"
+        ])
+      end
   end
 
   defp patch_remote(target, path, detail) do

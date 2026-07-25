@@ -81,6 +81,12 @@ fn run_provider_onboarding(provider: &str, staging: &str) -> Result<(), String> 
     match provider {
         "openai" => run_openai_onboarding(staging),
         "anthropic" => run_anthropic_onboarding(staging),
+        #[cfg(test)]
+        "fixture-provider" => std::fs::write(
+            std::path::Path::new(staging).join("fixture.json"),
+            "fixture-provider-credential",
+        )
+        .map_err(|error| error.to_string()),
         _ => Err(format!("unsupported provider: {provider}")),
     }
 }
@@ -502,6 +508,25 @@ fn target_from_probe(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_provider_materializes_its_staged_credential() {
+        let staging =
+            std::env::temp_dir().join(format!("tightbeam-fixture-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).unwrap();
+
+        assert_eq!(
+            run_provider_onboarding("fixture-provider", staging.to_str().unwrap()),
+            Ok(())
+        );
+        assert_eq!(
+            std::fs::read_to_string(staging.join("fixture.json")).unwrap(),
+            "fixture-provider-credential"
+        );
+
+        std::fs::remove_dir_all(staging).unwrap();
+    }
 
     #[derive(Default)]
     struct FakeIo {

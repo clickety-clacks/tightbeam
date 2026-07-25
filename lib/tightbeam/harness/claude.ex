@@ -77,7 +77,7 @@ defmodule Tightbeam.Harness.Claude do
     target =
       target
       |> Map.put_new(:patch_adapter, &patch_local/1)
-      |> Map.put(:remote_patch, &patch_remote(target, &1, &2))
+      |> Map.put_new(:remote_patch, &patch_remote(target, &1, &2))
 
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
@@ -203,6 +203,134 @@ defmodule Tightbeam.Harness.Claude do
       [] -> {:error, :empty_inventory}
       _ -> {:error, :malformed_catalog}
     end
+  end
+
+  @impl true
+  def conformance_vectors do
+    source = Enum.map_join(@adapter_replacements, "\n", &elem(&1, 0))
+
+    valid_entry = %{
+      ref: "claude-vector[low]",
+      display_name: "Claude Vector",
+      name: "Claude Vector",
+      efforts: ["low"],
+      max_input_tokens: 1_000,
+      capabilities: %{"effort" => %{"low" => %{"supported" => true}}},
+      provider: :anthropic
+    }
+
+    Support.conformance_vectors(__MODULE__, %{
+      wire_name: wire_name(),
+      provider: credential_provider(),
+      home_scope: wire_name(),
+      home_env: "CLAUDE_CONFIG_DIR",
+      credential_file: "oauth-token",
+      rails_file: "settings.json",
+      rails: %{"hooks" => %{"PreToolUse" => []}},
+      skills_path: Path.join([".claude", "skills"]),
+      local_extra_env: [{"CLAUDE_CODE_OAUTH_TOKEN", "vector-token"}],
+      rails_env: nil,
+      remote_prefix: fn base, home ->
+        [
+          "CLAUDE_CODE_OAUTH_TOKEN=$(cat #{Path.join([base, "auth", "claude", "oauth-token"])} 2>/dev/null)",
+          "CLAUDE_CONFIG_DIR=#{home}"
+        ]
+      end,
+      remote_rails_env: nil,
+      railed_probe: false,
+      adapter_bin: "claude-agent-acp",
+      adapter_package: @adapter_package,
+      adapter_bundle: @adapter_bundle,
+      adapter_version: @adapter_version,
+      source: source,
+      patched: patch_adapter_source(source),
+      remote_patch_detail: "; claude adapter patched",
+      session_meta: %{
+        systemPrompt: %{
+          type: "preset",
+          preset: "claude_code",
+          append: "vector guidance"
+        }
+      },
+      containment: [
+        {"/private/tmp", "claude Terminal per-command workdir"},
+        {"/dev", "claude session-new PTY allocation"}
+      ],
+      cli_name: "claude",
+      cli_version: "claude vector 1.0",
+      probe_path: :discovered,
+      auth_events: [
+        %{
+          case: "positive",
+          envelope: %{"authMode" => nil, "planType" => nil},
+          expected: :unknown,
+          divergence: "DIV-AUTH-CLAUDE-UNKNOWN"
+        },
+        %{case: "negative", envelope: %{"unrelated" => true}, expected: :unknown}
+      ],
+      subagent_events: [
+        %{
+          case: "positive_start",
+          envelope: %{
+            "sessionUpdate" => "tool_call",
+            "toolCallId" => "claude-call",
+            "_meta" => %{"claudeCode" => %{"toolName" => "Agent"}}
+          },
+          expected:
+            {:subagent_start, %{source_event_ref: "claude-call", subagent_ref: "claude-call"}}
+        },
+        %{
+          case: "positive_stop",
+          envelope: %{
+            "toolCallId" => "claude-call",
+            "_meta" => %{"claudeCode" => %{"subagentTerminated" => %{}}}
+          },
+          expected:
+            {:subagent_stop, %{source_event_ref: "claude-call", subagent_ref: "claude-call"}}
+        },
+        %{case: "negative", envelope: %{"sessionUpdate" => "tool_call"}, expected: :skip}
+      ],
+      catalog_expected: %{
+        "valid" => {:ok, [valid_entry]},
+        "malformed" => {:error, :malformed_catalog},
+        "unavailable" => {:error, :unavailable}
+      },
+      catalog_state: fn case_name, base ->
+        token = Path.join([base, "auth", "claude", "oauth-token"])
+        File.mkdir_p!(Path.dirname(token))
+        File.write!(token, "vector-token")
+
+        body =
+          JSON.encode!(%{
+            "data" => [
+              %{
+                "id" => "claude-vector",
+                "display_name" => "Claude Vector",
+                "max_input_tokens" => 1_000,
+                "capabilities" => %{
+                  "effort" => %{"low" => %{"supported" => true}}
+                }
+              }
+            ]
+          })
+
+        fetch = fn _path, _headers ->
+          case case_name do
+            "valid" -> {:ok, body}
+            "malformed" -> {:ok, "{}"}
+            "unavailable" -> {:error, :unavailable}
+          end
+        end
+
+        %{base_dir: base, options: %{claude_fetch: fetch}}
+      end,
+      wire_projection: %{
+        "id" => "claude",
+        "wire_name" => "claude",
+        "install_package" => "@agentclientprotocol/claude-agent-acp",
+        "process_markers" => ["claude-agent-acp"]
+      }
+    })
   end
 
   defp decode_catalog(body) when is_binary(body) do
@@ -340,17 +468,18 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   defp adapter_binary(target) do
-    if Support.local?(target) do
-      Path.expand("../tightbeam/node_modules/.bin/claude-agent-acp", File.cwd!())
-    else
-      Path.join([
-        target.host_config.base_dir,
-        "adapters",
-        "node_modules",
-        ".bin",
-        "claude-agent-acp"
-      ])
-    end
+    Map.get(target, :adapter_binary) ||
+      if Support.local?(target) do
+        Path.expand("../tightbeam/node_modules/.bin/claude-agent-acp", File.cwd!())
+      else
+        Path.join([
+          target.host_config.base_dir,
+          "adapters",
+          "node_modules",
+          ".bin",
+          "claude-agent-acp"
+        ])
+      end
   end
 
   defp patch_remote(target, path, detail) do
