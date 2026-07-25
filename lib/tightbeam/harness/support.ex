@@ -38,6 +38,608 @@ defmodule Tightbeam.Harness.Support do
     end
   end
 
+  @doc false
+  def conformance_vectors(module, profile) do
+    %{
+      "prepare_launch" => prepare_launch_vectors(module, profile),
+      "ensure_adapter" => ensure_adapter_vectors(module, profile),
+      "session_config" => session_config_vectors(module, profile),
+      "reconcile_home" => reconcile_home_vectors(module, profile),
+      "materialize_skills" => materialize_skills_vectors(module, profile),
+      "credential_ready?/harvest_credential" => credential_vectors(module, profile),
+      "probe_cli" => probe_cli_vectors(module, profile),
+      "containment_additions" => [
+        vector("exact_grants", profile.containment, %{})
+      ],
+      "classify_auth_event" => classification_vectors(module, profile.auth_events, :auth),
+      "classify_subagent_event" =>
+        classification_vectors(module, profile.subagent_events, :subagent),
+      "fetch_catalog" => catalog_vectors(module, profile),
+      "wire_projection" => wire_projection_vectors(module, profile)
+    }
+  end
+
+  @doc false
+  def observe_vector(module, "prepare_launch", %{input: input}),
+    do: observe_launch(module, input.profile, input.locality, input.rails)
+
+  def observe_vector(module, "ensure_adapter", %{input: input}),
+    do: observe_adapter(module, input.profile, input.locality, input.presence)
+
+  def observe_vector(module, "session_config", %{input: input}),
+    do: module.session_config(%{}, input.guidance).meta
+
+  def observe_vector(module, "reconcile_home", %{input: input}),
+    do: observe_reconcile_home(module, input.profile)
+
+  def observe_vector(module, "materialize_skills", %{input: input}),
+    do: observe_materialize_skills(module, input.profile)
+
+  def observe_vector(module, "credential_ready?/harvest_credential", %{input: input}),
+    do: observe_credential(module, input.profile, input.case)
+
+  def observe_vector(module, "probe_cli", %{input: input}),
+    do: observe_probe_cli(module, input.profile)
+
+  def observe_vector(module, "containment_additions", %{input: %{}}),
+    do: module.containment_additions()
+
+  def observe_vector(module, "classify_auth_event", %{input: input}),
+    do: module.classify_auth_event(input.envelope)
+
+  def observe_vector(module, "classify_subagent_event", %{input: input}),
+    do: module.classify_subagent_event(input.envelope)
+
+  def observe_vector(module, "fetch_catalog", %{input: input}),
+    do: observe_catalog(module, input.profile, input.case)
+
+  def observe_vector(module, "wire_projection", %{input: %{}}) do
+    {:ok, decoded} = module.wire_projection() |> JSON.decode()
+    Map.take(decoded, ~w(id wire_name install_package process_markers))
+  end
+
+  defp prepare_launch_vectors(_module, profile) do
+    for locality <- [:local, :remote],
+        rails <- [:railed, :lawless] do
+      case_name = "#{locality}_#{rails}"
+
+      vector(
+        case_name,
+        expected_launch(profile, locality, rails),
+        %{profile: profile, locality: locality, rails: rails}
+      )
+    end
+  end
+
+  defp observe_launch(module, profile, locality, rails) do
+    with_tmp("launch", fn base ->
+      home = Path.join(base, "home")
+      local? = locality == :local
+      adapter = adapter_path(base, profile.adapter_bin, locality)
+      token_path = Path.join([base, "auth", profile.home_scope, profile.credential_file])
+      File.mkdir_p!(Path.dirname(token_path))
+      File.write!(token_path, "vector-token\n")
+
+      target = %{
+        base_dir: base,
+        host_name: "vector",
+        host_config: %{base_dir: base, ssh: if(local?, do: nil, else: "vector@remote")},
+        adapter_binary: adapter,
+        sh: fn _command -> {"", 0} end
+      }
+
+      opts = [
+        common_env: [{"COMMON", "1"}],
+        remote_env: ["REMOTE=1"],
+        lineage: "tb-vector",
+        rails: if(rails == :railed, do: %{"hooks" => %{"PreToolUse" => []}}, else: nil),
+        ensure_workdir: fn _host, _cwd, _content, _opts -> :ok end,
+        sh_out: nil
+      ]
+
+      module.prepare_launch(target, home, opts)
+      |> launch_observation()
+      |> normalize_paths(base, home)
+    end)
+  end
+
+  defp expected_launch(profile, locality, rails) do
+    base = "<BASE>"
+    home = "<HOME>"
+    adapter = adapter_path(base, profile.adapter_bin, locality)
+    local? = locality == :local
+    railed? = rails == :railed
+
+    plan =
+      if local? do
+        extra =
+          profile.local_extra_env ++
+            if(railed? and profile.rails_env, do: [profile.rails_env], else: [])
+
+        [
+          cmd: [adapter],
+          env: [{profile.home_env, home}, {"COMMON", "1"} | extra]
+        ]
+      else
+        remote_env =
+          profile.remote_prefix.(base, home) ++
+            ["REMOTE=1"] ++
+            if(railed? and profile.remote_rails_env,
+              do: [profile.remote_rails_env],
+              else: []
+            )
+
+        [
+          cmd:
+            ["ssh" | ssh_opts()] ++
+              ["vector@remote", "exec", "env" | remote_env] ++ [adapter],
+          env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
+        ]
+      end
+
+    plan =
+      if railed? and profile.railed_probe do
+        Keyword.merge(plan,
+          probe_cwd: Path.join(base, "work/gate-probe"),
+          probe_model: "gpt-5.6-sol[medium]"
+        )
+      else
+        plan
+      end
+
+    launch_observation(plan)
+  end
+
+  defp launch_observation(plan) do
+    argv = Keyword.fetch!(plan, :cmd)
+
+    %{
+      argv: argv,
+      env: Keyword.fetch!(plan, :env),
+      serialized_command: Enum.map_join(argv, " ", &shell_quote/1),
+      probe_cwd: Keyword.get(plan, :probe_cwd),
+      probe_model: Keyword.get(plan, :probe_model)
+    }
+  end
+
+  defp ensure_adapter_vectors(_module, profile) do
+    for locality <- [:local, :remote],
+        presence <- [:present, :absent] do
+      case_name = "#{locality}_#{presence}"
+
+      vector(
+        case_name,
+        expected_adapter(profile, locality, presence),
+        %{profile: profile, locality: locality, presence: presence}
+      )
+    end
+  end
+
+  defp observe_adapter(module, profile, locality, presence) do
+    with_tmp("adapter", fn base ->
+      adapter = adapter_path(base, profile.adapter_bin, locality)
+      bundle = install_fake_adapter!(adapter, profile)
+      File.chmod!(bundle, 0o751)
+      if presence == :absent, do: File.rm!(adapter)
+
+      ref = make_ref()
+      Process.put({ref, :checks}, 0)
+
+      sh = fn command ->
+        send(self(), {ref, command})
+        joined = Enum.join(command, " ")
+
+        cond do
+          String.contains?(joined, "test -x") ->
+            checks = Process.get({ref, :checks}, 0)
+            Process.put({ref, :checks}, checks + 1)
+            if presence == :absent and checks == 0, do: {"", 1}, else: {"", 0}
+
+          true ->
+            {"", 0}
+        end
+      end
+
+      patch = fn _path, detail ->
+        patch_fake_bundle!(bundle, profile)
+        {:ok, detail <> profile.remote_patch_detail}
+      end
+
+      target = %{
+        base_dir: base,
+        host_name: "vector",
+        host_config: %{
+          base_dir: base,
+          ssh: if(locality == :local, do: nil, else: "vector@remote")
+        },
+        adapter_binary: adapter,
+        remote_patch: patch,
+        sh: sh
+      }
+
+      result = module.ensure_adapter(target)
+      commands = drain_commands(ref, [])
+      Process.delete({ref, :checks})
+      stat = File.stat!(bundle)
+
+      %{
+        result: normalize_paths(result, base, nil),
+        install_contribution:
+          commands
+          |> Enum.map(&Enum.join(&1, " "))
+          |> Enum.find_value("", fn command ->
+            if String.contains?(command, "npm install"), do: command, else: false
+          end)
+          |> normalize_paths(base, nil),
+        bundle: File.read!(bundle),
+        mode: Bitwise.band(stat.mode, 0o777)
+      }
+    end)
+  end
+
+  defp expected_adapter(profile, :local, :absent) do
+    adapter = adapter_path("<BASE>", profile.adapter_bin, :local)
+
+    %{
+      result:
+        {:error,
+         %{
+           code: "host_unready",
+           message:
+             "host vector is not ready for #{profile.wire_name}: adapter missing at #{adapter} " <>
+               "(install the ACP adapters in the local Tightbeam checkout)"
+         }},
+      install_contribution: "",
+      bundle: profile.source,
+      mode: 0o751
+    }
+  end
+
+  defp expected_adapter(profile, locality, presence) do
+    detail =
+      case {locality, presence} do
+        {:local, :present} -> "adapters present"
+        {:remote, :present} -> "adapters present" <> profile.remote_patch_detail
+        {:remote, :absent} -> "deployed adapters" <> profile.remote_patch_detail
+      end
+
+    install =
+      if locality == :remote and presence == :absent do
+        packages = Enum.map_join(Tightbeam.Harness.all(), " ", & &1.install_package())
+        script = "npm install --prefix '<BASE>/adapters' " <> packages
+
+        (["ssh" | ssh_opts()] ++
+           ["vector@remote", "sh", "-c", shell_quote(script)])
+        |> Enum.join(" ")
+      else
+        ""
+      end
+
+    %{
+      result: {:ok, detail},
+      install_contribution: install,
+      bundle: profile.patched,
+      mode: 0o751
+    }
+  end
+
+  defp session_config_vectors(_module, profile) do
+    [
+      vector("session", profile.session_meta, %{guidance: "vector guidance"})
+    ]
+  end
+
+  defp reconcile_home_vectors(_module, profile) do
+    expected_write_set =
+      [
+        ".tightbeam/manifest",
+        profile.credential_file,
+        profile.rails_file
+      ] ++ Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}")
+
+    [
+      vector(
+        "sentinel_seeded_desired_set",
+        %{write_set: Enum.sort(expected_write_set), sentinels_preserved: true},
+        %{profile: profile}
+      )
+    ]
+  end
+
+  defp observe_reconcile_home(module, profile) do
+    with_tmp("home", fn base ->
+      home = Path.join(base, "home")
+      auth_dir = Tightbeam.Credentials.store_dir(base, profile.provider)
+
+      sentinels = %{
+        "history/transcript" => "history-sentinel",
+        "sessions/state" => "session-sentinel",
+        "unowned" => "root-sentinel"
+      }
+
+      Enum.each(sentinels, fn {relative, bytes} ->
+        path = Path.join(home, relative)
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, bytes)
+      end)
+
+      File.mkdir_p!(auth_dir)
+      File.write!(Path.join(auth_dir, profile.credential_file), "credential")
+      before = leaf_snapshot(home)
+
+      target = %{
+        base_dir: base,
+        host_name: "vector",
+        host_config: %{base_dir: base, ssh: nil},
+        sh: &system_cmd/1
+      }
+
+      module.reconcile_home(target, home, %{
+        harness: module.id(),
+        machine: "vector",
+        rails: profile.rails,
+        auth_dir: auth_dir
+      })
+
+      after_snapshot = leaf_snapshot(home)
+
+      %{
+        write_set:
+          after_snapshot
+          |> Map.keys()
+          |> Enum.reject(&(Map.get(before, &1) == Map.get(after_snapshot, &1)))
+          |> Enum.sort(),
+        sentinels_preserved:
+          Enum.all?(sentinels, fn {relative, bytes} ->
+            File.read!(Path.join(home, relative)) == bytes
+          end)
+      }
+    end)
+  end
+
+  defp materialize_skills_vectors(_module, profile) do
+    expected = %{"tightbeam__alpha/SKILL.md" => "# Alpha\n"}
+
+    [
+      vector("snapshot", expected, %{profile: profile})
+    ]
+  end
+
+  defp observe_materialize_skills(module, profile) do
+    with_tmp("skills", fn cwd ->
+      skills_root = Path.join(cwd, profile.skills_path)
+      stale = Path.join(skills_root, "tightbeam__stale/SKILL.md")
+      File.mkdir_p!(Path.dirname(stale))
+      File.write!(stale, "stale")
+
+      module.materialize_skills(
+        %{host_config: %{ssh: nil}, base_dir: cwd},
+        cwd,
+        %{
+          revision: "vector",
+          archetype: "default",
+          guidance: "",
+          skills: %{"alpha" => "# Alpha\n"}
+        }
+      )
+
+      skills_root
+      |> leaf_snapshot()
+      |> Map.new(fn {path, entry} -> {path, entry.bytes} end)
+      |> Map.filter(fn {path, _entry} -> String.starts_with?(path, "tightbeam__") end)
+    end)
+  end
+
+  defp credential_vectors(_module, profile) do
+    for case_name <- ["present", "absent", "rotated"] do
+      expected =
+        case case_name do
+          "present" -> %{ready?: true, harvested: nil}
+          "absent" -> %{ready?: false, harvested: nil}
+          "rotated" -> %{ready?: true, harvested: "rotated-bytes"}
+        end
+
+      vector(case_name, expected, %{profile: profile, case: case_name})
+    end
+  end
+
+  defp observe_credential(module, profile, case_name) do
+    with_tmp("credential", fn base ->
+      store = Tightbeam.Credentials.store_dir(base, profile.provider)
+      home = Path.join(base, "home")
+      File.mkdir_p!(home)
+
+      if case_name in ["present", "rotated"] do
+        File.mkdir_p!(store)
+        File.write!(Path.join(store, profile.credential_file), "stored-bytes")
+      end
+
+      if case_name == "rotated" do
+        File.write!(Path.join(home, profile.credential_file), "rotated-bytes")
+      end
+
+      target = %{host_config: %{ssh: nil, base_dir: base}, base_dir: base}
+
+      %{
+        ready?: module.credential_ready?(target, home),
+        harvested: module.harvest_credential(target, home)
+      }
+    end)
+  end
+
+  defp probe_cli_vectors(_module, profile) do
+    expected_path =
+      case profile.probe_path do
+        :shim -> "<BASE>/bin/#{profile.cli_name}"
+        :discovered -> "<BASE>/discovered/#{profile.cli_name}"
+      end
+
+    [
+      vector(
+        "fake_cli",
+        {:ok, %{bin: expected_path, version: profile.cli_version}},
+        %{profile: profile}
+      )
+    ]
+  end
+
+  defp observe_probe_cli(module, profile) do
+    with_tmp("cli", fn base ->
+      cli_name = profile.cli_name
+      discovered = Path.join([base, "discovered", profile.cli_name])
+      File.mkdir_p!(Path.dirname(discovered))
+      File.write!(discovered, "#!/bin/sh\n")
+
+      module.probe_cli(%{
+        cli_bin: Path.join(base, "bin"),
+        find_executable: fn ^cli_name -> discovered end,
+        run: fn [_binary, "--version"] -> {"#{profile.cli_version}\n", 0} end
+      })
+      |> normalize_paths(base, nil)
+    end)
+  end
+
+  defp classification_vectors(_module, events, _kind) do
+    Enum.map(events, fn event ->
+      support =
+        if divergence = event[:divergence], do: {:unsupported, divergence}, else: :supported
+
+      vector(event.case, event.expected, %{envelope: event.envelope}, support)
+    end)
+  end
+
+  defp catalog_vectors(_module, profile) do
+    for case_name <- ["valid", "malformed", "unavailable"] do
+      vector(
+        case_name,
+        Map.fetch!(profile.catalog_expected, case_name),
+        %{profile: profile, case: case_name}
+      )
+    end
+  end
+
+  defp observe_catalog(module, profile, case_name) do
+    with_tmp("catalog", fn base ->
+      state = profile.catalog_state.(case_name, base)
+      module.fetch_catalog(state)
+    end)
+  end
+
+  defp wire_projection_vectors(_module, profile) do
+    [
+      vector("round_trip", profile.wire_projection, %{})
+    ]
+  end
+
+  defp vector(case_name, expected, input, support \\ :supported),
+    do: %{case: case_name, expected: expected, input: input, support: support}
+
+  defp adapter_path(base, adapter_bin, :local),
+    do: Path.join([base, "node_modules", ".bin", adapter_bin])
+
+  defp adapter_path(base, adapter_bin, :remote),
+    do: Path.join([base, "adapters", "node_modules", ".bin", adapter_bin])
+
+  defp install_fake_adapter!(adapter, profile) do
+    node_modules = adapter |> Path.dirname() |> Path.dirname()
+    package_dir = Path.join([node_modules, "@agentclientprotocol", profile.adapter_package])
+    bundle = Path.join([package_dir, "dist", profile.adapter_bundle])
+    File.mkdir_p!(Path.dirname(adapter))
+    File.mkdir_p!(Path.dirname(bundle))
+    File.write!(adapter, "#!/bin/sh\n")
+
+    File.write!(
+      Path.join(package_dir, "package.json"),
+      JSON.encode!(%{"version" => profile.adapter_version})
+    )
+
+    File.write!(bundle, profile.source)
+    bundle
+  end
+
+  defp patch_fake_bundle!(bundle, profile) do
+    %File.Stat{mode: mode} = File.stat!(bundle)
+    File.write!(bundle, profile.patched)
+    File.chmod!(bundle, mode)
+  end
+
+  defp drain_commands(ref, acc) do
+    receive do
+      {^ref, command} -> drain_commands(ref, [command | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp leaf_snapshot(root) do
+    if File.exists?(root) do
+      walk_leaves(root, root, %{})
+    else
+      %{}
+    end
+  end
+
+  defp walk_leaves(root, path, acc) do
+    case File.lstat!(path) do
+      %File.Stat{type: :directory} ->
+        path
+        |> File.ls!()
+        |> Enum.sort()
+        |> Enum.reduce(acc, fn child, entries ->
+          walk_leaves(root, Path.join(path, child), entries)
+        end)
+
+      %File.Stat{type: :symlink} ->
+        Map.put(acc, Path.relative_to(path, root), %{type: :symlink, bytes: File.read_link!(path)})
+
+      %File.Stat{type: type} ->
+        Map.put(acc, Path.relative_to(path, root), %{type: type, bytes: File.read!(path)})
+    end
+  end
+
+  defp normalize_paths(value, base, home) do
+    replace = fn string ->
+      if home do
+        string
+        |> String.replace(home, "<HOME>")
+        |> String.replace(base, "<BASE>")
+      else
+        String.replace(string, base, "<BASE>")
+      end
+    end
+
+    normalize_term(value, replace)
+  end
+
+  defp normalize_term(value, replace) when is_binary(value), do: replace.(value)
+
+  defp normalize_term(value, replace) when is_list(value),
+    do: Enum.map(value, &normalize_term(&1, replace))
+
+  defp normalize_term(value, replace) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.map(&normalize_term(&1, replace)) |> List.to_tuple()
+
+  defp normalize_term(value, replace) when is_map(value),
+    do: Map.new(value, fn {key, item} -> {key, normalize_term(item, replace)} end)
+
+  defp normalize_term(value, _replace), do: value
+
+  defp with_tmp(label, fun) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-conformance-#{label}-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+
+    try do
+      fun.(root)
+    after
+      File.rm_rf!(root)
+    end
+  end
+
   defp bounded_run(run, command, timeout) do
     task =
       Task.async(fn ->

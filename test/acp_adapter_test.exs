@@ -45,7 +45,12 @@ defmodule Tightbeam.Acp.AdapterTest do
       }
       case "session/load": capture(m); return send({ id: m.id, result: {} });
       case "session/close": capture(m); return send({ id: m.id, result: {} });
-      case "session/set_config_option": return send({ id: m.id, result: { configOptions: [] } });
+      case "session/set_config_option": {
+        if (failMode === "model-refusal") {
+          return send({ id: m.id, error: { code: -32000, message: "Invalid value for config option model" } });
+        }
+        return send({ id: m.id, result: { configOptions: [ { id: m.params.configId, currentValue: m.params.value } ] } });
+      }
       case "session/set_mode": {
         capture(m);
         modeCalls += 1;
@@ -290,6 +295,50 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     assert_receive {:auth, :terminal}
+  end
+
+  test "model-selection divergence is negative-controlled without losing the loaded session" do
+    {claude, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
+    assert :ok = Adapter.load_session(claude, "sess-1", "fable", "/tmp", [], "guidance")
+
+    assert {:error, :model_unavailable} =
+             Adapter.apply_model_strict(claude, "sess-1", "fable", "haiku")
+
+    assert Adapter.knows_session?(claude, "sess-1")
+
+    {codex, _capture} = start_adapter(harness: :codex)
+    assert :ok = Adapter.load_session(codex, "sess-1", "gpt-old", "/tmp", [], "guidance")
+    assert :ok = Adapter.apply_model_strict(codex, "sess-1", "gpt-new[high]", "gpt-old")
+  end
+
+  test "structured compaction is not silently claimed end-to-end" do
+    claude_boundary = %{"sessionUpdate" => "compact_boundary"}
+
+    codex_boundary = %{
+      "sessionUpdate" => "session_info_update",
+      "_meta" => %{"codex" => %{"contextCompaction" => %{}}}
+    }
+
+    assert Adapter.progress_status(claude_boundary) == :skip
+    assert Adapter.progress_status(codex_boundary) == :skip
+
+    for {harness, boundary} <- [
+          {Tightbeam.Harness.Claude, claude_boundary},
+          {Tightbeam.Harness.Codex, codex_boundary}
+        ] do
+      assert harness.classify_auth_event(boundary) == :unknown
+      assert harness.classify_subagent_event(boundary) == :skip
+    end
+  end
+
+  test "auth-event divergence keeps claude unknown while codex classifies terminal and transient" do
+    terminal = %{"authMode" => nil, "planType" => nil}
+    transient = %{"authMode" => "chatgpt", "planType" => "plus"}
+
+    assert Tightbeam.Harness.Claude.classify_auth_event(terminal) == :unknown
+    assert Tightbeam.Harness.Claude.classify_auth_event(transient) == :unknown
+    assert Tightbeam.Harness.Codex.classify_auth_event(terminal) == :terminal
+    assert Tightbeam.Harness.Codex.classify_auth_event(transient) == :transient
   end
 
   test "codex account updates preserve terminal parity through the credential path" do

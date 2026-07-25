@@ -2,10 +2,14 @@
 # (full HTTP + router + dispatch + handler + DB stack; the integration path
 # unit tests don't cover). Reads port+token from <base_dir>/gateway.json.
 #
-#   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam elixir scripts/feature_smoke.exs
+#   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
+#   TIGHTBEAM_SMOKE_MODEL_CLAUDE=fable \
+#   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol[medium]' \
+#   mix run --no-start scripts/feature_smoke.exs
 #
-# Exits non-zero on the first failed assertion. Every new roadmap feature that
-# is user-callable should get a check here (see the smoke-coverage practice).
+# Runs one explicit spawn/dispatch leg per Harness.all/0 entry and exits
+# non-zero on the first failed assertion. Every new roadmap feature that is
+# user-callable should get a check here (see the smoke-coverage practice).
 
 defmodule FeatureSmoke do
   @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "mike"
@@ -15,19 +19,30 @@ defmodule FeatureSmoke do
     install_smoke_rule!(base_dir)
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
-    state = %{port: gw["port"], token: gw["cliToken"], base_dir: base_dir, pass: 0}
 
-    state
-    |> check_identity_surface()
-    |> check_onboard_surface()
-    |> check_facts_read()
-    |> check_config_default_archetype()
-    |> check_work_item_and_assignment_get()
-    |> check_dispatch_opens_assignment()
-    |> check_effort_without_effect()
-    |> check_flagship_review_loop()
-    |> check_escalation_to_owner()
-    |> finish()
+    Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
+    |> Enum.each(fn leg ->
+      IO.puts("\nfeature-smoke leg #{leg.wire_name} model=#{leg.model}")
+
+      %{
+        port: gw["port"],
+        token: gw["cliToken"],
+        base_dir: base_dir,
+        pass: 0,
+        leg: leg,
+        providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
+      }
+      |> check_identity_surface()
+      |> check_onboard_surface()
+      |> check_facts_read()
+      |> check_config_default_archetype()
+      |> check_work_item_and_assignment_get()
+      |> check_dispatch_opens_assignment()
+      |> check_effort_without_effect()
+      |> check_flagship_review_loop()
+      |> check_escalation_to_owner()
+      |> finish_leg()
+    end)
   end
 
   defp install_smoke_rule!(base_dir) do
@@ -137,7 +152,7 @@ defmodule FeatureSmoke do
   # Exercise the public entry without beginning a credential mutation. The
   # phase-less request must direct the operator to the interactive CLI.
   defp check_onboard_surface(state) do
-    for provider <- ["openai", "anthropic"] do
+    for provider <- state.providers do
       # interactive_required is delivered as a wire ERROR envelope, so assert on it
       # directly rather than through ok! (which treats any error as a smoke failure).
       result = post(state, "onboard", %{"provider" => provider})
@@ -149,7 +164,7 @@ defmodule FeatureSmoke do
       )
     end
 
-    pass(state, "onboard openai|anthropic interactive entry")
+    pass(state, "onboard registered providers interactive entry")
   end
 
   # --- #3 escalation: a gated verb escalates to the owner for a decision --------
@@ -665,6 +680,11 @@ defmodule FeatureSmoke do
   @target_verbs ~w(assign dispatch wake retire critical assignments cancel)
 
   defp post(state, verb, params) do
+    params =
+      if verb == "spawn",
+        do: Tightbeam.FeatureSmokePlan.explicit_spawn(state.leg, params),
+        else: params
+
     {as_key, params} = Map.pop(params, "asSession")
 
     {target, params} =
@@ -729,7 +749,7 @@ defmodule FeatureSmoke do
   defp assert(state, _false, msg), do: fail(state, msg)
 
   defp pass(state, label) do
-    IO.puts("  PASS  #{label}")
+    IO.puts("  PASS [#{state.leg.wire_name}] #{label}")
     %{state | pass: state.pass + 1}
   end
 
@@ -738,8 +758,8 @@ defmodule FeatureSmoke do
     System.halt(1)
   end
 
-  defp finish(state) do
-    IO.puts("\nfeature-smoke: #{state.pass} checks passed")
+  defp finish_leg(state) do
+    IO.puts("feature-smoke leg #{state.leg.wire_name}: #{state.pass} checks PASS")
     :ok
   end
 
