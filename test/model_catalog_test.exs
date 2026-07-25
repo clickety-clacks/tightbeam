@@ -142,10 +142,9 @@ defmodule Tightbeam.ModelCatalogTest do
            ]
   end
 
-  # Regression: the LIVE /v1/models endpoint carries an aggregate `supported` BOOLEAN
-  # inside capabilities.effort alongside the per-level maps. The parser once rejected
-  # the whole catalog as :malformed_catalog on that key (found by feature_smoke against
-  # the real API — the fixtures above omit the aggregate and stayed green).
+  # Regression: the live endpoint and captured fixture carry an aggregate `supported`
+  # boolean beside the per-level maps. The parser once rejected the whole catalog as
+  # :malformed_catalog on that provider field.
   test "claude effort parser accepts the live aggregate supported boolean", ctx do
     claude_json =
       JSON.encode!(%{

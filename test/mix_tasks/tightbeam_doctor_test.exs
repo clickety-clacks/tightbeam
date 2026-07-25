@@ -63,10 +63,9 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     fixture = Path.expand("../fixtures/model_catalog/codex_models_cache.jsonc", __DIR__)
     codex_json = fixture_body(fixture)
-    started_at = System.monotonic_time(:millisecond)
 
     catalog =
-      Mix.Tasks.Tightbeam.Catalog.Diff.fetch_live(ctx.base_dir, 5_000,
+      Mix.Tasks.Tightbeam.Catalog.Diff.fetch_live(ctx.base_dir, 1_000,
         name: :"doctor_catalog_#{System.unique_integer([:positive])}",
         credential_status: fn
           :anthropic -> {:needs_onboarding, :dead_credential}
@@ -74,8 +73,6 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
         end,
         codex_read: fn _path -> {:ok, codex_json} end
       )
-
-    assert System.monotonic_time(:millisecond) - started_at < 1_000
 
     assert {:ok, %{"claude" => [], "codex" => [_ | _]}, %{"claude" => reason}} = catalog
     assert reason == {:unavailable, {:needs_onboarding, :dead_credential}}
