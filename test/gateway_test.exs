@@ -2956,6 +2956,46 @@ defmodule Tightbeam.GatewayTest do
     assert session_key == session.session_key
   end
 
+  # Regression: spawn creates the harness session LAZILY, so a freshly spawned session
+  # has no harness pointer until its first turn. identity-apply once raised on it —
+  # bricking `--all` org-wide whenever any never-started session existed (found by
+  # feature_smoke: it applied to the session it had just spawned). A pointer-less
+  # session is a no-op: it materializes from live at first start, already current.
+  test "identity apply skips a never-started session instead of raising", ctx do
+    base_dir = role_test_base("identity-apply-unstarted")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-unstarted",
+        display_name: "Identity apply unstarted",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    # No pointer appended: the session has never started. No adapter stub either —
+    # a no-op must not touch the adapter at all.
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{applied: [session_key], identity_revision: ^revision} =
+             apply.(%{
+               origin: "user:flynn",
+               params: %{session_key: session.session_key}
+             })
+
+    assert session_key == session.session_key
+    assert Org.current_pointer(ctx.db, session.session_key) == nil
+  end
+
   defp gateway_config(base_dir, db, port) do
     %{
       base_dir: base_dir,

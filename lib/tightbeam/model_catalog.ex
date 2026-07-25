@@ -310,10 +310,15 @@ defmodule Tightbeam.ModelCatalog do
   defp claude_efforts(capabilities) do
     effort_capabilities = Map.get(capabilities, "effort", %{})
 
+    # The live endpoint carries an aggregate `"supported" => boolean` alongside the
+    # per-level maps (`"low" => %{"supported" => true}, ...`); only map values are levels.
     if is_map(effort_capabilities) and
          Enum.all?(effort_capabilities, fn
            {effort, %{"supported" => supported}}
            when is_binary(effort) and is_boolean(supported) ->
+             true
+
+           {"supported", supported} when is_boolean(supported) ->
              true
 
            _ ->

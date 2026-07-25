@@ -134,11 +134,13 @@ defmodule FeatureSmoke do
   # phase-less request must direct the operator to the interactive CLI.
   defp check_onboard_surface(state) do
     for provider <- ["openai", "anthropic"] do
-      result = ok!(state, "onboard", %{"provider" => provider})
+      # interactive_required is delivered as a wire ERROR envelope, so assert on it
+      # directly rather than through ok! (which treats any error as a smoke failure).
+      result = post(state, "onboard", %{"provider" => provider})
 
       assert(
         state,
-        result["code"] == "interactive_required",
+        get_in(result, ["error", "code"]) == "interactive_required",
         "onboard #{provider} did not direct to the interactive CLI: #{inspect(result)}"
       )
     end
@@ -485,14 +487,17 @@ defmodule FeatureSmoke do
 
     got = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
+    # work-item-v1: `assign` is the ONLY verb extended with persistable workItemId;
+    # dispatch takes workItemId solely as rumination-rail input. Linkage via assign is
+    # covered by check_work_item_and_assignment_get.
     assert(
       state,
-      (got["workItemId"] || got["work_item_id"]) == wi_id,
-      "dispatched assignment not linked to its work-item: #{inspect(got)}"
+      got["workItemId"] == nil,
+      "dispatch must not persist workItemId (assign-only per work-item-v1): #{inspect(got)}"
     )
 
     retire(state, holder)
-    pass(state, "dispatch opens an assignment linked to its work-item (reroute unit-covered)")
+    pass(state, "dispatch opens an assignment (workItemId assign-only per spec)")
   end
 
   # --- helpers ---------------------------------------------------------------

@@ -76,6 +76,32 @@ P3. Rule: a preflight FAIL blocks that {harness × host} leg until fixed or
     failure is a FINDING (something rotated or leaked mid-run), never
     noise to shrug at.
 
+## Fresh-org provisioning (what "auth seeded" actually means)
+
+A fresh base_dir is NOT ready after copying files around; each item below is a
+seam with its own shape, and every one of these was rediscovered the hard way
+on 2026-07-25:
+
+- **Credentials are store rows, not loose files.** Each provider needs all
+  three: the store backing file (`auth/codex/auth.json`; claude
+  `auth/claude/oauth-token` — a full 108-char `sk-ant-oat…` setup token), the
+  home symlink (`homes/<machine>/<harness>/…` → store file), and the metadata
+  row (`auth/<harness>/.tightbeam/credential.json` with `"onboarded": true`).
+  The sanctioned path is `tightbeam onboard <provider>` on the host; the
+  manual recipe above is for smoke orgs only.
+- **Codex model catalog** reads `homes/<machine>/codex/models_cache.json` —
+  seed it (copy from a live `~/.codex/models_cache.json`) or every spawn dies
+  `catalog_unavailable`.
+- **Default model must match default harness** (`TIGHTBEAM_DEFAULT_HARNESS` /
+  `TIGHTBEAM_DEFAULT_MODEL`, or archetype `[defaults]`); the claude default
+  against a codex org fails `model_unavailable` at spawn.
+- **The identity repo working tree must stay clean.** Anything hand-placed
+  under `identity/` (e.g. a rules fixture) must be COMMITTED, or every
+  identity verb wedges with "identity working tree is dirty".
+- **`feature_smoke.exs` runs with `mix run --no-start`.** A plain `mix run`
+  boots a second gateway that OVERWRITES `gateway.json` and silently redirects
+  the smoke away from the gateway under test.
+
 ## 0. Boot + pair
 
 1. Boot the gateway (fresh base_dir; auth seeded for the claude harness).

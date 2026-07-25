@@ -1623,10 +1623,16 @@ defmodule Tightbeam.Gateway do
   end
 
   defp identity_apply_session(config, db, session, revision) do
-    pointer =
-      Org.current_pointer(db, session.session_key) ||
-        raise ArgumentError, "session #{session.session_key} has no harness history pointer"
+    case Org.current_pointer(db, session.session_key) do
+      nil -> :ok
+      pointer -> identity_apply_started_session(config, db, session, revision, pointer)
+    end
+  end
 
+  # A session that has never started has no harness session to bounce. It materializes
+  # from `tightbeam/live` at its first start (§Sessions stamp the revision they
+  # materialized from), so it is already on the applied revision by construction.
+  defp identity_apply_started_session(config, db, session, revision, pointer) do
     harness = String.to_existing_atom(session.harness)
     key = {harness, "shared", session.host}
     cwd = Placement.holder_workdir(config, session)
