@@ -1,7 +1,8 @@
 //! Hand-parsed CLI arguments.
 //!
-//! Unlike the TypeScript seam, multiple identity flags are rejected as required
-//! by the port specification's conflict ruling.
+//! Multiple explicit identity flags are rejected. Inside a session workdir,
+//! omission lets the gateway derive the principal from the discovered session
+//! credential.
 
 use std::collections::HashMap;
 use std::fs;
@@ -14,6 +15,7 @@ pub enum Identity {
     Role(String),
     User(String),
     Process(String),
+    Session,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +93,10 @@ pub enum Command {
         identity: Identity,
         request_id: String,
         action: String,
+    },
+    DecisionRequests {
+        identity: Identity,
+        status: Option<String>,
     },
     RevokeAssignment {
         identity: Identity,
@@ -188,7 +194,7 @@ Every command is one of the substrate's verbs; you invoke them exactly as the
 human operator does. Output is JSON on stdout; a nonzero exit means failure
 (the message is on stderr).
 
-IDENTITY (required on every command — this is the #1 thing to get right):
+IDENTITY (optional inside a session workdir; otherwise required):
   --as <role>          act as a role you currently hold. Use this when YOU (an
                        agent) run the command. The role must be bound to your
                        active session.
@@ -200,8 +206,10 @@ IDENTITY (required on every command — this is the #1 thing to get right):
   --as-process <name>  act as automation (cron, CI, a webhook — e.g.
                        "cron"). Processes may wake and cancel-wake ONLY —
                        they cannot spawn, retire, or administer.
-  Pass exactly ONE identity. It is who the call is attributed to, NOT the
-  target of the call.
+  Pass at most ONE explicit identity. It is who the call is attributed to, NOT
+  the target of the call. With no flag, the CLI walks up from the current
+  directory for .tightbeam-session and the gateway derives the identity from
+  that session credential.
 
 TARGET (for commands that take one — pass exactly one):
   --session <key>      this exact session incarnation
@@ -260,6 +268,8 @@ COMMANDS:
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in routed to your principal.
+  decision-requests [--status open|ruled|all]
+      List decision requests visible to your principal.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
   run-tests <assignmentId>
@@ -306,9 +316,9 @@ COMMANDS:
       After: add the host to an archetype's `where`.
         tightbeam assimilate work-1.local --as-user flynn
 
-DISCOVERY: the CLI finds the gateway via TIGHTBEAM_URL + TIGHTBEAM_TOKEN, else
-  <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json. In an agent shell this is already
-  set for you.
+DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
+  TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
+  <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
 
 DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
 
@@ -384,9 +394,7 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
 
     match identities.as_slice() {
         [identity] => Ok(identity.clone()),
-        [] => Err(
-            "identity required: pass --as <your-agent-handle> (when an agent runs this) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'.".to_owned(),
-        ),
+        [] => Ok(Identity::Session),
         _ => Err(
             "identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process"
                 .to_owned(),
@@ -734,6 +742,17 @@ fn parse_with_optional_catalog(
                 action,
             })
         }
+        "decision-requests" => {
+            if parsed.positional.len() != 1 {
+                return Err(
+                    "usage: tightbeam decision-requests [--status open|ruled|all]".to_owned(),
+                );
+            }
+            Ok(Command::DecisionRequests {
+                identity: identity(flags)?,
+                status: nonempty(flags, "status"),
+            })
+        }
         "revoke-assignment" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam revoke-assignment <assignmentId>".to_owned());
@@ -884,7 +903,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, revoke-assignment, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -1084,6 +1103,7 @@ mod tests {
                 "attests",
                 "cancel-wake",
                 "config",
+                "decision-requests",
                 "dispatch",
                 "doctor",
                 "effort-rule",
@@ -1230,11 +1250,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_and_multiple_identity() {
-        assert!(
-            parse(strings(&["list"]))
-                .unwrap_err()
-                .starts_with("identity required:")
+    fn permits_missing_and_rejects_multiple_identity() {
+        assert_eq!(
+            parse(strings(&["list"])),
+            Ok(Command::List {
+                identity: Identity::Session
+            })
         );
         assert_eq!(
             parse(strings(&["list", "--as", "coder", "--as-user", "flynn"])),
@@ -1276,7 +1297,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, revoke-assignment, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 
@@ -1292,7 +1313,6 @@ mod tests {
             "waive",
             "revoke-waiver",
             "withdraw",
-            "decision-requests",
             "decision-request",
             "critical",
             "adjudicate",
