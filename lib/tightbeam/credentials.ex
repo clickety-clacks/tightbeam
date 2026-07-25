@@ -13,8 +13,9 @@ defmodule Tightbeam.Credentials do
   alias Tightbeam.{Harness, Homes, Rails}
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+  @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
-  @type provider :: :openai | :anthropic
+  @type provider :: :openai | :anthropic | :fixture_provider
   @type status :: :onboarded | {:needs_onboarding, term()}
 
   @doc "Start one lifecycle owner for this machine."
@@ -99,6 +100,7 @@ defmodule Tightbeam.Credentials do
       case provider do
         :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
         :anthropic -> Path.join([base_dir, "auth", "claude", "oauth-token"])
+        :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
       end
 
     atomic_write!(path, bytes)
@@ -118,11 +120,7 @@ defmodule Tightbeam.Credentials do
        ssh: Keyword.get(opts, :ssh),
        sh: Keyword.get(opts, :sh, &system_cmd/1),
        now: Keyword.get(opts, :now, fn -> System.system_time(:second) end),
-       onboarders:
-         Keyword.get(opts, :onboarders, %{
-           openai: &onboard_openai/1,
-           anthropic: &onboard_anthropic/1
-         }),
+       onboarders: Keyword.get(opts, :onboarders, default_onboarders()),
        gate: Keyword.get(opts, :gate, fn _provider -> :ok end),
        stop: Keyword.get(opts, :stop, fn _provider -> :ok end),
        park: Keyword.get(opts, :park, fn _provider -> :ok end),
@@ -347,6 +345,13 @@ defmodule Tightbeam.Credentials do
     :ok
   end
 
+  defp write_credential!(state, :fixture_provider, credential) do
+    path = credential_store_path(state, :fixture_provider)
+    atomic_write!(path, credential.bytes)
+    reconcile_provider_homes(state, :fixture_provider)
+    :ok
+  end
+
   defp reconcile_provider_homes(state, provider) do
     target = credential_target(state)
 
@@ -372,6 +377,21 @@ defmodule Tightbeam.Credentials do
       host_name: state.machine,
       sh: state.sh
     }
+
+  defp default_onboarders do
+    onboarders = %{
+      openai: &onboard_openai/1,
+      anthropic: &onboard_anthropic/1
+    }
+
+    if @fixture_provider? do
+      Map.put(onboarders, :fixture_provider, fn _state ->
+        {:ok, %{bytes: "fixture-provider-credential", expires_at: nil}}
+      end)
+    else
+      onboarders
+    end
+  end
 
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
@@ -450,8 +470,12 @@ defmodule Tightbeam.Credentials do
   defp credential_store_path(state, :anthropic),
     do: Path.join([state.base_dir, "auth", "claude", "oauth-token"])
 
+  defp credential_store_path(state, :fixture_provider),
+    do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
+
   defp harness_name(:openai), do: "codex"
   defp harness_name(:anthropic), do: "claude"
+  defp harness_name(:fixture_provider), do: "fixture"
 
   defp atomic_write!(path, bytes) do
     File.mkdir_p!(Path.dirname(path))
@@ -559,6 +583,13 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  defp staged_credential(:fixture_provider, path) do
+    case File.read(Path.join(path, "fixture.json")) do
+      {:ok, bytes} -> {:ok, %{bytes: bytes, expires_at: nil}}
+      {:error, reason} -> {:error, {:fixture_provider_failed, reason}}
+    end
+  end
+
   defp install_staged!(%{ssh: nil} = state, provider, path) do
     with {:ok, credential} <- staged_credential(provider, path),
          :ok <- write_credential!(state, provider, credential) do
@@ -588,6 +619,7 @@ defmodule Tightbeam.Credentials do
   end
 
   defp installed_metadata(:openai), do: %{expires_at: nil}
+  defp installed_metadata(:fixture_provider), do: %{expires_at: nil}
 
   defp installed_metadata(:anthropic) do
     %{
@@ -598,6 +630,7 @@ defmodule Tightbeam.Credentials do
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, "oauth-token")
+  defp staged_path(:fixture_provider, path), do: Path.join(path, "fixture.json")
 
   defp onboarding_staging_path(%{ssh: nil}, provider) do
     Path.join(

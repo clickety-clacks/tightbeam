@@ -1,9 +1,21 @@
 defmodule Tightbeam.Harness do
+  @bundle_path Application.app_dir(:tightbeam, "priv/harness_bundle.json")
+  @external_resource @bundle_path
+  @bundle @bundle_path |> File.read!() |> JSON.decode!()
+  @bundle_checklist Enum.map_join(@bundle["obligations"], "\n", fn obligation ->
+                      "- `#{obligation["id"]}` — #{obligation["title"]}: " <>
+                        obligation["description"]
+                    end)
+
   @moduledoc """
   Stateless adapter boundary for every supported agent harness.
 
   Callers select a module from this registry and state intent. Harness
   implementations own their literals and perform the harness-shaped effects.
+
+  Adding a harness is one bundle satisfaction surface:
+
+  #{@bundle_checklist}
   """
 
   alias Tightbeam.Harness.{Claude, Codex, Fixture}
@@ -32,6 +44,16 @@ defmodule Tightbeam.Harness do
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
+  @callback conformance_vectors() :: %{
+              required(String.t()) => [
+                %{
+                  required(:case) => String.t(),
+                  required(:expected) => term(),
+                  required(:input) => map(),
+                  required(:support) => :supported | {:unsupported, String.t()}
+                }
+              ]
+            }
 
   @registry [Claude, Codex] ++
               if(Application.compile_env(:tightbeam, :fixture_harness, false),

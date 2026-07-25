@@ -997,10 +997,11 @@ fn parse_identity_command(
 
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
-        return Err("usage: tightbeam onboard openai|anthropic".to_owned());
+        return Err("usage: tightbeam onboard <provider>".to_owned());
     }
     let provider = parsed.positional[1].clone();
-    if !matches!(provider.as_str(), "openai" | "anthropic") {
+    let fixture_provider = cfg!(test) && provider == "fixture-provider";
+    if !matches!(provider.as_str(), "openai" | "anthropic") && !fixture_provider {
         return Err("provider must be openai or anthropic".to_owned());
     }
     Ok(Command::Onboard {
@@ -1027,6 +1028,22 @@ mod tests {
         ] {
             assert_eq!(parse(args), Ok(Command::Help));
         }
+    }
+
+    #[test]
+    fn fixture_provider_is_additive_inside_the_test_provider_bundle() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "fixture-provider",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "fixture-provider".to_owned(),
+            })
+        );
     }
 
     #[test]

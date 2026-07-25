@@ -40,3 +40,12 @@ then
   echo "credentials writes a harness home outside reconcile_home/3" >&2
   exit 1
 fi
+
+if grep -nE 'case .*harness|if .*harness|unless .*harness|harness[[:space:]]*==' \
+  test/harness_conformance_test.exs
+then
+  echo "shared harness conformance suite contains a harness branch" >&2
+  exit 1
+fi
+
+"$root/scripts/check_provider_literals.sh"

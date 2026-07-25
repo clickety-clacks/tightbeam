@@ -106,7 +106,25 @@ on 2026-07-25:
   slower codex leg every time.
 - **`feature_smoke.exs` runs with `mix run --no-start`.** A plain `mix run`
   boots a second gateway that OVERWRITES `gateway.json` and silently redirects
-  the smoke away from the gateway under test.
+  the smoke away from the gateway under test. The script enumerates
+  `Tightbeam.Harness.all/0`, runs one complete leg per registry entry, and adds
+  that leg's `harness` and `model` to every spawn explicitly. Supply one
+  compatible model per leg through
+  `TIGHTBEAM_SMOKE_MODEL_<UPPERCASE_WIRE_NAME>`; missing model configuration
+  refuses the run before the first leg. For the current registry:
+
+  ```sh
+  TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
+  TIGHTBEAM_SMOKE_MODEL_CLAUDE=fable \
+  TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol[medium]' \
+  mix run --no-start scripts/feature_smoke.exs
+  ```
+
+  Each registered harness must have its credential preflight and catalog
+  bootstrap complete first (including Codex `models_cache.json`). The gateway
+  still needs `TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500`. Success is reported
+  separately as `feature-smoke leg <wire>: <n> checks PASS`; absence of any
+  registered leg is not a pass.
 
 ## 0. Boot + pair
 

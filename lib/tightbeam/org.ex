@@ -54,6 +54,12 @@ defmodule Tightbeam.Org do
           created_at: integer()
         }
 
+  @provider_values "'anthropic','openai'" <>
+                     if(Application.compile_env(:tightbeam, :fixture_harness, false),
+                       do: ",'fixture_provider'",
+                       else: ""
+                     )
+
   @ddl """
   CREATE TABLE IF NOT EXISTS sessions (
     sessionKey    TEXT PRIMARY KEY,
@@ -72,7 +78,7 @@ defmodule Tightbeam.Org do
     identityRevision TEXT,
     cliToken      TEXT,
     harness       TEXT NOT NULL CHECK (harness IN (__TIGHTBEAM_HARNESSES__)),
-    provider      TEXT NOT NULL CHECK (provider IN ('anthropic','openai')),
+    provider      TEXT NOT NULL CHECK (provider IN (__TIGHTBEAM_PROVIDERS__)),
     model         TEXT NOT NULL,
     thinkingLevel TEXT,
     host          TEXT NOT NULL DEFAULT 'local',
@@ -104,7 +110,13 @@ defmodule Tightbeam.Org do
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
     harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
-    result = DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
+
+    ddl =
+      @ddl
+      |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
+      |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
+
+    result = DB.execute(db, ddl)
     # Additive migration for pre-placement databases (incl. TS-created ones,
     # adopt-in-place): a DEFAULT'd column is invisible to writers that name
     # their columns. Duplicate-column error means already migrated.
