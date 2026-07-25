@@ -25,6 +25,13 @@ obscures the change, and widens the review beyond what the spec can prove. Code 
 spec's behavior genuinely cannot function without is in scope even when unnamed; the
 test is necessity for a specified clause, not usefulness.
 
+## Change only what your goal requires
+Beyond no-additions (above): no MODIFICATIONS of working behavior without live
+authority. If the spec you are implementing appears to demand changing behavior that
+exists and works, that is a conflict to report with your exact citation — not an edit
+to make. Fidelity sweeps and refactors owe parity except changes the spec names as
+intentional.
+
 ## Understand before you touch
 Read the existing code and WHY it exists before you change it — engram traces a line to
 the conversation that produced it (`engram explain <file>:<lines>`). The odd branch, the

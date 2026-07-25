@@ -34,6 +34,12 @@ state's transition point, product logic inside a substrate — each is a finding
 regardless of whether the code computes the right values, because the next agent cannot
 preserve what the code does not show.
 
+## Necessity-gate behavioral deltas
+For each change to existing observable behavior in the diff, find the requiring clause
+and verify it is LIVE. A delta authorized only by conformance, fidelity, a retired
+clause, or tidiness is a blocking finding: the adjudication goes up, the change stays
+out.
+
 ## Review the whole, not the hunk
 Review the integrated result: the code as it stands with the change applied, and its
 callers, lifecycle, and error paths — not only the diff. A diff can be clean while the

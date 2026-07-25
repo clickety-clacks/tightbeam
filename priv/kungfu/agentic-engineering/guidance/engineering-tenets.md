@@ -2,6 +2,10 @@
 
 - Find the requirement before the code. A product's truth is in its spec and intent; the
   code is evidence, not the authority.
+- Change nothing the goal does not require. A change to existing observable behavior
+  cites its LIVE authority — a current spec clause, a directive, or a demonstrated bug.
+  Conformance, fidelity, and tidiness are never that authority; when a clause demands a
+  behavior change, surface the adjudication instead of making the edit.
 - Passing is not working. Compiling, green tests, and a clean review are not proof it works.
   Run it against real inputs before you call it done.
 - Capture test fixtures from real responses. A hand-written ideal fixture passes review and

@@ -22,6 +22,17 @@
   wiring-check prompt must ask the probe model to echo the refusal verbatim (codex
   surfaces a block as a tool result, not agent text). See specs permission-seam-spike.md.
 
+## Change only what the task requires
+
+A change to EXISTING OBSERVABLE BEHAVIOR needs named, LIVE authority: a clause in a
+current (non-archived) spec, an explicit directive, or a confirmed bug. Verify the
+clause's currency — a clause's existence is not its authority (a retired spec's ghost
+clause once silently killed session-implied CLI identity). Conformance sweeps,
+port-fidelity mandates, refactors, and tidiness NEVER authorize behavior changes: when
+a clause you're implementing demands one, STOP and report it as a finding for
+adjudication. Parity refactors owe byte-parity except changes the spec names as
+intentional.
+
 ## Tests — a green run is not the goal, a correct one is
 
 **Green tests < correct tests.** A suite that passes because its assertions were removed is
