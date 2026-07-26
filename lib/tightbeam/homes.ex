@@ -49,6 +49,14 @@ defmodule Tightbeam.Homes do
   @spec baseline_skill_names() :: [String.t()]
   def baseline_skill_names, do: @baseline_skill_names
 
+  @doc "Harness-registry-owned leaf entries for a projected home."
+  @spec owned_entries(harness()) :: [String.t()]
+  def owned_entries(harness) do
+    harness
+    |> Harness.module!()
+    |> then(& &1.owned_home_entries())
+  end
+
   @doc "Project or ownership-scope-regenerate a shared home."
   @spec project(String.t(), spec()) :: projected_home()
   def project(base_dir, spec) do
