@@ -12,6 +12,7 @@ defmodule Tightbeam.WorkItemsTest do
     Org,
     Roles,
     Rules,
+    Wakes,
     WorkItems,
     WorkState
   }
@@ -23,7 +24,7 @@ defmodule Tightbeam.WorkItemsTest do
     db = :work_items_db
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Devices, Idempotency, Org, Roles, WorkItems, Assignments, WorkState, EventLog] do
+    for module <- [Devices, Idempotency, Org, Roles, Wakes, WorkItems, Assignments, WorkState, EventLog] do
       :ok = module.ensure_schema(db)
     end
 
@@ -40,23 +41,34 @@ defmodule Tightbeam.WorkItemsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
-  test "schema pins typed creator, paired spec ref, and has no state column", %{db: db} do
+  test "schema pins typed creator, paired spec ref, owner, and the four disposition states",
+       %{db: db} do
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
 
     base =
-      "INSERT INTO work_items (id, title, specRefName, specRefSha256, createdByUser, createdBySession, createdAt) VALUES "
+      "INSERT INTO work_items (id, title, specRefName, specRefSha256, ownerUserId, state, createdByUser, createdBySession, createdAt) VALUES "
 
     for values <- [
-          "('wi_none','x',NULL,NULL,NULL,NULL,1)",
-          "('wi_both','x',NULL,NULL,'flynn','holder',1)",
-          "('wi_name','x','spec',NULL,'flynn',NULL,1)",
-          "('wi_sha','x',NULL,'#{@sha}','flynn',NULL,1)",
-          "('wi_blank','   ',NULL,NULL,'flynn',NULL,1)",
-          "('wi_upper','x','spec','#{String.upcase(@sha)}','flynn',NULL,1)"
+          "('wi_none','x',NULL,NULL,'flynn','open',NULL,NULL,1)",
+          "('wi_both','x',NULL,NULL,'flynn','open','flynn','holder',1)",
+          "('wi_name','x','spec',NULL,'flynn','open','flynn',NULL,1)",
+          "('wi_sha','x',NULL,'#{@sha}','flynn','open','flynn',NULL,1)",
+          "('wi_blank','   ',NULL,NULL,'flynn','open','flynn',NULL,1)",
+          "('wi_upper','x','spec','#{String.upcase(@sha)}','flynn','open','flynn',NULL,1)",
+          "('wi_state','x',NULL,NULL,'flynn','bogus','flynn',NULL,1)"
         ] do
       assert {:error, %DB.Error{message: message}} = DB.query(db, base <> values)
       assert message =~ "CHECK constraint"
     end
+
+    # ownerUserId is NOT NULL — the owner is always a user (constitution §3).
+    assert {:error, %DB.Error{message: null_message}} =
+             DB.query(
+               db,
+               "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_noowner','x',NULL,'flynn',1)"
+             )
+
+    assert null_message =~ "NOT NULL constraint failed: work_items.ownerUserId"
 
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(work_items)")
 
@@ -66,6 +78,11 @@ defmodule Tightbeam.WorkItemsTest do
              "specRefName",
              "specRefSha256",
              "isBug",
+             "ownerUserId",
+             "state",
+             "failReason",
+             "routingWakeId",
+             "slateWakeId",
              "createdByUser",
              "createdBySession",
              "createdAt"
@@ -276,9 +293,11 @@ defmodule Tightbeam.WorkItemsTest do
     item = create(ctx, {:user, "flynn"}, %{title: "Independent"})
     assignment = assign(ctx, "holder", "work", item.id)
 
-    before_item = row(ctx.db, "SELECT * FROM work_items WHERE id = ?1", item.id)
+    # The OBSERVABLE item (title/spec/owner/state — never the internal bracket
+    # wake-id columns, which a last-close does write) is untouched by closure.
+    before_item = get(ctx, {:user, "flynn"}, item.id).workItem
     _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(assignment.id))
-    assert row(ctx.db, "SELECT * FROM work_items WHERE id = ?1", item.id) == before_item
+    assert get(ctx, {:user, "flynn"}, item.id).workItem == before_item
 
     before_assignment = row(ctx.db, "SELECT * FROM assignments WHERE id = ?1", assignment.id)
     _ = update(ctx, {:user, "flynn"}, item.id, %{title: "Changed"})

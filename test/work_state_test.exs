@@ -11,6 +11,7 @@ defmodule Tightbeam.WorkStateTest do
     Idempotency,
     Org,
     Supervision,
+    Wakes,
     WorkItems,
     WorkState
   }
@@ -25,6 +26,7 @@ defmodule Tightbeam.WorkStateTest do
           Idempotency,
           Org,
           CriticalLeases,
+          Wakes,
           WorkItems,
           Assignments,
           Supervision,

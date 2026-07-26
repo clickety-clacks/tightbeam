@@ -21,7 +21,7 @@ defmodule Tightbeam.Idempotency do
   @ddl """
   CREATE TABLE IF NOT EXISTS wire_idempotency (
     ownerUserId    TEXT NOT NULL,
-    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition')),
+    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition','work-item-create')),
     idempotencyKey TEXT NOT NULL,
     sessionKey     TEXT NOT NULL,
     PRIMARY KEY (ownerUserId, operation, idempotencyKey)
@@ -34,9 +34,11 @@ defmodule Tightbeam.Idempotency do
     widen_operation_check(db)
   end
 
-  # SQLite cannot ALTER a CHECK: databases created before 'wake' joined the
-  # operation set get a rebuild (rename, recreate with the widened CHECK,
-  # copy, drop). Detected via the stored DDL; idempotent.
+  # SQLite cannot ALTER a CHECK: databases created before the newest operation
+  # joined the set get a rebuild (rename, recreate with the widened CHECK,
+  # copy, drop). Detected via the stored DDL; idempotent. 'work-item-create'
+  # is the current frontier (work-item brackets); a DB whose CHECK predates it
+  # (e.g. only through 'condition') is rebuilt.
   defp widen_operation_check(db) do
     {:ok, rows} =
       DB.query(
@@ -47,7 +49,7 @@ defmodule Tightbeam.Idempotency do
 
     case rows do
       [[sql]] ->
-        if String.contains?(sql, "'condition'") do
+        if String.contains?(sql, "'work-item-create'") do
           :ok
         else
           :ok = DB.execute(db, "ALTER TABLE wire_idempotency RENAME TO wire_idempotency_old;")

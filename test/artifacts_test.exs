@@ -615,8 +615,8 @@ defmodule Tightbeam.ArtifactsTest do
           db,
           """
           INSERT INTO work_items
-            (id, title, createdByUser, createdBySession, createdAt)
-          VALUES (?1, ?1, 'flynn', NULL, 1)
+            (id, title, ownerUserId, createdByUser, createdBySession, createdAt)
+          VALUES (?1, ?1, 'flynn', 'flynn', NULL, 1)
           """,
           [id]
         )

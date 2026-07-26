@@ -201,7 +201,7 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])
   end
 
-  test "linked dispatch ruminates first, then atomically assigns and wakes without linking",
+  test "linked dispatch ruminates first, then atomically assigns and wakes, linking the work item",
        ctx do
     work_item =
       handle(
@@ -234,7 +234,17 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'ship the rail'")
 
-    assert [wake] = Wakes.list_pending(ctx.db)
+    # Two wakes are pending: the bracket-1 routing nag armed at create (on the
+    # owner's personal session) and the rumination wake on the dispatcher.
+    pending = Wakes.list_pending(ctx.db)
+    wake = Enum.find(pending, & &1.rumination)
+    assert wake
+
+    assert Enum.any?(pending, fn w ->
+             not w.rumination and w.work_item_id == work_item.id and
+               w.session_key == Org.personal_session_key("flynn")
+           end)
+
     assert wake.session_key == "other-session"
     assert wake.creator_session_key == "other-session"
     assert wake.origin == "agent:other-session"
@@ -260,15 +270,16 @@ defmodule Tightbeam.AssignmentsTest do
     assert wake_id == wake.wake_id
     assert Wakes.rumination_exists?(ctx.db, work_item.id, "other-session")
 
+    # F7 amendment: the re-dispatch persists workItemId exactly as assign does.
     assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
-    assert assignment.workItemId == nil
+    assert assignment.workItemId == work_item.id
     assert assignment.openedBySession == "other-session"
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId IS NULL",
-               [assignment.id]
+               "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId = ?2",
+               [assignment.id, work_item.id]
              )
 
     assert {:ok, [[prompt]]} =
@@ -290,13 +301,13 @@ defmodule Tightbeam.AssignmentsTest do
         )
       )
 
-    assert user_dispatch.workItemId == nil
+    assert user_dispatch.workItemId == work_item.id
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId IS NULL",
-               [user_dispatch.id]
+               "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId = ?2",
+               [user_dispatch.id, work_item.id]
              )
 
     unlinked =

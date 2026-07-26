@@ -286,6 +286,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             title,
             spec_ref_name,
             spec_ref_sha256,
+            idempotency_key,
         } => {
             let mut params = vec![string_field("title", title)];
             if let Some(value) = spec_ref_name {
@@ -293,6 +294,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = spec_ref_sha256 {
                 params.push(string_field("specRefSha256", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
             }
             Ok(request(identity, "work-item-create", vec![], params))
         }
@@ -305,6 +309,44 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::WorkItemIcebox {
+            identity,
+            work_item_id,
+        } => Ok(request(
+            identity,
+            "work-item-icebox",
+            vec![],
+            vec![string_field("workItemId", work_item_id)],
+        )),
+        Command::WorkItemReopen {
+            identity,
+            work_item_id,
+        } => Ok(request(
+            identity,
+            "work-item-reopen",
+            vec![],
+            vec![string_field("workItemId", work_item_id)],
+        )),
+        Command::WorkItemClose {
+            identity,
+            work_item_id,
+        } => Ok(request(
+            identity,
+            "work-item-close",
+            vec![],
+            vec![string_field("workItemId", work_item_id)],
+        )),
+        Command::WorkItemFail {
+            identity,
+            work_item_id,
+            reason,
+        } => {
+            let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = reason {
+                params.push(string_field("reason", value));
+            }
+            Ok(request(identity, "work-item-fail", vec![], params))
+        }
         Command::Attest {
             identity,
             assignment_id,
@@ -708,6 +750,10 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::RunSmoke { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
+        | Command::WorkItemIcebox { identity, .. }
+        | Command::WorkItemReopen { identity, .. }
+        | Command::WorkItemClose { identity, .. }
+        | Command::WorkItemFail { identity, .. }
         | Command::Attest { identity, .. }
         | Command::Attests { identity, .. }
         | Command::Assignments { identity, .. }
@@ -1016,6 +1062,26 @@ mod tests {
         assert_eq!(
             body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-create", "--title", "Ship", "--key", "k1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Ship","idempotencyKey":"k1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-reopen", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-reopen","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-close", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-close","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-fail", "wi_1", "--reason", "cannot repro", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-fail","params":{"workItemId":"wi_1","reason":"cannot repro"}}"#
         );
     }
 

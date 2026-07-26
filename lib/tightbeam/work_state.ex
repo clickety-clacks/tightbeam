@@ -203,9 +203,14 @@ defmodule Tightbeam.WorkState do
     owner = Map.get(filters, :owner_user_id)
 
     Txn.q(txn, "SELECT #{item_columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
-    |> Enum.filter(fn [id | _] ->
-      (is_nil(session_key) or item_has_holder?(txn, id, session_key)) and
-        (is_nil(owner) or item_has_owner?(txn, id, owner))
+    |> Enum.filter(fn row ->
+      item = work_item(row)
+
+      # Owner visibility (observability-v1 amendment): an item is visible to its
+      # ownerUserId regardless of assignments — an unassigned item still reaches
+      # its owner. The assignment-holder path stays for non-owner visibility.
+      (is_nil(session_key) or item_has_holder?(txn, item.id, session_key)) and
+        (is_nil(owner) or item.ownerUserId == owner or item_has_owner?(txn, item.id, owner))
     end)
   end
 
@@ -314,7 +319,9 @@ defmodule Tightbeam.WorkState do
   end
 
   defp item_columns,
-    do: "id, title, specRefName, specRefSha256, isBug, createdByUser, createdBySession, createdAt"
+    do:
+      "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
+        "createdByUser, createdBySession, createdAt"
 
   defp assignment([
          id,
@@ -362,6 +369,9 @@ defmodule Tightbeam.WorkState do
          spec_ref_name,
          spec_ref_sha256,
          is_bug,
+         owner_user_id,
+         state,
+         fail_reason,
          user,
          session,
          created_at
@@ -372,6 +382,9 @@ defmodule Tightbeam.WorkState do
       specRefName: spec_ref_name,
       specRefSha256: spec_ref_sha256,
       isBug: is_bug == 1,
+      ownerUserId: owner_user_id,
+      state: state,
+      failReason: fail_reason,
       createdByUser: user,
       createdBySession: session,
       createdAt: created_at

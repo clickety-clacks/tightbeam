@@ -564,7 +564,13 @@ defmodule Tightbeam.Gateway do
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
       "role-list" => fn _call -> role_list_result(db) end,
-      "work-item-create" => fn call -> WorkItems.__handle__(db, "work-item-create", call) end,
+      "work-item-create" => fn call ->
+        WorkItems.__handle__(
+          db,
+          "work-item-create",
+          Map.put(call, :on_work_item_change, item_change)
+        )
+      end,
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
@@ -574,6 +580,10 @@ defmodule Tightbeam.Gateway do
           Map.put(call, :on_work_item_change, item_change)
         )
       end,
+      "work-item-icebox" => work_item_disposition(db, "work-item-icebox", item_change),
+      "work-item-reopen" => work_item_disposition(db, "work-item-reopen", item_change),
+      "work-item-close" => work_item_disposition(db, "work-item-close", item_change),
+      "work-item-fail" => work_item_disposition(db, "work-item-fail", item_change),
       "assign" => fn call ->
         call =
           call
@@ -634,6 +644,14 @@ defmodule Tightbeam.Gateway do
       "adjudicate" => fn call -> adjudicate_result(config, db, call) end,
       "retire" => fn call -> retire_result(config, db, call) end
     }
+  end
+
+  # A terminal-disposition handler routes the owner doorbell through the same
+  # work_item_events seam as create/update.
+  defp work_item_disposition(db, verb, item_change) do
+    fn call ->
+      WorkItems.__handle__(db, verb, Map.put(call, :on_work_item_change, item_change))
+    end
   end
 
   @doc "Attach the post-commit owner delivery used by `Escalation.escalate/4`."
@@ -728,6 +746,13 @@ defmodule Tightbeam.Gateway do
                 [opts[:wake_id], System.system_time(:millisecond)]
               )
             end
+
+            # Nag-by-re-arm: a bracket wake that just fired re-arms its
+            # replacement IN this transaction if the item is still holderless
+            # and non-terminal (the lattice does not watch holderless work).
+            # No-ops for every non-bracket wake (the discriminator is the item's
+            # routing/slate wake-id matching this wake).
+            WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
 
             {:appended, target, message, opts}
 
