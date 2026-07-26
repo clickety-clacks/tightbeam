@@ -122,6 +122,12 @@ defmodule Tightbeam.LedgerTest do
 
     assert {:ok, [["running", "gpt-5.6-sol[high]", "codex"]]} =
              DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
+
+    # The trace reads TERMINAL turns — the stamp must survive terminalization.
+    :ok = Ledger.finish(db, first, "delivered")
+
+    assert {:ok, [["delivered", "gpt-5.6-sol[high]", "codex"]]} =
+             DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
   end
 
   test "publication feed: terminal rows surface until marked published", %{db: db} do
