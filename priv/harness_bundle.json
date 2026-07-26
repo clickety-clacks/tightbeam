@@ -41,6 +41,11 @@
       "id": "HB-08-CREDENTIAL-LIVENESS",
       "title": "Authenticated credential liveness",
       "description": "Implement CAP-018 with a bounded, injected authenticated probe whose live, dead, unknown, timeout, cleanup, and named-divergence outcomes satisfy the shared vector contract."
+    },
+    {
+      "id": "HB-09-HOME-OWNERSHIP",
+      "title": "Projected-home ownership",
+      "description": "Declare the harness-owned leaf entries of a projected home and prove they exactly match the write-set produced by fresh home reconciliation."
     }
   ],
   "constant_accessor_callbacks": [
@@ -74,6 +79,12 @@
         "session"
       ],
       "oracle": "exact _meta map equals the vector's expected map"
+    },
+    "owned_home_entries": {
+      "required_cases": [
+        "fresh_projection_write_set"
+      ],
+      "oracle": "returned entries exactly equal the write-set reconcile_home produces for a fresh projection"
     },
     "reconcile_home": {
       "required_cases": [

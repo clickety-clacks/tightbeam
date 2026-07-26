@@ -34,6 +34,8 @@ defmodule Tightbeam.Harness do
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan()
   @callback ensure_adapter(target()) :: {:ok, String.t()} | {:error, map()}
   @callback session_config(map(), binary()) :: map()
+  @doc "The harness-owned leaf entries of a projected home."
+  @callback owned_home_entries() :: [String.t()]
   @callback reconcile_home(target(), String.t(), desired_home()) :: map()
   @callback materialize_skills(target(), String.t(), map()) :: map()
   @callback credential_ready?(target(), String.t()) :: boolean()

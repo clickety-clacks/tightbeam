@@ -121,6 +121,7 @@ defmodule Tightbeam.Harness.Support do
       "prepare_launch" => prepare_launch_vectors(module, profile),
       "ensure_adapter" => ensure_adapter_vectors(module, profile),
       "session_config" => session_config_vectors(module, profile),
+      "owned_home_entries" => owned_home_entries_vectors(profile),
       "reconcile_home" => reconcile_home_vectors(module, profile),
       "materialize_skills" => materialize_skills_vectors(module, profile),
       "credential_ready?/harvest_credential" => credential_vectors(module, profile),
@@ -147,6 +148,14 @@ defmodule Tightbeam.Harness.Support do
 
   def observe_vector(module, "session_config", %{input: input}),
     do: module.session_config(%{}, input.guidance).meta
+
+  def observe_vector(module, "owned_home_entries", %{input: input}) do
+    write_set = observe_reconcile_home(module, input.profile).write_set
+
+    if module.owned_home_entries() == write_set,
+      do: :matches_reconcile_write_set,
+      else: {:mismatch, %{owned_entries: module.owned_home_entries(), write_set: write_set}}
+  end
 
   def observe_vector(module, "reconcile_home", %{input: input}),
     do: observe_reconcile_home(module, input.profile)
@@ -419,6 +428,16 @@ defmodule Tightbeam.Harness.Support do
       vector(
         "sentinel_seeded_desired_set",
         %{write_set: module.owned_home_entries(), sentinels_preserved: true},
+        %{profile: profile}
+      )
+    ]
+  end
+
+  defp owned_home_entries_vectors(profile) do
+    [
+      vector(
+        "fresh_projection_write_set",
+        :matches_reconcile_write_set,
         %{profile: profile}
       )
     ]

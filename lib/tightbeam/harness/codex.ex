@@ -158,6 +158,7 @@ defmodule Tightbeam.Harness.Codex do
     }
   end
 
+  @impl true
   def owned_home_entries,
     do: Support.owned_home_entries("auth.json", "hooks.json")
 
