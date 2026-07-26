@@ -41,6 +41,10 @@ Canonical capability IDs (the full proof references live in
 - CAP-017 auth-event classification: Claude
   `DIV-AUTH-CLAUDE-UNKNOWN` (always `:unknown`); Codex classifies terminal and
   transient account updates.
+- CAP-018 credential liveness: PARITY through bounded authenticated calls.
+  Claude calls `GET /v1/models?limit=1`; Codex calls
+  `GET /backend-api/wham/accounts/check`. `:live` passes, `:dead` fails, and
+  `:unknown` is always INCOMPLETE.
 
 No capability may be described as unverified: a missing proof blocks the
 claim. If reality disagrees with the canonical matrix, flag the operator and

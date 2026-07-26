@@ -107,13 +107,13 @@ defmodule Tightbeam.ClientE2E do
   end
 
   @doc """
-  A leg blocked before it started: the preflight row plus an `incomplete` row
-  for every step that never ran.
+  A leg blocked before it started: the non-passing preflight row plus an
+  `incomplete` row for every step that never ran.
 
-  SMOKE P3 — "a preflight FAIL blocks that leg until fixed or waived by name" —
-  so nothing boots and no journey runs. The blocked steps are recorded rather
-  than omitted, because a step that silently vanishes from a report is how a
-  blocked leg reads as a short green one.
+  SMOKE P3 — FAIL and INCOMPLETE both block that leg until fixed or waived by
+  name — so nothing boots and no journey runs. The blocked steps are recorded
+  rather than omitted, because a step that silently vanishes from a report is
+  how a blocked leg reads as a short green one.
   """
   @spec blocked_leg(String.t(), String.t(), Scorecard.Row.t()) :: Leg.t()
   def blocked_leg(harness, host_name, preflight_row) do
@@ -122,7 +122,7 @@ defmodule Tightbeam.ClientE2E do
         Scorecard.incomplete(
           oracle.step,
           oracle.label,
-          "preflight-failed: #{preflight_row.step} did not pass, so this leg was not booted " <>
+          "preflight-blocked: #{preflight_row.step} did not pass, so this leg was not booted " <>
             "(SMOKE P3)",
           journey: oracle.journey
         )
@@ -141,61 +141,65 @@ defmodule Tightbeam.ClientE2E do
   harness and no credential mechanic, which is the seam
   `scripts/check_harness_seam.sh` enforces.
 
-  The grading turns on a question the driver ANSWERS RATHER THAN ASSUMES: is
-  this harness's catalog fetch actually gated on the credential? It is measured
-  by `catalog_gated?/2` — fetch the catalog from a copy of the org with the
-  credential store removed. A harness whose catalog is a live authenticated
-  call fails without it (its successful fetch therefore PROVED the grant is
-  live); a harness whose catalog is a cached file succeeds without it, so its
-  fetch proves only that a file exists.
-
-  - gated + catalog usable  -> `pass`, liveness proved.
-  - not gated               -> `incomplete`, PRESENCE-ONLY, pointing at the
-    `credential_live?` registry callback (task #15). Not a pass: a populated
-    cache beside an expired credential would otherwise read as green, which is
-    precisely the false comfort this row exists to prevent.
+  The harness's `credential_live?/3` callback performs the bounded authenticated
+  probe. Its result mapping is closed: `:live` passes after catalog readiness is
+  confirmed, `{:dead, reason}` fails, and `{:unknown, reason}` is INCOMPLETE —
+  never a pass.
   """
-  @spec preflight(String.t(), String.t()) :: Scorecard.Row.t()
-  def preflight(harness, base_dir) do
+  @spec preflight(String.t(), String.t(), keyword()) :: Scorecard.Row.t()
+  def preflight(harness, base_dir, opts \\ []) do
     step = "P-" <> harness
     label = "auth #{harness}"
 
     case Enum.find(Tightbeam.Harness.all(), &(&1.wire_name() == harness)) do
       nil -> Scorecard.incomplete(step, label, "#{harness} is not a registered harness")
-      module -> probe_credential(module, step, label, base_dir)
+      module -> probe_credential(module, step, label, base_dir, opts)
     end
   end
 
-  defp probe_credential(module, step, label, base_dir) do
+  defp probe_credential(module, step, label, base_dir, opts) do
     home = Tightbeam.Homes.home_path(base_dir, Tightbeam.Placement.local_host_name(), module.id())
+    target = target(base_dir)
+    opts = Keyword.put_new(opts, :transport, &Tightbeam.Harness.Support.credential_transport/2)
 
     cond do
-      not module.credential_ready?(target(base_dir), home) ->
-        Scorecard.fail(step, label, "the harness reports its credential store is not ready in #{base_dir}")
+      not module.credential_ready?(target, home) ->
+        Scorecard.fail(
+          step,
+          label,
+          "the harness reports its credential store is not ready in #{base_dir}"
+        )
 
       true ->
-        case module.fetch_catalog(target(base_dir)) do
-          {:ok, [_ | _]} -> grade_catalog(module, step, label, base_dir)
-          {:ok, []} -> Scorecard.fail(step, label, "catalog fetch returned no models")
-          {:error, reason} -> Scorecard.fail(step, label, "catalog fetch failed: #{inspect(reason)}")
+        case module.credential_live?(target, home, opts) do
+          :live ->
+            grade_live(module, step, label, base_dir)
+
+          {:dead, reason} ->
+            Scorecard.fail(step, label, "credential rejected: #{inspect(reason)}")
+
+          {:unknown, reason} ->
+            Scorecard.incomplete(step, label, "credential liveness unknown: #{inspect(reason)}")
         end
     end
   end
 
-  defp grade_catalog(module, step, label, base_dir) do
-    if catalog_gated?(module, base_dir) do
-      Scorecard.pass(step, label,
-        note: "credential store ready; catalog fetch is credential-gated, so the grant is LIVE"
-      )
-    else
-      Scorecard.incomplete(
-        step,
-        label,
-        "PRESENCE-ONLY: the credential store is in place, but this harness's catalog fetch " <>
-          "succeeds without it (cache-backed), so nothing here proves the grant is live — an " <>
-          "expired credential beside a populated cache would look identical. Liveness needs the " <>
-          "credential_live? registry callback (task #15)."
-      )
+  defp grade_live(module, step, label, base_dir) do
+    case module.fetch_catalog(target(base_dir)) do
+      {:ok, [_ | _]} ->
+        Scorecard.pass(step, label,
+          note: "credential store ready; authenticated liveness probe returned :live"
+        )
+
+      {:ok, []} ->
+        Scorecard.fail(step, label, "credential is live but catalog fetch returned no models")
+
+      {:error, reason} ->
+        Scorecard.fail(
+          step,
+          label,
+          "credential is live but catalog fetch failed: #{inspect(reason)}"
+        )
     end
   end
 

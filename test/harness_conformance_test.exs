@@ -24,11 +24,16 @@ defmodule Tightbeam.HarnessConformanceTest do
   end
 
   test "every non-constant Harness callback is declared in the vector contract" do
-    callbacks =
+    callbacks_with_arity =
       Harness.behaviour_info(:callbacks)
-      |> MapSet.new(fn {callback, _arity} -> Atom.to_string(callback) end)
+      |> Map.new(fn {callback, arity} -> {Atom.to_string(callback), arity} end)
 
     constants = MapSet.new(@manifest["constant_accessor_callbacks"])
+
+    assert Enum.all?(constants, &(Map.fetch!(callbacks_with_arity, &1) == 0)),
+           "every constant-accessor allowlist entry must name an arity-0 callback"
+
+    callbacks = callbacks_with_arity |> Map.keys() |> MapSet.new()
 
     declared =
       @contract
@@ -36,9 +41,13 @@ defmodule Tightbeam.HarnessConformanceTest do
       |> Enum.flat_map(&String.split(&1, "/"))
       |> MapSet.new()
 
-    assert callbacks
-           |> MapSet.difference(constants)
-           |> MapSet.subset?(declared)
+    offending =
+      callbacks
+      |> MapSet.difference(constants)
+      |> MapSet.difference(declared)
+
+    assert offending == MapSet.new(),
+           "Harness callbacks missing from vector_contract: #{inspect(MapSet.to_list(offending))}"
   end
 
   for harness <- @harnesses do

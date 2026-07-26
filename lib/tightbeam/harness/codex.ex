@@ -207,6 +207,33 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   @impl true
+  def credential_live?(target, home, opts) do
+    script = """
+    const fs = require("node:fs");
+    const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    fetch("https://chatgpt.com/backend-api/wham/accounts/check", {
+      headers: {
+        "Authorization": `Bearer ${auth.tokens.access_token}`,
+        "ChatGPT-Account-ID": auth.tokens.account_id,
+        "User-Agent": "codex_cli_rs/0.145.0"
+      }
+    }).then(async response => {
+      process.stdout.write(JSON.stringify({
+        status: response.status,
+        headers: {"content-type": response.headers.get("content-type")},
+        body: await response.text()
+      }));
+    }).catch(error => {
+      process.stderr.write(error.code || error.message);
+      process.exitCode = 70;
+    });
+    """
+
+    request = %{command: ["node", "--no-warnings", "-e", script, Path.join(home, "auth.json")]}
+    Support.credential_live_result(target, request, opts)
+  end
+
+  @impl true
   def install_cli_projection(cli_bin) do
     shim = Path.join(cli_bin, "codex")
     discovered = System.find_executable("codex")
@@ -331,6 +358,10 @@ defmodule Tightbeam.Harness.Codex do
       home_scope: wire_name(),
       home_env: "CODEX_HOME",
       credential_file: "auth.json",
+      credential_live: %{
+        live_fixture: Application.app_dir(:tightbeam, "priv/credential_live/codex-live.json"),
+        dead_fixture: Application.app_dir(:tightbeam, "priv/credential_live/codex-dead.json")
+      },
       rails_file: "hooks.json",
       rails: %{"hooks" => %{"PreToolUse" => []}},
       skills_path: Path.join([".codex", "skills"]),

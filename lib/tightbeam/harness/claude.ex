@@ -148,6 +148,36 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   @impl true
+  def credential_live?(target, home, opts) do
+    script = """
+    const fs = require("node:fs");
+    const token = fs.readFileSync(process.argv[1], "utf8").trim();
+    fetch("https://api.anthropic.com/v1/models?limit=1", {
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "claude-cli/2.1.220"
+      }
+    }).then(async response => {
+      process.stdout.write(JSON.stringify({
+        status: response.status,
+        headers: {"content-type": response.headers.get("content-type")},
+        body: await response.text()
+      }));
+    }).catch(error => {
+      process.stderr.write(error.code || error.message);
+      process.exitCode = 70;
+    });
+    """
+
+    request = %{
+      command: ["node", "--no-warnings", "-e", script, Path.join(home, "oauth-token")]
+    }
+
+    Support.credential_live_result(target, request, opts)
+  end
+
+  @impl true
   def install_cli_projection(_cli_bin), do: :ok
 
   @impl true
@@ -231,6 +261,10 @@ defmodule Tightbeam.Harness.Claude do
       home_scope: wire_name(),
       home_env: "CLAUDE_CONFIG_DIR",
       credential_file: "oauth-token",
+      credential_live: %{
+        live_fixture: Application.app_dir(:tightbeam, "priv/credential_live/claude-live.json"),
+        dead_fixture: Application.app_dir(:tightbeam, "priv/credential_live/claude-dead.json")
+      },
       rails_file: "settings.json",
       rails: %{"hooks" => %{"PreToolUse" => []}},
       skills_path: Path.join([".claude", "skills"]),
