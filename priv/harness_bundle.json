@@ -38,6 +38,13 @@
       "description": "Pass the single branch-free parameterized suite for every registered harness and the permanent fixture harness."
     }
   ],
+  "constant_accessor_callbacks": [
+    "id",
+    "wire_name",
+    "credential_provider",
+    "install_package",
+    "conformance_vectors"
+  ],
   "vector_contract": {
     "prepare_launch": {
       "required_cases": [
@@ -82,6 +89,14 @@
         "rotated"
       ],
       "oracle": "credential readiness boolean and harvested bytes equal the vector's expected values"
+    },
+    "install_cli_projection": {
+      "required_cases": [
+        "creates",
+        "already-exists-skip",
+        "self-resolved-skip"
+      ],
+      "oracle": "observed filesystem effect equals the vector's expected effect"
     },
     "probe_cli": {
       "required_cases": [

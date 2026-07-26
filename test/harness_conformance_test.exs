@@ -23,6 +23,24 @@ defmodule Tightbeam.HarnessConformanceTest do
     assert moduledoc_ids == manifest_ids
   end
 
+  test "every non-constant Harness callback is declared in the vector contract" do
+    callbacks =
+      Harness.behaviour_info(:callbacks)
+      |> MapSet.new(fn {callback, _arity} -> Atom.to_string(callback) end)
+
+    constants = MapSet.new(@manifest["constant_accessor_callbacks"])
+
+    declared =
+      @contract
+      |> Map.keys()
+      |> Enum.flat_map(&String.split(&1, "/"))
+      |> MapSet.new()
+
+    assert callbacks
+           |> MapSet.difference(constants)
+           |> MapSet.subset?(declared)
+  end
+
   for harness <- @harnesses do
     test "#{inspect(harness)} satisfies every manifest conformance vector" do
       vectors = unquote(harness).conformance_vectors()

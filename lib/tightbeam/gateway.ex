@@ -130,6 +130,13 @@ defmodule Tightbeam.Gateway do
   """
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
+    preflight!(config)
+    children_after_preflight(config)
+  end
+
+  @doc false
+  @spec children_after_preflight(config()) :: [Supervisor.child_spec() | {module(), term()}]
+  def children_after_preflight(config) do
     db = Map.get(config, :db, Tightbeam.DB)
     prod_limit = Map.get(config, :prod_limit, 3)
 
@@ -228,7 +235,6 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:producer_runner, producer_runner)
       |> handlers()
 
-    Identity.init!(config.base_dir)
     Rules.load!(config.base_dir, Map.keys(handler_table), producer_config)
     runner = turn_runner(Map.put(config, :db, db))
 
@@ -236,7 +242,6 @@ defmodule Tightbeam.Gateway do
     # boot (bad law stops the boot). Placement owns every host mechanic.
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)
-    assert_harness_binary_ready!(config, cli_bin)
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -331,45 +336,106 @@ defmodule Tightbeam.Gateway do
       ]
   end
 
+  @doc "Refuse an unusable harness or identity before the production store is created."
+  @spec preflight!(config()) :: :ok
+  def preflight!(config) do
+    assert_harness_binary_ready!(Path.join(config.base_dir, "bin"))
+    Identity.init!(config.base_dir)
+    :ok
+  end
+
   defp credential_children(config, db) do
     Enum.map(Placement.hosts(config.base_dir), fn {machine, host} ->
-      opts =
-        [
-          name: Tightbeam.Credentials.server(machine),
-          base_dir: host.base_dir,
-          staging_base_dir: config.base_dir,
-          machine: machine,
-          ssh: host.ssh,
-          gate: fn _provider -> :ok end,
-          stop: fn provider -> stop_provider_runtime(provider, machine) end,
-          park: fn provider -> stop_provider_runtime(provider, machine) end,
-          start: fn provider -> start_provider_runtime(provider, machine) end,
-          resume: fn _provider -> :ok end,
-          capture_sessions: fn provider ->
-            capture_credential_sessions(db, provider, machine)
-          end,
-          publish_sessions: fn captured, transition ->
-            publish_credential_sessions(db, captured, transition)
-          end
-        ]
-        |> maybe_put_credential_runner(config)
-
-      %{
-        id: {Tightbeam.Credentials, machine},
-        start: {Tightbeam.Credentials, :start_link, [opts]}
-      }
+      credential_child(config, db, machine, host)
     end)
+  end
+
+  defp credential_child(config, db, machine, host) do
+    opts =
+      [
+        name: Tightbeam.Credentials.server(machine),
+        base_dir: host.base_dir,
+        staging_base_dir: config.base_dir,
+        machine: machine,
+        ssh: host.ssh,
+        gate: fn _provider -> :ok end,
+        stop: fn provider -> stop_provider_runtime(provider, machine) end,
+        park: fn provider -> stop_provider_runtime(provider, machine) end,
+        start: fn provider -> start_provider_runtime(provider, machine) end,
+        resume: fn _provider -> :ok end,
+        capture_sessions: fn provider ->
+          capture_credential_sessions(db, provider, machine)
+        end,
+        publish_sessions: fn captured, transition ->
+          publish_credential_sessions(db, captured, transition)
+        end
+      ]
+      |> maybe_put_credential_runner(config)
+
+    %{
+      id: {Tightbeam.Credentials, machine},
+      start: {Tightbeam.Credentials, :start_link, [opts]}
+    }
+  end
+
+  defp start_credential_child(config, db, machine, previous_host, host) do
+    # The LOCAL credential server is boot-owned, and Placement.hosts/1 forces
+    # the synthetic local entry regardless of the registry — re-registering the
+    # gateway's own hostname must never replace it (a foreign base_dir plus a
+    # non-nil ssh here wedges every local spawn until restart, fail-closed).
+    if machine == Placement.local_host_name() do
+      :ok
+    else
+      start_remote_credential_child(config, db, machine, previous_host, host)
+    end
+  end
+
+  defp start_remote_credential_child(config, db, machine, previous_host, host) do
+    supervisor = Map.get(config, :credential_supervisor, Tightbeam.Supervisor)
+    child = credential_child(config, db, machine, host)
+
+    case Supervisor.start_child(supervisor, child) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, {:already_started, _pid}} ->
+        if same_credential_host?(previous_host, host) do
+          :ok
+        else
+          replace_credential_child(supervisor, child, machine)
+        end
+
+      {:error, :already_present} ->
+        replace_credential_child(supervisor, child, machine)
+
+      {:error, reason} ->
+        raise "failed to start credential server for host #{machine}: #{inspect(reason)}"
+    end
+  end
+
+  defp same_credential_host?(nil, _host), do: false
+
+  defp same_credential_host?(previous, current),
+    do: previous.base_dir == current.base_dir and previous.ssh == current.ssh
+
+  defp replace_credential_child(supervisor, child, machine) do
+    with :ok <- Supervisor.terminate_child(supervisor, child.id),
+         :ok <- Supervisor.delete_child(supervisor, child.id),
+         {:ok, _pid} <- Supervisor.start_child(supervisor, child) do
+      :ok
+    else
+      {:error, reason} ->
+        raise "failed to start credential server for host #{machine}: #{inspect(reason)}"
+    end
   end
 
   defp maybe_put_credential_runner(opts, %{sh: sh}), do: Keyword.put(opts, :sh, sh)
   defp maybe_put_credential_runner(opts, _config), do: opts
 
-  defp assert_harness_binary_ready!(config, cli_bin) do
-    probe = Map.get(config, :harness_binary_probe, &Placement.harness_binary_probe/2)
-
+  defp assert_harness_binary_ready!(cli_bin) do
     results =
       Enum.map(Harness.all(), fn module ->
-        {module.id(), probe.(module.id(), cli_bin)}
+        {module.id(), Placement.harness_binary_probe(module.id(), cli_bin)}
       end)
 
     unless Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) do
@@ -525,6 +591,8 @@ defmodule Tightbeam.Gateway do
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
           # prepared the machine; this records the fact. The topology is the
           # operator's to declare.
+          previous_entry = Placement.hosts(config.base_dir)[p.name]
+
           {:ok, entry} =
             Placement.register_host(config.base_dir, p.name, %{
               ssh: p[:ssh] || p.name,
@@ -533,6 +601,7 @@ defmodule Tightbeam.Gateway do
               adapter_bin_dir: p[:adapter_bin_dir]
             })
 
+          :ok = start_credential_child(config, db, p.name, previous_entry, entry)
           %{host: p.name, config: entry}
         end),
       "identity-edit" =>
@@ -1063,6 +1132,7 @@ defmodule Tightbeam.Gateway do
     end
 
     File.chmod!(wrapper, 0o755)
+    Enum.each(Harness.all(), fn module -> :ok = module.install_cli_projection(bin_dir) end)
 
     bin_dir
   end
@@ -2720,7 +2790,7 @@ defmodule Tightbeam.Gateway do
     server = Tightbeam.Credentials.server(machine)
 
     case GenServer.whereis(server) do
-      nil -> :onboarded
+      nil -> {:needs_onboarding, :credential_server_unavailable}
       _pid -> Tightbeam.Credentials.status(provider, server)
     end
   end

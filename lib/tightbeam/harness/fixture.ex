@@ -107,6 +107,9 @@ defmodule Tightbeam.Harness.Fixture do
     do: Tightbeam.Homes.harvest_credential(target, home, "fixture.json")
 
   @impl true
+  def install_cli_projection(_cli_bin), do: :ok
+
+  @impl true
   def probe_cli(target) do
     find = Map.get(target, :find_executable, &System.find_executable/1)
     Support.bounded_probe(find.("fixture"), target)

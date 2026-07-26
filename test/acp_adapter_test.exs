@@ -1,5 +1,6 @@
 defmodule Tightbeam.Acp.AdapterTest do
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   doctest Tightbeam.Acp.Adapter
 
@@ -68,6 +69,14 @@ defmodule Tightbeam.Acp.AdapterTest do
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } } } });
             return send({ id: m.id, result: { stopReason: "end_turn" } });
           }
+          if (gateMode === "pass-then-die") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } } } });
+            send({ id: m.id, result: { stopReason: "end_turn" } });
+            return setTimeout(() => {
+              process.stderr.write("x".repeat(20000) + "\nadapter exploded: credential socket closed\n");
+              process.exit(137);
+            }, 25);
+          }
           if (gateMode === "pass-tool") {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call", content: [{ type: "content", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } }] } } });
             return send({ id: m.id, result: { stopReason: "end_turn" } });
@@ -81,6 +90,7 @@ defmodule Tightbeam.Acp.AdapterTest do
             return send({ id: m.id, result: { stopReason: "end_turn" } });
           }
           if (gateMode === "turn-error") {
+            process.stderr.write("probe turn failed: adapter transport unavailable\n");
             return send({ id: m.id, error: { code: -32000, message: "probe turn failed" } });
           }
           if (gateMode === "stall") return;
@@ -125,9 +135,20 @@ defmodule Tightbeam.Acp.AdapterTest do
         cmd: [System.find_executable("node"), path, capture_path, fail_mode, gate_mode],
         home: "/tmp",
         cwd: "/tmp",
-        stderr_path: stderr_path,
         name: :"adapter_#{System.unique_integer([:positive])}"
       ]
+      |> then(fn adapter_opts ->
+        case Keyword.get(opts, :stderr_path, stderr_path) do
+          :omit -> adapter_opts
+          path -> Keyword.put(adapter_opts, :stderr_path, path)
+        end
+      end)
+      |> then(fn adapter_opts ->
+        case Keyword.fetch(opts, :gate_log_path) do
+          {:ok, path} -> Keyword.put(adapter_opts, :gate_log_path, path)
+          :error -> adapter_opts
+        end
+      end)
       |> then(fn adapter_opts ->
         if contained, do: Keyword.put(adapter_opts, :contained, true), else: adapter_opts
       end)
@@ -584,10 +605,10 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
       refute Adapter.knows_session?(adapter, "probe-sess")
 
-      assert capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+      assert capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
                "gate wiring-check PASS [gate: tightbeam-probe]"
 
-      refute capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+      refute capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
                "[gate-drift]"
     end
   end
@@ -598,10 +619,45 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, :no_marker}}
 
-    log = capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!()
+    log = capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!()
     assert log =~ "[gate-drift] raw_updates="
     assert log =~ ~s("sessionUpdate":"drifted_shape")
     assert byte_size(log) < 5_000
+  end
+
+  test "gate log is omitted without real stderr and honors an explicit path" do
+    parent = self()
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        gate_mode: "pass-message",
+        stderr_path: :omit,
+        on_ready: fn -> send(parent, :sentinel_gate_ready) end
+      )
+
+    assert_receive :sentinel_gate_ready
+    assert Process.alive?(adapter)
+
+    explicit_path =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-explicit-gate-#{System.unique_integer([:positive])}.log"
+      )
+
+    on_exit(fn -> File.rm(explicit_path) end)
+
+    {_adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        gate_mode: "pass-message",
+        stderr_path: :omit,
+        gate_log_path: explicit_path,
+        on_ready: fn -> send(parent, :explicit_gate_ready) end
+      )
+
+    assert_receive :explicit_gate_ready
+    assert File.read!(explicit_path) =~ "gate wiring-check PASS [gate: tightbeam-probe]"
   end
 
   test "gate wiring-check fails closed without the marker or on a probe turn error" do
@@ -614,12 +670,73 @@ defmodule Tightbeam.Acp.AdapterTest do
           catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance"))
         end)
 
-      assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, ^detail}}
+      assert_receive {:DOWN, ^monitor, :process, ^adapter, reason}
+
+      expected_reason =
+        case gate_mode do
+          "turn-error" ->
+            {:adapter_fault,
+             %{
+               reason: {:gate_attestation_failed, detail},
+               stderr: "probe turn failed: adapter transport unavailable"
+             }}
+
+          "no-marker" ->
+            {:gate_attestation_failed, detail}
+        end
+
+      assert reason == expected_reason
+
       refute match?({:ok, _sid}, Task.await(queued))
 
-      assert capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+      assert capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
                "gate wiring-check FAIL detail=#{detail}"
     end
+  end
+
+  test "a gate-passing adapter that dies reports only its real stderr tail" do
+    {adapter, capture_path} = start_adapter(harness: :codex, gate_mode: "pass-then-die")
+    monitor = Process.monitor(adapter)
+
+    assert_receive {:DOWN, ^monitor, :process, ^adapter,
+                    {:adapter_fault,
+                     %{
+                       reason: {:acp_exit, 137},
+                       stderr: "adapter exploded: credential socket closed"
+                     }}},
+                   2_000
+
+    stderr_path = Path.join(Path.dirname(capture_path), "stderr.log")
+    gate_path = stderr_path <> ".gate.log"
+    assert File.read!(gate_path) =~ "gate wiring-check PASS [gate: tightbeam-probe]"
+    refute File.read!(stderr_path) =~ "gate wiring-check"
+  end
+
+  test "adapter status redacts accumulating chunks and a raising call's guidance message" do
+    chunk_marker = "CHUNK_PAYLOAD_MARKER_DO_NOT_LOG"
+    guidance_marker = "GUIDANCE_PAYLOAD_MARKER_DO_NOT_LOG"
+    {adapter, _capture_path} = start_adapter(harness: :codex, probe: false)
+
+    :sys.replace_state(adapter, fn state ->
+      state
+      |> put_in([Access.key(:chunks), "sensitive-session"], [chunk_marker])
+      |> Map.put(:harness, :missing_harness)
+    end)
+
+    monitor = Process.monitor(adapter)
+
+    log =
+      capture_log(fn ->
+        catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], guidance_marker))
+
+        assert_receive {:DOWN, ^monitor, :process, ^adapter, _reason}
+        Logger.flush()
+      end)
+
+    refute log =~ chunk_marker
+    refute log =~ guidance_marker
+    assert log =~ "State: :redacted"
+    assert log =~ ~r/Last message(?: \(from .+?\))?: :redacted/
   end
 
   test "gate wiring-check enforces one absolute deadline and serves no queued session" do

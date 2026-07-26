@@ -125,6 +125,16 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule RejectingCredentialSupervisor do
+    use GenServer
+
+    def start_link, do: GenServer.start_link(__MODULE__, nil)
+    def init(nil), do: {:ok, nil}
+
+    def handle_call({:start_child, _child}, _from, state),
+      do: {:reply, {:error, :deliberate_start_failure}, state}
+  end
+
   defmodule TuneAdapterStub do
     use GenServer
 
@@ -778,31 +788,38 @@ defmodule Tightbeam.GatewayTest do
              Org.get(ctx.db, Org.personal_session_key(device.user_id))
   end
 
-  test "children refuses to boot when no harness binary is usable", ctx do
+  test "children refuses a broken harness on PATH without creating any org artifact", ctx do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_no_harness_#{System.unique_integer([:positive])}")
 
-    probe = fn
-      :claude, _cli_bin -> {:error, :not_found}
-      :codex, _cli_bin -> {:error, {:exec_failed, "exit=1 output=\"broken\""}}
-      :fixture, _cli_bin -> {:error, :not_found}
-    end
+    bin_dir =
+      Path.join(System.tmp_dir!(), "gateway_broken_bin_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(bin_dir)
+    codex = Path.join(bin_dir, "codex")
+    File.write!(codex, "#!/bin/sh\necho broken >&2\nexit 1\n")
+    File.chmod!(codex, 0o755)
+    previous_path = System.get_env("PATH")
+    System.put_env("PATH", bin_dir)
+    File.rm_rf!(base_dir)
+
+    on_exit(fn ->
+      System.put_env("PATH", previous_path)
+      File.rm_rf!(base_dir)
+      File.rm_rf!(bin_dir)
+    end)
 
     exception =
       assert_raise RuntimeError, fn ->
-        Gateway.children(
-          gateway_config(base_dir, ctx.db, 0)
-          |> Map.put(:harness_binary_probe, probe)
-        )
+        Gateway.children(gateway_config(base_dir, ctx.db, 0))
       end
 
     message = Exception.message(exception)
 
     assert message =~ "no usable harness CLI"
-    assert message =~ "claude: not found"
     assert message =~ "codex: exec failed"
-    assert message =~ "fixture: not found"
     assert message =~ "Install a registered harness CLI"
+    refute File.exists?(base_dir)
   end
 
   test "children backfills distinct tokens for active NULL rows only", ctx do
@@ -957,7 +974,7 @@ defmodule Tightbeam.GatewayTest do
     end)
   end
 
-  test "children installs the codex hook-trust shim and skips missing or self-resolved codex",
+  test "children installs the codex hook-trust shim and preserves missing or self-resolved codex",
        ctx do
     root =
       Path.join(
@@ -973,14 +990,18 @@ defmodule Tightbeam.GatewayTest do
     self_base = Path.join(root, "self-base")
     self_codex = Path.join(self_base, "bin/codex")
     original_path = System.get_env("PATH")
+    git = System.find_executable("git")
 
     File.mkdir_p!(real_bin)
     File.write!(real_codex, "#!/bin/sh\n")
     File.chmod!(real_codex, 0o755)
+    File.ln_s!(git, Path.join(real_bin, "git"))
     File.mkdir_p!(missing_bin)
+    File.ln_s!(git, Path.join(missing_bin, "git"))
     File.mkdir_p!(Path.dirname(self_codex))
     File.write!(self_codex, "self-sentinel")
     File.chmod!(self_codex, 0o755)
+    File.ln_s!(git, Path.join(Path.dirname(self_codex), "git"))
 
     for base <- [shim_base, missing_base, self_base], do: Identity.init!(base)
 
@@ -994,17 +1015,9 @@ defmodule Tightbeam.GatewayTest do
       end
     end)
 
-    probe = fn
-      :codex, cli_bin -> Placement.harness_binary_probe(:codex, cli_bin)
-      harness, _cli_bin -> {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
-    end
-
     System.put_env("PATH", real_bin)
 
-    Gateway.children(
-      gateway_config(shim_base, ctx.db, 0)
-      |> Map.put(:harness_binary_probe, probe)
-    )
+    Gateway.children(gateway_config(shim_base, ctx.db, 0))
 
     shim = Path.join(shim_base, "bin/codex")
 
@@ -1015,19 +1028,17 @@ defmodule Tightbeam.GatewayTest do
 
     System.put_env("PATH", missing_bin)
 
-    Gateway.children(
-      gateway_config(missing_base, ctx.db, 0)
-      |> Map.put(:harness_binary_probe, probe)
-    )
+    assert_raise RuntimeError, ~r/no usable harness CLI/, fn ->
+      Gateway.children(gateway_config(missing_base, ctx.db, 0))
+    end
 
     refute File.exists?(Path.join(missing_base, "bin/codex"))
 
     System.put_env("PATH", Path.dirname(self_codex))
 
-    Gateway.children(
-      gateway_config(self_base, ctx.db, 0)
-      |> Map.put(:harness_binary_probe, probe)
-    )
+    assert_raise RuntimeError, ~r/no usable harness CLI/, fn ->
+      Gateway.children(gateway_config(self_base, ctx.db, 0))
+    end
 
     assert File.read!(self_codex) == "self-sentinel"
   end
@@ -1509,6 +1520,199 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
     assert Roles.get(ctx.db, "unready") == nil
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
+  end
+
+  test "spawn fails closed when a registered host has no credential server", ctx do
+    machine = "credential-worker-missing"
+    base_dir = move_test_base("credential-server-missing", machine)
+
+    {:ok, _entry} =
+      Placement.register_host(base_dir, machine, %{
+        ssh: machine,
+        base_dir: "/remote/tb"
+      })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.delete(:credential_status)
+
+    assert GenServer.whereis(Credentials.server(machine)) == nil
+
+    expected_message =
+      "claude on #{machine} needs onboarding: :credential_server_unavailable; run tightbeam onboard anthropic on #{machine}"
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "needs_onboarding"},
+             message: ^expected_message
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "No credential owner",
+                 host: machine,
+                 idempotency_key: "spawn-no-credential-owner"
+               }
+             })
+  end
+
+  test "register-host supervises credentials and refuses spawn until onboarding", ctx do
+    machine = "credential-worker-registration"
+    base_dir = move_test_base("credential-server-registration", machine)
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:credential_command, command})
+      {"", 1}
+    end
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.delete(:credential_status)
+      |> Map.put(:sh, sh)
+
+    handlers = Gateway.handlers(config)
+    child_id = {Credentials, machine}
+
+    on_exit(fn ->
+      Supervisor.terminate_child(Tightbeam.Supervisor, child_id)
+      Supervisor.delete_child(Tightbeam.Supervisor, child_id)
+    end)
+
+    assert %{host: ^machine} =
+             handlers["register-host"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 name: machine,
+                 ssh: machine,
+                 base_dir: "/remote/tb"
+               }
+             })
+
+    server = Credentials.server(machine)
+    first_pid = GenServer.whereis(server)
+    assert is_pid(first_pid)
+    assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
+    assert_receive {:credential_command, first_command}
+    assert Enum.join(first_command, " ") =~ "/remote/tb"
+
+    :ok = :sys.suspend(first_pid)
+
+    try do
+      reregister =
+        Task.async(fn ->
+          handlers["register-host"].(%{
+            origin: "user:flynn",
+            session_key: nil,
+            params: %{
+              name: machine,
+              ssh: machine,
+              base_dir: "/remote/tb"
+            }
+          })
+        end)
+
+      assert %{host: ^machine} = Task.await(reregister, 500)
+      assert GenServer.whereis(server) == first_pid
+    after
+      :ok = :sys.resume(first_pid)
+    end
+
+    assert %{host: ^machine} =
+             handlers["register-host"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 name: machine,
+                 ssh: machine,
+                 base_dir: "/remote/new-tb"
+               }
+             })
+
+    second_pid = GenServer.whereis(server)
+    assert is_pid(second_pid)
+    refute second_pid == first_pid
+    assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
+    assert_receive {:credential_command, second_command}
+    assert Enum.join(second_command, " ") =~ "/remote/new-tb"
+
+    expected_message =
+      "claude on #{machine} needs onboarding: :missing; run tightbeam onboard anthropic on #{machine}"
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "needs_onboarding"},
+             message: ^expected_message
+           } =
+             handlers["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Fresh remote",
+                 host: machine,
+                 idempotency_key: "spawn-fresh-remote"
+               }
+             })
+  end
+
+  test "register-host with the LOCAL hostname never touches the boot-owned credential server", ctx do
+    local = Tightbeam.Placement.local_host_name()
+    base_dir = move_test_base("local-host-reregistration", local)
+    config = gateway_config(base_dir, ctx.db, 0)
+    handlers = Gateway.handlers(config)
+
+    local_server = GenServer.whereis(Credentials.server(local))
+
+    # An operator assimilating the gateway's own hostname (plausible re-sweep
+    # mistake) must be inert for credential supervision: replacing the local
+    # server with a foreign base_dir + non-nil ssh wedges every local spawn
+    # until restart (fail-closed), and Placement.hosts/1 ignores the registry
+    # entry for the local name anyway.
+    assert %{host: ^local} =
+             handlers["register-host"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 name: local,
+                 ssh: "clu@#{local}",
+                 base_dir: "/remote/definitely-elsewhere"
+               }
+             })
+
+    assert GenServer.whereis(Credentials.server(local)) == local_server,
+           "local credential server was replaced by re-registering the local hostname"
+
+    refute Enum.any?(Supervisor.which_children(Tightbeam.Supervisor), fn {id, _, _, _} ->
+             id == {Credentials, local}
+           end),
+           "re-registering the local hostname minted a dynamic credential child"
+  end
+
+  test "register-host raises a host-named error when credential child startup fails", ctx do
+    machine = "credential-worker-start-failure"
+    base_dir = move_test_base("credential-server-start-failure", machine)
+    {:ok, rejecting_supervisor} = RejectingCredentialSupervisor.start_link()
+
+    handler =
+      Gateway.handlers(
+        gateway_config(base_dir, ctx.db, 0)
+        |> Map.put(:credential_supervisor, rejecting_supervisor)
+      )["register-host"]
+
+    assert_raise RuntimeError,
+                 "failed to start credential server for host #{machine}: :deliberate_start_failure",
+                 fn ->
+                   handler.(%{
+                     origin: "user:flynn",
+                     session_key: nil,
+                     params: %{name: machine, ssh: machine, base_dir: "/remote/failed"}
+                   })
+                 end
+
+    assert {:ok, hosts} = base_dir |> Path.join("hosts.json") |> File.read!() |> JSON.decode()
+    assert hosts[machine]["base_dir"] == "/remote/failed"
   end
 
   test "spawn proceeds after a live remote readiness probe", ctx do
@@ -3982,10 +4186,7 @@ defmodule Tightbeam.GatewayTest do
       wake_tick_ms: 1_000,
       db: db,
       credential_status: fn _provider -> :onboarded end,
-      patch_adapter: fn _harness, _path -> :ok end,
-      harness_binary_probe: fn harness, _cli_bin ->
-        {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
-      end
+      patch_adapter: fn _harness, _path -> :ok end
     }
   end
 
@@ -4067,7 +4268,7 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  defp move_test_base(suffix) do
+  defp move_test_base(suffix, remote_host \\ "worker") do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_move_#{suffix}_#{System.unique_integer([:positive])}")
 
@@ -4075,17 +4276,27 @@ defmodule Tightbeam.GatewayTest do
     manifests = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
 
-    File.write!(Path.join(manifests, "default.toml"), """
-    name = "default"
-    where = ["testhost", "worker"]
-    """)
+    File.write!(
+      Path.join(manifests, "default.toml"),
+      "name = \"default\"\nwhere = [\"testhost\", \"#{remote_host}\"]\n"
+    )
 
     Archetypes.load!(base_dir)
     on_exit(fn -> :persistent_term.erase(Archetypes) end)
 
+    previous_hosts = Application.get_env(:tightbeam, :hosts)
+
     Application.put_env(:tightbeam, :hosts, %{
-      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
+      remote_host => %{ssh: remote_host, base_dir: "/remote/tb", cli_bin: nil}
     })
+
+    on_exit(fn ->
+      if previous_hosts do
+        Application.put_env(:tightbeam, :hosts, previous_hosts)
+      else
+        Application.delete_env(:tightbeam, :hosts)
+      end
+    end)
 
     base_dir
   end

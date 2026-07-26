@@ -47,6 +47,7 @@ defmodule Tightbeam.Harness.Support do
       "reconcile_home" => reconcile_home_vectors(module, profile),
       "materialize_skills" => materialize_skills_vectors(module, profile),
       "credential_ready?/harvest_credential" => credential_vectors(module, profile),
+      "install_cli_projection" => install_cli_projection_vectors(module),
       "probe_cli" => probe_cli_vectors(module, profile),
       "containment_additions" => [
         vector("exact_grants", profile.containment, %{})
@@ -77,6 +78,9 @@ defmodule Tightbeam.Harness.Support do
 
   def observe_vector(module, "credential_ready?/harvest_credential", %{input: input}),
     do: observe_credential(module, input.profile, input.case)
+
+  def observe_vector(module, "install_cli_projection", %{input: input}),
+    do: observe_cli_projection(module, input.case, input.effect)
 
   def observe_vector(module, "probe_cli", %{input: input}),
     do: observe_probe_cli(module, input.profile)
@@ -466,6 +470,105 @@ defmodule Tightbeam.Harness.Support do
       }
     end)
   end
+
+  defp install_cli_projection_vectors(module) do
+    effect = if module.id() == :codex, do: :codex_projection, else: :no_op
+
+    for case_name <- ["creates", "already-exists-skip", "self-resolved-skip"] do
+      vector(
+        case_name,
+        expected_cli_projection(case_name, effect),
+        %{case: case_name, effect: effect}
+      )
+    end
+  end
+
+  defp observe_cli_projection(module, case_name, effect) do
+    with_tmp("cli-projection", fn base ->
+      cli_bin = Path.join(base, "cli-bin")
+      discovered_bin = Path.join(base, "discovered-bin")
+      projection = Path.join(cli_bin, "codex")
+      discovered = Path.join(discovered_bin, "codex")
+      original_path = System.get_env("PATH")
+
+      File.mkdir_p!(cli_bin)
+      File.mkdir_p!(discovered_bin)
+
+      case case_name do
+        "creates" ->
+          executable!(discovered, "discovered")
+          System.put_env("PATH", discovered_bin)
+
+        "already-exists-skip" ->
+          executable!(discovered, "discovered")
+          executable!(projection, "existing")
+          System.put_env("PATH", discovered_bin)
+
+        "self-resolved-skip" ->
+          executable!(projection, "self-resolved")
+          System.put_env("PATH", cli_bin)
+      end
+
+      before = filesystem_effect(cli_bin)
+
+      try do
+        :ok = module.install_cli_projection(cli_bin)
+
+        %{effect: effect, before: before, after: filesystem_effect(cli_bin)}
+        |> normalize_paths(base, nil)
+      after
+        restore_env("PATH", original_path)
+      end
+    end)
+  end
+
+  defp expected_cli_projection("creates", :no_op),
+    do: %{effect: :no_op, before: %{}, after: %{}}
+
+  defp expected_cli_projection(case_name, :no_op)
+       when case_name in ["already-exists-skip", "self-resolved-skip"] do
+    bytes = if case_name == "already-exists-skip", do: "existing", else: "self-resolved"
+    snapshot = %{"codex" => %{bytes: bytes, mode: 0o755}}
+    %{effect: :no_op, before: snapshot, after: snapshot}
+  end
+
+  defp expected_cli_projection("creates", :codex_projection) do
+    %{
+      effect: :codex_projection,
+      before: %{},
+      after: %{
+        "codex" => %{
+          bytes:
+            "#!/bin/sh\nexec \"<BASE>/discovered-bin/codex\" --dangerously-bypass-hook-trust \"$@\"\n",
+          mode: 0o755
+        }
+      }
+    }
+  end
+
+  defp expected_cli_projection(case_name, :codex_projection)
+       when case_name in ["already-exists-skip", "self-resolved-skip"] do
+    bytes = if case_name == "already-exists-skip", do: "existing", else: "self-resolved"
+    snapshot = %{"codex" => %{bytes: bytes, mode: 0o755}}
+    %{effect: :codex_projection, before: snapshot, after: snapshot}
+  end
+
+  defp executable!(path, bytes) do
+    File.write!(path, bytes)
+    File.chmod!(path, 0o755)
+  end
+
+  defp filesystem_effect(root) do
+    root
+    |> leaf_snapshot()
+    |> Map.new(fn {path, entry} ->
+      stat = File.stat!(Path.join(root, path))
+      {path, %{bytes: entry.bytes, mode: Bitwise.band(stat.mode, 0o777)}}
+    end)
+  end
+
+  defp restore_env(name, nil), do: System.delete_env(name)
+  defp restore_env(name, value), do: System.put_env(name, value)
 
   defp probe_cli_vectors(_module, profile) do
     expected_path =

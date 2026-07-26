@@ -30,6 +30,7 @@ defmodule Tightbeam.Acp.Adapter do
     :preset,
     :harness,
     :cwd,
+    :stderr_path,
     :on_auth_event,
     :on_subagent_event,
     contained: false,
@@ -48,7 +49,7 @@ defmodule Tightbeam.Acp.Adapter do
   @doc """
   Start the adapter. Required: `:harness` (a registered harness id), `:cmd` (adapter
   argv), `:home` (agent-home dir, exported via the harness's home env var),
-  `:cwd`. Optional: `:env`, `:stderr_path`, `:name`.
+  `:cwd`. Optional: `:env`, `:stderr_path`, `:gate_log_path`, `:name`.
 
   Accepts either the opts keyword directly, or a ZERO-ARITY FUN producing it.
   The fun form is the coordinator's: opts-building may be expensive or hang
@@ -197,6 +198,7 @@ defmodule Tightbeam.Acp.Adapter do
       preset: preset,
       harness: harness,
       cwd: Keyword.fetch!(opts, :cwd),
+      stderr_path: Keyword.get(opts, :stderr_path, "/dev/null"),
       on_auth_event: Keyword.get(opts, :on_auth_event),
       on_subagent_event: Keyword.get(opts, :on_subagent_event),
       contained: Keyword.get(opts, :contained, false)
@@ -211,7 +213,7 @@ defmodule Tightbeam.Acp.Adapter do
         case gate_attestation(state, probe_cwd, Keyword.fetch!(opts, :probe_model), deadline) do
           {:ok, output} ->
             gate_log(
-              Keyword.get(opts, :stderr_path, "/dev/null"),
+              opts,
               "gate wiring-check PASS #{@gate_marker} output=#{inspect(output)}"
             )
 
@@ -219,17 +221,23 @@ defmodule Tightbeam.Acp.Adapter do
             {:noreply, state}
 
           {:error, detail, output, raw_updates} ->
+            reason =
+              adapter_failure_reason(
+                {:gate_attestation_failed, detail},
+                state.stderr_path
+              )
+
             gate_log(
-              Keyword.get(opts, :stderr_path, "/dev/null"),
+              opts,
               "[gate-drift] raw_updates=#{gate_raw_updates(raw_updates)}"
             )
 
             gate_log(
-              Keyword.get(opts, :stderr_path, "/dev/null"),
+              opts,
               "gate wiring-check FAIL detail=#{detail} output=#{inspect(output)}"
             )
 
-            {:stop, {:gate_attestation_failed, detail}, state}
+            {:stop, reason, state}
         end
 
       :error ->
@@ -420,9 +428,16 @@ defmodule Tightbeam.Acp.Adapter do
   # sessions. (Found by the soak driver's A3 audit: an adapter SIGKILL
   # left zero substrate records.)
   def handle_info({:acp_exit, status}, state),
-    do: {:stop, {:acp_exit, status}, state}
+    do: {:stop, adapter_failure_reason({:acp_exit, status}, state.stderr_path), state}
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl GenServer
+  def format_status(status) do
+    status
+    |> Map.put(:state, :redacted)
+    |> Map.put(:message, :redacted)
+  end
 
   defp maybe_emit_account_update(state, update) do
     emit_auth_classification(state, update)
@@ -694,6 +709,34 @@ defmodule Tightbeam.Acp.Adapter do
     |> String.slice(0, @gate_raw_log_limit)
   end
 
+  defp adapter_failure_reason(reason, stderr_path) do
+    case last_stderr_line(stderr_path) do
+      nil -> reason
+      line -> {:adapter_fault, %{reason: reason, stderr: line}}
+    end
+  end
+
+  defp last_stderr_line(stderr_path) do
+    with {:ok, file} <- :file.open(String.to_charlist(stderr_path), [:read, :binary]) do
+      try do
+        with {:ok, size} <- :file.position(file, :eof),
+             {:ok, _position} <- :file.position(file, max(0, size - 8_192)),
+             {:ok, bytes} <- :file.read(file, 8_192) do
+          bytes
+          |> String.split("\n", trim: true)
+          |> List.last()
+        else
+          :eof -> nil
+          {:error, _reason} -> nil
+        end
+      after
+        :file.close(file)
+      end
+    else
+      _ -> nil
+    end
+  end
+
   defp gate_remaining(deadline), do: deadline - System.monotonic_time(:millisecond)
 
   defp cancel_gate_timer(timer) do
@@ -706,7 +749,21 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp gate_log(path, line), do: File.write!(path, line <> "\n", [:append])
+  defp gate_log(opts, line) do
+    path =
+      case Keyword.fetch(opts, :gate_log_path) do
+        {:ok, path} ->
+          path
+
+        :error ->
+          case Keyword.fetch(opts, :stderr_path) do
+            {:ok, path} when path != "/dev/null" -> path <> ".gate.log"
+            _ -> nil
+          end
+      end
+
+    if path, do: File.write!(path, line <> "\n", [:append])
+  end
 
   @doc """
   Split a model ref into `{model, effort}`; effort is nil when absent.

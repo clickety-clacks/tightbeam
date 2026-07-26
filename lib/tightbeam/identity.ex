@@ -15,6 +15,7 @@ defmodule Tightbeam.Identity do
 
   @upstream "tightbeam/upstream"
   @live "tightbeam/live"
+  @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
 
   @type harness :: atom()
@@ -31,6 +32,7 @@ defmodule Tightbeam.Identity do
     identity_dir = identity_dir(base_dir)
 
     if File.dir?(Path.join(identity_dir, ".git")) do
+      verify_required_refs!(identity_dir)
       :noop
     else
       File.mkdir_p!(identity_dir)
@@ -42,6 +44,45 @@ defmodule Tightbeam.Identity do
       git!(identity_dir, ["branch", @live])
       :initialized
     end
+  end
+
+  defp verify_required_refs!(identity_dir) do
+    missing = Enum.reject(@required_refs, &required_ref_exists?(identity_dir, &1))
+
+    if missing != [] do
+      repair =
+        if any_ref_exists?(identity_dir) do
+          Enum.map_join(missing, "; ", fn
+            "main" -> "restore main from a known-good identity backup"
+            ref -> "git -C #{identity_dir} branch #{ref} main"
+          end)
+        else
+          "remove #{identity_dir} and re-boot to re-learn"
+        end
+
+      raise ArgumentError,
+            "identity repository is missing required refs: #{Enum.join(missing, ", ")}. Repair with: #{repair}"
+    end
+  end
+
+  defp required_ref_exists?(identity_dir, ref) do
+    full_ref = "refs/heads/#{ref}"
+
+    case System.cmd("git", ["rev-parse", "--verify", "--quiet", full_ref],
+           cd: identity_dir,
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      {_output, 1} -> false
+      {output, status} -> raise "git rev-parse failed (#{status}): #{String.trim(output)}"
+    end
+  end
+
+  defp any_ref_exists?(identity_dir) do
+    identity_dir
+    |> git_output!(["for-each-ref", "--format=%(refname)"])
+    |> String.trim()
+    |> Kernel.!=("")
   end
 
   @doc "Resolve the sole publication pointer."
