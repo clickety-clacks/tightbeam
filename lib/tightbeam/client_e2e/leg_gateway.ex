@@ -340,7 +340,9 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   """
   @spec process_command(pos_integer() | String.t()) :: String.t() | nil
   def process_command(pid) do
-    case System.cmd("ps", ["-o", "command=", "-p", to_string(pid)], stderr_to_stdout: true) do
+    case System.cmd("ps", ["-ww", "-o", "command=", "-p", to_string(pid)],
+           stderr_to_stdout: true
+         ) do
       {out, 0} ->
         case String.trim(out) do
           "" -> nil
