@@ -240,9 +240,12 @@ once: a `/new` that died pre-model with `Session not found`).
 
 16. [auto: J8] ⌥ `tb wake --session <mainKey> --prompt "reply with exactly: WAKE OK" --as-user
     <admin>`.
-    PASS: the prompt appears in Main as a sender-tagged message; assistant
-    replies "WAKE OK". Then `--after 15s` variant: fires after the delay
-    (row visible in `tb list` until it fires).
+    PASS: the prompt appears in Main as a sender-tagged message, the turn row
+    carries the dispatched wakeId, an assistant reply correlates to that
+    message, and the turn reaches `delivered`. The reply's CONTENT is not
+    asserted — instruction compliance is agent effectiveness, which evals own.
+    Then `--after 15s` variant: fires after the delay (row visible in
+    `tb list` until it fires).
 
 ## Automation index (client-e2e driver)
 

@@ -344,6 +344,12 @@ defmodule Tightbeam.ClientE2E.Journeys do
             journey: "J1"
           )
 
+        # DELIBERATE KEEP, do not generalize from it. This reads like the J8
+        # content assertion Flynn removed, but it is a PLACEMENT proof — the same
+        # shape as satellite S3's nonce file. Only a tool that really ran on THIS
+        # host can produce this host's `uname -s`, so the text is evidence that
+        # the turn executed where the substrate placed it, not evidence that the
+        # agent followed an instruction well.
         not String.contains?(result.reply_text || "", uname) ->
           Scorecard.fail(
             "4",
@@ -1183,15 +1189,16 @@ defmodule Tightbeam.ClientE2E.Journeys do
         {ctx, Scorecard.fail("16", "wakes", "wake dispatch failed: #{inspect(reason)}", journey: "J8")}
 
       {:ok, result} ->
-        j8_verdict(ctx, watermark, wake_id(result), "16", "wakes", "WAKE OK", ctx.turn_timeout_ms)
+        j8_verdict(ctx, watermark, wake_id(result), "16", "wakes", ctx.turn_timeout_ms)
     end
   end
 
   # One correlation chain, from the DISPATCHED wakeId to the reply, with no step
   # that accepts "some sender-tagged message" or "some wake-bearing row". Two
   # wakes in flight (J8 dispatches an immediate and a scheduled one) would
-  # otherwise let the evidence for one vouch for the other.
-  defp j8_verdict(ctx, watermark, wake_id, step, label, expected_text, timeout_ms) do
+  # otherwise let the evidence for one vouch for the other. The waits below only
+  # decide when to stop reading; `wake_oracle_error/1` decides what held.
+  defp j8_verdict(ctx, watermark, wake_id, step, label, timeout_ms) do
     turn = wake_id && Substrate.await_wake_turn(ctx.base_dir, wake_id, timeout_ms)
     message_id = turn && turn["messageId"]
 
@@ -1224,46 +1231,70 @@ defmodule Tightbeam.ClientE2E.Journeys do
     ctx = %{ctx | client: client}
 
     row =
-      cond do
-        is_nil(wake_id) ->
-          Scorecard.fail(step, label, "the wake dispatch returned no wakeId", journey: "J8")
-
-        is_nil(turn) ->
-          Scorecard.fail(step, label, "no turn row was ever created for wake #{wake_id}", journey: "J8")
-
-        turn["wakeId"] != wake_id ->
-          Scorecard.fail(
-            step,
-            label,
-            "turn row carries wakeId #{inspect(turn["wakeId"])}, not the dispatched #{inspect(wake_id)}",
-            journey: "J8"
-          )
-
-        is_nil(message_id) ->
-          Scorecard.fail(step, label, "the wake's turn row names no delivered message", journey: "J8")
-
-        is_nil(stamped) ->
-          Scorecard.fail(
-            step,
-            label,
-            "the wake's own message #{message_id} never arrived as a sender-tagged message in Main",
-            journey: "J8"
-          )
-
-        is_nil(reply) ->
-          Scorecard.fail(step, label, "no assistant reply correlated to the wake's message", journey: "J8")
-
-        not String.contains?(reply["content"] || "", expected_text) ->
-          Scorecard.fail(step, label, "the agent did not answer the wake prompt: #{inspect(reply["content"])}", journey: "J8")
-
-        turn["status"] != "delivered" ->
-          Scorecard.fail(step, label, "the wake's turn row is #{turn["status"]}#{turn_error(turn)}", journey: "J8")
-
-        true ->
-          Scorecard.pass(step, label, journey: "J8")
+      case wake_oracle_error(%{
+             wake_id: wake_id,
+             turn: turn,
+             message_id: message_id,
+             stamped: stamped,
+             reply: reply
+           }) do
+        nil -> Scorecard.pass(step, label, journey: "J8")
+        error -> Scorecard.fail(step, label, error, journey: "J8")
       end
 
     {ctx, row}
+  end
+
+  @doc """
+  The J8 oracle: did the substrate carry the DISPATCHED wake all the way into a
+  delivered turn?
+
+  Every leg correlates on identity, never on "some wake-bearing row": the turn
+  row carries the wakeId that was dispatched, that turn names the message it
+  delivered, that message arrived sender-tagged (provenance from the `sender`
+  field, not text parsing), a reply correlated to that message, and the turn
+  reached `delivered`.
+
+  WHAT IS NOT HERE: the reply's CONTENT. Whether the agent obeyed the prompt's
+  instruction is agent EFFECTIVENESS, which evals own; e2e tests substrate
+  FUNCTIONALITY (Flynn, 2026-07-26, after run a888f9b row 16 failed the claude
+  leg on reply text while every substrate oracle held). A competent agent that
+  answers the wake differently must still pass every leg above.
+
+  `observed` keys: `:wake_id` (as dispatched), `:turn`, `:message_id`,
+  `:stamped` (the sender-tagged frame), `:reply`.
+  """
+  @spec wake_oracle_error(map()) :: String.t() | nil
+  def wake_oracle_error(observed) do
+    turn = observed.turn
+
+    cond do
+      is_nil(observed.wake_id) ->
+        "the wake dispatch returned no wakeId"
+
+      is_nil(turn) ->
+        "no turn row was ever created for wake #{observed.wake_id}"
+
+      turn["wakeId"] != observed.wake_id ->
+        "turn row carries wakeId #{inspect(turn["wakeId"])}, " <>
+          "not the dispatched #{inspect(observed.wake_id)}"
+
+      is_nil(observed.message_id) ->
+        "the wake's turn row names no delivered message"
+
+      is_nil(observed.stamped) ->
+        "the wake's own message #{observed.message_id} never arrived as a " <>
+          "sender-tagged message in Main"
+
+      is_nil(observed.reply) ->
+        "no assistant reply correlated to the wake's message"
+
+      turn["status"] != "delivered" ->
+        "the wake's turn row is #{turn["status"]}#{turn_error(turn)}"
+
+      true ->
+        nil
+    end
   end
 
   defp wake_id(result) when is_map(result),
@@ -1295,7 +1326,6 @@ defmodule Tightbeam.ClientE2E.Journeys do
             id,
             "16b",
             "scheduled wake",
-            "LATER OK",
             delay_ms + ctx.turn_timeout_ms
           )
         else
