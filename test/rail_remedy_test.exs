@@ -1,5 +1,5 @@
 defmodule Tightbeam.RailRemedyTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     Archetypes,
@@ -199,7 +199,12 @@ defmodule Tightbeam.RailRemedyTest do
         Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
       end)
 
-    assert_receive {:original_dispatch_running, original_pid}
+    original_running =
+      receive do
+        {:original_dispatch_running, _pid} = message -> message
+      end
+
+    assert {:original_dispatch_running, original_pid} = original_running
 
     stale = System.system_time(:millisecond) - 60_001
 

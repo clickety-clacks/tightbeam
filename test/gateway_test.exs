@@ -1,5 +1,5 @@
 defmodule Tightbeam.GatewayTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     Adjudication,
@@ -806,7 +806,10 @@ defmodule Tightbeam.GatewayTest do
     File.rm_rf!(base_dir)
 
     on_exit(fn ->
-      System.put_env("PATH", previous_path)
+      if previous_path,
+        do: System.put_env("PATH", previous_path),
+        else: System.delete_env("PATH")
+
       File.rm_rf!(base_dir)
       File.rm_rf!(bin_dir)
     end)

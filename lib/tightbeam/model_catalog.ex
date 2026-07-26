@@ -71,6 +71,7 @@ defmodule Tightbeam.ModelCatalog do
       base_dir: Keyword.fetch!(opts, :base_dir),
       ttl_ms: Keyword.get(opts, :ttl_ms, @default_ttl_ms),
       now: Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end),
+      task_start: Keyword.get(opts, :task_start, &Task.start/1),
       options: Map.new(opts),
       credential_status: Keyword.get(opts, :credential_status, &default_credential_status/1),
       harnesses:
@@ -136,7 +137,7 @@ defmodule Tightbeam.ModelCatalog do
         snapshot = acc
 
         {:ok, _pid} =
-          Task.start(fn ->
+          acc.task_start.(fn ->
             result = safely_derive(harness, snapshot)
             send(owner, {:catalog_refresh, harness, result})
           end)

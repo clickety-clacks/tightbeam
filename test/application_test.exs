@@ -1,5 +1,5 @@
 defmodule Tightbeam.ApplicationTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
   alias Tightbeam.{DB, Ledger, EventLog}
 
   setup do
@@ -89,7 +89,7 @@ defmodule Tightbeam.ApplicationTest do
     on_exit(fn ->
       Application.put_env(:tightbeam, :base_dir, previous_base)
       Application.put_env(:tightbeam, :autostart, previous_autostart)
-      System.put_env("PATH", previous_path)
+      restore_path(previous_path)
       File.rm_rf!(base)
       File.rm_rf!(bin_dir)
     end)
@@ -125,12 +125,12 @@ defmodule Tightbeam.ApplicationTest do
 
     Application.put_env(:tightbeam, :base_dir, base)
     Application.put_env(:tightbeam, :autostart, true)
-    System.put_env("PATH", bin_dir <> ":" <> previous_path)
+    System.put_env("PATH", Enum.join(Enum.reject([bin_dir, previous_path], &is_nil/1), ":"))
 
     on_exit(fn ->
       Application.put_env(:tightbeam, :base_dir, previous_base)
       Application.put_env(:tightbeam, :autostart, previous_autostart)
-      System.put_env("PATH", previous_path)
+      restore_path(previous_path)
       File.rm_rf!(base)
     end)
 
@@ -142,4 +142,7 @@ defmodule Tightbeam.ApplicationTest do
     refute File.exists?(Path.join(base, "gateway.json"))
     refute File.exists?(Path.join(base, "harnesses.json"))
   end
+
+  defp restore_path(nil), do: System.delete_env("PATH")
+  defp restore_path(path), do: System.put_env("PATH", path)
 end

@@ -1,5 +1,5 @@
 defmodule TightbeamTest do
-  use ExUnit.Case
+  use Tightbeam.TestCase, async: false
 
   test "root documentation names the durable turn pipeline invariant" do
     assert {:docs_v1, _, :elixir, _, %{"en" => moduledoc}, _, _} = Code.fetch_docs(Tightbeam)

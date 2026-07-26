@@ -1,5 +1,5 @@
 defmodule Tightbeam.Acp.AdapterTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
   import ExUnit.CaptureLog
 
   doctest Tightbeam.Acp.Adapter
