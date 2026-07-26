@@ -215,6 +215,36 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     assert no_diagnosis_assignments(ctx.db, item.id)
   end
 
+  test "Proof 12: a disposed item beats the rail — no remedy episode, no diagnosis assignment",
+       ctx do
+    for verb <- ["work-item-close", "work-item-fail", "work-item-icebox"] do
+      item = work_item(ctx, true)
+      _prior = completed_fix(ctx, item.id)
+
+      # Dispose the item (its prior fix is closed, so zero open assignments).
+      assert %{ok: true} =
+               ctx.handlers[verb].(%{
+                 verb: verb,
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 session_key: nil,
+                 params: %{work_item_id: item.id}
+               })
+
+      # Dispatching the refix flow against the disposed item is refused by the
+      # pre-statute terminal guard: no remedy episode, no diagnosis assignment.
+      assert {:error, %{code: "work_item_not_open"}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 dispatch_call(ctx.holder.session_key, item.id, "repeat fix")
+               )
+
+      assert RailRemedy.episode(ctx.db, "refix-requires-diagnosis", item.id) == nil
+      assert no_diagnosis_assignments(ctx.db, item.id)
+    end
+  end
+
   defp work_item(ctx, is_bug) do
     WorkItems.__handle__(ctx.db, "work-item-create", %{
       principal: {:user, "flynn"},
