@@ -135,6 +135,12 @@ defmodule ClientE2ERunner do
           "  WARNING: gateway pid #{pid} outlived SIGTERM; base_dir KEPT at " <>
             "#{gateway.base_dir} (port #{gateway.port} may still be held)"
         )
+
+      {:error, :not_removed, path, reason} ->
+        IO.puts(
+          "  WARNING: gateway stopped, but #{path} could not be removed " <>
+            "(#{inspect(reason)}); base_dir KEPT at #{gateway.base_dir}"
+        )
     end
   end
 

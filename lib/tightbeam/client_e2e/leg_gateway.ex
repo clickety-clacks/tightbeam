@@ -165,6 +165,22 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     end
   end
 
+  defp remove_base_dir(base_dir, attempts_left \\ 5) do
+    case File.rm_rf(base_dir) do
+      {:ok, _removed} ->
+        :ok
+
+      {:error, reason, path} when attempts_left > 1 ->
+        _ = reason
+        _ = path
+        Process.sleep(500)
+        remove_base_dir(base_dir, attempts_left - 1)
+
+      {:error, reason, path} ->
+        {:error, :not_removed, path, reason}
+    end
+  end
+
   defp signal_exit(gateway, timeout_ms) do
     _ = System.cmd("kill", ["-TERM", Integer.to_string(gateway.os_pid)], stderr_to_stdout: true)
 
@@ -213,12 +229,22 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   directory — but ONLY once the process is confirmed gone.
 
   Returns `:ok`, or `{:error, :still_running, pid}` when the process outlived
-  the SIGTERM window. In that case the directory is KEPT and the caller is
-  expected to report it: a gateway still holding its port while its state
-  directory is deleted underneath it is a worse state than a leftover
-  directory, and it makes the next leg's bind failure unexplainable.
+  the SIGTERM window, or `{:error, :not_removed, path, reason}` when the tree
+  could not be removed. In BOTH failure cases the directory is KEPT and the
+  caller is expected to report it. A gateway still holding its port while its
+  state directory is deleted underneath it is worse than a leftover directory,
+  and it makes the next leg's bind failure unexplainable.
+
+  Removal retries: the gateway's adapter SUBPROCESSES outlive its SIGTERM by a
+  moment and keep writing into the projected homes, so a single `rm_rf` races
+  them and fails with EEXIST on a tree that is still changing. Cleanup that
+  fails is reported, never raised — a lost cleanup must not cost the run its
+  remaining legs, which is exactly what happened when this raised.
   """
-  @spec teardown(t(), keyword()) :: :ok | {:error, :still_running, pos_integer()}
+  @spec teardown(t(), keyword()) ::
+          :ok
+          | {:error, :still_running, pos_integer()}
+          | {:error, :not_removed, String.t(), term()}
   def teardown(%__MODULE__{} = gateway, opts \\ []) do
     exit_result =
       if gateway.os_pid do
@@ -230,13 +256,12 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
     if gateway.port_ref && Port.info(gateway.port_ref), do: Port.close(gateway.port_ref)
 
-    if exit_result == :ok and Keyword.get(opts, :remove, true) and run_local?(gateway.base_dir) do
-      File.rm_rf!(gateway.base_dir)
-    end
+    remove? = Keyword.get(opts, :remove, true) and run_local?(gateway.base_dir)
 
-    case exit_result do
-      :ok -> :ok
-      {:error, :still_running} -> {:error, :still_running, gateway.os_pid}
+    case {exit_result, remove?} do
+      {:ok, true} -> remove_base_dir(gateway.base_dir)
+      {:ok, false} -> :ok
+      {{:error, :still_running}, _} -> {:error, :still_running, gateway.os_pid}
     end
 
     :ok
