@@ -164,7 +164,7 @@ defmodule Tightbeam.Escalation do
 
         deadline_at = now + decision_deadline_ms()
 
-        {:ok, {request, inserted?}} =
+        {:ok, request} =
           DB.transaction(db, fn txn ->
             Txn.q(
               txn,
@@ -209,12 +209,22 @@ defmodule Tightbeam.Escalation do
                 request.id,
                 "raiser=#{raiser_id} statute=#{statute_name} owner=#{owner_user_id} assignment=#{assignment_id || "nil"}"
               )
+
+              # Transactional outbox: the owner notification is a durable wake
+              # armed with the request itself. Only the winning insert arms one;
+              # a conflict or replay arms none.
+              Wakes.schedule_in_txn(txn, %{
+                session_key: Org.personal_session_key(request.owner_user_id),
+                origin: "process:tightbeam",
+                prompt: owner_notification(request),
+                due_at: now,
+                target_gate: 0
+              })
             end
 
-            {request, inserted?}
+            request
           end)
 
-        if inserted?, do: deliver_owner(ctx, request)
         {:decision_pending, request.id}
     end
   end
@@ -1030,11 +1040,13 @@ defmodule Tightbeam.Escalation do
     if is_binary(value), do: value, else: raise(ArgumentError, "#{key} is required")
   end
 
-  defp deliver_owner(ctx, request) do
-    case Map.get(ctx, :deliver_owner) || Map.get(ctx, "deliver_owner") do
-      fun when is_function(fun, 2) -> fun.(request.owner_user_id, request)
-      _ -> :ok
-    end
+  defp owner_notification(request) do
+    options = if request.options, do: "\nOptions: #{JSON.encode!(request.options)}", else: ""
+
+    "Decision #{request.id} pending on #{request.statute_name}.\n" <>
+      request.question <>
+      options <>
+      "\nContext: #{JSON.encode!(request.context)}"
   end
 
   defp nudge(opts, fact_ids) do

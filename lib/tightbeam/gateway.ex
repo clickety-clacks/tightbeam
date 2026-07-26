@@ -290,17 +290,29 @@ defmodule Tightbeam.Gateway do
       :ok
     end
 
+    # The configured delivery dependencies, forwarded to every prompt wake: a
+    # wake consumer never constructs or substitutes its own delivery config.
+    delivery_config = [
+      conn_registry: config[:conn_registry] || Tightbeam.ConnRegistry,
+      lane_manager: config[:lane_manager] || Tightbeam.LaneManager
+    ]
+
     deliver = fn wake ->
       case wake.target_role do
         role when is_binary(role) ->
           case Roles.resolve(db, role) do
             {:ok, session_key, fallback} ->
-              deliver_prompt(session_key, wake.origin, wake.prompt,
-                db: db,
-                wake_id: wake.wake_id,
-                sender: wake.origin,
-                role_ref: role,
-                role_fallback: fallback
+              deliver_prompt(
+                session_key,
+                wake.origin,
+                wake.prompt,
+                [
+                  db: db,
+                  wake_id: wake.wake_id,
+                  sender: wake.origin,
+                  role_ref: role,
+                  role_fallback: fallback
+                ] ++ delivery_config
               )
 
             {:error, %{code: "unknown_role"}} ->
@@ -313,12 +325,19 @@ defmodule Tightbeam.Gateway do
           end
 
         nil ->
-          deliver_prompt(wake.session_key, wake.origin, wake.prompt,
-            db: db,
-            wake_id: wake.wake_id,
-            sender: wake.origin,
-            target_gate: wake,
-            fire_wake_in_txn: wake.origin == "process:tightbeam"
+          deliver_prompt(
+            wake.session_key,
+            wake.origin,
+            wake.prompt,
+            [
+              db: db,
+              wake_id: wake.wake_id,
+              sender: wake.origin,
+              # targetGate = 0 (decision notifications) delivers to the recorded
+              # sessionKey unconditionally; every other wake keeps its gate.
+              target_gate: if(wake.target_gate == 0, do: nil, else: wake),
+              fire_wake_in_txn: wake.origin == "process:tightbeam"
+            ] ++ delivery_config
           )
       end
     end
@@ -756,22 +775,6 @@ defmodule Tightbeam.Gateway do
     fn call ->
       WorkItems.__handle__(db, verb, Map.put(call, :on_work_item_change, item_change))
     end
-  end
-
-  @doc "Attach the post-commit owner delivery used by `Escalation.escalate/4`."
-  @spec escalation_context(config(), DB.server(), map()) :: map()
-  def escalation_context(config, db, ctx) do
-    Map.put(ctx, :deliver_owner, fn owner_user_id, request ->
-      options = if request.options, do: "\nOptions: #{JSON.encode!(request.options)}", else: ""
-
-      prompt =
-        "Decision #{request.id} pending on #{request.statute_name}.\n" <>
-          request.question <>
-          options <>
-          "\nContext: #{JSON.encode!(request.context)}"
-
-      notify_session(config, db, Org.personal_session_key(owner_user_id), prompt)
-    end)
   end
 
   @doc """
@@ -1260,7 +1263,7 @@ defmodule Tightbeam.Gateway do
           {:error, {failed_stage, reason}} ->
             condition = Adjudication.classify(reason)
             cause = adjudication_cause(failed_stage, reason, adapter_key)
-            adjudication_prompt = adjudication_brief(session, condition)
+            adjudication_prompt = adjudication_brief(session, condition, cause)
 
             failure_publish = fn _terminal ->
               # No assistant final will arrive to clear the indicator label —
@@ -1382,7 +1385,11 @@ defmodule Tightbeam.Gateway do
 
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
-  defp adjudication_brief(session, condition) do
+  # `condition` is the coarse classification bucket the episode is keyed on;
+  # `cause` is the precise reason the record already carries. The human reading
+  # this decides from the cause, so it is the line that must be here — a brief
+  # that only says `condition=other` tells them nothing they can act on.
+  defp adjudication_brief(session, condition, cause) do
     archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
     inventories =
@@ -1395,6 +1402,7 @@ defmodule Tightbeam.Gateway do
     Model adjudication required.
     affected_session=#{session.session_key}
     condition=#{condition}
+    cause=#{cause || "unclassified"}
     current_model=#{session.model}
     current_harness=#{session.harness}
     model_preferences=#{JSON.encode!(archetype.model_preferences)}

@@ -257,26 +257,18 @@ defmodule Tightbeam.EffortCheckin do
           )
       end
 
-    request =
-      case DB.transaction(db, fn txn -> probe_in_txn(txn, config, wake, inspection) end) do
-        {:ok, request} -> request
-        {:error, error} -> raise error
-      end
-
-    if is_map(request), do: notify_expecter(db, request, config)
-    :ok
+    case DB.transaction(db, fn txn -> probe_in_txn(txn, config, wake, inspection) end) do
+      {:ok, _request} -> :ok
+      {:error, error} -> raise error
+    end
   end
 
   @spec deadline(DB.server(), map(), Wakes.wake()) :: :ok
   def deadline(db, config, wake) do
-    request =
-      case DB.transaction(db, fn txn -> deadline_in_txn(txn, config, wake) end) do
-        {:ok, request} -> request
-        {:error, error} -> raise error
-      end
-
-    if is_map(request), do: notify_expecter(db, request, config)
-    :ok
+    case DB.transaction(db, fn txn -> deadline_in_txn(txn, config, wake) end) do
+      {:ok, _request} -> :ok
+      {:error, error} -> raise error
+    end
   end
 
   @spec rule(DB.server(), map(), map()) :: map()
@@ -483,7 +475,9 @@ defmodule Tightbeam.EffortCheckin do
             }
           })
 
-          request_for_id(txn, request.id)
+          advanced = request_for_id(txn, request.id)
+          arm_notification_in_txn(txn, advanced)
+          advanced
         else
           Wakes.cancel_in_txn(txn, replacement.wake_id, @origin)
           nil
@@ -612,7 +606,9 @@ defmodule Tightbeam.EffortCheckin do
     )
 
     if Txn.changes(txn) == 1 do
-      request_for_id(txn, request_id)
+      request = request_for_id(txn, request_id)
+      arm_notification_in_txn(txn, request)
+      request
     else
       Wakes.cancel_in_txn(txn, deadline.wake_id, @origin)
 
@@ -896,43 +892,24 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp notify_expecter(db, request, config) do
-    case Map.get(config, :effort_notify) do
-      fun when is_function(fun, 1) ->
-        fun.(request)
-
-      _ ->
-        deliver_notification(db, request)
-    end
-  end
-
-  defp deliver_notification(db, request) do
-    target = request.expecter_session_key || Org.personal_session_key(request.expecter_user_id)
-    job_ref = assignment_job_ref(db, request.assignment_id)
-
+  # Transactional outbox: the expecter notification is a durable wake armed with
+  # the request insert or the winning rung CAS. Its assignmentId is the carrier
+  # delivery derives assignment/job attribution from.
+  defp arm_notification_in_txn(txn, request) do
     prompt =
       "Effort check-in #{request.id} for assignment #{request.assignment_id}.\n" <>
         request.question <>
         "\nActions: #{Enum.join(request.options || [], ", ")}"
 
-    try do
-      Tightbeam.Gateway.deliver_prompt(target, @origin, prompt,
-        db: db,
-        sender: @origin,
-        assignment_id: request.assignment_id,
-        job_ref: job_ref
-      )
-    rescue
-      _ -> :ok
-    catch
-      :exit, _ -> :ok
-    end
-  end
-
-  defp assignment_job_ref(db, assignment_id) do
-    case DB.query(db, "SELECT workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
-      {:ok, [[job_ref]]} -> job_ref
-    end
+    Wakes.schedule_in_txn(txn, %{
+      session_key:
+        request.expecter_session_key || Org.personal_session_key(request.expecter_user_id),
+      origin: @origin,
+      prompt: prompt,
+      due_at: now(),
+      assignment_id: request.assignment_id,
+      target_gate: 0
+    })
   end
 
   defp authorized?({:session, key}, request), do: request.expecter_session_key == key
