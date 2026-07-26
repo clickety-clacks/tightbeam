@@ -22,6 +22,7 @@ defmodule Tightbeam.JobTraceTest do
     start_supervised!({DB, path: ":memory:", name: db})
 
     for module <- [
+          Tightbeam.CausalEvents,
           Devices,
           ConditionFacts,
           Idempotency,
@@ -305,6 +306,15 @@ defmodule Tightbeam.JobTraceTest do
 
         "effort_generation" ->
           ~w(assignmentId at evidence id state type)a
+
+        # job-forensics-v2 §3 — pinned EXACTLY: every key always present,
+        # nullable where the spec marks it, so a consumer never has to
+        # distinguish absent from null.
+        "causal_event" ->
+          ~w(assignmentId at detail id jobRef kind seqTiebreak sessionKey type)a
+
+        "wake_canceled" ->
+          ~w(assignmentId at id reason seqTiebreak type)a
       end
 
     assert_keys(entry, keys)

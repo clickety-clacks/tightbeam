@@ -7,7 +7,7 @@ defmodule Tightbeam.EffortCheckin do
   opens one parent-routed decision request with its durable deadline wake.
   """
 
-  alias Tightbeam.{DB, Org, Placement, Wakes}
+  alias Tightbeam.{CausalEvents, DB, Org, Placement, Wakes}
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
@@ -439,7 +439,8 @@ defmodule Tightbeam.EffortCheckin do
             session_key: next.session_key || Org.personal_session_key(next.user_id),
             origin: @origin,
             consumer: "effort_deadline",
-            due_at: deadline
+            due_at: deadline,
+            assignment_id: request.assignment_id
           })
 
         Txn.q(
@@ -465,6 +466,23 @@ defmodule Tightbeam.EffortCheckin do
 
         if Txn.changes(txn) == 1 do
           mark_wake_fired(txn, wake.wake_id)
+
+          # The request row is overwritten in place and the replacement deadline
+          # wake carries no rung, so the rung it advanced FROM has no other home.
+          CausalEvents.append_in_txn(txn, %{
+            kind: "effort_rung_advance",
+            assignment_id: request.assignment_id,
+            job_ref: job_ref_in_txn(txn, request.assignment_id),
+            session_key: next.session_key,
+            detail: %{
+              requestId: request.id,
+              fromRung: request.lineage_rung,
+              toRung: next.rung,
+              fromExpecter: expecter_ref(request.expecter_session_key, request.expecter_user_id),
+              toExpecter: expecter_ref(next.session_key, next.user_id)
+            }
+          })
+
           request_for_id(txn, request.id)
         else
           Wakes.cancel_in_txn(txn, replacement.wake_id, @origin)
@@ -555,7 +573,8 @@ defmodule Tightbeam.EffortCheckin do
         session_key: expecter.session_key || Org.personal_session_key(expecter.user_id),
         origin: @origin,
         consumer: "effort_deadline",
-        due_at: deadline_at
+        due_at: deadline_at,
+        assignment_id: generation.assignment_id
       })
 
     context = Map.put(evidence, :actions, menu)
@@ -631,7 +650,8 @@ defmodule Tightbeam.EffortCheckin do
         session_key: session.session_key,
         origin: @origin,
         consumer: "effort_probe",
-        due_at: armed_at + horizon * multiplier
+        due_at: armed_at + horizon * multiplier,
+        assignment_id: assignment_id
       })
 
     Txn.q(
@@ -1171,6 +1191,21 @@ defmodule Tightbeam.EffortCheckin do
       [wake_id, now()]
     )
   end
+
+  defp job_ref_in_txn(txn, assignment_id) do
+    case Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
+      [[job_ref]] -> job_ref
+      [] -> nil
+    end
+  end
+
+  # The expecter is a session OR a user; one ref renders either without losing
+  # which it was.
+  defp expecter_ref(session_key, _user_id) when is_binary(session_key),
+    do: "session:" <> session_key
+
+  defp expecter_ref(_session_key, user_id) when is_binary(user_id), do: "user:" <> user_id
+  defp expecter_ref(_session_key, _user_id), do: nil
 
   defp error(code, message), do: %{code: code, message: message}
   defp now, do: System.system_time(:millisecond)

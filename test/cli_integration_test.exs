@@ -50,6 +50,7 @@ defmodule Tightbeam.CliIntegrationTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     for module <- [
+          Tightbeam.CausalEvents,
           Assets,
           Devices,
           ConditionFacts,

@@ -22,6 +22,7 @@ defmodule Tightbeam.WorkStateTest do
     start_supervised!({ConnRegistry, name: ConnRegistry})
 
     for module <- [
+          Tightbeam.CausalEvents,
           Devices,
           Idempotency,
           Org,

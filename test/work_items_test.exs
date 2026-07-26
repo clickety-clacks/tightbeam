@@ -24,7 +24,7 @@ defmodule Tightbeam.WorkItemsTest do
     db = :work_items_db
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Devices, Idempotency, Org, Roles, Wakes, WorkItems, Assignments, WorkState, EventLog] do
+    for module <- [Tightbeam.CausalEvents,Devices, Idempotency, Org, Roles, Wakes, WorkItems, Assignments, WorkState, EventLog] do
       :ok = module.ensure_schema(db)
     end
 

@@ -188,7 +188,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "work and work-item device routes expose owner-scoped random-access snapshots", ctx do
-    for module <- [WorkItems, Assignments, Supervision, WorkState],
+    for module <- [Tightbeam.CausalEvents,WorkItems, Assignments, Supervision, WorkState],
         do: :ok = module.ensure_schema(ctx.db)
 
     create_session(ctx.db, "holder", ctx.device.user_id)
@@ -624,6 +624,43 @@ defmodule Tightbeam.Wire.RouterTest do
       |> Router.call(Router.init(ctx.opts))
 
     assert disallowed.status == 400
+  end
+
+  test "F6: the dispatch boundary strips a wake's substrate-only carrier", ctx do
+    # Law 0: a client-supplied wake `assignmentId` would forge
+    # wake -> turn -> trace attribution. The spec pins that it is STRIPPED at the
+    # dispatch boundary, so this drives a REAL authenticated /agent/dispatch
+    # request rather than calling the handler or the strip helper directly.
+    #
+    # The other half of the rule — that the strip is SCOPED to that carrier and
+    # leaves `assignmentId` alone on attest/assign/dispatch — is proven at the
+    # pure `atomize_params/2` seam in job_forensics_test, because asserting it
+    # here would run through Dispatch's rule engine (global persistent_term state)
+    # and prove nothing reliably.
+    forge =
+      JSON.encode!(%{
+        verb: "wake",
+        asUser: "flynn",
+        params: %{prompt: "an ordinary conversational wake", assignmentId: "asg_victim"}
+      })
+
+    response =
+      conn(:post, "/agent/dispatch", forge)
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    # The handler being REACHED with the params is the proof; assert that first, so
+    # a refusal upstream fails here with a legible message rather than as a status
+    # mismatch. (Dispatch consults Rules, which lives in :persistent_term — global
+    # across test files — so coupling this proof to an HTTP status makes it hostage
+    # to whatever rule set another file last loaded.)
+    assert_receive {:call, %{verb: "wake", params: wake_params}}
+
+    refute Map.has_key?(wake_params, :assignment_id),
+           "a client-supplied wake assignmentId must never reach the handler"
+
+    assert wake_params[:prompt] == "an ordinary conversational wake"
+    assert response.status == 200
   end
 
   test "typed target grammar distinguishes keys, users, and roles without unions", ctx do

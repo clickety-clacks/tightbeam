@@ -25,6 +25,7 @@ defmodule Tightbeam.SubagentMarkers do
     sourceEventRef TEXT NOT NULL,
     harness        TEXT NOT NULL CHECK (harness IN (__TIGHTBEAM_HARNESSES__)),
     at             INTEGER NOT NULL,
+    assignmentId   TEXT,
     UNIQUE (kind, sourceEventRef)
   );
   CREATE UNIQUE INDEX IF NOT EXISTS subagent_markers_one_stop
@@ -36,7 +37,14 @@ defmodule Tightbeam.SubagentMarkers do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
     harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
-    DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
+    result = DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
+
+    case DB.query(db, "ALTER TABLE subagent_markers ADD COLUMN assignmentId TEXT") do
+      {:ok, _} -> :ok
+      {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+    end
+
+    result
   end
 
   @doc "Append one canonical marker and nudge a matching wake after commit."
@@ -62,14 +70,20 @@ defmodule Tightbeam.SubagentMarkers do
     harness = input |> Map.fetch!(:harness) |> to_string()
     at = Map.fetch!(input, :at)
 
+    # A session can hold several open assignments at once, so the unique durable
+    # carrier at EMISSION time is the parent's RUNNING turn — never a guess from
+    # the session's open assignments (spec job-forensics-v2 §1). No running turn,
+    # or a turn with no attribution, stamps NULL.
+    assignment_id = running_turn_assignment_in_txn(txn, principal)
+
     Txn.q(
       txn,
       """
       INSERT OR IGNORE INTO subagent_markers
-        (kind, principal, subagentRef, sourceEventRef, harness, at)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        (kind, principal, subagentRef, sourceEventRef, harness, at, assignmentId)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
       """,
-      [kind, principal, subagent_ref, source_event_ref, harness, at]
+      [kind, principal, subagent_ref, source_event_ref, harness, at, assignment_id]
     )
 
     if Txn.changes(txn) == 1 do
@@ -79,7 +93,8 @@ defmodule Tightbeam.SubagentMarkers do
         subagent_ref: subagent_ref,
         source_event_ref: source_event_ref,
         harness: harness,
-        at: at
+        at: at,
+        assignment_id: assignment_id
       }
 
       if kind == "subagent_stop" do
@@ -197,7 +212,7 @@ defmodule Tightbeam.SubagentMarkers do
       DB.query(
         db,
         """
-        SELECT kind, principal, subagentRef, sourceEventRef, harness, at
+        SELECT kind, principal, subagentRef, sourceEventRef, harness, at, assignmentId
         FROM subagent_markers ORDER BY id
         """
       )
@@ -247,7 +262,7 @@ defmodule Tightbeam.SubagentMarkers do
     case Txn.q(
            txn,
            """
-           SELECT kind, principal, subagentRef, sourceEventRef, harness, at
+           SELECT kind, principal, subagentRef, sourceEventRef, harness, at, assignmentId
            FROM subagent_markers WHERE kind = ?1 AND sourceEventRef = ?2
            LIMIT 1
            """,
@@ -262,7 +277,7 @@ defmodule Tightbeam.SubagentMarkers do
     case Txn.q(
            txn,
            """
-           SELECT kind, principal, subagentRef, sourceEventRef, harness, at
+           SELECT kind, principal, subagentRef, sourceEventRef, harness, at, assignmentId
            FROM subagent_markers WHERE kind = ?1 AND subagentRef = ?2
            LIMIT 1
            """,
@@ -273,15 +288,28 @@ defmodule Tightbeam.SubagentMarkers do
     end
   end
 
-  defp to_marker([kind, principal, subagent_ref, source_event_ref, harness, at]) do
+  defp to_marker([kind, principal, subagent_ref, source_event_ref, harness, at, assignment_id]) do
     %{
       kind: kind,
       principal: principal,
       subagent_ref: subagent_ref,
       source_event_ref: source_event_ref,
       harness: harness,
-      at: at
+      at: at,
+      assignment_id: assignment_id
     }
+  end
+
+  # The parent's RUNNING turn is the unique durable carrier at emission time.
+  defp running_turn_assignment_in_txn(txn, principal) do
+    case Txn.q(
+           txn,
+           "SELECT assignmentId FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+           [principal]
+         ) do
+      [[assignment_id]] -> assignment_id
+      [] -> nil
+    end
   end
 
   defp encoded_ref(namespace, parts) do

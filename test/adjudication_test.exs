@@ -7,7 +7,7 @@ defmodule Tightbeam.AdjudicationTest do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
 
-    for module <- [EventLog, Org, Ledger, Idempotency, ConditionFacts, Wakes, Adjudication] do
+    for module <- [Tightbeam.CausalEvents,EventLog, Org, Ledger, Idempotency, ConditionFacts, Wakes, Adjudication] do
       :ok = module.ensure_schema(name)
     end
 

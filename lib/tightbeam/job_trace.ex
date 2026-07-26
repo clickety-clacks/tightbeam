@@ -1,16 +1,21 @@
 defmodule Tightbeam.JobTrace do
   @moduledoc "Pinned, read-only work-item trace artifact."
 
-  alias Tightbeam.DB
+  alias Tightbeam.{CausalEvents, DB}
 
+  # Every type needs an explicit rank — the sorter uses Map.fetch!/2, so an
+  # unranked type raises rather than sorting arbitrarily. The v2 types are
+  # INSERTED; the relative order of the v1 types is unchanged.
   @type_rank %{
     "turn_start" => 0,
     "wake_scheduled" => 1,
     "wake_fired" => 2,
-    "decision_request" => 3,
-    "effort_generation" => 4,
-    "attest" => 5,
-    "turn_end" => 6
+    "wake_canceled" => 3,
+    "decision_request" => 4,
+    "causal_event" => 5,
+    "effort_generation" => 6,
+    "attest" => 7,
+    "turn_end" => 8
   }
 
   @spec build(DB.server(), map()) :: map()
@@ -31,11 +36,33 @@ defmodule Tightbeam.JobTrace do
         (turn_entries(db, item.id) ++
            attest_entries(db, assignment_ids) ++
            wake_entries(db, item.id, assignment_ids) ++
-           decision_entries(db, assignment_ids) ++ effort_entries(db, assignment_ids))
+           decision_entries(db, assignment_ids) ++
+           effort_entries(db, assignment_ids) ++
+           causal_entries(db, item.id, assignment_ids))
         |> Enum.sort_by(fn entry ->
           {entry.at, Map.fetch!(@type_rank, entry.type), entry.id}
         end)
     }
+  end
+
+  # causal_events carry their own monotonic seq; `seqTiebreak` exposes it so two
+  # events sharing a millisecond still read in commit order.
+  defp causal_entries(db, work_item_id, assignment_ids) do
+    db
+    |> CausalEvents.for_job(work_item_id, assignment_ids)
+    |> Enum.map(fn event ->
+      %{
+        at: event.at,
+        seqTiebreak: event.seq,
+        type: "causal_event",
+        id: "ce:#{event.seq}",
+        kind: event.kind,
+        assignmentId: event.assignment_id,
+        jobRef: event.job_ref,
+        sessionKey: event.session_key,
+        detail: event.detail
+      }
+    end)
   end
 
   defp assignments(db, work_item_id) do
@@ -148,9 +175,9 @@ defmodule Tightbeam.JobTrace do
         db,
         """
         SELECT w.wakeId, NULL, w.createdAt, w.dueAt, w.firedAt, w.firedBy,
-               matched_fact_at
+               matched_fact_at, w.canceledAt, w.rid
         FROM (
-          SELECT w.*,
+          SELECT w.*, w.rowid AS rid,
                  CASE WHEN w.firedBy = 'condition' THEN (
                    SELECT f.ts FROM condition_facts AS f
                    WHERE f.id > w.conditionAfterId
@@ -182,6 +209,9 @@ defmodule Tightbeam.JobTrace do
               UNION
               SELECT deadlineWakeId, assignmentId FROM decision_requests
               WHERE assignmentId IN (#{clause})
+              UNION
+              SELECT wakeId, assignmentId FROM wakes
+              WHERE assignmentId IN (#{clause})
             )
             SELECT w.wakeId, links.assignmentId, w.createdAt, w.dueAt, w.firedAt, w.firedBy,
                    CASE WHEN w.firedBy = 'condition' THEN (
@@ -190,7 +220,8 @@ defmodule Tightbeam.JobTrace do
                        AND f.kind = w.conditionKind
                        AND (w.conditionScope IS NULL OR f.scope = w.conditionScope)
                      ORDER BY f.id ASC LIMIT 1
-                   ) END
+                   ) END,
+                   w.canceledAt, w.rowid
             FROM wakes AS w
             JOIN links ON links.wakeId = w.wakeId
             """,
@@ -207,7 +238,17 @@ defmodule Tightbeam.JobTrace do
   defp wake_rows(db, sql, params) do
     {:ok, rows} = DB.query(db, sql, params)
 
-    Enum.map(rows, fn [id, assignment_id, created, due, fired, fired_by, matched_fact_at] ->
+    Enum.map(rows, fn [
+                        id,
+                        assignment_id,
+                        created,
+                        due,
+                        fired,
+                        fired_by,
+                        matched_fact_at,
+                        canceled,
+                        rid
+                      ] ->
       scheduled = %{
         at: created,
         type: "wake_scheduled",
@@ -216,10 +257,9 @@ defmodule Tightbeam.JobTrace do
         dueAt: due
       }
 
-      entries =
+      fired_entry =
         if fired do
           [
-            scheduled,
             %{
               at: fired,
               type: "wake_fired",
@@ -230,10 +270,29 @@ defmodule Tightbeam.JobTrace do
             }
           ]
         else
-          [scheduled]
+          []
         end
 
-      {id, entries}
+      # `reason` is pinned nullable because no cancel path has a durable reason
+      # carrier — cancellation writes state and, now, a timestamp. Inventing one
+      # is a spec question, not an implementation liberty.
+      canceled_entry =
+        if canceled do
+          [
+            %{
+              at: canceled,
+              seqTiebreak: rid,
+              type: "wake_canceled",
+              id: id,
+              assignmentId: assignment_id,
+              reason: nil
+            }
+          ]
+        else
+          []
+        end
+
+      {id, [scheduled] ++ fired_entry ++ canceled_entry}
     end)
   end
 

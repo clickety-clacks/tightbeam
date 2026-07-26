@@ -16,7 +16,7 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{DB, Org, Wakes}
+  alias Tightbeam.{CausalEvents, DB, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
@@ -305,7 +305,27 @@ defmodule Tightbeam.WorkItems do
 
           true ->
             apply_disposition(txn, item, verb, target, reason)
-            {:disposed, fetch_in_txn(txn, id), true}
+            disposed = fetch_in_txn(txn, id)
+
+            # The item keeps its CURRENT state only, and reopen nulls failReason;
+            # work_item_events is a bare doorbell (kind is 'metadata' or
+            # 'composition'), so it records that something changed, never from
+            # what to what. jobRef IS the work-item id here, and a disposition
+            # belongs to no assignment.
+            CausalEvents.append_in_txn(txn, %{
+              kind: "disposition_transition",
+              job_ref: id,
+              assignment_id: nil,
+              session_key: nil,
+              detail: %{
+                workItemId: id,
+                fromState: item.state,
+                toState: target,
+                failReason: disposed.failReason
+              }
+            })
+
+            {:disposed, disposed, true}
         end
     end
   end
