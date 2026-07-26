@@ -563,25 +563,26 @@ defmodule Tightbeam.JobForensicsTest do
     assignment(db, "asg_pre", "wi_pre", "holder")
     handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
 
-    # A pre-v2 database: three attests already exist and are already COUNTED, but
-    # causal_events is empty because the table did not exist when they landed.
-    for id <- ["att_old_a", "att_old_b", "att_old_c"], do: attest(db, id, "asg_pre")
-
-    :ok =
-      DB.execute(db, """
-      INSERT INTO assignment_prods
-        (assignmentId, attemptCount, prodCount, deniedStreak, attestCount)
-      VALUES ('asg_pre', 0, 1, 0, 3)
-      """)
+    # The v2-epoch cutoff is when causal_events was created; PRE-v2 attests are the
+    # ones filed before it. `attestCount` is deliberately left stale here (0) so
+    # the bound cannot be coming from the counter — only the timestamp floor can
+    # keep these three out.
+    cutoff = CausalEvents.epoch(db)
+    for id <- ["att_old_a", "att_old_b", "att_old_c"], do: attest(db, id, "asg_pre", cutoff - 5_000)
 
     assert answered(db) == []
 
-    # ONE new attest arrives after migration.
-    attest(db, "att_new", "asg_pre")
+    # ONE attest arrives AFTER the cutoff.
+    attest(db, "att_new", "asg_pre", cutoff + 1_000)
     evaluate(db, handlers, "holder")
 
     assert answered(db) == ["att_new"],
-           "only the attest that actually arrived gets an event; history stays NULL"
+           "only post-cutoff attests get events; pre-v2 history stays unrecorded"
+
+    # A later evaluation still never reaches back across the cutoff.
+    attest(db, "att_newer", "asg_pre", cutoff + 2_000)
+    evaluate(db, handlers, "holder")
+    assert answered(db) == ["att_new", "att_newer"]
   end
 
   test "F6: an agent cannot forge wake or turn attribution", ctx do
@@ -606,6 +607,24 @@ defmodule Tightbeam.JobForensicsTest do
     # NULL, and no forged carrier can reach the turn or the trace (Law 0).
     %{wake_id: agent_wake} = forge.({:session, "agent-session"})
     assert is_nil(Wakes.get(db, agent_wake).assignment_id)
+
+    # And the spec's pinned defence is at the BOUNDARY: the field never survives
+    # an agent/dispatch param map, so no handler has to remember to distrust it.
+    refute Map.has_key?(
+             Tightbeam.Wire.Router.atomize_params_for_test("wake", %{
+               "prompt" => "p",
+               "assignmentId" => "asg_victim"
+             }),
+             :assignment_id
+           )
+
+    # ...and ONLY for that carrier: assignmentId is an ordinary caller param on the
+    # verbs that name the assignment they act on, so the strip must not reach them.
+    assert %{assignment_id: "asg_victim"} =
+             Tightbeam.Wire.Router.atomize_params_for_test("attest", %{
+               "assignmentId" => "asg_victim",
+               "kind" => "completion"
+             })
 
     # The SUBSTRATE's own principal — which the router reserves and refuses to
     # mint for a wire caller — is the only one that may stamp it.
@@ -670,11 +689,13 @@ defmodule Tightbeam.JobForensicsTest do
       """)
   end
 
-  defp attest(db, id, assignment_id) do
+  defp attest(db, id, assignment_id, ts \\ nil) do
+    ts = ts || System.system_time(:millisecond)
+
     :ok =
       DB.execute(db, """
       INSERT INTO attests (id, assignmentId, kind, bySession, ts)
-      VALUES ('#{id}', '#{assignment_id}', 'completion', 'holder', 1)
+      VALUES ('#{id}', '#{assignment_id}', 'completion', 'holder', #{ts})
       """)
   end
 

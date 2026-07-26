@@ -121,7 +121,7 @@ defmodule Tightbeam.Wire.Router do
         session_key: artifact_caller_session(verb, session_key, principal),
         target_role: target_meta.role,
         role_fallback: target_meta.fallback,
-        params: atomize_params(body["params"] || %{})
+        params: atomize_params(verb, body["params"] || %{})
       }
 
       dispatch_response(conn, call, 200, &%{"result" => &1})
@@ -803,8 +803,27 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp atomize_params(params) when is_map(params) do
-    Map.new(params, fn {key, value} -> {key |> Macro.underscore() |> String.to_atom(), value} end)
+  # SUBSTRATE-INTERNAL params, PER VERB: fields a client may not set on that verb
+  # because the substrate is their only legitimate author. `wake.assignmentId` is
+  # the wake's attribution CARRIER — a client-supplied one would forge
+  # wake -> turn -> trace attribution, which Law 0 forbids (cross-review F6), so
+  # it is stripped before the handler sees it.
+  #
+  # Scoped per verb deliberately: `assignmentId` is an ORDINARY caller param on
+  # attest/assign/dispatch/effort-rule, which name the assignment they act on. A
+  # blanket strip breaks all of those (the CLI round-trip suite proves it), so the
+  # spec's "stripped from any agent/dispatch param map" is read as scoped to the
+  # carrier it is written about, not to the parameter name everywhere.
+  @substrate_only_params %{"wake" => ~w(assignment_id)a}
+
+  @doc false
+  # Exposed so the Law-0 boundary strip is provable at its own seam.
+  def atomize_params_for_test(verb, params), do: atomize_params(verb, params)
+
+  defp atomize_params(verb, params) when is_map(params) do
+    params
+    |> Map.new(fn {key, value} -> {key |> Macro.underscore() |> String.to_atom(), value} end)
+    |> Map.drop(Map.get(@substrate_only_params, verb, []))
   end
 
   defp json(conn, status, body) do

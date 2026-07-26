@@ -727,6 +727,20 @@ defmodule Tightbeam.AdapterHealTest do
     assert epochs == Enum.sort(epochs)
     assert Enum.chunk_every(epochs, 2, 1, :discard) |> Enum.all?(fn [a, b] -> b > a end)
 
+    # The SAME-MILLISECOND pair the reviewer's probe found a ULID losing: two
+    # epochs minted inside one millisecond must still be strictly ordered.
+    same_ms =
+      Stream.repeatedly(fn ->
+        before = System.system_time(:millisecond)
+        pair = {AdapterCoordinator.mint_epoch(ctx.db), AdapterCoordinator.mint_epoch(ctx.db)}
+        {before == System.system_time(:millisecond), pair}
+      end)
+      |> Enum.find(fn {same_ms?, _pair} -> same_ms? end)
+
+    assert {true, {first, second}} = same_ms
+    assert second > first, "a same-millisecond mint pair must still be strictly increasing"
+
+
     # And the ordering the sweep actually relies on: a later epoch with a RESET
     # generation still outranks an earlier epoch's high generation.
     [early, late] = [Enum.at(epochs, 0), Enum.at(epochs, -1)]

@@ -48,6 +48,17 @@ defmodule Tightbeam.CausalEvents do
   @kinds ~w(adjudication_reopen adjudication_escalate effort_rung_advance
             prod_fired prod_answered disposition_transition)
 
+  # The v2-EPOCH CUTOFF: when causal_events first came into existence. Attests
+  # filed before it are pre-v2 history that this table was never going to record,
+  # and the spec forbids retroactively emitting events for them (cross-review F5).
+  # One row, written only at first creation, so it is stable across every later boot.
+  @epoch_ddl """
+  CREATE TABLE IF NOT EXISTS causal_events_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    at INTEGER NOT NULL
+  );
+  """
+
   @ddl """
   CREATE TABLE IF NOT EXISTS causal_events (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,7 +77,26 @@ defmodule Tightbeam.CausalEvents do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    :ok = DB.execute(db, @ddl)
+    :ok = DB.execute(db, @epoch_ddl)
+
+    # INSERT OR IGNORE, so the cutoff is stamped once — at the migration that
+    # created the table — and never moved by a later boot.
+    {:ok, _} =
+      DB.query(db, "INSERT OR IGNORE INTO causal_events_epoch (id, at) VALUES (0, ?1)", [
+        System.system_time(:millisecond)
+      ])
+
+    :ok
+  end
+
+  @doc "When causal_events came into existence; attests older than this are pre-v2."
+  @spec epoch(DB.server()) :: integer()
+  def epoch(db \\ DB) do
+    {:ok, [[at]]} = DB.query(db, "SELECT at FROM causal_events_epoch WHERE id = 0")
+    at
+  end
 
   @doc "The admitted kinds, in the order the spec lists them."
   @spec kinds() :: [String.t()]
@@ -104,38 +134,36 @@ defmodule Tightbeam.CausalEvents do
   @doc """
   The attest ids that answered a prod round, ordered by attest id.
 
-  `arrived` is how many attests appeared since the last evaluation
-  (`attestCount` is a bare count — the only watermark the schema carries). Only
-  that many are considered, taken NEWEST-first by rowid, because attests are
-  append-only: the newest `arrived` rows ARE the new ones. Bounding the window
-  this way is what keeps pre-v2 history out — scanning the whole attest history
-  would give every historical attest an event the first time a new one landed
-  after migration, which the spec forbids outright (cross-review F5).
+  BOUNDED to attests filed at/after the v2-epoch cutoff — the moment
+  causal_events was created. Scanning an assignment's whole attest history would
+  make the FIRST post-migration attest retroactively emit an event for every
+  historical one, which the spec forbids outright (cross-review F5). A hard
+  timestamp floor is the bound rather than "how many arrived since the last
+  evaluation", because `attestCount` is a mutable aggregate and cannot be trusted
+  to fence pre-v2 rows.
 
   Within the window, ids already named by a `prod_answered` event are dropped, so
+  several attests arriving between two evaluations each get exactly one event and
   a re-run of the same evaluation adds nothing.
   """
-  @spec unseen_attest_ids_in_txn(Txn.t(), String.t(), non_neg_integer()) :: [String.t()]
-  def unseen_attest_ids_in_txn(_txn, _assignment_id, arrived) when arrived <= 0, do: []
+  @spec unseen_attest_ids_in_txn(Txn.t(), String.t()) :: [String.t()]
+  def unseen_attest_ids_in_txn(%Txn{} = txn, assignment_id) do
+    [[cutoff]] = Txn.q(txn, "SELECT at FROM causal_events_epoch WHERE id = 0")
 
-  def unseen_attest_ids_in_txn(%Txn{} = txn, assignment_id, arrived) do
     txn
     |> Txn.q(
       """
-      SELECT a.id FROM (
-        SELECT id, rowid FROM attests
-        WHERE assignmentId = ?1
-        ORDER BY rowid DESC
-        LIMIT ?2
-      ) AS a
-      WHERE NOT EXISTS (
-        SELECT 1 FROM causal_events AS c
-        WHERE c.kind = 'prod_answered' AND c.assignmentId = ?1
-          AND json_extract(c.detail, '$.byAttestId') = a.id
-      )
+      SELECT a.id FROM attests AS a
+      WHERE a.assignmentId = ?1
+        AND a.ts >= ?2
+        AND NOT EXISTS (
+          SELECT 1 FROM causal_events AS c
+          WHERE c.kind = 'prod_answered' AND c.assignmentId = ?1
+            AND json_extract(c.detail, '$.byAttestId') = a.id
+        )
       ORDER BY a.id ASC
       """,
-      [assignment_id, arrived]
+      [assignment_id, cutoff]
     )
     |> Enum.map(&hd/1)
   end

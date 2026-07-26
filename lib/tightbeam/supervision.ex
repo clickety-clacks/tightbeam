@@ -527,9 +527,7 @@ defmodule Tightbeam.Supervision do
       if attest_count > prior.attestCount do
         job_ref = job_ref_in_txn(txn, assignment.id)
 
-        arrived = attest_count - prior.attestCount
-
-        for attest_id <- CausalEvents.unseen_attest_ids_in_txn(txn, assignment.id, arrived) do
+        for attest_id <- CausalEvents.unseen_attest_ids_in_txn(txn, assignment.id) do
           CausalEvents.append_in_txn(txn, %{
             kind: "prod_answered",
             assignment_id: assignment.id,
