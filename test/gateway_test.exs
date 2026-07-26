@@ -1,5 +1,5 @@
 defmodule Tightbeam.GatewayTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
@@ -869,7 +869,10 @@ defmodule Tightbeam.GatewayTest do
     File.rm_rf!(base_dir)
 
     on_exit(fn ->
-      System.put_env("PATH", previous_path)
+      if previous_path,
+        do: System.put_env("PATH", previous_path),
+        else: System.delete_env("PATH")
+
       File.rm_rf!(base_dir)
       File.rm_rf!(bin_dir)
     end)
@@ -1270,7 +1273,6 @@ defmodule Tightbeam.GatewayTest do
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.put(:effort_checkin_horizon_ms, 1)
-      |> Map.put(:effort_notify, fn _request -> :ok end)
       |> Map.put(:effort_probe, fn _session, _root, _config ->
         {:ok, %{repos: [%{path: ".", head: "same", tracked: "same"}], untracked: []}}
       end)
@@ -1332,7 +1334,25 @@ defmodule Tightbeam.GatewayTest do
     assert is_binary(request_id)
     assert Wakes.get(ctx.db, wake_id).state == "fired"
 
+    # The expecter notification is a durable ungated wake armed with the request,
+    # still pending: the same tick that opened the request delivers nothing.
+    assert {:ok, [[notify_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE targetGate = 0 AND state = 'pending'"
+             )
+
+    assert %{consumer: "prompt", session_key: expecter} = Wakes.get(ctx.db, notify_id)
+
+    # The next ordinary tick delivers it through the gateway's own configured
+    # prompt closure — real ConnRegistry, real lane nudge, one turn.
     assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, notify_id).state == "fired"
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [notify_id])
+
+    assert_received {:ensure_lane, ^expecter}
 
     assert {:ok, [[1]]} =
              DB.query(

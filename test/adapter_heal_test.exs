@@ -8,7 +8,7 @@ defmodule Tightbeam.AdapterHealTest do
   adapter in proof 1 is a REAL process spawning a REAL non-executable binary —
   the reason under test is produced by `sh`, not by the test.
   """
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     AdapterCoordinator,

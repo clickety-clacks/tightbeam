@@ -1,10 +1,11 @@
 defmodule Tightbeam.EffortCheckinTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     Archetypes,
     Assignments,
     ConditionFacts,
+    ConnRegistry,
     DB,
     Devices,
     EffortCheckin,
@@ -21,6 +22,21 @@ defmodule Tightbeam.EffortCheckinTest do
     WorkItems
   }
 
+  defmodule LaneDoorbell do
+    @moduledoc false
+    use GenServer
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:ensure_lane, session_key}, _from, parent) do
+      send(parent, {:lane_nudged, session_key})
+      {:reply, :ok, parent}
+    end
+  end
+
   setup do
     db = :"effort_#{System.unique_integer([:positive])}"
 
@@ -31,6 +47,8 @@ defmodule Tightbeam.EffortCheckinTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneDoorbell, self()})
 
     for module <- [
           Tightbeam.CausalEvents,
@@ -59,7 +77,19 @@ defmodule Tightbeam.EffortCheckinTest do
     host = Placement.local_host_name()
     parent = session(db, "parent", "h1", host)
     holder = session(db, "holder", "h2", host, %{spawned_by: "parent"})
-    config = %{db: db, base_dir: base_dir, port: 4_321, effort_checkin_horizon_ms: 10}
+    # The extra keys are what `Gateway.children_after_preflight/1` reads: the
+    # notification drain uses the REAL prompt-wake child, not a test closure.
+    config = %{
+      db: db,
+      base_dir: base_dir,
+      port: 4_321,
+      effort_checkin_horizon_ms: 10,
+      cwd: base_dir,
+      default_harness: :claude,
+      default_model: "claude-fable-5",
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 60_000
+    }
     root = Placement.workdir_path(config, holder)
     init_repo(root)
 
@@ -277,6 +307,14 @@ defmodule Tightbeam.EffortCheckinTest do
     first_deadline = request.deadline_wake_id
     :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, first_deadline))
 
+    # `assignmentId` on the notification wake is the carrier that replaced the
+    # deleted explicit `assignment_id`/`job_ref` delivery opts.
+    assert [assignment.id, assignment.id] ==
+             Enum.map(notification_wakes(ctx.db), & &1.assignment_id)
+
+    drain_notifications!(ctx)
+
+    # Delivery derives the SAME attribution through `wake_attribution/2`.
     assert rows(
              ctx.db,
              """
@@ -731,13 +769,15 @@ defmodule Tightbeam.EffortCheckinTest do
            ]
   end
 
-  test "proofs 6 and 8b: commits survive crashes before request and deadline notifications",
+  test "proofs 6 and 8b: request and notification commit together and stay pending until delivered",
        ctx do
-    item = dispatch(ctx, {:session, "parent"}, "holder", "notify crash")
-    probe_wake = current_wake(ctx.db, item.id)
-    crash = Map.put(ctx.config, :effort_notify, fn _request -> exit(:notify_crash) end)
+    personal_key = Org.personal_session_key("h1")
+    session(ctx.db, personal_key, "h1", Placement.local_host_name())
 
-    assert catch_exit(EffortCheckin.probe(ctx.db, crash, probe_wake)) == :notify_crash
+    item = dispatch(ctx, {:session, "parent"}, "holder", "notify durability")
+    probe_wake = current_wake(ctx.db, item.id)
+
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, probe_wake)
 
     [[request_id, old_deadline_id]] =
       rows(
@@ -746,43 +786,43 @@ defmodule Tightbeam.EffortCheckinTest do
         [item.id]
       )
 
+    # Proof 6: the notification committed WITH the request. Nothing has been
+    # delivered — a death here still leaves the intent durable and pending.
+    assert [%{state: "pending", target_gate: 0} = opened] = notification_wakes(ctx.db)
+    assert opened.prompt =~ "Effort check-in #{request_id}"
+    assert Wakes.get(ctx.db, old_deadline_id).state == "pending"
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened.wake_id]) == [[0]]
+    assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.wake_id == opened.wake_id))
+
+    # Ordinary wake recovery surfaces it without waiting for the deadline.
+    scheduler = drain_notifications!(ctx)
+    assert Wakes.get(ctx.db, opened.wake_id).state == "fired"
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened.wake_id]) == [[1]]
     assert Wakes.get(ctx.db, old_deadline_id).state == "pending"
 
-    surface =
-      Map.put(ctx.config, :effort_notify, fn surfaced ->
-        send(self(), {:surfaced, surfaced.id, surfaced.deadline_wake_id})
-      end)
-
-    :ok = EffortCheckin.deadline(ctx.db, surface, Wakes.get(ctx.db, old_deadline_id))
-    first_advanced = request(ctx.db, request_id)
-    assert_receive {:surfaced, ^request_id, first_deadline}
-    assert first_deadline == first_advanced.deadline_wake_id
-
-    second = dispatch(ctx, {:session, "parent"}, "holder", "deadline notify crash")
-    second_request = fire_probe(ctx, second.id)
-    second_old_deadline = second_request.deadline_wake_id
-
-    assert catch_exit(
-             EffortCheckin.deadline(ctx.db, crash, Wakes.get(ctx.db, second_old_deadline))
-           ) == :notify_crash
-
-    advanced = request(ctx.db, second_request.id)
-    assert advanced.deadline_wake_id != second_old_deadline
+    # Proof 8b: the winning deadline advance commits the new rung, its
+    # replacement deadline wake, and the new-rung notification atomically.
+    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline_id))
+    advanced = request(ctx.db, request_id)
+    assert advanced.deadline_wake_id != old_deadline_id
     assert Wakes.get(ctx.db, advanced.deadline_wake_id).state == "pending"
+    assert Wakes.get(ctx.db, old_deadline_id).state == "fired"
 
-    :ok =
-      EffortCheckin.deadline(
-        ctx.db,
-        surface,
-        Wakes.get(ctx.db, advanced.deadline_wake_id)
-      )
+    assert [%{state: "fired"}, %{state: "pending", target_gate: 0} = rung] =
+             notification_wakes(ctx.db)
 
-    assert_receive {:surfaced, surfaced_id, next_deadline}
-    assert surfaced_id == second_request.id
-    assert next_deadline == request(ctx.db, second_request.id).deadline_wake_id
+    assert rung.session_key == (advanced.expecter_session_key || personal_key)
+    assert rung.prompt =~ "Effort check-in #{request_id}"
 
-    :ok = EffortCheckin.deadline(ctx.db, surface, Wakes.get(ctx.db, second_old_deadline))
-    refute_receive {:surfaced, _, _}
+    :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, rung.wake_id).state == "fired"
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [rung.wake_id]) == [[1]]
+
+    # A stale deadline replay still no-ops on deadlineWakeId mismatch: no rung
+    # rotation, no third notification.
+    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline_id))
+    assert request(ctx.db, request_id).deadline_wake_id == advanced.deadline_wake_id
+    assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [opened.wake_id, rung.wake_id]
   end
 
   test "proof 10: workspace motion supersedes old evidence and re-arms on the new holder/host",
@@ -1050,6 +1090,28 @@ defmodule Tightbeam.EffortCheckinTest do
   defp rows(db, sql, params) do
     {:ok, rows} = DB.query(db, sql, params)
     rows
+  end
+
+  # Notification wakes are the ungated (targetGate = 0) prompt wakes.
+  defp notification_wakes(db) do
+    db
+    |> rows("SELECT wakeId FROM wakes WHERE targetGate = 0 ORDER BY rowid", [])
+    |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
+  end
+
+  # Drain through the REAL gateway prompt-wake child: its closure, its delivery
+  # config, its targetGate handling and wake attribution — not a test stand-in.
+  defp drain_notifications!(ctx) do
+    name = :"effort_wakes_#{System.unique_integer([:positive])}"
+
+    {Wakes, opts} =
+      ctx.config
+      |> Gateway.children_after_preflight()
+      |> Enum.find(&match?({Wakes, _}, &1))
+
+    start_supervised!({Wakes, Keyword.merge(opts, name: name, tick_ms: 60_000)}, id: name)
+    :ok = Wakes.fire_due(name)
+    name
   end
 
   defp session(db, key, owner, host, overrides \\ %{}) do

@@ -19,7 +19,7 @@ defmodule Tightbeam.ClientE2ETest do
   be exactly the false confidence the standing directive forbids.
   """
 
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{ConnRegistry, DB, Devices, EventLog, Gateway, Idempotency, Ledger, Org, Projection, Rules}
   alias Tightbeam.ClientE2E

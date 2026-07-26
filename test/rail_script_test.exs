@@ -1,5 +1,5 @@
 defmodule Tightbeam.RailScriptTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cli_dir Path.expand("../cli", __DIR__)
@@ -26,7 +26,8 @@ defmodule Tightbeam.RailScriptTest do
     Org,
     Placement,
     RailScript,
-    Rules
+    Rules,
+    Wakes
   }
 
   setup do
@@ -36,6 +37,8 @@ defmodule Tightbeam.RailScriptTest do
     :ok = EventLog.ensure_schema(db)
     :ok = ConditionFacts.ensure_schema(db)
     :ok = Escalation.ensure_schema(db)
+    # Opening a request arms its owner notification wake in the same transaction.
+    :ok = Wakes.ensure_schema(db)
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
 

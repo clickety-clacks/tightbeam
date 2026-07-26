@@ -1,5 +1,5 @@
 defmodule Tightbeam.CliIntegrationTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   @moduletag :cli_integration
 

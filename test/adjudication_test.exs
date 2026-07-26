@@ -1,5 +1,5 @@
 defmodule Tightbeam.AdjudicationTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Adjudication, ConditionFacts, DB, EventLog, Idempotency, Ledger, Org, Wakes}
 

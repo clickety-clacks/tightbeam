@@ -1,5 +1,5 @@
 defmodule Tightbeam.LaneTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, Ledger, EventLog, SessionLane, LaneManager}
 

@@ -1,5 +1,5 @@
 defmodule Tightbeam.EscalationTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     ConditionFacts,
@@ -134,32 +134,52 @@ defmodule Tightbeam.EscalationTest do
              Escalation.escalate(ctx.db, call, statute(), Map.put(escalation_ctx(), :dr_id, id))
   end
 
-  test "owner delivery runs once and only after the open transaction commits", ctx do
+  test "owner delivery is one durable wake armed with the open transaction", ctx do
     parent = self()
     call = call(ctx.raiser, %{assignment_id: "a-delivery", kind: "completion"})
+    owner_session = Org.personal_session_key("flynn")
 
-    delivery = fn owner, row ->
-      send(parent, {:delivered, owner, row.id, request(ctx, row.id).status})
-    end
+    {:decision_pending, id} = Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
 
-    {:decision_pending, id} =
-      Escalation.escalate(
-        ctx.db,
-        call,
-        statute(),
-        Map.put(escalation_ctx(), :deliver_owner, delivery)
-      )
+    # The notification is committed WITH the request: pending, ungated, carrying
+    # the owner prompt — and nothing has been delivered yet.
+    assert [%{session_key: ^owner_session, target_gate: 0, state: "pending"} = wake] =
+             notification_wakes(ctx)
 
-    assert_receive {:delivered, "flynn", ^id, "open"}
+    assert wake.prompt =~ "Decision #{id} pending on review."
+    assert wake.prompt =~ "Allow this action?"
+    assert request(ctx, id).status == "open"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
+    # Delivery is the ordinary prompt consumer, strictly after the commit.
+    deliverer = :"escalation_deliverer_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: deliverer,
+       tick_ms: 60_000,
+       deliver: fn fired ->
+         send(parent, {:delivered, fired.session_key, id, request(ctx, id).status})
+       end},
+      id: deliverer
+    )
+
+    :ok = Wakes.fire_due(deliverer)
+    assert_receive {:delivered, ^owner_session, ^id, "open"}
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+    # A decision-pending replay arms nothing and redelivers nothing.
     assert {:decision_pending, ^id} =
              Escalation.escalate(
                ctx.db,
                call,
                statute(),
-               escalation_ctx() |> Map.put(:dr_id, id) |> Map.put(:deliver_owner, delivery)
+               Map.put(escalation_ctx(), :dr_id, id)
              )
 
+    assert Enum.map(notification_wakes(ctx), & &1.wake_id) == [wake.wake_id]
+    :ok = Wakes.fire_due(deliverer)
     refute_receive {:delivered, _, _, _}
   end
 
@@ -541,6 +561,14 @@ defmodule Tightbeam.EscalationTest do
 
   defp request(ctx, id) do
     Escalation.get(ctx.db, rule_call(id, "allow"), id, owner_user_id: "flynn")
+  end
+
+  # Decision notification wakes are the only ungated (targetGate = 0) wakes.
+  defp notification_wakes(ctx) do
+    {:ok, rows} =
+      DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE targetGate = 0 ORDER BY rowid")
+
+    Enum.map(rows, fn [wake_id] -> Wakes.get(ctx.db, wake_id) end)
   end
 
   defp ruling_wake(ctx, id) do

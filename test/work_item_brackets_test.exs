@@ -3,7 +3,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
   The work-item-brackets-v1 required proofs (fail-on-revert). Each test names
   the proof number it discharges; see the spec §Required proofs.
   """
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     Artifacts,

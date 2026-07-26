@@ -125,6 +125,14 @@ pub enum Command {
         identity: Identity,
         work_item_id: String,
     },
+    Transcript {
+        identity: Identity,
+        session: Option<String>,
+        name: Option<String>,
+        before: Option<String>,
+        after: Option<String>,
+        limit: Option<String>,
+    },
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
@@ -285,6 +293,13 @@ COMMANDS:
       idempotent (same key returns the same item).
   work-item-get <workItemId>
   work-item-trace <workItemId>
+  transcript (--session <key> | --name <displayName>)
+             [--before <messageId> | --after <messageId>] [--limit <n>]
+      Read a session's conversation from the substrate's own rows. --name is a
+      LOOKUP: it returns candidate sessions to choose from, never content.
+      No cursor reads the tail (newest first page, shown oldest-first); page
+      back with --before <oldestId> and catch up with --after <newestId>, both
+      ids the previous response handed you. --limit defaults to 50, caps at 500.
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -858,6 +873,37 @@ fn parse_with_optional_catalog(
                 work_item_id: parsed.positional[1].clone(),
             })
         }
+        "transcript" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam transcript (--session <key> | --name <displayName>) [--before <messageId> | --after <messageId>] [--limit <n>]".to_owned());
+            }
+            let session = nonempty(flags, "session");
+            let name = nonempty(flags, "name");
+            // A name resolves to a CHOICE, never to content, so the two flags
+            // are separate and never guessed between.
+            if session.is_some() == name.is_some() {
+                return Err(
+                    "transcript requires exactly one of --session <key> or --name <displayName>"
+                        .to_owned(),
+                );
+            }
+            let before = nonempty(flags, "before");
+            let after = nonempty(flags, "after");
+            if before.is_some() && after.is_some() {
+                return Err("transcript takes at most one of --before or --after".to_owned());
+            }
+            Ok(Command::Transcript {
+                identity: identity(flags)?,
+                session,
+                name,
+                before,
+                after,
+                // Same numeric coercion the other numeric flags use, rendered as
+                // a JSON number so the handler receives an integer, not a string.
+                limit: nonempty(flags, "limit")
+                    .map(|value| js_number_json(number_coercion(&value))),
+            })
+        }
         "work-item-icebox" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-icebox <workItemId>".to_owned());
@@ -996,7 +1042,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -1213,6 +1259,7 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "transcript",
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
@@ -1395,7 +1442,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 

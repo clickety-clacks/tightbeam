@@ -1,5 +1,5 @@
 defmodule Tightbeam.SpinupTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, EventLog, Spinup}
 

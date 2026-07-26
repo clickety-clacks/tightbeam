@@ -45,7 +45,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host identity-edit identity-status identity-relearn identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail run-tests run-smoke cancel-producer-job rule effort-rule waive revoke-waiver withdraw decision-requests decision-request)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host identity-edit identity-status identity-relearn identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail run-tests run-smoke cancel-producer-job rule effort-rule waive revoke-waiver withdraw decision-requests decision-request transcript)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -512,10 +512,34 @@ defmodule Tightbeam.Wire.Router do
   # attribution fields, the seam that was always right.
   @target_fields ["sessionKey", "role", "userId"]
 
+  # Verbs with no legitimate top-level typed-target use. A LOCAL declaration
+  # about these verbs, decided here rather than in the handler because the router
+  # can answer FIRST — `typed_target/3` would otherwise resolve a volunteered
+  # sessionKey through `Org.get/2` and hand back an identifying 404. This clause
+  # runs before that lookup and before the generic target-shape refusals, so the
+  # response is identical for an unknown key, a readable session, a forbidden
+  # session, retired `target` syntax, and several targeting fields at once: the
+  # router never queries the volunteered target's existence. The retrieval key
+  # travels as an ordinary body param instead.
+  @non_target_verbs ~w(transcript)
+
+  # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
+  # number, a boolean or an object — is still a caller volunteering a typed target
+  # to a verb that has none, and must land on the SAME refusal a string does. The
+  # generic clauses below filter on `is_binary/1` for their own reasons (they go on
+  # to resolve the value), which is why this check cannot reuse `given`: doing so
+  # returned 200 and emitted a verb event for a null-valued key.
+  defp volunteers_typed_target?(body) do
+    Enum.any?(["target" | @target_fields], &Map.has_key?(body, &1))
+  end
+
   defp typed_target(verb, body, conn) do
     given = Enum.filter(@target_fields, &is_binary(body[&1]))
 
     cond do
+      verb in @non_target_verbs and volunteers_typed_target?(body) ->
+        {:error, 400, "invalid_message", "#{verb} takes no typed target"}
+
       is_binary(body["target"]) ->
         {:error, 400, "invalid_message", ~s("target" is retired: use sessionKey | role | userId)}
 
