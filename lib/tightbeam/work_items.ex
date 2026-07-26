@@ -345,8 +345,11 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp disposition_allowed?(txn, {:session, session}, item) do
+    # A session token always arrives as {:session, key} even for an admin, so
+    # the owner-or-admin check must resolve the session's owning user and honour
+    # its admin bit — not only direct ownership.
     case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session]) do
-      [[owner]] -> owner == item.ownerUserId
+      [[owner]] -> owner == item.ownerUserId or admin_user?(txn, owner)
       _ -> false
     end
   end

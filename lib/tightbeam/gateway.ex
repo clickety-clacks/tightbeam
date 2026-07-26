@@ -3862,7 +3862,18 @@ defmodule Tightbeam.Gateway do
           [work_item_id]
         )
 
-      owners = rows |> Enum.map(&hd/1) |> MapSet.new()
+      # The item's own owner always receives the doorbell (work-item-brackets
+      # observability amendment: an item is visible to its ownerUserId
+      # regardless of assignments). An unassigned item has no holders, so
+      # without this union its create/disposition doorbell would publish to an
+      # empty recipient set and the owner's board would never update.
+      item_owner =
+        case DB.query(db, "SELECT ownerUserId FROM work_items WHERE id = ?1", [work_item_id]) do
+          {:ok, [[owner]]} when is_binary(owner) -> [owner]
+          _ -> []
+        end
+
+      owners = MapSet.new(Enum.map(rows, &hd/1) ++ item_owner)
 
       Tightbeam.ConnRegistry.publish_work_item(
         Tightbeam.ConnRegistry,

@@ -9,6 +9,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     Artifacts,
     Assignments,
     ConditionFacts,
+    ConnRegistry,
     DB,
     Devices,
     Dispatch,
@@ -31,6 +32,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
   setup do
     db = :"brackets_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!({ConnRegistry, name: ConnRegistry})
 
     for module <- [
           Devices,
@@ -252,6 +254,27 @@ defmodule Tightbeam.WorkItemBracketsTest do
              disp_assign(ctx, {:user, "flynn"}, "holder", "x", fail_item.id)
   end
 
+  ## Disposition authority — owner-or-admin, resolved through the session's user.
+
+  test "disposition authority: an admin session disposes a foreign item; a non-admin cannot", ctx do
+    eves_item = create(ctx, {:user, "eve"}, %{title: "Eve's item"})
+
+    # A non-admin session (dana) cannot dispose another user's item.
+    assert %{code: "not_authorized"} =
+             dispose(ctx, "work-item-close", {:session, "dsession"}, eves_item.id)
+
+    # "holder" is owned by flynn, who is admin — an admin session (not the owner)
+    # disposes it. Before the fix this was wrongly refused (session != owner).
+    assert %{ok: true, workItem: %{state: "closed"}} =
+             dispose(ctx, "work-item-close", {:session, "holder"}, eves_item.id)
+
+    # A non-admin session still disposes its OWN owner's item.
+    danas_item = create(ctx, {:user, "dana"}, %{title: "Dana's item"})
+
+    assert %{ok: true, workItem: %{state: "iceboxed"}} =
+             dispose(ctx, "work-item-icebox", {:session, "dsession"}, danas_item.id)
+  end
+
   ## Proof 6 — owner resolution: session-created items anchor to the session's owning user.
 
   test "Proof 6: a session-created item is owned by its session's user; bracket targets the main",
@@ -437,20 +460,35 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert rumination_wake_count(ctx.db) == 0
   end
 
-  test "Proof 10 (added): assign replay through Dispatch is statute- and disposition-inert", ctx do
+  test "Proof 10 (added): a keyed assign replay through Dispatch is statute-inert", ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Assign replay"})
     {:ok, orig} = disp_assign(ctx, {:user, "flynn"}, "holder", "seed", item.id, key: "ak")
     assert orig.workItemId == item.id
 
-    # Dispose the item, then replay the keyed assign through the chokepoint.
-    revoke(ctx, orig.id)
-    dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+    # Install a statute that Rules.decide WOULD deny a user-origin assign under.
+    load_rules(ctx, """
+    [[rule]]
+    name = "deny-assign"
+    verb = "assign"
+    text = "assign denied"
+    [[rule.deny_when]]
+    fact = "caller.origin_class"
+    op = "eq"
+    value = "user"
+    """)
 
+    # The statute is live: a fresh (non-replay) assign is denied by the rail.
+    assert {:error, %{code: "rule_denied"}} =
+             disp_assign(ctx, {:user, "flynn"}, "holder", "fresh", item.id)
+
+    # The keyed replay short-circuits ABOVE the rail: the original assignment
+    # returns untouched and no remedy episode is filed (statute inertness).
     assert {:ok, replay} =
-             disp_assign(ctx, {:user, "flynn"}, "holder", "ignored", "wi_unknown", key: "ak")
+             disp_assign(ctx, {:user, "flynn"}, "holder", "ignored", item.id, key: "ak")
 
     assert replay.id == orig.id
     assert replay.workItemId == item.id
+    assert RailRemedy.episode(ctx.db, "deny-assign", item.id) == nil
   end
 
   ## Proof 11 — disposition-while-open is refused with a legible error.
@@ -520,41 +558,56 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   ## Proof 15 — create doorbell: one on a real create, zero on a keyed replay.
 
-  test "Proof 15: an actual create emits one owner-routed doorbell; a keyed replay emits none", ctx do
+  test "Proof 15: an actual create publishes to the owner's board (unassigned); replay is silent",
+       ctx do
+    observe("flynn", :flynn)
+    observe("eve", :eve)
+
+    # An UNASSIGNED item has no holders: the doorbell must still reach its owner.
     item = create(ctx, {:user, "flynn"}, %{title: "Doorbell", idempotency_key: "dk"})
     assert doorbell_count(ctx.db, item.id) == 1
+    assert_receive {:flynn, {:push, %{"type" => "work_item_event", "kind" => "metadata"}}}
+    refute_receive {:eve, {:push, _}}
 
     replay = create(ctx, {:user, "flynn"}, %{title: "Doorbell", idempotency_key: "dk"})
     assert replay.id == item.id
     assert doorbell_count(ctx.db, item.id) == 1
+    refute_receive {:flynn, {:push, _}}
 
-    # Owner-routed: the item is visible to its owner, not to a different user.
     assert item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "flynn"}))
     refute item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "eve"}))
   end
 
   ## Proof 16 — the in-txn state='open' interlock aborts an insert racing a disposition.
 
-  test "Proof 16: a disposition committing between the guards aborts the assignment insert", ctx do
+  test "Proof 16: through Dispatch, a disposition landing between the guards aborts the insert",
+       ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Raced"})
 
-    # The probe simulates a disposition committing AFTER the pre-statute guard read
-    # but BEFORE the assignment insert — the in-txn interlock must abort.
+    # The pre-statute guard (Dispatch precheck) will read this open state and proceed.
+    assert WorkItems.state_for(ctx.db, item.id) == "open"
+
     call =
       assign_call({:user, "flynn"}, "holder", "w", item.id)
       |> Map.put(:on_work_item_interlock, fn txn ->
+        # A genuine disposition (close) commits AFTER the pre-statute guard read
+        # but BEFORE the insert — the same mechanics work-item-close applies
+        # (cancel both brackets, set state). The substrate is one BEGIN IMMEDIATE
+        # connection, so this txn seam is how a committed disposition interleaves;
+        # a literal second connection would serialize behind this transaction.
+        WorkItems.cancel_brackets_in_txn(txn, item.id)
         Txn.q(txn, "UPDATE work_items SET state = 'closed' WHERE id = ?1", [item.id])
       end)
 
-    assert %{code: "work_item_not_open"} = Assignments.__handle__(ctx.db, "assign", call)
+    # Driven through the chokepoint: precheck saw open, only the in-txn interlock
+    # catches the disposition and aborts the insert.
+    assert {:error, %{code: "work_item_not_open"}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
-    # The terminal item did NOT acquire an open assignment.
+    # The now-terminal item never acquired an assignment.
     assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM assignments WHERE workItemId = ?1 AND state = 'open'",
-               [item.id]
-             )
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId = ?1", [item.id])
+
+    assert WorkItems.state_for(ctx.db, item.id) == "closed"
   end
 
   ## Proof 17 — bracket-2 slate re-arm on fire.
@@ -595,12 +648,16 @@ defmodule Tightbeam.WorkItemBracketsTest do
     item = create(ctx, {:user, "flynn"}, %{title: "Doorbells"})
     base = doorbell_count(ctx.db, item.id)
 
+    # A disposition on an UNASSIGNED item still reaches the owner's board.
+    observe("flynn", :flynn)
     dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 1
+    assert_receive {:flynn, {:push, %{"type" => "work_item_event", "kind" => "metadata"}}}
 
-    # Same-state no-op: no doorbell.
+    # Same-state no-op: no doorbell, no publish.
     dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 1
+    refute_receive {:flynn, {:push, _}}
 
     dispose(ctx, "work-item-reopen", {:user, "flynn"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 2
@@ -775,6 +832,39 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp item_ids(%{items: items}), do: Enum.map(items, & &1.workItem.id)
+
+  # Register a work-state subscriber for a user, relaying its pushes to the test
+  # process tagged so owner vs non-owner delivery can be asserted independently.
+  defp observe(user_id, tag) do
+    test = self()
+    relay = spawn(fn -> relay_loop(test, tag) end)
+
+    {:ok, _, _} =
+      Tightbeam.ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: relay,
+        user_id: user_id,
+        device_id: "obs-#{user_id}",
+        is_admin: false,
+        subscriptions: MapSet.new(["work_state"])
+      })
+
+    relay
+  end
+
+  defp relay_loop(test, tag) do
+    receive do
+      msg -> send(test, {tag, msg})
+    end
+
+    relay_loop(test, tag)
+  end
+
+  defp load_rules(ctx, toml) do
+    base = Path.join(System.tmp_dir!(), "tb-brackets-rules-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join(base, "identity/rules"))
+    File.write!(Path.join(base, "identity/rules/statute.toml"), toml)
+    Rules.load!(base, Map.keys(ctx.handlers), %{})
+  end
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
