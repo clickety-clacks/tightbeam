@@ -158,6 +158,9 @@ defmodule Tightbeam.Harness.Codex do
     }
   end
 
+  def owned_home_entries,
+    do: Support.owned_home_entries("auth.json", "hooks.json")
+
   @impl true
   def reconcile_home(target, home, desired) do
     rails =

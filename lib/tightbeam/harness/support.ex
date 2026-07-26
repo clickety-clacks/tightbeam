@@ -19,6 +19,17 @@ defmodule Tightbeam.Harness.Support do
 
   def system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
 
+  @doc false
+  def owned_home_entries(credential_file, rails_file) do
+    [
+      ".tightbeam/manifest",
+      credential_file,
+      rails_file
+      | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}")
+    ]
+    |> Enum.sort()
+  end
+
   def credential_transport(target, %{command: command}) do
     invocation =
       if local?(target) do
@@ -403,18 +414,11 @@ defmodule Tightbeam.Harness.Support do
     ]
   end
 
-  defp reconcile_home_vectors(_module, profile) do
-    expected_write_set =
-      [
-        ".tightbeam/manifest",
-        profile.credential_file,
-        profile.rails_file
-      ] ++ Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}")
-
+  defp reconcile_home_vectors(module, profile) do
     [
       vector(
         "sentinel_seeded_desired_set",
-        %{write_set: Enum.sort(expected_write_set), sentinels_preserved: true},
+        %{write_set: module.owned_home_entries(), sentinels_preserved: true},
         %{profile: profile}
       )
     ]

@@ -12,6 +12,10 @@
 # user-callable should get a check here (see the smoke-coverage practice).
 
 defmodule FeatureSmoke do
+  defmodule Failure do
+    defexception [:message]
+  end
+
   @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "mike"
 
   def run do
@@ -34,6 +38,7 @@ defmodule FeatureSmoke do
         providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
       }
       |> sweep_open_work_items()
+      |> check_local_deployment()
       |> check_identity_surface()
       |> check_onboard_surface()
       |> check_facts_read()
@@ -56,6 +61,95 @@ defmodule FeatureSmoke do
       :fail -> raise "credential preflight failed: #{row.note}"
       :incomplete -> raise "credential preflight INCOMPLETE/blocker: #{row.note}"
     end
+  end
+
+  # --- local deployment: live home + cwd projection and durable redelivery ----
+  defp check_local_deployment(state) do
+    harness = state.leg.harness.id()
+    machine = Tightbeam.Placement.local_host_name()
+
+    session =
+      ok!(state, "spawn", %{
+        "archetype" => "reviewer",
+        "displayName" => "smoke-local-deploy-#{unique()}",
+        "idempotencyKey" => "local-deploy-#{unique()}"
+      })
+
+    session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
+    home = Tightbeam.Homes.home_path(state.base_dir, machine, harness)
+    expected_home = MapSet.new(Tightbeam.Homes.owned_entries(harness))
+    before_home = if File.dir?(home), do: MapSet.new(leaf_entries(home)), else: MapSet.new()
+    sentinel = Path.join(home, ".feature-smoke-durable-#{unique()}")
+
+    cwd =
+      Tightbeam.Placement.workdir_path(%{base_dir: state.base_dir}, %{
+        session_key: session_key,
+        host: machine
+      })
+
+    try do
+      redeploy!(state, session_key)
+
+      assert(state, File.dir?(home), "local deployment HOME missing: #{home}")
+
+      actual_home = home |> leaf_entries() |> MapSet.new()
+
+      expected_home
+      |> MapSet.difference(actual_home)
+      |> Enum.each(fn relative ->
+        assert(
+          state,
+          false,
+          "local deployment HOME missing owned path: #{Path.join(home, relative)}"
+        )
+      end)
+
+      actual_home
+      |> MapSet.difference(before_home)
+      |> MapSet.difference(expected_home)
+      |> Enum.each(fn relative ->
+        assert(
+          state,
+          false,
+          "local deployment HOME contains stray path: #{Path.join(home, relative)}"
+        )
+      end)
+
+      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer", harness)
+
+      assert(
+        state,
+        map_size(snapshot.skills) > 0,
+        "local deployment elected no skills for reviewer at #{cwd}"
+      )
+
+      ok!(state, "wake", %{
+        "sessionKey" => session_key,
+        "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
+        "idempotencyKey" => "local-deploy-wake-#{unique()}"
+      })
+
+      await_materialized_skills!(state, cwd, snapshot.skills)
+      await_turn_boundary!(state, session_key)
+
+      sentinel_bytes = "durable-local-deployment-#{unique()}\n"
+      File.write!(sentinel, sentinel_bytes)
+      redeploy!(state, session_key)
+
+      assert(
+        state,
+        File.read(sentinel) == {:ok, sentinel_bytes},
+        "local deployment durable state changed during redelivery: #{sentinel}"
+      )
+    after
+      File.rm(sentinel)
+      retire(state, session)
+    end
+
+    pass(
+      state,
+      "local deployment HOME path + exact owned projection + cwd skills + no strays + durable redelivery"
+    )
   end
 
   defp install_smoke_rule!(base_dir) do
@@ -374,6 +468,15 @@ defmodule FeatureSmoke do
 
   defp post_as(state, token, verb, params) do
     post(state |> Map.put(:token, token) |> Map.put(:as_session, true), verb, params)
+  end
+
+  defp redeploy!(state, session_key) do
+    ok!(state, "tune", %{
+      "sessionKey" => session_key,
+      "setting" => "set_harness",
+      "harness" => state.leg.wire_name,
+      "model" => state.leg.model
+    })
   end
 
   # --- facts-read: file a condition fact, read it back -----------------------
@@ -711,7 +814,7 @@ defmodule FeatureSmoke do
 
   # Verbs whose sessionKey/role/userId is a router-extracted BODY-ROOT target.
   # Other verbs (role-bind, role-rm, …) carry sessionKey as a normal param.
-  @target_verbs ~w(assign dispatch wake retire critical assignments cancel)
+  @target_verbs ~w(assign dispatch wake retire critical assignments cancel tune)
 
   defp post(state, verb, params) do
     params =
@@ -779,6 +882,101 @@ defmodule FeatureSmoke do
     if is_binary(key), do: post(state, "retire", %{"sessionKey" => key})
   end
 
+  defp leaf_entries(root), do: leaf_entries(root, root, [])
+
+  defp leaf_entries(path, root, entries) do
+    path
+    |> File.ls!()
+    |> Enum.reduce(entries, fn name, acc ->
+      child = Path.join(path, name)
+
+      case File.lstat!(child).type do
+        :directory ->
+          case File.ls!(child) do
+            [] -> [Path.relative_to(child, root) <> "/" | acc]
+            _ -> leaf_entries(child, root, acc)
+          end
+
+        _ ->
+          [Path.relative_to(child, root) | acc]
+      end
+    end)
+  end
+
+  defp await_materialized_skills!(state, cwd, skills) do
+    deadline = System.monotonic_time(:millisecond) + 30_000
+    await_materialized_skills!(state, cwd, skills, deadline)
+  end
+
+  defp await_materialized_skills!(state, cwd, skills, deadline) do
+    observed =
+      if(File.dir?(cwd), do: leaf_entries(cwd), else: [])
+      |> Enum.filter(fn relative ->
+        Path.basename(relative) == "SKILL.md" and
+          String.starts_with?(Path.basename(Path.dirname(relative)), "tightbeam__")
+      end)
+      |> Map.new(fn relative ->
+        path = Path.join(cwd, relative)
+        {Path.basename(Path.dirname(relative)), {path, File.read!(path)}}
+      end)
+
+    missing =
+      Enum.reject(skills, fn {name, body} ->
+        match?({_, ^body}, observed["tightbeam__#{name}"])
+      end)
+
+    cond do
+      missing == [] ->
+        state
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        Enum.each(missing, fn {name, _body} ->
+          case observed["tightbeam__#{name}"] do
+            nil ->
+              assert(
+                state,
+                false,
+                "local deployment elected skill missing under #{cwd}: tightbeam__#{name}/SKILL.md"
+              )
+
+            {path, _bytes} ->
+              assert(state, false, "local deployment elected skill bytes differ: #{path}")
+          end
+        end)
+
+      true ->
+        Process.sleep(100)
+        await_materialized_skills!(state, cwd, skills, deadline)
+    end
+  end
+
+  defp await_turn_boundary!(state, session_key) do
+    deadline = System.monotonic_time(:millisecond) + 30_000
+    await_turn_boundary!(state, session_key, deadline)
+  end
+
+  defp await_turn_boundary!(state, session_key, deadline) do
+    db = Path.join(state.base_dir, "state.db")
+
+    {out, 0} =
+      System.cmd("sqlite3", [
+        db,
+        "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(session_key)} AND status IN ('queued','running')"
+      ])
+
+    cond do
+      String.trim(out) == "0" ->
+        state
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        assert(state, false, "local deployment turn did not settle for CWD: #{session_key}")
+
+      true ->
+        Process.sleep(100)
+        await_turn_boundary!(state, session_key, deadline)
+    end
+  end
+
   defp assert(state, true, _msg), do: state
   defp assert(state, _false, msg), do: fail(state, msg)
 
@@ -788,8 +986,7 @@ defmodule FeatureSmoke do
   end
 
   defp fail(_state, msg) do
-    IO.puts("  FAIL  #{msg}")
-    System.halt(1)
+    raise Failure, message: msg
   end
 
   defp finish_leg(state) do
@@ -800,4 +997,10 @@ defmodule FeatureSmoke do
   defp unique, do: "#{Process.get(:salt, "")}#{System.unique_integer([:positive])}"
 end
 
-FeatureSmoke.run()
+try do
+  FeatureSmoke.run()
+rescue
+  error in FeatureSmoke.Failure ->
+    IO.puts("  FAIL  #{error.message}")
+    System.halt(1)
+end

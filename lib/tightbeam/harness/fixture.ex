@@ -71,6 +71,9 @@ defmodule Tightbeam.Harness.Fixture do
     }
   end
 
+  def owned_home_entries,
+    do: Support.owned_home_entries("fixture.json", "fixture.rails")
+
   @impl true
   def reconcile_home(target, home, desired) do
     rails = if is_map(desired.rails), do: JSON.encode!(desired.rails), else: desired.rails
