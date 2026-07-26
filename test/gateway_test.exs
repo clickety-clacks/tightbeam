@@ -1883,7 +1883,8 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:spinup_command, ["ssh" | _]}
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: skill verbs removed; served-identity-home-projection-v1 owns skill delivery; RETIRE proposed"
   test "superseded skill-rm command", ctx do
     base_dir = role_test_base("skill-rm")
     manifests = Path.join([base_dir, "identity", "archetypes"])
@@ -1969,7 +1970,8 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: skill verbs removed; served-identity-home-projection-v1 owns skill delivery; RETIRE proposed"
   test "superseded missing skill-rm command", ctx do
     base_dir = role_test_base("skill-rm-missing")
     Archetypes.load!(base_dir)
@@ -1982,7 +1984,8 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: skill verbs removed; served-identity-home-projection-v1 owns skill delivery; RETIRE proposed"
   test "superseded skill-list command", ctx do
     base_dir = role_test_base("skill-list-member")
     put_skill!(base_dir, "review", "# Review")
@@ -2162,7 +2165,8 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: overrides are served per-session, not projected into homes (served-identity-home-projection-v1); RETIRE proposed"
   test "superseded live home override projection",
        ctx do
     base_dir = role_test_base("override-pin")

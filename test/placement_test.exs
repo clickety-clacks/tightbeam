@@ -77,7 +77,8 @@ defmodule Tightbeam.PlacementTest do
              )
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: served-identity-home-projection-v1 shared homes replace per-identity projection; RETIRE proposed"
   test "superseded per-identity home reconstruction",
        %{base_dir: base_dir, db: db} do
     put_skill!(base_dir, "review", "# Review")
@@ -198,7 +199,8 @@ defmodule Tightbeam.PlacementTest do
     end
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: served-identity-home-projection-v1 shared homes replace per-identity projection; RETIRE proposed"
   test "superseded per-identity adapter projection",
        %{base_dir: base_dir, db: db} do
     manifests = Path.join([base_dir, "identity", "archetypes"])
@@ -1102,7 +1104,8 @@ defmodule Tightbeam.PlacementTest do
     assert Base.url_decode64!(encoded, padding: false) == "codex@testhost"
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: served-identity-home-projection-v1 shared homes replace per-identity projection; RETIRE proposed"
   test "superseded remote per-identity staging flow", %{
     base_dir: base_dir
   } do
@@ -1194,7 +1197,8 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join(staged_home, "auth.json"))
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: served-identity-home-projection-v1 serves model/identity per-session; homes carry no pins; RETIRE proposed"
   test "superseded Claude model pin in shared home", %{base_dir: base_dir} do
     config = %{
       base_dir: base_dir,
@@ -1213,7 +1217,8 @@ defmodule Tightbeam.PlacementTest do
     assert settings == %{"model" => "claude-fable-5"}
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: served-identity-home-projection-v1 serves model/identity per-session; homes carry no pins; RETIRE proposed"
   test "superseded archetype model pin in shared home", %{
     base_dir: base_dir
   } do
@@ -1247,7 +1252,8 @@ defmodule Tightbeam.PlacementTest do
     assert settings == %{"model" => "claude-sonnet-4-6"}
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: served-identity-home-projection-v1 serves guidance per-session; homes carry no identity files; RETIRE proposed"
   test "superseded home guidance projection",
        %{
          base_dir: base_dir
@@ -1329,7 +1335,8 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join(home, "hooks.json"))
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: served-identity-home-projection-v1 shared homes replace per-identity projection; RETIRE proposed"
   test "superseded archetype projection manifest bytes", %{base_dir: base_dir} do
     install_statute(base_dir, "First refusal text.")
     Rails.load!(base_dir)
@@ -1352,7 +1359,8 @@ defmodule Tightbeam.PlacementTest do
              Homes.manifest_bytes(Map.put(spec, :extra_files, %{"hooks.json" => second_hooks}))
   end
 
-  @tag :skip
+  @tag skip:
+         "superseded: served-identity-home-projection-v1 shared homes replace per-identity projection; RETIRE proposed"
   test "superseded parent manifest home projection", %{
     base_dir: base_dir
   } do
