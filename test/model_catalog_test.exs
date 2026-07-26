@@ -359,7 +359,8 @@ defmodule Tightbeam.ModelCatalogTest do
       {ModelCatalog,
        name: missing,
        base_dir: Path.join(ctx.base_dir, "missing"),
-       codex_home: Path.join(ctx.base_dir, "missing-codex")}
+       codex_home: Path.join(ctx.base_dir, "missing-codex"),
+       credential_status: fn _provider -> :onboarded end}
     )
 
     await(fn ->
@@ -384,6 +385,37 @@ defmodule Tightbeam.ModelCatalogTest do
 
     Archetypes.load!(ctx.base_dir)
     assert is_map(Gateway.org_options())
+  end
+
+  test "missing Credentials server fails catalog refresh closed", ctx do
+    parent = self()
+    name = unique_name(:missing_credentials)
+
+    refute Process.whereis(Tightbeam.Credentials)
+
+    start_supervised!(
+      {ModelCatalog,
+       name: name,
+       base_dir: ctx.base_dir,
+       codex_home: ctx.codex_home,
+       claude_fetch: fn path, headers ->
+         send(parent, :provider_io)
+         ctx.claude_fetch.(path, headers)
+       end,
+       codex_read: fn path ->
+         send(parent, :provider_io)
+         ctx.codex_read.(path)
+       end}
+    )
+
+    unavailable = {:unavailable, {:needs_onboarding, :credential_server_unavailable}}
+
+    await(fn ->
+      ModelCatalog.get("claude", name) == {[], unavailable} and
+        ModelCatalog.get("codex", name) == {[], unavailable}
+    end)
+
+    refute_receive :provider_io
   end
 
   test "a hung refresh never blocks a reader or concurrent org-options list", ctx do
@@ -448,7 +480,8 @@ defmodule Tightbeam.ModelCatalogTest do
         base_dir: ctx.base_dir,
         codex_home: ctx.codex_home,
         claude_fetch: ctx.claude_fetch,
-        codex_read: ctx.codex_read
+        codex_read: ctx.codex_read,
+        credential_status: fn _provider -> :onboarded end
       ]
       |> Keyword.merge(overrides)
 

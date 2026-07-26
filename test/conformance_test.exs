@@ -2487,6 +2487,7 @@ defmodule Tightbeam.ConformanceSupport do
           ModelCatalog.start_link(
             base_dir: base,
             codex_home: Path.join(base, "codex"),
+            credential_status: fn _provider -> :onboarded end,
             claude_fetch: fn _, _ -> {:error, :unused} end,
             codex_read: fn _ ->
               {:ok,
@@ -2515,6 +2516,8 @@ defmodule Tightbeam.ConformanceSupport do
         max_live_sessions_per_user: 50,
         wake_tick_ms: 1_000,
         db: db,
+        # Limitation CATALOG-CREDENTIAL-REFUSAL: remedy fixtures force onboarded status,
+        # so this support config cannot observe a needs_onboarding refusal.
         credential_status: fn _provider -> :onboarded end
       })
 

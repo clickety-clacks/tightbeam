@@ -1001,6 +1001,7 @@ defmodule Tightbeam.RailRemedyTest do
           {ModelCatalog,
            base_dir: ctx.base_dir,
            codex_home: Path.join(ctx.base_dir, "codex"),
+           credential_status: fn _provider -> :onboarded end,
            claude_fetch: fn _, _ -> {:error, :unused} end,
            codex_read: fn _ ->
              {:ok,

@@ -168,7 +168,7 @@ defmodule Tightbeam.ModelCatalog do
 
   defp default_credential_status(provider) do
     case Process.whereis(Tightbeam.Credentials) do
-      nil -> :onboarded
+      nil -> {:needs_onboarding, :credential_server_unavailable}
       _pid -> Tightbeam.Credentials.status(provider)
     end
   end
