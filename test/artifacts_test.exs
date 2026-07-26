@@ -1,5 +1,5 @@
 defmodule Tightbeam.ArtifactsTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Artifacts, DB, Gateway, Org, Projection, WorkItems}
 

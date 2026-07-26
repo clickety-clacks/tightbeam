@@ -1,5 +1,5 @@
 defmodule Tightbeam.WakesTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   import ExUnit.CaptureLog
 

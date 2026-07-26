@@ -6,7 +6,7 @@ defmodule Tightbeam.JobForensicsTest do
   Law 0 holds throughout: every row asserted here is a substrate side effect of
   a domain write, never something a caller authored.
   """
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     Adjudication,
