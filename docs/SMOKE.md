@@ -138,9 +138,21 @@ on 2026-07-25:
 ## 1. Converse (the fundamental loop)
 
 3. [auto: J1] Post "hello, who are you?" in Main.
-   PASS: echo bubble immediately; typing indicator ON with live progress
-   text (at minimum "Thinking…" flickers); assistant bubble arrives;
-   indicator clears WITHOUT lingering. DB: turn row `delivered`.
+   PASS: echo bubble immediately; typing indicator ON; assistant bubble
+   arrives; indicator clears WITHOUT lingering. DB: turn row `delivered`.
+   The indicator's ON/OFF is the INVARIANT — its absence, or a lingering
+   indicator, is a failure. Its LABEL is not: the substrate relays labels the
+   harness reports (`agent_thought_chunk` → "Thinking…", `tool_call*` → its
+   title) and fabricates none, so a plain conversational turn can legitimately
+   run with an unlabeled indicator. A label is REQUIRED only where an event
+   backs it — step 4, which is also the proof CAP-012 cites. Measured on the
+   claude leg at `claude-sonnet-5[medium]` (client-e2e run 0e40b93): a plain
+   turn and an explicitly reasoning-provoking turn each produced the full
+   frame sequence with ZERO `agent_progress` frames, claude-agent-acp having
+   sent no thought chunk. The user-visible consequence — an unlabeled
+   indicator during ordinary conversation — is a CLIENT presentation concern
+   (clawline `docs/notes/typing-label-local-fallback.md`), not a substrate
+   defect and not a driver assertion.
 4. [auto: J1] Post a message that provokes tool use ("run `uname -a` and tell me what
    it says").
    PASS: progress label shows a tool title during the turn; assistant bubble

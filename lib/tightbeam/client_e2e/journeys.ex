@@ -77,7 +77,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "converse",
       action: ~s(post "hello, who are you?" in Main),
       client:
-        "echo message frame carrying our clientMessageId; typing active=true; at least one agent_progress with non-empty progressText; assistant message replying to that clientMessageId; typing active=false and no further typing=true through the settle window",
+        "echo message frame carrying our clientMessageId; typing active=true; assistant message replying to that clientMessageId; typing active=false and no further typing=true through the settle window. The indicator is the INVARIANT; its LABEL is not asserted here — the substrate relays only labels the harness reports and a plain turn legitimately has none (SMOKE step 3, measured 0e40b93). Step 4 asserts the label where an event backs it.",
       substrate: "turn row for that clientMessageId reaches `delivered`"
     },
     %{
@@ -139,7 +139,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "Smoke B's assistant bubble arrives BEFORE Main's first; every assistant bubble carries its own sessionKey (no cross-talk); Main's two turns complete in post order",
+        "Smoke B's assistant bubble arrives while Main's slow turn is still running; every assistant bubble carries its own sessionKey (no cross-talk); Main's two turns complete in post order. When the slow prompt finishes first there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -523,7 +523,16 @@ defmodule Tightbeam.ClientE2E.Journeys do
       watermark = SimClient.mark(ctx.client)
 
       {:ok, client, slow_id} =
-        SimClient.post(ctx.client, ctx.main_key, "Write a haiku about each of the 10 planets and dwarf planets, one at a time.")
+        SimClient.post(
+          ctx.client,
+          ctx.main_key,
+          # Long ON PURPOSE. The client-side half of this journey can only be
+          # observed while Main's turn is STILL RUNNING, so a prompt that might
+          # finish first does not make the substrate wrong — it makes the
+          # observation impossible. See the premise handling below.
+          "Write a detailed haiku about each of the 10 planets and dwarf planets, " <>
+            "one at a time, with a sentence of commentary after each."
+        )
 
       {:ok, client, b_id} = SimClient.post(client, session_key, "what is 2+2?")
       {:ok, client, done_id} = SimClient.post(client, ctx.main_key, "now say exactly: DONE")
@@ -552,6 +561,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
       parallel? = Map.get(peaks, ctx.main_key, 0) >= 1 and Map.get(peaks, session_key, 0) >= 1
       turns = Enum.map([slow_id, b_id, done_id], &Substrate.turn_for_client_message(ctx.base_dir, &1))
 
+      # The PREMISE this journey needs: Main's slow turn must still have been
+      # running when Smoke B's reply arrived. When the model answers the slow
+      # prompt faster than the trivial one, there is no overlap to observe —
+      # and reporting FAIL then would blame the substrate for the model's
+      # speed. That case is INCOMPLETE: the driver could not establish the
+      # conditions the assertion needs. The substrate's own witness (two
+      # `running` rows in different lanes, sampled throughout) is what decides
+      # which of the two it was.
+      b_index = Enum.find_index(reply_order, &(&1 == b_id))
+      slow_index = Enum.find_index(reply_order, &(&1 == slow_id))
+      overlap_observed? = is_integer(b_index) and (is_nil(slow_index) or b_index < slow_index)
+
       row =
         cond do
           is_nil(b_reply) ->
@@ -560,20 +581,42 @@ defmodule Tightbeam.ClientE2E.Journeys do
           not is_nil(cross_talk) ->
             Scorecard.fail("10", "concurrency", "cross-talk: a reply landed in the wrong stream", journey: "J5")
 
-          Enum.find_index(reply_order, &(&1 == b_id)) > Enum.find_index(reply_order, &(&1 == slow_id)) ->
-            Scorecard.fail("10", "concurrency", "Smoke B's reply waited for Main's slow turn — the lanes are not parallel", journey: "J5")
-
-          not parallel? ->
-            Scorecard.fail("10", "concurrency", "never sampled running turns in both lanes: #{inspect(peaks)}", journey: "J5")
+          Enum.any?(turns, &(is_nil(&1) or &1["status"] != "delivered")) ->
+            Scorecard.fail("10", "concurrency", "turn rows: #{inspect(Enum.map(turns, & &1 && &1["status"]))}", journey: "J5")
 
           Enum.filter(reply_order, &(&1 in [slow_id, done_id])) != [slow_id, done_id] ->
             Scorecard.fail("10", "concurrency", "Main's turns completed out of order: #{inspect(reply_order)}", journey: "J5")
 
-          Enum.any?(turns, &(is_nil(&1) or &1["status"] != "delivered")) ->
-            Scorecard.fail("10", "concurrency", "turn rows: #{inspect(Enum.map(turns, & &1 && &1["status"]))}", journey: "J5")
+          overlap_observed? and parallel? ->
+            Scorecard.pass("10", "concurrency", journey: "J5")
+
+          parallel? ->
+            Scorecard.incomplete(
+              "10",
+              "concurrency",
+              "the substrate ran both lanes concurrently (sampled #{inspect(peaks)}) but Main's " <>
+                "slow turn finished before Smoke B's reply, so the client-side overlap this step " <>
+                "asserts could not be observed — a faster-than-expected model, not a lane defect",
+              journey: "J5"
+            )
+
+          overlap_observed? ->
+            Scorecard.fail(
+              "10",
+              "concurrency",
+              "Smoke B replied while Main was still running, yet no sample ever caught two " <>
+                "`running` rows in different lanes: #{inspect(peaks)}",
+              journey: "J5"
+            )
 
           true ->
-            Scorecard.pass("10", "concurrency", journey: "J5")
+            Scorecard.fail(
+              "10",
+              "concurrency",
+              "Smoke B's reply waited for Main's slow turn and no sample caught both lanes " <>
+                "running (#{inspect(peaks)}) — the lanes are not parallel",
+              journey: "J5"
+            )
         end
 
       {ctx, [row]}
@@ -879,24 +922,16 @@ defmodule Tightbeam.ClientE2E.Journeys do
         {:error, :timeout, row} -> row
       end
 
-    # Order matters: when the turn row already says what went wrong, report
-    # THAT rather than the client-side symptom it caused. "no assistant reply
-    # within 180000ms" sends a reader looking at the client; "turn row is
-    # failed (Invalid value for config option model: ...)" sends them to the
-    # actual fault.
     error =
-      cond do
-        is_nil(echo) -> "no echo bubble for the posted message"
-        is_nil(turn) -> "no turn row for the posted message"
-        turn["status"] in ~w(failed failed_unknown) -> "turn row is #{turn["status"]}#{turn_error(turn)}"
-        is_nil(typing_on) -> "typing indicator never turned on"
-        progress == [] -> "no live progress text during the turn"
-        is_nil(reply) -> "no assistant reply within #{ctx.turn_timeout_ms}ms"
-        is_nil(typing_off) -> "typing indicator never cleared"
-        not is_nil(lingering) -> "typing indicator came back after the turn ended"
-        turn["status"] != "delivered" -> "turn row is #{turn["status"]}#{turn_error(turn)}"
-        true -> nil
-      end
+      turn_oracle_error(%{
+        echo: echo,
+        typing_on: typing_on,
+        typing_off: typing_off,
+        lingering: lingering,
+        reply: reply,
+        turn: turn,
+        timeout_ms: ctx.turn_timeout_ms
+      })
 
     {ctx,
      %{
@@ -939,6 +974,42 @@ defmodule Tightbeam.ClientE2E.Journeys do
           System.monotonic_time(:millisecond) >= deadline -> {nil, client}
           true -> await_reply(client, watermark, cmid, ctx, predicate, deadline)
         end
+    end
+  end
+
+  @doc """
+  J1's turn-completion oracle as a pure decision over one turn's observations;
+  nil means every leg held.
+
+  Two things are deliberate here.
+
+  ORDER: when the turn row already says what went wrong, that is reported
+  ahead of the client-side symptom it caused. "no assistant reply within
+  180000ms" sends a reader looking at the client; "turn row is failed (Invalid
+  value for config option model: …)" sends them to the fault.
+
+  WHAT IS NOT HERE: the typing indicator's LABEL. The indicator's ON and OFF
+  are invariants and fail hard; the label is harness-reported and the
+  substrate fabricates none, so a plain conversational turn legitimately runs
+  unlabeled (SMOKE step 3, as amended; measured on the claude leg in run
+  0e40b93). Step 4 asserts the label where a `tool_call*` event backs it.
+  Re-adding a label requirement here would silently fail every plain-turn step
+  again, which is why this lives in a function a test can pin.
+  """
+  @spec turn_oracle_error(map()) :: String.t() | nil
+  def turn_oracle_error(observed) do
+    turn = observed.turn
+
+    cond do
+      is_nil(observed.echo) -> "no echo bubble for the posted message"
+      is_nil(turn) -> "no turn row for the posted message"
+      turn["status"] in ~w(failed failed_unknown) -> "turn row is #{turn["status"]}#{turn_error(turn)}"
+      is_nil(observed.typing_on) -> "typing indicator never turned on"
+      is_nil(observed.reply) -> "no assistant reply within #{observed.timeout_ms}ms"
+      is_nil(observed.typing_off) -> "typing indicator never cleared"
+      not is_nil(observed.lingering) -> "typing indicator came back after the turn ended"
+      turn["status"] != "delivered" -> "turn row is #{turn["status"]}#{turn_error(turn)}"
+      true -> nil
     end
   end
 

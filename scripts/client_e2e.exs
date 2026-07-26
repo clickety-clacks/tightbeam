@@ -20,7 +20,6 @@
 
 alias Tightbeam.ClientE2E
 alias Tightbeam.ClientE2E.{LegGateway, Scorecard}
-alias Tightbeam.ClientE2E.Scorecard.Leg
 
 defmodule ClientE2ERunner do
   @unautomated [

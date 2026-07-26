@@ -155,6 +155,67 @@ defmodule Tightbeam.ClientE2ETest do
     end
   end
 
+  describe "J1's turn-completion oracle" do
+    # SMOKE step 3 as amended: the typing indicator is the invariant, its label
+    # is harness-reported. These pin the amended contract in both directions —
+    # the label must not be required, and the indicator must still fail hard.
+    defp delivered_turn, do: %{"status" => "delivered"}
+
+    defp observed(overrides) do
+      Map.merge(
+        %{
+          echo: %{"type" => "message"},
+          typing_on: %{"active" => true},
+          typing_off: %{"active" => false},
+          lingering: nil,
+          reply: %{"content" => "hi"},
+          turn: delivered_turn(),
+          timeout_ms: 1_000
+        },
+        overrides
+      )
+    end
+
+    test "a plain turn with NO progress label passes — the substrate fabricates no label" do
+      assert Journeys.turn_oracle_error(observed(%{})) == nil
+    end
+
+    test "the indicator turning on is an invariant" do
+      assert Journeys.turn_oracle_error(observed(%{typing_on: nil})) =~ "never turned on"
+    end
+
+    test "the indicator clearing is an invariant, and so is not coming back" do
+      assert Journeys.turn_oracle_error(observed(%{typing_off: nil})) =~ "never cleared"
+
+      assert Journeys.turn_oracle_error(observed(%{lingering: %{"active" => true}})) =~
+               "came back after the turn ended"
+    end
+
+    test "a failed turn row is reported ahead of the client symptom it caused" do
+      error =
+        Journeys.turn_oracle_error(
+          observed(%{
+            reply: nil,
+            typing_on: nil,
+            turn: %{"status" => "failed", "error" => "Invalid value for config option model"}
+          })
+        )
+
+      assert error =~ "turn row is failed"
+      assert error =~ "Invalid value for config option model"
+      refute error =~ "never turned on"
+    end
+
+    test "a missing echo is the first thing reported — nothing else is meaningful without it" do
+      assert Journeys.turn_oracle_error(observed(%{echo: nil, turn: nil})) =~ "no echo bubble"
+    end
+
+    test "a non-terminal turn row fails even when every frame arrived" do
+      assert Journeys.turn_oracle_error(observed(%{turn: %{"status" => "queued"}})) =~
+               "turn row is queued"
+    end
+  end
+
   describe "the client's session-status decode contract" do
     test "a full payload has no gaps" do
       assert Journeys.decode_contract_gaps(%{
