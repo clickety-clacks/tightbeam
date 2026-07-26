@@ -5,6 +5,7 @@ ledger, and stores stay on the gateway host (spec §Placement). There is no
 satellite daemon: sshd is the transport, rsync materializes non-secret
 session identity, and the gateway does the rest. Prerequisite: the gateway host can ssh to the
 satellite non-interactively (shared keys — you bring these).
+The gateway host also needs at least one registered harness CLI installed and on PATH.
 
 ## On the satellite (one-time, by the operator)
 
