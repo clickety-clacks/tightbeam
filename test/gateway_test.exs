@@ -1657,6 +1657,39 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "register-host with the LOCAL hostname never touches the boot-owned credential server", ctx do
+    local = Tightbeam.Placement.local_host_name()
+    base_dir = move_test_base("local-host-reregistration", local)
+    config = gateway_config(base_dir, ctx.db, 0)
+    handlers = Gateway.handlers(config)
+
+    local_server = GenServer.whereis(Credentials.server(local))
+
+    # An operator assimilating the gateway's own hostname (plausible re-sweep
+    # mistake) must be inert for credential supervision: replacing the local
+    # server with a foreign base_dir + non-nil ssh wedges every local spawn
+    # until restart (fail-closed), and Placement.hosts/1 ignores the registry
+    # entry for the local name anyway.
+    assert %{host: ^local} =
+             handlers["register-host"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 name: local,
+                 ssh: "clu@#{local}",
+                 base_dir: "/remote/definitely-elsewhere"
+               }
+             })
+
+    assert GenServer.whereis(Credentials.server(local)) == local_server,
+           "local credential server was replaced by re-registering the local hostname"
+
+    refute Enum.any?(Supervisor.which_children(Tightbeam.Supervisor), fn {id, _, _, _} ->
+             id == {Credentials, local}
+           end),
+           "re-registering the local hostname minted a dynamic credential child"
+  end
+
   test "register-host raises a host-named error when credential child startup fails", ctx do
     machine = "credential-worker-start-failure"
     base_dir = move_test_base("credential-server-start-failure", machine)

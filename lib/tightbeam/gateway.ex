@@ -379,6 +379,18 @@ defmodule Tightbeam.Gateway do
   end
 
   defp start_credential_child(config, db, machine, previous_host, host) do
+    # The LOCAL credential server is boot-owned, and Placement.hosts/1 forces
+    # the synthetic local entry regardless of the registry — re-registering the
+    # gateway's own hostname must never replace it (a foreign base_dir plus a
+    # non-nil ssh here wedges every local spawn until restart, fail-closed).
+    if machine == Placement.local_host_name() do
+      :ok
+    else
+      start_remote_credential_child(config, db, machine, previous_host, host)
+    end
+  end
+
+  defp start_remote_credential_child(config, db, machine, previous_host, host) do
     supervisor = Map.get(config, :credential_supervisor, Tightbeam.Supervisor)
     child = credential_child(config, db, machine, host)
 
