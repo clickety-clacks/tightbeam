@@ -296,6 +296,25 @@ defmodule Tightbeam.AdapterHealTest do
     assert episode(ctx.db).cause == @cause
   end
 
+  test "the owner's brief names the precise cause the episode carries", ctx do
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "the turn whose brief must be legible")
+
+    episode = episode(ctx.db)
+    assert episode.cause == @cause
+    prompt = Wakes.get(ctx.db, episode.owner_wake_id).prompt
+
+    # The brief used to carry only the coarse bucket, so a reader saw
+    # `condition=other` for a fault the record already named precisely.
+    assert prompt =~ "cause=#{@cause}"
+    assert prompt =~ "affected_session=k1"
+
+    # The condition stays too — it is what the episode is keyed on — but it is
+    # no longer the only classification the human gets.
+    assert prompt =~ "condition="
+    refute prompt =~ "cause=unclassified"
+  end
+
   ## Proof 2 — fault → hold → heal → auto-release, probe FIRST
 
   test "proof 2: heal releases the hold via a probe that claims before an older queued turn", ctx do
