@@ -121,7 +121,13 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
     case await_ready(gateway, Keyword.get(opts, :boot_timeout_ms, 60_000)) do
       :ok ->
-        {:ok, gateway}
+        # Re-read the identity NOW, not at spawn: `sh -c "exec mix run"` is an
+        # EXEC CHAIN (sh → mix → elixir → beam.smp) that rewrites this pid's
+        # argv while it boots. An identity captured at spawn never matches the
+        # booted process again, so every ours?-gated signal silently skips and
+        # the gateway survives its own teardown/restart (found by the codex J7
+        # leg: :port_still_answering with the BEAM orphaned to launchd).
+        {:ok, %{gateway | os_command: process_command(gateway.os_pid)}}
 
       {:error, reason} ->
         # The half-booted gateway is returned WITH the error so the caller's
@@ -198,14 +204,25 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   end
 
   defp signal_exit(gateway, timeout_ms) do
+    # The tracked pid is the launcher; the BEAM that OWNS THE PORT is its child
+    # and does not die with a TERM to the parent. Capture the tree BEFORE
+    # signalling (children reparent once the parent is gone) and reap it too,
+    # or the port keeps answering and a restart looks like :port_still_answering
+    # (found by the codex J7 leg re-run after task #20).
+    descendants = if ours?(gateway), do: capture_tree(gateway.os_pid), else: []
+
     if ours?(gateway) do
       signal(Integer.to_string(gateway.os_pid), gateway.os_command, "-TERM")
     end
 
-    case await_exit(gateway, timeout_ms) do
-      :ok -> :ok
-      {:error, :still_running} -> {:error, {:still_running, gateway.os_pid}}
-    end
+    result =
+      case await_exit(gateway, timeout_ms) do
+        :ok -> :ok
+        {:error, :still_running} -> {:error, {:still_running, gateway.os_pid}}
+      end
+
+    _ = reap_descendants(descendants, 15_000)
+    result
   end
 
   @doc """
