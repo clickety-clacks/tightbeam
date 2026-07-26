@@ -175,13 +175,23 @@ defmodule Tightbeam.Ledger do
             :busy
 
           [] ->
-            session_filter =
+            {session_filter, selected_mind} =
               case Txn.q(
                      txn,
                      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
                    ) do
                 [[1]] ->
-                  """
+                  mind =
+                    case Txn.q(
+                           txn,
+                           "SELECT model, harness FROM sessions WHERE sessionKey = ?1",
+                           [session_key]
+                         ) do
+                      [[model, harness]] -> {model, harness}
+                      [] -> {nil, nil}
+                    end
+
+                  filter = """
                   AND EXISTS (
                     SELECT 1 FROM sessions AS s
                     WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
@@ -190,21 +200,25 @@ defmodule Tightbeam.Ledger do
                   )
                   """
 
+                  {filter, mind}
+
                 [] ->
-                  ""
+                  {"", {nil, nil}}
               end
 
             Txn.q(
               txn,
               """
-                UPDATE turns SET status = 'running', owner = ?2, startedAt = ?3
+                UPDATE turns
+                SET status = 'running', owner = ?2, startedAt = ?3,
+                    model = ?4, harness = ?5
                 WHERE seq = (SELECT t.seq FROM turns AS t
                              WHERE t.sessionKey = ?1 AND t.status = 'queued'
                                #{session_filter}
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
               """,
-              [session_key, owner, now]
+              [session_key, owner, now, elem(selected_mind, 0), elem(selected_mind, 1)]
             )
 
             if Txn.changes(txn) == 1 do
@@ -412,23 +426,6 @@ defmodule Tightbeam.Ledger do
       ])
 
     :ok
-  end
-
-  @doc "Persist the adapter-confirmed mind before the ACP prompt send."
-  @spec stamp_mind(db(), integer(), String.t(), String.t()) :: :ok | :already_terminal
-  def stamp_mind(db \\ Tightbeam.DB, seq, model, harness) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        UPDATE turns SET model = ?2, harness = ?3
-        WHERE seq = ?1 AND status = 'running'
-        RETURNING seq
-        """,
-        [seq, model, harness]
-      )
-
-    if rows == [[seq]], do: :ok, else: :already_terminal
   end
 
   @doc "Newest adapter generation stamped by an earlier turn in the session, or nil."

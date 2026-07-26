@@ -184,42 +184,6 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
-  defp wait_for_request_order(path, attempts \\ 20)
-
-  defp wait_for_request_order(path, 0), do: captured_requests(path)
-
-  defp wait_for_request_order(path, attempts) do
-    requests = captured_requests(path)
-    prompt_index = boundary_prompt_index(requests)
-    tune_index = last_method_index(requests, "session/set_config_option")
-    cancel_index = last_method_index(requests, "session/cancel")
-
-    if is_integer(prompt_index) and is_integer(tune_index) and is_integer(cancel_index) and
-         prompt_index < tune_index and prompt_index < cancel_index do
-      requests
-    else
-      receive after: (10 -> wait_for_request_order(path, attempts - 1))
-    end
-  end
-
-  defp boundary_prompt_index(requests) do
-    Enum.find_index(requests, fn request ->
-      request["method"] == "session/prompt" and
-        get_in(request, ["prompt", Access.at(0), "text"]) == "boundary"
-    end)
-  end
-
-  defp last_method_index(requests, method) do
-    requests
-    |> Enum.with_index()
-    |> Enum.filter(fn {request, _index} -> request["method"] == method end)
-    |> List.last()
-    |> case do
-      nil -> nil
-      {_request, index} -> index
-    end
-  end
-
   defp session_requests(path) do
     Enum.filter(captured_requests(path), &(&1["method"] in ["session/new", "session/load"]))
   end
@@ -253,66 +217,6 @@ defmodule Tightbeam.Acp.AdapterTest do
              session_requests(capture_path)
 
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
-  end
-
-  test "configured prompt serializes apply-readback-persist-send against tune and cancellation" do
-    {adapter, capture_path} = start_adapter()
-    assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
-    parent = self()
-
-    prompt =
-      Task.async(fn ->
-        Adapter.prompt_configured(
-          adapter,
-          "sess-1",
-          "haiku",
-          "boundary",
-          fn ->
-            send(parent, :persist_boundary)
-
-            receive do
-              :release_boundary -> :ok
-            end
-          end
-        )
-      end)
-
-    assert_receive :persist_boundary
-
-    refute Enum.any?(
-             captured_requests(capture_path),
-             &(&1["method"] == "session/prompt" and
-                 get_in(&1, ["prompt", Access.at(0), "text"]) == "boundary")
-           )
-
-    tune = Task.async(fn -> Adapter.apply_model_strict(adapter, "sess-1", "haiku", "haiku") end)
-
-    cancel =
-      Task.async(fn ->
-        Adapter.cancel_session(adapter, "sess-1", fn ->
-          send(parent, :cancel_boundary)
-          :ok
-        end)
-      end)
-
-    refute Task.yield(tune, 25)
-    refute Task.yield(cancel, 25)
-    refute_received :cancel_boundary
-
-    send(adapter, :release_boundary)
-
-    assert :ok = Task.await(tune)
-    assert :ok = Task.await(cancel)
-    assert_received :cancel_boundary
-    assert {:ok, %{text: "pong[allow-once]"}} = Task.await(prompt)
-
-    requests = wait_for_request_order(capture_path)
-    prompt_index = boundary_prompt_index(requests)
-    tune_index = last_method_index(requests, "session/set_config_option")
-    cancel_index = last_method_index(requests, "session/cancel")
-
-    assert prompt_index < tune_index
-    assert prompt_index < cancel_index
   end
 
   test "a prompt worker that dies before dispatch returns an error without wedging the adapter" do
@@ -443,14 +347,17 @@ defmodule Tightbeam.Acp.AdapterTest do
                     }}
   end
 
-  test "model-selection divergence is negative-controlled without losing the loaded session" do
-    {claude, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
-    assert :ok = Adapter.load_session(claude, "sess-1", "fable", "/tmp", [], "guidance")
+  test "new and load surface model apply failures without claiming residency" do
+    {adapter, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
 
-    assert {:error, :model_unavailable} =
-             Adapter.apply_model_strict(claude, "sess-1", "fable", "haiku")
+    assert {:error, %{"message" => "Invalid value for config option model"}} =
+             Adapter.new_session(adapter, "fable", "/tmp", [], "guidance")
 
-    assert Adapter.knows_session?(claude, "sess-1")
+    assert {:error,
+            {:model_apply_failed, %{"message" => "Invalid value for config option model"}}} =
+             Adapter.load_session(adapter, "sess-1", "fable", "/tmp", [], "guidance")
+
+    refute Adapter.knows_session?(adapter, "sess-1")
 
     {codex, _capture} = start_adapter(harness: :codex)
     assert :ok = Adapter.load_session(codex, "sess-1", "gpt-old", "/tmp", [], "guidance")
