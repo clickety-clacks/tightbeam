@@ -51,7 +51,7 @@ defmodule Tightbeam.ClientE2E.Substrate do
   def turn_for_client_message(base_dir, client_message_id) do
     base_dir
     |> query("""
-    SELECT t.seq, t.sessionKey, t.status, t.origin, t.error, t.startedAt, t.endedAt
+    SELECT t.seq, t.sessionKey, t.status, t.origin, t.error, t.createdAt, t.startedAt, t.endedAt
     FROM turns t JOIN messages m ON m.id = t.messageId
     WHERE m.clientMessageId = #{quote_string(client_message_id)}
     """)
@@ -163,6 +163,42 @@ defmodule Tightbeam.ClientE2E.Substrate do
     |> List.first()
   end
 
+  @doc """
+  The turn row a specific wake produced, by wakeId — the only correlation that
+  cannot stitch one wake's delivery to another's evidence.
+  """
+  @spec turn_by_wake_id(base_dir(), String.t()) :: map() | nil
+  def turn_by_wake_id(base_dir, wake_id) do
+    base_dir
+    |> query("""
+    SELECT seq, status, wakeId, messageId, origin, error
+    FROM turns WHERE wakeId = #{quote_string(wake_id)}
+    """)
+    |> List.first()
+  end
+
+  @doc """
+  Waits for a wake's turn row to appear and reach a terminal status, returning
+  the row (or the last seen shape) so a failure can name what it was doing.
+  """
+  @spec await_wake_turn(base_dir(), String.t(), timeout()) :: map() | nil
+  def await_wake_turn(base_dir, wake_id, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    poll_wake_turn(base_dir, wake_id, deadline, nil)
+  end
+
+  defp poll_wake_turn(base_dir, wake_id, deadline, last) do
+    row = turn_by_wake_id(base_dir, wake_id)
+
+    cond do
+      is_map(row) and row["status"] in ~w(delivered canceled failed failed_unknown) -> row
+      System.monotonic_time(:millisecond) >= deadline -> row || last
+      true ->
+        Process.sleep(200)
+        poll_wake_turn(base_dir, wake_id, deadline, row || last)
+    end
+  end
+
   @doc "Wake rows still pending — J8 asserts a scheduled wake is visible before it fires."
   @spec pending_wakes(base_dir()) :: [map()]
   def pending_wakes(base_dir) do
@@ -259,19 +295,34 @@ defmodule Tightbeam.ClientE2E.Substrate do
   Whether two turn rows overlapped in wall-clock time, from their own
   `startedAt`/`endedAt` — deterministic simultaneous evidence that does not
   depend on catching them with a sampler.
+
+  Two corrections a probe caught in the first version:
+
+  - Boundaries are STRICT. One turn ending on the same millisecond another
+    begins is a hand-off, not an overlap, and millisecond resolution makes that
+    a real outcome rather than a curiosity.
+  - A row with no `endedAt` is STILL RUNNING, so its interval extends to now,
+    not to its own start. Collapsing it to a point meant an in-flight turn
+    could never be seen overlapping anything.
   """
   @spec turns_overlapped?(map() | nil, map() | nil) :: boolean()
   def turns_overlapped?(a, b) do
-    with %{"startedAt" => a_start} <- a,
-         %{"startedAt" => b_start} <- b,
-         true <- is_integer(a_start) and is_integer(b_start) do
-      a_end = a["endedAt"] || a_start
-      b_end = b["endedAt"] || b_start
-      a_start <= b_end and b_start <= a_end
+    with {:ok, a_start, a_end} <- interval(a),
+         {:ok, b_start, b_end} <- interval(b) do
+      a_start < b_end and b_start < a_end
     else
       _ -> false
     end
   end
+
+  defp interval(%{"startedAt" => start} = row) when is_integer(start) do
+    case row["endedAt"] do
+      finish when is_integer(finish) -> {:ok, start, finish}
+      _ -> {:ok, start, System.system_time(:millisecond)}
+    end
+  end
+
+  defp interval(_), do: :error
 
   defp sample_loop(base_dir, interval_ms, samples, owner) do
     sample = running_by_session(base_dir)

@@ -26,7 +26,7 @@
 # scorecard to TIGHTBEAM_CLIENT_E2E_OUT when set.
 
 alias Tightbeam.ClientE2E
-alias Tightbeam.ClientE2E.{LegGateway, Scorecard}
+alias Tightbeam.ClientE2E.{LegGateway, Provenance, Scorecard}
 
 defmodule ClientE2ERunner do
   def run do
@@ -77,6 +77,21 @@ defmodule ClientE2ERunner do
     preflight_row = ClientE2E.preflight(harness, base_dir)
     IO.puts("  preflight #{preflight_row.step}: #{preflight_row.status}")
 
+    # SMOKE P3: a preflight FAIL blocks the leg. Nothing boots, no journey runs,
+    # and every step it would have walked is recorded as blocked rather than
+    # omitted.
+    if preflight_row.status == :fail do
+      IO.puts("  preflight FAILED — leg blocked, gateway not booted (SMOKE P3)")
+      leg = ClientE2E.blocked_leg(harness, Tightbeam.Placement.local_host_name(), preflight_row)
+      IO.puts("leg #{harness}: #{Scorecard.verdict_text(Scorecard.leg_verdict(leg))}")
+      File.rm_rf(base_dir)
+      leg
+    else
+      run_booted_leg(harness, base_dir, port, repo_root, preflight_row)
+    end
+  end
+
+  defp run_booted_leg(harness, base_dir, port, repo_root, preflight_row) do
     try do
       # Boot INSIDE the try so the after-block owns teardown on every path,
       # including a boot that half-succeeds and leaves a process behind.
@@ -98,7 +113,10 @@ defmodule ClientE2ERunner do
         {:ok, gateway} ->
           Process.put(:leg_gateway, gateway)
 
-          leg =
+          # run_leg hands back the CURRENT gateway: J7 restarts it, and tearing
+          # down the pre-restart handle would signal a dead pid and delete the
+          # base_dir from under the live one.
+          {leg, current_gateway} =
             ClientE2E.run_leg(
               host: "127.0.0.1",
               port: port,
@@ -109,6 +127,7 @@ defmodule ClientE2ERunner do
               preflight_row: preflight_row
             )
 
+          Process.put(:leg_gateway, current_gateway || gateway)
           IO.puts("leg #{harness}: #{Scorecard.verdict_text(Scorecard.leg_verdict(leg))}")
           leg
       end
@@ -163,39 +182,28 @@ defmodule ClientE2ERunner do
   end
 
   # The scorecard's sha must name the code that produced it, or a PASS proves an
-  # unrecorded working-tree state — found by cross-review, where a scorecard was
-  # headed with a sha whose tree did not yet contain the logic it credited.
+  # unrecorded working-tree state. The stamp itself lives in
+  # Tightbeam.ClientE2E.Provenance, where the suite can hold it — both review
+  # rounds found their provenance defects in script code no test could reach.
   defp provenance! do
-    sha =
-      case System.cmd("git", ["rev-parse", "--short", "HEAD"], stderr_to_stdout: true) do
-        {out, 0} -> String.trim(out)
-        _ -> "unknown"
-      end
-
-    case System.cmd("git", ["status", "--porcelain"], stderr_to_stdout: true) do
-      {"", 0} ->
+    case Provenance.stamp() do
+      {:clean, sha} ->
         sha
 
-      {dirty, 0} ->
-        {diff, _} = System.cmd("git", ["diff", "HEAD"], stderr_to_stdout: true)
-        hash = :crypto.hash(:sha256, diff) |> Base.encode16(case: :lower) |> binary_part(0, 12)
-
+      {:dirty, _sha, fingerprint, listing} = stamp ->
         if System.get_env("TIGHTBEAM_CLIENT_E2E_ALLOW_DIRTY") == "1" do
-          "#{sha} DIRTY (diff #{hash})"
+          Provenance.to_header(stamp)
         else
           raise """
           refusing to run on a dirty worktree — a scorecard from an uncommitted tree \
           cannot be reproduced from its sha.
 
-          #{String.trim(dirty)}
+          #{String.trim(listing)}
 
           Commit, or set TIGHTBEAM_CLIENT_E2E_ALLOW_DIRTY=1 to run with the scorecard \
-          stamped DIRTY (diff #{hash}).
+          stamped DIRTY (diff #{fingerprint}).
           """
         end
-
-      _ ->
-        sha
     end
   end
 

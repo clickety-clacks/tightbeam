@@ -311,17 +311,177 @@ defmodule Tightbeam.ClientE2ETest do
       refute Substrate.turns_overlapped?(main, %{"startedAt" => 950, "endedAt" => 1_200})
     end
 
+    test "touching boundaries are a HAND-OFF, not an overlap" do
+      # One turn ending on the same millisecond another begins is exactly the
+      # sequential case; an inclusive comparison called it concurrency.
+      main = %{"startedAt" => 100, "endedAt" => 900}
+
+      refute Substrate.turns_overlapped?(main, %{"startedAt" => 900, "endedAt" => 1_400})
+      refute Substrate.turns_overlapped?(%{"startedAt" => 900, "endedAt" => 1_400}, main)
+      refute Substrate.turns_overlapped?(main, %{"startedAt" => 50, "endedAt" => 100})
+    end
+
     test "a turn that never started cannot witness overlap" do
       refute Substrate.turns_overlapped?(%{"startedAt" => nil}, %{"startedAt" => 100})
       refute Substrate.turns_overlapped?(nil, %{"startedAt" => 100})
+      refute Substrate.turns_overlapped?(%{"startedAt" => 100}, nil)
     end
 
-    test "a still-running turn counts from its start" do
-      # endedAt nil means "still going", so it overlaps anything after its start.
-      assert Substrate.turns_overlapped?(
-               %{"startedAt" => 100, "endedAt" => nil},
-               %{"startedAt" => 100, "endedAt" => 500}
-             )
+    test "a STILL-RUNNING turn extends to now, not to its own start" do
+      # endedAt nil means "still going". Collapsing it to a point meant an
+      # in-flight turn could never be seen overlapping anything — including the
+      # turn queued right beside it.
+      now = System.system_time(:millisecond)
+      running = %{"startedAt" => now - 5_000, "endedAt" => nil}
+
+      assert Substrate.turns_overlapped?(running, %{"startedAt" => now - 1_000, "endedAt" => now})
+      assert Substrate.turns_overlapped?(%{"startedAt" => now - 1_000, "endedAt" => nil}, running)
+      # Still bounded by its start: something that ended before it began cannot overlap.
+      refute Substrate.turns_overlapped?(running, %{"startedAt" => now - 9_000, "endedAt" => now - 6_000})
+    end
+  end
+
+  describe "leg teardown reports what actually happened" do
+    alias Tightbeam.ClientE2E.LegGateway
+
+    # This behaviour shipped INERT once: teardown computed :still_running or
+    # :not_removed and then returned a bare :ok, so the runner's warnings could
+    # never fire. A survivor that ignores SIGTERM is the cheapest way to hold
+    # the real contract.
+    test "a process that outlives SIGTERM returns :still_running and KEEPS the base_dir" do
+      base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-teardown-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(base_dir, "homes"))
+      on_exit(fn -> File.rm_rf!(base_dir) end)
+
+      # `trap "" TERM` makes SIGTERM a no-op for this shell. Two details this
+      # test needed before it could hold the contract: the LOOP (given a single
+      # simple command, sh execs it and the trap dies with the shell it
+      # replaced), and the READY file (signalling before the trap is installed
+      # kills the survivor on the default disposition and proves nothing).
+      ready = Path.join(base_dir, "ready")
+
+      port =
+        Port.open({:spawn_executable, System.find_executable("sh")}, [
+          :binary,
+          :exit_status,
+          args: ["-c", "trap '' TERM; touch #{ready}; while true; do sleep 1; done"]
+        ])
+
+      os_pid = port |> Port.info(:os_pid) |> elem(1)
+      wait_for_file(ready, 5_000)
+
+      gateway = %LegGateway{
+        base_dir: base_dir,
+        port: 0,
+        os_pid: os_pid,
+        port_ref: nil,
+        log_path: Path.join(base_dir, "gateway.log")
+      }
+
+      assert {:error, :still_running, ^os_pid} =
+               LegGateway.teardown(gateway, exit_timeout_ms: 1_000)
+
+      assert File.dir?(base_dir), "the base_dir must survive a gateway that is still running"
+
+      System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    end
+
+    test "a clean stop removes the run-local base_dir and returns :ok" do
+      base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-teardown-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base_dir)
+
+      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: nil, port_ref: nil, log_path: ""}
+
+      assert LegGateway.teardown(gateway) == :ok
+      refute File.exists?(base_dir)
+    end
+
+    test "a base_dir this driver did not provision is NEVER removed" do
+      # The one unrecoverable mistake is deleting a real org.
+      base_dir = Path.join(System.tmp_dir!(), "somebody-elses-org-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base_dir)
+      on_exit(fn -> File.rm_rf!(base_dir) end)
+
+      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: nil, port_ref: nil, log_path: ""}
+
+      assert LegGateway.teardown(gateway) == :ok
+      assert File.dir?(base_dir)
+    end
+  end
+
+  describe "a failed preflight blocks the leg (SMOKE P3)" do
+    test "every step is recorded as blocked, and the leg FAILS" do
+      row = Scorecard.fail("P-x", "auth x", "OAuth session expired")
+      leg = ClientE2E.blocked_leg("x", "testhost", row)
+
+      # The preflight FAIL is what fails the leg; the blocked steps are
+      # incomplete, and none of them is silently missing.
+      assert Scorecard.leg_verdict(leg) == :fail
+
+      steps = Enum.map(leg.rows, & &1.step)
+      assert "P-x" in steps
+      assert Enum.sort(steps -- ["P-x"]) == Enum.sort(Journeys.automated_steps())
+
+      blocked = Enum.reject(leg.rows, &(&1.step == "P-x"))
+      assert Enum.all?(blocked, &(&1.status == :incomplete))
+      assert Enum.all?(blocked, &(&1.note =~ "preflight-failed"))
+    end
+  end
+
+  describe "scorecard provenance" do
+    alias Tightbeam.ClientE2E.Provenance
+
+    setup do
+      repo = Path.join(System.tmp_dir!(), "client-e2e-prov-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(repo)
+      on_exit(fn -> File.rm_rf!(repo) end)
+
+      git = fn args -> System.cmd("git", args, cd: repo, stderr_to_stdout: true) end
+      git.(["init", "-q", "-b", "main"])
+      git.(["config", "user.email", "driver@example.test"])
+      git.(["config", "user.name", "driver"])
+      File.write!(Path.join(repo, "tracked.txt"), "one\n")
+      git.(["add", "-A"])
+      git.(["commit", "-q", "-m", "seed"])
+
+      %{repo: repo, git: git}
+    end
+
+    test "a clean worktree stamps just the sha", ctx do
+      assert {:clean, sha} = Provenance.stamp(ctx.repo)
+      assert sha =~ ~r/^[0-9a-f]{7,}$/
+      assert Provenance.to_header({:clean, sha}) == sha
+    end
+
+    test "a tracked edit makes it dirty and shows in the header", ctx do
+      File.write!(Path.join(ctx.repo, "tracked.txt"), "two\n")
+
+      assert {:dirty, sha, fingerprint, listing} = Provenance.stamp(ctx.repo)
+      assert listing =~ "tracked.txt"
+      assert Provenance.to_header({:dirty, sha, fingerprint, listing}) =~ "DIRTY (diff #{fingerprint})"
+    end
+
+    test "UNTRACKED content changes the fingerprint" do
+      # `git diff HEAD` omits untracked files, so the previous fingerprint gave
+      # two different untracked driver sources the same empty-diff hash.
+      listing = "?? probe.exs\n"
+      dir = Path.join(System.tmp_dir!(), "client-e2e-untracked-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      path = Path.join(dir, "probe.exs")
+
+      File.write!(path, "IO.puts(:alpha)")
+      alpha = Provenance.fingerprint(dir, listing)
+
+      File.write!(path, "IO.puts(:beta)")
+      beta = Provenance.fingerprint(dir, listing)
+
+      refute alpha == beta, "same filename, different bytes must not share a fingerprint"
+    end
+
+    test "untracked paths are read off the porcelain listing" do
+      listing = "?? b.exs\n M tracked.txt\n?? a.exs\n"
+      assert Provenance.untracked_paths(listing) == ["a.exs", "b.exs"]
     end
   end
 
@@ -353,7 +513,7 @@ defmodule Tightbeam.ClientE2ETest do
 
   describe "the driver cannot pass vacuously" do
     test "against a closed port the leg FAILS with the client's own transport error" do
-      leg =
+      {leg, _gateway} =
         ClientE2E.run_leg(
           host: "127.0.0.1",
           port: closed_port(),
@@ -400,6 +560,22 @@ defmodule Tightbeam.ClientE2ETest do
       assert Enum.all?(rows, &(&1.status == :incomplete))
       assert Enum.all?(rows, &(&1.note =~ "gateway"))
     end
+  end
+
+  defp wait_for_file(path, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    Stream.repeatedly(fn ->
+      if File.exists?(path) or System.monotonic_time(:millisecond) >= deadline do
+        :done
+      else
+        Process.sleep(50)
+        :wait
+      end
+    end)
+    |> Enum.find(&(&1 == :done))
+
+    assert File.exists?(path), "the survivor process never signalled readiness"
   end
 
   defp registered_harness, do: Tightbeam.Harness.all() |> hd() |> then(& &1.wire_name())

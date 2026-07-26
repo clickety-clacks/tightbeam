@@ -37,7 +37,10 @@ defmodule Tightbeam.ClientE2E do
         ]
 
   @doc """
-  Runs one leg and returns its scorecard leg.
+  Runs one leg, returning `{leg, current_gateway}`.
+
+  The gateway comes back because J7 REPLACES it: whoever tears down at the end
+  must signal the process that is actually running.
 
   Options: `:host`, `:port`, `:base_dir`, `:harness` (all required — the
   harness has NO default on purpose: a driver that silently picks one names a
@@ -47,7 +50,7 @@ defmodule Tightbeam.ClientE2E do
   already produced BEFORE boot (SMOKE: preflight runs first, before anything
   boots).
   """
-  @spec run_leg(opts()) :: Leg.t()
+  @spec run_leg(opts()) :: {Leg.t(), Tightbeam.ClientE2E.LegGateway.t() | nil}
   def run_leg(opts) do
     host = Keyword.get(opts, :host, "127.0.0.1")
     port = Keyword.fetch!(opts, :port)
@@ -92,11 +95,40 @@ defmodule Tightbeam.ClientE2E do
           end)
 
         SimClient.disconnect(ctx.client)
-        leg
+        # The CURRENT gateway, not the one we were handed: J7 restarts it, and a
+        # caller that tears down the pre-restart handle signals a dead pid and
+        # can delete the base_dir out from under the live gateway.
+        {leg, ctx.gateway}
 
       {:error, step, reason} ->
-        Scorecard.add(leg, unreachable_rows(host, port, step, reason, ids))
+        {Scorecard.add(leg, unreachable_rows(host, port, step, reason, ids)),
+         Keyword.get(opts, :gateway)}
     end
+  end
+
+  @doc """
+  A leg blocked before it started: the preflight row plus an `incomplete` row
+  for every step that never ran.
+
+  SMOKE P3 — "a preflight FAIL blocks that leg until fixed or waived by name" —
+  so nothing boots and no journey runs. The blocked steps are recorded rather
+  than omitted, because a step that silently vanishes from a report is how a
+  blocked leg reads as a short green one.
+  """
+  @spec blocked_leg(String.t(), String.t(), Scorecard.Row.t()) :: Leg.t()
+  def blocked_leg(harness, host_name, preflight_row) do
+    blocked =
+      Enum.map(Journeys.oracles(), fn oracle ->
+        Scorecard.incomplete(
+          oracle.step,
+          oracle.label,
+          "preflight-failed: #{preflight_row.step} did not pass, so this leg was not booted " <>
+            "(SMOKE P3)",
+          journey: oracle.journey
+        )
+      end)
+
+    Scorecard.add(%Leg{harness: harness, host: host_name}, [preflight_row | blocked])
   end
 
   @doc """

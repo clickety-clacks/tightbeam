@@ -258,13 +258,14 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
     remove? = Keyword.get(opts, :remove, true) and run_local?(gateway.base_dir)
 
+    # RETURN this. An earlier version computed the same result and then fell
+    # through to a bare `:ok`, so the survivor and removal warnings could never
+    # fire and the whole point of reporting a failed teardown was inert.
     case {exit_result, remove?} do
       {:ok, true} -> remove_base_dir(gateway.base_dir)
       {:ok, false} -> :ok
       {{:error, :still_running}, _} -> {:error, :still_running, gateway.os_pid}
     end
-
-    :ok
   end
 
   # A guard against the one mistake that is not recoverable: removing a real

@@ -659,14 +659,15 @@ defmodule Tightbeam.ClientE2E.Journeys do
       intervals_overlapped? = Substrate.turns_overlapped?(slow_turn, b_turn)
       substrate_concurrent? = sampled_together? or intervals_overlapped?
 
-      # Did the substrate even have the OPPORTUNITY to overlap them? B was
-      # posted while Main was still running iff B's turn was created before
-      # Main's ended. Without that, nothing about lanes can be concluded.
+      # Did the substrate have the OPPORTUNITY to overlap them? The question is
+      # when B was ENQUEUED, not when it started. A B turn serialized behind
+      # Main necessarily STARTS after Main ends — using its start time put the
+      # serialized case into INCOMPLETE and made the queued-behind FAIL branch
+      # unreachable, which a probe confirmed.
       had_opportunity? =
-        with %{"seq" => _} <- b_turn,
-             %{"endedAt" => main_end} when is_integer(main_end) <- slow_turn,
-             b_start when is_integer(b_start) <- b_turn["startedAt"] do
-          b_start <= main_end
+        with %{"createdAt" => b_created} when is_integer(b_created) <- b_turn,
+             %{"endedAt" => main_end} when is_integer(main_end) <- slow_turn do
+          b_created < main_end
         else
           _ -> false
         end
@@ -722,7 +723,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
             Scorecard.fail(
               "10",
               "concurrency",
-              "Smoke B was queued while Main was still running yet never ran beside it " <>
+              "Smoke B was ENQUEUED while Main was still running yet never ran beside it " <>
                 "(#{witness}) — the lanes are not parallel",
               journey: "J5"
             )
@@ -881,7 +882,12 @@ defmodule Tightbeam.ClientE2E.Journeys do
   # published as failed — never a silent stuck indicator — and the client
   # reconnects onto healed state with its history intact.
   defp j7_drain(ctx) do
-    before_messages = length(Substrate.messages(ctx.base_dir, ctx.main_key))
+    # Row IDENTITY, captured BEFORE the interrupted post. A count taken here and
+    # compared afterwards is satisfied by the interrupted turn's own new rows,
+    # so losing an older message would be masked by the arithmetic.
+    before_ids =
+      ctx.base_dir |> Substrate.messages(ctx.main_key) |> MapSet.new(& &1["id"])
+
     watermark = SimClient.mark(ctx.client)
     {:ok, client, cmid} = SimClient.post(ctx.client, ctx.main_key, "Count to 300 slowly, one line per number.")
 
@@ -917,17 +923,19 @@ defmodule Tightbeam.ClientE2E.Journeys do
                Scorecard.fail("14", "restart resilience", "client could not reconnect after restart: #{inspect(reason)}", journey: "J7")}
 
             {:ok, ctx} ->
-              j7_drain_verdict(ctx, cmid, old_pid, gateway.os_pid, before_messages)
+              j7_drain_verdict(ctx, cmid, old_pid, gateway.os_pid, before_ids)
           end
       end
     end
   end
 
-  defp j7_drain_verdict(ctx, cmid, old_pid, new_pid, before_messages) do
+  defp j7_drain_verdict(ctx, cmid, old_pid, new_pid, before_ids) do
     snapshot = SimClient.find(ctx.client, 0, &(&1["type"] == "stream_snapshot"))
     sync = SimClient.find(ctx.client, 0, &(&1["type"] == "sync_complete"))
-    replayed = Enum.count(SimClient.frames(ctx.client), &(&1["type"] == "message"))
-    kept = length(Substrate.messages(ctx.base_dir, ctx.main_key))
+    replayed_ids = SimClient.frames(ctx.client) |> Enum.filter(&(&1["type"] == "message")) |> MapSet.new(& &1["id"])
+    kept_ids = ctx.base_dir |> Substrate.messages(ctx.main_key) |> MapSet.new(& &1["id"])
+    lost = MapSet.difference(before_ids, kept_ids)
+    unreplayed = MapSet.difference(before_ids, replayed_ids)
 
     turn =
       case Substrate.await_turn_terminal(ctx.base_dir, cmid, 120_000) do
@@ -946,11 +954,33 @@ defmodule Tightbeam.ClientE2E.Journeys do
         is_nil(snapshot) or is_nil(sync) ->
           Scorecard.fail("14", "restart resilience", "reconnect did not heal: no stream_snapshot/sync_complete", journey: "J7")
 
-        kept < before_messages ->
-          Scorecard.fail("14", "restart resilience", "delivered rows were lost across the restart (#{before_messages} → #{kept})", journey: "J7")
+        MapSet.size(lost) > 0 ->
+          Scorecard.fail(
+            "14",
+            "restart resilience",
+            "message rows present before the restart are GONE after it: " <>
+              "#{inspect(Enum.take(lost, 5))}",
+            journey: "J7"
+          )
 
-        replayed == 0 ->
-          Scorecard.fail("14", "restart resilience", "replay after reconnect carried no history", journey: "J7")
+        MapSet.size(before_ids) > 0 and MapSet.size(unreplayed) > 0 ->
+          Scorecard.fail(
+            "14",
+            "restart resilience",
+            "replay after reconnect did not carry the full history — missing " <>
+              "#{inspect(Enum.take(unreplayed, 5))}",
+            journey: "J7"
+          )
+
+        is_nil(pointer) or pointer["reason"] != "loaded" ->
+          Scorecard.fail(
+            "14",
+            "restart resilience",
+            "the harness session was not re-adopted: pointer reason is " <>
+              "#{inspect(pointer && pointer["reason"])}, expected \"loaded\" (a `fallback` " <>
+              "means the model lost its context across the restart)",
+            journey: "J7"
+          )
 
         is_nil(turn) ->
           Scorecard.fail("14", "restart resilience", "the interrupted turn left no row", journey: "J7")
@@ -986,8 +1016,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {:ok, client, second} = SimClient.post(client, ctx.main_key, "say exactly: SURVIVED")
     ctx = %{ctx | client: client}
 
-    # Wait until the substrate has actually queued the second turn behind the
-    # first — killing before that proves nothing about queue durability.
+    # Wait until the substrate has actually parked the second turn in `queued`
+    # behind the running first — killing before that proves nothing about queue
+    # durability.
     queued? = await_queued(ctx.base_dir, second, 60_000)
 
     case LegGateway.restart(ctx.gateway) do
@@ -1055,12 +1086,19 @@ defmodule Tightbeam.ClientE2E.Journeys do
     poll_queued(base_dir, client_message_id, deadline)
   end
 
+  # `queued` ONLY. Accepting `running` would let a second turn that already
+  # started stand in for one waiting behind the first, which is the very thing
+  # step 15 exists to prove survives a restart.
   defp poll_queued(base_dir, client_message_id, deadline) do
     row = Substrate.turn_for_client_message(base_dir, client_message_id)
 
     cond do
-      is_map(row) and row["status"] in ~w(queued running) -> true
-      System.monotonic_time(:millisecond) >= deadline -> false
+      is_map(row) and row["status"] == "queued" ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
       true ->
         Process.sleep(200)
         poll_queued(base_dir, client_message_id, deadline)
@@ -1076,63 +1114,94 @@ defmodule Tightbeam.ClientE2E.Journeys do
       {:error, reason} ->
         {ctx, Scorecard.fail("16", "wakes", "wake dispatch failed: #{inspect(reason)}", journey: "J8")}
 
-      {:ok, _result} ->
-        # The wake's prompt is delivered as a SENDER-TAGGED user message, which
-        # is what lets a client render provenance rather than parse text.
-        {stamped, client} =
-          await_frame(
-            ctx.client,
-            watermark,
-            &(&1["type"] == "message" and &1["role"] == "user" and is_binary(&1["sender"]) and
-                &1["sessionKey"] == ctx.main_key),
-            60_000
-          )
-
-        # CORRELATE, do not take the next reply. A wake carries no
-        # clientMessageId, but the assistant's final points back at the
-        # delivered message through `replyToMessageId` — and the first run of
-        # this journey grabbed a reply belonging to J7's still-draining queued
-        # turn, then blamed the agent for answering "SURVIVED".
-        {reply, client} =
-          if stamped do
-            await_frame(
-              client,
-              watermark,
-              &(&1["type"] == "message" and &1["role"] == "assistant" and
-                  &1["replyToMessageId"] == stamped["id"]),
-              ctx.turn_timeout_ms
-            )
-          else
-            {nil, client}
-          end
-
-        ctx = %{ctx | client: client}
-        woken = stamped && Substrate.turn_for_wake(ctx.base_dir, stamped["id"])
-
-        row =
-          cond do
-            is_nil(stamped) ->
-              Scorecard.fail("16", "wakes", "the wake's prompt never appeared in Main as a sender-tagged message", journey: "J8")
-
-            is_nil(reply) ->
-              Scorecard.fail("16", "wakes", "no assistant reply to the wake", journey: "J8")
-
-            not String.contains?(reply["content"] || "", "WAKE OK") ->
-              Scorecard.fail("16", "wakes", "the agent did not answer the wake prompt: #{inspect(reply["content"])}", journey: "J8")
-
-            is_nil(woken) or woken["wakeId"] in [nil, ""] ->
-              Scorecard.fail("16", "wakes", "the delivered message carries no wake-bearing turn row", journey: "J8")
-
-            woken["status"] != "delivered" ->
-              Scorecard.fail("16", "wakes", "the wake's turn row is #{woken["status"]}", journey: "J8")
-
-            true ->
-              Scorecard.pass("16", "wakes", journey: "J8")
-          end
-
-        {ctx, row}
+      {:ok, result} ->
+        j8_verdict(ctx, watermark, wake_id(result), "16", "wakes", "WAKE OK", ctx.turn_timeout_ms)
     end
   end
+
+  # One correlation chain, from the DISPATCHED wakeId to the reply, with no step
+  # that accepts "some sender-tagged message" or "some wake-bearing row". Two
+  # wakes in flight (J8 dispatches an immediate and a scheduled one) would
+  # otherwise let the evidence for one vouch for the other.
+  defp j8_verdict(ctx, watermark, wake_id, step, label, expected_text, timeout_ms) do
+    turn = wake_id && Substrate.await_wake_turn(ctx.base_dir, wake_id, timeout_ms)
+    message_id = turn && turn["messageId"]
+
+    {stamped, client} =
+      if message_id do
+        await_frame(
+          ctx.client,
+          watermark,
+          &(&1["type"] == "message" and &1["role"] == "user" and &1["id"] == message_id and
+              is_binary(&1["sender"])),
+          60_000
+        )
+      else
+        {nil, ctx.client}
+      end
+
+    {reply, client} =
+      if stamped do
+        await_frame(
+          client,
+          watermark,
+          &(&1["type"] == "message" and &1["role"] == "assistant" and
+              &1["replyToMessageId"] == message_id),
+          timeout_ms
+        )
+      else
+        {nil, client}
+      end
+
+    ctx = %{ctx | client: client}
+
+    row =
+      cond do
+        is_nil(wake_id) ->
+          Scorecard.fail(step, label, "the wake dispatch returned no wakeId", journey: "J8")
+
+        is_nil(turn) ->
+          Scorecard.fail(step, label, "no turn row was ever created for wake #{wake_id}", journey: "J8")
+
+        turn["wakeId"] != wake_id ->
+          Scorecard.fail(
+            step,
+            label,
+            "turn row carries wakeId #{inspect(turn["wakeId"])}, not the dispatched #{inspect(wake_id)}",
+            journey: "J8"
+          )
+
+        is_nil(message_id) ->
+          Scorecard.fail(step, label, "the wake's turn row names no delivered message", journey: "J8")
+
+        is_nil(stamped) ->
+          Scorecard.fail(
+            step,
+            label,
+            "the wake's own message #{message_id} never arrived as a sender-tagged message in Main",
+            journey: "J8"
+          )
+
+        is_nil(reply) ->
+          Scorecard.fail(step, label, "no assistant reply correlated to the wake's message", journey: "J8")
+
+        not String.contains?(reply["content"] || "", expected_text) ->
+          Scorecard.fail(step, label, "the agent did not answer the wake prompt: #{inspect(reply["content"])}", journey: "J8")
+
+        turn["status"] != "delivered" ->
+          Scorecard.fail(step, label, "the wake's turn row is #{turn["status"]}#{turn_error(turn)}", journey: "J8")
+
+        true ->
+          Scorecard.pass(step, label, journey: "J8")
+      end
+
+    {ctx, row}
+  end
+
+  defp wake_id(result) when is_map(result),
+    do: result["wakeId"] || get_in(result, ["result", "wakeId"])
+
+  defp wake_id(_), do: nil
 
   # The scheduled variant: the row is visible BEFORE it fires, then it fires.
   defp j8_delayed_wake(ctx) do
@@ -1144,62 +1213,33 @@ defmodule Tightbeam.ClientE2E.Journeys do
         {ctx, Scorecard.fail("16b", "scheduled wake", "scheduled wake dispatch failed: #{inspect(reason)}", journey: "J8")}
 
       {:ok, result} ->
-        wake_id = result["wakeId"] || get_in(result, ["result", "wakeId"])
-        pending = Substrate.pending_wakes(ctx.base_dir)
+        id = wake_id(result)
+        # Read pending BEFORE waiting: the row must be visible while it is still
+        # scheduled, which is the half of step 16 a fired-only check misses.
+        pending? = id && Enum.any?(Substrate.pending_wakes(ctx.base_dir), &(&1["wakeId"] == id))
 
-        # Wait for the SCHEDULED delivery itself (a sender-tagged message that
-        # arrives only after the delay), then its correlated reply.
-        {delivered, client} =
-          await_frame(
-            ctx.client,
+        if pending? do
+          # Same single chain as the immediate variant, keyed on THIS wakeId, so
+          # the immediate wake's delivery cannot stand in for the scheduled one.
+          j8_verdict(
+            ctx,
             watermark,
-            &(&1["type"] == "message" and &1["role"] == "user" and is_binary(&1["sender"]) and
-                &1["sessionKey"] == ctx.main_key),
-            delay_ms + 60_000
+            id,
+            "16b",
+            "scheduled wake",
+            "LATER OK",
+            delay_ms + ctx.turn_timeout_ms
           )
-
-        {reply, client} =
-          if delivered do
-            await_frame(
-              client,
-              watermark,
-              &(&1["type"] == "message" and &1["role"] == "assistant" and
-                  &1["replyToMessageId"] == delivered["id"]),
-              ctx.turn_timeout_ms
-            )
-          else
-            {nil, client}
-          end
-
-        ctx = %{ctx | client: client}
-
-        row =
-          cond do
-            is_nil(wake_id) ->
-              Scorecard.fail("16b", "scheduled wake", "the scheduled wake returned no wakeId: #{inspect(result)}", journey: "J8")
-
-            not Enum.any?(pending, &(&1["wakeId"] == wake_id)) ->
-              Scorecard.fail(
-                "16b",
-                "scheduled wake",
-                "the wake was not listed as pending before firing (rows: #{inspect(Enum.map(pending, & &1["wakeId"]))})",
-                journey: "J8"
-              )
-
-            is_nil(delivered) ->
-              Scorecard.fail("16b", "scheduled wake", "the scheduled wake never fired within #{delay_ms}ms + 60s", journey: "J8")
-
-            is_nil(reply) ->
-              Scorecard.fail("16b", "scheduled wake", "the scheduled wake fired but drew no reply", journey: "J8")
-
-            not String.contains?(reply["content"] || "", "LATER OK") ->
-              Scorecard.fail("16b", "scheduled wake", "the agent did not answer the scheduled prompt: #{inspect(reply["content"])}", journey: "J8")
-
-            true ->
-              Scorecard.pass("16b", "scheduled wake", journey: "J8")
-          end
-
-        {ctx, row}
+        else
+          {ctx,
+           Scorecard.fail(
+             "16b",
+             "scheduled wake",
+             "wake #{inspect(id)} was not listed as pending before firing (pending: " <>
+               "#{inspect(Enum.map(Substrate.pending_wakes(ctx.base_dir), & &1["wakeId"]))})",
+             journey: "J8"
+           )}
+        end
     end
   end
 
