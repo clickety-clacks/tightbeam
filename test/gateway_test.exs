@@ -281,6 +281,7 @@ defmodule Tightbeam.GatewayTest do
       {ModelCatalog,
        base_dir: catalog_base,
        codex_home: Path.join(catalog_base, "codex"),
+       credential_status: fn _provider -> :onboarded end,
        claude_fetch: fn _, _ -> {:ok, claude_models} end,
        codex_read: fn _ ->
          {:ok,
