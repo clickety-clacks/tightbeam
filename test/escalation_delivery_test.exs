@@ -521,21 +521,29 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert Enum.filter(Map.keys(sink_sites()), &(elem(&1, 1) == "Ledger.enqueue/2")) == []
 
     # A hand-written turn insert would step around every AST allowlist above.
-    # Case- and whitespace-insensitive: `insert into turns` and a phrase broken
-    # across lines are the same step-around as the canonical spelling.
+    # Case-, whitespace- and quoting-insensitive: `insert into turns`, the phrase
+    # broken across lines, and `insert into "turns"` / `[turns]` / backticked are
+    # all the same step-around as the canonical spelling (SQLite accepts every
+    # one of those identifier quotings).
     #
-    # WHAT THIS CATCHES, AND WHAT IT DOES NOT. Both this scan and the
-    # decision-request scan below read string LITERALS. They catch a new call
-    # site, and a plainly-written raw insert in any case or spacing. They do NOT
-    # catch SQL assembled at runtime — `"INSERT INTO " <> table`, an interpolated
-    # table name, or a query built from fragments. That limit is deliberate:
-    # folding arbitrary concatenation is unbounded, and someone concatenating SQL
-    # to slip past a named guard is evading review, which no test prevents. The
-    # guard is a floor against drift, not a sandbox against intent.
-    assert Enum.filter(production_files(), &(File.read!(&1) =~ ~r/insert\s+into\s+turns\b/i)) ==
-             [
-               "lib/tightbeam/ledger.ex"
-             ]
+    # WHAT EACH SCAN READS, AND WHAT NEITHER CATCHES. This one greps the ENTIRE
+    # SOURCE TEXT of each production file, so it sees the phrase wherever it is
+    # written — including in a comment, which would be a false positive it
+    # deliberately accepts rather than parsing to exclude. The decision-request
+    # scan below is different: it walks the AST and inspects individual string
+    # LITERALS.
+    #
+    # Neither catches SQL whose table name is assembled at runtime —
+    # `"INSERT INTO " <> table`, an interpolated name, or a query built from
+    # fragments — because the phrase is then never adjacent in one place to be
+    # found. That limit is deliberate: folding arbitrary concatenation is
+    # unbounded, and someone concatenating SQL to slip past a named guard is
+    # evading review, which no test prevents. The guard is a floor against drift,
+    # not a sandbox against intent.
+    assert Enum.filter(
+             production_files(),
+             &(File.read!(&1) =~ ~r/insert\s+into\s+["\[`]?turns\b/i)
+           ) == ["lib/tightbeam/ledger.ex"]
 
     # The request modules cannot reach a delivery seam through an injected fun.
     for file <- ["lib/tightbeam/escalation.ex", "lib/tightbeam/effort_checkin.ex"] do
@@ -885,15 +893,16 @@ defmodule Tightbeam.EscalationDeliveryTest do
         do: {file, ref}
   end
 
-  # Literal-based, with the same documented limit as the turn-insert scan above:
-  # case and spacing cannot hide a writer, runtime-assembled SQL can.
+  # Per-LITERAL, unlike the whole-file turn scan above: case, spacing and
+  # identifier quoting cannot hide a writer, but SQL assembled from fragments can
+  # (no single literal then holds the phrase).
   defp touches_decision_requests?(body) do
     body
     |> collect(fn
       sql when is_binary(sql) ->
         cond do
           # `\b` excludes the schema-rebuild copy into `decision_requests_new`.
-          sql_matches?(sql, ~r/insert\s+into\s+decision_requests\b/i) -> :insert
+          sql_matches?(sql, ~r/insert\s+into\s+["\[`]?decision_requests\b/i) -> :insert
           retarget_sql?(sql) -> :retarget
           true -> nil
         end
@@ -905,8 +914,23 @@ defmodule Tightbeam.EscalationDeliveryTest do
   end
 
   # A retarget is the expecter/deadline rotation CAS, not a ruling or withdrawal.
+  #
+  # This is INTENTIONALLY not what the pre-r2 check matched, in two cases the
+  # cross-review found, and both changes are the point rather than a side effect:
+  #
+  #   `UPDATE decision_requests SET expecterSessionKey=?1` — no space before `=`.
+  #   Was NOT matched, now IS. SQL does not require that space, so the old check
+  #   had a false negative on a real retarget site.
+  #
+  #   `UPDATE decision_requests_new SET expecterSessionKey = ?1` — the
+  #   schema-rebuild copy table. WAS matched, now is NOT. A rebuild is not a
+  #   retarget site, and `\b` here now agrees with the insert scan, which always
+  #   excluded `decision_requests_new`.
+  #
+  # The production site as written today matches under both, so the allowlist did
+  # not move when this changed.
   defp retarget_sql?(sql) do
-    sql_matches?(sql, ~r/update\s+decision_requests\b/i) and
+    sql_matches?(sql, ~r/update\s+["\[`]?decision_requests\b/i) and
       sql_matches?(sql, ~r/expecterSessionKey\s*=/i)
   end
 
