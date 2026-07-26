@@ -792,15 +792,15 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {_status, before} = SimClient.get(ctx.client, "/api/session-status", sessionKey: ctx.main_key)
     current = get_in(before, ["display", "model"])
 
-    candidate =
+    candidates =
       before
       |> get_in(["modelCatalog", "models"])
       |> List.wrap()
       |> Enum.map(&(&1["ref"] || &1["id"]))
       |> Enum.reject(&(is_nil(&1) or base_ref(&1) == current))
-      |> List.first()
+      |> Enum.uniq_by(&base_ref/1)
 
-    if is_nil(candidate) do
+    if candidates == [] do
       {ctx,
        Scorecard.incomplete(
          "13b",
@@ -812,42 +812,110 @@ defmodule Tightbeam.ClientE2E.Journeys do
          journey: "J6"
        )}
     else
-      {status, _body} =
-        SimClient.post_json(ctx.client, "/api/session-control", %{
-          "sessionKey" => ctx.main_key,
-          "action" => "set_model",
-          "model" => candidate
-        })
-
-      {_status, after_change} = SimClient.get(ctx.client, "/api/session-status", sessionKey: ctx.main_key)
-      reported = get_in(after_change, ["display", "model"])
-      missing = decode_contract_gaps(after_change)
-      row = Substrate.session(ctx.base_dir, ctx.main_key)
-      {ctx, next_turn} = turn_completes(ctx, ctx.main_key, "say exactly: MODEL OK", "13b-turn", "post-change turn", "J6")
-
-      result =
-        cond do
-          status != 200 ->
-            Scorecard.fail("13b", "model change", "set_model → #{status}", journey: "J6")
-
-          reported != base_ref(candidate) ->
-            Scorecard.fail("13b", "model change", "session-status reports #{inspect(reported)}, expected #{inspect(base_ref(candidate))}", journey: "J6")
-
-          missing != [] ->
-            Scorecard.fail("13b", "model change", "session-status omits fields the client's decoder requires: #{Enum.join(missing, ", ")}", journey: "J6")
-
-          base_ref(row["model"]) != base_ref(candidate) ->
-            Scorecard.fail("13b", "model change", "sessions.model is #{inspect(row["model"])}", journey: "J6")
-
-          next_turn.status != :pass ->
-            Scorecard.fail("13b", "model change", "the turn after the change did not complete: #{next_turn.note}", journey: "J6")
-
-          true ->
-            Scorecard.pass("13b", "model change", journey: "J6")
-        end
-
-      {ctx, result}
+      try_model_change(ctx, current, candidates, [])
     end
+  end
+
+  # The gateway does not always ACCEPT a catalog model: on a resident session it
+  # applies the change to the live harness session, and a model the grant is not
+  # entitled to comes back `ok: false` with the session left alone. Reading that
+  # field is the difference between an oracle and a guess — an earlier version
+  # asserted the status had changed no matter what the response said, and failed
+  # the substrate for correctly refusing.
+  #
+  # So: `ok: true` must change the model; `ok: false` must NOT change it (a
+  # refusal that mutated the session anyway would be the worse bug, and is now
+  # caught); and a catalog where nothing can be applied leaves the step without
+  # a verdict rather than with a false one.
+  defp try_model_change(ctx, current, [candidate | rest], refused) do
+    {status, body} =
+      SimClient.post_json(ctx.client, "/api/session-control", %{
+        "sessionKey" => ctx.main_key,
+        "action" => "set_model",
+        "model" => candidate
+      })
+
+    {_status, after_change} =
+      SimClient.get(ctx.client, "/api/session-status", sessionKey: ctx.main_key)
+
+    reported = get_in(after_change, ["display", "model"])
+    applied? = is_map(body) and body["ok"] == true
+
+    cond do
+      status != 200 ->
+        {ctx, Scorecard.fail("13b", "model change", "set_model → HTTP #{status}", journey: "J6")}
+
+      not is_map(body) or not is_boolean(body["ok"]) ->
+        {ctx,
+         Scorecard.fail(
+           "13b",
+           "model change",
+           "set_model response carries no boolean `ok`: #{inspect(body)}",
+           journey: "J6"
+         )}
+
+      applied? ->
+        finish_model_change(ctx, candidate, reported, after_change)
+
+      reported != current ->
+        {ctx,
+         Scorecard.fail(
+           "13b",
+           "model change",
+           "set_model #{candidate} reported ok=false, yet the session's model changed from " <>
+             "#{inspect(current)} to #{inspect(reported)} — a refusal must not mutate the session",
+           journey: "J6"
+         )}
+
+      true ->
+        try_model_change(ctx, current, rest, [candidate | refused])
+    end
+  end
+
+  defp try_model_change(ctx, current, [], refused) do
+    {ctx,
+     Scorecard.incomplete(
+       "13b",
+       "model change",
+       "every catalog model the driver offered was refused with ok=false while the session " <>
+         "stayed on #{inspect(current)} (tried #{inspect(Enum.reverse(refused))}) — this grant " <>
+         "is not entitled to a second applicable model, so the step has no verdict to give",
+       journey: "J6"
+     )}
+  end
+
+  defp finish_model_change(ctx, candidate, reported, after_change) do
+    missing = decode_contract_gaps(after_change)
+    row = Substrate.session(ctx.base_dir, ctx.main_key)
+
+    {ctx, next_turn} =
+      turn_completes(ctx, ctx.main_key, "say exactly: MODEL OK", "13b-turn", "post-change turn", "J6")
+
+    result =
+      cond do
+        reported != base_ref(candidate) ->
+          Scorecard.fail(
+            "13b",
+            "model change",
+            "set_model #{candidate} reported ok=true but session-status shows " <>
+              "#{inspect(reported)}, expected #{inspect(base_ref(candidate))}",
+            journey: "J6"
+          )
+
+        missing != [] ->
+          Scorecard.fail("13b", "model change", "session-status omits fields the client's decoder requires: #{Enum.join(missing, ", ")}", journey: "J6")
+
+        base_ref(row["model"]) != base_ref(candidate) ->
+          Scorecard.fail("13b", "model change", "sessions.model is #{inspect(row["model"])}", journey: "J6")
+
+        next_turn.status != :pass ->
+          Scorecard.fail("13b", "model change", "the turn after the change did not complete: #{next_turn.note}", journey: "J6")
+
+        true ->
+          Scorecard.pass("13b", "model change", journey: "J6", note: "applied #{base_ref(candidate)}")
+      end
+
+    {ctx, result}
   end
 
   @doc """

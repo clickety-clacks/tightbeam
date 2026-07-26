@@ -386,6 +386,51 @@ defmodule Tightbeam.ClientE2ETest do
       System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
     end
 
+    test "teardown reaps the gateway's DESCENDANTS, not just the gateway" do
+      # Harness adapters outlive the gateway's SIGTERM and hold the leg's homes
+      # open, which is what defeated directory removal in real runs (eight
+      # orphans in one afternoon). They are found by process TREE: `ps -E`
+      # cannot read a BEAM-spawned process's environment on macOS, so an
+      # env-based match found nothing and reported success.
+      base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-reap-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base_dir)
+      on_exit(fn -> File.rm_rf!(base_dir) end)
+      ready = Path.join(base_dir, "ready")
+
+      # A parent that spawns a GRANDCHILD ignoring SIGTERM: the grandchild is
+      # the shape of an orphaned adapter.
+      port =
+        Port.open({:spawn_executable, System.find_executable("sh")}, [
+          :binary,
+          :exit_status,
+          args: [
+            "-c",
+            "sh -c \"trap '' TERM; touch #{ready}; while true; do sleep 1; done\" & wait"
+          ]
+        ])
+
+      parent = port |> Port.info(:os_pid) |> elem(1)
+      wait_for_file(ready, 5_000)
+
+      descendants = LegGateway.descendant_pids(parent)
+      assert descendants != [], "the child process must be discoverable while the parent lives"
+
+      gateway = %LegGateway{
+        base_dir: base_dir,
+        port: 0,
+        os_pid: parent,
+        port_ref: nil,
+        log_path: ""
+      }
+
+      assert LegGateway.teardown(gateway, exit_timeout_ms: 3_000, reap_timeout_ms: 3_000) == :ok
+
+      for pid <- descendants do
+        assert {_, 1} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true),
+               "descendant #{pid} outlived teardown"
+      end
+    end
+
     test "a clean stop removes the run-local base_dir and returns :ok" do
       base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-teardown-#{System.unique_integer([:positive])}")
       File.mkdir_p!(base_dir)

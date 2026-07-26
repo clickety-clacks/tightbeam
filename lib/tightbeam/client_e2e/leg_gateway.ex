@@ -246,6 +246,10 @@ defmodule Tightbeam.ClientE2E.LegGateway do
           | {:error, :still_running, pos_integer()}
           | {:error, :not_removed, String.t(), term()}
   def teardown(%__MODULE__{} = gateway, opts \\ []) do
+    # BEFORE the kill: the adapters are only findable while the gateway is still
+    # their parent.
+    descendants = if gateway.os_pid, do: descendant_pids(gateway.os_pid), else: []
+
     exit_result =
       if gateway.os_pid do
         _ = System.cmd("kill", ["-TERM", Integer.to_string(gateway.os_pid)], stderr_to_stdout: true)
@@ -255,6 +259,8 @@ defmodule Tightbeam.ClientE2E.LegGateway do
       end
 
     if gateway.port_ref && Port.info(gateway.port_ref), do: Port.close(gateway.port_ref)
+
+    reap_descendants(descendants, Keyword.get(opts, :reap_timeout_ms, 5_000))
 
     remove? = Keyword.get(opts, :remove, true) and run_local?(gateway.base_dir)
 
@@ -268,7 +274,67 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     end
   end
 
+  @doc """
+  Every descendant of `pid`, deepest last, via `pgrep -P`.
+
+  Capture this BEFORE signalling the gateway: once it dies its children are
+  reparented to launchd and the tree that named them is gone.
+  """
+  @spec descendant_pids(pos_integer() | String.t()) :: [String.t()]
+  def descendant_pids(pid) do
+    children =
+      case System.cmd("pgrep", ["-P", to_string(pid)], stderr_to_stdout: true) do
+        {out, 0} -> out |> String.split("\n", trim: true) |> Enum.filter(&Regex.match?(~r/^\d+$/, &1))
+        _ -> []
+      end
+
+    children ++ Enum.flat_map(children, &descendant_pids/1)
+  end
+
+  @doc """
+  SIGTERMs the given pids, then KILLs whatever is still alive.
+
+  These are the gateway's harness ADAPTERS. SIGTERM to the gateway does not take
+  them with it: they outlive it holding the leg's projected homes open, which
+  defeats directory removal and leaves harness processes running against an org
+  that is supposed to be gone. Eight orphans accumulated across one afternoon of
+  runs before this existed.
+
+  Identified by process TREE rather than by environment: `ps -E` cannot read the
+  environment of a BEAM-spawned process on macOS, so an env match found nothing
+  and cheerfully reported success.
+  """
+  @spec reap_descendants([String.t()], non_neg_integer()) :: :ok
+  def reap_descendants([], _timeout_ms), do: :ok
+
+  def reap_descendants(pids, timeout_ms) do
+    for pid <- pids, do: System.cmd("kill", ["-TERM", pid], stderr_to_stdout: true)
+    await_reaped(pids, System.monotonic_time(:millisecond) + timeout_ms)
+  end
+
+  defp await_reaped(pids, deadline) do
+    remaining = Enum.filter(pids, &alive?/1)
+
+    cond do
+      remaining == [] ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        # A harness adapter that ignores SIGTERM still must not outlive the org
+        # it was serving.
+        for pid <- remaining, do: System.cmd("kill", ["-KILL", pid], stderr_to_stdout: true)
+        :ok
+
+      true ->
+        Process.sleep(250)
+        await_reaped(pids, deadline)
+    end
+  end
+
+  defp alive?(pid), do: match?({_, 0}, System.cmd("kill", ["-0", to_string(pid)], stderr_to_stdout: true))
+
   # A guard against the one mistake that is not recoverable: removing a real
+  # org.  # A guard against the one mistake that is not recoverable: removing a real
   # org. The driver only ever deletes directories it provisioned, which are
   # named for this driver.
   defp run_local?(base_dir), do: String.contains?(Path.basename(base_dir), "client-e2e")
