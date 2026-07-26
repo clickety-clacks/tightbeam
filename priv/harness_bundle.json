@@ -36,6 +36,11 @@
       "id": "HB-07-CONFORMANCE-SUITE",
       "title": "Shared conformance suite",
       "description": "Pass the single branch-free parameterized suite for every registered harness and the permanent fixture harness."
+    },
+    {
+      "id": "HB-08-CREDENTIAL-LIVENESS",
+      "title": "Authenticated credential liveness",
+      "description": "Implement CAP-018 with a bounded, injected authenticated probe whose live, dead, unknown, timeout, cleanup, and named-divergence outcomes satisfy the shared vector contract."
     }
   ],
   "constant_accessor_callbacks": [
@@ -89,6 +94,18 @@
         "rotated"
       ],
       "oracle": "credential readiness boolean and harvested bytes equal the vector's expected values"
+    },
+    "credential_live?": {
+      "capability_id": "CAP-018",
+      "default_timeout_ms": 5000,
+      "required_cases": [
+        "authenticated_success",
+        "explicit_rejection",
+        "timeout",
+        "transient_transport_failure",
+        "no_probe_transport"
+      ],
+      "oracle": "raw recorded authenticated success is live; explicit rejection is dead; timeout, transient transport failure, and no-probe transport are unknown; elapsed time is bounded and the transport worker is cleaned up"
     },
     "install_cli_projection": {
       "required_cases": [

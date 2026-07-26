@@ -1,0 +1,30 @@
+{
+  "recorded_at": "2026-07-26",
+  "request": {
+    "method": "GET",
+    "url": "https://chatgpt.com/backend-api/wham/accounts/check",
+    "source": "codex-cli 0.145.0",
+    "sanitized": true
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "accounts": [
+        {
+          "id": "recorded-account",
+          "account_user_id": "recorded-user",
+          "account_user_role": "account-owner",
+          "structure": "personal",
+          "plan_type": "pro"
+        }
+      ],
+      "default_account_id": "recorded-account",
+      "account_ordering": [
+        "recorded-account"
+      ]
+    }
+  }
+}

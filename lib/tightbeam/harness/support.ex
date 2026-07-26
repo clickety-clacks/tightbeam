@@ -2,12 +2,78 @@ defmodule Tightbeam.Harness.Support do
   @moduledoc false
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+  @bundle_path Application.app_dir(:tightbeam, "priv/harness_bundle.json")
+  @external_resource @bundle_path
+  @credential_live_timeout_ms @bundle_path
+                              |> File.read!()
+                              |> JSON.decode!()
+                              |> get_in([
+                                "vector_contract",
+                                "credential_live?",
+                                "default_timeout_ms"
+                              ])
 
   def ssh_opts, do: @ssh_opts
 
   def local?(target), do: target.host_config.ssh == nil
 
   def system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
+
+  def credential_transport(target, %{command: command}) do
+    invocation =
+      if local?(target) do
+        command
+      else
+        ["ssh" | ssh_opts()] ++
+          [
+            target.host_config.ssh,
+            "sh",
+            "-lc",
+            shell_quote(Enum.map_join(command, " ", &shell_quote/1))
+          ]
+      end
+
+    case target.sh.(invocation) do
+      {output, 0} ->
+        case JSON.decode(output) do
+          {:ok, decoded} ->
+            {:ok,
+             %{
+               status: decoded["status"],
+               headers: decoded["headers"],
+               body: decoded["body"]
+             }}
+
+          {:error, reason} ->
+            {:error, {:malformed_transport_response, reason}}
+        end
+
+      {output, exit} ->
+        {:error, {:transport_exit, exit, String.trim(output)}}
+    end
+  end
+
+  def credential_live_result(target, request, opts) do
+    transport = Keyword.fetch!(opts, :transport)
+    timeout_ms = Keyword.get(opts, :timeout_ms, @credential_live_timeout_ms)
+
+    case bounded_call(fn -> transport.(target, request) end, timeout_ms) do
+      {:ok, {:ok, %{status: status}}} when status in 200..299 ->
+        :live
+
+      {:ok, {:ok, %{status: status}}} when status in [401, 403] ->
+        {:dead, {:http_status, status}}
+
+      {:ok, {:ok, %{status: status}}} ->
+        {:unknown, {:http_status, status}}
+
+      {:ok, {:error, reason}} ->
+        {:unknown, reason}
+
+      :timeout ->
+        {:unknown, :timeout}
+    end
+  end
 
   def run!(target, command) do
     case target.sh.(command) do
@@ -47,6 +113,7 @@ defmodule Tightbeam.Harness.Support do
       "reconcile_home" => reconcile_home_vectors(module, profile),
       "materialize_skills" => materialize_skills_vectors(module, profile),
       "credential_ready?/harvest_credential" => credential_vectors(module, profile),
+      "credential_live?" => credential_live_vectors(module, profile),
       "install_cli_projection" => install_cli_projection_vectors(module),
       "probe_cli" => probe_cli_vectors(module, profile),
       "containment_additions" => [
@@ -78,6 +145,9 @@ defmodule Tightbeam.Harness.Support do
 
   def observe_vector(module, "credential_ready?/harvest_credential", %{input: input}),
     do: observe_credential(module, input.profile, input.case)
+
+  def observe_vector(module, "credential_live?", %{input: input}),
+    do: observe_credential_live(module, input.profile, input.case)
 
   def observe_vector(module, "install_cli_projection", %{input: input}),
     do: observe_cli_projection(module, input.case, input.effect)
@@ -471,6 +541,113 @@ defmodule Tightbeam.Harness.Support do
     end)
   end
 
+  defp credential_live_vectors(_module, profile) do
+    cases = [
+      {"authenticated_success", :live},
+      {"explicit_rejection", {:dead, {:http_status, 401}}},
+      {"timeout", {:unknown, :timeout}},
+      {"transient_transport_failure", {:unknown, :econnrefused}},
+      {"no_probe_transport", {:unknown, :no_cheap_authenticated_probe}}
+    ]
+
+    Enum.map(cases, fn {case_name, supported_expected} ->
+      {expected, support} =
+        case profile.credential_live do
+          :unsupported ->
+            {
+              {:unknown, :no_cheap_authenticated_probe},
+              {:unsupported, "DIV-CREDENTIAL-LIVE-FIXTURE-NO-PROBE"}
+            }
+
+          _ ->
+            {supported_expected, :supported}
+        end
+
+      vector(
+        case_name,
+        %{result: expected, bounded_elapsed: true, cleanup: true},
+        %{profile: profile, case: case_name},
+        support
+      )
+    end)
+  end
+
+  defp observe_credential_live(module, profile, case_name) do
+    timeout_ms = 25
+    parent = self()
+
+    transport =
+      if profile.credential_live == :unsupported do
+        fn _target, _request -> {:error, :must_not_be_called} end
+      else
+        case case_name do
+          "authenticated_success" ->
+            raw_fixture_transport(profile.credential_live.live_fixture)
+
+          "explicit_rejection" ->
+            raw_fixture_transport(profile.credential_live.dead_fixture)
+
+          "timeout" ->
+            fn _target, _request ->
+              send(parent, {:credential_transport_pid, self()})
+
+              receive do
+                :never -> {:error, :unexpected}
+              end
+            end
+
+          "transient_transport_failure" ->
+            fn _target, _request -> {:error, :econnrefused} end
+
+          "no_probe_transport" ->
+            fn _target, _request -> {:error, :no_cheap_authenticated_probe} end
+        end
+      end
+
+    started = System.monotonic_time(:millisecond)
+
+    result =
+      module.credential_live?(
+        %{host_config: %{ssh: nil}, sh: &system_cmd/1},
+        "/vector/home",
+        transport: transport,
+        timeout_ms: timeout_ms
+      )
+
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    transport_pid =
+      receive do
+        {:credential_transport_pid, pid} -> pid
+      after
+        0 -> nil
+      end
+
+    %{
+      result: result,
+      bounded_elapsed: elapsed <= timeout_ms + 250,
+      cleanup: is_nil(transport_pid) or not Process.alive?(transport_pid)
+    }
+  end
+
+  defp raw_fixture_transport(path) do
+    recording =
+      path
+      |> File.read!()
+      |> JSON.decode!()
+      |> Map.fetch!("response")
+
+    raw =
+      {:ok,
+       %{
+         status: recording["status"],
+         headers: recording["headers"],
+         body: JSON.encode!(recording["body"])
+       }}
+
+    fn _target, _request -> raw end
+  end
+
   defp install_cli_projection_vectors(module) do
     effect = if module.id() == :codex, do: :codex_projection, else: :no_op
 
@@ -744,21 +921,28 @@ defmodule Tightbeam.Harness.Support do
   end
 
   defp bounded_run(run, command, timeout) do
+    case bounded_call(fn -> run.(command) end, timeout) do
+      {:ok, result} -> {:ok, result}
+      :timeout -> {:error, "timed out after #{timeout}ms"}
+    end
+  end
+
+  defp bounded_call(fun, timeout) do
     task =
       Task.async(fn ->
         try do
-          {:ok, run.(command)}
+          fun.()
         rescue
-          error -> {:error, Exception.message(error)}
+          error -> {:error, {:transport_exception, Exception.message(error)}}
         catch
-          kind, reason -> {:error, "#{kind}: #{inspect(reason)}"}
+          kind, reason -> {:error, {:transport_exception, kind, reason}}
         end
       end)
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, result} -> result
-      {:exit, reason} -> {:error, "runner exited: #{inspect(reason)}"}
-      nil -> {:error, "timed out after #{timeout}ms"}
+      {:ok, result} -> {:ok, result}
+      {:exit, reason} -> {:ok, {:error, {:transport_exit, reason}}}
+      nil -> :timeout
     end
   end
 end

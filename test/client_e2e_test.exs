@@ -560,7 +560,13 @@ defmodule Tightbeam.ClientE2ETest do
     end
   end
 
-  describe "a failed preflight blocks the leg (SMOKE P3)" do
+  describe "a non-passing preflight blocks the leg (SMOKE P3)" do
+    test "the runner gate blocks FAIL and INCOMPLETE but not PASS" do
+      refute ClientE2E.preflight_blocked?(Scorecard.pass("P", "auth"))
+      assert ClientE2E.preflight_blocked?(Scorecard.fail("P", "auth", "rejected"))
+      assert ClientE2E.preflight_blocked?(Scorecard.incomplete("P", "auth", "timeout"))
+    end
+
     test "every step is recorded as blocked, and the leg FAILS" do
       row = Scorecard.fail("P-x", "auth x", "OAuth session expired")
       leg = ClientE2E.blocked_leg("x", "testhost", row)
@@ -575,7 +581,83 @@ defmodule Tightbeam.ClientE2ETest do
 
       blocked = Enum.reject(leg.rows, &(&1.step == "P-x"))
       assert Enum.all?(blocked, &(&1.status == :incomplete))
-      assert Enum.all?(blocked, &(&1.note =~ "preflight-failed"))
+      assert Enum.all?(blocked, &(&1.note =~ "preflight-blocked"))
+    end
+
+    test "an incomplete credential preflight blocks every journey" do
+      preflight =
+        Scorecard.incomplete("P-codex", "auth codex", "credential liveness unknown: :timeout")
+
+      leg = ClientE2E.blocked_leg("codex", "eezo", preflight)
+
+      assert match?({:incomplete, [_preflight | _blocked]}, Scorecard.leg_verdict(leg))
+
+      blocked = Enum.reject(leg.rows, &(&1.step == "P-codex"))
+      assert length(blocked) == length(Journeys.oracles())
+      assert Enum.all?(blocked, &(&1.status == :incomplete))
+      assert Enum.all?(blocked, &(&1.note =~ "preflight-blocked"))
+    end
+  end
+
+  describe "credential liveness preflight mapping" do
+    setup do
+      base_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "tightbeam-client-e2e-credential-live-#{System.unique_integer([:positive])}"
+        )
+
+      store = Tightbeam.Credentials.store_dir(base_dir, :openai)
+      home = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
+      File.mkdir_p!(store)
+      File.mkdir_p!(home)
+      File.write!(Path.join(store, "auth.json"), "{}")
+
+      File.write!(
+        Path.join(home, "models_cache.json"),
+        JSON.encode!(%{
+          "models" => [
+            %{
+              "slug" => "recorded-model",
+              "display_name" => "Recorded Model",
+              "supported_reasoning_levels" => [],
+              "max_input_tokens" => 1_000
+            }
+          ]
+        })
+      )
+
+      on_exit(fn -> File.rm_rf!(base_dir) end)
+      %{base_dir: base_dir}
+    end
+
+    test ":live passes", ctx do
+      transport = fn _target, _request ->
+        {:ok, %{status: 200, headers: %{}, body: "{}"}}
+      end
+
+      assert %{status: :pass} =
+               ClientE2E.preflight("codex", ctx.base_dir, transport: transport)
+    end
+
+    test ":dead fails", ctx do
+      transport = fn _target, _request ->
+        {:ok, %{status: 401, headers: %{}, body: ~s({"detail":"rejected"})}}
+      end
+
+      assert %{status: :fail, note: note} =
+               ClientE2E.preflight("codex", ctx.base_dir, transport: transport)
+
+      assert note =~ "credential rejected"
+    end
+
+    test ":unknown is INCOMPLETE and never passes", ctx do
+      transport = fn _target, _request -> {:error, :econnrefused} end
+
+      assert %{status: :incomplete, note: note} =
+               ClientE2E.preflight("codex", ctx.base_dir, transport: transport)
+
+      assert note =~ "credential liveness unknown"
     end
   end
 

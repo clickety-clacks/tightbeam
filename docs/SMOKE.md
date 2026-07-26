@@ -60,21 +60,22 @@ diagnostic hour on 2026-07-18). So the run starts by proving every grant
 in scope is LIVE, per {harness × host}: the gateway machine and every
 satellite a leg will place sessions on.
 
-P1. claude, per host (run ON the host; ssh for satellites):
-    `env CLAUDE_CONFIG_DIR=<scratch dir> CLAUDE_CODE_OAUTH_TOKEN=$(cat
-    <base_dir>/auth/claude/oauth-token) claude -p "reply with exactly: OK"`
-    PASS: the reply "OK". FAIL signatures: "OAuth session expired and
-    could not be refreshed" or persistent invalid-token 401s. Repair with
+P1. claude, per host: run the registry preflight. Its bounded authenticated
+    probe calls `GET https://api.anthropic.com/v1/models?limit=1` with the
+    host-local OAuth grant. Repair an explicit rejection with
     `tightbeam onboard anthropic` ON that host; never harvest or copy a
     rotating Claude login.
-P2. codex, per host: `env CODEX_HOME=<base_dir>/auth/codex codex login
-    status`. PASS: reports logged in. (If the codex leg is waived for a
-    missing grant, say so here — the waiver is named at preflight, not
-    discovered mid-run.)
+P2. codex, per host: run the registry preflight. Its bounded authenticated
+    probe calls
+    `GET https://chatgpt.com/backend-api/wham/accounts/check` with the
+    host-local ChatGPT grant and account header. Login status/presence is not
+    liveness. If the codex leg is waived for a missing grant, say so here.
 P3. Rule: a preflight FAIL blocks that {harness × host} leg until fixed or
     waived by name. After a clean preflight, any downstream auth-shaped
     failure is a FINDING (something rotated or leaked mid-run), never
-    noise to shrug at.
+    noise to shrug at. The result map is pinned for every preflight surface:
+    `:live` → PASS; `{:dead, reason}` → FAIL; `{:unknown, reason}` →
+    INCOMPLETE/blocker, never PASS.
 
 ## Fresh-org provisioning (what "auth seeded" actually means)
 

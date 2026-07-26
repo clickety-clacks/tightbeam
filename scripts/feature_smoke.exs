@@ -23,6 +23,7 @@ defmodule FeatureSmoke do
     Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
     |> Enum.each(fn leg ->
       IO.puts("\nfeature-smoke leg #{leg.wire_name} model=#{leg.model}")
+      preflight!(leg, base_dir)
 
       %{
         port: gw["port"],
@@ -44,6 +45,17 @@ defmodule FeatureSmoke do
       |> check_escalation_to_owner()
       |> finish_leg()
     end)
+  end
+
+  defp preflight!(leg, base_dir) do
+    row = Tightbeam.ClientE2E.preflight(leg.wire_name, base_dir)
+    IO.puts("credential preflight #{row.step}: #{String.upcase(to_string(row.status))}")
+
+    case row.status do
+      :pass -> :ok
+      :fail -> raise "credential preflight failed: #{row.note}"
+      :incomplete -> raise "credential preflight INCOMPLETE/blocker: #{row.note}"
+    end
   end
 
   defp install_smoke_rule!(base_dir) do
