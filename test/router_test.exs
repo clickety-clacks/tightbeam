@@ -626,12 +626,17 @@ defmodule Tightbeam.Wire.RouterTest do
     assert disallowed.status == 400
   end
 
-  test "F6: the dispatch boundary strips a substrate-only carrier, and only on its verb",
-       ctx do
+  test "F6: the dispatch boundary strips a wake's substrate-only carrier", ctx do
     # Law 0: a client-supplied wake `assignmentId` would forge
     # wake -> turn -> trace attribution. The spec pins that it is STRIPPED at the
     # dispatch boundary, so this drives a REAL authenticated /agent/dispatch
     # request rather than calling the handler or the strip helper directly.
+    #
+    # The other half of the rule — that the strip is SCOPED to that carrier and
+    # leaves `assignmentId` alone on attest/assign/dispatch — is proven at the
+    # pure `atomize_params/2` seam in job_forensics_test, because asserting it
+    # here would run through Dispatch's rule engine (global persistent_term state)
+    # and prove nothing reliably.
     forge =
       JSON.encode!(%{
         verb: "wake",
@@ -644,33 +649,18 @@ defmodule Tightbeam.Wire.RouterTest do
       |> put_req_header("authorization", "Bearer tbc_test")
       |> Router.call(Router.init(ctx.opts))
 
-    assert response.status == 200
+    # The handler being REACHED with the params is the proof; assert that first, so
+    # a refusal upstream fails here with a legible message rather than as a status
+    # mismatch. (Dispatch consults Rules, which lives in :persistent_term — global
+    # across test files — so coupling this proof to an HTTP status makes it hostage
+    # to whatever rule set another file last loaded.)
     assert_receive {:call, %{verb: "wake", params: wake_params}}
 
     refute Map.has_key?(wake_params, :assignment_id),
            "a client-supplied wake assignmentId must never reach the handler"
 
     assert wake_params[:prompt] == "an ordinary conversational wake"
-
-    # ...and ONLY on that verb: `assignmentId` is an ordinary caller param on the
-    # verbs that name the assignment they act on, so the strip must not reach them.
-    attest =
-      JSON.encode!(%{
-        verb: "attest",
-        asUser: "flynn",
-        params: %{assignmentId: "asg_victim", kind: "completion"}
-      })
-
-    attest_response =
-      conn(:post, "/agent/dispatch", attest)
-      |> put_req_header("authorization", "Bearer tbc_test")
-      |> Router.call(Router.init(ctx.opts))
-
-    # The stub answers `not_holder` (403) — its business answer, not a boundary
-    # rejection. What matters is that the handler was REACHED with the field intact.
-    assert attest_response.status == 403
-    assert_receive {:call, %{verb: "attest", params: attest_params}}
-    assert attest_params[:assignment_id] == "asg_victim"
+    assert response.status == 200
   end
 
   test "typed target grammar distinguishes keys, users, and roles without unions", ctx do
