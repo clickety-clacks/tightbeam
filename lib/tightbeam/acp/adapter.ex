@@ -34,6 +34,7 @@ defmodule Tightbeam.Acp.Adapter do
     :on_auth_event,
     :on_subagent_event,
     contained: false,
+    stderr_offset: 0,
     chunks: %{},
     progress: %{},
     known: MapSet.new()
@@ -71,20 +72,15 @@ defmodule Tightbeam.Acp.Adapter do
   agent). Returns {:ok, session_id}.
   """
   @spec new_session(adapter(), model_ref(), String.t(), [map()], String.t()) ::
-          {:ok, String.t()}
+          {:ok, String.t()} | {:error, term()}
   def new_session(adapter, model, cwd, mcp_servers, guidance),
-    do: GenServer.call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
+    do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
 
   @doc "Adopt an existing harness session at its workdir — re-applies the model; never trusts the advertised one."
   @spec load_session(adapter(), String.t(), model_ref(), String.t(), [map()], String.t()) ::
           :ok | {:error, term()}
   def load_session(adapter, session_id, model, cwd, mcp_servers, guidance),
-    do:
-      GenServer.call(
-        adapter,
-        {:load_session, session_id, model, cwd, mcp_servers, guidance},
-        30_000
-      )
+    do: call(adapter, {:load_session, session_id, model, cwd, mcp_servers, guidance}, 30_000)
 
   @doc "Best-effort ACP teardown for one harness session; adapter failures never escape the caller."
   @spec close_session(adapter(), String.t()) :: :ok | {:error, term()}
@@ -95,6 +91,38 @@ defmodule Tightbeam.Acp.Adapter do
   catch
     :exit, reason -> {:error, {:adapter_unavailable, reason}}
   end
+
+  # An adapter that cannot BOOT dies in handle_continue, so the turn's first
+  # call exits carrying only the death reason — that is how an actionable spawn
+  # error ("Permission denied") used to reach the lane as a bare :task_crash
+  # (S4 defect 1). Translating the exit into the DESIGNED
+  # {:adapter_unavailable, one-line reason} here — the same shape close_session
+  # has always produced — is what puts the reason on the turn row. Every
+  # adapter-boundary call the turn path makes goes through this.
+  defp call(adapter, message, timeout) do
+    GenServer.call(adapter, message, timeout)
+  catch
+    :exit, reason -> {:error, {:adapter_unavailable, unavailable_reason(reason)}}
+  end
+
+  # `:noproc` stays an ATOM: it means the adapter was ALREADY dead when the call
+  # went out, so this call carries no reason of its own and the caller should
+  # prefer the coordinator's record of the death. Every other exit yields text.
+  defp unavailable_reason({:noproc, {GenServer, :call, _args}}), do: :noproc
+  defp unavailable_reason({reason, {GenServer, :call, _args}}), do: failure_text(reason)
+  defp unavailable_reason(reason), do: failure_text(reason)
+
+  @doc """
+  Render an adapter DEATH reason as the one-line turn-facing text. The stderr
+  line is the spawn error; the wrapper names what failed while producing it.
+  """
+  @spec failure_text(term()) :: String.t()
+  def failure_text({:adapter_fault, %{reason: reason, stderr: line}}),
+    do: one_line("#{inspect(reason)}: #{line}")
+
+  def failure_text(reason), do: one_line(inspect(reason))
+
+  defp one_line(text), do: text |> String.replace(~r/\s*\n\s*/, " ") |> String.trim()
 
   @doc "Strict adjudication-only model apply: base, effort, then response read-back."
   @spec apply_model_strict(adapter(), String.t(), model_ref(), model_ref()) ::
@@ -156,8 +184,15 @@ defmodule Tightbeam.Acp.Adapter do
   itself cannot.
   """
   @spec knows_session?(adapter(), String.t()) :: boolean()
-  def knows_session?(adapter, session_id),
-    do: GenServer.call(adapter, {:knows_session?, session_id})
+  def knows_session?(adapter, session_id) do
+    GenServer.call(adapter, {:knows_session?, session_id})
+  catch
+    # An adapter that never finished booting has created or loaded nothing, so
+    # `false` is the honest answer; the load_session that follows carries the
+    # {:adapter_unavailable, reason} the turn needs. Returning an error tuple
+    # here would be TRUTHY at the caller's `if` — the boolean contract stays.
+    :exit, _reason -> false
+  end
 
   @doc "The underlying Acp.Conn (for pending_count / quiescence probes)."
   @spec conn(adapter()) :: pid()
@@ -175,6 +210,23 @@ defmodule Tightbeam.Acp.Adapter do
     do: handle_continue({:boot, fun.()}, nil)
 
   def handle_continue({:boot, opts}, nil) do
+    stderr_path = Keyword.get(opts, :stderr_path, "/dev/null")
+    # ATTEMPT-SCOPED stderr: the per-key log is opened `2>>` and accumulates
+    # across every spawn, so the file's last line can belong to a PREVIOUS
+    # attempt. One adapter process is exactly one spawn attempt; recording the
+    # size before the port opens makes "the last stderr line of that boot
+    # attempt" mean it (S4 defect 1).
+    offset = stderr_size(stderr_path)
+
+    try do
+      boot(opts, stderr_path, offset)
+    rescue
+      error ->
+        {:stop, adapter_failure_reason({:boot_failed, Exception.message(error)}, stderr_path, offset), nil}
+    end
+  end
+
+  defp boot(opts, stderr_path, offset) do
     harness = Keyword.fetch!(opts, :harness)
     module = Harness.module!(harness)
     preset = module.session_config(%{}, "")
@@ -183,27 +235,38 @@ defmodule Tightbeam.Acp.Adapter do
       Conn.start_link(
         cmd: Keyword.fetch!(opts, :cmd),
         env: Keyword.get(opts, :env, []),
-        stderr_path: Keyword.get(opts, :stderr_path, "/dev/null"),
+        stderr_path: stderr_path,
         subscriber: self()
       )
-
-    {:ok, %{"protocolVersion" => 1}} =
-      Conn.request(conn, "initialize", %{
-        protocolVersion: 1,
-        clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
-      })
 
     state = %__MODULE__{
       conn: conn,
       preset: preset,
       harness: harness,
       cwd: Keyword.fetch!(opts, :cwd),
-      stderr_path: Keyword.get(opts, :stderr_path, "/dev/null"),
+      stderr_path: stderr_path,
+      stderr_offset: offset,
       on_auth_event: Keyword.get(opts, :on_auth_event),
       on_subagent_event: Keyword.get(opts, :on_subagent_event),
       contained: Keyword.get(opts, :contained, false)
     }
 
+    # A binary that cannot execute still opens the port (the spawn is `sh -c`),
+    # so the failure surfaces HERE as {:error, :closed} — no exception to
+    # translate. Naming it explicitly is what carries the spawn error out.
+    case Conn.request(conn, "initialize", %{
+           protocolVersion: 1,
+           clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
+         }) do
+      {:ok, %{"protocolVersion" => 1}} ->
+        gate(opts, state)
+
+      other ->
+        {:stop, adapter_failure_reason({:initialize_failed, other}, stderr_path, offset), state}
+    end
+  end
+
+  defp gate(opts, state) do
     case Keyword.fetch(opts, :probe_cwd) do
       {:ok, probe_cwd} ->
         deadline =
@@ -224,7 +287,8 @@ defmodule Tightbeam.Acp.Adapter do
             reason =
               adapter_failure_reason(
                 {:gate_attestation_failed, detail},
-                state.stderr_path
+                state.stderr_path,
+                state.stderr_offset
               )
 
             gate_log(
@@ -428,7 +492,9 @@ defmodule Tightbeam.Acp.Adapter do
   # sessions. (Found by the soak driver's A3 audit: an adapter SIGKILL
   # left zero substrate records.)
   def handle_info({:acp_exit, status}, state),
-    do: {:stop, adapter_failure_reason({:acp_exit, status}, state.stderr_path), state}
+    do:
+      {:stop, adapter_failure_reason({:acp_exit, status}, state.stderr_path, state.stderr_offset),
+       state}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -709,25 +775,35 @@ defmodule Tightbeam.Acp.Adapter do
     |> String.slice(0, @gate_raw_log_limit)
   end
 
-  defp adapter_failure_reason(reason, stderr_path) do
-    case last_stderr_line(stderr_path) do
+  defp adapter_failure_reason(reason, stderr_path, offset) do
+    case last_stderr_line(stderr_path, offset) do
       nil -> reason
       line -> {:adapter_fault, %{reason: reason, stderr: line}}
     end
   end
 
-  defp last_stderr_line(stderr_path) do
+  defp stderr_size(stderr_path) do
+    case File.stat(stderr_path) do
+      {:ok, %{size: size}} -> size
+      {:error, _reason} -> 0
+    end
+  end
+
+  # The 8KiB tail is a cap on how much of THIS attempt's stderr we read; the
+  # attempt's start offset is the floor, so nothing from a prior spawn can be
+  # reported as this failure's reason.
+  defp last_stderr_line(stderr_path, offset) do
     with {:ok, file} <- :file.open(String.to_charlist(stderr_path), [:read, :binary]) do
       try do
         with {:ok, size} <- :file.position(file, :eof),
-             {:ok, _position} <- :file.position(file, max(0, size - 8_192)),
+             true <- size > offset,
+             {:ok, _position} <- :file.position(file, max(offset, size - 8_192)),
              {:ok, bytes} <- :file.read(file, 8_192) do
           bytes
           |> String.split("\n", trim: true)
           |> List.last()
         else
-          :eof -> nil
-          {:error, _reason} -> nil
+          _ -> nil
         end
       after
         :file.close(file)

@@ -282,18 +282,60 @@ defmodule Tightbeam.Ledger do
       Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [[1]]
 
     if won and sessions_exist? do
-      Txn.q(
-        txn,
-        """
-        UPDATE sessions SET adjudicationHold = NULL, updatedAt = ?2
-        WHERE sessionKey = (SELECT sessionKey FROM turns WHERE seq = ?1)
-          AND adjudicationHold = (SELECT wakeId FROM turns WHERE seq = ?1)
-        """,
-        [seq, now]
-      )
+      if terminal == "delivered" or is_nil(probe_episode(txn, seq)) do
+        Txn.q(
+          txn,
+          """
+          UPDATE sessions SET adjudicationHold = NULL, updatedAt = ?2
+          WHERE sessionKey = (SELECT sessionKey FROM turns WHERE seq = ?1)
+            AND adjudicationHold = (SELECT wakeId FROM turns WHERE seq = ?1)
+          """,
+          [seq, now]
+        )
+      else
+        # PROBE-TERMINAL TOTALITY (spec s4-operability-v1 §2): a heal probe
+        # clears the hold only by SUCCEEDING. failed / canceled / task-crash all
+        # land here and re-hold, so the adapter fault has to actually heal before
+        # the session runs real work. The human recovery path is untouched — only
+        # the heal sweep stamps the healToken this predicate requires.
+        rehold_probe(txn, seq, now)
+      end
     end
 
     won
+  end
+
+  @doc """
+  Re-hold the session of a probe turn identified by `seq`, wide (`'*'`).
+  Shared by the terminal writers; idempotent.
+  """
+  @spec rehold_probe(Txn.t(), integer(), integer()) :: :ok
+  def rehold_probe(%Txn{} = txn, seq, now) do
+    Txn.q(
+      txn,
+      """
+      UPDATE sessions SET adjudicationHold = '*', updatedAt = ?2
+      WHERE sessionKey = (SELECT sessionKey FROM turns WHERE seq = ?1)
+        AND adjudicationHold = (SELECT wakeId FROM turns WHERE seq = ?1)
+      """,
+      [seq, now]
+    )
+
+    :ok
+  end
+
+  defp probe_episode(%Txn{} = txn, seq) do
+    episodes_exist? =
+      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudication_episodes'") ==
+        [[1]]
+
+    with true <- episodes_exist?,
+         [[wake_id]] when is_binary(wake_id) <-
+           Txn.q(txn, "SELECT wakeId FROM turns WHERE seq = ?1", [seq]) do
+      Tightbeam.Adjudication.probe_episode_for_wake_in_txn(txn, wake_id)
+    else
+      _ -> nil
+    end
   end
 
   @doc """
@@ -343,6 +385,15 @@ defmodule Tightbeam.Ledger do
     {:ok, seqs} =
       DB.transaction(db, fn txn ->
         rows = Txn.q(txn, "SELECT seq FROM turns WHERE status = 'running'")
+        seqs = Enum.map(rows, fn [seq] -> seq end)
+
+        # A probe in flight across a restart is a NON-DELIVERED probe terminal:
+        # its hold must survive as a wide hold rather than be freed by the
+        # boot-reconciliation sweep (spec s4-operability-v1 §2, totality).
+        # Read before the UPDATE only for the seqs; the re-hold is keyed by seq
+        # and so is order-independent.
+        sessions_exist? =
+          Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [[1]]
 
         Txn.q(
           txn,
@@ -354,7 +405,11 @@ defmodule Tightbeam.Ledger do
           [now]
         )
 
-        Enum.map(rows, fn [seq] -> seq end)
+        if sessions_exist? do
+          for seq <- seqs, probe_episode(txn, seq), do: rehold_probe(txn, seq, now)
+        end
+
+        seqs
       end)
 
     seqs

@@ -7,7 +7,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
+  alias Tightbeam.{Adjudication, ConditionFacts, DB, EventLog, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
 
   @default_decision_deadline_ms 86_400_000
@@ -452,7 +452,15 @@ defmodule Tightbeam.Escalation do
     :ok
   end
 
-  @doc "List visible decision requests. Owner/admin and raiser visibility are disjoint filters."
+  @doc """
+  List visible decision requests. Owner/admin and raiser visibility are disjoint
+  filters.
+
+  The listing also carries ADJUDICATION HOLDS, as a read-time union over
+  adjudication episodes (spec s4-operability-v1 §2.3 — dark ≠ opaque). The
+  decision_requests table is untouched: a hold is never a row there, its kind
+  CHECK stays locked, and kind-filtering consumers see only a new kind value.
+  """
   @spec list(DB.server(), map(), String.t() | nil, keyword()) :: [map()]
   def list(db, call, status \\ "open", opts \\ []) do
     {where, params} = visibility(call, Keyword.get(opts, :owner_user_id))
@@ -466,12 +474,31 @@ defmodule Tightbeam.Escalation do
         params
       )
 
-    Enum.map(rows, &(request_from_row(&1) |> list_projection()))
+    requests = Enum.map(rows, &(request_from_row(&1) |> list_projection()))
+
+    # Holds interleave by raisedAt into the EXISTING newest-first order; the sort
+    # is stable and the request rows arrive already ordered, so nothing existing
+    # is reordered.
+    if status in [nil, "open"] do
+      Enum.sort_by(requests ++ hold_rows(db, opts), &(-&1.raised_at))
+    else
+      requests
+    end
   end
 
-  @doc "Fetch one visible decision request including its halted-call context."
+  @doc """
+  Fetch one visible decision request including its halted-call context. A
+  `"hold:"<episodeId>` id resolves to the synthetic hold row, read-only, under
+  the same visibility rule as the listing.
+  """
   @spec get(DB.server(), map(), String.t(), keyword()) :: map() | nil
-  def get(db, call, id, opts \\ []) do
+  def get(db, call, id, opts \\ [])
+
+  def get(db, _call, "hold:" <> episode_id, opts) do
+    Enum.find(hold_rows(db, opts), &(&1.id == "hold:" <> episode_id))
+  end
+
+  def get(db, call, id, opts) do
     {where, params} = visibility(call, Keyword.get(opts, :owner_user_id))
 
     {:ok, rows} =
@@ -485,6 +512,62 @@ defmodule Tightbeam.Escalation do
       [row] -> request_from_row(row)
       [] -> nil
     end
+  end
+
+  # A session's hold is OPEN whether it is wide ('*') or narrowed to an in-flight
+  # heal probe — a probe-in-flight hold is still a hold, so the resolved episode
+  # behind it is listed too. Admin visibility applies HERE ONLY; it never
+  # broadens the decision_requests rows above.
+  defp hold_rows(db, opts) do
+    owner_user_id = Keyword.get(opts, :owner_user_id)
+    admin? = Keyword.get(opts, :admin, false)
+
+    if holds_available?(db) and (admin? or is_binary(owner_user_id)) do
+      {:ok, rows} =
+        DB.query(
+          db,
+          """
+          SELECT e.episodeId, e.sessionKey, e.cause, e.openedAt
+          FROM adjudication_episodes AS e
+          JOIN sessions AS s ON s.sessionKey = e.sessionKey
+          WHERE s.adjudicationHold IS NOT NULL
+            AND e.episodeId IS NOT NULL
+            AND (e.status IN ('claimed','notified')
+                 OR (e.status = 'resolved' AND e.recoveryWakeId = s.adjudicationHold))
+            AND (?1 = 1 OR s.ownerUserId = ?2)
+          ORDER BY e.openedAt DESC
+          """,
+          [if(admin?, do: 1, else: 0), owner_user_id]
+        )
+
+      Enum.map(rows, fn [episode_id, session_key, cause, opened_at] ->
+        %{
+          kind: "adjudication_hold",
+          id: "hold:" <> episode_id,
+          status: "open",
+          cause: cause,
+          disposition:
+            if(Adjudication.adapter_fault?(cause),
+              do: "auto_on_adapter_heal",
+              else: "awaits_ruling"
+            ),
+          session_key: session_key,
+          raised_at: opened_at
+        }
+      end)
+    else
+      []
+    end
+  end
+
+  defp holds_available?(db) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('adjudication_episodes', 'sessions')"
+      )
+
+    count == 2
   end
 
   @doc "Canonical SHA-256 action fingerprint."

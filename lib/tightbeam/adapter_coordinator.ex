@@ -27,6 +27,14 @@ defmodule Tightbeam.AdapterCoordinator do
     flagged as planned — distinguishable from crashes in lifecycle_events.
   - The coordinator MONITORS adapters (never links); adapter death emits a
     lifecycle event with the exit reason and bumps the generation.
+  - HEAL TOKEN: `{coordinatorEpoch, generation}`. The epoch is a ULID minted
+    once at init, so every later coordinator epoch sorts strictly after every
+    earlier one; generation is the per-key counter above, which RESETS on
+    restart. Comparing epoch-first then generation is therefore restart-stable:
+    a post-restart ready always outranks a token stamped under the old epoch
+    (spec s4-operability-v1 §2). Readiness is tracked explicitly — a fresh
+    entry has zero failures and a closed circuit without ever having booted, so
+    only `{:adapter_ready, key}` may mark a key ready.
   """
 
   use GenServer
@@ -84,6 +92,73 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, :health)
   end
 
+  @typedoc "Heal token: epoch-first, then generation (see the moduledoc)."
+  @type heal_token :: {String.t(), non_neg_integer()}
+
+  @doc """
+  The heal token for `key` if that adapter is ready RIGHT NOW, else `:not_ready`
+  — the LEVEL half of the heal trigger, for a hold that commits after a ready
+  event already fired (the lost-edge case).
+  """
+  @spec ready_token(GenServer.server(), adapter_key()) :: {:ok, heal_token()} | :not_ready
+  def ready_token(server \\ __MODULE__, key) do
+    GenServer.call(server, {:ready_token, key})
+  end
+
+  @doc """
+  The reason the adapter for `key` most recently DIED, or nil once it is ready
+  again. Boot is lazy and fast-failing, so a turn's first call can arrive after
+  the adapter is already gone and exit with a bare `:noproc` — the actionable
+  spawn error would then be lost. Remembering the death here makes it available
+  to whoever asks, instead of only to whoever happened to have a call pending
+  (spec s4-operability-v1 §Defect 1).
+  """
+  @spec last_failure(GenServer.server(), adapter_key()) :: term() | nil
+  def last_failure(server \\ __MODULE__, key) do
+    GenServer.call(server, {:last_failure, key})
+  end
+
+  @doc "The canonical key string `<harness>:<preset>@<host>`, exactly as /version renders it."
+  @spec key_name(adapter_key()) :: String.t()
+  def key_name({harness, archetype, host}), do: "#{harness}:#{archetype}@#{host}"
+
+  @doc """
+  Order two heal tokens: EPOCH first (ULID, so string order is mint order),
+  then generation. `true` when `left` is strictly newer than `right`; a nil
+  `right` (never probed) is always outranked.
+  """
+  @spec newer_token?(heal_token(), heal_token() | nil) :: boolean()
+  def newer_token?(_left, nil), do: true
+
+  def newer_token?({epoch, generation}, {prior_epoch, prior_generation}) do
+    cond do
+      epoch > prior_epoch -> true
+      epoch < prior_epoch -> false
+      true -> generation > prior_generation
+    end
+  end
+
+  @doc "Wire encoding for the `healToken` column: `\"<epoch>:<generation>\"`."
+  @spec encode_token(heal_token()) :: String.t()
+  def encode_token({epoch, generation}), do: epoch <> ":" <> Integer.to_string(generation)
+
+  @doc "Inverse of `encode_token/1`; nil for a NULL/unparsable column."
+  @spec decode_token(String.t() | nil) :: heal_token() | nil
+  def decode_token(nil), do: nil
+
+  def decode_token(encoded) do
+    case String.split(encoded, ":", parts: 2) do
+      [epoch, generation] ->
+        case Integer.parse(generation) do
+          {generation, ""} -> {epoch, generation}
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
   @doc "Best-effort planned teardown of the currently running adapter for `key`."
   @spec close_adapter(GenServer.server(), adapter_key()) :: :ok
   def close_adapter(server \\ __MODULE__, key) do
@@ -104,6 +179,8 @@ defmodule Tightbeam.AdapterCoordinator do
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
        load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
        failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
+       epoch: Tightbeam.Id.ulid(),
+       on_adapter_ready: Keyword.get(opts, :on_adapter_ready, fn _key_name, _token -> :ok end),
        adapters: %{},
        monitors: %{},
        load_active: %{},
@@ -130,6 +207,20 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_call({:generation, key}, _from, state) do
     {:reply, get_in(state.adapters, [key, :generation]) || 0, state}
+  end
+
+  def handle_call({:last_failure, key}, _from, state) do
+    {:reply, get_in(state.adapters, [key, :last_failure]), state}
+  end
+
+  def handle_call({:ready_token, key}, _from, state) do
+    reply =
+      case state.adapters[key] do
+        %{ready: true, generation: generation} -> {:ok, {state.epoch, generation}}
+        _ -> :not_ready
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:acquire_load_slot, borrower}, from, state) do
@@ -169,7 +260,7 @@ defmodule Tightbeam.AdapterCoordinator do
           :exit, _reason -> :ok
         end
 
-        entry = %{entry | pid: nil, monitor: nil}
+        entry = %{entry | pid: nil, monitor: nil, ready: false}
 
         {:reply, :ok,
          %{
@@ -218,7 +309,9 @@ defmodule Tightbeam.AdapterCoordinator do
               generation: generation,
               failures: failures,
               circuit: circuit,
-              timer: timer
+              timer: timer,
+              ready: false,
+              last_failure: reason
           }
 
           {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
@@ -237,7 +330,11 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_info({:adapter_ready, key}, state) do
     case state.adapters[key] do
       %{pid: pid} = entry when is_pid(pid) ->
-        entry = %{entry | failures: 0, circuit: :closed}
+        entry = %{entry | failures: 0, circuit: :closed, ready: true, last_failure: nil}
+        # EDGE half of the heal trigger. The hook is invoked with the FULL token
+        # so the sweep can decide replay-vs-new without asking us back (and
+        # without this process ever blocking on a DB transaction).
+        state.on_adapter_ready.(key_name(key), {state.epoch, entry.generation})
         {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
 
       _ ->
@@ -282,7 +379,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
         # Boot is LAZY: a spawned pid proves nothing. failures/circuit are
         # reset only by {:adapter_ready, key} — the completed-boot signal.
-        entry = %{entry | pid: pid, monitor: ref, generation: generation, timer: nil}
+        entry = %{entry | pid: pid, monitor: ref, generation: generation, timer: nil, ready: false}
 
         state = %{
           state
@@ -292,7 +389,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
         {{:ok, pid, generation}, state}
 
-      {:error, _reason} ->
+      {:error, start_reason} ->
         failures = entry.failures + 1
         circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
@@ -304,7 +401,9 @@ defmodule Tightbeam.AdapterCoordinator do
           | generation: generation,
             failures: failures,
             circuit: circuit,
-            timer: timer
+            timer: timer,
+            ready: false,
+            last_failure: {:adapter_start_failed, start_reason}
         }
 
         {{:error, :degraded}, %{state | adapters: Map.put(state.adapters, key, entry)}}
@@ -312,11 +411,19 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp fresh_entry do
-    %{pid: nil, monitor: nil, generation: 0, failures: 0, circuit: :closed, timer: nil}
+    %{
+      pid: nil,
+      monitor: nil,
+      generation: 0,
+      failures: 0,
+      circuit: :closed,
+      timer: nil,
+      ready: false,
+      last_failure: nil
+    }
   end
 
   defp backoff(state, failures), do: min(state.backoff_base_ms * Integer.pow(2, max(failures - 1, 0)), 60_000)
-  defp key_name({harness, archetype, host}), do: "#{harness}:#{archetype}@#{host}"
 
   defp grant_slot(borrower, state) do
     slot = make_ref()

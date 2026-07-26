@@ -7,10 +7,12 @@ defmodule Tightbeam.Adjudication do
   keys therefore have no effect.
   """
 
-  alias Tightbeam.{DB, EventLog, Idempotency, Supervision, Wakes}
+  alias Tightbeam.{AdapterCoordinator, DB, EventLog, Idempotency, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
   @conditions ~w(auth_failed model_unavailable boot_failed quota_exhausted other)
+
+  @adapter_fault_prefix "adapter_fault:"
 
   @ddl """
   CREATE TABLE IF NOT EXISTS adjudication_episodes (
@@ -26,13 +28,51 @@ defmodule Tightbeam.Adjudication do
     deadlineAt INTEGER NOT NULL,
     openedAt INTEGER NOT NULL,
     resolvedAt INTEGER,
+    episodeId TEXT,
+    cause TEXT,
+    healToken TEXT,
     PRIMARY KEY (sessionKey, condition)
   );
   CREATE INDEX IF NOT EXISTS adjudication_open_deadline
     ON adjudication_episodes (status, deadlineAt);
   """
 
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    result = DB.execute(db, @ddl)
+
+    # Additive, nullable, never backfilled by the migration: a NULL cause is a
+    # LEGACY (or unclassified) hold and is never swept by an adapter heal.
+    for ddl <- [
+          "ALTER TABLE adjudication_episodes ADD COLUMN episodeId TEXT",
+          "ALTER TABLE adjudication_episodes ADD COLUMN cause TEXT",
+          "ALTER TABLE adjudication_episodes ADD COLUMN healToken TEXT"
+        ] do
+      case DB.query(db, ddl) do
+        {:ok, _} -> :ok
+        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+      end
+    end
+
+    :ok =
+      DB.execute(
+        db,
+        "CREATE INDEX IF NOT EXISTS adjudication_episode_id ON adjudication_episodes (episodeId);"
+      )
+
+    result
+  end
+
+  @doc "The pinned cause encoding for an adapter fault on `key`."
+  @spec adapter_fault_cause(AdapterCoordinator.adapter_key()) :: String.t()
+  def adapter_fault_cause(key), do: adapter_fault_cause_for_name(AdapterCoordinator.key_name(key))
+
+  @doc "Same encoding, from an already-rendered key string (what the ready event carries)."
+  @spec adapter_fault_cause_for_name(String.t()) :: String.t()
+  def adapter_fault_cause_for_name(key_name), do: @adapter_fault_prefix <> key_name
+
+  @doc "Whether a cause is auto-releasable by an adapter heal (NULL/model_decision are not)."
+  @spec adapter_fault?(String.t() | nil) :: boolean()
+  def adapter_fault?(cause), do: is_binary(cause) and String.starts_with?(cause, @adapter_fault_prefix)
 
   @doc "Pluggable runtime classifier. The initial engine deliberately defaults to `other`."
   @spec classify(term()) :: String.t()
@@ -64,11 +104,21 @@ defmodule Tightbeam.Adjudication do
       """
       INSERT INTO adjudication_episodes
         (sessionKey, condition, status, correlationKey, reresolveSeed,
-         reresolveRung, deadlineAt, openedAt)
-      VALUES (?1, ?2, 'claimed', ?3, ?4, ?5, ?6, ?7)
+         reresolveRung, deadlineAt, openedAt, episodeId, cause)
+      VALUES (?1, ?2, 'claimed', ?3, ?4, ?5, ?6, ?7, ?8, ?9)
       ON CONFLICT(sessionKey, condition) DO NOTHING
       """,
-      [session_key, condition, correlation_key, seed, rung, now + claim_window, now]
+      [
+        session_key,
+        condition,
+        correlation_key,
+        seed,
+        rung,
+        now + claim_window,
+        now,
+        Tightbeam.Id.ulid(),
+        Keyword.get(opts, :cause)
+      ]
     )
 
     if Txn.changes(txn) == 1, do: get_in_txn(txn, session_key, condition), else: nil
@@ -85,7 +135,10 @@ defmodule Tightbeam.Adjudication do
       UPDATE adjudication_episodes
       SET status='claimed', correlationKey=?3, ownerTarget=NULL, ownerWakeId=NULL,
           recoveryWakeId=NULL, reresolveSeed=?4, reresolveRung=?5,
-          deadlineAt=?6, openedAt=?7, resolvedAt=NULL
+          deadlineAt=?6, openedAt=?7, resolvedAt=NULL,
+          episodeId=COALESCE(episodeId, ?8), cause=?9,
+          healToken=CASE WHEN ?10 IS NOT NULL AND recoveryWakeId = ?10
+                         THEN healToken ELSE NULL END
       WHERE sessionKey=?1 AND condition=?2 AND status='resolved'
       """,
       [
@@ -95,7 +148,14 @@ defmodule Tightbeam.Adjudication do
         Keyword.get(opts, :reresolve_seed, session_key),
         Keyword.get(opts, :reresolve_rung, 1),
         now + Keyword.fetch!(opts, :claim_window_ms),
-        now
+        now,
+        Tightbeam.Id.ulid(),
+        Keyword.get(opts, :cause),
+        # The FAILING turn's wake. When it is this episode's own probe wake the
+        # reopen is a probe failure: keep healToken so the re-held session waits
+        # for a STRICTLY NEWER token instead of re-probing the same one forever.
+        # Any other reopen is a genuinely new fault and starts token-eligible.
+        Keyword.get(opts, :failing_wake_id)
       ]
     )
 
@@ -201,6 +261,45 @@ defmodule Tightbeam.Adjudication do
           """
         )
 
+        # episodeId is the STABLE READ HANDLE the listing exposes; rows that
+        # predate the column are backfilled on this first touch. No other
+        # retroactive repair happens here — cause stays NULL, so a legacy hold
+        # is never swept.
+        for [session_key, condition] <-
+              Txn.q(
+                txn,
+                "SELECT sessionKey, condition FROM adjudication_episodes WHERE episodeId IS NULL"
+              ) do
+          Txn.q(
+            txn,
+            "UPDATE adjudication_episodes SET episodeId=?3 WHERE sessionKey=?1 AND condition=?2",
+            [session_key, condition, Tightbeam.Id.ulid()]
+          )
+        end
+
+        # PROBE-TERMINAL TOTALITY, boot half: a hold narrowed to a probe wake
+        # whose turn never reached a terminal must RE-HOLD, not clear — clearing
+        # would free the session onto the same unhealed adapter. Every other
+        # narrowed hold clears exactly as before.
+        Txn.q(
+          txn,
+          """
+          UPDATE sessions AS s SET adjudicationHold='*', updatedAt=?1
+          WHERE adjudicationHold IS NOT NULL AND adjudicationHold != '*'
+            AND NOT EXISTS (
+              SELECT 1 FROM turns AS t
+              WHERE t.sessionKey=s.sessionKey AND t.wakeId=s.adjudicationHold
+                AND t.status IN ('queued','running')
+            )
+            AND EXISTS (
+              SELECT 1 FROM adjudication_episodes AS e
+              WHERE e.sessionKey=s.sessionKey AND e.recoveryWakeId=s.adjudicationHold
+                AND e.healToken IS NOT NULL AND e.cause LIKE '#{@adapter_fault_prefix}%'
+            )
+          """,
+          [now()]
+        )
+
         Txn.q(
           txn,
           """
@@ -297,8 +396,130 @@ defmodule Tightbeam.Adjudication do
     :ok
   end
 
+  ## Adapter-heal auto-release (spec s4-operability-v1 §2)
+
+  @probe_prompt "[adapter recovered]\n\nThe adapter fault that halted this session has cleared. Re-derive your state from the durable facts and continue."
+
+  @doc """
+  Held sessions this ready token should probe: hold is still `'*'` (a hold
+  narrowed to a probe wake already has one in flight), the episode's cause names
+  THIS adapter key, and the token is strictly newer than the one that last
+  probed it — so replaying a token produces nothing and a post-restart ready
+  (new epoch) always qualifies. Returns `{session_key, condition}` pairs.
+  """
+  @spec heal_candidates(DB.server(), String.t(), AdapterCoordinator.heal_token()) ::
+          [{String.t(), String.t()}]
+  def heal_candidates(db \\ DB, cause, token) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT e.sessionKey, e.condition, e.healToken
+        FROM adjudication_episodes AS e
+        JOIN sessions AS s ON s.sessionKey = e.sessionKey
+        WHERE s.adjudicationHold = '*' AND s.state = 'active' AND e.cause = ?1
+        ORDER BY e.openedAt, e.condition
+        """,
+        [cause]
+      )
+
+    for [session_key, condition, heal_token] <- rows,
+        AdapterCoordinator.newer_token?(token, AdapterCoordinator.decode_token(heal_token)),
+        do: {session_key, condition}
+  end
+
+  @doc """
+  The probe wake for one (episode, token) — deterministic, so an at-least-once
+  sweep enqueues EXACTLY ONE probe turn per token even if it runs twice. The
+  token is part of the idempotency key: the next probe of a re-held session is a
+  different wake, which the ledger's UNIQUE wakeId then admits.
+  """
+  @spec probe_wake_in_txn(Txn.t(), map(), String.t()) :: String.t()
+  def probe_wake_in_txn(%Txn{} = txn, episode, encoded_token) do
+    idempotent_wake_in_txn(
+      txn,
+      episode,
+      "probe:" <> encoded_token,
+      episode.session_key,
+      @probe_prompt,
+      nil
+    )
+  end
+
+  @doc "The prompt a probe turn carries (also the text the session sees in history)."
+  @spec probe_prompt() :: String.t()
+  def probe_prompt, do: @probe_prompt
+
+  @doc """
+  Resolve an episode as HEALED and stamp the token that probed it. Accepts
+  `claimed` and `notified` (a hold can heal before the owner was ever notified)
+  and is a no-op-safe update on an already-`resolved` re-held episode. Returns
+  true when the row was stamped.
+  """
+  @spec heal_resolve_in_txn(Txn.t(), map(), String.t(), String.t()) :: boolean()
+  def heal_resolve_in_txn(%Txn{} = txn, episode, probe_wake_id, encoded_token) do
+    Txn.q(
+      txn,
+      """
+      UPDATE adjudication_episodes
+      SET status='resolved', recoveryWakeId=?3, resolvedAt=?4, healToken=?5
+      WHERE sessionKey=?1 AND condition=?2
+      """,
+      [episode.session_key, episode.condition, probe_wake_id, now(), encoded_token]
+    )
+
+    Txn.changes(txn) == 1
+  end
+
+  @doc """
+  Dispose the owner-adjudication wake at heal time. A PENDING wake is canceled;
+  a FIRED one is left alone — its owner turn is already queued or running and
+  its eventual ruling lands on a resolved episode, where it is an acknowledged
+  no-op. Returns `:canceled` or `:left_fired`.
+  """
+  @spec dispose_owner_wake_in_txn(Txn.t(), map()) :: :canceled | :left_fired
+  def dispose_owner_wake_in_txn(%Txn{}, %{owner_wake_id: nil}), do: :left_fired
+
+  def dispose_owner_wake_in_txn(%Txn{} = txn, episode) do
+    Txn.q(
+      txn,
+      "UPDATE wakes SET state='canceled' WHERE wakeId=?1 AND state='pending'",
+      [episode.owner_wake_id]
+    )
+
+    if Txn.changes(txn) == 1, do: :canceled, else: :left_fired
+  end
+
+  @doc """
+  The episode whose in-flight PROBE is the given wake, or nil. `healToken IS NOT
+  NULL` is what separates a probe from a human ruling's recovery wake — only the
+  heal sweep ever stamps it — so probe-terminal handling can never disturb the
+  human path.
+  """
+  @spec probe_episode_for_wake_in_txn(Txn.t(), String.t()) :: map() | nil
+  def probe_episode_for_wake_in_txn(%Txn{} = txn, wake_id) do
+    txn
+    |> Txn.q(
+      select_sql() <>
+        " WHERE recoveryWakeId=?1 AND healToken IS NOT NULL AND cause LIKE '#{@adapter_fault_prefix}%'",
+      [wake_id]
+    )
+    |> one()
+  end
+
   def deterministic_wake_in_txn(%Txn{} = txn, episode, purpose, target, prompt)
       when purpose in ~w(owner recovery) do
+    idempotent_wake_in_txn(
+      txn,
+      episode,
+      purpose,
+      target,
+      prompt,
+      if(purpose == "owner", do: "lineage")
+    )
+  end
+
+  defp idempotent_wake_in_txn(%Txn{} = txn, episode, purpose, target, prompt, reresolve) do
     key =
       Enum.join(
         [
@@ -322,7 +543,7 @@ defmodule Tightbeam.Adjudication do
             origin: "process:tightbeam",
             prompt: prompt,
             due_at: now(),
-            reresolve: if(purpose == "owner", do: "lineage"),
+            reresolve: reresolve,
             reresolve_seed: episode.reresolve_seed,
             reresolve_rung: episode.reresolve_rung
           })
@@ -339,7 +560,7 @@ defmodule Tightbeam.Adjudication do
   end
 
   defp select_sql do
-    "SELECT sessionKey, condition, status, correlationKey, ownerTarget, ownerWakeId, recoveryWakeId, reresolveSeed, reresolveRung, deadlineAt, openedAt, resolvedAt FROM adjudication_episodes"
+    "SELECT sessionKey, condition, status, correlationKey, ownerTarget, ownerWakeId, recoveryWakeId, reresolveSeed, reresolveRung, deadlineAt, openedAt, resolvedAt, episodeId, cause, healToken FROM adjudication_episodes"
   end
 
   defp one([row]), do: row(row)
@@ -357,7 +578,10 @@ defmodule Tightbeam.Adjudication do
          rung,
          deadline,
          opened,
-         resolved
+         resolved,
+         episode_id,
+         cause,
+         heal_token
        ]) do
     %{
       session_key: session,
@@ -371,7 +595,10 @@ defmodule Tightbeam.Adjudication do
       reresolve_rung: rung,
       deadline_at: deadline,
       opened_at: opened,
-      resolved_at: resolved
+      resolved_at: resolved,
+      episode_id: episode_id,
+      cause: cause,
+      heal_token: heal_token
     }
   end
 

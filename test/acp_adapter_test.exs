@@ -666,9 +666,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       monitor = Process.monitor(adapter)
 
       queued =
-        Task.async(fn ->
-          catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance"))
-        end)
+        Task.async(fn -> Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance") end)
 
       assert_receive {:DOWN, ^monitor, :process, ^adapter, reason}
 
@@ -687,7 +685,13 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       assert reason == expected_reason
 
-      refute match?({:ok, _sid}, Task.await(queued))
+      # S4 defect 1: the queued call gets the DESIGNED reason, not an exit the
+      # lane can only report as :task_crash.
+      assert {:error, {:adapter_unavailable, queued_reason}} = Task.await(queued)
+      assert queued_reason =~ "gate_attestation_failed"
+
+      if gate_mode == "turn-error",
+        do: assert(queued_reason =~ "probe turn failed: adapter transport unavailable")
 
       assert capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
                "gate wiring-check FAIL detail=#{detail}"
@@ -727,7 +731,8 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     log =
       capture_log(fn ->
-        catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], guidance_marker))
+        assert {:error, {:adapter_unavailable, _reason}} =
+                 Adapter.new_session(adapter, "haiku", "/tmp", [], guidance_marker)
 
         assert_receive {:DOWN, ^monitor, :process, ^adapter, _reason}
         Logger.flush()
@@ -752,15 +757,15 @@ defmodule Tightbeam.Acp.AdapterTest do
     monitor = Process.monitor(adapter)
 
     queued =
-      Task.async(fn ->
-        catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance"))
-      end)
+      Task.async(fn -> Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance") end)
 
     assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, :deadline}},
                    1_000
 
     assert System.monotonic_time(:millisecond) - started < 1_000
-    refute match?({:ok, _sid}, Task.await(queued))
+
+    assert {:error, {:adapter_unavailable, reason}} = Task.await(queued)
+    assert reason =~ "deadline"
   end
 
   test "boot without probe opts sends no probe request" do
