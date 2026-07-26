@@ -26,6 +26,8 @@ defmodule Tightbeam.AssignmentsTest do
 
     for module <- [
           Tightbeam.CausalEvents,
+          Tightbeam.Escalation,
+          Tightbeam.EffortCheckin,
           Devices,
           ConditionFacts,
           Idempotency,
@@ -564,14 +566,30 @@ defmodule Tightbeam.AssignmentsTest do
     assert second_review.workItemId == nil
     assert Assignments.resolved_work_item_id(ctx.db, second_review.id) == item.id
 
-    resolved_count =
-      Assignments.list(ctx.db, %{state: "all"})
-      |> Enum.count(fn assignment ->
-        assignment.id == second_review.id and
-          Assignments.resolved_work_item_id(ctx.db, assignment.id) == item.id
-      end)
+    # "Counts exactly once" must be proven against the PRODUCTION resolved
+    # reader, not against a list that is already one row per primary key. The
+    # reader is `work-item-trace`, whose recursive CTE (job_trace.ex:68) is the
+    # second implementation of this same edge relation — so this also pins the
+    # two against each other and fails on drift.
+    trace =
+      Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
+        verb: "work-item-trace",
+        principal: {:user, "flynn"},
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{work_item_id: item.id}
+      })
 
-    assert resolved_count == 1
+    traced_ids = Enum.map(trace.assignments, & &1.id)
+
+    assert Enum.count(traced_ids, &(&1 == second_review.id)) == 1
+    assert Enum.count(traced_ids, &(&1 == first_review.id)) == 1
+    assert Enum.sort(traced_ids) == Enum.sort([reviewed.id, first_review.id, second_review.id])
+
+    # The CTE and resolved_work_item_id/2 must agree on every member.
+    for id <- traced_ids do
+      assert Assignments.resolved_work_item_id(ctx.db, id) == item.id
+    end
   end
 
   test "Proof 3: an assignment with neither key resolves to NONE", ctx do
