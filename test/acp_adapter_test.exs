@@ -1,5 +1,6 @@
 defmodule Tightbeam.Acp.AdapterTest do
   use ExUnit.Case, async: false
+  import ExUnit.CaptureLog
 
   doctest Tightbeam.Acp.Adapter
 
@@ -81,6 +82,7 @@ defmodule Tightbeam.Acp.AdapterTest do
             return send({ id: m.id, result: { stopReason: "end_turn" } });
           }
           if (gateMode === "turn-error") {
+            process.stderr.write("probe turn failed: adapter transport unavailable\n");
             return send({ id: m.id, error: { code: -32000, message: "probe turn failed" } });
           }
           if (gateMode === "stall") return;
@@ -614,12 +616,52 @@ defmodule Tightbeam.Acp.AdapterTest do
           catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance"))
         end)
 
-      assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, ^detail}}
+      assert_receive {:DOWN, ^monitor, :process, ^adapter, reason}
+
+      expected_reason =
+        case gate_mode do
+          "turn-error" ->
+            {:adapter_fault,
+             %{
+               reason: {:gate_attestation_failed, detail},
+               stderr: "probe turn failed: adapter transport unavailable"
+             }}
+
+          "no-marker" ->
+            {:gate_attestation_failed, detail}
+        end
+
+      assert reason == expected_reason
+
       refute match?({:ok, _sid}, Task.await(queued))
 
       assert capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
                "gate wiring-check FAIL detail=#{detail}"
     end
+  end
+
+  test "adapter failure log includes stderr reason and redacts instruction state" do
+    marker = "INSTRUCTION_BLOB_MARKER_DO_NOT_LOG"
+    {adapter, capture_path} = start_adapter(harness: :codex, probe: false)
+    stderr_path = Path.join(Path.dirname(capture_path), "stderr.log")
+    File.write!(stderr_path, "adapter exploded: credential socket closed\n")
+
+    :sys.replace_state(adapter, fn state ->
+      put_in(state.preset.meta.developerInstructions, marker)
+    end)
+
+    monitor = Process.monitor(adapter)
+
+    log =
+      capture_log(fn ->
+        send(adapter, {:acp_exit, 137})
+        assert_receive {:DOWN, ^monitor, :process, ^adapter, reason}
+        assert inspect(reason) =~ "acp_exit"
+        Logger.flush()
+      end)
+
+    assert log =~ "adapter exploded: credential socket closed"
+    refute log =~ marker
   end
 
   test "gate wiring-check enforces one absolute deadline and serves no queued session" do

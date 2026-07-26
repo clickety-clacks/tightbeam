@@ -30,6 +30,7 @@ defmodule Tightbeam.Acp.Adapter do
     :preset,
     :harness,
     :cwd,
+    :stderr_path,
     :on_auth_event,
     :on_subagent_event,
     contained: false,
@@ -197,6 +198,7 @@ defmodule Tightbeam.Acp.Adapter do
       preset: preset,
       harness: harness,
       cwd: Keyword.fetch!(opts, :cwd),
+      stderr_path: Keyword.get(opts, :stderr_path, "/dev/null"),
       on_auth_event: Keyword.get(opts, :on_auth_event),
       on_subagent_event: Keyword.get(opts, :on_subagent_event),
       contained: Keyword.get(opts, :contained, false)
@@ -219,6 +221,12 @@ defmodule Tightbeam.Acp.Adapter do
             {:noreply, state}
 
           {:error, detail, output, raw_updates} ->
+            reason =
+              adapter_failure_reason(
+                {:gate_attestation_failed, detail},
+                state.stderr_path
+              )
+
             gate_log(
               Keyword.get(opts, :stderr_path, "/dev/null"),
               "[gate-drift] raw_updates=#{gate_raw_updates(raw_updates)}"
@@ -229,7 +237,7 @@ defmodule Tightbeam.Acp.Adapter do
               "gate wiring-check FAIL detail=#{detail} output=#{inspect(output)}"
             )
 
-            {:stop, {:gate_attestation_failed, detail}, state}
+            {:stop, reason, state}
         end
 
       :error ->
@@ -420,9 +428,14 @@ defmodule Tightbeam.Acp.Adapter do
   # sessions. (Found by the soak driver's A3 audit: an adapter SIGKILL
   # left zero substrate records.)
   def handle_info({:acp_exit, status}, state),
-    do: {:stop, {:acp_exit, status}, state}
+    do: {:stop, adapter_failure_reason({:acp_exit, status}, state.stderr_path), state}
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl GenServer
+  def format_status(status) do
+    Map.put(status, :state, :redacted)
+  end
 
   defp maybe_emit_account_update(state, update) do
     emit_auth_classification(state, update)
@@ -692,6 +705,25 @@ defmodule Tightbeam.Acp.Adapter do
     |> Enum.reverse()
     |> JSON.encode!()
     |> String.slice(0, @gate_raw_log_limit)
+  end
+
+  defp adapter_failure_reason(reason, stderr_path) do
+    case last_stderr_line(stderr_path) do
+      nil -> reason
+      line -> {:adapter_fault, %{reason: reason, stderr: line}}
+    end
+  end
+
+  defp last_stderr_line(stderr_path) do
+    case File.read(stderr_path) do
+      {:ok, bytes} ->
+        bytes
+        |> String.split("\n", trim: true)
+        |> List.last()
+
+      {:error, _reason} ->
+        nil
+    end
   end
 
   defp gate_remaining(deadline), do: deadline - System.monotonic_time(:millisecond)
