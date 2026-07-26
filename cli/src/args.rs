@@ -133,6 +133,17 @@ pub enum Command {
         after: Option<String>,
         limit: Option<String>,
     },
+    Toplines {
+        identity: Identity,
+        filters: ToplineFilters,
+        tree: bool,
+    },
+    Topline {
+        identity: Identity,
+        under: Option<String>,
+        assignments: Option<Vec<String>>,
+        filters: ToplineFilters,
+    },
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
@@ -206,6 +217,20 @@ pub enum Command {
         value: String,
     },
     Assimilate(AssimilateArgs),
+}
+
+/// Roster filters, identical for `toplines` and `topline --under`. They select
+/// which authorized nodes APPEAR; they never change authorization, edge
+/// derivation, or causal reachability.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToplineFilters {
+    pub origin: Option<String>,
+    pub owner: Option<String>,
+    pub state: Option<String>,
+    pub quiet_over_ms: Option<String>,
+    pub spec: Option<String>,
+    pub spec_sha: Option<String>,
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +325,25 @@ COMMANDS:
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
+  toplines [--origin user|session|all] [--owner <userId>] [--state <state>]
+           [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
+           [--session <key>] [--tree]
+      The work telemetry the substrate already knows: every work item you can
+      see, with its assignment/job/attest/turn counts, who holds it, whether
+      anything is running, and how long it has been quiet. --tree renders the
+      causal forest instead of a flat roster. Parent edges are derived from the
+      turn that was RUNNING when each item was created, so they record
+      concurrency, not proven causality — every node states its own
+      epistemic status (linked, from_turn, no_turn_observed, unrecorded).
+      No percentages and no completion estimates: the rows do not support them.
+        tightbeam toplines --origin user --state open --as-user flynn
+        tightbeam toplines --quiet-over 2h --as-user flynn
+  topline (--under <workItemId> | --assignments <id,...>) [roster filters]
+      --under walks one item's causal subtree (the anchor plus its visible
+      linked descendants). --assignments names an explicit assignment set and
+      reports the items they resolve to; an assignment belonging to no item
+      comes back in noItem rather than being silently dropped.
+        tightbeam topline --under wi_abc123 --as-user flynn
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -399,7 +443,7 @@ pub fn render_help(catalog: Option<&HarnessCatalog>) -> String {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
-    "abort", "all", "dry-run", "help", "json", "manifest", "resolve", "rm",
+    "abort", "all", "dry-run", "help", "json", "manifest", "resolve", "rm", "tree",
 ];
 
 #[derive(Debug)]
@@ -455,6 +499,10 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
 }
 
 pub fn parse_after(text: &str) -> Result<String, String> {
+    parse_duration("after", text)
+}
+
+fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
     let (digits, multiplier) = if let Some(value) = text.strip_suffix("ms") {
         (value, 1.0)
     } else if let Some(value) = text.strip_suffix('s') {
@@ -464,10 +512,10 @@ pub fn parse_after(text: &str) -> Result<String, String> {
     } else if let Some(value) = text.strip_suffix('h') {
         (value, 3_600_000.0)
     } else {
-        return Err(bad_after(text));
+        return Err(bad_duration(flag, text));
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(bad_after(text));
+        return Err(bad_duration(flag, text));
     }
     let value = digits
         .parse::<f64>()
@@ -475,8 +523,40 @@ pub fn parse_after(text: &str) -> Result<String, String> {
     Ok(js_number_json(value * multiplier))
 }
 
-fn bad_after(text: &str) -> String {
-    format!("bad --after value: {text} (use e.g. 30s, 5m, 2h)")
+const TOPLINES_USAGE: &str = "usage: tightbeam toplines [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
+
+const TOPLINE_USAGE: &str = "usage: tightbeam topline (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+
+fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, String> {
+    // The origin enum is closed HERE: the reader treats anything but user or
+    // session as "all", so an unrecognised value must never reach it silently.
+    let origin = nonempty(flags, "origin");
+    if let Some(value) = &origin {
+        if !matches!(value.as_str(), "user" | "session" | "all") {
+            return Err(format!(
+                "bad --origin value: {value} (use user, session, or all)"
+            ));
+        }
+    }
+    // --spec-sha narrows a --spec cohort; alone it selects nothing nameable.
+    if flags.contains_key("spec-sha") && nonempty(flags, "spec").is_none() {
+        return Err("--spec-sha requires --spec <name>".to_owned());
+    }
+    Ok(ToplineFilters {
+        origin,
+        owner: nonempty(flags, "owner"),
+        state: nonempty(flags, "state"),
+        quiet_over_ms: nonempty(flags, "quiet-over")
+            .map(|value| parse_duration("quiet-over", &value))
+            .transpose()?,
+        spec: nonempty(flags, "spec"),
+        spec_sha: nonempty(flags, "spec-sha"),
+        session: nonempty(flags, "session"),
+    })
+}
+
+fn bad_duration(flag: &str, text: &str) -> String {
+    format!("bad --{flag} value: {text} (use e.g. 30s, 5m, 2h)")
 }
 
 fn number_coercion(text: &str) -> f64 {
@@ -904,6 +984,52 @@ fn parse_with_optional_catalog(
                     .map(|value| js_number_json(number_coercion(&value))),
             })
         }
+        "toplines" => {
+            if parsed.positional.len() != 1 {
+                return Err(TOPLINES_USAGE.to_owned());
+            }
+            Ok(Command::Toplines {
+                identity: identity(flags)?,
+                filters: topline_filters(flags)?,
+                tree: flags.contains_key("tree"),
+            })
+        }
+        "topline" => {
+            if parsed.positional.len() != 1 {
+                return Err(TOPLINE_USAGE.to_owned());
+            }
+            let under = nonempty(flags, "under");
+            // Two different selections, never guessed between: --under walks the
+            // causal forest, --assignments names an explicit assignment set.
+            let assignments = flags.get("assignments").map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
+            match (&under, &assignments) {
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(
+                        "topline requires exactly one of --under <workItemId> or --assignments <id,...>"
+                            .to_owned(),
+                    )
+                }
+                // Empty input is a USAGE error, not an empty result: the caller
+                // named a set and named nothing in it.
+                (None, Some(ids)) if ids.is_empty() => {
+                    return Err("--assignments requires at least one assignment id".to_owned())
+                }
+                _ => {}
+            }
+            Ok(Command::Topline {
+                identity: identity(flags)?,
+                under,
+                assignments,
+                filters: topline_filters(flags)?,
+            })
+        }
         "work-item-icebox" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-icebox <workItemId>".to_owned());
@@ -1042,7 +1168,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -1260,6 +1386,8 @@ mod tests {
                 "work-item-fail",
                 "work-item-get",
                 "transcript",
+                "topline",
+                "toplines",
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
@@ -1442,7 +1570,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 

@@ -40,6 +40,28 @@ fn string_field(name: &str, value: &str) -> String {
     format!("\"{name}\":{}", quoted(value))
 }
 
+/// Roster filters, shared verbatim by `toplines` and `topline --under` — the
+/// spec says "the same roster filters", so there is one builder, not two lists.
+fn filter_params(filters: &crate::args::ToplineFilters) -> Vec<String> {
+    let mut params = Vec::new();
+    for (name, value) in [
+        ("origin", &filters.origin),
+        ("owner", &filters.owner),
+        ("state", &filters.state),
+        ("spec", &filters.spec),
+        ("specSha", &filters.spec_sha),
+        ("session", &filters.session),
+    ] {
+        if let Some(value) = value {
+            params.push(string_field(name, value));
+        }
+    }
+    if let Some(ms) = &filters.quiet_over_ms {
+        params.push(format!("\"quietOver\":{ms}"));
+    }
+    params
+}
+
 fn params_field(fields: Vec<String>) -> String {
     format!("\"params\":{}", object(fields))
 }
@@ -346,6 +368,42 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params.push(format!("\"limit\":{limit}"));
             }
             Ok(request(identity, "transcript", vec![], params))
+        }
+        Command::Toplines {
+            identity,
+            filters,
+            tree,
+        } => {
+            let mut params = filter_params(filters);
+            if *tree {
+                params.push("\"tree\":true".to_owned());
+            }
+            Ok(request(identity, "toplines", vec![], params))
+        }
+        Command::Topline {
+            identity,
+            under,
+            assignments,
+            filters,
+        } => {
+            // Every selector travels as an ordinary body PARAM: both verbs are
+            // declared non-target at the router, and --session here is a COHORT
+            // FILTER over creator identity, not a target to resolve.
+            let mut params = filter_params(filters);
+            if let Some(under) = under {
+                params.push(string_field("under", under));
+            }
+            if let Some(ids) = assignments {
+                let list = ids
+                    .iter()
+                    .map(|id| serde_json::Value::String(id.clone()))
+                    .collect::<Vec<_>>();
+                params.push(format!(
+                    "\"assignments\":{}",
+                    serde_json::Value::Array(list)
+                ));
+            }
+            Ok(request(identity, "topline", vec![], params))
         }
         Command::WorkItemIcebox {
             identity,
@@ -797,6 +855,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Transcript { identity, .. }
+        | Command::Toplines { identity, .. }
+        | Command::Topline { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
