@@ -526,6 +526,13 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # all the same step-around as the canonical spelling (SQLite accepts every
     # one of those identifier quotings).
     #
+    # The quoting class is a RUN that includes a backslash on purpose. Because
+    # this scan reads SOURCE TEXT, a double-quoted identifier inside an ordinary
+    # Elixir string is spelled `\"turns\"` in the file, while the same identifier
+    # in a heredoc is spelled `"turns"`. A class matching only the quote character
+    # catches the heredoc form and misses the escaped one — which is exactly how
+    # the first attempt at this fix still let the reviewer's case through.
+    #
     # WHAT EACH SCAN READS, AND WHAT NEITHER CATCHES. This one greps the ENTIRE
     # SOURCE TEXT of each production file, so it sees the phrase wherever it is
     # written — including in a comment, which would be a false positive it
@@ -542,7 +549,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # not a sandbox against intent.
     assert Enum.filter(
              production_files(),
-             &(File.read!(&1) =~ ~r/insert\s+into\s+["\[`]?turns\b/i)
+             &(File.read!(&1) =~ ~r/insert\s+into\s*[\\"\[`\s]*turns\b/i)
            ) == ["lib/tightbeam/ledger.ex"]
 
     # The request modules cannot reach a delivery seam through an injected fun.
