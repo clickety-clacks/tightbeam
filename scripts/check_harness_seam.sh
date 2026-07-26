@@ -5,7 +5,11 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
 mechanics='CODEX_HOME|CLAUDE_CONFIG_DIR|codex-acp|claude-agent-acp|auth\.json|oauth-token|settings\.json|hooks\.json|CLAUDE_CODE_OAUTH_TOKEN|CODEX_CONFIG'
-identity='==[[:space:]]*:(claude|codex)|case[[:space:]]+([[:alnum:]_]+\.)?harness[[:space:]]+do|\[:claude,[[:space:]]*:codex\]|\[:codex,[[:space:]]*:claude\]|\["claude",[[:space:]]*"codex"\]|\["codex",[[:space:]]*"claude"\]'
+# A bare harness NAME in executable code is a seam break on its own, not only
+# in pairs: a default like `Keyword.get(opts, :harness, "claude")` silently
+# pins one harness and survives a registry change (found by cross-review of
+# the client-e2e driver). Quoted or atom form, anywhere outside the registry.
+identity='==[[:space:]]*:(claude|codex)|case[[:space:]]+([[:alnum:]_]+\.)?harness[[:space:]]+do|\[:claude,[[:space:]]*:codex\]|\[:codex,[[:space:]]*:claude\]|\["claude",[[:space:]]*"codex"\]|\["codex",[[:space:]]*"claude"\]|"(claude|codex)"|(^|[^[:alnum:]_:]):(claude|codex)([^[:alnum:]_]|$)'
 
 # Portable: grep -E / perl only — the test harness's System.cmd PATH carries no rg.
 if grep -RnE "$mechanics" lib \
@@ -27,8 +31,12 @@ then
   exit 1
 fi
 
+# credentials.ex owns the provider<->harness naming (same carve-out the
+# mechanics scan gives it: it IS the credential store, and the store's paths
+# are named per harness by definition).
 if grep -RnE "$identity" lib config \
-  --exclude-dir=harness
+  --exclude-dir=harness \
+  --exclude=credentials.ex
 then
   echo "harness identity dispatch or list escaped the registry" >&2
   exit 1
