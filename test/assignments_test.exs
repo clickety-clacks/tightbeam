@@ -521,6 +521,99 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'unknown review'")
   end
 
+  test "Proof 1: a conflicting review-assignment create is refused with review_item_conflict",
+       ctx do
+    first_item = create_work_item(ctx, "Reviewed item")
+    second_item = create_work_item(ctx, "Conflicting item")
+
+    reviewed =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "reviewed", nil, first_item.id))
+
+    conflict =
+      assign_call({:user, "flynn"}, "conflicting review", nil, second_item.id)
+      |> put_in([:params, :reviews_assignment_id], reviewed.id)
+
+    assert %{
+             code: "review_item_conflict",
+             message: "a review assignment must belong to the item it reviews"
+           } = handle(ctx, "assign", conflict)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignments WHERE subject = 'conflicting review'"
+             )
+  end
+
+  test "Proof 2: a NULL-workItemId review assignment resolves transitively for RESOLVED readers and counts exactly once",
+       ctx do
+    item = create_work_item(ctx, "Transitive story")
+    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "base", nil, item.id))
+
+    first_review =
+      assign_call({:user, "flynn"}, "first review")
+      |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    second_review =
+      assign_call({:user, "flynn"}, "second review")
+      |> put_in([:params, :reviews_assignment_id], first_review.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert first_review.workItemId == nil
+    assert second_review.workItemId == nil
+    assert Assignments.resolved_work_item_id(ctx.db, second_review.id) == item.id
+
+    resolved_count =
+      Assignments.list(ctx.db, %{state: "all"})
+      |> Enum.count(fn assignment ->
+        assignment.id == second_review.id and
+          Assignments.resolved_work_item_id(ctx.db, assignment.id) == item.id
+      end)
+
+    assert resolved_count == 1
+  end
+
+  test "Proof 3: an assignment with neither key resolves to NONE", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "unlinked"))
+
+    assert assignment.workItemId == nil
+    assert assignment.reviewsAssignmentId == nil
+    assert Assignments.resolved_work_item_id(ctx.db, assignment.id) == nil
+  end
+
+  test "Proof 4: DIRECT consumers stay unchanged: revoke-loop membership is direct and client snapshots are byte-identical",
+       ctx do
+    item = create_work_item(ctx, "Direct lifecycle")
+    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "owned", nil, item.id))
+
+    before_get =
+      handle(
+        ctx,
+        "work-item-get",
+        work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: item.id})
+      )
+
+    before_snapshot = ctx.db |> WorkState.item_detail(item.id) |> JSON.encode!()
+
+    review =
+      assign_call({:user, "flynn"}, "story-only review")
+      |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    after_get =
+      handle(
+        ctx,
+        "work-item-get",
+        work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: item.id})
+      )
+
+    assert Enum.map(after_get.assignments, & &1.id) == [reviewed.id]
+    refute Enum.any?(after_get.assignments, &(&1.id == review.id))
+    assert after_get == before_get
+    assert ctx.db |> WorkState.item_detail(item.id) |> JSON.encode!() == before_snapshot
+  end
+
   test "attests rebuild reaches the full checked shape from every prior version" do
     for starting_shape <- [:bare, :check_tier, :partial_p3] do
       db = :"attests_#{starting_shape}_#{System.unique_integer([:positive])}"
@@ -1161,6 +1254,14 @@ defmodule Tightbeam.AssignmentsTest do
        do: Assignments.__handle__(ctx.db, verb, %{call | verb: verb})
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
+
+  defp create_work_item(ctx, title) do
+    handle(
+      ctx,
+      "work-item-create",
+      work_item_call("work-item-create", {:user, "flynn"}, %{title: title})
+    )
+  end
 
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
