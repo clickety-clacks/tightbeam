@@ -515,22 +515,28 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {ctx, samples} =
       Substrate.sample_while(ctx.base_dir, 200, fn ->
         Enum.reduce(ids, ctx, fn id, ctx ->
-          {_ok, _frame, client} =
-            case SimClient.await(
-                   ctx.client,
-                   watermark,
-                   &(&1["type"] == "message" and &1["role"] == "assistant" and
-                       &1["replyToClientMessageId"] == id),
-                   ctx.turn_timeout_ms
-                 ) do
-              {:ok, frame, client} -> {:ok, frame, client}
-              {:error, reason, client} -> {:error, reason, client}
-            end
+          {_frame, client} =
+            await_frame(
+              ctx.client,
+              watermark,
+              &(&1["type"] == "message" and &1["role"] == "assistant" and
+                  &1["replyToClientMessageId"] == id),
+              ctx.turn_timeout_ms
+            )
 
           %{ctx | client: client}
         end)
       end)
 
+    # The batch's LAST clear arrives after its last reply, so judging the
+    # indicator the instant the third reply lands reads the third turn's
+    # `typing=true` as the final state. Drain until the SEQUENCE settles —
+    # awaiting "a typing=false" from the batch watermark would match turn one's
+    # clear and prove nothing, which is the same stale-match trap the oracle
+    # itself was fixed for.
+    client = drain_until_settled(ctx.client, watermark, ctx.main_key, 30_000)
+    client = SimClient.settle(client, ctx.settle_ms)
+    ctx = %{ctx | client: client}
     frames = SimClient.frames_since(ctx.client, watermark)
 
     # SMOKE step 9's last clause — "the indicator stays sane throughout (on
@@ -1595,6 +1601,24 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
   defp index_where(frames, predicate) do
     frames |> Enum.with_index() |> Enum.find_value(fn {f, i} -> if predicate.(f), do: i end)
+  end
+
+  # Reads in short slices until the indicator sequence ENDS cleared, or the
+  # deadline passes. Returning early when it is already settled keeps the happy
+  # path fast; the deadline keeps a genuinely stuck indicator from hanging the
+  # run instead of failing it.
+  defp drain_until_settled(client, watermark, session_key, timeout_ms) do
+    drain_until_settled(client, watermark, session_key, System.monotonic_time(:millisecond) + timeout_ms)
+  end
+
+  defp drain_until_settled(client, watermark, session_key, deadline) do
+    frames = SimClient.frames_since(client, watermark)
+
+    cond do
+      is_nil(indicator_settled_error(frames, session_key, 0)) -> client
+      System.monotonic_time(:millisecond) >= deadline -> client
+      true -> drain_until_settled(SimClient.settle(client, 500), watermark, session_key, deadline)
+    end
   end
 
   defp await_frame(client, watermark, predicate, timeout_ms) do
