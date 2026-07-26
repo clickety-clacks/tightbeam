@@ -349,9 +349,16 @@ defmodule Tightbeam.EffortCheckin do
           []
       end
 
+    # Per effort-without-effect-checkin-v1: the menu is computed PER POWER, and
+    # retire appears iff the RETIRE HANDLER authorizes this rung's principal —
+    # never from a role label, and authority is never widened to make a menu item.
+    # The gate was `expecter.user_id &&`, i.e. user rungs only, which agreed with
+    # the handler only because the handler was broken for every agent origin. Now
+    # that it resolves the caller's owner, a SESSION rung whose owner owns the
+    # holder can retire it, so the menu widens to match — following the handler,
+    # not leading it.
     retire =
-      if expecter.user_id &&
-           holder_owner(txn, assignment.holder_key) == expecter.principal_user_id &&
+      if holder_owner(txn, assignment.holder_key) == expecter.principal_user_id &&
            not built_in?(txn, assignment.holder_key),
          do: ["retire"],
          else: []

@@ -3203,7 +3203,14 @@ defmodule Tightbeam.Gateway do
 
   defp retire_result(config, db, call) do
     p = call.params
-    owner = String.replace_prefix(call.origin, "user:", "")
+    # Resolve the caller's owner, do not string-strip the origin: an agent's
+    # origin is `agent:<role>`, which stripping leaves intact, so it matched no
+    # ownerUserId and every agent got `not_found` — including for sessions its own
+    # owner controls, which the guidance we ship tells agents to retire.
+    # `resolve_caller/2` handles all three origin classes and yields a nil owner
+    # for a process, which cannot match a NOT NULL ownerUserId, so unknown and
+    # process callers keep getting `not_found`.
+    owner = resolve_caller(db, call.origin)[:owner_user_id]
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
