@@ -32,6 +32,7 @@ defmodule FeatureSmoke do
         leg: leg,
         providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
       }
+      |> sweep_open_work_items()
       |> check_identity_surface()
       |> check_onboard_surface()
       |> check_facts_read()
@@ -506,17 +507,16 @@ defmodule FeatureSmoke do
 
     got = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
-    # work-item-v1: `assign` is the ONLY verb extended with persistable workItemId;
-    # dispatch takes workItemId solely as rumination-rail input. Linkage via assign is
-    # covered by check_work_item_and_assignment_get.
+    # work-item-brackets-v1 (F7, amends work-item-v1): dispatch persists workItemId
+    # like assign — a dispatched assignment is causally joined to its work item.
     assert(
       state,
-      got["workItemId"] == nil,
-      "dispatch must not persist workItemId (assign-only per work-item-v1): #{inspect(got)}"
+      got["workItemId"] == wi_id,
+      "dispatch must persist workItemId (work-item-brackets-v1 F7): #{inspect(got)}"
     )
 
     retire(state, holder)
-    pass(state, "dispatch opens an assignment (workItemId assign-only per spec)")
+    pass(state, "dispatch opens an assignment linked to its work item (brackets F7)")
   end
 
   # --- effort-without-effect: durable parent check-in and reassignment ----------
@@ -665,6 +665,28 @@ defmodule FeatureSmoke do
   end
 
   # --- helpers ---------------------------------------------------------------
+  # Brackets hygiene: an open unrouted work item nags its owner's main session
+  # (work-item-brackets-v1 bracket 1), so leftovers from a prior partial run flood
+  # the main session with nag turns and identity-apply never finds a turn boundary.
+  # Dispose anything a previous smoke left open; disposal cancels both bracket wakes.
+  defp sweep_open_work_items(state) do
+    items = ok!(state, "work-item-list", %{})["workItems"] || []
+
+    items
+    |> Enum.filter(&(&1["state"] == "open"))
+    |> Enum.each(fn item ->
+      got = ok!(state, "work-item-get", %{"workItemId" => item["id"]})
+
+      for asg <- got["assignments"] || [], asg["state"] == "open" do
+        ok!(state, "revoke-assignment", %{"assignmentId" => asg["id"]})
+      end
+
+      ok!(state, "work-item-close", %{"workItemId" => item["id"]})
+    end)
+
+    state
+  end
+
   defp ok!(state, verb, params) do
     res = post(state, verb, params)
 
