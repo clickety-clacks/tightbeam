@@ -1,5 +1,5 @@
 defmodule Tightbeam.RulesTransportTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   import Plug.Conn
   import Plug.Test

@@ -1,5 +1,5 @@
 defmodule Tightbeam.AssetsTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Assets, DB}
 

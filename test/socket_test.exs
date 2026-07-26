@@ -1,5 +1,5 @@
 defmodule Tightbeam.Wire.SocketTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     ConnRegistry,

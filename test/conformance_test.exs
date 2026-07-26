@@ -3581,7 +3581,7 @@ defmodule Tightbeam.ConformanceSupport do
 end
 
 defmodule Tightbeam.ConformanceTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.ConformanceSupport, as: Corpus
 

@@ -8,7 +8,7 @@ defmodule Tightbeam.AdapterHealTest do
   adapter in proof 1 is a REAL process spawning a REAL non-executable binary —
   the reason under test is produced by `sh`, not by the test.
   """
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     AdapterCoordinator,
@@ -294,6 +294,25 @@ defmodule Tightbeam.AdapterHealTest do
 
     # And it is classified as an adapter fault, so the heal machinery owns it.
     assert episode(ctx.db).cause == @cause
+  end
+
+  test "the owner's brief names the precise cause the episode carries", ctx do
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "the turn whose brief must be legible")
+
+    episode = episode(ctx.db)
+    assert episode.cause == @cause
+    prompt = Wakes.get(ctx.db, episode.owner_wake_id).prompt
+
+    # The brief used to carry only the coarse bucket, so a reader saw
+    # `condition=other` for a fault the record already named precisely.
+    assert prompt =~ "cause=#{@cause}"
+    assert prompt =~ "affected_session=k1"
+
+    # The condition stays too — it is what the episode is keyed on — but it is
+    # no longer the only classification the human gets.
+    assert prompt =~ "condition="
+    refute prompt =~ "cause=unclassified"
   end
 
   ## Proof 2 — fault → hold → heal → auto-release, probe FIRST

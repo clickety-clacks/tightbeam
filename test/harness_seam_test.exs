@@ -1,5 +1,5 @@
 defmodule Tightbeam.HarnessSeamTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Harness, Homes}
 
@@ -50,14 +50,36 @@ defmodule Tightbeam.HarnessSeamTest do
   end
 
   test "literal scan passes, fails on a scoped reintroduction, and wire projection has two consumers" do
-    scan = Path.expand("scripts/check_harness_seam.sh")
-    assert {"", 0} = System.cmd(scan, [], stderr_to_stdout: true)
+    scan_root = Path.join(System.tmp_dir!(), "harness-seam-scan")
 
-    probe = "lib/tightbeam/harness_literal_probe.ex"
+    Enum.each(
+      [
+        "lib",
+        "config",
+        "scripts",
+        "cli/src",
+        "docs/SMOKE.md",
+        "priv/provider_literal_sites.txt",
+        "test/harness_conformance_test.exs"
+      ],
+      fn path ->
+        destination = Path.join(scan_root, path)
+        File.mkdir_p!(Path.dirname(destination))
+        File.cp_r!(path, destination)
+      end
+    )
+
+    scan = Path.join(scan_root, "scripts/check_harness_seam.sh")
+
+    assert {"", 0} =
+             System.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
+
+    probe = Path.join(scan_root, "lib/tightbeam/harness_literal_probe.ex")
     File.write!(probe, ~s(defmodule Tightbeam.HarnessLiteralProbe, do: @value "CODEX_HOME"\n))
-    on_exit(fn -> File.rm(probe) end)
 
-    assert {_output, 1} = System.cmd(scan, [], stderr_to_stdout: true)
+    assert {_output, 1} =
+             System.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
+
     File.rm!(probe)
 
     File.write!(
@@ -71,27 +93,37 @@ defmodule Tightbeam.HarnessSeamTest do
       """
     )
 
-    assert {_output, 1} = System.cmd(scan, [], stderr_to_stdout: true)
+    assert {_output, 1} =
+             System.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
+
     File.rm!(probe)
 
     # grep, not rg: the test harness's System.cmd PATH carries no rg.
     {calls, 0} =
-      System.cmd("grep", [
-        "-RlE",
-        "\\.wire_projection\\(\\)",
-        "lib",
-        "--exclude-dir=harness"
-      ])
+      System.cmd(
+        "grep",
+        [
+          "-RlE",
+          "\\.wire_projection\\(\\)",
+          "lib",
+          "--exclude-dir=harness"
+        ],
+        cd: scan_root
+      )
 
     assert calls |> String.split("\n", trim: true) |> Enum.sort() ==
              ["lib/tightbeam/boot.ex", "lib/tightbeam/wire/router.ex"]
 
     assert {"", 1} =
-             System.cmd("grep", [
-               "-RnE",
-               "\"(wire_name|install_package|process_markers)\"",
-               "lib",
-               "--exclude-dir=harness"
-             ])
+             System.cmd(
+               "grep",
+               [
+                 "-RnE",
+                 "\"(wire_name|install_package|process_markers)\"",
+                 "lib",
+                 "--exclude-dir=harness"
+               ],
+               cd: scan_root
+             )
   end
 end

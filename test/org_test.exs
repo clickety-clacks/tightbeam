@@ -1,5 +1,5 @@
 defmodule Tightbeam.OrgTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   doctest Tightbeam.Org
 

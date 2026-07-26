@@ -1,5 +1,5 @@
 defmodule Tightbeam.ProviderAdditivityTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Credentials, DB, Devices, Gateway, Harness, Homes}
 

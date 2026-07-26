@@ -1,5 +1,5 @@
 defmodule Tightbeam.AdapterCoordinatorTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{AdapterCoordinator, DB, EventLog}
 
@@ -15,10 +15,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   setup do
     db = :"coordinator_db_#{System.unique_integer([:positive])}"
     sup = :"adapter_sup_#{System.unique_integer([:positive])}"
+    test_dir = Path.join(System.tmp_dir!(), "adapter-coordinator-#{test_nonce()}")
+    File.mkdir_p!(test_dir)
+    on_exit(fn -> File.rm_rf!(test_dir) end)
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = EventLog.ensure_schema(db)
     start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: sup})
-    %{db: db, sup: sup}
+    %{db: db, sup: sup, test_dir: test_dir}
   end
 
   test "five consecutive boot failures open the circuit (async boot)", ctx do
@@ -131,15 +134,17 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     end
   end
 
-  test "harness OS-process death (acp_exit) kills the adapter — no silent wedge", ctx do
-    path =
-      Path.join(
-        System.tmp_dir!(),
-        "coordinator_acp_exit_#{System.unique_integer([:positive])}.js"
-      )
+  defp test_nonce do
+    12
+    |> :crypto.strong_rand_bytes()
+    |> Base.url_encode64(padding: false)
+  end
 
+  test "harness OS-process death (acp_exit) kills the adapter — no silent wedge", ctx do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
-    stderr_path = path <> ".stderr.log"
+    stderr_path = Path.join(ctx.test_dir, "stderr.log")
+    refute File.exists?(stderr_path)
 
     coordinator =
       start_supervised!(
@@ -149,8 +154,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            [
              harness: :claude,
              cmd: [System.find_executable("node"), path],
-             home: "/tmp",
-             cwd: "/tmp",
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
              stderr_path: stderr_path
            ]
          end,
@@ -190,9 +195,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   test "adapter death bumps generation and records lifecycle", ctx do
-    path =
-      Path.join(System.tmp_dir!(), "coordinator_adapter_#{System.unique_integer([:positive])}.js")
-
+    path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
 
     coordinator =
@@ -203,8 +206,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            [
              harness: :claude,
              cmd: [System.find_executable("node"), path],
-             home: "/tmp",
-             cwd: "/tmp"
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
            ]
          end,
          db: ctx.db,
@@ -225,9 +228,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   test "planned close tears down the adapter without crash restart bookkeeping", ctx do
-    path =
-      Path.join(System.tmp_dir!(), "coordinator_close_#{System.unique_integer([:positive])}.js")
-
+    path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
 
     coordinator =
@@ -238,8 +239,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            [
              harness: :claude,
              cmd: [System.find_executable("node"), path],
-             home: "/tmp",
-             cwd: "/tmp"
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
            ]
          end,
          db: ctx.db,

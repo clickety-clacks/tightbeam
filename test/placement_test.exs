@@ -1,5 +1,5 @@
 defmodule Tightbeam.PlacementTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Archetypes, DB, EventLog, Homes, Identity, Org, Placement, Rails}
 

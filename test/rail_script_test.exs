@@ -1,5 +1,5 @@
 defmodule Tightbeam.RailScriptTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cli_dir Path.expand("../cli", __DIR__)

@@ -1,5 +1,5 @@
 defmodule Tightbeam.DispatchTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Rules}
 

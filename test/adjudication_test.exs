@@ -1,5 +1,5 @@
 defmodule Tightbeam.AdjudicationTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Adjudication, ConditionFacts, DB, EventLog, Idempotency, Ledger, Org, Wakes}
 
@@ -65,6 +65,40 @@ defmodule Tightbeam.AdjudicationTest do
              DB.transaction(ctx.db, fn txn ->
                Adjudication.claim_in_txn(txn, "holder", "other", claim_window_ms: 300_000)
              end)
+  end
+
+  test "the unanswered-escalation re-notify names the precise cause, not just the condition", ctx do
+    cause = "adapter_fault:claude:shared@testhost"
+
+    {:ok, episode} =
+      DB.transaction(ctx.db, fn txn ->
+        episode =
+          Adjudication.claim_in_txn(txn, ctx.holder.session_key, "other",
+            claim_window_ms: 300_000,
+            reresolve_seed: ctx.holder.session_key,
+            reresolve_rung: 1,
+            cause: cause
+          )
+
+        {:ok, _wake_id, _target} = Adjudication.notify_in_txn(txn, episode, "the brief", 0)
+        Adjudication.get_in_txn(txn, ctx.holder.session_key, "other")
+      end)
+
+    # The original brief's wake is gone, so escalate_due falls back to composing
+    # its own text — the path that used to say only "(other)".
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM wakes WHERE wakeId=?1", [episode.owner_wake_id])
+    :ok = Adjudication.escalate_due(ctx.db, 86_400_000)
+
+    escalated = Adjudication.get(ctx.db, ctx.holder.session_key, "other")
+    assert escalated.owner_wake_id != episode.owner_wake_id
+    prompt = Wakes.get(ctx.db, escalated.owner_wake_id).prompt
+
+    # The cause the record already holds must reach the human who decides.
+    assert prompt =~ "cause=#{cause}"
+    assert prompt =~ "condition=other"
+
+    # And it must not regress to a generic string that names the bucket alone.
+    refute prompt =~ "(other)"
   end
 
   test "retirement drain cancels queued turns and uses the normal publication feed", ctx do

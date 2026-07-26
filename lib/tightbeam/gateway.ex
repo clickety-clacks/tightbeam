@@ -1262,7 +1262,7 @@ defmodule Tightbeam.Gateway do
           {:error, {failed_stage, reason}} ->
             condition = Adjudication.classify(reason)
             cause = adjudication_cause(failed_stage, reason, adapter_key)
-            adjudication_prompt = adjudication_brief(session, condition)
+            adjudication_prompt = adjudication_brief(session, condition, cause)
 
             failure_publish = fn _terminal ->
               # No assistant final will arrive to clear the indicator label —
@@ -1384,7 +1384,11 @@ defmodule Tightbeam.Gateway do
 
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
-  defp adjudication_brief(session, condition) do
+  # `condition` is the coarse classification bucket the episode is keyed on;
+  # `cause` is the precise reason the record already carries. The human reading
+  # this decides from the cause, so it is the line that must be here — a brief
+  # that only says `condition=other` tells them nothing they can act on.
+  defp adjudication_brief(session, condition, cause) do
     archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
     inventories =
@@ -1397,6 +1401,7 @@ defmodule Tightbeam.Gateway do
     Model adjudication required.
     affected_session=#{session.session_key}
     condition=#{condition}
+    cause=#{cause || "unclassified"}
     current_model=#{session.model}
     current_harness=#{session.harness}
     model_preferences=#{JSON.encode!(archetype.model_preferences)}
