@@ -12,9 +12,25 @@ defmodule Tightbeam.TestCase do
   ]
 
   setup do
+    assert_hermetic_tmp!()
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
     :ok
+  end
+
+  # Per-test scratch dirs are named with System.unique_integer/1, which is unique
+  # only within one BEAM. They stay collision-free because config/test.exs points
+  # TMPDIR at a per-BEAM root. If that root goes missing, System.tmp_dir!/0 falls
+  # back to the shared /tmp, concurrent `mix test` processes mint the same scratch
+  # names, and each one's rm_rf cleanup deletes fixtures another is still using —
+  # which reads as a passing assertion over an absent file, not as a failure.
+  defp assert_hermetic_tmp! do
+    suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
+    actual = System.tmp_dir!()
+
+    if actual != suite_tmp do
+      raise "test tmp root is not hermetic: expected #{suite_tmp}, got #{actual}"
+    end
   end
 
   @doc false

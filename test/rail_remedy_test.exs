@@ -199,12 +199,11 @@ defmodule Tightbeam.RailRemedyTest do
         Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
       end)
 
-    original_running =
-      receive do
-        {:original_dispatch_running, _pid} = message -> message
-      end
-
-    assert {:original_dispatch_running, original_pid} = original_running
+    # The handler only reaches this send after the remedy fires and dispatch has
+    # written the episode, so the wait spans real DB work. Measured over 732 runs
+    # on 12 concurrent BEAMs at `+S 2:2`: p50 3ms, p99 82ms, max 191ms -- the
+    # 100ms assert_receive default sits inside that spread, which is why it flaked.
+    assert_receive {:original_dispatch_running, original_pid}, 5_000
 
     stale = System.system_time(:millisecond) - 60_001
 

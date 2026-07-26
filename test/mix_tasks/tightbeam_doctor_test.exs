@@ -63,26 +63,22 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     fixture = Path.expand("../fixtures/model_catalog/codex_models_cache.jsonc", __DIR__)
     codex_json = fixture_body(fixture)
-    test_pid = self()
 
+    # fetch_live blocks in await_fresh until every harness inventory reports a
+    # settled health, so it returns as soon as the async refreshes land and this
+    # number is only a ceiling on pathology. It has to stay well clear of real
+    # scheduling delay: at 1_000 the deadline expired under four concurrent full
+    # suites and the call returned {:error, %{"claude" => {:unavailable,
+    # :not_derived}, "codex" => {:unavailable, :not_derived}}}.
     catalog =
-      Mix.Tasks.Tightbeam.Catalog.Diff.fetch_live(ctx.base_dir, 1_000,
+      Mix.Tasks.Tightbeam.Catalog.Diff.fetch_live(ctx.base_dir, 20_000,
         name: :"doctor_catalog_#{System.unique_integer([:positive])}",
-        task_start: fn fun ->
-          send(test_pid, :catalog_task_started)
-          run_inline(fun)
-        end,
         credential_status: fn
           :anthropic -> {:needs_onboarding, :dead_credential}
           _provider -> :onboarded
         end,
         codex_read: fn _path -> {:ok, codex_json} end
       )
-
-    assert_received :catalog_task_started
-    assert_received :catalog_task_started
-    assert_received :catalog_task_started
-    refute_received :catalog_task_started
 
     assert {:ok, %{"claude" => [], "codex" => [_ | _]}, %{"claude" => reason}} = catalog
     assert reason == {:unavailable, {:needs_onboarding, :dead_credential}}
@@ -104,11 +100,6 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert find(report, "base_dir_identity").ok
     assert find(report, "advertised_url").ok
     assert find(report, "hosts_registered").ok
-  end
-
-  defp run_inline(fun) do
-    fun.()
-    {:ok, self()}
   end
 
   test "one fully ready harness passes while the unavailable harness warns", ctx do

@@ -30,7 +30,12 @@ defmodule Tightbeam.TestCaseTest do
     assert :persistent_term.get(Tightbeam.Rules) == [:baseline]
   end
 
-  test "restore returns persistent state to absent after a failed body" do
+  # Scoped to restore/1 itself: an aborted body leaves behind keys it introduced,
+  # and restoring over them has to take them back out. That the template's own
+  # on_exit fires after a genuinely failing ExUnit test is ExUnit's guarantee, and
+  # no sibling test can observe it — on_exit callbacks run in reverse registration
+  # order, so anything registered from a test body runs before the template's.
+  test "restore/1 removes a key the raising body introduced" do
     :persistent_term.erase(Tightbeam.Rails)
     snapshot = Tightbeam.TestCase.snapshot()
 
