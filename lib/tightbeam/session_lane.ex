@@ -110,7 +110,7 @@ defmodule Tightbeam.SessionLane do
   def handle_call({:cancel_current, cancel_boundary}, _from, state) do
     finish =
       if is_function(cancel_boundary, 1),
-        do: cancel_boundary.(state.current_seq),
+        do: run_cancel_boundary(cancel_boundary, state),
         else: Ledger.finish(state.db, state.current_seq, "canceled")
 
     case finish do
@@ -125,6 +125,14 @@ defmodule Tightbeam.SessionLane do
       :already_terminal ->
         {:reply, :not_running, state}
     end
+  end
+
+  defp run_cancel_boundary(cancel_boundary, state) do
+    cancel_boundary.(state.current_seq)
+  rescue
+    _ -> Ledger.finish(state.db, state.current_seq, "canceled")
+  catch
+    :exit, _ -> Ledger.finish(state.db, state.current_seq, "canceled")
   end
 
   @impl true

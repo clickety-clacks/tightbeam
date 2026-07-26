@@ -24,6 +24,7 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
+  @cancel_boundary_timeout 125_000
 
   defstruct [
     :conn,
@@ -125,7 +126,7 @@ defmodule Tightbeam.Acp.Adapter do
           String.t(),
           model_ref(),
           String.t(),
-          (-> :ok),
+          (-> :ok | :already_terminal),
           timeout(),
           keyword()
         ) ::
@@ -149,7 +150,12 @@ defmodule Tightbeam.Acp.Adapter do
   @doc "Serialize an ACP cancellation against tune and the configured prompt boundary."
   @spec cancel_session(adapter(), String.t(), (-> result)) :: result when result: term()
   def cancel_session(adapter, session_id, before_cancel \\ fn -> :ok end),
-    do: GenServer.call(adapter, {:cancel_session, session_id, before_cancel})
+    do:
+      GenServer.call(
+        adapter,
+        {:cancel_session, session_id, before_cancel},
+        @cancel_boundary_timeout
+      )
 
   @doc """
   Map one ACP session/update to a typing-indicator status line, or :skip.
@@ -385,24 +391,30 @@ defmodule Tightbeam.Acp.Adapter do
     dispatched = make_ref()
     conn_monitor = Process.monitor(state.conn)
 
-    spawn(fn ->
-      result =
-        Conn.request(
-          state.conn,
-          "session/prompt",
-          %{sessionId: sid, prompt: [%{type: "text", text: text}]},
-          timeout: Application.get_env(:tightbeam, :turn_timeout_ms, 600_000),
-          notify_dispatched: {parent, {:prompt_dispatched, dispatched}}
-        )
+    prompt_worker =
+      spawn(fn ->
+        result =
+          Conn.request(
+            state.conn,
+            "session/prompt",
+            %{sessionId: sid, prompt: [%{type: "text", text: text}]},
+            timeout: Application.get_env(:tightbeam, :turn_timeout_ms, 600_000),
+            notify_dispatched: {parent, {:prompt_dispatched, dispatched}}
+          )
 
-      send(parent, {:prompt_done, sid, from, result})
-    end)
+        send(parent, {:prompt_done, sid, from, result})
+      end)
 
     receive do
       {:prompt_dispatched, ^dispatched} ->
         Process.demonitor(conn_monitor, [:flush])
 
       {:DOWN, ^conn_monitor, :process, _pid, _reason} ->
+        send(parent, {:prompt_done, sid, from, {:error, :prompt_dispatch_failed}})
+    after
+      Application.get_env(:tightbeam, :prompt_dispatch_timeout_ms, 60_000) ->
+        Process.demonitor(conn_monitor, [:flush])
+        Process.exit(prompt_worker, :kill)
         send(parent, {:prompt_done, sid, from, {:error, :prompt_dispatch_failed}})
     end
 

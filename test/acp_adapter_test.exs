@@ -327,6 +327,34 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Adapter.conn(adapter) == dead_conn
   end
 
+  test "a missing prompt dispatch acknowledgement times out without wedging the adapter" do
+    old_timeout = Application.get_env(:tightbeam, :prompt_dispatch_timeout_ms)
+
+    on_exit(fn ->
+      if old_timeout,
+        do: Application.put_env(:tightbeam, :prompt_dispatch_timeout_ms, old_timeout),
+        else: Application.delete_env(:tightbeam, :prompt_dispatch_timeout_ms)
+    end)
+
+    Application.put_env(:tightbeam, :prompt_dispatch_timeout_ms, 25)
+    {adapter, _capture_path} = start_adapter()
+
+    inert_conn =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn -> send(inert_conn, :stop) end)
+    :sys.replace_state(adapter, &%{&1 | conn: inert_conn})
+
+    assert {:error, :prompt_dispatch_failed} =
+             Adapter.prompt(adapter, "sess-1", "never acknowledged", 100)
+
+    assert Adapter.conn(adapter) == inert_conn
+  end
+
   test "close_session sends ACP session/close with the harness session id" do
     {adapter, capture_path} = start_adapter()
     assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")

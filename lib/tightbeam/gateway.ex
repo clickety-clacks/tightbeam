@@ -1132,6 +1132,9 @@ defmodule Tightbeam.Gateway do
 
           {:ok, %{terminal_publish: terminal_publish}}
         else
+          {:error, :turn_terminal} ->
+            {:ok, %{}}
+
           {:error, reason} ->
             condition = Adjudication.classify(reason)
             adjudication_prompt = adjudication_brief(session, condition)
