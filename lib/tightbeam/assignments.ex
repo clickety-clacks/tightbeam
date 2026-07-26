@@ -1,6 +1,8 @@
 defmodule Tightbeam.Assignments do
   @moduledoc "Assignments and their attests."
 
+  require Logger
+
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
@@ -376,6 +378,54 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &assignment/1)
   end
 
+  @doc "Resolve an assignment's story membership without changing direct ownership readers."
+  @spec resolved_work_item_id(DB.server(), String.t()) :: String.t() | nil
+  def resolved_work_item_id(db, assignment_id) do
+    {:ok, work_item_id} =
+      DB.transaction(db, fn txn ->
+        resolve_work_item_id_in_txn(txn, assignment_id, MapSet.new())
+      end)
+
+    work_item_id
+  end
+
+  @doc "Log legacy review/item conflicts without mutating assignment rows."
+  @spec audit_review_item_conflicts(DB.server()) :: :ok
+  def audit_review_item_conflicts(db) do
+    {:ok, conflicts} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          """
+          SELECT id, workItemId, reviewsAssignmentId
+          FROM assignments
+          WHERE reviewsAssignmentId IS NOT NULL
+          ORDER BY id
+          """
+        )
+        |> Enum.reduce([], fn [id, work_item_id, reviews_assignment_id], conflicts ->
+          reviewed_item_id =
+            resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
+
+          if not is_nil(work_item_id) and work_item_id != reviewed_item_id do
+            [{id, work_item_id, reviews_assignment_id, reviewed_item_id} | conflicts]
+          else
+            conflicts
+          end
+        end)
+        |> Enum.reverse()
+      end)
+
+    Enum.each(conflicts, fn {id, work_item_id, reviews_assignment_id, reviewed_item_id} ->
+      Logger.warning(
+        "review_item_conflict legacy assignment=#{id} workItemId=#{work_item_id} " <>
+          "reviewsAssignmentId=#{reviews_assignment_id} reviewedWorkItemId=#{inspect(reviewed_item_id)}"
+      )
+    end)
+
+    :ok
+  end
+
   @doc false
   def __handle__(db, "assign", call), do: assign_result(db, call)
   def __handle__(db, "dispatch", call), do: dispatch_result(db, call)
@@ -690,6 +740,15 @@ defmodule Tightbeam.Assignments do
              Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1", [reviews_assignment_id]) == [],
            do: raise(UnknownReviewTarget, assignment_id: reviews_assignment_id)
 
+        if reviews_assignment_id do
+          reviewed_item_id =
+            resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
+
+          if not is_nil(work_item_id) and work_item_id != reviewed_item_id do
+            throw(:review_item_conflict)
+          end
+        end
+
         case open_assignments_touching_in_txn(txn, files, nil) do
           [] -> :ok
           [colliding_id | _] -> throw({:files_overlap, colliding_id})
@@ -768,6 +827,40 @@ defmodule Tightbeam.Assignments do
 
     {:work_item_not_open, work_item_id} ->
       error("work_item_not_open", "work item #{work_item_id} is not open")
+
+    :review_item_conflict ->
+      error(
+        "review_item_conflict",
+        "a review assignment must belong to the item it reviews"
+      )
+  end
+
+  defp resolve_work_item_id_in_txn(txn, assignment_id, visited) do
+    if MapSet.member?(visited, assignment_id) do
+      nil
+    else
+      case Txn.q(
+             txn,
+             "SELECT workItemId, reviewsAssignmentId FROM assignments WHERE id = ?1",
+             [assignment_id]
+           ) do
+        [[work_item_id, _reviews_assignment_id]] when not is_nil(work_item_id) ->
+          work_item_id
+
+        [[nil, nil]] ->
+          nil
+
+        [[nil, reviews_assignment_id]] ->
+          resolve_work_item_id_in_txn(
+            txn,
+            reviews_assignment_id,
+            MapSet.put(visited, assignment_id)
+          )
+
+        [] ->
+          nil
+      end
+    end
   end
 
   defp assert_work_item_open!(_txn, _call, nil), do: :ok

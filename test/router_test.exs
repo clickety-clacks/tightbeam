@@ -663,6 +663,31 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.status == 200
   end
 
+  test "Proof 2: agent-supplied createdInTurnSeq and createdContextKnown are stripped from work-item-create",
+       ctx do
+    forged =
+      JSON.encode!(%{
+        verb: "work-item-create",
+        asUser: "flynn",
+        params: %{
+          title: "substrate-stamped",
+          createdInTurnSeq: 999_999,
+          createdContextKnown: 0
+        }
+      })
+
+    response =
+      conn(:post, "/agent/dispatch", forged)
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert_receive {:call, %{verb: "work-item-create", params: params}}
+    assert params[:title] == "substrate-stamped"
+    refute Map.has_key?(params, :created_in_turn_seq)
+    refute Map.has_key?(params, :created_context_known)
+    assert response.status == 200
+  end
+
   test "typed target grammar distinguishes keys, users, and roles without unions", ctx do
     {:pending, _device} =
       Devices.pair(ctx.db, %{
