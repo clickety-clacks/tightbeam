@@ -1,4 +1,6 @@
 defmodule Tightbeam.ClientE2E.LegGateway do
+  require Logger
+
   @moduledoc """
   Provisions, boots and tears down the run-local gateway ONE LEG uses.
 
@@ -381,9 +383,15 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   defp signal(pid, expected_command, flag) do
     cond do
       is_nil(expected_command) ->
+        Logger.warning("leg teardown: pid #{pid} has no captured command — NOT signalling")
         :skipped
 
       process_command(pid) != expected_command ->
+        Logger.warning(
+          "leg teardown: pid #{pid} recycled — captured #{inspect(expected_command)}, " <>
+            "now #{inspect(process_command(pid))} — NOT signalling"
+        )
+
         :skipped
 
       true ->
