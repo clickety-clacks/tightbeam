@@ -185,17 +185,33 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "dispatch atomically opens an assignment and enqueues its brief with the card id", ctx do
+    work_item =
+      handle(
+        ctx,
+        "work-item-create",
+        work_item_call("work-item-create", {:user, "flynn"}, %{title: "Dispatch trace"})
+      )
+
     assignment =
-      handle(ctx, "dispatch", dispatch_call({:user, "flynn"}, "ship it", "Please ship it."))
+      handle(
+        ctx,
+        "dispatch",
+        dispatch_call({:user, "flynn"}, "ship it", "Please ship it.", nil, work_item.id)
+      )
 
     assert assignment.subject == "ship it"
     assert assignment.holderKey == "holder"
 
-    assert {:ok, [[prompt]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey = 'holder'")
+    assert {:ok, [[prompt, assignment_id, job_ref]]} =
+             DB.query(
+               ctx.db,
+               "SELECT prompt, assignmentId, jobRef FROM turns WHERE sessionKey = 'holder'"
+             )
 
     assert prompt =~ assignment.id
     assert prompt =~ "Please ship it."
+    assert assignment_id == assignment.id
+    assert job_ref == work_item.id
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])

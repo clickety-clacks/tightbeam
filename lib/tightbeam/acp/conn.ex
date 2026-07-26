@@ -93,9 +93,11 @@ defmodule Tightbeam.Acp.Conn do
   @impl true
   def handle_call({:request, method, params, opts}, {pid, _} = from, state) do
     if state.closed do
+      notify_dispatched(opts)
       {:reply, {:error, :closed}, state}
     else
       id = state.next_id
+      notify_dispatched(opts)
       send_json(state.port, %{jsonrpc: "2.0", id: id, method: method, params: params})
       timeout = Keyword.get(opts, :timeout, 60_000)
       Process.send_after(self(), {:req_timeout, id}, timeout)
@@ -117,7 +119,9 @@ defmodule Tightbeam.Acp.Conn do
 
   @impl true
   def handle_cast({:notify, method, params}, state) do
-    unless state.closed, do: send_json(state.port, %{jsonrpc: "2.0", method: method, params: params})
+    unless state.closed,
+      do: send_json(state.port, %{jsonrpc: "2.0", method: method, params: params})
+
     {:noreply, state}
   end
 
@@ -224,6 +228,13 @@ defmodule Tightbeam.Acp.Conn do
 
   defp emit(%{subscriber: nil}, _msg), do: :ok
   defp emit(%{subscriber: pid}, msg), do: send(pid, msg)
+
+  defp notify_dispatched(opts) do
+    case Keyword.get(opts, :notify_dispatched) do
+      {pid, message} -> send(pid, message)
+      nil -> :ok
+    end
+  end
 
   defp send_json(port, map), do: Port.command(port, JSON.encode!(map) <> "\n")
 

@@ -184,6 +184,42 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  defp wait_for_request_order(path, attempts \\ 20)
+
+  defp wait_for_request_order(path, 0), do: captured_requests(path)
+
+  defp wait_for_request_order(path, attempts) do
+    requests = captured_requests(path)
+    prompt_index = boundary_prompt_index(requests)
+    tune_index = last_method_index(requests, "session/set_config_option")
+    cancel_index = last_method_index(requests, "session/cancel")
+
+    if is_integer(prompt_index) and is_integer(tune_index) and is_integer(cancel_index) and
+         prompt_index < tune_index and prompt_index < cancel_index do
+      requests
+    else
+      receive after: (10 -> wait_for_request_order(path, attempts - 1))
+    end
+  end
+
+  defp boundary_prompt_index(requests) do
+    Enum.find_index(requests, fn request ->
+      request["method"] == "session/prompt" and
+        get_in(request, ["prompt", Access.at(0), "text"]) == "boundary"
+    end)
+  end
+
+  defp last_method_index(requests, method) do
+    requests
+    |> Enum.with_index()
+    |> Enum.filter(fn {request, _index} -> request["method"] == method end)
+    |> List.last()
+    |> case do
+      nil -> nil
+      {_request, index} -> index
+    end
+  end
+
   defp session_requests(path) do
     Enum.filter(captured_requests(path), &(&1["method"] in ["session/new", "session/load"]))
   end
@@ -217,6 +253,78 @@ defmodule Tightbeam.Acp.AdapterTest do
              session_requests(capture_path)
 
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
+  end
+
+  test "configured prompt serializes apply-readback-persist-send against tune and cancellation" do
+    {adapter, capture_path} = start_adapter()
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
+    parent = self()
+
+    prompt =
+      Task.async(fn ->
+        Adapter.prompt_configured(
+          adapter,
+          "sess-1",
+          "haiku",
+          "boundary",
+          fn ->
+            send(parent, :persist_boundary)
+
+            receive do
+              :release_boundary -> :ok
+            end
+          end
+        )
+      end)
+
+    assert_receive :persist_boundary
+
+    refute Enum.any?(
+             captured_requests(capture_path),
+             &(&1["method"] == "session/prompt" and
+                 get_in(&1, ["prompt", Access.at(0), "text"]) == "boundary")
+           )
+
+    tune = Task.async(fn -> Adapter.apply_model_strict(adapter, "sess-1", "haiku", "haiku") end)
+
+    cancel =
+      Task.async(fn ->
+        Adapter.cancel_session(adapter, "sess-1", fn ->
+          send(parent, :cancel_boundary)
+          :ok
+        end)
+      end)
+
+    refute Task.yield(tune, 25)
+    refute Task.yield(cancel, 25)
+    refute_received :cancel_boundary
+
+    send(adapter, :release_boundary)
+
+    assert :ok = Task.await(tune)
+    assert :ok = Task.await(cancel)
+    assert_received :cancel_boundary
+    assert {:ok, %{text: "pong[allow-once]"}} = Task.await(prompt)
+
+    requests = wait_for_request_order(capture_path)
+    prompt_index = boundary_prompt_index(requests)
+    tune_index = last_method_index(requests, "session/set_config_option")
+    cancel_index = last_method_index(requests, "session/cancel")
+
+    assert prompt_index < tune_index
+    assert prompt_index < cancel_index
+  end
+
+  test "a prompt worker that dies before dispatch returns an error without wedging the adapter" do
+    {adapter, _capture_path} = start_adapter()
+    dead_conn = spawn(fn -> :ok end)
+    monitor = Process.monitor(dead_conn)
+    assert_receive {:DOWN, ^monitor, :process, ^dead_conn, :normal}
+
+    :sys.replace_state(adapter, &%{&1 | conn: dead_conn})
+
+    assert {:error, :prompt_dispatch_failed} = Adapter.prompt(adapter, "sess-1", "never sent")
+    assert Adapter.conn(adapter) == dead_conn
   end
 
   test "close_session sends ACP session/close with the harness session id" do

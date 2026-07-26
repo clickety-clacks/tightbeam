@@ -309,6 +309,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::WorkItemTrace {
+            identity,
+            work_item_id,
+        } => Ok(request(
+            identity,
+            "work-item-trace",
+            vec![],
+            vec![string_field("workItemId", work_item_id)],
+        )),
         Command::WorkItemIcebox {
             identity,
             work_item_id,
@@ -353,6 +362,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             kind,
             verdict,
             note,
+            commit_refs,
         } => {
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
@@ -363,6 +373,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = verdict {
                 params.push(string_field("verdictKind", value));
+            }
+            if let Some(value) = commit_refs {
+                params.push(format!(
+                    "\"commitRefs\":{}",
+                    serde_json::to_string(value).expect("commit refs are JSON serializable")
+                ));
             }
             Ok(request(identity, "attest", vec![], params))
         }
@@ -750,6 +766,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::RunSmoke { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
+        | Command::WorkItemTrace { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
@@ -1038,6 +1055,19 @@ mod tests {
             body(&["attests", "asg_1", "--as", "reviewer"]),
             r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
         );
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "completion",
+                "--commit-refs",
+                r#"[{"repo":"eezo:/src/repo","commit":"abc123"}]"#,
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"eezo:/src/repo"}]}}"#
+        );
     }
 
     #[test]
@@ -1064,7 +1094,19 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
-            body(&["work-item-create", "--title", "Ship", "--key", "k1", "--as-user", "flynn"]),
+            body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-trace","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-create",
+                "--title",
+                "Ship",
+                "--key",
+                "k1",
+                "--as-user",
+                "flynn"
+            ]),
             r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Ship","idempotencyKey":"k1"}}"#
         );
         assert_eq!(
@@ -1080,7 +1122,14 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-close","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
-            body(&["work-item-fail", "wi_1", "--reason", "cannot repro", "--as-user", "flynn"]),
+            body(&[
+                "work-item-fail",
+                "wi_1",
+                "--reason",
+                "cannot repro",
+                "--as-user",
+                "flynn"
+            ]),
             r#"{"asUser":"flynn","verb":"work-item-fail","params":{"workItemId":"wi_1","reason":"cannot repro"}}"#
         );
     }

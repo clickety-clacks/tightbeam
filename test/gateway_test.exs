@@ -101,6 +101,18 @@ defmodule Tightbeam.GatewayTest do
          {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
          parent}
 
+    def handle_call(
+          {:prompt_configured, _sid, _model, prompt, before_send, _opts},
+          from,
+          parent
+        ) do
+      :ok = before_send.()
+      handle_call({:prompt, "harness-1", prompt, []}, from, parent)
+    end
+
+    def handle_call({:cancel_session, _sid, before_cancel}, _from, parent),
+      do: {:reply, before_cancel.(), parent}
+
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
@@ -2744,6 +2756,42 @@ defmodule Tightbeam.GatewayTest do
     assert Gateway.deliver_prompt("k1", "user:flynn", "hello", opts) == :duplicate
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  test "conversational turns stay unattributed and bracket-1 nags reverse-link jobRef only",
+       ctx do
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO work_items
+        (id, title, ownerUserId, state, routingWakeId, createdByUser, createdAt)
+      VALUES ('wi_nag', 'Route me', 'flynn', 'open', 'w_nag', 'flynn', 1)
+      """)
+
+    common = [
+      db: ctx.db,
+      conn_registry: ctx.registry,
+      lane_manager: ctx.lane,
+      sender: "process:tightbeam"
+    ]
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
+
+    assert :appended =
+             Gateway.deliver_prompt(
+               "k1",
+               "process:tightbeam",
+               "route it or icebox it",
+               Keyword.put(common, :wake_id, "w_nag")
+             )
+
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId, jobRef FROM turns ORDER BY seq ASC"
+             )
+
+    assert rows == [[nil, nil], [nil, "wi_nag"]]
   end
 
   test "wake_id dedupes the transaction including its second echo", ctx do

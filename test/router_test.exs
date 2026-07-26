@@ -73,6 +73,10 @@ defmodule Tightbeam.Wire.RouterTest do
           do: %{code: call.params.return_code},
           else: %{workItem: %{id: call.params.work_item_id}, assignments: []}
       end,
+      "work-item-trace" => fn call ->
+        send(parent, {:call, call})
+        %{workItem: %{id: call.params.work_item_id}, assignments: [], timeline: []}
+      end,
       "work-item-list" => fn call ->
         send(parent, {:call, call})
         %{workItems: []}
@@ -251,6 +255,7 @@ defmodule Tightbeam.Wire.RouterTest do
     for {verb, params} <- [
           {"work-item-create", %{title: "Create"}},
           {"work-item-get", %{workItemId: "wi_test"}},
+          {"work-item-trace", %{workItemId: "wi_test"}},
           {"work-item-list", %{}},
           {"work-item-update", %{workItemId: "wi_test", title: "Update"}}
         ] do
