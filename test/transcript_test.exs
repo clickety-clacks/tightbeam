@@ -309,6 +309,9 @@ defmodule Tightbeam.TranscriptTest do
 
     # Every top-level targeting shape is refused BEFORE any lookup, with bytes
     # that cannot distinguish unknown from readable from forbidden.
+    # Refusal is on the FIELD'S PRESENCE, not its value's type. The non-string
+    # values below all reached a 200 with a verb event while the check filtered on
+    # `is_binary/1` — a null-valued key is still a volunteered typed target.
     bodies = [
       %{verb: "transcript", asUser: "flynn", sessionKey: "no-such-session"},
       %{verb: "transcript", asUser: "flynn", sessionKey: "owned"},
@@ -316,7 +319,16 @@ defmodule Tightbeam.TranscriptTest do
       %{verb: "transcript", asUser: "flynn", target: "owned"},
       %{verb: "transcript", asUser: "flynn", sessionKey: "owned", role: "whatever"},
       %{verb: "transcript", asUser: "flynn", userId: "flynn"},
-      %{verb: "transcript", asUser: "flynn", role: "whatever"}
+      %{verb: "transcript", asUser: "flynn", role: "whatever"},
+      # Null, and carrying otherwise-valid params so nothing else could refuse it.
+      %{verb: "transcript", asUser: "flynn", sessionKey: nil, params: %{sessionKey: "owned"}},
+      %{verb: "transcript", asUser: "flynn", target: nil, params: %{sessionKey: "owned"}},
+      %{verb: "transcript", asUser: "flynn", role: nil, params: %{sessionKey: "owned"}},
+      %{verb: "transcript", asUser: "flynn", userId: nil, params: %{sessionKey: "owned"}},
+      # A number, a boolean and an object — the same gap as null.
+      %{verb: "transcript", asUser: "flynn", sessionKey: 42, params: %{sessionKey: "owned"}},
+      %{verb: "transcript", asUser: "flynn", sessionKey: true, params: %{sessionKey: "owned"}},
+      %{verb: "transcript", asUser: "flynn", sessionKey: %{key: "owned"}, params: %{sessionKey: "owned"}}
     ]
 
     before_events = verb_event_count(ctx.db)
@@ -498,7 +510,15 @@ defmodule Tightbeam.TranscriptTest do
       params: %{session_key: "owned"}
     }
 
-    assert {:error, %{code: "server_error"}} = Dispatch.dispatch(ctx.db, handlers, call)
+    assert {:error, returned} = Dispatch.dispatch(ctx.db, handlers, call)
+    assert returned.code == "server_error"
+
+    # The CALLER's error IS built with `Exception.message/1` and so DOES carry the
+    # term the handler was holding. Asserted rather than glossed: elision governs
+    # the audit row, not this value, and the caller has just passed authorization
+    # for exactly these rows. A test that matched only on `code` here would read as
+    # a guarantee that the returned error is content-free, which is not true.
+    assert is_binary(returned.message)
 
     # EXACTLY these four keys — in particular no `message`, which is where
     # `Exception.message/1` would have put the row the handler was holding.

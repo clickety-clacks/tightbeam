@@ -523,11 +523,21 @@ defmodule Tightbeam.Wire.Router do
   # travels as an ordinary body param instead.
   @non_target_verbs ~w(transcript)
 
+  # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
+  # number, a boolean or an object — is still a caller volunteering a typed target
+  # to a verb that has none, and must land on the SAME refusal a string does. The
+  # generic clauses below filter on `is_binary/1` for their own reasons (they go on
+  # to resolve the value), which is why this check cannot reuse `given`: doing so
+  # returned 200 and emitted a verb event for a null-valued key.
+  defp volunteers_typed_target?(body) do
+    Enum.any?(["target" | @target_fields], &Map.has_key?(body, &1))
+  end
+
   defp typed_target(verb, body, conn) do
     given = Enum.filter(@target_fields, &is_binary(body[&1]))
 
     cond do
-      verb in @non_target_verbs and (is_binary(body["target"]) or given != []) ->
+      verb in @non_target_verbs and volunteers_typed_target?(body) ->
         {:error, 400, "invalid_message", "#{verb} takes no typed target"}
 
       is_binary(body["target"]) ->
