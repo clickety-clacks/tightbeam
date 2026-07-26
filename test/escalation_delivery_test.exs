@@ -521,9 +521,21 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert Enum.filter(Map.keys(sink_sites()), &(elem(&1, 1) == "Ledger.enqueue/2")) == []
 
     # A hand-written turn insert would step around every AST allowlist above.
-    assert Enum.filter(production_files(), &(File.read!(&1) =~ "INSERT INTO turns")) == [
-             "lib/tightbeam/ledger.ex"
-           ]
+    # Case- and whitespace-insensitive: `insert into turns` and a phrase broken
+    # across lines are the same step-around as the canonical spelling.
+    #
+    # WHAT THIS CATCHES, AND WHAT IT DOES NOT. Both this scan and the
+    # decision-request scan below read string LITERALS. They catch a new call
+    # site, and a plainly-written raw insert in any case or spacing. They do NOT
+    # catch SQL assembled at runtime — `"INSERT INTO " <> table`, an interpolated
+    # table name, or a query built from fragments. That limit is deliberate:
+    # folding arbitrary concatenation is unbounded, and someone concatenating SQL
+    # to slip past a named guard is evading review, which no test prevents. The
+    # guard is a floor against drift, not a sandbox against intent.
+    assert Enum.filter(production_files(), &(File.read!(&1) =~ ~r/insert\s+into\s+turns\b/i)) ==
+             [
+               "lib/tightbeam/ledger.ex"
+             ]
 
     # The request modules cannot reach a delivery seam through an injected fun.
     for file <- ["lib/tightbeam/escalation.ex", "lib/tightbeam/effort_checkin.ex"] do
@@ -873,16 +885,16 @@ defmodule Tightbeam.EscalationDeliveryTest do
         do: {file, ref}
   end
 
+  # Literal-based, with the same documented limit as the turn-insert scan above:
+  # case and spacing cannot hide a writer, runtime-assembled SQL can.
   defp touches_decision_requests?(body) do
     body
     |> collect(fn
       sql when is_binary(sql) ->
-        normalized = sql |> String.replace(~r/\s+/, " ") |> String.upcase()
-
         cond do
           # `\b` excludes the schema-rebuild copy into `decision_requests_new`.
-          Regex.match?(~r/INSERT INTO DECISION_REQUESTS\b/, normalized) -> :insert
-          retarget_sql?(normalized) -> :retarget
+          sql_matches?(sql, ~r/insert\s+into\s+decision_requests\b/i) -> :insert
+          retarget_sql?(sql) -> :retarget
           true -> nil
         end
 
@@ -894,9 +906,12 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   # A retarget is the expecter/deadline rotation CAS, not a ruling or withdrawal.
   defp retarget_sql?(sql) do
-    String.contains?(sql, "UPDATE DECISION_REQUESTS") and
-      String.contains?(sql, "EXPECTERSESSIONKEY =")
+    sql_matches?(sql, ~r/update\s+decision_requests\b/i) and
+      sql_matches?(sql, ~r/expecterSessionKey\s*=/i)
   end
+
+  defp sql_matches?(sql, pattern),
+    do: sql |> String.replace(~r/\s+/, " ") |> then(&Regex.match?(pattern, &1))
 
   # The arm may be inline or one local private helper away (effort's shared
   # `arm_notification_in_txn/2`), so resolution follows same-file local calls.
