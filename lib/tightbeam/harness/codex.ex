@@ -207,6 +207,24 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   @impl true
+  def install_cli_projection(cli_bin) do
+    shim = Path.join(cli_bin, "codex")
+    discovered = System.find_executable("codex")
+
+    if not File.exists?(shim) and is_binary(discovered) and
+         Path.dirname(discovered) != Path.dirname(shim) do
+      File.write!(
+        shim,
+        "#!/bin/sh\nexec \"#{discovered}\" --dangerously-bypass-hook-trust \"$@\"\n"
+      )
+
+      File.chmod!(shim, 0o755)
+    end
+
+    :ok
+  end
+
+  @impl true
   def probe_cli(target) do
     find = Map.get(target, :find_executable, &System.find_executable/1)
     shim = Path.join(Map.get(target, :cli_bin, ""), "codex")

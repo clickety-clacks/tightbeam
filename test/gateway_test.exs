@@ -1598,6 +1598,28 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:credential_command, first_command}
     assert Enum.join(first_command, " ") =~ "/remote/tb"
 
+    :ok = :sys.suspend(first_pid)
+
+    try do
+      reregister =
+        Task.async(fn ->
+          handlers["register-host"].(%{
+            origin: "user:flynn",
+            session_key: nil,
+            params: %{
+              name: machine,
+              ssh: machine,
+              base_dir: "/remote/tb"
+            }
+          })
+        end)
+
+      assert %{host: ^machine} = Task.await(reregister, 500)
+      assert GenServer.whereis(server) == first_pid
+    after
+      :ok = :sys.resume(first_pid)
+    end
+
     assert %{host: ^machine} =
              handlers["register-host"].(%{
                origin: "user:flynn",

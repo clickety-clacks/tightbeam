@@ -135,9 +135,20 @@ defmodule Tightbeam.Acp.AdapterTest do
         cmd: [System.find_executable("node"), path, capture_path, fail_mode, gate_mode],
         home: "/tmp",
         cwd: "/tmp",
-        stderr_path: stderr_path,
         name: :"adapter_#{System.unique_integer([:positive])}"
       ]
+      |> then(fn adapter_opts ->
+        case Keyword.get(opts, :stderr_path, stderr_path) do
+          :omit -> adapter_opts
+          path -> Keyword.put(adapter_opts, :stderr_path, path)
+        end
+      end)
+      |> then(fn adapter_opts ->
+        case Keyword.fetch(opts, :gate_log_path) do
+          {:ok, path} -> Keyword.put(adapter_opts, :gate_log_path, path)
+          :error -> adapter_opts
+        end
+      end)
       |> then(fn adapter_opts ->
         if contained, do: Keyword.put(adapter_opts, :contained, true), else: adapter_opts
       end)
@@ -612,6 +623,41 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert log =~ "[gate-drift] raw_updates="
     assert log =~ ~s("sessionUpdate":"drifted_shape")
     assert byte_size(log) < 5_000
+  end
+
+  test "gate log is omitted without real stderr and honors an explicit path" do
+    parent = self()
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        gate_mode: "pass-message",
+        stderr_path: :omit,
+        on_ready: fn -> send(parent, :sentinel_gate_ready) end
+      )
+
+    assert_receive :sentinel_gate_ready
+    assert Process.alive?(adapter)
+
+    explicit_path =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-explicit-gate-#{System.unique_integer([:positive])}.log"
+      )
+
+    on_exit(fn -> File.rm(explicit_path) end)
+
+    {_adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        gate_mode: "pass-message",
+        stderr_path: :omit,
+        gate_log_path: explicit_path,
+        on_ready: fn -> send(parent, :explicit_gate_ready) end
+      )
+
+    assert_receive :explicit_gate_ready
+    assert File.read!(explicit_path) =~ "gate wiring-check PASS [gate: tightbeam-probe]"
   end
 
   test "gate wiring-check fails closed without the marker or on a probe turn error" do

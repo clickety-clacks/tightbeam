@@ -378,7 +378,7 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp start_credential_child(config, db, machine, host) do
+  defp start_credential_child(config, db, machine, previous_host, host) do
     supervisor = Map.get(config, :credential_supervisor, Tightbeam.Supervisor)
     child = credential_child(config, db, machine, host)
 
@@ -386,10 +386,8 @@ defmodule Tightbeam.Gateway do
       {:ok, _pid} ->
         :ok
 
-      {:error, {:already_started, pid}} ->
-        state = :sys.get_state(pid)
-
-        if state.base_dir == host.base_dir and state.ssh == host.ssh do
+      {:error, {:already_started, _pid}} ->
+        if same_credential_host?(previous_host, host) do
           :ok
         else
           replace_credential_child(supervisor, child, machine)
@@ -402,6 +400,11 @@ defmodule Tightbeam.Gateway do
         raise "failed to start credential server for host #{machine}: #{inspect(reason)}"
     end
   end
+
+  defp same_credential_host?(nil, _host), do: false
+
+  defp same_credential_host?(previous, current),
+    do: previous.base_dir == current.base_dir and previous.ssh == current.ssh
 
   defp replace_credential_child(supervisor, child, machine) do
     with :ok <- Supervisor.terminate_child(supervisor, child.id),
@@ -576,6 +579,8 @@ defmodule Tightbeam.Gateway do
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
           # prepared the machine; this records the fact. The topology is the
           # operator's to declare.
+          previous_entry = Placement.hosts(config.base_dir)[p.name]
+
           {:ok, entry} =
             Placement.register_host(config.base_dir, p.name, %{
               ssh: p[:ssh] || p.name,
@@ -584,7 +589,7 @@ defmodule Tightbeam.Gateway do
               adapter_bin_dir: p[:adapter_bin_dir]
             })
 
-          :ok = start_credential_child(config, db, p.name, entry)
+          :ok = start_credential_child(config, db, p.name, previous_entry, entry)
           %{host: p.name, config: entry}
         end),
       "identity-edit" =>
@@ -1115,24 +1120,9 @@ defmodule Tightbeam.Gateway do
     end
 
     File.chmod!(wrapper, 0o755)
-    install_codex_shim(bin_dir)
+    Enum.each(Harness.all(), fn module -> :ok = module.install_cli_projection(bin_dir) end)
 
     bin_dir
-  end
-
-  defp install_codex_shim(bin_dir) do
-    shim = Path.join(bin_dir, "codex")
-    discovered = System.find_executable("codex")
-
-    if not File.exists?(shim) and is_binary(discovered) and
-         Path.dirname(discovered) != Path.dirname(shim) do
-      File.write!(
-        shim,
-        "#!/bin/sh\nexec \"#{discovered}\" --dangerously-bypass-hook-trust \"$@\"\n"
-      )
-
-      File.chmod!(shim, 0o755)
-    end
   end
 
   defp turn_runner(config) do

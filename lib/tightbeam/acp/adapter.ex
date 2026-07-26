@@ -49,7 +49,7 @@ defmodule Tightbeam.Acp.Adapter do
   @doc """
   Start the adapter. Required: `:harness` (a registered harness id), `:cmd` (adapter
   argv), `:home` (agent-home dir, exported via the harness's home env var),
-  `:cwd`. Optional: `:env`, `:stderr_path`, `:name`.
+  `:cwd`. Optional: `:env`, `:stderr_path`, `:gate_log_path`, `:name`.
 
   Accepts either the opts keyword directly, or a ZERO-ARITY FUN producing it.
   The fun form is the coordinator's: opts-building may be expensive or hang
@@ -213,7 +213,7 @@ defmodule Tightbeam.Acp.Adapter do
         case gate_attestation(state, probe_cwd, Keyword.fetch!(opts, :probe_model), deadline) do
           {:ok, output} ->
             gate_log(
-              Keyword.get(opts, :stderr_path, "/dev/null"),
+              opts,
               "gate wiring-check PASS #{@gate_marker} output=#{inspect(output)}"
             )
 
@@ -228,12 +228,12 @@ defmodule Tightbeam.Acp.Adapter do
               )
 
             gate_log(
-              Keyword.get(opts, :stderr_path, "/dev/null"),
+              opts,
               "[gate-drift] raw_updates=#{gate_raw_updates(raw_updates)}"
             )
 
             gate_log(
-              Keyword.get(opts, :stderr_path, "/dev/null"),
+              opts,
               "gate wiring-check FAIL detail=#{detail} output=#{inspect(output)}"
             )
 
@@ -749,7 +749,21 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp gate_log(path, line), do: File.write!(path <> ".gate.log", line <> "\n", [:append])
+  defp gate_log(opts, line) do
+    path =
+      case Keyword.fetch(opts, :gate_log_path) do
+        {:ok, path} ->
+          path
+
+        :error ->
+          case Keyword.fetch(opts, :stderr_path) do
+            {:ok, path} when path != "/dev/null" -> path <> ".gate.log"
+            _ -> nil
+          end
+      end
+
+    if path, do: File.write!(path, line <> "\n", [:append])
+  end
 
   @doc """
   Split a model ref into `{model, effort}`; effort is nil when absent.

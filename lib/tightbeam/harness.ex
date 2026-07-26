@@ -36,6 +36,7 @@ defmodule Tightbeam.Harness do
   @callback materialize_skills(target(), String.t(), map()) :: map()
   @callback credential_ready?(target(), String.t()) :: boolean()
   @callback harvest_credential(target(), String.t()) :: binary() | nil
+  @callback install_cli_projection(String.t()) :: :ok
   @callback probe_cli(target()) ::
               {:ok, %{bin: String.t(), version: String.t()}}
               | {:error, :not_found | {:exec_failed, String.t()}}
