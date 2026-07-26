@@ -572,6 +572,7 @@ defmodule Tightbeam.Gateway do
         )
       end,
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
+      "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
@@ -729,6 +730,8 @@ defmodule Tightbeam.Gateway do
 
         case Projection.append_in_txn(txn, input) do
           {:appended, message} ->
+            {assignment_id, job_ref} = turn_attribution(txn, opts)
+
             Ledger.enqueue_in_txn(txn, %{
               session_key: target,
               message_id: message.id,
@@ -736,7 +739,9 @@ defmodule Tightbeam.Gateway do
               origin: origin,
               prompt: stamped,
               role_ref: role_ref || opts[:role_ref],
-              role_fallback: role_fallback || opts[:role_fallback] || false
+              role_fallback: role_fallback || opts[:role_fallback] || false,
+              assignment_id: assignment_id,
+              job_ref: job_ref
             })
 
             if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
@@ -759,6 +764,42 @@ defmodule Tightbeam.Gateway do
           other ->
             other
         end
+    end
+  end
+
+  defp turn_attribution(txn, opts) do
+    case {opts[:assignment_id], opts[:job_ref]} do
+      {assignment_id, job_ref} when is_binary(assignment_id) ->
+        {assignment_id, job_ref}
+
+      {nil, nil} ->
+        case opts[:wake_id] do
+          wake_id when is_binary(wake_id) ->
+            case DB.Txn.q(
+                   txn,
+                   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'work_items'",
+                   []
+                 ) do
+              [[1]] ->
+                case DB.Txn.q(
+                       txn,
+                       "SELECT id FROM work_items WHERE routingWakeId = ?1",
+                       [wake_id]
+                     ) do
+                  [[job_ref]] -> {nil, job_ref}
+                  [] -> {nil, nil}
+                end
+
+              [] ->
+                {nil, nil}
+            end
+
+          nil ->
+            {nil, nil}
+        end
+
+      attribution ->
+        attribution
     end
   end
 
@@ -1068,7 +1109,11 @@ defmodule Tightbeam.Gateway do
              {:ok, harness_session_id} <-
                harness_session(config, db, adapter, generation, session, turn.seq),
              {:ok, result} <-
-               Adapter.prompt(adapter, harness_session_id, turn.prompt, 600_000,
+               Adapter.prompt(
+                 adapter,
+                 harness_session_id,
+                 turn.prompt,
+                 600_000,
                  progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                ) do
           case Projection.append(db, %{
@@ -1291,8 +1336,6 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # Best-effort: the model should stop burning tokens, but a failure here
-  # changes nothing durable (the ledger row is already terminal).
   defp harness_cancel(db, session) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
          key = {Harness.parse!(session.harness).id(), "shared", session.host},
@@ -1450,6 +1493,9 @@ defmodule Tightbeam.Gateway do
                   {:ok, pointer.harness_session_id}
 
                 {:error, :contained_sandbox_disable_failed} = error ->
+                  error
+
+                {:error, {:model_apply_failed, _reason}} = error ->
                   error
 
                 {:error, lost} ->
@@ -2561,44 +2607,56 @@ defmodule Tightbeam.Gateway do
     with :ok <- validate_catalog_model(session.harness, new_ref, false),
          {%{provider: provider}, _health} <-
            ModelCatalog.entry(session.harness, new_ref, ModelCatalog) do
-      Org.set_model(db, call.session_key, new_ref, Atom.to_string(provider))
+      case apply_tuned_model(config, db, session, new_ref) do
+        :ok ->
+          Org.set_model(db, call.session_key, new_ref, Atom.to_string(provider))
+          %{ok: true}
 
-      load_result =
-        with pointer when not is_nil(pointer) <- Org.current_pointer(db, call.session_key),
-             coordinator when is_pid(coordinator) <-
-               Process.whereis(Tightbeam.AdapterCoordinator),
-             harness = Harness.parse!(session.harness).id(),
-             cwd = Placement.holder_workdir(config, session),
-             revision = session.identity_revision || Identity.live_revision!(config.base_dir),
-             snapshot = served_snapshot(config, session, harness, revision),
+        {:error, reason} ->
+          %{ok: false, reason: reason}
+      end
+    else
+      {:error, denial} -> denial
+    end
+  end
+
+  defp apply_tuned_model(config, db, session, new_ref) do
+    case Org.current_pointer(db, session.session_key) do
+      nil ->
+        :ok
+
+      pointer ->
+        coordinator = Process.whereis(Tightbeam.AdapterCoordinator)
+        harness = Harness.parse!(session.harness).id()
+
+        with true <- is_pid(coordinator),
              {:ok, adapter, _generation} <-
                AdapterCoordinator.adapter_for(
                  coordinator,
                  {harness, "shared", session.host}
                ) do
-          AdapterCoordinator.with_load_slot(coordinator, fn ->
-            Adapter.load_session(
-              adapter,
-              pointer.harness_session_id,
-              new_ref,
-              cwd,
-              session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers(),
-              snapshot.guidance
-            )
-          end)
+          if Adapter.knows_session?(adapter, pointer.harness_session_id) do
+            Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
+          else
+            cwd = Placement.holder_workdir(config, session)
+            revision = session.identity_revision || Identity.live_revision!(config.base_dir)
+            snapshot = served_snapshot(config, session, harness, revision)
+
+            AdapterCoordinator.with_load_slot(coordinator, fn ->
+              Adapter.load_session(
+                adapter,
+                pointer.harness_session_id,
+                new_ref,
+                cwd,
+                session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers(),
+                snapshot.guidance
+              )
+            end)
+          end
         else
-          _ -> :ok
+          false -> {:error, :adapter_unavailable}
+          {:error, reason} -> {:error, reason}
         end
-
-      case load_result do
-        {:error, :contained_sandbox_disable_failed} ->
-          %{ok: false, reason: :contained_sandbox_disable_failed}
-
-        _ ->
-          %{ok: true}
-      end
-    else
-      {:error, denial} -> denial
     end
   end
 

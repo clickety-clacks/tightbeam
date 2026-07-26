@@ -101,6 +101,11 @@ defmodule Tightbeam.Acp.Adapter do
   def apply_model_strict(adapter, session_id, model, prior_model),
     do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
 
+  @doc "Apply a model selection and surface any explicit harness refusal."
+  @spec apply_model(adapter(), String.t(), model_ref()) :: :ok | {:error, term()}
+  def apply_model(adapter, session_id, model),
+    do: GenServer.call(adapter, {:apply_model, session_id, model}, 30_000)
+
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
   this GenServer keeps routing updates, replies when the harness finishes.
@@ -242,7 +247,7 @@ defmodule Tightbeam.Acp.Adapter do
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            }),
          sid = result["sessionId"],
-         :ok <- apply_model(state, sid, model),
+         :ok <- apply_model_to_session(state, sid, model),
          :ok <- set_mode(state, sid) do
       state = %{state | known: MapSet.put(state.known, sid)}
       {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
@@ -260,21 +265,22 @@ defmodule Tightbeam.Acp.Adapter do
            mcpServers: mcp_servers,
            _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
          }) do
-      {:ok, _} ->
-        # Best-effort: a loaded session already HAS a model. The option's
-        # valid set is populated asynchronously in the harness and can lag
-        # adapter boot, so a refused re-assert here must never cost the
-        # session's memory — continuity outranks the config option.
-        _ = apply_model(state, sid, model)
-
-        case set_mode_after_load(state, sid) do
+      {:ok, _result} ->
+        case apply_model_to_session(state, sid, model) do
           :ok ->
-            state = %{state | known: MapSet.put(state.known, sid)}
-            {:reply, :ok, put_in(state.chunks[sid], [])}
+            case set_mode_after_load(state, sid) do
+              :ok ->
+                state = %{state | known: MapSet.put(state.known, sid)}
+                {:reply, :ok, put_in(state.chunks[sid], [])}
 
-          {:error, :contained_sandbox_disable_failed} = error ->
+              {:error, _reason} = error ->
+                state = %{state | known: MapSet.delete(state.known, sid)}
+                {:reply, error, state}
+            end
+
+          {:error, reason} ->
             state = %{state | known: MapSet.delete(state.known, sid)}
-            {:reply, error, state}
+            {:reply, {:error, {:model_apply_failed, reason}}, state}
         end
 
       {:error, error} ->
@@ -306,10 +312,20 @@ defmodule Tightbeam.Acp.Adapter do
     {:reply, strict_apply_with_retry(state, sid, model, prior_model, 3), state}
   end
 
+  def handle_call({:apply_model, sid, model}, _from, state) do
+    {:reply, apply_model_to_session(state, sid, model), state}
+  end
+
   def handle_call({:knows_session?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
 
   def handle_call({:prompt, sid, text, opts}, from, state) do
+    start_prompt(state, sid, text, opts, from)
+  end
+
+  def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
+
+  defp start_prompt(state, sid, text, opts, from) do
     state = put_in(state.chunks[sid], [])
     # Per-turn progress channel: {fun, last_status, seq}. Deduped on text so
     # per-token thought chunks emit ONE "Thinking…" until something changes.
@@ -322,23 +338,38 @@ defmodule Tightbeam.Acp.Adapter do
     # Fire the ACP prompt asynchronously so this GenServer keeps routing
     # session/update chunks while the turn runs.
     parent = self()
+    dispatched = make_ref()
+    conn_monitor = Process.monitor(state.conn)
 
-    Task.start(fn ->
-      result =
-        Conn.request(
-          state.conn,
-          "session/prompt",
-          %{sessionId: sid, prompt: [%{type: "text", text: text}]},
-          timeout: Application.get_env(:tightbeam, :turn_timeout_ms, 600_000)
-        )
+    prompt_worker =
+      spawn(fn ->
+        result =
+          Conn.request(
+            state.conn,
+            "session/prompt",
+            %{sessionId: sid, prompt: [%{type: "text", text: text}]},
+            timeout: Application.get_env(:tightbeam, :turn_timeout_ms, 600_000),
+            notify_dispatched: {parent, {:prompt_dispatched, dispatched}}
+          )
 
-      send(parent, {:prompt_done, sid, from, result})
-    end)
+        send(parent, {:prompt_done, sid, from, result})
+      end)
+
+    receive do
+      {:prompt_dispatched, ^dispatched} ->
+        Process.demonitor(conn_monitor, [:flush])
+
+      {:DOWN, ^conn_monitor, :process, _pid, _reason} ->
+        send(parent, {:prompt_done, sid, from, {:error, :prompt_dispatch_failed}})
+    after
+      Application.get_env(:tightbeam, :prompt_dispatch_timeout_ms, 60_000) ->
+        Process.demonitor(conn_monitor, [:flush])
+        Process.exit(prompt_worker, :kill)
+        send(parent, {:prompt_done, sid, from, {:error, :prompt_dispatch_failed}})
+    end
 
     {:noreply, state}
   end
-
-  def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
 
   @impl true
   def handle_info({:acp_notification, "account/updated", params}, state) do
@@ -426,13 +457,13 @@ defmodule Tightbeam.Acp.Adapter do
 
   ## Model application (the fable-trap rule)
 
-  defp apply_model(state, sid, model_ref) do
-    apply_model(state, sid, model_ref, fn method, params ->
+  defp apply_model_to_session(state, sid, model_ref) do
+    apply_model_to_session(state, sid, model_ref, fn method, params ->
       Conn.request(state.conn, method, params)
     end)
   end
 
-  defp apply_model(state, sid, model_ref, request) do
+  defp apply_model_to_session(state, sid, model_ref, request) do
     {model, effort} = parse_model_ref(model_ref)
 
     with {:ok, _} <-
@@ -551,7 +582,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     with {:ok, result} <- request.("session/new", %{cwd: probe_cwd, mcpServers: []}),
          sid = result["sessionId"],
-         :ok <- apply_model(state, sid, probe_model, request),
+         :ok <- apply_model_to_session(state, sid, probe_model, request),
          {:ok, _} <-
            request.("session/set_mode", %{
              sessionId: sid,

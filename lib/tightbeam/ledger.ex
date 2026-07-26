@@ -44,6 +44,10 @@ defmodule Tightbeam.Ledger do
     prompt     TEXT NOT NULL,
     roleRef    TEXT,
     roleFallback INTEGER NOT NULL DEFAULT 0,
+    assignmentId TEXT,
+    jobRef     TEXT,
+    model      TEXT,
+    harness    TEXT,
     status     TEXT NOT NULL DEFAULT 'queued'
                CHECK (status IN ('queued','running','delivered','canceled',
                                  'failed','failed_unknown')),
@@ -70,13 +74,26 @@ defmodule Tightbeam.Ledger do
 
     for ddl <- [
           "ALTER TABLE turns ADD COLUMN roleRef TEXT",
-          "ALTER TABLE turns ADD COLUMN roleFallback INTEGER NOT NULL DEFAULT 0"
+          "ALTER TABLE turns ADD COLUMN roleFallback INTEGER NOT NULL DEFAULT 0",
+          "ALTER TABLE turns ADD COLUMN assignmentId TEXT",
+          "ALTER TABLE turns ADD COLUMN jobRef TEXT",
+          "ALTER TABLE turns ADD COLUMN model TEXT",
+          "ALTER TABLE turns ADD COLUMN harness TEXT"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
         {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
       end
     end
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        CREATE INDEX IF NOT EXISTS turns_job_ref ON turns (jobRef);
+        CREATE INDEX IF NOT EXISTS turns_assignment_id ON turns (assignmentId);
+        """
+      )
 
     result
   end
@@ -94,8 +111,9 @@ defmodule Tightbeam.Ledger do
       txn,
       """
         INSERT INTO turns
-          (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+          (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
+           assignmentId, jobRef, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
       """,
       [
         Map.fetch!(attrs, :session_key),
@@ -105,6 +123,8 @@ defmodule Tightbeam.Ledger do
         Map.fetch!(attrs, :prompt),
         Map.get(attrs, :role_ref),
         if(Map.get(attrs, :role_fallback, false), do: 1, else: 0),
+        Map.get(attrs, :assignment_id),
+        Map.get(attrs, :job_ref),
         now
       ]
     )
@@ -155,13 +175,23 @@ defmodule Tightbeam.Ledger do
             :busy
 
           [] ->
-            session_filter =
+            {session_filter, selected_mind} =
               case Txn.q(
                      txn,
                      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
                    ) do
                 [[1]] ->
-                  """
+                  mind =
+                    case Txn.q(
+                           txn,
+                           "SELECT model, harness FROM sessions WHERE sessionKey = ?1",
+                           [session_key]
+                         ) do
+                      [[model, harness]] -> {model, harness}
+                      [] -> {nil, nil}
+                    end
+
+                  filter = """
                   AND EXISTS (
                     SELECT 1 FROM sessions AS s
                     WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
@@ -170,21 +200,25 @@ defmodule Tightbeam.Ledger do
                   )
                   """
 
+                  {filter, mind}
+
                 [] ->
-                  ""
+                  {"", {nil, nil}}
               end
 
             Txn.q(
               txn,
               """
-                UPDATE turns SET status = 'running', owner = ?2, startedAt = ?3
+                UPDATE turns
+                SET status = 'running', owner = ?2, startedAt = ?3,
+                    model = ?4, harness = ?5
                 WHERE seq = (SELECT t.seq FROM turns AS t
                              WHERE t.sessionKey = ?1 AND t.status = 'queued'
                                #{session_filter}
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
               """,
-              [session_key, owner, now]
+              [session_key, owner, now, elem(selected_mind, 0), elem(selected_mind, 1)]
             )
 
             if Txn.changes(txn) == 1 do

@@ -280,10 +280,17 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
             &format!(
                 "cd {} && npm install --prefix adapters {}",
                 remote_path(&resolved_base),
-                catalog
-                    .harnesses
+                args.harnesses
                     .iter()
-                    .map(|harness| harness.install_package.as_str())
+                    .map(|name| {
+                        catalog
+                            .harnesses
+                            .iter()
+                            .find(|harness| harness.wire_name == *name)
+                            .expect("harnesses were validated")
+                            .install_package
+                            .as_str()
+                    })
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -689,7 +696,7 @@ mod tests {
         let adapter_install = io.commands[3].1.last().unwrap();
         assert!(adapter_install.contains("claude-package"));
         assert!(adapter_install.contains("codex-package"));
-        assert!(adapter_install.contains("fixture-package"));
+        assert!(!adapter_install.contains("fixture-package"));
         assert!(!adapter_install.contains("absent-package"));
         assert_eq!(
             io.dispatched,
@@ -719,6 +726,46 @@ mod tests {
                 .contains(&"[assimilate] REGISTER... skipped (--dry-run)".to_owned())
         );
         assert!(io.dispatched.is_empty());
+    }
+
+    #[test]
+    fn dry_run_installs_only_selected_harness_adapters() {
+        let catalog = HarnessCatalog {
+            harnesses: [
+                ("claude", "@agentclientprotocol/claude-agent-acp"),
+                ("codex", "codex-acp"),
+            ]
+            .into_iter()
+            .map(
+                |(name, install_package)| crate::harnesses::HarnessProjection {
+                    id: name.to_owned(),
+                    wire_name: name.to_owned(),
+                    install_package: install_package.to_owned(),
+                    process_markers: Vec::new(),
+                },
+            )
+            .collect(),
+        };
+
+        let mut codex_io = FakeIo::default();
+        let mut codex_args = args();
+        codex_args.dry_run = true;
+        codex_args.harnesses = vec!["codex".to_owned()];
+        codex_args.catalog = catalog.clone();
+        assimilate_with(&mut codex_io, codex_args).unwrap();
+        let codex_plan = codex_io.logs.join("\n");
+        assert!(codex_plan.contains("codex-acp"));
+        assert!(!codex_plan.contains("claude-agent-acp"));
+
+        let mut all_io = FakeIo::default();
+        let mut all_args = args();
+        all_args.dry_run = true;
+        all_args.harnesses = catalog.names();
+        all_args.catalog = catalog;
+        assimilate_with(&mut all_io, all_args).unwrap();
+        let all_plan = all_io.logs.join("\n");
+        assert!(all_plan.contains("codex-acp"));
+        assert!(all_plan.contains("claude-agent-acp"));
     }
 
     #[test]

@@ -9,16 +9,44 @@ defmodule Tightbeam.LaneTest do
     :ok = Ledger.ensure_schema(db)
     :ok = EventLog.ensure_schema(db)
 
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE sessions (
+        sessionKey TEXT PRIMARY KEY,
+        model TEXT NOT NULL,
+        harness TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'active',
+        adjudicationHold TEXT,
+        updatedAt INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO sessions (sessionKey, model, harness)
+      VALUES
+        ('k1', 'claude-sonnet-5[medium]', 'claude'),
+        ('k2', 'claude-sonnet-5[medium]', 'claude');
+      """)
+
     reg = start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
-    task_sup = start_supervised!({Task.Supervisor, name: :"tsup_#{System.unique_integer([:positive])}"})
-    lane_sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: :"lsup_#{System.unique_integer([:positive])}"})
+
+    task_sup =
+      start_supervised!({Task.Supervisor, name: :"tsup_#{System.unique_integer([:positive])}"})
+
+    lane_sup =
+      start_supervised!(
+        {DynamicSupervisor,
+         strategy: :one_for_one, name: :"lsup_#{System.unique_integer([:positive])}"}
+      )
 
     %{db: db, reg: reg, task_sup: task_sup, lane_sup: lane_sup}
   end
 
   defp enqueue!(db, sk, prompt) do
     {:ok, seq} =
-      Ledger.enqueue(db, %{session_key: sk, message_id: "m_#{System.unique_integer([:positive])}", origin: "user:t", prompt: prompt})
+      Ledger.enqueue(db, %{
+        session_key: sk,
+        message_id: "m_#{System.unique_integer([:positive])}",
+        origin: "user:t",
+        prompt: prompt
+      })
 
     seq
   end
@@ -38,8 +66,12 @@ defmodule Tightbeam.LaneTest do
 
     {:ok, mgr} =
       LaneManager.start_link(
-        db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
-        runner: recording_runner(agent), interval: 60_000, name: :"mgr_#{System.unique_integer([:positive])}"
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: recording_runner(agent),
+        interval: 60_000,
+        name: :"mgr_#{System.unique_integer([:positive])}"
       )
 
     :ok = LaneManager.reconcile(mgr)
@@ -54,8 +86,12 @@ defmodule Tightbeam.LaneTest do
 
     {:ok, _mgr} =
       LaneManager.start_link(
-        db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
-        runner: recording_runner(agent), interval: 60_000, name: :"mgr_#{System.unique_integer([:positive])}"
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: recording_runner(agent),
+        interval: 60_000,
+        name: :"mgr_#{System.unique_integer([:positive])}"
       )
 
     # init runs one reconcile pass; the committed turn must be picked up
@@ -77,8 +113,12 @@ defmodule Tightbeam.LaneTest do
 
     {:ok, mgr} =
       LaneManager.start_link(
-        db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
-        runner: runner, interval: 60_000, name: :"mgr_#{System.unique_integer([:positive])}"
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :"mgr_#{System.unique_integer([:positive])}"
       )
 
     :ok = LaneManager.reconcile(mgr)
@@ -86,14 +126,20 @@ defmodule Tightbeam.LaneTest do
     # survivor ran; boom is terminal-failed, never retried
     assert Agent.get(agent, & &1) == ["survivor"]
 
-    {:ok, [[n]]} = {:ok, DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE status='failed'") |> elem(1)}
+    {:ok, [[n]]} =
+      {:ok, DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE status='failed'") |> elem(1)}
+
     assert n == 1
   end
 
   defp eventually(fun, tries \\ 60) do
     cond do
-      fun.() -> true
-      tries == 0 -> false
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
       true ->
         Process.sleep(25)
         eventually(fun, tries - 1)
@@ -117,16 +163,30 @@ defmodule Tightbeam.LaneTest do
 
     {:ok, _mgr} =
       LaneManager.start_link(
-        db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
-        runner: runner, interval: 60_000, name: mgr_name,
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: mgr_name,
         on_terminal: fn session_key, seq -> send(test_pid, {:terminal, session_key, seq}) end
       )
 
     {:ok, seq1} =
-      Ledger.enqueue(ctx.db, %{session_key: "k1", message_id: "m_hang", origin: "user:u", prompt: "hang"})
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m_hang",
+        origin: "user:u",
+        prompt: "hang"
+      })
 
     {:ok, _} =
-      Ledger.enqueue(ctx.db, %{session_key: "k1", message_id: "m_next", origin: "user:u", prompt: "next"})
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m_next",
+        origin: "user:u",
+        prompt: "next"
+      })
 
     :ok = LaneManager.ensure_lane(mgr_name, "k1")
     assert_receive {:started, "hang"}
@@ -150,8 +210,11 @@ defmodule Tightbeam.LaneTest do
 
     {:ok, _mgr} =
       LaneManager.start_link(
-        db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
-        runner: fn _ -> {:ok, %{}} end, interval: 60_000,
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: fn _ -> {:ok, %{}} end,
+        interval: 60_000,
         terminal_publisher: fn _ -> :ok end,
         on_terminal: fn session_key, terminal_seq ->
           send(parent, {:recovered_terminal, session_key, terminal_seq})

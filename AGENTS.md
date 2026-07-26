@@ -53,3 +53,13 @@ everyone downstream.
 - **Make sure the test is real.** It must be able to fail: it exercises the actual subject, it
   asserts a specific observable outcome, and breaking the code it covers turns it red. If you
   cannot state what regression it would catch, it is not a test yet.
+- **A mock that diverges from the real harness tests fake shit.** (Flynn, 2026-07-26, after
+  merge ff4b64b passed 730 mocked tests and then killed every LIVE claude turn — reverted.)
+  Mocks are valid ONLY for properties that live entirely on OUR side of the ACP seam
+  (durability, ordering, races, SQL — stage pathologies freely). Any test whose property
+  depends on what the OTHER side actually does is circular through a mock: it verifies our
+  handling of a reply we authored. Every boundary assumption a mock encodes (which methods
+  exist, what replies carry, which config options a harness declares) must be backed by
+  recorded real responses (re-capture fixtures) or a live gate. Any lane that touches the
+  adapter seam runs the LIVE feature_smoke matrix (both harnesses, fresh org) as part of its
+  own gates — before merge, not after.

@@ -219,6 +219,46 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
   end
 
+  test "a prompt worker that dies before dispatch returns an error without wedging the adapter" do
+    {adapter, _capture_path} = start_adapter()
+    dead_conn = spawn(fn -> :ok end)
+    monitor = Process.monitor(dead_conn)
+    assert_receive {:DOWN, ^monitor, :process, ^dead_conn, :normal}
+
+    :sys.replace_state(adapter, &%{&1 | conn: dead_conn})
+
+    assert {:error, :prompt_dispatch_failed} = Adapter.prompt(adapter, "sess-1", "never sent")
+    assert Adapter.conn(adapter) == dead_conn
+  end
+
+  test "a missing prompt dispatch acknowledgement times out without wedging the adapter" do
+    old_timeout = Application.get_env(:tightbeam, :prompt_dispatch_timeout_ms)
+
+    on_exit(fn ->
+      if old_timeout,
+        do: Application.put_env(:tightbeam, :prompt_dispatch_timeout_ms, old_timeout),
+        else: Application.delete_env(:tightbeam, :prompt_dispatch_timeout_ms)
+    end)
+
+    Application.put_env(:tightbeam, :prompt_dispatch_timeout_ms, 25)
+    {adapter, _capture_path} = start_adapter()
+
+    inert_conn =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn -> send(inert_conn, :stop) end)
+    :sys.replace_state(adapter, &%{&1 | conn: inert_conn})
+
+    assert {:error, :prompt_dispatch_failed} =
+             Adapter.prompt(adapter, "sess-1", "never acknowledged", 100)
+
+    assert Adapter.conn(adapter) == inert_conn
+  end
+
   test "close_session sends ACP session/close with the harness session id" do
     {adapter, capture_path} = start_adapter()
     assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
@@ -307,14 +347,17 @@ defmodule Tightbeam.Acp.AdapterTest do
                     }}
   end
 
-  test "model-selection divergence is negative-controlled without losing the loaded session" do
-    {claude, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
-    assert :ok = Adapter.load_session(claude, "sess-1", "fable", "/tmp", [], "guidance")
+  test "new and load surface model apply failures without claiming residency" do
+    {adapter, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
 
-    assert {:error, :model_unavailable} =
-             Adapter.apply_model_strict(claude, "sess-1", "fable", "haiku")
+    assert {:error, %{"message" => "Invalid value for config option model"}} =
+             Adapter.new_session(adapter, "fable", "/tmp", [], "guidance")
 
-    assert Adapter.knows_session?(claude, "sess-1")
+    assert {:error,
+            {:model_apply_failed, %{"message" => "Invalid value for config option model"}}} =
+             Adapter.load_session(adapter, "sess-1", "fable", "/tmp", [], "guidance")
+
+    refute Adapter.knows_session?(adapter, "sess-1")
 
     {codex, _capture} = start_adapter(harness: :codex)
     assert :ok = Adapter.load_session(codex, "sess-1", "gpt-old", "/tmp", [], "guidance")
