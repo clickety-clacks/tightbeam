@@ -24,7 +24,7 @@ defmodule Tightbeam.Dispatch do
   still appends a "verb" row with the error.
   """
 
-  alias Tightbeam.{DB, Escalation, EventLog, RailRemedy, Rules}
+  alias Tightbeam.{Assignments, DB, Escalation, EventLog, RailRemedy, Rules}
 
   @typedoc """
   A verb call. `origin` is WHO (\"user:flynn\" | \"agent:<handle>\") — never
@@ -64,6 +64,34 @@ defmodule Tightbeam.Dispatch do
     principal = Map.get(call, :principal)
     session_key = Map.get(call, :session_key)
 
+    case bracket_precheck(db, call, verb) do
+      :proceed ->
+        dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key)
+
+      {:replay, assignment} ->
+        # A keyed replay bypasses the rail entirely (statute inertness): the
+        # original assignment is returned, no rumination, no terminal guard.
+        :ok = EventLog.append_event(db, "verb", verb, origin, session_key, assignment, principal)
+        {:ok, assignment}
+
+      {:refuse, error} ->
+        # Terminal guard fires BEFORE Rules.decide: no statute or remedy episode
+        # touches a non-open item (work-item-brackets §Mechanism, Proof 12).
+        best_effort_denial(db, verb, origin, principal, session_key, error)
+        {:error, error}
+    end
+  end
+
+  # The replay/terminal hoist is the one structural change: for an assign or
+  # dispatch, the idempotency replay lookup and the terminal guard are resolved
+  # before the rail so both the guard and Rules.decide see the replay outcome.
+  defp bracket_precheck(db, call, verb) when verb in ["assign", "dispatch"] do
+    Assignments.dispatch_precheck(db, call)
+  end
+
+  defp bracket_precheck(_db, _call, _verb), do: :proceed
+
+  defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
     {decision, to_close, to_consume} = Rules.decide(db, call)
     Enum.each(to_close, fn {statute, subject} -> RailRemedy.close(db, statute, subject) end)
 

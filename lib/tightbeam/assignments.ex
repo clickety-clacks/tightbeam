@@ -130,18 +130,22 @@ defmodule Tightbeam.Assignments do
       Txn.q(
         txn,
         """
-        SELECT a.id, EXISTS(SELECT 1 FROM attests f WHERE f.assignmentId=a.id)
+        SELECT a.id, EXISTS(SELECT 1 FROM attests f WHERE f.assignmentId=a.id), a.workItemId
         FROM assignments a
         WHERE a.holderKey=?1 AND a.state='open'
         ORDER BY a.openedAt, a.id
         """,
         [session_key]
       )
-      |> Enum.map(fn [id, has_attests] ->
-        %{assignment_id: id, from_state: if(has_attests == 1, do: "active", else: "open")}
+      |> Enum.map(fn [id, has_attests, work_item_id] ->
+        %{
+          assignment_id: id,
+          from_state: if(has_attests == 1, do: "active", else: "open"),
+          work_item_id: work_item_id
+        }
       end)
 
-    Enum.each(assignments, fn %{assignment_id: assignment_id} ->
+    Enum.each(assignments, fn %{assignment_id: assignment_id, work_item_id: work_item_id} ->
       ts = now()
 
       Txn.q(
@@ -164,6 +168,7 @@ defmodule Tightbeam.Assignments do
 
       append_marker(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
       EffortCheckin.cancel_in_txn(txn, assignment_id)
+      Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
     end)
 
     assignments
@@ -386,6 +391,51 @@ defmodule Tightbeam.Assignments do
       "assign"
     )
   end
+
+  @doc """
+  The dispatch-chokepoint precheck (work-item-brackets §Mechanism total order):
+  hoisted ABOVE `Rules.decide` so both the terminal guard and the rail see the
+  replay outcome first. For a keyed assign/dispatch, an idempotency hit returns
+  the ORIGINAL assignment and bypasses work-item state, statutes, the terminal
+  guard, and rumination. On a miss, a workItemId pointing at a non-open item is
+  refused BEFORE any statute or remedy episode can fire. Assign's pre-lookup
+  validations (authority, subject, key-format, files) run verbatim first.
+  """
+  @spec dispatch_precheck(DB.server(), map()) ::
+          :proceed | {:replay, map()} | {:refuse, map()}
+  def dispatch_precheck(db, call) do
+    verb = Map.fetch!(call, :verb)
+
+    with :ok <- principal_allowed(call.principal, verb),
+         :ok <- valid_subject(call.params[:subject]),
+         :ok <- valid_idempotency_key(call.params[:idempotency_key]),
+         {:ok, _files} <- assignment_files(verb, call.params) do
+      key = call.params[:idempotency_key]
+      replay = if is_binary(key), do: replayed_assignment(db, call), else: nil
+
+      case replay do
+        %{} = assignment ->
+          {:replay, assignment}
+
+        nil ->
+          case call.params[:work_item_id] do
+            nil ->
+              :proceed
+
+            work_item_id ->
+              case Tightbeam.WorkItems.state_for(db, work_item_id) do
+                state when state in [nil, "open"] -> :proceed
+                _terminal -> {:refuse, work_item_not_open(work_item_id)}
+              end
+          end
+      end
+    else
+      %{code: _} = error -> {:refuse, error}
+    end
+  end
+
+  defp work_item_not_open(work_item_id),
+    do: error("work_item_not_open", "work item #{work_item_id} is not open")
 
   defp dispatch_result(db, call) do
     case {call.params[:work_item_id], call.principal} do
@@ -614,7 +664,8 @@ defmodule Tightbeam.Assignments do
         error("session_retired", "assignments require an active holder session")
 
       [["active", harness, provider]] ->
-        work_item_id = if verb == "assign", do: call.params[:work_item_id], else: nil
+        # F7 amendment: dispatch persists workItemId exactly as assign does.
+        work_item_id = call.params[:work_item_id]
 
         case work_item_id do
           nil ->
@@ -636,6 +687,12 @@ defmodule Tightbeam.Assignments do
           [] -> :ok
           [colliding_id | _] -> throw({:files_overlap, colliding_id})
         end
+
+        # In-txn state='open' INTERLOCK (r4-F1): the pre-statute guard and this
+        # insert are different transactions; a disposition committing between
+        # them must not let a terminal item acquire an open assignment. The
+        # optional probe seam drives a concurrent disposition between the checks.
+        assert_work_item_open!(txn, call, work_item_id)
 
         id = id("asg_")
         now = now()
@@ -674,6 +731,10 @@ defmodule Tightbeam.Assignments do
           )
         end)
 
+        # This assign/dispatch routed the item: cancel bracket 1 (and bracket 2
+        # if a prior last-close armed a slate wake — the slate is no longer clear).
+        if work_item_id, do: Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id)
+
         if key do
           # ownerUserId and sessionKey are historical column names: for assign
           # they store the prefixed principal id and assignment id respectively.
@@ -697,6 +758,23 @@ defmodule Tightbeam.Assignments do
         "files_overlap",
         "declared files overlap open assignment #{colliding_id}"
       )
+
+    {:work_item_not_open, work_item_id} ->
+      error("work_item_not_open", "work item #{work_item_id} is not open")
+  end
+
+  defp assert_work_item_open!(_txn, _call, nil), do: :ok
+
+  defp assert_work_item_open!(txn, call, work_item_id) do
+    case Map.get(call, :on_work_item_interlock) do
+      fun when is_function(fun, 1) -> fun.(txn)
+      _ -> :ok
+    end
+
+    case Tightbeam.WorkItems.state_in_txn(txn, work_item_id) do
+      "open" -> :ok
+      _ -> throw({:work_item_not_open, work_item_id})
+    end
   end
 
   defp attest_in_txn(txn, call) do
@@ -751,6 +829,7 @@ defmodule Tightbeam.Assignments do
                 if Txn.changes(txn) != 1, do: raise(TransitionRace)
                 EffortCheckin.cancel_in_txn(txn, assignment_id)
                 closed_assignment = fetch_assignment!(txn, assignment_id)
+                Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
                 append_attest_marker(txn, attest)
                 append_assignment_marker(txn, closed_assignment, :closed)
                 %{assignment: closed_assignment, attest: attest}
@@ -819,6 +898,7 @@ defmodule Tightbeam.Assignments do
             if Txn.changes(txn) != 1, do: raise(TransitionRace)
             EffortCheckin.cancel_in_txn(txn, assignment_id)
             revoked_assignment = fetch_assignment!(txn, assignment_id)
+            Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
             append_assignment_marker(txn, revoked_assignment, :revoked)
             revoked_assignment
         end

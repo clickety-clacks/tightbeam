@@ -473,8 +473,8 @@ defmodule Tightbeam.GatewayTest do
         ctx.db,
         """
         INSERT INTO work_items
-          (id, title, createdByUser, createdAt)
-        VALUES ('wi_banana', 'Banana', 'flynn', 1)
+          (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES ('wi_banana', 'Banana', 'flynn', 'flynn', 1)
         """
       )
 

@@ -21,7 +21,7 @@ defmodule Tightbeam.Idempotency do
   @ddl """
   CREATE TABLE IF NOT EXISTS wire_idempotency (
     ownerUserId    TEXT NOT NULL,
-    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition')),
+    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition','work-item-create')),
     idempotencyKey TEXT NOT NULL,
     sessionKey     TEXT NOT NULL,
     PRIMARY KEY (ownerUserId, operation, idempotencyKey)
@@ -34,10 +34,16 @@ defmodule Tightbeam.Idempotency do
     widen_operation_check(db)
   end
 
-  # SQLite cannot ALTER a CHECK: databases created before 'wake' joined the
-  # operation set get a rebuild (rename, recreate with the widened CHECK,
-  # copy, drop). Detected via the stored DDL; idempotent.
+  # SQLite cannot ALTER a CHECK: databases created before the newest operation
+  # joined the set get a rebuild (rename, recreate with the widened CHECK,
+  # copy, drop). 'work-item-create' is the current frontier (work-item
+  # brackets); a DB whose CHECK predates it (e.g. only through 'condition') is
+  # rebuilt. The rebuild is ONE transaction so a crash cannot strand keys in a
+  # half-migrated state, and a resume guard finishes any rebuild interrupted by
+  # a crash of an earlier (non-transactional) release before proceeding.
   defp widen_operation_check(db) do
+    recover_half_migrated(db)
+
     {:ok, rows} =
       DB.query(
         db,
@@ -47,21 +53,48 @@ defmodule Tightbeam.Idempotency do
 
     case rows do
       [[sql]] ->
-        if String.contains?(sql, "'condition'") do
-          :ok
-        else
-          :ok = DB.execute(db, "ALTER TABLE wire_idempotency RENAME TO wire_idempotency_old;")
-          :ok = DB.execute(db, @ddl)
-
-          {:ok, _} =
-            DB.query(db, "INSERT INTO wire_idempotency SELECT * FROM wire_idempotency_old", [])
-
-          :ok = DB.execute(db, "DROP TABLE wire_idempotency_old;")
-        end
+        unless String.contains?(sql, "'work-item-create'"), do: rebuild(db)
+        :ok
 
       _ ->
         :ok
     end
+  end
+
+  # An older release migrated with separate committed statements; a crash after
+  # the rename could leave wire_idempotency_old behind. Complete the copy (and
+  # drop) atomically before any caller reads the ledger, so no key is stranded.
+  # INSERT OR IGNORE tolerates a crash at any point (empty, partial, or full
+  # copy) because the primary key dedupes.
+  defp recover_half_migrated(db) do
+    {:ok, [[old_exists]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wire_idempotency_old'"
+      )
+
+    if old_exists == 1 do
+      transaction!(db, fn txn ->
+        Txn.exec(txn, @ddl)
+        Txn.q(txn, "INSERT OR IGNORE INTO wire_idempotency SELECT * FROM wire_idempotency_old")
+        Txn.exec(txn, "DROP TABLE wire_idempotency_old")
+        :ok
+      end)
+    end
+
+    :ok
+  end
+
+  defp rebuild(db) do
+    transaction!(db, fn txn ->
+      Txn.exec(txn, "ALTER TABLE wire_idempotency RENAME TO wire_idempotency_old")
+      Txn.exec(txn, @ddl)
+      Txn.q(txn, "INSERT INTO wire_idempotency SELECT * FROM wire_idempotency_old")
+      Txn.exec(txn, "DROP TABLE wire_idempotency_old")
+      :ok
+    end)
+
+    :ok
   end
 
   @doc "Prior result for this (owner, operation, key), or nil."

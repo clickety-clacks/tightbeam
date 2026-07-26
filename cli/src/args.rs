@@ -115,10 +115,28 @@ pub enum Command {
         title: String,
         spec_ref_name: Option<String>,
         spec_ref_sha256: Option<String>,
+        idempotency_key: Option<String>,
     },
     WorkItemGet {
         identity: Identity,
         work_item_id: String,
+    },
+    WorkItemIcebox {
+        identity: Identity,
+        work_item_id: String,
+    },
+    WorkItemReopen {
+        identity: Identity,
+        work_item_id: String,
+    },
+    WorkItemClose {
+        identity: Identity,
+        work_item_id: String,
+    },
+    WorkItemFail {
+        identity: Identity,
+        work_item_id: String,
+        reason: Option<String>,
     },
     Attest {
         identity: Identity,
@@ -256,7 +274,19 @@ COMMANDS:
       End a session deliberately.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
+                   [--key <idempotencyKey>]
+      File a work item. Unrouted, it becomes YOUR problem on a deadline: file
+      it, then route it (assign/dispatch) or icebox it. --key makes create
+      idempotent (same key returns the same item).
   work-item-get <workItemId>
+  work-item-icebox <workItemId>
+      Shelve an unstaffed item (open → iceboxed). Requires zero open
+      assignments; work-item-reopen resumes it.
+  work-item-reopen <workItemId>
+  work-item-close <workItemId>
+      Conclude an item (→ closed). Requires zero open assignments.
+  work-item-fail <workItemId> [--reason <text>]
+      Rule an item failed (→ failed); --reason is recorded on the item.
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--files '["lib/a.ex","test/a_test.exs"]']
@@ -800,6 +830,7 @@ fn parse_with_optional_catalog(
                 title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
                 spec_ref_name,
                 spec_ref_sha256,
+                idempotency_key: nonempty(flags, "key"),
             })
         }
         "work-item-get" => {
@@ -809,6 +840,45 @@ fn parse_with_optional_catalog(
             Ok(Command::WorkItemGet {
                 identity: identity(flags)?,
                 work_item_id: parsed.positional[1].clone(),
+            })
+        }
+        "work-item-icebox" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-icebox <workItemId>".to_owned());
+            }
+            Ok(Command::WorkItemIcebox {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+            })
+        }
+        "work-item-reopen" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-reopen <workItemId>".to_owned());
+            }
+            Ok(Command::WorkItemReopen {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+            })
+        }
+        "work-item-close" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-close <workItemId>".to_owned());
+            }
+            Ok(Command::WorkItemClose {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+            })
+        }
+        "work-item-fail" => {
+            if parsed.positional.len() != 2 {
+                return Err(
+                    "usage: tightbeam work-item-fail <workItemId> [--reason <text>]".to_owned(),
+                );
+            }
+            Ok(Command::WorkItemFail {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+                reason: nonempty(flags, "reason"),
             })
         }
         "attest" => {
@@ -903,7 +973,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -1116,8 +1186,12 @@ mod tests {
                 "run-tests",
                 "spawn",
                 "wake",
+                "work-item-close",
                 "work-item-create",
+                "work-item-fail",
                 "work-item-get",
+                "work-item-icebox",
+                "work-item-reopen",
             ]
             .into_iter()
             .collect()
@@ -1297,7 +1371,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 
