@@ -28,9 +28,13 @@ defmodule Tightbeam.Id do
 
   @doc """
   ULID string (26 chars, Crockford base32): 48-bit millisecond timestamp then
-  80 random bits. Chosen where a value must be BOTH unique and lexicographically
-  ordered by mint time — a later ULID always sorts strictly after an earlier one,
-  which is what makes a coordinator epoch comparable across restarts.
+  80 random bits. Unique, and sortable by mint time to MILLISECOND granularity.
+
+  NOT strictly ordered: two ULIDs minted in the same millisecond order by their
+  random suffixes, so one may sort before another minted earlier. Use it as a
+  stable handle (an episodeId), never where a strictly-increasing value is
+  required — a coordinator epoch needs `AdapterCoordinator.mint_epoch/1`, whose
+  durable counter cannot tie.
 
       iex> id = Tightbeam.Id.ulid()
       iex> String.length(id)

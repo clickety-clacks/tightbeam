@@ -476,14 +476,26 @@ defmodule Tightbeam.Escalation do
 
     requests = Enum.map(rows, &(request_from_row(&1) |> list_projection()))
 
-    # Holds interleave by raisedAt into the EXISTING newest-first order; the sort
-    # is stable and the request rows arrive already ordered, so nothing existing
-    # is reordered.
     if status in [nil, "open"] do
-      Enum.sort_by(requests ++ hold_rows(db, opts), &(-&1.raised_at))
+      merge_holds(requests, hold_rows(db, opts))
     else
       requests
     end
+  end
+
+  # Holds interleave by raisedAt into the EXISTING order. This walks the request
+  # list and INSERTS holds into it rather than sorting the union: the existing
+  # sequence is emitted in the order the query returned it, so it cannot be
+  # permuted by a clock rollback or a migrated row whose timestamp does not track
+  # its rowid (cross-review F7 — a global sort could reorder existing rows, and
+  # the spec pins that existing results are NOT reordered).
+  defp merge_holds(requests, []), do: requests
+
+  defp merge_holds([], holds), do: Enum.sort_by(holds, &(-&1.raised_at))
+
+  defp merge_holds([request | rest], holds) do
+    {earlier, later} = Enum.split_with(holds, &(&1.raised_at > request.raised_at))
+    Enum.sort_by(earlier, &(-&1.raised_at)) ++ [request | merge_holds(rest, later)]
   end
 
   @doc """

@@ -102,27 +102,40 @@ defmodule Tightbeam.CausalEvents do
   end
 
   @doc """
-  Attest ids for `assignment_id` that no `prod_answered` event has recorded yet,
-  ordered by attest id. `assignment_prods.attestCount` is a bare count, so this
-  table is the only watermark available: an attest is "previously unseen" when
-  no event names it. Multiple attests arriving between two evaluations therefore
-  each get their own event, in id order.
+  The attest ids that answered a prod round, ordered by attest id.
+
+  `arrived` is how many attests appeared since the last evaluation
+  (`attestCount` is a bare count — the only watermark the schema carries). Only
+  that many are considered, taken NEWEST-first by rowid, because attests are
+  append-only: the newest `arrived` rows ARE the new ones. Bounding the window
+  this way is what keeps pre-v2 history out — scanning the whole attest history
+  would give every historical attest an event the first time a new one landed
+  after migration, which the spec forbids outright (cross-review F5).
+
+  Within the window, ids already named by a `prod_answered` event are dropped, so
+  a re-run of the same evaluation adds nothing.
   """
-  @spec unseen_attest_ids_in_txn(Txn.t(), String.t()) :: [String.t()]
-  def unseen_attest_ids_in_txn(%Txn{} = txn, assignment_id) do
+  @spec unseen_attest_ids_in_txn(Txn.t(), String.t(), non_neg_integer()) :: [String.t()]
+  def unseen_attest_ids_in_txn(_txn, _assignment_id, arrived) when arrived <= 0, do: []
+
+  def unseen_attest_ids_in_txn(%Txn{} = txn, assignment_id, arrived) do
     txn
     |> Txn.q(
       """
-      SELECT a.id FROM attests AS a
-      WHERE a.assignmentId = ?1
-        AND NOT EXISTS (
-          SELECT 1 FROM causal_events AS c
-          WHERE c.kind = 'prod_answered' AND c.assignmentId = ?1
-            AND json_extract(c.detail, '$.byAttestId') = a.id
-        )
+      SELECT a.id FROM (
+        SELECT id, rowid FROM attests
+        WHERE assignmentId = ?1
+        ORDER BY rowid DESC
+        LIMIT ?2
+      ) AS a
+      WHERE NOT EXISTS (
+        SELECT 1 FROM causal_events AS c
+        WHERE c.kind = 'prod_answered' AND c.assignmentId = ?1
+          AND json_extract(c.detail, '$.byAttestId') = a.id
+      )
       ORDER BY a.id ASC
       """,
-      [assignment_id]
+      [assignment_id, arrived]
     )
     |> Enum.map(&hd/1)
   end

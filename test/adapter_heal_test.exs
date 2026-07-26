@@ -61,6 +61,22 @@ defmodule Tightbeam.AdapterHealTest do
       do: {:reply, Map.fetch!(state, :load_session), state}
   end
 
+  defmodule DyingAdapter do
+    @moduledoc false
+    use GenServer
+    def start_link(_opts), do: GenServer.start_link(__MODULE__, nil)
+    def init(state), do: {:ok, state}
+
+    def handle_call({:knows_session?, _sid}, _from, state), do: {:reply, true, state}
+
+    # What Acp.Adapter's own {:acp_exit, status} handler produces when the harness
+    # process dies mid-turn: the adapter stops before it can reply.
+    def handle_call({:prompt, _sid, _text, _opts}, _from, state),
+      do:
+        {:stop, {:adapter_fault, %{reason: {:acp_exit, 137}, stderr: "harness died mid-turn"}},
+         state}
+  end
+
   defmodule WakeSchedulerStub do
     @moduledoc false
     use GenServer
@@ -100,6 +116,10 @@ defmodule Tightbeam.AdapterHealTest do
 
     def handle_call({:ready_token, _key}, _from, state) do
       {:reply, Map.get(state, :ready, :not_ready), state}
+    end
+
+    def handle_call({:last_failure, _key, generation}, _from, state) do
+      {:reply, Map.get(state, :failures, %{})[generation], state}
     end
 
     def handle_call({:set_ready, token}, _from, state),
@@ -277,7 +297,7 @@ defmodule Tightbeam.AdapterHealTest do
     assert :none = Ledger.claim_next(ctx.db, "k1", "held")
 
     # The verified ready event.
-    heal(ctx, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 2})
+    heal(ctx, {7, 2})
 
     probe_wake = hold(ctx.db)
     assert is_binary(probe_wake) and probe_wake != "*"
@@ -320,7 +340,7 @@ defmodule Tightbeam.AdapterHealTest do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
 
-    epoch = "01AAAAAAAAAAAAAAAAAAAAAAAA"
+    epoch = 7
     heal(ctx, {epoch, 2})
     first_probe = hold(ctx.db)
     assert is_binary(first_probe) and first_probe != "*"
@@ -346,7 +366,7 @@ defmodule Tightbeam.AdapterHealTest do
       start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
       run_failing_turn(ctx, "fault")
 
-      epoch = "01AAAAAAAAAAAAAAAAAAAAAAAA"
+      epoch = 7
       heal(ctx, {epoch, 2})
       probe_wake = hold(ctx.db)
       assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
@@ -389,7 +409,7 @@ defmodule Tightbeam.AdapterHealTest do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
 
-    epoch = "01AAAAAAAAAAAAAAAAAAAAAAAA"
+    epoch = 7
     :ok = CoordinatorStub.set_ready({:ok, {epoch, 2}})
     heal(ctx, {epoch, 2})
     assert probe_count(ctx.db) == 1
@@ -416,7 +436,7 @@ defmodule Tightbeam.AdapterHealTest do
   test "proof 3: a task-crash probe terminal re-holds (no adjudication closure runs)", ctx do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
-    heal(ctx, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 2})
+    heal(ctx, {7, 2})
     assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
 
     # SessionLane's :DOWN path: `failed` with :task_crash and NO
@@ -431,7 +451,7 @@ defmodule Tightbeam.AdapterHealTest do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
 
-    heal(ctx, {"01BBBBBBBBBBBBBBBBBBBBBBBB", 7})
+    heal(ctx, {11, 7})
     assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
     assert :ok = Ledger.finish(ctx.db, probe.seq, "failed")
     assert hold(ctx.db) == "*"
@@ -439,12 +459,9 @@ defmodule Tightbeam.AdapterHealTest do
     # A restarted coordinator mints a LARGER epoch and resets generation to 1.
     # Generation alone would read as older; epoch-first ordering is what makes
     # the sweep restart-stable.
-    assert AdapterCoordinator.newer_token?(
-             {"01CCCCCCCCCCCCCCCCCCCCCCCC", 1},
-             {"01BBBBBBBBBBBBBBBBBBBBBBBB", 7}
-           )
+    assert AdapterCoordinator.newer_token?({12, 1}, {11, 7})
 
-    heal(ctx, {"01CCCCCCCCCCCCCCCCCCCCCCCC", 1})
+    heal(ctx, {12, 1})
     assert probe_count(ctx.db) == 2
     assert hold(ctx.db) != "*"
   end
@@ -454,7 +471,7 @@ defmodule Tightbeam.AdapterHealTest do
     # committed (the lost-edge case). The post-commit level read must probe.
     start_supervised!(
       {CoordinatorStub,
-       checkout: {:error, :degraded}, ready: {:ok, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 4}}}
+       checkout: {:error, :degraded}, ready: {:ok, {7, 4}}}
     )
 
     run_failing_turn(ctx, "fault")
@@ -462,7 +479,7 @@ defmodule Tightbeam.AdapterHealTest do
     assert probe_count(ctx.db) == 1
     assert hold(ctx.db) != "*"
     assert AdapterCoordinator.decode_token(episode(ctx.db).heal_token) ==
-             {"01AAAAAAAAAAAAAAAAAAAAAAAA", 4}
+             {7, 4}
   end
 
   ## Proof 4 — visibility, and genuine decisions stay human
@@ -496,7 +513,7 @@ defmodule Tightbeam.AdapterHealTest do
     assert ^row = Escalation.get(ctx.db, owner_call, id, owner_user_id: "flynn")
 
     # A probe-in-flight hold is STILL a hold: the resolved episode stays listed.
-    heal(ctx, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 2})
+    heal(ctx, {7, 2})
     assert Adjudication.get(ctx.db, "k1", "other").status == "resolved"
 
     assert [%{id: ^id}] =
@@ -542,7 +559,7 @@ defmodule Tightbeam.AdapterHealTest do
     assert hold(ctx.db) == "*"
 
     # An adapter heal for this very session's adapter changes nothing.
-    heal(ctx, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 9})
+    heal(ctx, {7, 9})
     assert hold(ctx.db) == "*"
     assert probe_count(ctx.db) == 0
     assert episode(ctx.db).status == "notified"
@@ -570,7 +587,7 @@ defmodule Tightbeam.AdapterHealTest do
         ])
       end)
 
-    heal(ctx, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 2})
+    heal(ctx, {7, 2})
     probe_wake = hold(ctx.db)
     assert probe_wake != "*"
 
@@ -603,7 +620,7 @@ defmodule Tightbeam.AdapterHealTest do
         DB.Txn.q(txn, "UPDATE sessions SET adjudicationHold='w_ruling' WHERE sessionKey='k1'")
       end)
 
-    heal(ctx, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 2})
+    heal(ctx, {7, 2})
 
     assert hold(ctx.db) == "w_ruling"
     assert probe_count(ctx.db) == 0
@@ -625,7 +642,7 @@ defmodule Tightbeam.AdapterHealTest do
         )
       end)
 
-    heal(ctx, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 2})
+    heal(ctx, {7, 2})
 
     assert probe_count(ctx.db) == 1, "a session gets one probe, not one per episode"
     assert hold(ctx.db) != "*"
@@ -661,7 +678,7 @@ defmodule Tightbeam.AdapterHealTest do
         )
       end)
 
-    heal(ctx, {"01AAAAAAAAAAAAAAAAAAAAAAAA", 2})
+    heal(ctx, {7, 2})
 
     assert hold(ctx.db) == "*"
     assert probe_count(ctx.db) == 0
@@ -677,6 +694,185 @@ defmodule Tightbeam.AdapterHealTest do
     assert [%{cause: nil, disposition: "awaits_ruling"}] =
              Escalation.list(ctx.db, owner_call, "open", owner_user_id: "flynn")
              |> Enum.filter(&(&1.kind == "adjudication_hold"))
+  end
+
+  ## Cross-review regressions (Sol CHANGES-REQUIRED, 2026-07-26)
+
+  test "F1: a harness that dies MID-PROMPT opens an adapter_fault hold, not a bare task_crash",
+       ctx do
+    Org.append_pointer(ctx.db, "k1", "harness-sid-live", "created")
+    adapter = start_supervised!({DyingAdapter, []}, restart: :temporary)
+    start_supervised!({CoordinatorStub, checkout: {:ok, adapter, 1}})
+
+    {seq, reason} = run_failing_turn(ctx, "a turn the harness dies during")
+
+    # The designed error, NOT an exit the lane can only record as :task_crash.
+    assert {:adapter_unavailable, text} = reason
+    assert text =~ "acp_exit"
+    assert text =~ "harness died mid-turn"
+    refute turn_error(ctx.db, seq) =~ "task_crash"
+
+    # ...which is what lets the adjudication closure run at all: a runtime fault
+    # is a tagged, heal-eligible hold.
+    assert hold(ctx.db) == "*"
+    assert episode(ctx.db).cause == @cause
+  end
+
+  test "F2: coordinator epochs are STRICTLY increasing, with no same-millisecond ties", ctx do
+    # ULIDs tie randomly inside a millisecond, which could make a fast restart
+    # reject its own ready token and wedge the hold. The durable counter cannot.
+    epochs = for _ <- 1..2_000, do: AdapterCoordinator.mint_epoch(ctx.db)
+
+    assert length(Enum.uniq(epochs)) == 2_000
+    assert epochs == Enum.sort(epochs)
+    assert Enum.chunk_every(epochs, 2, 1, :discard) |> Enum.all?(fn [a, b] -> b > a end)
+
+    # And the ordering the sweep actually relies on: a later epoch with a RESET
+    # generation still outranks an earlier epoch's high generation.
+    [early, late] = [Enum.at(epochs, 0), Enum.at(epochs, -1)]
+    assert AdapterCoordinator.newer_token?({late, 1}, {early, 999})
+    refute AdapterCoordinator.newer_token?({early, 999}, {late, 1})
+  end
+
+  test "F2: an epoch survives a coordinator restart and keeps increasing", ctx do
+    first = AdapterCoordinator.mint_epoch(ctx.db)
+    # A restart re-reads the durable counter rather than minting from the clock.
+    second = AdapterCoordinator.mint_epoch(ctx.db)
+    assert second > first
+  end
+
+  test "F3: a DELAYED PARK ruling is not overwritten by a later heal", ctx do
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+
+    # The REAL park verb: it resolves the episode and schedules a condition wake,
+    # and it deliberately leaves the hold WIDE until that wake fires. A hold-only
+    # guard would let the heal below overwrite this human ruling.
+    handlers = Gateway.handlers(Map.put(ctx.config, :db, ctx.db))
+
+    assert %{ok: true, action: "park"} =
+             handlers["adjudicate"].(%{
+               origin: "user:flynn",
+               principal: {:session, episode.owner_target},
+               params: %{episode: episode.correlation_key, action: "park"}
+             })
+
+    parked = episode(ctx.db)
+    assert parked.status == "resolved"
+    assert is_nil(parked.heal_token), "a human ruling stamps no heal token"
+    assert hold(ctx.db) == "*", "park leaves the hold wide — the F3 precondition"
+
+    heal(ctx, {7, 2})
+
+    assert probe_count(ctx.db) == 0, "the heal must not overwrite a winning ruling"
+    assert hold(ctx.db) == "*"
+    assert episode(ctx.db).recovery_wake_id == parked.recovery_wake_id
+    assert is_nil(episode(ctx.db).heal_token)
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "adjudication_heal_lost"))
+  end
+
+  test "F3: a ruling that loses to a heal mid-flight is DENIED, not a crash", ctx do
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    handlers = Gateway.handlers(Map.put(ctx.config, :db, ctx.db))
+
+    # The inverse TOCTOU: the ruling validated the episode as `notified`, then a
+    # heal resolved it before the ruling's own transaction ran.
+    heal(ctx, {7, 2})
+    probe = hold(ctx.db)
+
+    assert %{code: "denied"} =
+             handlers["adjudicate"].(%{
+               origin: "user:flynn",
+               principal: {:session, episode.owner_target},
+               params: %{episode: episode.correlation_key, action: "park"}
+             })
+
+    # Rolled back cleanly: the probe still owns the hold, no park wake persisted.
+    assert hold(ctx.db) == probe
+    assert Adjudication.get(ctx.db, "k1", "other").recovery_wake_id == probe
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "adjudication_ruling_superseded")
+           )
+  end
+
+  test "F4: a remembered death reason is served ONLY to the generation that died", ctx do
+    sup =
+      start_supervised!(
+        {DynamicSupervisor,
+         strategy: :one_for_one, name: :"f4_sup_#{:erlang.unique_integer([:positive])}"}
+      )
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: sup,
+         db: ctx.db,
+         adapter_opts: fn _key -> [harness: :claude, cmd: ["/nonexistent/adapter"], home: "/tmp", cwd: "/tmp"] end,
+         name: :"f4_coord_#{:erlang.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "shared", "testhost"}
+    assert {:ok, _pid, generation} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert eventually(fn -> AdapterCoordinator.last_failure(coordinator, key, generation) != nil end)
+
+    # The generation that died gets its reason...
+    assert AdapterCoordinator.last_failure(coordinator, key, generation)
+
+    # ...and no other generation is ever labelled with it. Reporting a
+    # predecessor's reason for a new death is worse than reporting none.
+    refute AdapterCoordinator.last_failure(coordinator, key, generation + 1)
+    refute AdapterCoordinator.last_failure(coordinator, key, generation + 5)
+  end
+
+  test "F7: adding hold rows never reorders existing decision requests", ctx do
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+
+    # Requests whose raisedAt does NOT track rowid — a clock rollback, or rows
+    # migrated with timestamps that do not match insertion order. A global sort
+    # over the union would permute these; the listing must not.
+    for {id, raised_at} <- [{"dr_first", 9_000}, {"dr_second", 1_000}, {"dr_third", 5_000}] do
+      :ok =
+        DB.execute(ctx.db, """
+        INSERT INTO decision_requests
+          (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+           actionKey, question, options, context, status)
+        VALUES ('#{id}', 'statute', 'user:flynn', 'flynn', #{raised_at}, 1,
+                'st', '#{id}', 'q', '[]', '{}', 'open')
+        """)
+    end
+
+    call = %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
+
+    baseline =
+      Escalation.list(ctx.db, call, "open", owner_user_id: "flynn")
+      |> Enum.filter(&(&1.kind == "statute"))
+      |> Enum.map(& &1.id)
+
+    assert "hold:" <> _ =
+             Escalation.list(ctx.db, call, "open", owner_user_id: "flynn")
+             |> Enum.find(&(&1.kind == "adjudication_hold"))
+             |> Map.fetch!(:id)
+
+    with_holds =
+      Escalation.list(ctx.db, call, "open", owner_user_id: "flynn")
+      |> Enum.filter(&(&1.kind == "statute"))
+      |> Enum.map(& &1.id)
+
+    assert with_holds == baseline, "existing rows keep their exact relative order"
+    assert baseline == ["dr_third", "dr_second", "dr_first"], "the shipped rowid DESC direction"
+  end
+
+  defp eventually(fun, tries \\ 60) do
+    Enum.reduce_while(1..tries, false, fn _, _ ->
+      if fun.(), do: {:halt, true}, else: (Process.sleep(25); {:cont, false})
+    end)
   end
 
   ## Helpers

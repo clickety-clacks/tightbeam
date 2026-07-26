@@ -27,14 +27,23 @@ defmodule Tightbeam.AdapterCoordinator do
     flagged as planned — distinguishable from crashes in lifecycle_events.
   - The coordinator MONITORS adapters (never links); adapter death emits a
     lifecycle event with the exit reason and bumps the generation.
-  - HEAL TOKEN: `{coordinatorEpoch, generation}`. The epoch is a ULID minted
-    once at init, so every later coordinator epoch sorts strictly after every
-    earlier one; generation is the per-key counter above, which RESETS on
-    restart. Comparing epoch-first then generation is therefore restart-stable:
-    a post-restart ready always outranks a token stamped under the old epoch
-    (spec s4-operability-v1 §2). Readiness is tracked explicitly — a fresh
-    entry has zero failures and a closed circuit without ever having booted, so
-    only `{:adapter_ready, key}` may mark a key ready.
+  - HEAL TOKEN: `{coordinatorEpoch, generation}`. The epoch is a DURABLE
+    STRICTLY-MONOTONIC integer — one `coordinator_epochs` row inserted at each
+    init, its AUTOINCREMENT rowid taken as the epoch. It must be strictly
+    ordered, not merely usually: a ULID's random suffix ties arbitrarily WITHIN a
+    millisecond (cross-review F2 found a descending pair in 10k draws), so a fast
+    restart could mint a LOWER epoch, reject its own ready token as stale, and
+    leave the hold wedged — the exact wedge this spec exists to remove.
+    Generation is the per-key counter above, which RESETS on restart; comparing
+    epoch-first then generation is what makes the comparison restart-stable, so a
+    post-restart ready always outranks a token stamped under an older epoch
+    (spec s4-operability-v1 §2). Readiness is tracked explicitly — a fresh entry
+    has zero failures and a closed circuit without ever having booted, so only
+    `{:adapter_ready, key}` may mark a key ready.
+  - FAILURE MEMORY is ATTEMPT-SCOPED: `last_failure` records {generation, reason}
+    and is only served to a caller asking about that same generation. A
+    replacement adapter's death must never be labelled with its predecessor's
+    reason (cross-review F4).
   """
 
   use GenServer
@@ -93,7 +102,7 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   @typedoc "Heal token: epoch-first, then generation (see the moduledoc)."
-  @type heal_token :: {String.t(), non_neg_integer()}
+  @type heal_token :: {pos_integer(), non_neg_integer()}
 
   @doc """
   The heal token for `key` if that adapter is ready RIGHT NOW, else `:not_ready`
@@ -113,9 +122,9 @@ defmodule Tightbeam.AdapterCoordinator do
   to whoever asks, instead of only to whoever happened to have a call pending
   (spec s4-operability-v1 §Defect 1).
   """
-  @spec last_failure(GenServer.server(), adapter_key()) :: term() | nil
-  def last_failure(server \\ __MODULE__, key) do
-    GenServer.call(server, {:last_failure, key})
+  @spec last_failure(GenServer.server(), adapter_key(), non_neg_integer()) :: term() | nil
+  def last_failure(server \\ __MODULE__, key, generation) do
+    GenServer.call(server, {:last_failure, key, generation})
   end
 
   @doc "The canonical key string `<harness>:<preset>@<host>`, exactly as /version renders it."
@@ -138,24 +147,54 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
+  @doc """
+  Mint the next coordinator epoch: a durable strictly-increasing integer. The
+  AUTOINCREMENT rowid gives strict ordering across restarts for free, and the
+  rows double as a record of every coordinator start.
+  """
+  @spec mint_epoch(GenServer.server()) :: pos_integer()
+  def mint_epoch(db) do
+    :ok = ensure_schema(db)
+
+    {:ok, [[epoch]]} =
+      Tightbeam.DB.query(db, "INSERT INTO coordinator_epochs (at) VALUES (?1) RETURNING seq", [
+        System.system_time(:millisecond)
+      ])
+
+    epoch
+  end
+
+  @doc """
+  The epoch counter's table. Created by the coordinator itself at init rather
+  than by the org schema sweep, because the coordinator is also started directly
+  (tests, tooling) and its epoch must be durable in every case.
+  """
+  @spec ensure_schema(GenServer.server()) :: :ok | {:error, term()}
+  def ensure_schema(db) do
+    Tightbeam.DB.execute(db, """
+    CREATE TABLE IF NOT EXISTS coordinator_epochs (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      at  INTEGER NOT NULL
+    );
+    """)
+  end
+
   @doc "Wire encoding for the `healToken` column: `\"<epoch>:<generation>\"`."
   @spec encode_token(heal_token()) :: String.t()
-  def encode_token({epoch, generation}), do: epoch <> ":" <> Integer.to_string(generation)
+  def encode_token({epoch, generation}),
+    do: Integer.to_string(epoch) <> ":" <> Integer.to_string(generation)
 
   @doc "Inverse of `encode_token/1`; nil for a NULL/unparsable column."
   @spec decode_token(String.t() | nil) :: heal_token() | nil
   def decode_token(nil), do: nil
 
   def decode_token(encoded) do
-    case String.split(encoded, ":", parts: 2) do
-      [epoch, generation] ->
-        case Integer.parse(generation) do
-          {generation, ""} -> {epoch, generation}
-          _ -> nil
-        end
-
-      _ ->
-        nil
+    with [epoch, generation] <- String.split(encoded, ":", parts: 2),
+         {epoch, ""} <- Integer.parse(epoch),
+         {generation, ""} <- Integer.parse(generation) do
+      {epoch, generation}
+    else
+      _ -> nil
     end
   end
 
@@ -179,7 +218,7 @@ defmodule Tightbeam.AdapterCoordinator do
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
        load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
        failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
-       epoch: Tightbeam.Id.ulid(),
+       epoch: mint_epoch(Keyword.get(opts, :db, Tightbeam.DB)),
        on_adapter_ready: Keyword.get(opts, :on_adapter_ready, fn _key_name, _token -> :ok end),
        adapters: %{},
        monitors: %{},
@@ -209,8 +248,18 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, get_in(state.adapters, [key, :generation]) || 0, state}
   end
 
-  def handle_call({:last_failure, key}, _from, state) do
-    {:reply, get_in(state.adapters, [key, :last_failure]), state}
+  def handle_call({:last_failure, key, generation}, _from, state) do
+    # ATTEMPT-SCOPED: serve the reason only to the generation it belongs to. A
+    # caller whose adapter died while the coordinator has not yet processed that
+    # :DOWN gets nil, not the PREVIOUS attempt's reason — a generic reason is
+    # honest, a wrong one is not.
+    reply =
+      case get_in(state.adapters, [key, :last_failure]) do
+        {^generation, reason} -> reason
+        _ -> nil
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:ready_token, key}, _from, state) do
@@ -298,6 +347,10 @@ defmodule Tightbeam.AdapterCoordinator do
 
           failures = entry.failures + 1
           circuit = if failures >= state.failure_circuit, do: :open, else: :closed
+          # The death belongs to the generation that DIED, not to the bumped one
+          # the replacement will carry — that is the generation a turn holding
+          # this adapter checked out, and the only one it can ask about.
+          died_at = entry.generation
           generation = entry.generation + 1
           delay = backoff(state, failures)
           timer = Process.send_after(self(), {:restart_adapter, key, generation}, delay)
@@ -311,7 +364,7 @@ defmodule Tightbeam.AdapterCoordinator do
               circuit: circuit,
               timer: timer,
               ready: false,
-              last_failure: reason
+              last_failure: {died_at, reason}
           }
 
           {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
@@ -403,7 +456,7 @@ defmodule Tightbeam.AdapterCoordinator do
             circuit: circuit,
             timer: timer,
             ready: false,
-            last_failure: {:adapter_start_failed, start_reason}
+            last_failure: {generation, {:adapter_start_failed, start_reason}}
         }
 
         {{:error, :degraded}, %{state | adapters: Map.put(state.adapters, key, entry)}}

@@ -553,6 +553,66 @@ defmodule Tightbeam.JobForensicsTest do
     assert List.last(timeline).type == "turn_end"
   end
 
+  ## Cross-review regressions (Sol CHANGES-REQUIRED, 2026-07-26)
+
+  test "F5: a post-migration attest does NOT backfill pre-v2 attest history", ctx do
+    db = ctx.db
+    work_item(db, "wi_pre")
+    session(db, "supervisor")
+    session(db, "holder", "supervisor")
+    assignment(db, "asg_pre", "wi_pre", "holder")
+    handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
+
+    # A pre-v2 database: three attests already exist and are already COUNTED, but
+    # causal_events is empty because the table did not exist when they landed.
+    for id <- ["att_old_a", "att_old_b", "att_old_c"], do: attest(db, id, "asg_pre")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignment_prods
+        (assignmentId, attemptCount, prodCount, deniedStreak, attestCount)
+      VALUES ('asg_pre', 0, 1, 0, 3)
+      """)
+
+    assert answered(db) == []
+
+    # ONE new attest arrives after migration.
+    attest(db, "att_new", "asg_pre")
+    evaluate(db, handlers, "holder")
+
+    assert answered(db) == ["att_new"],
+           "only the attest that actually arrived gets an event; history stays NULL"
+  end
+
+  test "F6: an agent cannot forge wake or turn attribution", ctx do
+    db = ctx.db
+    work_item(db, "wi_forge")
+    session(db, "agent-session")
+    assignment(db, "asg_victim", "wi_forge", "agent-session")
+    handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
+
+    forge = fn principal ->
+      handlers["wake"].(%{
+        verb: "wake",
+        origin: "user:flynn",
+        principal: principal,
+        session_key: "agent-session",
+        params: %{prompt: "an ordinary conversational wake", after_ms: 0, nudge: false,
+                  assignment_id: "asg_victim"}
+      })
+    end
+
+    # An AGENT supplying assignment_id gets it dropped: a conversational wake is
+    # NULL, and no forged carrier can reach the turn or the trace (Law 0).
+    %{wake_id: agent_wake} = forge.({:session, "agent-session"})
+    assert is_nil(Wakes.get(db, agent_wake).assignment_id)
+
+    # The SUBSTRATE's own principal — which the router reserves and refuses to
+    # mint for a wire caller — is the only one that may stamp it.
+    %{wake_id: substrate_wake} = forge.({:process, "tightbeam"})
+    assert Wakes.get(db, substrate_wake).assignment_id == "asg_victim"
+  end
+
   ## Helpers
 
   # One turn-end shift. A prod leaves a PENDING wake, and the turn-end schedule's

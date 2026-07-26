@@ -142,6 +142,12 @@ defmodule Tightbeam.Acp.Adapter do
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
   this GenServer keeps routing updates, replies when the harness finishes.
+
+  A harness that dies MID-PROMPT kills this adapter before it can reply, so the
+  call must be caught like every other adapter-boundary call: otherwise the turn
+  task exits and the lane records a bare `:task_crash`, skipping the
+  adjudication closure entirely — no hold, no cause, nothing to heal
+  (cross-review F1; the spec names runtime failures an adapter-fault form).
   """
   @spec prompt(adapter(), String.t(), String.t(), timeout(), keyword()) ::
           {:ok, %{stop_reason: String.t(), text: String.t()}} | {:error, term()}
@@ -152,7 +158,7 @@ defmodule Tightbeam.Acp.Adapter do
         timeout \\ Application.get_env(:tightbeam, :turn_timeout_ms, 600_000),
         opts \\ []
       ),
-      do: GenServer.call(adapter, {:prompt, session_id, text, opts}, timeout + 5_000)
+      do: call(adapter, {:prompt, session_id, text, opts}, timeout + 5_000)
 
   @doc """
   Map one ACP session/update to a typing-indicator status line, or :skip.

@@ -513,10 +513,29 @@ defmodule Tightbeam.Adjudication do
   def probe_prompt, do: @probe_prompt
 
   @doc """
-  Resolve an episode as HEALED and stamp the token that probed it. Accepts
-  `claimed` and `notified` (a hold can heal before the owner was ever notified)
-  and is a no-op-safe update on an already-`resolved` re-held episode. Returns
-  true when the row was stamped.
+  Whether an episode is in a state a heal may take. This is the episode-state
+  half of the heal-vs-ruling CAS, and it is NOT the same question as "is the
+  session held":
+
+  - `claimed`/`notified` — open, no ruling has landed, the heal may take it.
+  - `resolved` WITH a healToken — a previous probe resolved it and its terminal
+    re-held the session; the heal may take it again on a newer token.
+  - `resolved` WITHOUT a healToken — a HUMAN RULING resolved it, and the heal must
+    keep its hands off. A delayed `park` is exactly this shape: it resolves the
+    episode but leaves the hold wide until its condition wake fires, so a
+    hold-only guard would let a later heal overwrite the winning ruling
+    (cross-review F3).
+  """
+  @spec heal_eligible?(map()) :: boolean()
+  def heal_eligible?(%{status: status}) when status in ["claimed", "notified"], do: true
+  def heal_eligible?(%{status: "resolved", heal_token: token}), do: not is_nil(token)
+  def heal_eligible?(_episode), do: false
+
+  @doc """
+  Resolve an episode as HEALED and stamp the token that probed it, CAS'd on the
+  episode still being heal-eligible per `heal_eligible?/1`. Returns true only
+  when this transition won; a false return means a human ruling got there first
+  and the caller must not proceed.
   """
   @spec heal_resolve_in_txn(Txn.t(), map(), String.t(), String.t()) :: boolean()
   def heal_resolve_in_txn(%Txn{} = txn, episode, probe_wake_id, encoded_token) do
@@ -526,6 +545,7 @@ defmodule Tightbeam.Adjudication do
       UPDATE adjudication_episodes
       SET status='resolved', recoveryWakeId=?3, resolvedAt=?4, healToken=?5
       WHERE sessionKey=?1 AND condition=?2
+        AND (status IN ('claimed','notified') OR healToken IS NOT NULL)
       """,
       [episode.session_key, episode.condition, probe_wake_id, now(), encoded_token]
     )

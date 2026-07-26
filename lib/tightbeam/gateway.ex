@@ -105,6 +105,16 @@ defmodule Tightbeam.Gateway do
     defexception message: "effort rearm snapshot changed"
   end
 
+  defmodule HealLost do
+    @moduledoc false
+    defexception message: "a human ruling already owns this adjudication episode"
+  end
+
+  defmodule AdjudicationSuperseded do
+    @moduledoc false
+    defexception message: "an adapter heal already resolved this adjudication episode"
+  end
+
   @typedoc "Gateway config (gateway.ts GatewayConfig)."
   @type config :: %{
           base_dir: String.t(),
@@ -1360,6 +1370,11 @@ defmodule Tightbeam.Gateway do
   defp adjudication_cause(:prompt, reason, key) when reason in [:closed, :prompt_dispatch_failed],
     do: Adjudication.adapter_fault_cause(key)
 
+  # The adapter died mid-turn (or stopped answering). A runtime adapter fault,
+  # and heal-eligible: the replacement adapter's ready event releases the hold.
+  defp adjudication_cause(:prompt, {:adapter_unavailable, _reason}, key),
+    do: Adjudication.adapter_fault_cause(key)
+
   defp adjudication_cause(_stage, _reason, _key), do: nil
 
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
@@ -1686,7 +1701,7 @@ defmodule Tightbeam.Gateway do
           end
       end
 
-    case enrich_adapter_unavailable(config, result, adapter_key(session)) do
+    case enrich_adapter_unavailable(config, result, adapter_key(session), generation) do
       {:ok, sid} ->
         :ok = Ledger.stamp_adapter(db, turn_seq, generation)
         {:ok, sid}
@@ -1701,11 +1716,16 @@ defmodule Tightbeam.Gateway do
   # Without this, a fast-failing boot reaches the turn as an unactionable
   # ":noproc" (spec s4-operability-v1 §Defect 1: the reason must name the
   # spawn error).
-  defp enrich_adapter_unavailable(config, {:error, {:adapter_unavailable, :noproc}}, key) do
+  defp enrich_adapter_unavailable(config, {:error, {:adapter_unavailable, :noproc}}, key, generation) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
+    # ATTEMPT-SCOPED: ask only for the death of the generation this turn checked
+    # out. If the coordinator has not yet processed that :DOWN — or the record
+    # belongs to a PREVIOUS attempt — we get nil and report the generic reason.
+    # Mislabelling a new death with its predecessor's reason would be worse than
+    # saying less (cross-review F4).
     reason =
-      case AdapterCoordinator.last_failure(coordinator, key) do
+      case AdapterCoordinator.last_failure(coordinator, key, generation) do
         nil -> "adapter is not running"
         failure -> Adapter.failure_text(failure)
       end
@@ -1717,7 +1737,7 @@ defmodule Tightbeam.Gateway do
     :exit, _ -> {:error, {:adapter_unavailable, "adapter is not running"}}
   end
 
-  defp enrich_adapter_unavailable(_config, result, _key), do: result
+  defp enrich_adapter_unavailable(_config, result, _key, _generation), do: result
 
   defp served_snapshot(config, session, harness, revision) do
     snapshot =
@@ -2403,11 +2423,21 @@ defmodule Tightbeam.Gateway do
       reresolve: p[:reresolve],
       reresolve_seed: p[:reresolve_seed],
       reresolve_rung: p[:reresolve_rung],
-      # Whatever the scheduler held; NULL for conversational and owner wakes,
-      # which genuinely have no job.
-      assignment_id: p[:assignment_id]
+      # SUBSTRATE-ONLY carrier. `wake` is an agent-callable verb, so an arbitrary
+      # params value here would let an agent stamp a conversational wake with any
+      # assignment and have delivery promote that forged carrier into the turn and
+      # the trace — agent-authored attribution, which Law 0 forbids (F6). Only the
+      # substrate's own principal may set it; the router reserves
+      # process:tightbeam, so it cannot be claimed over the wire. Conversational
+      # and owner wakes stay NULL, as the spec requires.
+      assignment_id: substrate_assignment_id(call)
     })
   end
+
+  defp substrate_assignment_id(%{principal: {:process, "tightbeam"}} = call),
+    do: call.params[:assignment_id]
+
+  defp substrate_assignment_id(_call), do: nil
 
   defp creator_session_key({:session, key}), do: key
   defp creator_session_key(_principal), do: nil
@@ -3333,18 +3363,7 @@ defmodule Tightbeam.Gateway do
         # adapter heal that already resolved the episode. It is an acknowledged
         # no-op, not a silent one.
         if episode && episode.heal_token,
-          do:
-            EventLog.lifecycle(
-              db,
-              "adjudication_ruling_superseded",
-              episode.session_key,
-              JSON.encode!(%{
-                episodeId: episode.episode_id,
-                cause: episode.cause,
-                healToken: episode.heal_token,
-                action: call.params[:action]
-              })
-            )
+          do: log_superseded(db, episode, call.params[:action])
 
         %{code: "denied", message: "stale or unknown adjudication episode"}
 
@@ -3363,12 +3382,48 @@ defmodule Tightbeam.Gateway do
   end
 
   defp adjudicate_action(config, db, call, episode) do
-    case call.params.action do
-      "park" -> adjudicate_park(config, db, call, episode)
-      "swap" -> adjudicate_swap(config, db, call, episode)
-      "respawn" -> adjudicate_respawn(config, db, call, episode)
-      "stop" -> adjudicate_stop(config, db, call, episode)
+    action = fn ->
+      case call.params.action do
+        "park" -> adjudicate_park(config, db, call, episode)
+        "swap" -> adjudicate_swap(config, db, call, episode)
+        "respawn" -> adjudicate_respawn(config, db, call, episode)
+        "stop" -> adjudicate_stop(config, db, call, episode)
+      end
     end
+
+    # A ruling validated as `notified` can still lose to an adapter heal before
+    # its action transaction commits (the inverse TOCTOU of the heal's own CAS).
+    # That is an acknowledged no-op, not a crash: the transaction already rolled
+    # back, so nothing partial survives, and the caller gets the same denial it
+    # would have got a millisecond earlier (F3).
+    try do
+      action.()
+    rescue
+      AdjudicationSuperseded ->
+        log_superseded(db, episode, call.params[:action])
+        %{code: "denied", message: "stale or unknown adjudication episode"}
+    end
+  end
+
+  # `resolved` with a healToken means a heal won; anything else is the ordinary
+  # stale-correlation case the ruling paths have always raised on.
+  defp superseded_or_stale(%{status: "resolved", heal_token: token}) when not is_nil(token),
+    do: %AdjudicationSuperseded{}
+
+  defp superseded_or_stale(_episode), do: RuntimeError.exception("stale adjudication episode")
+
+  defp log_superseded(db, episode, action) do
+    EventLog.lifecycle(
+      db,
+      "adjudication_ruling_superseded",
+      episode.session_key,
+      JSON.encode!(%{
+        episodeId: episode.episode_id,
+        cause: episode.cause,
+        healToken: episode.heal_token,
+        action: action
+      })
+    )
   end
 
   defp adjudicate_stop(config, db, call, episode) do
@@ -3400,7 +3455,7 @@ defmodule Tightbeam.Gateway do
 
           result
         else
-          raise "stale adjudication episode"
+          raise superseded_or_stale(current)
         end
       end)
 
@@ -3489,7 +3544,7 @@ defmodule Tightbeam.Gateway do
 
           {wake.wake_id, delivery}
         else
-          raise "stale adjudication episode"
+          raise superseded_or_stale(current)
         end
       end)
 
@@ -3537,7 +3592,7 @@ defmodule Tightbeam.Gateway do
                 end
 
                 unless Adjudication.resolve_in_txn(txn, current, wake_id),
-                  do: raise("stale adjudication episode")
+                  do: raise(superseded_or_stale(current))
 
                 delivery =
                   deliver_prompt_in_txn(
@@ -3715,7 +3770,7 @@ defmodule Tightbeam.Gateway do
           )
 
           unless Adjudication.resolve_in_txn(txn, current, wake_id),
-            do: raise("stale adjudication episode")
+            do: raise(superseded_or_stale(current))
 
           delivery =
             deliver_prompt_in_txn(
@@ -3823,54 +3878,60 @@ defmodule Tightbeam.Gateway do
   defp release_hold(config, db, session_key, condition, cause, encoded_token) do
     result =
       DB.transaction(db, fn txn ->
-        # The DB is one serialized writer under BEGIN IMMEDIATE, so reading the
-        # hold and writing it in the same transaction IS the compare-and-swap;
-        # deciding BEFORE any write means the loser leaves nothing behind.
+        # The DB is one serialized writer under BEGIN IMMEDIATE, so reading and
+        # then writing in the same transaction IS the compare-and-swap. BOTH
+        # guards are read before any write, so a loser leaves nothing behind:
+        # the session must still be held WIDE, and the episode must still be in a
+        # state a heal may take. A human ruling that resolved the episode is NOT
+        # such a state, and a delayed park leaves the hold wide while doing
+        # exactly that — so the hold alone is not a sufficient guard (F3).
         held? = Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [session_key])
+        episode = Adjudication.get_in_txn(txn, session_key, condition)
 
-        case {held?, Adjudication.get_in_txn(txn, session_key, condition)} do
-          {[["*"]], %{} = episode} ->
-            probe_wake_id = Adjudication.probe_wake_in_txn(txn, episode, encoded_token)
-            Adjudication.heal_resolve_in_txn(txn, episode, probe_wake_id, encoded_token)
-            disposition = Adjudication.dispose_owner_wake_in_txn(txn, episode)
+        if held? == [["*"]] and is_map(episode) and Adjudication.heal_eligible?(episode) do
+          probe_wake_id = Adjudication.probe_wake_in_txn(txn, episode, encoded_token)
 
-            delivery =
-              deliver_prompt_in_txn(
-                txn,
-                session_key,
-                "process:tightbeam",
-                Adjudication.probe_prompt(),
-                wake_id: probe_wake_id,
-                sender: "process:tightbeam",
-                fire_wake_in_txn: true
-              )
+          unless Adjudication.heal_resolve_in_txn(txn, episode, probe_wake_id, encoded_token),
+            do: raise(HealLost)
 
-            # No probe TURN means no probe terminal to clear the hold; refuse to
-            # narrow the hold rather than wedge the session on a wake that will
-            # never be answered.
-            unless match?({:appended, _target, _message, _opts}, delivery),
-              do: raise("heal probe was not enqueued: #{inspect(delivery)}")
+          disposition = Adjudication.dispose_owner_wake_in_txn(txn, episode)
 
-            arm_hold_in_txn(txn, session_key, probe_wake_id)
-
-            EventLog.lifecycle_in_txn(
+          delivery =
+            deliver_prompt_in_txn(
               txn,
-              "adjudication_hold_healed",
               session_key,
-              JSON.encode!(%{
-                cause: cause,
-                condition: condition,
-                episodeId: episode.episode_id,
-                healToken: encoded_token,
-                probeWakeId: probe_wake_id,
-                ownerWake: to_string(disposition)
-              })
+              "process:tightbeam",
+              Adjudication.probe_prompt(),
+              wake_id: probe_wake_id,
+              sender: "process:tightbeam",
+              fire_wake_in_txn: true
             )
 
-            {:released, delivery}
+          # No probe TURN means no probe terminal to clear the hold; refuse to
+          # narrow the hold rather than wedge the session on a wake that will
+          # never be answered.
+          unless match?({:appended, _target, _message, _opts}, delivery),
+            do: raise("heal probe was not enqueued: #{inspect(delivery)}")
 
-          _ ->
-            :lost
+          arm_hold_in_txn(txn, session_key, probe_wake_id)
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "adjudication_hold_healed",
+            session_key,
+            JSON.encode!(%{
+              cause: cause,
+              condition: condition,
+              episodeId: episode.episode_id,
+              healToken: encoded_token,
+              probeWakeId: probe_wake_id,
+              ownerWake: to_string(disposition)
+            })
+          )
+
+          {:released, delivery}
+        else
+          :lost
         end
       end)
 
@@ -3880,8 +3941,9 @@ defmodule Tightbeam.Gateway do
         Wakes.fire_due(config[:wake_scheduler] || Tightbeam.WakeScheduler)
 
       _ ->
-        # Lost the CAS (a human ruling already owns this hold) or the probe could
-        # not be enqueued. Dark ≠ silent: the decision not to probe is recorded.
+        # Lost the CAS (a human ruling owns this hold) or the probe could not be
+        # enqueued. Dark != silent: the decision NOT to probe is recorded, and
+        # nothing was written — a raise rolled the attempt back.
         EventLog.lifecycle(
           db,
           "adjudication_heal_lost",
