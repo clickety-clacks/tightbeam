@@ -856,13 +856,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {typing_on, client} =
       await_frame(client, watermark, &(&1["type"] == "typing" and &1["active"] == true and &1["sessionKey"] == session_key), 60_000)
 
-    {reply, client} =
-      await_frame(
-        client,
-        watermark,
-        &(&1["type"] == "message" and &1["role"] == "assistant" and &1["replyToClientMessageId"] == cmid),
-        ctx.turn_timeout_ms
-      )
+    {reply, client} = await_reply(client, watermark, cmid, ctx)
 
     {typing_off, client} =
       await_frame(client, watermark, &(&1["type"] == "typing" and &1["active"] == false and &1["sessionKey"] == session_key), 30_000)
@@ -885,15 +879,21 @@ defmodule Tightbeam.ClientE2E.Journeys do
         {:error, :timeout, row} -> row
       end
 
+    # Order matters: when the turn row already says what went wrong, report
+    # THAT rather than the client-side symptom it caused. "no assistant reply
+    # within 180000ms" sends a reader looking at the client; "turn row is
+    # failed (Invalid value for config option model: ...)" sends them to the
+    # actual fault.
     error =
       cond do
         is_nil(echo) -> "no echo bubble for the posted message"
+        is_nil(turn) -> "no turn row for the posted message"
+        turn["status"] in ~w(failed failed_unknown) -> "turn row is #{turn["status"]}#{turn_error(turn)}"
         is_nil(typing_on) -> "typing indicator never turned on"
         progress == [] -> "no live progress text during the turn"
         is_nil(reply) -> "no assistant reply within #{ctx.turn_timeout_ms}ms"
         is_nil(typing_off) -> "typing indicator never cleared"
         not is_nil(lingering) -> "typing indicator came back after the turn ended"
-        is_nil(turn) -> "no turn row for the posted message"
         turn["status"] != "delivered" -> "turn row is #{turn["status"]}#{turn_error(turn)}"
         true -> nil
       end
@@ -906,6 +906,40 @@ defmodule Tightbeam.ClientE2E.Journeys do
        turn: turn,
        error: error
      }}
+  end
+
+  # Waits for the assistant reply, but gives up the moment the SUBSTRATE says
+  # no reply is coming.
+  #
+  # Without this, a turn that fails in the first second still costs the full
+  # turn timeout on every step, and a red run takes an hour to say what the
+  # turns table already knew. A driver nobody will sit through is a driver
+  # nobody runs.
+  defp await_reply(client, watermark, cmid, ctx) do
+    predicate =
+      &(&1["type"] == "message" and &1["role"] == "assistant" and
+          &1["replyToClientMessageId"] == cmid)
+
+    deadline = System.monotonic_time(:millisecond) + ctx.turn_timeout_ms
+    await_reply(client, watermark, cmid, ctx, predicate, deadline)
+  end
+
+  defp await_reply(client, watermark, cmid, ctx, predicate, deadline) do
+    slice = min(2_000, max(0, deadline - System.monotonic_time(:millisecond)))
+
+    case SimClient.await(client, watermark, predicate, slice) do
+      {:ok, frame, client} ->
+        {frame, client}
+
+      {:error, _reason, client} ->
+        turn = Substrate.turn_for_client_message(ctx.base_dir, cmid)
+
+        cond do
+          is_map(turn) and turn["status"] in ~w(failed failed_unknown canceled) -> {nil, client}
+          System.monotonic_time(:millisecond) >= deadline -> {nil, client}
+          true -> await_reply(client, watermark, cmid, ctx, predicate, deadline)
+        end
+    end
   end
 
   defp await_frame(client, watermark, predicate, timeout_ms) do
