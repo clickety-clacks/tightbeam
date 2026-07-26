@@ -130,16 +130,19 @@ defmodule Tightbeam.Gateway do
   """
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
+    preflight!(config)
+    children_after_preflight(config)
+  end
+
+  @doc false
+  @spec children_after_preflight(config()) :: [Supervisor.child_spec() | {module(), term()}]
+  def children_after_preflight(config) do
     db = Map.get(config, :db, Tightbeam.DB)
     prod_limit = Map.get(config, :prod_limit, 3)
 
     unless is_integer(prod_limit) and prod_limit >= 0 do
       raise ArgumentError, "prod_limit must be an integer >= 0"
     end
-
-    cli_bin = Path.join(config.base_dir, "bin")
-    assert_harness_binary_ready!(config, cli_bin)
-    Identity.init!(config.base_dir)
 
     File.mkdir_p!(config.base_dir)
 
@@ -331,6 +334,14 @@ defmodule Tightbeam.Gateway do
          name: Tightbeam.LaneManager},
         {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
       ]
+  end
+
+  @doc "Refuse an unusable harness or identity before the production store is created."
+  @spec preflight!(config()) :: :ok
+  def preflight!(config) do
+    assert_harness_binary_ready!(config, Path.join(config.base_dir, "bin"))
+    Identity.init!(config.base_dir)
+    :ok
   end
 
   defp credential_children(config, db) do

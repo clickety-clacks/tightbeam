@@ -21,35 +21,11 @@ defmodule Tightbeam.Application do
   @impl true
   def start(_type, _args) do
     if Application.get_env(:tightbeam, :autostart, true) do
+      config = production_config()
+      Tightbeam.Gateway.preflight!(config)
+
       with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
-        base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())
-
-        config = %{
-          base_dir: base_dir,
-          cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
-          port: Application.get_env(:tightbeam, :port, 4_321),
-          default_harness: Tightbeam.Harness.default().id(),
-          default_model:
-            Application.get_env(:tightbeam, :default_model, "claude-sonnet-5[medium]"),
-          max_live_sessions_per_user:
-            Application.get_env(:tightbeam, :max_live_sessions_per_user, 50),
-          wake_tick_ms: Application.get_env(:tightbeam, :wake_tick_ms, 1_000),
-          prod_limit: Application.get_env(:tightbeam, :prod_limit, 3),
-          escalation_decision_deadline_ms:
-            Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),
-          effort_checkin_horizon_ms:
-            Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000),
-          adjudication_claim_window_ms:
-            Application.get_env(:tightbeam, :adjudication_claim_window_ms, 300_000),
-          adjudication_response_window_ms:
-            Application.get_env(:tightbeam, :adjudication_response_window_ms, 86_400_000),
-          adjudication_park_fallback_ms:
-            Application.get_env(:tightbeam, :adjudication_park_fallback_ms, 14_400_000),
-          critical_lease_hard_cap_ms:
-            Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000)
-        }
-
-        Enum.each(Tightbeam.Gateway.children(config), fn child ->
+        Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
           {:ok, _pid} = Supervisor.start_child(supervisor, child)
         end)
 
@@ -92,6 +68,38 @@ defmodule Tightbeam.Application do
   @doc "True while the gateway is shutting down — lanes refuse new claims."
   @spec draining?() :: boolean()
   def draining?, do: :persistent_term.get({__MODULE__, :draining}, false)
+
+  defp production_config do
+    %{
+      base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
+      cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
+      port: Application.get_env(:tightbeam, :port, 4_321),
+      harness_binary_probe:
+        Application.get_env(
+          :tightbeam,
+          :harness_binary_probe,
+          &Tightbeam.Placement.harness_binary_probe/2
+        ),
+      default_harness: Tightbeam.Harness.default().id(),
+      default_model: Application.get_env(:tightbeam, :default_model, "claude-sonnet-5[medium]"),
+      max_live_sessions_per_user:
+        Application.get_env(:tightbeam, :max_live_sessions_per_user, 50),
+      wake_tick_ms: Application.get_env(:tightbeam, :wake_tick_ms, 1_000),
+      prod_limit: Application.get_env(:tightbeam, :prod_limit, 3),
+      escalation_decision_deadline_ms:
+        Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),
+      effort_checkin_horizon_ms:
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000),
+      adjudication_claim_window_ms:
+        Application.get_env(:tightbeam, :adjudication_claim_window_ms, 300_000),
+      adjudication_response_window_ms:
+        Application.get_env(:tightbeam, :adjudication_response_window_ms, 86_400_000),
+      adjudication_park_fallback_ms:
+        Application.get_env(:tightbeam, :adjudication_park_fallback_ms, 14_400_000),
+      critical_lease_hard_cap_ms:
+        Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000)
+    }
+  end
 
   @impl true
   def prep_stop(state) do

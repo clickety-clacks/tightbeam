@@ -52,6 +52,32 @@ defmodule Tightbeam.IdentityTest do
                  end
   end
 
+  test "init verifies required refs stored only in packed-refs", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    git!(dir, ["pack-refs", "--all", "--prune"])
+
+    refute File.exists?(Path.join(dir, ".git/refs/heads/tightbeam/live"))
+    assert :noop = Identity.init!(ctx.base)
+
+    packed_path = Path.join(dir, ".git/packed-refs")
+
+    packed =
+      packed_path
+      |> File.read!()
+      |> String.split("\n")
+      |> Enum.reject(&String.ends_with?(&1, " refs/heads/tightbeam/live"))
+      |> Enum.join("\n")
+
+    File.write!(packed_path, packed)
+
+    assert_raise ArgumentError,
+                 "identity repository is missing required refs: tightbeam/live. Repair with: git -C #{dir} branch tightbeam/live main",
+                 fn ->
+                   Identity.init!(ctx.base)
+                 end
+  end
+
   test "reserved skills reconcile at exact cwd without product collisions", ctx do
     Identity.init!(ctx.base)
     cwd = Path.join(ctx.root, "plain")

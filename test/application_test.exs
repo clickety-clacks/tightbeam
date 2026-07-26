@@ -65,4 +65,73 @@ defmodule Tightbeam.ApplicationTest do
       end
     end)
   end
+
+  test "production entry refuses missing harnesses before creating the org store" do
+    base =
+      Path.join(System.tmp_dir!(), "tb_app_refused_#{System.unique_integer([:positive])}")
+
+    previous_base = Application.fetch_env!(:tightbeam, :base_dir)
+    previous_autostart = Application.fetch_env!(:tightbeam, :autostart)
+    previous_path = System.get_env("PATH")
+
+    Application.put_env(:tightbeam, :base_dir, base)
+    Application.put_env(:tightbeam, :autostart, true)
+    System.put_env("PATH", "")
+
+    on_exit(fn ->
+      Application.put_env(:tightbeam, :base_dir, previous_base)
+      Application.put_env(:tightbeam, :autostart, previous_autostart)
+      System.put_env("PATH", previous_path)
+      File.rm_rf!(base)
+    end)
+
+    assert_raise RuntimeError, ~r/no usable harness CLI is installed/, fn ->
+      Tightbeam.Application.start(:normal, [])
+    end
+
+    refute File.exists?(base)
+  end
+
+  test "production entry refuses a broken identity before creating store artifacts" do
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tb_app_identity_refused_#{System.unique_integer([:positive])}"
+      )
+
+    assert :initialized = Tightbeam.Identity.init!(base)
+    identity_dir = Path.join(base, "identity")
+
+    {_output, 0} =
+      System.cmd("git", ["update-ref", "-d", "refs/heads/tightbeam/live"], cd: identity_dir)
+
+    previous_base = Application.fetch_env!(:tightbeam, :base_dir)
+    previous_autostart = Application.fetch_env!(:tightbeam, :autostart)
+    previous_probe = Application.get_env(:tightbeam, :harness_binary_probe)
+
+    Application.put_env(:tightbeam, :base_dir, base)
+    Application.put_env(:tightbeam, :autostart, true)
+    Application.put_env(:tightbeam, :harness_binary_probe, fn _harness, _bin -> {:ok, "test"} end)
+
+    on_exit(fn ->
+      Application.put_env(:tightbeam, :base_dir, previous_base)
+      Application.put_env(:tightbeam, :autostart, previous_autostart)
+
+      if previous_probe do
+        Application.put_env(:tightbeam, :harness_binary_probe, previous_probe)
+      else
+        Application.delete_env(:tightbeam, :harness_binary_probe)
+      end
+
+      File.rm_rf!(base)
+    end)
+
+    assert_raise ArgumentError, ~r|missing required refs: tightbeam/live|, fn ->
+      Tightbeam.Application.start(:normal, [])
+    end
+
+    refute File.exists?(Path.join(base, "state.db"))
+    refute File.exists?(Path.join(base, "gateway.json"))
+    refute File.exists?(Path.join(base, "harnesses.json"))
+  end
 end
