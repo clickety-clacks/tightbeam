@@ -386,49 +386,82 @@ defmodule Tightbeam.ClientE2ETest do
       System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
     end
 
-    test "teardown reaps the gateway's DESCENDANTS, not just the gateway" do
+    test "teardown reaps a GRANDCHILD that ignores SIGTERM" do
       # Harness adapters outlive the gateway's SIGTERM and hold the leg's homes
-      # open, which is what defeated directory removal in real runs (eight
-      # orphans in one afternoon). They are found by process TREE: `ps -E`
-      # cannot read a BEAM-spawned process's environment on macOS, so an
-      # env-based match found nothing and reported success.
+      # open — eight orphans accumulated across one afternoon before teardown
+      # reaped anything.
+      #
+      # The pids asserted here are recorded by the processes THEMSELVES (each
+      # echoes its own $$), never derived from descendant_pids/1, or the test
+      # would be checking that a function agrees with itself. And the
+      # SIGTERM-ignorer is the GRANDCHILD: with a direct child, dropping the
+      # recursive descent from descendant_pids/1 would still pass.
       base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-reap-#{System.unique_integer([:positive])}")
       File.mkdir_p!(base_dir)
       on_exit(fn -> File.rm_rf!(base_dir) end)
+
+      mid_pid_file = Path.join(base_dir, "mid.pid")
+      grand_pid_file = Path.join(base_dir, "grand.pid")
       ready = Path.join(base_dir, "ready")
+      grand_sh = Path.join(base_dir, "grand.sh")
+      mid_sh = Path.join(base_dir, "mid.sh")
+      top_sh = Path.join(base_dir, "top.sh")
 
-      # A parent that spawns a GRANDCHILD ignoring SIGTERM: the grandchild is
-      # the shape of an orphaned adapter.
-      port =
-        Port.open({:spawn_executable, System.find_executable("sh")}, [
-          :binary,
-          :exit_status,
-          args: [
-            "-c",
-            "sh -c \"trap '' TERM; touch #{ready}; while true; do sleep 1; done\" & wait"
-          ]
-        ])
+      # Level 3: ignores SIGTERM, so only a KILL from the reaper ends it.
+      File.write!(grand_sh, """
+      #!/bin/sh
+      trap '' TERM
+      echo $$ > #{grand_pid_file}
+      touch #{ready}
+      while true; do sleep 1; done
+      """)
 
-      parent = port |> Port.info(:os_pid) |> elem(1)
-      wait_for_file(ready, 5_000)
+      # Level 2: a real intermediate process, so the grandchild is two hops down.
+      File.write!(mid_sh, """
+      #!/bin/sh
+      echo $$ > #{mid_pid_file}
+      #{grand_sh} &
+      wait
+      """)
 
-      descendants = LegGateway.descendant_pids(parent)
-      assert descendants != [], "the child process must be discoverable while the parent lives"
+      # Level 1: stands in for the gateway BEAM.
+      File.write!(top_sh, """
+      #!/bin/sh
+      #{mid_sh} &
+      wait
+      """)
 
-      gateway = %LegGateway{
-        base_dir: base_dir,
-        port: 0,
-        os_pid: parent,
-        port_ref: nil,
-        log_path: ""
-      }
+      for f <- [grand_sh, mid_sh, top_sh], do: File.chmod!(f, 0o755)
+
+      port = Port.open({:spawn_executable, top_sh}, [:binary, :exit_status])
+      top = port |> Port.info(:os_pid) |> elem(1)
+      wait_for_file(ready, 10_000)
+      wait_for_file(mid_pid_file, 10_000)
+      wait_for_file(grand_pid_file, 10_000)
+
+      mid = File.read!(mid_pid_file) |> String.trim()
+      grand = File.read!(grand_pid_file) |> String.trim()
+
+      # Independently recorded, and genuinely three distinct processes.
+      assert mid != "" and grand != ""
+      assert Enum.uniq([to_string(top), mid, grand]) |> length() == 3
+
+      # The recursive descent, pinned directly: the GRANDCHILD's own recorded pid
+      # must appear in the tree. Drop the recursion and this fails here, without
+      # needing a mutation run to prove it.
+      tree = LegGateway.descendant_pids(top)
+      assert grand in tree, "descendant_pids/1 must descend past direct children"
+      assert mid in tree
+
+      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: top, port_ref: nil, log_path: ""}
 
       assert LegGateway.teardown(gateway, exit_timeout_ms: 3_000, reap_timeout_ms: 3_000) == :ok
 
-      for pid <- descendants do
-        assert {_, 1} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true),
-               "descendant #{pid} outlived teardown"
-      end
+      assert {_, 1} = System.cmd("kill", ["-0", grand], stderr_to_stdout: true),
+             "the SIGTERM-ignoring GRANDCHILD (#{grand}) outlived teardown"
+
+      assert {_, 1} = System.cmd("kill", ["-0", mid], stderr_to_stdout: true),
+             "the intermediate child (#{mid}) outlived teardown"
     end
 
     test "a clean stop removes the run-local base_dir and returns :ok" do
@@ -522,6 +555,37 @@ defmodule Tightbeam.ClientE2ETest do
       beta = Provenance.fingerprint(dir, listing)
 
       refute alpha == beta, "same filename, different bytes must not share a fingerprint"
+    end
+
+    test "a content change INSIDE an untracked directory changes the fingerprint", ctx do
+      # Plain `git status --porcelain` reports a wholly-untracked subtree as one
+      # `?? dir/` entry. A directory has no bytes to hash, so every edit inside
+      # it used to fingerprint identically — an untracked driver tree could
+      # change completely and claim the same provenance.
+      nested = Path.join([ctx.repo, "e2e", "sim"])
+      File.mkdir_p!(nested)
+      File.write!(Path.join(nested, "driver.exs"), "IO.puts(:alpha)")
+
+      assert {:dirty, _sha, alpha, listing} = Provenance.stamp(ctx.repo)
+      assert listing =~ "e2e/sim/driver.exs", "the nested file must be listed in its own right"
+
+      File.write!(Path.join(nested, "driver.exs"), "IO.puts(:beta)")
+      assert {:dirty, _sha, beta, _listing} = Provenance.stamp(ctx.repo)
+
+      refute alpha == beta, "a change inside an untracked directory must change the fingerprint"
+    end
+
+    test "adding a file inside an untracked directory changes the fingerprint", ctx do
+      nested = Path.join(ctx.repo, "e2e")
+      File.mkdir_p!(nested)
+      File.write!(Path.join(nested, "one.exs"), "one")
+
+      assert {:dirty, _, before, _} = Provenance.stamp(ctx.repo)
+
+      File.write!(Path.join(nested, "two.exs"), "two")
+      assert {:dirty, _, later, _} = Provenance.stamp(ctx.repo)
+
+      refute before == later
     end
 
     test "untracked paths are read off the porcelain listing" do

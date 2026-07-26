@@ -19,7 +19,9 @@ defmodule Tightbeam.ClientE2E.Provenance do
   `git diff HEAD` omits untracked files entirely, so a driver source that exists
   only as an untracked file would fingerprint identically no matter what it
   said — two different runs, one provenance. Hashing the porcelain listing, the
-  tracked diff, and each untracked file's bytes closes that.
+  tracked diff, and each untracked file's bytes closes that, and the listing is
+  taken with `--untracked-files=all` so a nested file is named in its own right
+  rather than hidden behind its parent directory.
 
   This lives in `lib` rather than in the runner script on purpose: it is the
   part of provenance a test can hold, and both review rounds found their
@@ -33,7 +35,11 @@ defmodule Tightbeam.ClientE2E.Provenance do
   def stamp(repo_root \\ nil) do
     sha = git(repo_root, ["rev-parse", "--short", "HEAD"]) |> String.trim()
     sha = if sha == "", do: "unknown", else: sha
-    listing = git(repo_root, ["status", "--porcelain"])
+    # `--untracked-files=all`: plain porcelain collapses a wholly-untracked
+    # subtree to a single `?? path/` entry, and a directory has no content to
+    # hash — so every change INSIDE it fingerprinted identically. Per-file
+    # listing is what makes the content hashes below mean anything.
+    listing = git(repo_root, ["status", "--porcelain", "--untracked-files=all"])
 
     if String.trim(listing) == "" do
       {:clean, sha}
