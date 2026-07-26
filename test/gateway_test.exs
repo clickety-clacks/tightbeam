@@ -1511,6 +1511,81 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
   end
 
+  test "spawn fails closed when a registered host has no credential server", ctx do
+    base_dir = move_test_base("credential-server-missing")
+
+    {:ok, _entry} =
+      Placement.register_host(base_dir, "worker", %{
+        ssh: "worker",
+        base_dir: "/remote/tb"
+      })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.delete(:credential_status)
+
+    assert GenServer.whereis(Credentials.server("worker")) == nil
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "needs_onboarding"},
+             message:
+               "claude on worker needs onboarding: :credential_server_unavailable; run tightbeam onboard anthropic on worker"
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "No credential owner",
+                 host: "worker",
+                 idempotency_key: "spawn-no-credential-owner"
+               }
+             })
+  end
+
+  test "register-host supervises credentials and refuses spawn until onboarding", ctx do
+    base_dir = move_test_base("credential-server-registration")
+    {:ok, credential_supervisor} = Supervisor.start_link([], strategy: :one_for_one)
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.delete(:credential_status)
+      |> Map.put(:credential_supervisor, credential_supervisor)
+
+    handlers = Gateway.handlers(config)
+
+    assert %{host: "worker"} =
+             handlers["register-host"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 name: "worker",
+                 ssh: "worker",
+                 base_dir: "/remote/tb"
+               }
+             })
+
+    server = Credentials.server("worker")
+    assert is_pid(GenServer.whereis(server))
+    assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "needs_onboarding"},
+             message:
+               "claude on worker needs onboarding: :missing; run tightbeam onboard anthropic on worker"
+           } =
+             handlers["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Fresh remote",
+                 host: "worker",
+                 idempotency_key: "spawn-fresh-remote"
+               }
+             })
+  end
+
   test "spawn proceeds after a live remote readiness probe", ctx do
     base_dir = move_test_base("spawn-ready")
     parent = self()

@@ -333,32 +333,46 @@ defmodule Tightbeam.Gateway do
 
   defp credential_children(config, db) do
     Enum.map(Placement.hosts(config.base_dir), fn {machine, host} ->
-      opts =
-        [
-          name: Tightbeam.Credentials.server(machine),
-          base_dir: host.base_dir,
-          staging_base_dir: config.base_dir,
-          machine: machine,
-          ssh: host.ssh,
-          gate: fn _provider -> :ok end,
-          stop: fn provider -> stop_provider_runtime(provider, machine) end,
-          park: fn provider -> stop_provider_runtime(provider, machine) end,
-          start: fn provider -> start_provider_runtime(provider, machine) end,
-          resume: fn _provider -> :ok end,
-          capture_sessions: fn provider ->
-            capture_credential_sessions(db, provider, machine)
-          end,
-          publish_sessions: fn captured, transition ->
-            publish_credential_sessions(db, captured, transition)
-          end
-        ]
-        |> maybe_put_credential_runner(config)
-
-      %{
-        id: {Tightbeam.Credentials, machine},
-        start: {Tightbeam.Credentials, :start_link, [opts]}
-      }
+      credential_child(config, db, machine, host)
     end)
+  end
+
+  defp credential_child(config, db, machine, host) do
+    opts =
+      [
+        name: Tightbeam.Credentials.server(machine),
+        base_dir: host.base_dir,
+        staging_base_dir: config.base_dir,
+        machine: machine,
+        ssh: host.ssh,
+        gate: fn _provider -> :ok end,
+        stop: fn provider -> stop_provider_runtime(provider, machine) end,
+        park: fn provider -> stop_provider_runtime(provider, machine) end,
+        start: fn provider -> start_provider_runtime(provider, machine) end,
+        resume: fn _provider -> :ok end,
+        capture_sessions: fn provider ->
+          capture_credential_sessions(db, provider, machine)
+        end,
+        publish_sessions: fn captured, transition ->
+          publish_credential_sessions(db, captured, transition)
+        end
+      ]
+      |> maybe_put_credential_runner(config)
+
+    %{
+      id: {Tightbeam.Credentials, machine},
+      start: {Tightbeam.Credentials, :start_link, [opts]}
+    }
+  end
+
+  defp start_credential_child(config, db, machine, host) do
+    supervisor = Map.get(config, :credential_supervisor, Tightbeam.Supervisor)
+
+    case Supervisor.start_child(supervisor, credential_child(config, db, machine, host)) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+      {:error, :already_present} -> :ok
+    end
   end
 
   defp maybe_put_credential_runner(opts, %{sh: sh}), do: Keyword.put(opts, :sh, sh)
@@ -533,6 +547,7 @@ defmodule Tightbeam.Gateway do
               adapter_bin_dir: p[:adapter_bin_dir]
             })
 
+          :ok = start_credential_child(config, db, p.name, entry)
           %{host: p.name, config: entry}
         end),
       "identity-edit" =>
@@ -2720,7 +2735,7 @@ defmodule Tightbeam.Gateway do
     server = Tightbeam.Credentials.server(machine)
 
     case GenServer.whereis(server) do
-      nil -> :onboarded
+      nil -> {:needs_onboarding, :credential_server_unavailable}
       _pid -> Tightbeam.Credentials.status(provider, server)
     end
   end
