@@ -20,6 +20,10 @@ defmodule Tightbeam.Acp.Adapter do
   alias Tightbeam.Acp.Conn
 
   @gate_attestation_timeout 120_000
+  # Boot may spend 60s initializing ACP before the separate 120s gate
+  # deadline starts. Residency calls queue behind handle_continue, so their
+  # caller budget must clear the full boot boundary.
+  @boot_boundary_timeout 185_000
   @gate_marker "[gate: tightbeam-probe]"
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
@@ -155,9 +159,15 @@ defmodule Tightbeam.Acp.Adapter do
   generations can spuriously match across a restart; asking the process
   itself cannot.
   """
-  @spec knows_session?(adapter(), String.t()) :: boolean()
-  def knows_session?(adapter, session_id),
-    do: GenServer.call(adapter, {:knows_session?, session_id})
+  @spec knows_session?(adapter(), String.t()) ::
+          boolean() | {:error, {:adapter_unavailable, term()}}
+  def knows_session?(adapter, session_id) do
+    GenServer.call(adapter, {:knows_session?, session_id}, @boot_boundary_timeout)
+  rescue
+    reason -> {:error, {:adapter_unavailable, reason}}
+  catch
+    :exit, reason -> {:error, {:adapter_unavailable, reason}}
+  end
 
   @doc "The underlying Acp.Conn (for pending_count / quiescence probes)."
   @spec conn(adapter()) :: pid()

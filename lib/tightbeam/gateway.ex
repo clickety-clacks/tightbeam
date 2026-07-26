@@ -1535,66 +1535,71 @@ defmodule Tightbeam.Gateway do
         pointer ->
           # The adapter PROCESS is the authority on residency: stamped
           # generations reset across boots and can spuriously match.
-          if Adapter.knows_session?(adapter, pointer.harness_session_id) do
-            {:ok, pointer.harness_session_id}
-          else
-            revision = session.identity_revision || Identity.live_revision!(config.base_dir)
+          case Adapter.knows_session?(adapter, pointer.harness_session_id) do
+            true ->
+              {:ok, pointer.harness_session_id}
 
-            snapshot = served_snapshot(config, session, harness, revision)
+            false ->
+              revision = session.identity_revision || Identity.live_revision!(config.base_dir)
 
-            AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, fn ->
-              case Adapter.load_session(
-                     adapter,
-                     pointer.harness_session_id,
-                     session.model,
-                     cwd,
-                     mcp_servers,
-                     snapshot.guidance
-                   ) do
-                :ok ->
-                  Org.append_pointer(
-                    db,
-                    session.session_key,
-                    pointer.harness_session_id,
-                    "loaded"
-                  )
+              snapshot = served_snapshot(config, session, harness, revision)
 
-                  Org.set_identity_revision(db, session.session_key, snapshot.revision)
-                  {:ok, pointer.harness_session_id}
+              AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, fn ->
+                case Adapter.load_session(
+                       adapter,
+                       pointer.harness_session_id,
+                       session.model,
+                       cwd,
+                       mcp_servers,
+                       snapshot.guidance
+                     ) do
+                  :ok ->
+                    Org.append_pointer(
+                      db,
+                      session.session_key,
+                      pointer.harness_session_id,
+                      "loaded"
+                    )
 
-                {:error, :contained_sandbox_disable_failed} = error ->
-                  error
-
-                {:error, {:model_apply_failed, _reason}} = error ->
-                  error
-
-                {:error, lost} ->
-                  # Spec §pointer chain: reason "fallback" — the harness lost
-                  # the session; start fresh, on the record, model context
-                  # forfeited but chat history substrate-side and intact.
-                  # A fallback is a memory loss: the WHY goes on the record.
-                  Tightbeam.EventLog.lifecycle(
-                    db,
-                    "pointer_fallback",
-                    session.session_key,
-                    inspect(lost)
-                  )
-
-                  with {:ok, sid} <-
-                         Adapter.new_session(
-                           adapter,
-                           session.model,
-                           cwd,
-                           mcp_servers,
-                           snapshot.guidance
-                         ) do
-                    Org.append_pointer(db, session.session_key, sid, "fallback")
                     Org.set_identity_revision(db, session.session_key, snapshot.revision)
-                    append_context_reset_marker(db, session)
-                    {:ok, sid}
-                  end
-              end
-            end)
+                    {:ok, pointer.harness_session_id}
+
+                  {:error, :contained_sandbox_disable_failed} = error ->
+                    error
+
+                  {:error, {:model_apply_failed, _reason}} = error ->
+                    error
+
+                  {:error, lost} ->
+                    # Spec §pointer chain: reason "fallback" — the harness lost
+                    # the session; start fresh, on the record, model context
+                    # forfeited but chat history substrate-side and intact.
+                    # A fallback is a memory loss: the WHY goes on the record.
+                    Tightbeam.EventLog.lifecycle(
+                      db,
+                      "pointer_fallback",
+                      session.session_key,
+                      inspect(lost)
+                    )
+
+                    with {:ok, sid} <-
+                           Adapter.new_session(
+                             adapter,
+                             session.model,
+                             cwd,
+                             mcp_servers,
+                             snapshot.guidance
+                           ) do
+                      Org.append_pointer(db, session.session_key, sid, "fallback")
+                      Org.set_identity_revision(db, session.session_key, snapshot.revision)
+                      append_context_reset_marker(db, session)
+                      {:ok, sid}
+                    end
+                end
+              end)
+
+            {:error, _reason} = error ->
+              error
           end
       end
 
@@ -2705,23 +2710,28 @@ defmodule Tightbeam.Gateway do
                  coordinator,
                  {harness, "shared", session.host}
                ) do
-          if Adapter.knows_session?(adapter, pointer.harness_session_id) do
-            Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
-          else
-            cwd = Placement.holder_workdir(config, session)
-            revision = session.identity_revision || Identity.live_revision!(config.base_dir)
-            snapshot = served_snapshot(config, session, harness, revision)
+          case Adapter.knows_session?(adapter, pointer.harness_session_id) do
+            true ->
+              Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
 
-            AdapterCoordinator.with_load_slot(coordinator, fn ->
-              Adapter.load_session(
-                adapter,
-                pointer.harness_session_id,
-                new_ref,
-                cwd,
-                session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers(),
-                snapshot.guidance
-              )
-            end)
+            false ->
+              cwd = Placement.holder_workdir(config, session)
+              revision = session.identity_revision || Identity.live_revision!(config.base_dir)
+              snapshot = served_snapshot(config, session, harness, revision)
+
+              AdapterCoordinator.with_load_slot(coordinator, fn ->
+                Adapter.load_session(
+                  adapter,
+                  pointer.harness_session_id,
+                  new_ref,
+                  cwd,
+                  session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers(),
+                  snapshot.guidance
+                )
+              end)
+
+            {:error, _reason} = error ->
+              error
           end
         else
           false -> {:error, :adapter_unavailable}
