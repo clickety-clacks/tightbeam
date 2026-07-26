@@ -15,6 +15,7 @@ defmodule Tightbeam.Identity do
 
   @upstream "tightbeam/upstream"
   @live "tightbeam/live"
+  @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
 
   @type harness :: atom()
@@ -31,6 +32,7 @@ defmodule Tightbeam.Identity do
     identity_dir = identity_dir(base_dir)
 
     if File.dir?(Path.join(identity_dir, ".git")) do
+      verify_required_refs!(identity_dir)
       :noop
     else
       File.mkdir_p!(identity_dir)
@@ -42,6 +44,35 @@ defmodule Tightbeam.Identity do
       git!(identity_dir, ["branch", @live])
       :initialized
     end
+  end
+
+  defp verify_required_refs!(identity_dir) do
+    missing = Enum.reject(@required_refs, &required_ref_exists?(identity_dir, &1))
+
+    if missing != [] do
+      repair =
+        Enum.map_join(missing, "; ", fn
+          "main" -> "restore main from a known-good identity backup"
+          ref -> "git -C #{identity_dir} branch #{ref} main"
+        end)
+
+      raise ArgumentError,
+            "identity repository is missing required refs: #{Enum.join(missing, ", ")}. Repair with: #{repair}"
+    end
+  end
+
+  defp required_ref_exists?(identity_dir, ref) do
+    git_dir = Path.join(identity_dir, ".git")
+    full_ref = "refs/heads/#{ref}"
+
+    File.regular?(Path.join(git_dir, full_ref)) ||
+      case File.read(Path.join(git_dir, "packed-refs")) do
+        {:ok, packed} ->
+          Enum.any?(String.split(packed, "\n"), &String.ends_with?(&1, " #{full_ref}"))
+
+        {:error, :enoent} ->
+          false
+      end
   end
 
   @doc "Resolve the sole publication pointer."

@@ -137,6 +137,10 @@ defmodule Tightbeam.Gateway do
       raise ArgumentError, "prod_limit must be an integer >= 0"
     end
 
+    cli_bin = Path.join(config.base_dir, "bin")
+    assert_harness_binary_ready!(config, cli_bin)
+    Identity.init!(config.base_dir)
+
     File.mkdir_p!(config.base_dir)
 
     for module <- [
@@ -228,7 +232,6 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:producer_runner, producer_runner)
       |> handlers()
 
-    Identity.init!(config.base_dir)
     Rules.load!(config.base_dir, Map.keys(handler_table), producer_config)
     runner = turn_runner(Map.put(config, :db, db))
 
@@ -236,7 +239,6 @@ defmodule Tightbeam.Gateway do
     # boot (bad law stops the boot). Placement owns every host mechanic.
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)
-    assert_harness_binary_ready!(config, cli_bin)
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)

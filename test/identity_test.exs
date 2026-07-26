@@ -40,6 +40,18 @@ defmodule Tightbeam.IdentityTest do
     assert codex.guidance =~ "tightbeam identity edit"
   end
 
+  test "init refuses an identity repository missing the live ref with repair guidance", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    git!(dir, ["update-ref", "-d", "refs/heads/tightbeam/live"])
+
+    assert_raise ArgumentError,
+                 "identity repository is missing required refs: tightbeam/live. Repair with: git -C #{dir} branch tightbeam/live main",
+                 fn ->
+                   Identity.init!(ctx.base)
+                 end
+  end
+
   test "reserved skills reconcile at exact cwd without product collisions", ctx do
     Identity.init!(ctx.base)
     cwd = Path.join(ctx.root, "plain")

@@ -803,6 +803,7 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "codex: exec failed"
     assert message =~ "fixture: not found"
     assert message =~ "Install a registered harness CLI"
+    refute File.exists?(base_dir)
   end
 
   test "children backfills distinct tokens for active NULL rows only", ctx do
