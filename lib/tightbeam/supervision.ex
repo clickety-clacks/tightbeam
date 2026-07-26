@@ -6,6 +6,7 @@ defmodule Tightbeam.Supervision do
   alias Tightbeam.{
     Adjudication,
     Assignments,
+    CausalEvents,
     DB,
     Dispatch,
     Escalation,
@@ -401,10 +402,10 @@ defmodule Tightbeam.Supervision do
 
   defp park_escalation(db, session_key, decision_request_id) do
     transaction!(db, fn txn ->
-      [[deadline_at, park_wake_id]] =
+      [[deadline_at, park_wake_id, assignment_id]] =
         Txn.q(
           txn,
-          "SELECT deadlineAt, parkWakeId FROM decision_requests WHERE id = ?1",
+          "SELECT deadlineAt, parkWakeId, assignmentId FROM decision_requests WHERE id = ?1",
           [decision_request_id]
         )
 
@@ -419,7 +420,10 @@ defmodule Tightbeam.Supervision do
             due_at: deadline_at,
             condition_kind: "escalation-ruled",
             condition_scope: decision_request_id,
-            creator_session_key: nil
+            creator_session_key: nil,
+            # A decision-DEADLINE wake resolves its assignment from the REQUEST
+            # row, where it is durable (spec job-forensics-v2 §1).
+            assignment_id: assignment_id
           })
 
         Txn.q(
@@ -515,6 +519,24 @@ defmodule Tightbeam.Supervision do
         """,
         [session_key, terminal_seq, branch, assignment.id, k, n]
       )
+
+      # prod_answered: attestCount is a bare COUNT, so which attest answered the
+      # prods is unrecoverable from it. causal_events is its own watermark — every
+      # attest not yet named by an event gets one, in attest-id order, so several
+      # attests arriving between evaluations each keep their edge.
+      if attest_count > prior.attestCount do
+        job_ref = job_ref_in_txn(txn, assignment.id)
+
+        for attest_id <- CausalEvents.unseen_attest_ids_in_txn(txn, assignment.id) do
+          CausalEvents.append_in_txn(txn, %{
+            kind: "prod_answered",
+            assignment_id: assignment.id,
+            job_ref: job_ref,
+            session_key: session_key,
+            detail: %{byAttestId: attest_id}
+          })
+        end
+      end
 
       Txn.q(
         txn,
@@ -618,7 +640,14 @@ defmodule Tightbeam.Supervision do
           )
       end
 
-    params = %{prompt: prompt, after_ms: 0, nudge: false}
+    # Supervision prods and escalations already hold their assignment when they
+  # schedule; they stop dropping it. THIS is what unlocks prod-turn attribution.
+    params = %{
+      prompt: prompt,
+      after_ms: 0,
+      nudge: false,
+      assignment_id: pending.pendingAssignment
+    }
 
     params =
       if pending.pendingBranch == "escalation" do
@@ -680,6 +709,18 @@ defmodule Tightbeam.Supervision do
           "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
           [pending.pendingAssignment, now()]
         )
+
+        # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
+        # overwritten every evaluation: the tier that fired has no other home.
+        if pending.pendingBranch == "prod" do
+          CausalEvents.append_in_txn(txn, %{
+            kind: "prod_fired",
+            assignment_id: pending.pendingAssignment,
+            job_ref: job_ref_in_txn(txn, pending.pendingAssignment),
+            session_key: pending.sessionKey,
+            detail: %{tier: pending.pendingK}
+          })
+        end
       end
     end)
   end
@@ -701,6 +742,13 @@ defmodule Tightbeam.Supervision do
 
       streak
     end)
+  end
+
+  defp job_ref_in_txn(txn, assignment_id) do
+    case Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
+      [[job_ref]] -> job_ref
+      [] -> nil
+    end
   end
 
   defp clear_pending_in_txn(txn, pending) do

@@ -2812,6 +2812,7 @@ defmodule Tightbeam.ConformanceSupport do
     {:ok, pid} = DB.start_link(path: ":memory:", name: name)
 
     for module <- [
+          Tightbeam.CausalEvents,
           Devices,
           Idempotency,
           Projection,

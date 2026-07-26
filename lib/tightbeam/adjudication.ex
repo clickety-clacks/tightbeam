@@ -7,7 +7,7 @@ defmodule Tightbeam.Adjudication do
   keys therefore have no effect.
   """
 
-  alias Tightbeam.{AdapterCoordinator, DB, EventLog, Idempotency, Supervision, Wakes}
+  alias Tightbeam.{AdapterCoordinator, CausalEvents, DB, EventLog, Idempotency, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
   @conditions ~w(auth_failed model_unavailable boot_failed quota_exhausted other)
@@ -31,6 +31,8 @@ defmodule Tightbeam.Adjudication do
     episodeId TEXT,
     cause TEXT,
     healToken TEXT,
+    assignmentId TEXT,
+    jobRef TEXT,
     PRIMARY KEY (sessionKey, condition)
   );
   CREATE INDEX IF NOT EXISTS adjudication_open_deadline
@@ -45,7 +47,9 @@ defmodule Tightbeam.Adjudication do
     for ddl <- [
           "ALTER TABLE adjudication_episodes ADD COLUMN episodeId TEXT",
           "ALTER TABLE adjudication_episodes ADD COLUMN cause TEXT",
-          "ALTER TABLE adjudication_episodes ADD COLUMN healToken TEXT"
+          "ALTER TABLE adjudication_episodes ADD COLUMN healToken TEXT",
+          "ALTER TABLE adjudication_episodes ADD COLUMN assignmentId TEXT",
+          "ALTER TABLE adjudication_episodes ADD COLUMN jobRef TEXT"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
@@ -99,13 +103,15 @@ defmodule Tightbeam.Adjudication do
     seed = Keyword.get(opts, :reresolve_seed, session_key)
     rung = Keyword.get(opts, :reresolve_rung, 1)
 
+    {assignment_id, job_ref} = failing_turn_attribution(txn, opts)
+
     Txn.q(
       txn,
       """
       INSERT INTO adjudication_episodes
         (sessionKey, condition, status, correlationKey, reresolveSeed,
-         reresolveRung, deadlineAt, openedAt, episodeId, cause)
-      VALUES (?1, ?2, 'claimed', ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         reresolveRung, deadlineAt, openedAt, episodeId, cause, assignmentId, jobRef)
+      VALUES (?1, ?2, 'claimed', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
       ON CONFLICT(sessionKey, condition) DO NOTHING
       """,
       [
@@ -117,7 +123,9 @@ defmodule Tightbeam.Adjudication do
         now + claim_window,
         now,
         Tightbeam.Id.ulid(),
-        Keyword.get(opts, :cause)
+        Keyword.get(opts, :cause),
+        assignment_id,
+        job_ref
       ]
     )
 
@@ -128,6 +136,9 @@ defmodule Tightbeam.Adjudication do
   def reopen_in_txn(%Txn{} = txn, session_key, condition, opts) do
     now = Keyword.get(opts, :now, now())
     correlation_key = Keyword.get(opts, :correlation_key, correlation_key())
+    {assignment_id, job_ref} = failing_turn_attribution(txn, opts)
+    prior = get_in_txn(txn, session_key, condition)
+    rung = Keyword.get(opts, :reresolve_rung, 1)
 
     Txn.q(
       txn,
@@ -138,7 +149,8 @@ defmodule Tightbeam.Adjudication do
           deadlineAt=?6, openedAt=?7, resolvedAt=NULL,
           episodeId=COALESCE(episodeId, ?8), cause=?9,
           healToken=CASE WHEN ?10 IS NOT NULL AND recoveryWakeId = ?10
-                         THEN healToken ELSE NULL END
+                         THEN healToken ELSE NULL END,
+          assignmentId=?11, jobRef=?12
       WHERE sessionKey=?1 AND condition=?2 AND status='resolved'
       """,
       [
@@ -146,7 +158,7 @@ defmodule Tightbeam.Adjudication do
         condition,
         correlation_key,
         Keyword.get(opts, :reresolve_seed, session_key),
-        Keyword.get(opts, :reresolve_rung, 1),
+        rung,
         now + Keyword.fetch!(opts, :claim_window_ms),
         now,
         Tightbeam.Id.ulid(),
@@ -155,11 +167,47 @@ defmodule Tightbeam.Adjudication do
         # reopen is a probe failure: keep healToken so the re-held session waits
         # for a STRICTLY NEWER token instead of re-probing the same one forever.
         # Any other reopen is a genuinely new fault and starts token-eligible.
-        Keyword.get(opts, :failing_wake_id)
+        Keyword.get(opts, :failing_wake_id),
+        assignment_id,
+        job_ref
       ]
     )
 
-    if Txn.changes(txn) == 1, do: get_in_txn(txn, session_key, condition), else: nil
+    if Txn.changes(txn) == 1 do
+      episode = get_in_txn(txn, session_key, condition)
+
+      CausalEvents.append_in_txn(txn, %{
+        kind: "adjudication_reopen",
+        at: now,
+        assignment_id: episode.assignment_id,
+        job_ref: episode.job_ref,
+        session_key: session_key,
+        detail: %{
+          episodeId: episode.episode_id,
+          fromState: prior.status,
+          toState: episode.status,
+          toRung: rung,
+          toTarget: episode.owner_target
+        }
+      })
+
+      episode
+    else
+      nil
+    end
+  end
+
+  # The claim carries only the failing turn's seq; the attribution is whatever
+  # that TURN durably records. NULL stamps NULL — never the session's "active"
+  # assignment, which a session can hold several of (spec job-forensics-v2 §1).
+  defp failing_turn_attribution(%Txn{} = txn, opts) do
+    with seq when is_integer(seq) <- Keyword.get(opts, :failing_seq),
+         [[assignment_id, job_ref]] <-
+           Txn.q(txn, "SELECT assignmentId, jobRef FROM turns WHERE seq = ?1", [seq]) do
+      {assignment_id, job_ref}
+    else
+      _ -> {nil, nil}
+    end
   end
 
   @doc "Schedule the deterministic owner wake and perform claimed→notified in the same txn."
@@ -357,11 +405,7 @@ defmodule Tightbeam.Adjudication do
               target = Supervision.ladder_target(txn, next.reresolve_seed, next.reresolve_rung)
               wake_id = deterministic_wake_in_txn(txn, next, "owner", target, old_prompt)
 
-              Txn.q(
-                txn,
-                "UPDATE wakes SET state='canceled' WHERE wakeId=?1 AND state='pending'",
-                [episode.owner_wake_id]
-              )
+              Wakes.cancel_pending_in_txn(txn, episode.owner_wake_id)
 
               Txn.q(
                 txn,
@@ -384,7 +428,25 @@ defmodule Tightbeam.Adjudication do
                 ]
               )
 
-              Txn.changes(txn) == 1
+              if Txn.changes(txn) == 1 do
+                CausalEvents.append_in_txn(txn, %{
+                  kind: "adjudication_escalate",
+                  assignment_id: episode.assignment_id,
+                  job_ref: episode.job_ref,
+                  session_key: session_key,
+                  detail: %{
+                    episodeId: episode.episode_id,
+                    fromState: status,
+                    toState: "notified",
+                    toRung: next.reresolve_rung,
+                    toTarget: target
+                  }
+                })
+
+                true
+              else
+                false
+              end
             end
 
           _ ->
@@ -481,13 +543,9 @@ defmodule Tightbeam.Adjudication do
   def dispose_owner_wake_in_txn(%Txn{}, %{owner_wake_id: nil}), do: :left_fired
 
   def dispose_owner_wake_in_txn(%Txn{} = txn, episode) do
-    Txn.q(
-      txn,
-      "UPDATE wakes SET state='canceled' WHERE wakeId=?1 AND state='pending'",
-      [episode.owner_wake_id]
-    )
-
-    if Txn.changes(txn) == 1, do: :canceled, else: :left_fired
+    if Wakes.cancel_pending_in_txn(txn, episode.owner_wake_id),
+      do: :canceled,
+      else: :left_fired
   end
 
   @doc """
@@ -560,7 +618,7 @@ defmodule Tightbeam.Adjudication do
   end
 
   defp select_sql do
-    "SELECT sessionKey, condition, status, correlationKey, ownerTarget, ownerWakeId, recoveryWakeId, reresolveSeed, reresolveRung, deadlineAt, openedAt, resolvedAt, episodeId, cause, healToken FROM adjudication_episodes"
+    "SELECT sessionKey, condition, status, correlationKey, ownerTarget, ownerWakeId, recoveryWakeId, reresolveSeed, reresolveRung, deadlineAt, openedAt, resolvedAt, episodeId, cause, healToken, assignmentId, jobRef FROM adjudication_episodes"
   end
 
   defp one([row]), do: row(row)
@@ -581,7 +639,9 @@ defmodule Tightbeam.Adjudication do
          resolved,
          episode_id,
          cause,
-         heal_token
+         heal_token,
+         assignment_id,
+         job_ref
        ]) do
     %{
       session_key: session,
@@ -598,7 +658,9 @@ defmodule Tightbeam.Adjudication do
       resolved_at: resolved,
       episode_id: episode_id,
       cause: cause,
-      heal_token: heal_token
+      heal_token: heal_token,
+      assignment_id: assignment_id,
+      job_ref: job_ref
     }
   end
 

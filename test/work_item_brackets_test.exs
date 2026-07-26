@@ -35,6 +35,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     start_supervised!({ConnRegistry, name: ConnRegistry})
 
     for module <- [
+          Tightbeam.CausalEvents,
           Devices,
           EventLog,
           Idempotency,

@@ -188,7 +188,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "work and work-item device routes expose owner-scoped random-access snapshots", ctx do
-    for module <- [WorkItems, Assignments, Supervision, WorkState],
+    for module <- [Tightbeam.CausalEvents,WorkItems, Assignments, Supervision, WorkState],
         do: :ok = module.ensure_schema(ctx.db)
 
     create_session(ctx.db, "holder", ctx.device.user_id)

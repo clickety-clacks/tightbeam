@@ -77,6 +77,8 @@ defmodule Tightbeam.Wakes do
     creatorSessionKey TEXT NULL,
     rumination INTEGER NOT NULL DEFAULT 0,
     work_item_id TEXT,
+    assignmentId TEXT,
+    canceledAt INTEGER,
     CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
   );
   CREATE INDEX IF NOT EXISTS wakes_due ON wakes (state, dueAt);
@@ -109,6 +111,8 @@ defmodule Tightbeam.Wakes do
     creatorSessionKey TEXT NULL,
     rumination INTEGER NOT NULL DEFAULT 0,
     work_item_id TEXT,
+    assignmentId TEXT,
+    canceledAt INTEGER,
     CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
   )
   """
@@ -128,7 +132,9 @@ defmodule Tightbeam.Wakes do
           "ALTER TABLE wakes ADD COLUMN firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback'))",
           "ALTER TABLE wakes ADD COLUMN creatorSessionKey TEXT NULL",
           "ALTER TABLE wakes ADD COLUMN rumination INTEGER NOT NULL DEFAULT 0",
-          "ALTER TABLE wakes ADD COLUMN work_item_id TEXT"
+          "ALTER TABLE wakes ADD COLUMN work_item_id TEXT",
+          "ALTER TABLE wakes ADD COLUMN assignmentId TEXT",
+          "ALTER TABLE wakes ADD COLUMN canceledAt INTEGER"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
@@ -193,6 +199,8 @@ defmodule Tightbeam.Wakes do
       creator_session_key: Map.get(input, :creator_session_key),
       rumination: Map.get(input, :rumination, false),
       work_item_id: Map.get(input, :work_item_id),
+      assignment_id: Map.get(input, :assignment_id),
+      canceled_at: nil,
       reresolve: Map.get(input, :reresolve),
       reresolve_seed: Map.get(input, :reresolve_seed),
       reresolve_rung: Map.get(input, :reresolve_rung)
@@ -204,9 +212,9 @@ defmodule Tightbeam.Wakes do
         INSERT INTO wakes
           (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt,
            reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope,
-           conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id)
+           conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, ?9, ?10, ?11,
-                ?12, ?13, ?14, NULL, ?15, ?16, ?17)
+                ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18)
       """,
       [
         wake.wake_id,
@@ -225,7 +233,8 @@ defmodule Tightbeam.Wakes do
         wake.condition_after_id,
         wake.creator_session_key,
         if(wake.rumination, do: 1, else: 0),
-        wake.work_item_id
+        wake.work_item_id,
+        wake.assignment_id
       ]
     )
 
@@ -272,10 +281,27 @@ defmodule Tightbeam.Wakes do
     Txn.q(
       txn,
       """
-        UPDATE wakes SET state = 'canceled'
+        UPDATE wakes SET state = 'canceled', canceledAt = ?3
         WHERE wakeId = ?1 AND origin = ?2 AND state = 'pending'
       """,
-      [wake_id, origin]
+      [wake_id, origin, now()]
+    )
+
+    Txn.changes(txn) == 1
+  end
+
+  @doc """
+  Cancel a pending wake regardless of origin, stamping `canceledAt`. For
+  substrate-internal retargeting (an escalation moving its owner wake up a rung,
+  a park superseded by a recovery already recorded) where the canceller is the
+  substrate itself, not the scheduling origin. Returns true if a row transitioned.
+  """
+  @spec cancel_pending_in_txn(Txn.t(), String.t()) :: boolean()
+  def cancel_pending_in_txn(%Txn{} = txn, wake_id) do
+    Txn.q(
+      txn,
+      "UPDATE wakes SET state = 'canceled', canceledAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+      [wake_id, now()]
     )
 
     Txn.changes(txn) == 1
@@ -800,7 +826,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt FROM wakes"
   end
 
   defp to_wake([
@@ -823,7 +849,9 @@ defmodule Tightbeam.Wakes do
          fired_by,
          creator_session_key,
          rumination,
-         work_item_id
+         work_item_id,
+         assignment_id,
+         canceled_at
        ]) do
     %{
       wake_id: wake_id,
@@ -845,7 +873,9 @@ defmodule Tightbeam.Wakes do
       fired_by: fired_by,
       creator_session_key: creator_session_key,
       rumination: rumination == 1,
-      work_item_id: work_item_id
+      work_item_id: work_item_id,
+      assignment_id: assignment_id,
+      canceled_at: canceled_at
     }
   end
 
@@ -861,7 +891,7 @@ defmodule Tightbeam.Wakes do
       names = Enum.map(columns, &Enum.at(&1, 1))
 
       copied =
-        ~w(wakeId sessionKey targetRole origin prompt dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination work_item_id)
+        ~w(wakeId sessionKey targetRole origin prompt dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination work_item_id assignmentId canceledAt)
         |> Enum.filter(&(&1 in names))
 
       transaction!(db, fn txn ->

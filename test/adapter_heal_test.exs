@@ -134,6 +134,7 @@ defmodule Tightbeam.AdapterHealTest do
     )
 
     for module <- [
+          Tightbeam.CausalEvents,
           Devices,
           Artifacts,
           EventLog,

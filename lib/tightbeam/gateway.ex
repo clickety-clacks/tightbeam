@@ -64,6 +64,7 @@ defmodule Tightbeam.Gateway do
     Archetypes,
     Artifacts,
     Assignments,
+    CausalEvents,
     ConditionFacts,
     CriticalLeases,
     Placement,
@@ -149,6 +150,7 @@ defmodule Tightbeam.Gateway do
     for module <- [
           Tightbeam.Assets,
           Artifacts,
+          CausalEvents,
           Adjudication,
           Devices,
           Idempotency,
@@ -862,33 +864,49 @@ defmodule Tightbeam.Gateway do
 
       {nil, nil} ->
         case opts[:wake_id] do
-          wake_id when is_binary(wake_id) ->
-            case DB.Txn.q(
-                   txn,
-                   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'work_items'",
-                   []
-                 ) do
-              [[1]] ->
-                case DB.Txn.q(
-                       txn,
-                       "SELECT id FROM work_items WHERE routingWakeId = ?1",
-                       [wake_id]
-                     ) do
-                  [[job_ref]] -> {nil, job_ref}
-                  [] -> {nil, nil}
-                end
-
-              [] ->
-                {nil, nil}
-            end
-
-          nil ->
-            {nil, nil}
+          wake_id when is_binary(wake_id) -> wake_attribution(txn, wake_id)
+          nil -> {nil, nil}
         end
 
       attribution ->
         attribution
     end
+  end
+
+  # A wake-delivered turn inherits its wake's carriers — the same rule every
+  # other carrier follows. This is what CLOSES v1's prod-turn exclusion ("no
+  # durable carrier"): supervision now stamps wakes.assignmentId, so the prod
+  # turn is attributable, and jobRef follows from the assignment. A bracket wake
+  # has no assignment and keeps resolving its jobRef from the work item.
+  defp wake_attribution(txn, wake_id) do
+    assignment_id =
+      case DB.Txn.q(txn, "SELECT assignmentId FROM wakes WHERE wakeId = ?1", [wake_id]) do
+        [[assignment_id]] -> assignment_id
+        [] -> nil
+      end
+
+    cond do
+      is_binary(assignment_id) ->
+        case DB.Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
+          [[job_ref]] -> {assignment_id, job_ref}
+          [] -> {assignment_id, nil}
+        end
+
+      table?(txn, "work_items") ->
+        case DB.Txn.q(txn, "SELECT id FROM work_items WHERE routingWakeId = ?1", [wake_id]) do
+          [[job_ref]] -> {nil, job_ref}
+          [] -> {nil, nil}
+        end
+
+      true ->
+        {nil, nil}
+    end
+  end
+
+  defp table?(txn, name) do
+    DB.Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name]) == [
+      [1]
+    ]
   end
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
@@ -1275,7 +1293,8 @@ defmodule Tightbeam.Gateway do
                 reresolve_seed: turn.session_key,
                 reresolve_rung: 1,
                 cause: cause,
-                failing_wake_id: turn.wake_id
+                failing_wake_id: turn.wake_id,
+                failing_seq: turn.seq
               ]
 
               episode =
@@ -2377,7 +2396,10 @@ defmodule Tightbeam.Gateway do
       creator_session_key: creator_session_key(call[:principal]),
       reresolve: p[:reresolve],
       reresolve_seed: p[:reresolve_seed],
-      reresolve_rung: p[:reresolve_rung]
+      reresolve_rung: p[:reresolve_rung],
+      # Whatever the scheduler held; NULL for conversational and owner wakes,
+      # which genuinely have no job.
+      assignment_id: p[:assignment_id]
     })
   end
 
@@ -3438,11 +3460,7 @@ defmodule Tightbeam.Gateway do
 
           delivery =
             if already_recovered do
-              Txn.q(
-                txn,
-                "UPDATE wakes SET state='canceled' WHERE wakeId=?1 AND state='pending'",
-                [wake.wake_id]
-              )
+              Wakes.cancel_pending_in_txn(txn, wake.wake_id)
 
               delivered =
                 deliver_prompt_in_txn(
