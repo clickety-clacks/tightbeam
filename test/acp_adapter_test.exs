@@ -6,9 +6,61 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   alias Tightbeam.Acp.Adapter
 
+  defmodule SlowBootAdapter do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+
+    @impl true
+    def init(parent) do
+      {:ok, parent, {:continue, :boot}}
+    end
+
+    @impl true
+    def handle_continue(:boot, parent) do
+      send(parent, {:adapter_booting, self()})
+
+      receive do
+        :finish_boot -> {:noreply, parent}
+      end
+    end
+
+    @impl true
+    def handle_call({:knows_session?, "resident"}, _from, parent),
+      do: {:reply, true, parent}
+  end
+
   test "parse_model_ref splits effort" do
     assert Adapter.parse_model_ref("gpt-5.6-sol[medium]") == {"gpt-5.6-sol", "medium"}
     assert Adapter.parse_model_ref("haiku") == {"haiku", nil}
+  end
+
+  test "residency waits behind slow adapter boot and dead adapters fail promptly" do
+    adapter = start_supervised!({SlowBootAdapter, self()})
+    assert_receive {:adapter_booting, ^adapter}
+
+    queued =
+      Task.async(fn ->
+        try do
+          Adapter.knows_session?(adapter, "resident")
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+      end)
+
+    Process.sleep(5_100)
+    assert Task.yield(queued, 0) == nil
+
+    send(adapter, :finish_boot)
+    assert Task.await(queued) == true
+
+    GenServer.stop(adapter)
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, {:adapter_unavailable, _reason}} =
+             Adapter.knows_session?(adapter, "resident")
+
+    assert System.monotonic_time(:millisecond) - started < 1_000
   end
 
   # Fake adapter that records the method order and streams chunks, mid-turn
