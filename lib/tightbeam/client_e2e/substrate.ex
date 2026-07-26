@@ -192,17 +192,18 @@ defmodule Tightbeam.ClientE2E.Substrate do
 
   @doc """
   Samples the running set on an interval while `task` runs, returning
-  `{task_result, samples}` where each sample is the `MapSet` of session keys
-  running AT THAT INSTANT.
+  `{task_result, samples}` where each sample is a map of session key => number
+  of turns running for it AT THAT INSTANT.
 
-  Per-sample sets, not per-session maxima. A maximum per session, merged across
-  different samples, cannot distinguish "both lanes ran at once" from "one ran,
-  finished, then the other ran" — it would report sequential execution as
-  concurrency, which is the one thing J5 exists to disprove. Simultaneity is a
-  property of a single observation, so a single observation is what is kept.
+  Per-sample observations, not per-session maxima. A maximum per session, merged
+  across different samples, cannot distinguish "both lanes ran at once" from
+  "one ran, finished, then the other ran" — it would report sequential execution
+  as concurrency, the one thing J5 exists to disprove. Counts rather than sets
+  because J4 asks a different question of the same samples: never more than one
+  turn running for ONE session.
   """
   @spec sample_while(base_dir(), non_neg_integer(), (-> result)) ::
-          {result, [MapSet.t(String.t())]}
+          {result, [%{String.t() => non_neg_integer()}]}
         when result: term()
   def sample_while(base_dir, interval_ms, task) do
     owner = self()
@@ -234,15 +235,25 @@ defmodule Tightbeam.ClientE2E.Substrate do
   True when SOME SINGLE sample caught every one of `session_keys` running at
   the same instant — the simultaneous-lane witness J5 asserts.
   """
-  @spec simultaneous?([MapSet.t(String.t())], [String.t()]) :: boolean()
+  @spec simultaneous?([%{String.t() => non_neg_integer()}], [String.t()]) :: boolean()
   def simultaneous?(samples, session_keys) do
-    wanted = MapSet.new(session_keys)
-    Enum.any?(samples, &MapSet.subset?(wanted, &1))
+    Enum.any?(samples, fn sample ->
+      Enum.all?(session_keys, &(Map.get(sample, &1, 0) > 0))
+    end)
   end
 
-  @doc "The largest number of sessions seen running in any one sample."
-  @spec widest_sample([MapSet.t(String.t())]) :: non_neg_integer()
-  def widest_sample(samples), do: samples |> Enum.map(&MapSet.size/1) |> Enum.max(fn -> 0 end)
+  @doc "The largest number of DISTINCT sessions seen running in any one sample."
+  @spec widest_sample([%{String.t() => non_neg_integer()}]) :: non_neg_integer()
+  def widest_sample(samples), do: samples |> Enum.map(&map_size/1) |> Enum.max(fn -> 0 end)
+
+  @doc """
+  The most turns seen running for ONE session in any single sample — J4's
+  strict-order witness ("never more than one `running` for the session").
+  """
+  @spec busiest_lane([%{String.t() => non_neg_integer()}], String.t()) :: non_neg_integer()
+  def busiest_lane(samples, session_key) do
+    samples |> Enum.map(&Map.get(&1, session_key, 0)) |> Enum.max(fn -> 0 end)
+  end
 
   @doc """
   Whether two turn rows overlapped in wall-clock time, from their own
@@ -263,12 +274,10 @@ defmodule Tightbeam.ClientE2E.Substrate do
   end
 
   defp sample_loop(base_dir, interval_ms, samples, owner) do
-    sample = base_dir |> running_by_session() |> Map.keys() |> MapSet.new()
+    sample = running_by_session(base_dir)
 
     receive do
-      {:stop, ^owner} ->
-        final = base_dir |> running_by_session() |> Map.keys() |> MapSet.new()
-        Enum.reverse([final, sample | samples])
+      {:stop, ^owner} -> Enum.reverse([running_by_session(base_dir), sample | samples])
     after
       interval_ms -> sample_loop(base_dir, interval_ms, [sample | samples], owner)
     end

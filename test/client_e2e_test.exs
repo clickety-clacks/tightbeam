@@ -275,8 +275,8 @@ defmodule Tightbeam.ClientE2ETest do
     alias Tightbeam.ClientE2E.Substrate
 
     test "simultaneity requires ONE sample holding both sessions" do
-      sequential = [MapSet.new(["a"]), MapSet.new([]), MapSet.new(["b"])]
-      together = [MapSet.new(["a"]), MapSet.new(["a", "b"]), MapSet.new(["b"])]
+      sequential = [%{"a" => 1}, %{}, %{"b" => 1}]
+      together = [%{"a" => 1}, %{"a" => 1, "b" => 1}, %{"b" => 1}]
 
       # This is the laundering the cross-review found: per-session maxima are
       # 1 and 1 in BOTH lists, so a maxima-based witness calls sequential
@@ -290,6 +290,17 @@ defmodule Tightbeam.ClientE2ETest do
     test "an empty sample list witnesses nothing" do
       refute Substrate.simultaneous?([], ["a", "b"])
       assert Substrate.widest_sample([]) == 0
+      assert Substrate.busiest_lane([], "a") == 0
+    end
+
+    test "the lane witness counts turns within ONE session (J4's strict order)" do
+      # Two turns running at once in one lane is the queueing violation; the
+      # same samples must not read as concurrency across lanes.
+      doubled = [%{"a" => 1}, %{"a" => 2}, %{"a" => 1}]
+
+      assert Substrate.busiest_lane(doubled, "a") == 2
+      assert Substrate.busiest_lane([%{"a" => 1}, %{"a" => 1}], "a") == 1
+      refute Substrate.simultaneous?(doubled, ["a", "b"])
     end
 
     test "turn intervals witness overlap without needing a lucky sample" do

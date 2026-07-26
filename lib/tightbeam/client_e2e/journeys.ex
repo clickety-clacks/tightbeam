@@ -512,7 +512,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
     ctx = %{ctx | client: client}
 
-    {ctx, peaks} =
+    {ctx, samples} =
       Substrate.sample_while(ctx.base_dir, 200, fn ->
         Enum.reduce(ids, ctx, fn id, ctx ->
           {_ok, _frame, client} =
@@ -559,7 +559,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
     first_reply_index = Enum.find_index(frames, &(&1["type"] == "message" and &1["role"] == "assistant"))
     echo_indexes = for {f, i} <- Enum.with_index(frames), f["type"] == "message", f["role"] == "user", do: i
     turns = Enum.map(ids, &Substrate.turn_for_client_message(ctx.base_dir, &1))
-    peak = Map.get(peaks, ctx.main_key, 0)
+    peak = Substrate.busiest_lane(samples, ctx.main_key)
 
     row =
       cond do
@@ -1082,13 +1082,23 @@ defmodule Tightbeam.ClientE2E.Journeys do
             60_000
           )
 
+        # CORRELATE, do not take the next reply. A wake carries no
+        # clientMessageId, but the assistant's final points back at the
+        # delivered message through `replyToMessageId` — and the first run of
+        # this journey grabbed a reply belonging to J7's still-draining queued
+        # turn, then blamed the agent for answering "SURVIVED".
         {reply, client} =
-          await_frame(
-            client,
-            watermark,
-            &(&1["type"] == "message" and &1["role"] == "assistant" and &1["sessionKey"] == ctx.main_key),
-            ctx.turn_timeout_ms
-          )
+          if stamped do
+            await_frame(
+              client,
+              watermark,
+              &(&1["type"] == "message" and &1["role"] == "assistant" and
+                  &1["replyToMessageId"] == stamped["id"]),
+              ctx.turn_timeout_ms
+            )
+          else
+            {nil, client}
+          end
 
         ctx = %{ctx | client: client}
         woken = stamped && Substrate.turn_for_wake(ctx.base_dir, stamped["id"])
@@ -1131,14 +1141,29 @@ defmodule Tightbeam.ClientE2E.Journeys do
         wake_id = result["wakeId"] || get_in(result, ["result", "wakeId"])
         pending = Substrate.pending_wakes(ctx.base_dir)
 
-        {reply, client} =
+        # Wait for the SCHEDULED delivery itself (a sender-tagged message that
+        # arrives only after the delay), then its correlated reply.
+        {delivered, client} =
           await_frame(
             ctx.client,
             watermark,
-            &(&1["type"] == "message" and &1["role"] == "assistant" and
-                (&1["content"] || "") =~ "LATER OK"),
-            delay_ms + ctx.turn_timeout_ms
+            &(&1["type"] == "message" and &1["role"] == "user" and is_binary(&1["sender"]) and
+                &1["sessionKey"] == ctx.main_key),
+            delay_ms + 60_000
           )
+
+        {reply, client} =
+          if delivered do
+            await_frame(
+              client,
+              watermark,
+              &(&1["type"] == "message" and &1["role"] == "assistant" and
+                  &1["replyToMessageId"] == delivered["id"]),
+              ctx.turn_timeout_ms
+            )
+          else
+            {nil, client}
+          end
 
         ctx = %{ctx | client: client}
 
@@ -1155,8 +1180,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
                 journey: "J8"
               )
 
+            is_nil(delivered) ->
+              Scorecard.fail("16b", "scheduled wake", "the scheduled wake never fired within #{delay_ms}ms + 60s", journey: "J8")
+
             is_nil(reply) ->
-              Scorecard.fail("16b", "scheduled wake", "the scheduled wake never fired within #{delay_ms}ms + turn timeout", journey: "J8")
+              Scorecard.fail("16b", "scheduled wake", "the scheduled wake fired but drew no reply", journey: "J8")
+
+            not String.contains?(reply["content"] || "", "LATER OK") ->
+              Scorecard.fail("16b", "scheduled wake", "the agent did not answer the scheduled prompt: #{inspect(reply["content"])}", journey: "J8")
 
             true ->
               Scorecard.pass("16b", "scheduled wake", journey: "J8")
