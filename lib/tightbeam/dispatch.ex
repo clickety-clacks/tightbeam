@@ -24,7 +24,7 @@ defmodule Tightbeam.Dispatch do
   still appends a "verb" row with the error.
   """
 
-  alias Tightbeam.{Assignments, DB, Escalation, EventLog, RailRemedy, Rules}
+  alias Tightbeam.{Assignments, DB, Escalation, EventLog, Gateway, RailRemedy, Rules}
 
   @typedoc """
   A verb call. `origin` is WHO (\"user:flynn\" | \"agent:<handle>\") — never
@@ -109,8 +109,12 @@ defmodule Tightbeam.Dispatch do
       {:escalate, statute, ctx, dr_id} ->
         outcome =
           case dr_id do
-            nil -> Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
-            id -> {:decision_pending, id}
+            nil ->
+              ctx = Gateway.escalation_context(%{}, db, Map.put(ctx, :dr_id, nil))
+              Escalation.escalate(db, call, statute, ctx)
+
+            id ->
+              {:decision_pending, id}
           end
 
         best_effort_denial(db, verb, origin, principal, session_key, ctx.error)

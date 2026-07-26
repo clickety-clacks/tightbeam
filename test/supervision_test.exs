@@ -26,9 +26,14 @@ defmodule Tightbeam.SupervisionTest do
 
   defmodule LaneDoorbell do
     use GenServer
+    def start_link({name, parent}), do: GenServer.start_link(__MODULE__, parent, name: name)
     def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
     def init(state), do: {:ok, state}
-    def handle_call({:ensure_lane, _key}, _from, state), do: {:reply, :ok, state}
+
+    def handle_call({:ensure_lane, key}, _from, state) do
+      if is_pid(state), do: send(state, {:lane_nudged, key})
+      {:reply, :ok, state}
+    end
   end
 
   defmodule RaceLane do
@@ -276,6 +281,9 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "turn-end escalation still opens and parks the same decision request", ctx do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneDoorbell, {Tightbeam.LaneManager, self()}})
+
     write_rules(
       ctx,
       """
@@ -304,6 +312,18 @@ defmodule Tightbeam.SupervisionTest do
 
     assert is_binary(id)
     assert is_binary(park_wake_id)
+
+    assert_receive {:lane_nudged, owner_session}
+    assert owner_session == ctx.main.session_key
+
+    assert {:ok, [[owner_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT prompt FROM turns WHERE sessionKey = ?1 AND origin = 'process:tightbeam'",
+               [ctx.main.session_key]
+             )
+
+    assert owner_prompt =~ "Decision #{id} pending on completion-needs-owner."
 
     assert %{condition_kind: "escalation-ruled", condition_scope: ^id} =
              Wakes.get(ctx.db, park_wake_id)

@@ -375,8 +375,10 @@ defmodule Tightbeam.Supervision do
           decision_request_id =
             case dr_id do
               nil ->
+                ctx = Gateway.escalation_context(%{}, db, Map.put(ctx, :dr_id, nil))
+
                 {:decision_pending, id} =
-                  Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
+                  Escalation.escalate(db, call, statute, ctx)
 
                 id
 

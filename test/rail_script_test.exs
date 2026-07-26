@@ -19,15 +19,32 @@ defmodule Tightbeam.RailScriptTest do
 
   alias Tightbeam.{
     ConditionFacts,
+    ConnRegistry,
     DB,
     Dispatch,
     Escalation,
     EventLog,
+    Ledger,
     Org,
     Placement,
+    Projection,
     RailScript,
     Rules
   }
+
+  defmodule LaneDoorbell do
+    use GenServer
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:ensure_lane, session_key}, _from, parent) do
+      send(parent, {:lane_nudged, session_key})
+      {:reply, :ok, parent}
+    end
+  end
 
   setup do
     db = :"rail_script_db_#{System.unique_integer([:positive])}"
@@ -333,6 +350,10 @@ defmodule Tightbeam.RailScriptTest do
 
   test "verb-edge escalation opens once, returns pending, and consumes an allow ruling", ctx do
     parent = self()
+    :ok = Projection.ensure_schema(ctx.db)
+    :ok = Ledger.ensure_schema(ctx.db)
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneDoorbell, self()})
 
     escalated_call = %{
       call()
@@ -353,11 +374,24 @@ defmodule Tightbeam.RailScriptTest do
     assert {:decision_pending, id} = Dispatch.dispatch(ctx.db, handlers, escalated_call)
     refute_received :handler_ran
 
+    owner_session = Org.personal_session_key("flynn")
+    assert_receive {:lane_nudged, ^owner_session}
+
+    assert {:ok, [[owner_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT prompt FROM turns WHERE sessionKey = ?1 AND origin = 'process:tightbeam'",
+               [owner_session]
+             )
+
+    assert owner_prompt =~ "Decision #{id} pending on script-escalate."
+
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status = 'open'")
 
     assert {:decision_pending, ^id} = Dispatch.dispatch(ctx.db, handlers, escalated_call)
     refute_received :handler_ran
+    refute_receive {:lane_nudged, ^owner_session}
 
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
 

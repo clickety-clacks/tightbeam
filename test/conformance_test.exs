@@ -1456,6 +1456,7 @@ defmodule Tightbeam.ConformanceSupport do
     base = temp_dir!("conformance-escalation-dispatch-matrix")
     prepare_rule_base!(base, fixture)
     Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    service_pids = start_wake_delivery_services()
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -1570,6 +1571,7 @@ defmodule Tightbeam.ConformanceSupport do
         end
       end)
     after
+      Enum.each(service_pids, &GenServer.stop/1)
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
     end
@@ -1767,6 +1769,7 @@ defmodule Tightbeam.ConformanceSupport do
     base = temp_dir!("conformance-park-wake-reuse")
     prepare_rule_base!(base, fixture)
     Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    service_pids = start_wake_delivery_services()
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -1817,6 +1820,7 @@ defmodule Tightbeam.ConformanceSupport do
         end
       end)
     after
+      Enum.each(service_pids, &GenServer.stop/1)
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
     end
@@ -2036,6 +2040,7 @@ defmodule Tightbeam.ConformanceSupport do
     base = temp_dir!("conformance-sweep-ruling")
     prepare_rule_base!(base, fixture)
     Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    service_pids = start_wake_delivery_services()
     {db, pid} = memory_db!()
 
     try do
@@ -2064,7 +2069,7 @@ defmodule Tightbeam.ConformanceSupport do
       ids =
         materialize_world(
           db,
-          %{"turn" => %{"session" => session_key, "seq" => 2, "window_start" => 1}},
+          %{"turn" => %{"session" => session_key, "seq" => 3, "window_start" => 1}},
           ids
         )
 
@@ -2086,6 +2091,7 @@ defmodule Tightbeam.ConformanceSupport do
       refute new_request_id == request_id
     after
       GenServer.stop(pid)
+      Enum.each(service_pids, &GenServer.stop/1)
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
     end
@@ -2379,6 +2385,7 @@ defmodule Tightbeam.ConformanceSupport do
     base = temp_dir!("conformance-sweep-escalation")
     prepare_rule_base!(base, fixture)
     Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    service_pids = start_wake_delivery_services()
     {db, pid} = memory_db!()
 
     try do
@@ -2400,7 +2407,7 @@ defmodule Tightbeam.ConformanceSupport do
       ids =
         materialize_world(
           db,
-          %{"turn" => %{"session" => "holder", "seq" => 2, "window_start" => 1}},
+          %{"turn" => %{"session" => "holder", "seq" => 3, "window_start" => 1}},
           ids
         )
 
@@ -2413,6 +2420,7 @@ defmodule Tightbeam.ConformanceSupport do
       assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
     after
       GenServer.stop(pid)
+      Enum.each(service_pids, &GenServer.stop/1)
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
     end
@@ -2552,6 +2560,7 @@ defmodule Tightbeam.ConformanceSupport do
     prepare_rule_base!(base, fixture)
     handlers = Gateway.handlers(%{})
     Rules.load!(base, Map.keys(handlers), %{})
+    service_pids = start_wake_delivery_services()
 
     try do
       {db, pid} = memory_db!()
@@ -2617,6 +2626,7 @@ defmodule Tightbeam.ConformanceSupport do
         GenServer.stop(pid)
       end
     after
+      Enum.each(service_pids, &GenServer.stop/1)
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
     end
