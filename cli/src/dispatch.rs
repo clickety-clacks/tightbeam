@@ -318,6 +318,35 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::Transcript {
+            identity,
+            session,
+            name,
+            before,
+            after,
+            limit,
+        } => {
+            // The retrieval key travels as an ordinary body PARAM, never as a
+            // top-level typed target: transcript is declared non-target at the
+            // router, which refuses any top-level targeting field.
+            let mut params = Vec::new();
+            if let Some(session) = session {
+                params.push(string_field("sessionKey", session));
+            }
+            if let Some(name) = name {
+                params.push(string_field("name", name));
+            }
+            if let Some(before) = before {
+                params.push(string_field("before", before));
+            }
+            if let Some(after) = after {
+                params.push(string_field("after", after));
+            }
+            if let Some(limit) = limit {
+                params.push(format!("\"limit\":{limit}"));
+            }
+            Ok(request(identity, "transcript", vec![], params))
+        }
         Command::WorkItemIcebox {
             identity,
             work_item_id,
@@ -767,6 +796,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
+        | Command::Transcript { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
