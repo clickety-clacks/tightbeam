@@ -44,10 +44,23 @@ defmodule Tightbeam.ClientE2E.WS do
   def connect(host, port, path \\ "/ws") do
     opts = [:binary, active: false, packet: :raw, nodelay: true]
 
-    with {:ok, socket} <- :gen_tcp.connect(to_charlist(host), port, opts, @connect_timeout_ms),
-         :ok <- :gen_tcp.send(socket, upgrade_request(host, port, path)),
-         {:ok, rest} <- read_handshake(socket, <<>>) do
-      {:ok, %__MODULE__{socket: socket, buffer: rest}}
+    case :gen_tcp.connect(to_charlist(host), port, opts, @connect_timeout_ms) do
+      {:ok, socket} ->
+        # Once the socket exists, EVERY failure path closes it. A driver that
+        # leaks a socket per failed attempt exhausts descriptors across a
+        # matrix run and starts failing for reasons that have nothing to do
+        # with the gateway.
+        with :ok <- :gen_tcp.send(socket, upgrade_request(host, port, path)),
+             {:ok, rest} <- read_handshake(socket, <<>>) do
+          {:ok, %__MODULE__{socket: socket, buffer: rest}}
+        else
+          {:error, reason} ->
+            _ = :gen_tcp.close(socket)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -129,14 +142,27 @@ defmodule Tightbeam.ClientE2E.WS do
     end
   end
 
-  # Data frames: 0x0 continuation, 0x1 text, 0x2 binary (the gateway sends none).
-  defp dispatch_frame(ws, fin, opcode, payload, deadline) when opcode in [0x0, 0x1, 0x2] do
-    assembled = (ws.fragment || <<>>) <> payload
-
-    if fin do
-      {:ok, {:text, assembled}, %{ws | fragment: nil}}
+  # TEXT (0x1) starts a message; CONTINUATION (0x0) may only extend one.
+  #
+  # Strictness is the point, not pedantry: the wire contract is text JSON, and
+  # a gateway that regressed to BINARY JSON would still be understood by a
+  # permissive driver while breaking the shipping client. A driver that is
+  # more tolerant than the client it stands in for cannot fail on the client's
+  # behalf, so anything that is not a text-or-continuation data frame is an
+  # error here.
+  defp dispatch_frame(ws, fin, 0x1, payload, deadline) do
+    if is_nil(ws.fragment) do
+      finish_or_fragment(ws, fin, payload, deadline)
     else
-      recv_until(%{ws | fragment: assembled}, deadline)
+      {:error, {:protocol_error, :text_inside_fragmented_message}, ws}
+    end
+  end
+
+  defp dispatch_frame(ws, fin, 0x0, payload, deadline) do
+    if is_nil(ws.fragment) do
+      {:error, {:protocol_error, :continuation_without_message}, ws}
+    else
+      finish_or_fragment(ws, fin, ws.fragment <> payload, deadline)
     end
   end
 
@@ -149,7 +175,17 @@ defmodule Tightbeam.ClientE2E.WS do
     end
   end
 
-  defp dispatch_frame(ws, _fin, _opcode, _payload, deadline), do: recv_until(ws, deadline)
+  defp dispatch_frame(ws, _fin, 0xA, _payload, deadline), do: recv_until(ws, deadline)
+
+  defp dispatch_frame(ws, _fin, opcode, _payload, _deadline) do
+    {:error, {:protocol_error, {:unexpected_opcode, opcode}}, ws}
+  end
+
+  defp finish_or_fragment(ws, true, assembled, _deadline),
+    do: {:ok, {:text, assembled}, %{ws | fragment: nil}}
+
+  defp finish_or_fragment(ws, false, assembled, deadline),
+    do: recv_until(%{ws | fragment: assembled}, deadline)
 
   # --- codec ------------------------------------------------------------------
 

@@ -30,7 +30,8 @@ defmodule Tightbeam.ClientE2E do
           host_name: String.t(),
           model: String.t() | nil,
           journeys: [String.t()],
-          preflight: boolean(),
+          gateway: Tightbeam.ClientE2E.LegGateway.t() | nil,
+          preflight_row: Scorecard.Row.t() | nil,
           turn_timeout_ms: pos_integer(),
           settle_ms: pos_integer()
         ]
@@ -38,27 +39,31 @@ defmodule Tightbeam.ClientE2E do
   @doc """
   Runs one leg and returns its scorecard leg.
 
-  Options: `:host`, `:port`, `:base_dir` (required); `:harness` and
-  `:host_name` name the leg; `:journeys` restricts the walk (defaults to all
-  of `Journeys.ids/0`); `:preflight` (default true) runs SMOKE's P1/P2
-  credential check for this leg's harness first.
+  Options: `:host`, `:port`, `:base_dir`, `:harness` (all required — the
+  harness has NO default on purpose: a driver that silently picks one names a
+  harness, and the registry is the only authority on which legs exist);
+  `:host_name` names the leg's host; `:journeys` restricts the walk (defaults
+  to all of `Journeys.ids/0`); `:preflight_row` carries the row the runner
+  already produced BEFORE boot (SMOKE: preflight runs first, before anything
+  boots).
   """
   @spec run_leg(opts()) :: Leg.t()
   def run_leg(opts) do
     host = Keyword.get(opts, :host, "127.0.0.1")
     port = Keyword.fetch!(opts, :port)
     base_dir = Keyword.fetch!(opts, :base_dir)
-    harness = Keyword.get(opts, :harness, "claude")
+    harness = Keyword.fetch!(opts, :harness)
     host_name = Keyword.get(opts, :host_name, Tightbeam.Placement.local_host_name())
     ids = Keyword.get(opts, :journeys, Journeys.ids())
 
     leg = %Leg{harness: harness, host: host_name}
 
+    # The preflight row is produced by the RUNNER before the gateway boots
+    # (SMOKE: "FIRST, before anything boots"), and merely carried here.
     leg =
-      if Keyword.get(opts, :preflight, true) do
-        Scorecard.add(leg, preflight(harness, base_dir))
-      else
-        leg
+      case Keyword.get(opts, :preflight_row) do
+        nil -> leg
+        row -> Scorecard.add(leg, row)
       end
 
     device_id = "sim-client-e2e-#{System.unique_integer([:positive])}"
@@ -71,6 +76,10 @@ defmodule Tightbeam.ClientE2E do
           port: port,
           client: client,
           main_key: nil,
+          # J7 restarts the gateway, so it needs the handle the runner booted.
+          # nil is legitimate (the in-process test harness has none) and J7
+          # reports itself incomplete rather than pretending.
+          gateway: Keyword.get(opts, :gateway),
           leg: %{harness: harness, host: host_name, model: Keyword.get(opts, :model)},
           turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms, @default_turn_timeout_ms),
           settle_ms: Keyword.get(opts, :settle_ms, @default_settle_ms)
@@ -92,29 +101,27 @@ defmodule Tightbeam.ClientE2E do
 
   @doc """
   SMOKE.md's credential PREFLIGHT for one harness leg, as an automated
-  scorecard row.
+  scorecard row. Runs BEFORE anything boots — the runbook is explicit that a
+  dead grant must be caught first, because downstream it masquerades (no auth
+  means no catalog means every model value invalid).
 
-  Dead credentials do not fail as "auth" downstream — they masquerade (an
-  expired grant surfaces as an invalid model ref, because no auth means no
-  catalog means every value invalid), so the run checks the grant before it
-  walks anything. A preflight FAIL blocks the leg, and after a clean preflight
-  any auth-shaped failure later in the run is a FINDING, not noise.
+  Everything here goes through the harness REGISTRY; this module names no
+  harness and no credential mechanic, which is the seam
+  `scripts/check_harness_seam.sh` enforces.
 
-  Two checks, both through the harness REGISTRY — this module names no harness
-  and no credential mechanic, which is the seam `scripts/check_harness_seam.sh`
-  enforces:
+  The grading turns on a question the driver ANSWERS RATHER THAN ASSUMES: is
+  this harness's catalog fetch actually gated on the credential? It is measured
+  by `catalog_gated?/2` — fetch the catalog from a copy of the org with the
+  credential store removed. A harness whose catalog is a live authenticated
+  call fails without it (its successful fetch therefore PROVED the grant is
+  live); a harness whose catalog is a cached file succeeds without it, so its
+  fetch proves only that a file exists.
 
-  1. `credential_ready?/2` — the store rows the harness needs are in place.
-  2. `fetch_catalog/1` — the catalog the harness serves is usable. For a
-     harness whose catalog is a live authenticated fetch this is a real grant
-     probe; for one whose catalog is a cached file it proves the cache, not
-     the grant.
-
-  That second caveat is a real gap against SMOKE's P1/P2, which run each
-  harness's own liveness command. Expressing those through the registry needs
-  a `credential_live?` callback that does not exist yet; until it does, the
-  row's note says which of the two checks stood behind the verdict rather than
-  claiming the stronger one.
+  - gated + catalog usable  -> `pass`, liveness proved.
+  - not gated               -> `incomplete`, PRESENCE-ONLY, pointing at the
+    `credential_live?` registry callback (task #15). Not a pass: a populated
+    cache beside an expired credential would otherwise read as green, which is
+    precisely the false comfort this row exists to prevent.
   """
   @spec preflight(String.t(), String.t()) :: Scorecard.Row.t()
   def preflight(harness, base_dir) do
@@ -128,36 +135,77 @@ defmodule Tightbeam.ClientE2E do
   end
 
   defp probe_credential(module, step, label, base_dir) do
-    host_name = Tightbeam.Placement.local_host_name()
-
-    # The registry's target shape: `ssh: nil` is what marks the host local, and
-    # the leg's gateway is always the local one.
-    target = %{
-      base_dir: base_dir,
-      host_config: %{base_dir: base_dir, ssh: nil},
-      host_name: host_name,
-      options: %{},
-      sh: &System.cmd(hd(&1), tl(&1), stderr_to_stdout: true)
-    }
-
-    home = Tightbeam.Homes.home_path(base_dir, host_name, module.id())
+    home = Tightbeam.Homes.home_path(base_dir, Tightbeam.Placement.local_host_name(), module.id())
 
     cond do
-      not module.credential_ready?(target, home) ->
+      not module.credential_ready?(target(base_dir), home) ->
         Scorecard.fail(step, label, "the harness reports its credential store is not ready in #{base_dir}")
 
       true ->
-        case module.fetch_catalog(target) do
-          {:ok, [_ | _]} ->
-            Scorecard.pass(step, label, note: "credential store ready; catalog fetch usable")
-
-          {:ok, []} ->
-            Scorecard.fail(step, label, "catalog fetch returned no models")
-
-          {:error, reason} ->
-            Scorecard.fail(step, label, "catalog fetch failed: #{inspect(reason)}")
+        case module.fetch_catalog(target(base_dir)) do
+          {:ok, [_ | _]} -> grade_catalog(module, step, label, base_dir)
+          {:ok, []} -> Scorecard.fail(step, label, "catalog fetch returned no models")
+          {:error, reason} -> Scorecard.fail(step, label, "catalog fetch failed: #{inspect(reason)}")
         end
     end
+  end
+
+  defp grade_catalog(module, step, label, base_dir) do
+    if catalog_gated?(module, base_dir) do
+      Scorecard.pass(step, label,
+        note: "credential store ready; catalog fetch is credential-gated, so the grant is LIVE"
+      )
+    else
+      Scorecard.incomplete(
+        step,
+        label,
+        "PRESENCE-ONLY: the credential store is in place, but this harness's catalog fetch " <>
+          "succeeds without it (cache-backed), so nothing here proves the grant is live — an " <>
+          "expired credential beside a populated cache would look identical. Liveness needs the " <>
+          "credential_live? registry callback (task #15)."
+      )
+    end
+  end
+
+  @doc """
+  Whether `module`'s catalog fetch actually depends on the credential store.
+
+  Measured, not assumed: the org's credential-bearing directories are copied to
+  a scratch org, the credential store is removed from the COPY, and the catalog
+  is fetched there. The real org is never touched.
+  """
+  @spec catalog_gated?(module(), String.t()) :: boolean()
+  def catalog_gated?(module, base_dir) do
+    scratch = Path.join(System.tmp_dir!(), "client-e2e-gate-#{System.unique_integer([:positive])}")
+
+    try do
+      File.mkdir_p!(scratch)
+
+      for dir <- ["auth", "homes"], File.dir?(Path.join(base_dir, dir)) do
+        File.cp_r!(Path.join(base_dir, dir), Path.join(scratch, dir))
+      end
+
+      File.rm_rf!(Tightbeam.Credentials.store_dir(scratch, module.credential_provider()))
+
+      case module.fetch_catalog(target(scratch)) do
+        {:ok, [_ | _]} -> false
+        _ -> true
+      end
+    after
+      File.rm_rf!(scratch)
+    end
+  end
+
+  # The registry's target shape: `ssh: nil` is what marks the host local, and
+  # the leg's gateway is always the local one.
+  defp target(base_dir) do
+    %{
+      base_dir: base_dir,
+      host_config: %{base_dir: base_dir, ssh: nil},
+      host_name: Tightbeam.Placement.local_host_name(),
+      options: %{},
+      sh: &System.cmd(hd(&1), tl(&1), stderr_to_stdout: true)
+    }
   end
 
   defp connect(host, port, device_id) do

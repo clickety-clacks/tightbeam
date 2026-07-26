@@ -31,7 +31,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
   own regression test, `ClawlineTests/SessionStatusDecodeResilienceTests.swift`).
   """
 
-  alias Tightbeam.ClientE2E.{Scorecard, SimClient, Substrate}
+  alias Tightbeam.ClientE2E.{LegGateway, Scorecard, SimClient, Substrate}
 
   @typedoc """
   Journey context. `client` is the live sim client, `main_key` the admin's
@@ -43,13 +43,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
           required(:port) => :inet.port_number(),
           required(:client) => SimClient.t(),
           required(:main_key) => String.t() | nil,
+          required(:gateway) => Tightbeam.ClientE2E.LegGateway.t() | nil,
           required(:leg) => map(),
           required(:turn_timeout_ms) => pos_integer(),
           required(:settle_ms) => pos_integer(),
           optional(atom()) => term()
         }
 
-  @ids ~w(J0 J1 J2 J3 J4 J5 J6)
+  @ids ~w(J0 J1 J2 J3 J4 J5 J6 J7 J8)
+
+  @no_gateway "this journey restarts the gateway, so it needs the runner's leg " <>
+                "gateway handle (`:gateway` in the journey context); the in-process " <>
+                "test harness has none"
 
   # The oracle table. `client` and `substrate` are the two normative columns;
   # `{:none, reason}` is the only legal way for a column to be empty.
@@ -191,6 +196,43 @@ defmodule Tightbeam.ClientE2E.Journeys do
            "so asserting the ref verbatim fails against a correct client."},
       substrate:
         {:none, "a rendering assertion has no substrate row; 13b carries the substrate proof"}
+    },
+    %{
+      journey: "J7",
+      step: "14",
+      label: "restart resilience",
+      action:
+        "post a slow prompt, then SIGTERM the gateway's captured pid mid-turn, await process exit AND the health endpoint going unreachable, restart on the SAME port and base_dir, confirm a NEW pid, reconnect the same client",
+      client:
+        "the client reconnects onto a healed connection (auth_result, stream_snapshot, sync_complete) with its history replayed; the interrupted turn is never left as a silent spinning indicator; a fresh post afterwards completes",
+      substrate:
+        "a NEW gateway pid; no delivered message rows lost across the restart; the interrupted turn row reaches a TERMINAL status (delivered | failed | failed_unknown); the harness pointer is recorded"
+    },
+    %{
+      journey: "J7",
+      step: "15",
+      label: "restart queue survival",
+      action: "queue a second post behind a running one, restart before the first completes, re-send NOTHING",
+      client: "the client reconnects and needs no re-send for the queued work to finish",
+      substrate:
+        "the queued turn row survives the restart and reaches `delivered`; the interrupted first turn reaches a terminal status"
+    },
+    %{
+      journey: "J8",
+      step: "16",
+      label: "wakes",
+      action: ~s(wake Main with "reply with exactly: WAKE OK" through /agent/dispatch as the admin),
+      client:
+        "the wake's prompt lands in Main as a SENDER-TAGGED user message (provenance from the `sender` field, not text parsing); the assistant answers it",
+      substrate: "the delivered message's turn row carries a wakeId and reaches `delivered`"
+    },
+    %{
+      journey: "J8",
+      step: "16b",
+      label: "scheduled wake",
+      action: "schedule the same wake with a delay",
+      client: "the delayed prompt's reply arrives after the delay",
+      substrate: "the wake row is `pending` and visible BEFORE it fires, then fires"
     }
   ]
 
@@ -400,12 +442,27 @@ defmodule Tightbeam.ClientE2E.Journeys do
                 &1["replyToClientMessageId"] == cmid)
           )
 
-        lingering =
-          SimClient.find(
-            ctx.client,
-            cancel_watermark,
-            &(&1["type"] == "typing" and &1["active"] == true and &1["sessionKey"] == ctx.main_key)
-          )
+        # SMOKE step 8 requires the indicator to CLEAR on cancel, not merely to
+        # avoid coming back. Checking only for a later typing=true would pass a
+        # cancel that leaves the indicator spinning forever — the exact stuck
+        # indicator this journey exists to catch.
+        cancel_frames = SimClient.frames_since(ctx.client, cancel_watermark)
+
+        canceled_at =
+          if canceled,
+            do:
+              Enum.find_index(
+                cancel_frames,
+                &(&1["type"] == "event" and &1["event"] == "prompt_turn_state" and
+                    get_in(&1, ["payload", "messageId"]) == cmid and
+                    get_in(&1, ["payload", "state"]) == "canceled")
+              ),
+            else: nil
+
+        indicator_error =
+          if canceled_at,
+            do: indicator_settled_error(cancel_frames, ctx.main_key, canceled_at),
+            else: nil
 
         turn = Substrate.turn_for_client_message(ctx.base_dir, cmid)
         {ctx, drained} = turn_completes(ctx, ctx.main_key, "say exactly: DRAINED", "8b", "post-cancel turn", "J3")
@@ -424,8 +481,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
             not is_nil(stray_reply) ->
               Scorecard.fail("8", "cancel", "an assistant bubble arrived for the canceled turn", journey: "J3")
 
-            not is_nil(lingering) ->
-              Scorecard.fail("8", "cancel", "the typing indicator came back after the cancel", journey: "J3")
+            indicator_error ->
+              Scorecard.fail("8", "cancel", "after the cancel, #{indicator_error}", journey: "J3")
 
             is_nil(turn) or turn["status"] != "canceled" ->
               Scorecard.fail("8", "cancel", "turn row is #{inspect(turn && turn["status"])}, not canceled", journey: "J3")
@@ -475,6 +532,28 @@ defmodule Tightbeam.ClientE2E.Journeys do
       end)
 
     frames = SimClient.frames_since(ctx.client, watermark)
+
+    # SMOKE step 9's last clause — "the indicator stays sane throughout (on
+    # while running, cleared at the end)" — was unasserted. Three queued turns
+    # that leave the indicator spinning is precisely the shape of the bug this
+    # journey is for.
+    last_reply_at =
+      frames
+      |> Enum.with_index()
+      |> Enum.reduce(nil, fn {f, i}, acc ->
+        if f["type"] == "message" and f["role"] == "assistant" and
+             f["replyToClientMessageId"] in ids,
+           do: i,
+           else: acc
+      end)
+
+    indicator_error =
+      cond do
+        is_nil(last_reply_at) -> nil
+        is_nil(indicator_on_at(frames, ctx.main_key, 0)) -> "the typing indicator never turned on"
+        true -> indicator_settled_error(frames, ctx.main_key, last_reply_at)
+      end
+
     echoes = for f <- frames, f["type"] == "message", f["role"] == "user", do: f["clientMessageId"]
     replies = for f <- frames, f["type"] == "message", f["role"] == "assistant", do: f["replyToClientMessageId"]
     first_reply_index = Enum.find_index(frames, &(&1["type"] == "message" and &1["role"] == "assistant"))
@@ -498,6 +577,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
         Enum.any?(turns, &(is_nil(&1) or &1["status"] != "delivered")) ->
           Scorecard.fail("9", "queueing", "turn rows: #{inspect(Enum.map(turns, & &1 && &1["status"]))}", journey: "J4")
+
+        indicator_error ->
+          Scorecard.fail("9", "queueing", "across the queued batch, #{indicator_error}", journey: "J4")
 
         true ->
           Scorecard.pass("9", "queueing", journey: "J4")
@@ -538,7 +620,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       {:ok, client, done_id} = SimClient.post(client, ctx.main_key, "now say exactly: DONE")
       ctx = %{ctx | client: client}
 
-      {ctx, peaks} =
+      {ctx, samples} =
         Substrate.sample_while(ctx.base_dir, 150, fn ->
           Enum.reduce([b_id, slow_id, done_id], ctx, fn id, ctx ->
             case SimClient.await(
@@ -558,8 +640,32 @@ defmodule Tightbeam.ClientE2E.Journeys do
       reply_order = for f <- frames, f["type"] == "message", f["role"] == "assistant", do: f["replyToClientMessageId"]
       b_reply = Enum.find(frames, &(&1["type"] == "message" and &1["role"] == "assistant" and &1["replyToClientMessageId"] == b_id))
       cross_talk = Enum.find(frames, &(&1["type"] == "message" and &1["role"] == "assistant" and &1["replyToClientMessageId"] == b_id and &1["sessionKey"] != session_key))
-      parallel? = Map.get(peaks, ctx.main_key, 0) >= 1 and Map.get(peaks, session_key, 0) >= 1
       turns = Enum.map([slow_id, b_id, done_id], &Substrate.turn_for_client_message(ctx.base_dir, &1))
+      [slow_turn, b_turn, _done_turn] = turns
+
+      # SIMULTANEITY, two independent witnesses, both of which are about ONE
+      # instant rather than a maximum merged across samples:
+      #   - a single sample that caught both lanes running at once, and
+      #   - the two turn rows' own start/end intervals overlapping.
+      # Either one proves the substrate ran them concurrently; the interval
+      # join does not depend on the sampler being lucky.
+      sampled_together? = Substrate.simultaneous?(samples, [ctx.main_key, session_key])
+      intervals_overlapped? = Substrate.turns_overlapped?(slow_turn, b_turn)
+      substrate_concurrent? = sampled_together? or intervals_overlapped?
+
+      # Did the substrate even have the OPPORTUNITY to overlap them? B was
+      # posted while Main was still running iff B's turn was created before
+      # Main's ended. Without that, nothing about lanes can be concluded.
+      had_opportunity? =
+        with %{"seq" => _} <- b_turn,
+             %{"endedAt" => main_end} when is_integer(main_end) <- slow_turn,
+             b_start when is_integer(b_start) <- b_turn["startedAt"] do
+          b_start <= main_end
+        else
+          _ -> false
+        end
+
+      witness = "sampled_together=#{sampled_together?} intervals_overlapped=#{intervals_overlapped?} widest_sample=#{Substrate.widest_sample(samples)}"
 
       # The PREMISE this journey needs: Main's slow turn must still have been
       # running when Smoke B's reply arrived. When the model answers the slow
@@ -571,7 +677,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       # which of the two it was.
       b_index = Enum.find_index(reply_order, &(&1 == b_id))
       slow_index = Enum.find_index(reply_order, &(&1 == slow_id))
-      overlap_observed? = is_integer(b_index) and (is_nil(slow_index) or b_index < slow_index)
+      client_saw_overlap? = is_integer(b_index) and (is_nil(slow_index) or b_index < slow_index)
 
       row =
         cond do
@@ -587,34 +693,42 @@ defmodule Tightbeam.ClientE2E.Journeys do
           Enum.filter(reply_order, &(&1 in [slow_id, done_id])) != [slow_id, done_id] ->
             Scorecard.fail("10", "concurrency", "Main's turns completed out of order: #{inspect(reply_order)}", journey: "J5")
 
-          overlap_observed? and parallel? ->
+          substrate_concurrent? and client_saw_overlap? ->
             Scorecard.pass("10", "concurrency", journey: "J5")
 
-          parallel? ->
+          # The substrate PROVABLY ran both lanes at once, yet the client never
+          # saw B's reply arrive during Main's turn. That is a client/WS
+          # delivery failure and it FAILS — calling it incomplete would launder
+          # exactly the delayed-frame defect this journey should catch.
+          substrate_concurrent? ->
+            Scorecard.fail(
+              "10",
+              "concurrency",
+              "the substrate ran both lanes simultaneously (#{witness}) but the client did not " <>
+                "see Smoke B's reply during Main's turn (reply order #{inspect(reply_order)}) — " <>
+                "a delayed client frame, not a lane defect",
+              journey: "J5"
+            )
+
+          # No simultaneity witness, and B only started after Main had already
+          # finished: the substrate serialized the two lanes.
+          had_opportunity? ->
+            Scorecard.fail(
+              "10",
+              "concurrency",
+              "Smoke B was queued while Main was still running yet never ran beside it " <>
+                "(#{witness}) — the lanes are not parallel",
+              journey: "J5"
+            )
+
+          # Main's turn was over before B's could start: there was no overlap to
+          # observe on either side, so the step has no verdict to give.
+          true ->
             Scorecard.incomplete(
               "10",
               "concurrency",
-              "the substrate ran both lanes concurrently (sampled #{inspect(peaks)}) but Main's " <>
-                "slow turn finished before Smoke B's reply, so the client-side overlap this step " <>
-                "asserts could not be observed — a faster-than-expected model, not a lane defect",
-              journey: "J5"
-            )
-
-          overlap_observed? ->
-            Scorecard.fail(
-              "10",
-              "concurrency",
-              "Smoke B replied while Main was still running, yet no sample ever caught two " <>
-                "`running` rows in different lanes: #{inspect(peaks)}",
-              journey: "J5"
-            )
-
-          true ->
-            Scorecard.fail(
-              "10",
-              "concurrency",
-              "Smoke B's reply waited for Main's slow turn and no sample caught both lanes " <>
-                "running (#{inspect(peaks)}) — the lanes are not parallel",
+              "no overlap was possible: Main's slow turn ended before Smoke B's turn started " <>
+                "(#{witness}) — a faster-than-expected model left the premise unestablished",
               journey: "J5"
             )
         end
@@ -641,6 +755,30 @@ defmodule Tightbeam.ClientE2E.Journeys do
       )
 
     {ctx, [new_row, compact_row, model_row, change_row, footer_row]}
+  end
+
+  # --- J7: restart resilience (SMOKE 14, 15) -----------------------------------
+
+  defp walk(ctx, "J7") do
+    if is_nil(ctx[:gateway]) do
+      {ctx,
+       [
+         Scorecard.incomplete("14", "restart resilience", @no_gateway, journey: "J7"),
+         Scorecard.incomplete("15", "restart queue survival", @no_gateway, journey: "J7")
+       ]}
+    else
+      {ctx, drain_row} = j7_drain(ctx)
+      {ctx, queue_row} = j7_queue_survival(ctx)
+      {ctx, [drain_row, queue_row]}
+    end
+  end
+
+  # --- J8: wakes (SMOKE 16) ----------------------------------------------------
+
+  defp walk(ctx, "J8") do
+    {ctx, immediate} = j8_immediate_wake(ctx)
+    {ctx, delayed} = j8_delayed_wake(ctx)
+    {ctx, [immediate, delayed]}
   end
 
   defp j6_model_change(ctx) do
@@ -730,6 +868,332 @@ defmodule Tightbeam.ClientE2E.Journeys do
   end
 
   def decode_contract_gaps(_), do: ["<no session-status payload>"]
+
+  # --- J7 helpers -------------------------------------------------------------
+
+  # Step 14: a turn in flight when the gateway is SIGTERMed either drains or is
+  # published as failed — never a silent stuck indicator — and the client
+  # reconnects onto healed state with its history intact.
+  defp j7_drain(ctx) do
+    before_messages = length(Substrate.messages(ctx.base_dir, ctx.main_key))
+    watermark = SimClient.mark(ctx.client)
+    {:ok, client, cmid} = SimClient.post(ctx.client, ctx.main_key, "Count to 300 slowly, one line per number.")
+
+    {typing, client} =
+      await_frame(
+        client,
+        watermark,
+        &(&1["type"] == "typing" and &1["active"] == true and &1["sessionKey"] == ctx.main_key),
+        ctx.turn_timeout_ms
+      )
+
+    ctx = %{ctx | client: client}
+
+    if is_nil(typing) do
+      {ctx, Scorecard.fail("14", "restart resilience", "no turn was in flight to interrupt", journey: "J7")}
+    else
+      old_pid = ctx.gateway.os_pid
+
+      case LegGateway.restart(ctx.gateway) do
+        {:error, reason} ->
+          {ctx,
+           Scorecard.fail("14", "restart resilience", "restart failed: #{inspect(reason)}", journey: "J7")}
+
+        {:ok, gateway} ->
+          ctx = %{ctx | gateway: gateway}
+
+          # The sim client's stand-in for "the app stays running and reconnects
+          # by itself": the same client process, same device identity, same
+          # token, a fresh socket.
+          case reconnect(ctx) do
+            {:error, reason} ->
+              {ctx,
+               Scorecard.fail("14", "restart resilience", "client could not reconnect after restart: #{inspect(reason)}", journey: "J7")}
+
+            {:ok, ctx} ->
+              j7_drain_verdict(ctx, cmid, old_pid, gateway.os_pid, before_messages)
+          end
+      end
+    end
+  end
+
+  defp j7_drain_verdict(ctx, cmid, old_pid, new_pid, before_messages) do
+    snapshot = SimClient.find(ctx.client, 0, &(&1["type"] == "stream_snapshot"))
+    sync = SimClient.find(ctx.client, 0, &(&1["type"] == "sync_complete"))
+    replayed = Enum.count(SimClient.frames(ctx.client), &(&1["type"] == "message"))
+    kept = length(Substrate.messages(ctx.base_dir, ctx.main_key))
+
+    turn =
+      case Substrate.await_turn_terminal(ctx.base_dir, cmid, 120_000) do
+        {:ok, row} -> row
+        {:error, :timeout, row} -> row
+      end
+
+    {ctx, fresh} = turn_completes(ctx, ctx.main_key, "say exactly: AFTER RESTART", "14b", "post-restart turn", "J7")
+    pointer = Substrate.harness_pointer(ctx.base_dir, ctx.main_key)
+
+    row =
+      cond do
+        new_pid == old_pid ->
+          Scorecard.fail("14", "restart resilience", "the gateway pid did not change (#{old_pid})", journey: "J7")
+
+        is_nil(snapshot) or is_nil(sync) ->
+          Scorecard.fail("14", "restart resilience", "reconnect did not heal: no stream_snapshot/sync_complete", journey: "J7")
+
+        kept < before_messages ->
+          Scorecard.fail("14", "restart resilience", "delivered rows were lost across the restart (#{before_messages} → #{kept})", journey: "J7")
+
+        replayed == 0 ->
+          Scorecard.fail("14", "restart resilience", "replay after reconnect carried no history", journey: "J7")
+
+        is_nil(turn) ->
+          Scorecard.fail("14", "restart resilience", "the interrupted turn left no row", journey: "J7")
+
+        turn["status"] not in ~w(delivered failed failed_unknown) ->
+          Scorecard.fail(
+            "14",
+            "restart resilience",
+            "the interrupted turn is #{turn["status"]} after the restart — a stuck indicator with " <>
+              "no terminal state is the exact failure this step forbids",
+            journey: "J7"
+          )
+
+        fresh.status != :pass ->
+          Scorecard.fail("14", "restart resilience", "a fresh post after the restart did not complete: #{fresh.note}", journey: "J7")
+
+        true ->
+          Scorecard.pass("14", "restart resilience",
+            journey: "J7",
+            note:
+              "pid #{old_pid} → #{new_pid}; interrupted turn #{turn["status"]}; " <>
+                "harness pointer #{inspect(pointer && pointer["reason"])}"
+          )
+      end
+
+    {ctx, row}
+  end
+
+  # Step 15: queued (not-yet-running) turns survive a restart and run to
+  # delivered without being re-sent.
+  defp j7_queue_survival(ctx) do
+    {:ok, client, first} = SimClient.post(ctx.client, ctx.main_key, "Count to 200 slowly, one line per number.")
+    {:ok, client, second} = SimClient.post(client, ctx.main_key, "say exactly: SURVIVED")
+    ctx = %{ctx | client: client}
+
+    # Wait until the substrate has actually queued the second turn behind the
+    # first — killing before that proves nothing about queue durability.
+    queued? = await_queued(ctx.base_dir, second, 60_000)
+
+    case LegGateway.restart(ctx.gateway) do
+      {:error, reason} ->
+        {ctx, Scorecard.fail("15", "restart queue survival", "restart failed: #{inspect(reason)}", journey: "J7")}
+
+      {:ok, gateway} ->
+        ctx = %{ctx | gateway: gateway}
+
+        case reconnect(ctx) do
+          {:error, reason} ->
+            {ctx, Scorecard.fail("15", "restart queue survival", "client could not reconnect: #{inspect(reason)}", journey: "J7")}
+
+          {:ok, ctx} ->
+            # NOTHING is re-sent here. That is the assertion.
+            second_turn =
+              case Substrate.await_turn_terminal(ctx.base_dir, second, ctx.turn_timeout_ms) do
+                {:ok, row} -> row
+                {:error, :timeout, row} -> row
+              end
+
+            first_turn = Substrate.turn_for_client_message(ctx.base_dir, first)
+
+            row =
+              cond do
+                not queued? ->
+                  Scorecard.incomplete(
+                    "15",
+                    "restart queue survival",
+                    "the second turn never reached `queued` before the restart, so queue " <>
+                      "durability had nothing to survive",
+                    journey: "J7"
+                  )
+
+                is_nil(second_turn) ->
+                  Scorecard.fail("15", "restart queue survival", "the queued turn's row vanished across the restart", journey: "J7")
+
+                second_turn["status"] != "delivered" ->
+                  Scorecard.fail(
+                    "15",
+                    "restart queue survival",
+                    "the queued turn is #{second_turn["status"]} after the restart, not delivered",
+                    journey: "J7"
+                  )
+
+                is_nil(first_turn) or first_turn["status"] not in ~w(delivered failed failed_unknown) ->
+                  Scorecard.fail(
+                    "15",
+                    "restart queue survival",
+                    "the interrupted first turn is #{inspect(first_turn && first_turn["status"])} — not terminal",
+                    journey: "J7"
+                  )
+
+                true ->
+                  Scorecard.pass("15", "restart queue survival", journey: "J7")
+              end
+
+            {ctx, row}
+        end
+    end
+  end
+
+  defp await_queued(base_dir, client_message_id, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    poll_queued(base_dir, client_message_id, deadline)
+  end
+
+  defp poll_queued(base_dir, client_message_id, deadline) do
+    row = Substrate.turn_for_client_message(base_dir, client_message_id)
+
+    cond do
+      is_map(row) and row["status"] in ~w(queued running) -> true
+      System.monotonic_time(:millisecond) >= deadline -> false
+      true ->
+        Process.sleep(200)
+        poll_queued(base_dir, client_message_id, deadline)
+    end
+  end
+
+  # --- J8 helpers -------------------------------------------------------------
+
+  defp j8_immediate_wake(ctx) do
+    watermark = SimClient.mark(ctx.client)
+
+    case wake(ctx, %{"prompt" => "reply with exactly: WAKE OK"}) do
+      {:error, reason} ->
+        {ctx, Scorecard.fail("16", "wakes", "wake dispatch failed: #{inspect(reason)}", journey: "J8")}
+
+      {:ok, _result} ->
+        # The wake's prompt is delivered as a SENDER-TAGGED user message, which
+        # is what lets a client render provenance rather than parse text.
+        {stamped, client} =
+          await_frame(
+            ctx.client,
+            watermark,
+            &(&1["type"] == "message" and &1["role"] == "user" and is_binary(&1["sender"]) and
+                &1["sessionKey"] == ctx.main_key),
+            60_000
+          )
+
+        {reply, client} =
+          await_frame(
+            client,
+            watermark,
+            &(&1["type"] == "message" and &1["role"] == "assistant" and &1["sessionKey"] == ctx.main_key),
+            ctx.turn_timeout_ms
+          )
+
+        ctx = %{ctx | client: client}
+        woken = stamped && Substrate.turn_for_wake(ctx.base_dir, stamped["id"])
+
+        row =
+          cond do
+            is_nil(stamped) ->
+              Scorecard.fail("16", "wakes", "the wake's prompt never appeared in Main as a sender-tagged message", journey: "J8")
+
+            is_nil(reply) ->
+              Scorecard.fail("16", "wakes", "no assistant reply to the wake", journey: "J8")
+
+            not String.contains?(reply["content"] || "", "WAKE OK") ->
+              Scorecard.fail("16", "wakes", "the agent did not answer the wake prompt: #{inspect(reply["content"])}", journey: "J8")
+
+            is_nil(woken) or woken["wakeId"] in [nil, ""] ->
+              Scorecard.fail("16", "wakes", "the delivered message carries no wake-bearing turn row", journey: "J8")
+
+            woken["status"] != "delivered" ->
+              Scorecard.fail("16", "wakes", "the wake's turn row is #{woken["status"]}", journey: "J8")
+
+            true ->
+              Scorecard.pass("16", "wakes", journey: "J8")
+          end
+
+        {ctx, row}
+    end
+  end
+
+  # The scheduled variant: the row is visible BEFORE it fires, then it fires.
+  defp j8_delayed_wake(ctx) do
+    delay_ms = 15_000
+    watermark = SimClient.mark(ctx.client)
+
+    case wake(ctx, %{"prompt" => "reply with exactly: LATER OK", "afterMs" => delay_ms}) do
+      {:error, reason} ->
+        {ctx, Scorecard.fail("16b", "scheduled wake", "scheduled wake dispatch failed: #{inspect(reason)}", journey: "J8")}
+
+      {:ok, result} ->
+        wake_id = result["wakeId"] || get_in(result, ["result", "wakeId"])
+        pending = Substrate.pending_wakes(ctx.base_dir)
+
+        {reply, client} =
+          await_frame(
+            ctx.client,
+            watermark,
+            &(&1["type"] == "message" and &1["role"] == "assistant" and
+                (&1["content"] || "") =~ "LATER OK"),
+            delay_ms + ctx.turn_timeout_ms
+          )
+
+        ctx = %{ctx | client: client}
+
+        row =
+          cond do
+            is_nil(wake_id) ->
+              Scorecard.fail("16b", "scheduled wake", "the scheduled wake returned no wakeId: #{inspect(result)}", journey: "J8")
+
+            not Enum.any?(pending, &(&1["wakeId"] == wake_id)) ->
+              Scorecard.fail(
+                "16b",
+                "scheduled wake",
+                "the wake was not listed as pending before firing (rows: #{inspect(Enum.map(pending, & &1["wakeId"]))})",
+                journey: "J8"
+              )
+
+            is_nil(reply) ->
+              Scorecard.fail("16b", "scheduled wake", "the scheduled wake never fired within #{delay_ms}ms + turn timeout", journey: "J8")
+
+            true ->
+              Scorecard.pass("16b", "scheduled wake", journey: "J8")
+          end
+
+        {ctx, row}
+    end
+  end
+
+  # The ⌥ CLI path expressed over the gateway's own facade: /agent/dispatch with
+  # the org cliToken, which is what `tb wake` posts.
+  defp wake(ctx, params) do
+    with {:ok, token} <- Substrate.cli_token(ctx.base_dir) do
+      body = %{
+        "verb" => "wake",
+        "sessionKey" => ctx.main_key,
+        "asUser" => ctx.client.user_id,
+        "params" => params
+      }
+
+      case SimClient.post_json_as(ctx.client, token, "/agent/dispatch", body) do
+        {200, response} -> {:ok, response["result"] || response}
+        {status, response} -> {:error, {status, response}}
+      end
+    end
+  end
+
+  defp reconnect(ctx) do
+    _ = SimClient.disconnect(ctx.client)
+    device_id = ctx.client.device_id
+    token = ctx.client.token
+
+    case SimClient.connect(ctx.host, ctx.port, token, device_id: device_id, timeout: 30_000) do
+      {:ok, client} -> {:ok, %{ctx | client: client}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   # --- J2 helpers -------------------------------------------------------------
 
@@ -894,27 +1358,35 @@ defmodule Tightbeam.ClientE2E.Journeys do
     watermark = SimClient.mark(ctx.client)
     {:ok, client, cmid} = SimClient.post(ctx.client, session_key, content)
 
-    {echo, client} = await_frame(client, watermark, &(&1["type"] == "message" and &1["clientMessageId"] == cmid), 30_000)
+    # Wait for the frames that END the turn, then hand the whole SEQUENCE to
+    # the oracle. Waiting per-frame from a shared watermark is what let a stale
+    # clear vouch for a live indicator; the waits below only decide when to
+    # stop reading, never what held.
+    {_echo, client} =
+      await_frame(client, watermark, &(&1["type"] == "message" and &1["clientMessageId"] == cmid), 30_000)
 
-    {typing_on, client} =
-      await_frame(client, watermark, &(&1["type"] == "typing" and &1["active"] == true and &1["sessionKey"] == session_key), 60_000)
+    {_reply, client} = await_reply(client, watermark, cmid, ctx)
 
-    {reply, client} = await_reply(client, watermark, cmid, ctx)
+    {_typing_off, client} =
+      await_frame(
+        client,
+        watermark,
+        &(&1["type"] == "typing" and &1["active"] == false and &1["sessionKey"] == session_key),
+        30_000
+      )
 
-    {typing_off, client} =
-      await_frame(client, watermark, &(&1["type"] == "typing" and &1["active"] == false and &1["sessionKey"] == session_key), 30_000)
-
-    settle_mark = SimClient.mark(client)
+    # The settle window is part of the evidence, not an afterthought: an
+    # indicator that comes back after the turn ends only shows up here.
     client = SimClient.settle(client, ctx.settle_ms)
     ctx = %{ctx | client: client}
-
-    lingering =
-      SimClient.find(client, settle_mark, &(&1["type"] == "typing" and &1["active"] == true and &1["sessionKey"] == session_key))
+    frames = SimClient.frames_since(client, watermark)
 
     progress =
-      client
-      |> SimClient.frames_since(watermark)
-      |> Enum.filter(&(&1["type"] == "agent_progress" and &1["sessionKey"] == session_key and (&1["progressText"] || "") != ""))
+      Enum.filter(
+        frames,
+        &(&1["type"] == "agent_progress" and &1["sessionKey"] == session_key and
+            (&1["progressText"] || "") != "")
+      )
 
     turn =
       case Substrate.await_turn_terminal(ctx.base_dir, cmid, 30_000) do
@@ -922,13 +1394,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
         {:error, :timeout, row} -> row
       end
 
+    reply =
+      Enum.find(
+        frames,
+        &(&1["type"] == "message" and &1["role"] == "assistant" and
+            &1["replyToClientMessageId"] == cmid)
+      )
+
     error =
       turn_oracle_error(%{
-        echo: echo,
-        typing_on: typing_on,
-        typing_off: typing_off,
-        lingering: lingering,
-        reply: reply,
+        frames: frames,
+        session_key: session_key,
+        client_message_id: cmid,
         turn: turn,
         timeout_ms: ctx.turn_timeout_ms
       })
@@ -936,6 +1413,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {ctx,
      %{
        client_message_id: cmid,
+       frames: frames,
+       watermark: watermark,
        reply_text: reply && reply["content"],
        progress: progress,
        turn: turn,
@@ -943,13 +1422,6 @@ defmodule Tightbeam.ClientE2E.Journeys do
      }}
   end
 
-  # Waits for the assistant reply, but gives up the moment the SUBSTRATE says
-  # no reply is coming.
-  #
-  # Without this, a turn that fails in the first second still costs the full
-  # turn timeout on every step, and a red run takes an hour to say what the
-  # turns table already knew. A driver nobody will sit through is a driver
-  # nobody runs.
   defp await_reply(client, watermark, cmid, ctx) do
     predicate =
       &(&1["type"] == "message" and &1["role"] == "assistant" and
@@ -970,47 +1442,128 @@ defmodule Tightbeam.ClientE2E.Journeys do
         turn = Substrate.turn_for_client_message(ctx.base_dir, cmid)
 
         cond do
-          is_map(turn) and turn["status"] in ~w(failed failed_unknown canceled) -> {nil, client}
-          System.monotonic_time(:millisecond) >= deadline -> {nil, client}
-          true -> await_reply(client, watermark, cmid, ctx, predicate, deadline)
+          is_map(turn) and turn["status"] in ~w(failed failed_unknown canceled) ->
+            {nil, client}
+
+          # A closed socket returns instantly, so without this the loop would
+          # spin on the database until the full turn timeout — burning minutes
+          # per step to learn something the socket already said. No frame can
+          # arrive on a closed socket; stop and let the oracle report it.
+          client.closed ->
+            {nil, client}
+
+          System.monotonic_time(:millisecond) >= deadline ->
+            {nil, client}
+
+          true ->
+            await_reply(client, watermark, cmid, ctx, predicate, deadline)
         end
     end
   end
 
   @doc """
-  J1's turn-completion oracle as a pure decision over one turn's observations;
-  nil means every leg held.
+  J1's turn-completion oracle as a pure decision over the turn's FRAME
+  SEQUENCE; nil means every leg held.
 
-  Two things are deliberate here.
+  It takes frames rather than pre-resolved booleans, and that is the whole
+  design. The first version asked "is there a typing=false somewhere after the
+  post?", which a STALE clear from the previous turn answers happily: the
+  broken sequence `typing=false → typing=true → reply` passed with the
+  indicator left ON, because the clear check matched the old false while the
+  lingering check started after the final true. An indicator invariant that
+  cannot see order is not an invariant. Order is now the input.
 
-  ORDER: when the turn row already says what went wrong, that is reported
-  ahead of the client-side symptom it caused. "no assistant reply within
-  180000ms" sends a reader looking at the client; "turn row is failed (Invalid
-  value for config option model: …)" sends them to the fault.
+  ORDER OF REPORTING: when the turn row already says what went wrong, that is
+  reported ahead of the client-side symptom it caused. "no assistant reply
+  within 180000ms" sends a reader looking at the client; "turn row is failed
+  (Invalid value for config option model: …)" sends them to the fault.
 
-  WHAT IS NOT HERE: the typing indicator's LABEL. The indicator's ON and OFF
-  are invariants and fail hard; the label is harness-reported and the
-  substrate fabricates none, so a plain conversational turn legitimately runs
-  unlabeled (SMOKE step 3, as amended; measured on the claude leg in run
-  0e40b93). Step 4 asserts the label where a `tool_call*` event backs it.
-  Re-adding a label requirement here would silently fail every plain-turn step
-  again, which is why this lives in a function a test can pin.
+  WHAT IS NOT HERE: the indicator's LABEL. ON and OFF are invariants and fail
+  hard; the label is harness-reported and the substrate fabricates none, so a
+  plain conversational turn legitimately runs unlabeled (SMOKE step 3 as
+  amended, measured in run 0e40b93). Step 4 asserts the label where a
+  `tool_call*` event backs it.
+
+  `observed` keys: `:frames` (ordered, from the post watermark through the
+  settle window), `:session_key`, `:client_message_id`, `:turn`, `:timeout_ms`.
   """
   @spec turn_oracle_error(map()) :: String.t() | nil
   def turn_oracle_error(observed) do
     turn = observed.turn
+    frames = observed.frames
+    cmid = observed.client_message_id
+    key = observed.session_key
+
+    echo_at = index_where(frames, &(&1["type"] == "message" and &1["clientMessageId"] == cmid))
+
+    reply_at =
+      index_where(
+        frames,
+        &(&1["type"] == "message" and &1["role"] == "assistant" and
+            &1["replyToClientMessageId"] == cmid)
+      )
 
     cond do
-      is_nil(observed.echo) -> "no echo bubble for the posted message"
+      is_nil(echo_at) -> "no echo bubble for the posted message"
       is_nil(turn) -> "no turn row for the posted message"
       turn["status"] in ~w(failed failed_unknown) -> "turn row is #{turn["status"]}#{turn_error(turn)}"
-      is_nil(observed.typing_on) -> "typing indicator never turned on"
-      is_nil(observed.reply) -> "no assistant reply within #{observed.timeout_ms}ms"
-      is_nil(observed.typing_off) -> "typing indicator never cleared"
-      not is_nil(observed.lingering) -> "typing indicator came back after the turn ended"
+      is_nil(indicator_on_at(frames, key, echo_at)) -> "typing indicator never turned on"
+      is_nil(reply_at) -> "no assistant reply within #{observed.timeout_ms}ms"
+      error = indicator_settled_error(frames, key, reply_at) -> error
       turn["status"] != "delivered" -> "turn row is #{turn["status"]}#{turn_error(turn)}"
       true -> nil
     end
+  end
+
+  @doc """
+  The indicator invariant: after `after_at`, the indicator must END cleared.
+
+  Returns nil when the LAST typing frame for the session is a clear that came
+  after `after_at`, and a reason otherwise. "Ends cleared" is the only form of
+  this check that survives out-of-order frames — asking whether a clear exists
+  anywhere lets a stale one vouch for a live indicator.
+  """
+  @spec indicator_settled_error([map()], String.t(), non_neg_integer()) :: String.t() | nil
+  def indicator_settled_error(frames, session_key, after_at) do
+    case last_indicator(frames, session_key) do
+      nil ->
+        "typing indicator never cleared (no typing frame at all)"
+
+      {at, true} ->
+        "typing indicator was left ON (last indicator frame at position #{at} is active)"
+
+      {at, false} when at < after_at ->
+        "typing indicator never cleared after the turn ended (its last clear at position " <>
+          "#{at} predates position #{after_at})"
+
+      {_at, false} ->
+        nil
+    end
+  end
+
+  @doc "Position of the first typing=true for the session after `after_at`, or nil."
+  @spec indicator_on_at([map()], String.t(), non_neg_integer()) :: non_neg_integer() | nil
+  def indicator_on_at(frames, session_key, after_at) do
+    frames
+    |> Enum.with_index()
+    |> Enum.find_value(fn {frame, at} ->
+      if at > after_at and typing?(frame, session_key) and frame["active"] == true, do: at
+    end)
+  end
+
+  defp last_indicator(frames, session_key) do
+    frames
+    |> Enum.with_index()
+    |> Enum.reduce(nil, fn {frame, at}, acc ->
+      if typing?(frame, session_key), do: {at, frame["active"] == true}, else: acc
+    end)
+  end
+
+  defp typing?(frame, session_key),
+    do: frame["type"] == "typing" and frame["sessionKey"] == session_key
+
+  defp index_where(frames, predicate) do
+    frames |> Enum.with_index() |> Enum.find_value(fn {f, i} -> if predicate.(f), do: i end)
   end
 
   defp await_frame(client, watermark, predicate, timeout_ms) do

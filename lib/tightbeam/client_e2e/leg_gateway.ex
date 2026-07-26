@@ -75,8 +75,9 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   gateway holding the port, and the next leg fails to bind for reasons that
   look nothing like the cause.
   """
-  @spec boot!(String.t(), :inet.port_number(), keyword()) :: t()
-  def boot!(base_dir, port, opts \\ []) do
+  @spec boot(String.t(), :inet.port_number(), keyword()) ::
+          {:ok, t()} | {:error, term(), t()}
+  def boot(base_dir, port, opts \\ []) do
     log_path = Path.join(base_dir, "gateway.log")
     repo_root = Keyword.get(opts, :repo_root, File.cwd!())
 
@@ -104,11 +105,91 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
     case await_ready(gateway, Keyword.get(opts, :boot_timeout_ms, 60_000)) do
       :ok ->
-        gateway
+        {:ok, gateway}
 
       {:error, reason} ->
+        # The half-booted gateway is returned WITH the error so the caller's
+        # teardown owns it. Tearing it down here and raising loses the handle,
+        # which is how a process ends up alive on a port nobody remembers.
+        {:error, reason, gateway}
+    end
+  end
+
+  @doc """
+  `boot/3` or raise. Callers that cannot tear down a half-booted gateway
+  themselves should prefer `boot/3` — this exists for scripts that already run
+  their teardown from an `after` block covering the boot call.
+  """
+  @spec boot!(String.t(), :inet.port_number(), keyword()) :: t()
+  def boot!(base_dir, port, opts \\ []) do
+    case boot(base_dir, port, opts) do
+      {:ok, gateway} ->
+        gateway
+
+      {:error, reason, gateway} ->
         teardown(gateway, remove: false)
-        raise "gateway did not come up on port #{port} (#{reason}); log: #{log_path}"
+        raise "gateway did not come up on port #{port} (#{reason}); log: #{gateway.log_path}"
+    end
+  end
+
+  @doc """
+  Restarts the gateway in place: SIGTERM the captured pid, wait for the process
+  to exit AND for the health endpoint to go unreachable, then boot again on the
+  SAME port and base_dir and confirm a NEW pid.
+
+  J7's proof is executable precisely because each of those is checked (spec
+  r1 F4). Killing a wrapper, or dropping a socket, or restarting on a fresh
+  base_dir would all "pass" a weaker check while proving nothing about deploy
+  semantics — so the old pid must be gone, the port must actually stop
+  answering, and the new pid must differ.
+  """
+  @spec restart(t(), keyword()) :: {:ok, t()} | {:error, term()}
+  def restart(%__MODULE__{} = gateway, opts \\ []) do
+    old_pid = gateway.os_pid
+
+    with :ok <- signal_exit(gateway, Keyword.get(opts, :exit_timeout_ms, 60_000)),
+         :ok <- await_unreachable(gateway, Keyword.get(opts, :unreachable_timeout_ms, 30_000)) do
+      if gateway.port_ref && Port.info(gateway.port_ref), do: Port.close(gateway.port_ref)
+
+      case boot(gateway.base_dir, gateway.port, opts) do
+        {:ok, restarted} ->
+          if restarted.os_pid == old_pid do
+            {:error, {:same_pid, old_pid}}
+          else
+            {:ok, restarted}
+          end
+
+        {:error, reason, restarted} ->
+          {:error, {:restart_boot_failed, reason, restarted.log_path}}
+      end
+    end
+  end
+
+  defp signal_exit(gateway, timeout_ms) do
+    _ = System.cmd("kill", ["-TERM", Integer.to_string(gateway.os_pid)], stderr_to_stdout: true)
+
+    case await_exit(gateway, timeout_ms) do
+      :ok -> :ok
+      {:error, :still_running} -> {:error, {:still_running, gateway.os_pid}}
+    end
+  end
+
+  defp await_unreachable(gateway, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    poll_unreachable(gateway, deadline)
+  end
+
+  defp poll_unreachable(gateway, deadline) do
+    cond do
+      not ready?(gateway) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :port_still_answering}
+
+      true ->
+        Process.sleep(250)
+        poll_unreachable(gateway, deadline)
     end
   end
 
@@ -128,20 +209,34 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   end
 
   @doc """
-  SIGTERMs the gateway, waits for the process to exit, and (by default)
-  removes the run-local base directory.
+  SIGTERMs the gateway, waits for exit, and removes the run-local base
+  directory — but ONLY once the process is confirmed gone.
+
+  Returns `:ok`, or `{:error, :still_running, pid}` when the process outlived
+  the SIGTERM window. In that case the directory is KEPT and the caller is
+  expected to report it: a gateway still holding its port while its state
+  directory is deleted underneath it is a worse state than a leftover
+  directory, and it makes the next leg's bind failure unexplainable.
   """
-  @spec teardown(t(), keyword()) :: :ok
+  @spec teardown(t(), keyword()) :: :ok | {:error, :still_running, pos_integer()}
   def teardown(%__MODULE__{} = gateway, opts \\ []) do
-    if gateway.os_pid do
-      _ = System.cmd("kill", ["-TERM", Integer.to_string(gateway.os_pid)], stderr_to_stdout: true)
-      await_exit(gateway, Keyword.get(opts, :exit_timeout_ms, 30_000))
-    end
+    exit_result =
+      if gateway.os_pid do
+        _ = System.cmd("kill", ["-TERM", Integer.to_string(gateway.os_pid)], stderr_to_stdout: true)
+        await_exit(gateway, Keyword.get(opts, :exit_timeout_ms, 30_000))
+      else
+        :ok
+      end
 
     if gateway.port_ref && Port.info(gateway.port_ref), do: Port.close(gateway.port_ref)
 
-    if Keyword.get(opts, :remove, true) and run_local?(gateway.base_dir) do
+    if exit_result == :ok and Keyword.get(opts, :remove, true) and run_local?(gateway.base_dir) do
       File.rm_rf!(gateway.base_dir)
+    end
+
+    case exit_result do
+      :ok -> :ok
+      {:error, :still_running} -> {:error, :still_running, gateway.os_pid}
     end
 
     :ok

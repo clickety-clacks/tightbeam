@@ -50,8 +50,10 @@ driver emits this table directly (`TIGHTBEAM_CLIENT_E2E_OUT=<this file>`).
 | 13a /model [J6] | | | |
 | 13b model change [J6] | | | |
 | 13c model footer | | | rendered-footer assertion is app-side |
-| 14-15 restart | | | |
-| 16 wakes | | | |
+| 14 restart resilience [J7] | | | |
+| 15 restart queue survival [J7] | | | |
+| 16 wakes [J8] | | | |
+| 16b scheduled wake [J8] | | | |
 | 17-23 rails | | N/A per step (negative checks only) | |
 | 24 satellite propagation | | | |
 | 25-33 roles | | | |

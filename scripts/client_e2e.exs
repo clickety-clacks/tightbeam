@@ -1,33 +1,34 @@
 # Client e2e — walks the SMOKE.md operator journeys with a sim client against a
-# REAL gateway, one leg per harness, and prints the v1 scorecard.
+# REAL gateway, one leg per registered harness, and prints the v1 scorecard.
 #
-#   TIGHTBEAM_CLIENT_E2E_TEMPLATE=~/.tightbeam-beam \
+#   TIGHTBEAM_CLIENT_E2E_TEMPLATE=~/.tightbeam-smoke-<sha> \
 #   TIGHTBEAM_CLIENT_E2E_PORT=12100 \
 #   TIGHTBEAM_CLIENT_E2E_HARNESSES=claude,codex \
-#   TIGHTBEAM_SMOKE_MODEL_CLAUDE=fable \
+#   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5[medium]' \
 #   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol[medium]' \
 #   mix run --no-start scripts/client_e2e.exs
 #
-# Each leg provisions a FRESH base_dir from the template org (credentials,
-# homes, identity — never state.db), boots its own gateway on its own port,
-# walks J0-J6, then SIGTERMs the gateway and removes the directory. Exits
-# non-zero unless the run verdict is PASS, and writes the scorecard to
-# TIGHTBEAM_CLIENT_E2E_OUT when set.
+# Per leg, in this order — the order IS the contract:
+#   1. PREFLIGHT the harness credential, BEFORE anything boots: a dead grant
+#      masquerades downstream as an invalid model ref rather than as auth.
+#   2. Provision a FRESH base_dir from the template org (credentials, homes,
+#      identity — never state.db).
+#   3. Boot a gateway on its own run-local port.
+#   4. Walk every journey in Tightbeam.ClientE2E.Journeys.ids/0 (J0-J8).
+#   5. SIGTERM, await exit, remove the directory — and if the process outlives
+#      the window, KEEP the directory and say so out loud.
 #
-# Journeys J7 (restart resilience) and J8 (wakes) are v1 spec scope but are NOT
-# driven here; they are recorded as manual rows so their absence is visible in
-# the scorecard rather than silent.
+# PROVENANCE: the run refuses to start on a dirty worktree, so a scorecard's sha
+# names the code that actually produced it. TIGHTBEAM_CLIENT_E2E_ALLOW_DIRTY=1
+# runs anyway and stamps the scorecard DIRTY with a hash of the diff.
+#
+# Exits 0 only on RUN VERDICT PASS (1 on FAIL, 2 on INCOMPLETE), and writes the
+# scorecard to TIGHTBEAM_CLIENT_E2E_OUT when set.
 
 alias Tightbeam.ClientE2E
 alias Tightbeam.ClientE2E.{LegGateway, Scorecard}
 
 defmodule ClientE2ERunner do
-  @unautomated [
-    {"14", "restart resilience", "J7 is spec scope, not driven by this lane's driver"},
-    {"15", "restart queue survival", "J7 is spec scope, not driven by this lane's driver"},
-    {"16", "wakes", "J8 is spec scope, not driven by this lane's driver"}
-  ]
-
   def run do
     template = env!("TIGHTBEAM_CLIENT_E2E_TEMPLATE")
     base_port = env("TIGHTBEAM_CLIENT_E2E_PORT", "12100") |> String.to_integer()
@@ -37,17 +38,17 @@ defmodule ClientE2ERunner do
       raise "client-e2e runs on throwaway ports >= 12000 (got #{base_port})"
     end
 
-    harnesses = legs()
+    provenance = provenance!()
 
     legs =
-      harnesses
+      legs()
       |> Enum.with_index()
       |> Enum.map(fn {harness, index} -> run_leg(harness, template, base_port + index, repo_root) end)
 
     scorecard = %Scorecard{
       legs: legs,
       date: Date.utc_today() |> Date.to_iso8601(),
-      gateway_sha: gateway_sha(),
+      gateway_sha: provenance,
       client_build: "sim-client (driver)"
     }
 
@@ -62,7 +63,8 @@ defmodule ClientE2ERunner do
 
     case Scorecard.run_verdict(scorecard, registered) do
       :pass -> :ok
-      verdict -> System.halt(if(verdict == :fail, do: 1, else: 2))
+      :fail -> System.halt(1)
+      {:incomplete, _blockers} -> System.halt(2)
     end
   end
 
@@ -71,30 +73,68 @@ defmodule ClientE2ERunner do
     IO.puts("\nclient-e2e leg #{harness} port=#{port} base_dir=#{base_dir}")
     LegGateway.provision!(template, base_dir)
 
-    gateway =
-      LegGateway.boot!(base_dir, port,
-        repo_root: repo_root,
-        env: leg_env(harness)
-      )
+    # Preflight FIRST, against the provisioned org, while no gateway exists.
+    preflight_row = ClientE2E.preflight(harness, base_dir)
+    IO.puts("  preflight #{preflight_row.step}: #{preflight_row.status}")
 
     try do
-      leg =
-        ClientE2E.run_leg(
-          host: "127.0.0.1",
-          port: port,
-          base_dir: base_dir,
-          harness: harness,
-          model: model_for(harness)
-        )
+      # Boot INSIDE the try so the after-block owns teardown on every path,
+      # including a boot that half-succeeds and leaves a process behind.
+      case LegGateway.boot(base_dir, port, repo_root: repo_root, env: leg_env(harness)) do
+        {:error, reason, gateway} ->
+          Process.put(:leg_gateway, gateway)
 
-      leg = Enum.reduce(@unautomated, leg, fn {step, label, why}, leg ->
-        Scorecard.add(leg, Scorecard.manual(step, label, why))
-      end)
+          %Scorecard.Leg{harness: harness, host: Tightbeam.Placement.local_host_name()}
+          |> Scorecard.add(preflight_row)
+          |> Scorecard.add(
+            Scorecard.fail(
+              "1",
+              "boot",
+              "gateway did not come up: #{inspect(reason)}; log: #{gateway.log_path}",
+              journey: "J0"
+            )
+          )
 
-      IO.puts("leg #{harness}: #{Scorecard.verdict_text(Scorecard.leg_verdict(leg))}")
-      leg
+        {:ok, gateway} ->
+          Process.put(:leg_gateway, gateway)
+
+          leg =
+            ClientE2E.run_leg(
+              host: "127.0.0.1",
+              port: port,
+              base_dir: base_dir,
+              harness: harness,
+              model: model_for(harness),
+              gateway: gateway,
+              preflight_row: preflight_row
+            )
+
+          IO.puts("leg #{harness}: #{Scorecard.verdict_text(Scorecard.leg_verdict(leg))}")
+          leg
+      end
     after
-      LegGateway.teardown(gateway)
+      teardown(Process.get(:leg_gateway), base_dir)
+      Process.delete(:leg_gateway)
+    end
+  end
+
+  # A gateway that outlived SIGTERM keeps its directory, and gets said out loud:
+  # deleting state from under a live process makes the next leg's bind failure
+  # unexplainable.
+  defp teardown(nil, base_dir) do
+    IO.puts("  no gateway handle; leaving #{base_dir} in place")
+  end
+
+  defp teardown(gateway, _base_dir) do
+    case LegGateway.teardown(gateway) do
+      :ok ->
+        :ok
+
+      {:error, :still_running, pid} ->
+        IO.puts(
+          "  WARNING: gateway pid #{pid} outlived SIGTERM; base_dir KEPT at " <>
+            "#{gateway.base_dir} (port #{gateway.port} may still be held)"
+        )
     end
   end
 
@@ -116,10 +156,40 @@ defmodule ClientE2ERunner do
     end
   end
 
-  defp gateway_sha do
-    case System.cmd("git", ["rev-parse", "--short", "HEAD"], stderr_to_stdout: true) do
-      {sha, 0} -> String.trim(sha)
-      _ -> nil
+  # The scorecard's sha must name the code that produced it, or a PASS proves an
+  # unrecorded working-tree state — found by cross-review, where a scorecard was
+  # headed with a sha whose tree did not yet contain the logic it credited.
+  defp provenance! do
+    sha =
+      case System.cmd("git", ["rev-parse", "--short", "HEAD"], stderr_to_stdout: true) do
+        {out, 0} -> String.trim(out)
+        _ -> "unknown"
+      end
+
+    case System.cmd("git", ["status", "--porcelain"], stderr_to_stdout: true) do
+      {"", 0} ->
+        sha
+
+      {dirty, 0} ->
+        {diff, _} = System.cmd("git", ["diff", "HEAD"], stderr_to_stdout: true)
+        hash = :crypto.hash(:sha256, diff) |> Base.encode16(case: :lower) |> binary_part(0, 12)
+
+        if System.get_env("TIGHTBEAM_CLIENT_E2E_ALLOW_DIRTY") == "1" do
+          "#{sha} DIRTY (diff #{hash})"
+        else
+          raise """
+          refusing to run on a dirty worktree — a scorecard from an uncommitted tree \
+          cannot be reproduced from its sha.
+
+          #{String.trim(dirty)}
+
+          Commit, or set TIGHTBEAM_CLIENT_E2E_ALLOW_DIRTY=1 to run with the scorecard \
+          stamped DIRTY (diff #{hash}).
+          """
+        end
+
+      _ ->
+        sha
     end
   end
 

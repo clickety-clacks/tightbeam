@@ -222,7 +222,7 @@ once: a `/new` that died pre-model with `Session not found`).
 
 ## 7. Restart resilience (deploy semantics)
 
-14. [manual] Post a slow prompt; while the indicator is live, SIGTERM the gateway
+14. [auto: J7] Post a slow prompt; while the indicator is live, SIGTERM the gateway
     (plain `kill <pid>`), wait for exit, restart it.
     PASS: the gateway drains — either the turn completes before exit
     (assistant bubble, then restart is invisible beyond a reconnect blip)
@@ -231,13 +231,13 @@ once: a `/new` that died pre-model with `Session not found`).
     indicator. Client reconnects by itself; replay shows full history; a
     fresh post works and the model still has its context (same harness
     session re-adopted — pointer chain shows `loaded`, not `fallback`).
-15. [manual] Queue two messages, SIGTERM before the first completes, restart.
+15. [auto: J7] Queue two messages, SIGTERM before the first completes, restart.
     PASS: queued (not-yet-running) turns survive and run to `delivered`
     after the restart without re-sending.
 
 ## 8. Wakes (agent comms surface)
 
-16. [manual] ⌥ `tb wake --session <mainKey> --prompt "reply with exactly: WAKE OK" --as-user
+16. [auto: J8] ⌥ `tb wake --session <mainKey> --prompt "reply with exactly: WAKE OK" --as-user
     <admin>`.
     PASS: the prompt appears in Main as a sender-tagged message; assistant
     replies "WAKE OK". Then `--after 15s` variant: fires after the delay
@@ -252,9 +252,10 @@ real gateway (`mix run --no-start scripts/client_e2e.exs`). `[manual]` steps
 stay this runbook's, run by a human, and appear in the scorecard as
 verdict-neutral MANUAL rows.
 
-Steps 14-16 (J7 restart resilience, J8 wakes) are v1 SPEC scope with no driver
-yet — they are `[manual]` because that is the truth today, not because the
-spec retired them.
+Steps 14-16 are driven: J7 restarts the gateway for real (SIGTERM the captured
+pid, await exit AND the port going unreachable, restart on the same port and
+base_dir, confirm a NEW pid) and J8 drives wakes through `/agent/dispatch`,
+the same facade `tb wake` posts. Step 16b is J8's scheduled variant.
 
 ## Recording results — the scorecard
 

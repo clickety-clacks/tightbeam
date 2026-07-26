@@ -149,56 +149,98 @@ defmodule Tightbeam.ClientE2ETest do
       assert steps == Enum.uniq(steps)
     end
 
-    test "the SMOKE steps this driver claims are exactly J0-J6's steps 1-13" do
+    test "the driver claims every v1 journey step: J0-J8, SMOKE steps 1-16" do
+      # J7 (restart) and J8 (wakes) are v1 SPEC scope. They were once recorded
+      # as verdict-neutral MANUAL rows, which meant a gateway with broken
+      # restart recovery or dead wakes could still earn RUN VERDICT PASS. Only
+      # 13c stays manual, and only because it is a RENDERED surface no
+      # wire-level driver can witness.
       assert Journeys.automated_steps() ==
-               ~w(1 2 3 4 5 6 7 8 9 10 11 12 13a 13b 13c)
+               ~w(1 2 3 4 5 6 7 8 9 10 11 12 13a 13b 13c 14 15 16 16b)
+
+      manual_only = for o <- Journeys.oracles(), match?({:none, _}, o.client), do: o.step
+      assert manual_only == ["13c"]
     end
   end
 
   describe "J1's turn-completion oracle" do
     # SMOKE step 3 as amended: the typing indicator is the invariant, its label
-    # is harness-reported. These pin the amended contract in both directions —
-    # the label must not be required, and the indicator must still fail hard.
-    defp delivered_turn, do: %{"status" => "delivered"}
+    # is harness-reported. These are FRAME-ORDER tests on purpose — the first
+    # version of this oracle asked "does a clear exist after the post?", which
+    # a stale clear from the previous turn answers, and the pure-map tests it
+    # shipped with could not see order at all.
+    @session "agent:main:clawline:user:main"
 
-    defp observed(overrides) do
-      Map.merge(
-        %{
-          echo: %{"type" => "message"},
-          typing_on: %{"active" => true},
-          typing_off: %{"active" => false},
-          lingering: nil,
-          reply: %{"content" => "hi"},
-          turn: delivered_turn(),
-          timeout_ms: 1_000
-        },
-        overrides
-      )
+    defp echo(cmid), do: %{"type" => "message", "role" => "user", "clientMessageId" => cmid}
+    defp reply(cmid), do: %{"type" => "message", "role" => "assistant", "replyToClientMessageId" => cmid}
+    defp typing(active), do: %{"type" => "typing", "active" => active, "sessionKey" => @session}
+
+    defp oracle(frames, opts \\ []) do
+      Journeys.turn_oracle_error(%{
+        frames: frames,
+        session_key: @session,
+        client_message_id: "c_1",
+        turn: Keyword.get(opts, :turn, %{"status" => "delivered"}),
+        timeout_ms: 1_000
+      })
+    end
+
+    defp healthy_sequence do
+      [echo("c_1"), typing(true), reply("c_1"), typing(false)]
+    end
+
+    test "the healthy frame order passes" do
+      assert oracle(healthy_sequence()) == nil
     end
 
     test "a plain turn with NO progress label passes — the substrate fabricates no label" do
-      assert Journeys.turn_oracle_error(observed(%{})) == nil
+      # No agent_progress frame anywhere in the sequence.
+      refute Enum.any?(healthy_sequence(), &(&1["type"] == "agent_progress"))
+      assert oracle(healthy_sequence()) == nil
     end
 
-    test "the indicator turning on is an invariant" do
-      assert Journeys.turn_oracle_error(observed(%{typing_on: nil})) =~ "never turned on"
+    test "REGRESSION: a stale clear cannot vouch for an indicator left ON" do
+      # false → true → reply. The old oracle matched the leading `false` as
+      # "cleared" and started its lingering check after the final `true`, so it
+      # passed with the indicator active. This is the bug the cross-review found.
+      frames = [echo("c_1"), typing(false), typing(true), reply("c_1")]
+
+      assert oracle(frames) =~ "left ON"
     end
 
-    test "the indicator clearing is an invariant, and so is not coming back" do
-      assert Journeys.turn_oracle_error(observed(%{typing_off: nil})) =~ "never cleared"
+    test "REGRESSION: an indicator that comes back after the reply fails" do
+      frames = [echo("c_1"), typing(true), reply("c_1"), typing(false), typing(true)]
 
-      assert Journeys.turn_oracle_error(observed(%{lingering: %{"active" => true}})) =~
-               "came back after the turn ended"
+      assert oracle(frames) =~ "left ON"
+    end
+
+    test "a clear that predates the reply does not count as clearing the turn" do
+      frames = [echo("c_1"), typing(true), typing(false), reply("c_1")]
+
+      assert oracle(frames) =~ "never cleared after the turn ended"
+    end
+
+    test "an indicator that never turns on fails" do
+      frames = [echo("c_1"), reply("c_1"), typing(false)]
+
+      assert oracle(frames) =~ "never turned on"
+    end
+
+    test "a typing frame for ANOTHER session cannot satisfy this session's indicator" do
+      other = %{"type" => "typing", "active" => true, "sessionKey" => "agent:main:other"}
+      frames = [echo("c_1"), other, reply("c_1"), typing(false)]
+
+      assert oracle(frames) =~ "never turned on"
+    end
+
+    test "no typing frame at all fails, and says so" do
+      assert oracle([echo("c_1"), reply("c_1")]) =~ "never turned on"
     end
 
     test "a failed turn row is reported ahead of the client symptom it caused" do
       error =
-        Journeys.turn_oracle_error(
-          observed(%{
-            reply: nil,
-            typing_on: nil,
-            turn: %{"status" => "failed", "error" => "Invalid value for config option model"}
-          })
+        oracle([echo("c_1")],
+          turn: %{"status" => "failed", "error" => "Invalid value for config option model"}
         )
 
       assert error =~ "turn row is failed"
@@ -207,12 +249,68 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "a missing echo is the first thing reported — nothing else is meaningful without it" do
-      assert Journeys.turn_oracle_error(observed(%{echo: nil, turn: nil})) =~ "no echo bubble"
+      assert oracle([typing(true), reply("c_1")], turn: nil) =~ "no echo bubble"
+    end
+
+    test "a missing reply is reported once the indicator legs hold" do
+      assert oracle([echo("c_1"), typing(true)]) =~ "no assistant reply"
     end
 
     test "a non-terminal turn row fails even when every frame arrived" do
-      assert Journeys.turn_oracle_error(observed(%{turn: %{"status" => "queued"}})) =~
-               "turn row is queued"
+      assert oracle(healthy_sequence(), turn: %{"status" => "queued"}) =~ "turn row is queued"
+    end
+
+    test "indicator_settled_error/3 is reusable by cancel and the queued batch" do
+      # J3 and J4 assert the same invariant against their own anchor frame.
+      frames = [typing(true), %{"type" => "event"}, typing(false), %{"type" => "event"}]
+      # Anchored before the clear: settled. Anchored after it: the clear is stale.
+      assert Journeys.indicator_settled_error(frames, @session, 1) == nil
+      assert Journeys.indicator_settled_error(frames, @session, 3) =~ "never cleared"
+      assert Journeys.indicator_settled_error([typing(true)], @session, 0) =~ "left ON"
+      assert Journeys.indicator_settled_error([], @session, 0) =~ "no typing frame at all"
+    end
+  end
+
+  describe "the concurrency witness (step 10)" do
+    alias Tightbeam.ClientE2E.Substrate
+
+    test "simultaneity requires ONE sample holding both sessions" do
+      sequential = [MapSet.new(["a"]), MapSet.new([]), MapSet.new(["b"])]
+      together = [MapSet.new(["a"]), MapSet.new(["a", "b"]), MapSet.new(["b"])]
+
+      # This is the laundering the cross-review found: per-session maxima are
+      # 1 and 1 in BOTH lists, so a maxima-based witness calls sequential
+      # execution concurrent.
+      refute Substrate.simultaneous?(sequential, ["a", "b"])
+      assert Substrate.simultaneous?(together, ["a", "b"])
+      assert Substrate.widest_sample(sequential) == 1
+      assert Substrate.widest_sample(together) == 2
+    end
+
+    test "an empty sample list witnesses nothing" do
+      refute Substrate.simultaneous?([], ["a", "b"])
+      assert Substrate.widest_sample([]) == 0
+    end
+
+    test "turn intervals witness overlap without needing a lucky sample" do
+      main = %{"startedAt" => 100, "endedAt" => 900}
+
+      assert Substrate.turns_overlapped?(main, %{"startedAt" => 200, "endedAt" => 400})
+      assert Substrate.turns_overlapped?(main, %{"startedAt" => 800, "endedAt" => 1_500})
+      refute Substrate.turns_overlapped?(main, %{"startedAt" => 950, "endedAt" => 1_200})
+    end
+
+    test "a turn that never started cannot witness overlap" do
+      refute Substrate.turns_overlapped?(%{"startedAt" => nil}, %{"startedAt" => 100})
+      refute Substrate.turns_overlapped?(nil, %{"startedAt" => 100})
+    end
+
+    test "a still-running turn counts from its start" do
+      # endedAt nil means "still going", so it overlaps anything after its start.
+      assert Substrate.turns_overlapped?(
+               %{"startedAt" => 100, "endedAt" => nil},
+               %{"startedAt" => 100, "endedAt" => 500}
+             )
     end
   end
 
@@ -249,9 +347,9 @@ defmodule Tightbeam.ClientE2ETest do
           host: "127.0.0.1",
           port: closed_port(),
           base_dir: System.tmp_dir!(),
-          harness: "claude",
-          host_name: "testhost",
-          preflight: false
+          # From the registry, not a literal: the driver has no default harness.
+          harness: registered_harness(),
+          host_name: "testhost"
         )
 
       assert Scorecard.leg_verdict(leg) == :fail
@@ -264,7 +362,36 @@ defmodule Tightbeam.ClientE2ETest do
       # simply vanished from the report is how a broken run looks green.
       assert Enum.sort(Enum.map(leg.rows, & &1.step)) == Enum.sort(Journeys.automated_steps())
     end
+
+    test "run_leg REFUSES to guess a harness" do
+      # A default harness silently pins one leg and survives a registry change.
+      assert_raise KeyError, fn ->
+        ClientE2E.run_leg(host: "127.0.0.1", port: closed_port(), base_dir: System.tmp_dir!())
+      end
+    end
+
+    test "J7 reports itself incomplete without a gateway handle rather than passing" do
+      ctx = %{
+        base_dir: System.tmp_dir!(),
+        host: "127.0.0.1",
+        port: 0,
+        client: nil,
+        main_key: "agent:main:x",
+        gateway: nil,
+        leg: %{},
+        turn_timeout_ms: 1_000,
+        settle_ms: 1
+      }
+
+      {_ctx, rows} = Journeys.run(ctx, "J7")
+
+      assert Enum.map(rows, & &1.step) == ["14", "15"]
+      assert Enum.all?(rows, &(&1.status == :incomplete))
+      assert Enum.all?(rows, &(&1.note =~ "gateway"))
+    end
   end
+
+  defp registered_harness, do: Tightbeam.Harness.all() |> hd() |> then(& &1.wire_name())
 
   describe "the sim client against a real gateway" do
     setup :real_gateway
@@ -318,6 +445,7 @@ defmodule Tightbeam.ClientE2ETest do
       port: ctx.port,
       client: client,
       main_key: nil,
+      gateway: nil,
       leg: %{harness: "claude", host: "testhost", model: "fable"},
       turn_timeout_ms: 10_000,
       settle_ms: 250

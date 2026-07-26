@@ -140,17 +140,69 @@ defmodule Tightbeam.ClientE2E.Substrate do
     query(base_dir, "SELECT userId, isAdmin FROM users ORDER BY rowid")
   end
 
-  @doc """
-  Samples `running_by_session/1` on an interval while `task` runs, returning
-  `{task_result, peak_by_session}`.
+  @doc "The session's latest harness pointer — J7 reads its `reason` (loaded vs fallback)."
+  @spec harness_pointer(base_dir(), String.t()) :: map() | nil
+  def harness_pointer(base_dir, session_key) do
+    base_dir
+    |> query("""
+    SELECT reason, harnessSessionId, harness, machine
+    FROM harness_pointers WHERE sessionKey = #{quote_string(session_key)}
+    ORDER BY id DESC LIMIT 1
+    """)
+    |> List.first()
+  end
 
-  J4 ("never more than one running for the session") and J5 ("at peak, two
-  running rows with DIFFERENT sessionKeys") are both statements about a peak
-  that exists only DURING the turns. Reading the table afterwards proves
-  nothing about either, so the driver watches while the work happens.
+  @doc "The turn row a wake-delivered message produced, by that message's id."
+  @spec turn_for_wake(base_dir(), String.t()) :: map() | nil
+  def turn_for_wake(base_dir, message_id) do
+    base_dir
+    |> query("""
+    SELECT seq, status, wakeId, origin, error
+    FROM turns WHERE messageId = #{quote_string(message_id)}
+    """)
+    |> List.first()
+  end
+
+  @doc "Wake rows still pending — J8 asserts a scheduled wake is visible before it fires."
+  @spec pending_wakes(base_dir()) :: [map()]
+  def pending_wakes(base_dir) do
+    query(
+      base_dir,
+      "SELECT wakeId, sessionKey, state, dueAt, prompt FROM wakes WHERE state = 'pending' ORDER BY dueAt"
+    )
+  end
+
+  @doc """
+  The org's CLI bearer token from `<base_dir>/gateway.json` — the credential
+  `tb` itself uses, so the driver's wake goes through the same facade an
+  operator would.
+  """
+  @spec cli_token(base_dir()) :: {:ok, String.t()} | {:error, term()}
+  def cli_token(base_dir) do
+    path = Path.join(base_dir, "gateway.json")
+
+    with {:ok, bytes} <- File.read(path),
+         {:ok, %{"cliToken" => token}} when is_binary(token) <- JSON.decode(bytes) do
+      {:ok, token}
+    else
+      {:error, reason} -> {:error, {:no_cli_token, path, reason}}
+      other -> {:error, {:no_cli_token, path, other}}
+    end
+  end
+
+  @doc """
+  Samples the running set on an interval while `task` runs, returning
+  `{task_result, samples}` where each sample is the `MapSet` of session keys
+  running AT THAT INSTANT.
+
+  Per-sample sets, not per-session maxima. A maximum per session, merged across
+  different samples, cannot distinguish "both lanes ran at once" from "one ran,
+  finished, then the other ran" — it would report sequential execution as
+  concurrency, which is the one thing J5 exists to disprove. Simultaneity is a
+  property of a single observation, so a single observation is what is kept.
   """
   @spec sample_while(base_dir(), non_neg_integer(), (-> result)) ::
-          {result, %{String.t() => non_neg_integer()}}
+          {result, [MapSet.t(String.t())]}
         when result: term()
   def sample_while(base_dir, interval_ms, task) do
     owner = self()
@@ -158,8 +210,7 @@ defmodule Tightbeam.ClientE2E.Substrate do
 
     sampler =
       spawn_link(fn ->
-        peaks = sample_loop(base_dir, interval_ms, %{}, owner)
-        send(owner, {ref, peaks})
+        send(owner, {ref, sample_loop(base_dir, interval_ms, [], owner)})
       end)
 
     result =
@@ -169,23 +220,57 @@ defmodule Tightbeam.ClientE2E.Substrate do
         send(sampler, {:stop, self()})
       end
 
-    peaks =
+    samples =
       receive do
-        {^ref, peaks} -> peaks
+        {^ref, samples} -> samples
       after
-        interval_ms * 4 + 1_000 -> %{}
+        interval_ms * 4 + 1_000 -> []
       end
 
-    {result, peaks}
+    {result, samples}
   end
 
-  defp sample_loop(base_dir, interval_ms, peaks, owner) do
-    peaks = Map.merge(peaks, running_by_session(base_dir), fn _key, a, b -> max(a, b) end)
+  @doc """
+  True when SOME SINGLE sample caught every one of `session_keys` running at
+  the same instant — the simultaneous-lane witness J5 asserts.
+  """
+  @spec simultaneous?([MapSet.t(String.t())], [String.t()]) :: boolean()
+  def simultaneous?(samples, session_keys) do
+    wanted = MapSet.new(session_keys)
+    Enum.any?(samples, &MapSet.subset?(wanted, &1))
+  end
+
+  @doc "The largest number of sessions seen running in any one sample."
+  @spec widest_sample([MapSet.t(String.t())]) :: non_neg_integer()
+  def widest_sample(samples), do: samples |> Enum.map(&MapSet.size/1) |> Enum.max(fn -> 0 end)
+
+  @doc """
+  Whether two turn rows overlapped in wall-clock time, from their own
+  `startedAt`/`endedAt` — deterministic simultaneous evidence that does not
+  depend on catching them with a sampler.
+  """
+  @spec turns_overlapped?(map() | nil, map() | nil) :: boolean()
+  def turns_overlapped?(a, b) do
+    with %{"startedAt" => a_start} <- a,
+         %{"startedAt" => b_start} <- b,
+         true <- is_integer(a_start) and is_integer(b_start) do
+      a_end = a["endedAt"] || a_start
+      b_end = b["endedAt"] || b_start
+      a_start <= b_end and b_start <= a_end
+    else
+      _ -> false
+    end
+  end
+
+  defp sample_loop(base_dir, interval_ms, samples, owner) do
+    sample = base_dir |> running_by_session() |> Map.keys() |> MapSet.new()
 
     receive do
-      {:stop, ^owner} -> Map.merge(peaks, running_by_session(base_dir), fn _k, a, b -> max(a, b) end)
+      {:stop, ^owner} ->
+        final = base_dir |> running_by_session() |> Map.keys() |> MapSet.new()
+        Enum.reverse([final, sample | samples])
     after
-      interval_ms -> sample_loop(base_dir, interval_ms, peaks, owner)
+      interval_ms -> sample_loop(base_dir, interval_ms, [sample | samples], owner)
     end
   end
 

@@ -78,28 +78,43 @@ defmodule Tightbeam.ClientE2E.SimClient do
       "deviceInfo" => %{"platform" => "sim", "model" => "client-e2e"}
     }
 
-    with {:ok, ws} <- WS.connect(host, port, "/ws"),
-         :ok <- WS.send_text(ws, JSON.encode!(request)),
-         {:ok, {:text, body}, ws} <- WS.recv(ws, 10_000) do
-      WS.close(ws)
+    # Every exit from here closes the pairing socket, success or failure. The
+    # gateway closes its end after pair_result, but a driver that only cleans
+    # up on the happy path leaks one descriptor per refusal — and refusals are
+    # exactly what a failing run produces in bulk.
+    case WS.connect(host, port, "/ws") do
+      {:error, reason} ->
+        {:error, reason}
 
-      case JSON.decode(body) do
-        {:ok, %{"type" => "pair_result", "success" => true} = frame} ->
-          {:ok, %{token: frame["token"], user_id: frame["userId"]}}
+      {:ok, ws} ->
+        result =
+          with :ok <- WS.send_text(ws, JSON.encode!(request)),
+               {:ok, {:text, body}, _ws} <- WS.recv(ws, 10_000) do
+            decode_pair_result(body)
+          else
+            {:ok, :closed, _ws} -> {:error, :closed_before_pair_result}
+            {:error, reason, _ws} -> {:error, reason}
+            {:error, reason} -> {:error, reason}
+          end
 
-        {:ok, %{"type" => "pair_result", "reason" => reason}} ->
-          {:error, reason}
+        WS.close(ws)
+        result
+    end
+  end
 
-        {:ok, %{"type" => "error", "code" => code}} ->
-          {:error, code}
+  defp decode_pair_result(body) do
+    case JSON.decode(body) do
+      {:ok, %{"type" => "pair_result", "success" => true} = frame} ->
+        {:ok, %{token: frame["token"], user_id: frame["userId"]}}
 
-        other ->
-          {:error, {:unexpected_pair_frame, other}}
-      end
-    else
-      {:ok, :closed, _ws} -> {:error, :closed_before_pair_result}
-      {:error, reason, _ws} -> {:error, reason}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{"type" => "pair_result", "reason" => reason}} ->
+        {:error, reason}
+
+      {:ok, %{"type" => "error", "code" => code}} ->
+        {:error, code}
+
+      other ->
+        {:error, {:unexpected_pair_frame, other}}
     end
   end
 
@@ -119,31 +134,53 @@ defmodule Tightbeam.ClientE2E.SimClient do
       %{"type" => "auth", "token" => token, "deviceId" => device_id}
       |> maybe_put("replayCursorsBySessionKey", Keyword.get(opts, :replay_cursors))
 
-    with {:ok, ws} <- WS.connect(host, port, "/ws"),
-         :ok <- WS.send_text(ws, JSON.encode!(auth)) do
-      client = %__MODULE__{host: host, port: port, ws: ws, token: token, device_id: device_id}
+    case WS.connect(host, port, "/ws") do
+      {:error, reason} ->
+        {:error, reason}
 
-      case await(client, 0, &(&1["type"] == "sync_complete"), Keyword.get(opts, :timeout, 15_000)) do
-        {:ok, _frame, client} ->
-          case find(client, 0, &(&1["type"] == "auth_result")) do
-            %{"success" => true} = result ->
-              {:ok, %{client | user_id: result["userId"], is_admin: result["isAdmin"] == true}}
+      {:ok, ws} ->
+        client = %__MODULE__{host: host, port: port, ws: ws, token: token, device_id: device_id}
 
-            %{"reason" => reason} ->
-              {:error, reason}
-
-            nil ->
-              {:error, :no_auth_result}
-          end
-
-        {:error, reason, client} ->
-          case find(client, 0, &(&1["type"] == "auth_result" and &1["success"] == false)) do
-            %{"reason" => refusal} -> {:error, refusal}
-            _ -> {:error, reason}
-          end
-      end
+        # A refused auth leaves a socket behind unless the failure path closes
+        # it; only the SUCCESS path hands the socket to the caller.
+        case authenticate(client, auth, Keyword.get(opts, :timeout, 15_000)) do
+          {:ok, client} -> {:ok, client}
+          {:error, reason, client} -> {:error, reason, disconnect(client)} |> drop_client()
+        end
     end
   end
+
+  defp authenticate(client, auth, timeout_ms) do
+    case WS.send_text(client.ws, JSON.encode!(auth)) do
+      {:error, reason} ->
+        {:error, reason, client}
+
+      :ok ->
+        case await(client, 0, &(&1["type"] == "sync_complete"), timeout_ms) do
+          {:ok, _frame, client} ->
+            case find(client, 0, &(&1["type"] == "auth_result")) do
+              %{"success" => true} = result ->
+                {:ok, %{client | user_id: result["userId"], is_admin: result["isAdmin"] == true}}
+
+              %{"reason" => reason} ->
+                {:error, reason, client}
+
+              nil ->
+                {:error, :no_auth_result, client}
+            end
+
+          {:error, reason, client} ->
+            # The gateway's own refusal reason beats the transport symptom it
+            # caused: "device_not_approved" is actionable, ":closed" is not.
+            case find(client, 0, &(&1["type"] == "auth_result" and &1["success"] == false)) do
+              %{"reason" => refusal} -> {:error, refusal, client}
+              _ -> {:error, reason, client}
+            end
+        end
+    end
+  end
+
+  defp drop_client({:error, reason, _client}), do: {:error, reason}
 
   @doc "Closes the socket. Safe to call on an already-closed client."
   @spec disconnect(t()) :: t()
@@ -241,6 +278,15 @@ defmodule Tightbeam.ClientE2E.SimClient do
   @doc "DELETE with a JSON body with the device bearer; returns {status, decoded_body}."
   @spec delete_json(t(), String.t(), map()) :: {integer(), term()}
   def delete_json(client, path, body), do: request(client, :delete, path, body)
+
+  @doc """
+  POSTs JSON with a DIFFERENT bearer than the device token — the org cliToken
+  for `/agent/dispatch`, which is the credential the reference CLI uses.
+  """
+  @spec post_json_as(t(), String.t(), String.t(), map()) :: {integer(), term()}
+  def post_json_as(client, token, path, body) do
+    request(%{client | token: token}, :post, path, body)
+  end
 
   defp request(client, method, path, body) do
     _ = Application.ensure_all_started(:inets)
