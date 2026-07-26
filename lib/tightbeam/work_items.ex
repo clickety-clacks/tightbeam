@@ -54,6 +54,7 @@ defmodule Tightbeam.WorkItems do
   @doc false
   def __handle__(db, "work-item-create", call), do: create_result(db, call)
   def __handle__(db, "work-item-get", call), do: get_result(db, call)
+  def __handle__(db, "work-item-trace", call), do: trace_result(db, call)
   def __handle__(db, "work-item-list", call), do: list_result(db, call)
   def __handle__(db, "work-item-update", call), do: update_result(db, call)
   def __handle__(db, "work-item-icebox", call), do: dispose_result(db, call, :icebox)
@@ -479,8 +480,7 @@ defmodule Tightbeam.WorkItems do
               Wakes.schedule_in_txn(txn, %{
                 session_key: Org.personal_session_key(owner),
                 origin: @origin,
-                prompt:
-                  "slate clear on #{item_id}: close it, card more work, or rule it failed",
+                prompt: "slate clear on #{item_id}: close it, card more work, or rule it failed",
                 due_at: now() + triage_deadline_ms(),
                 work_item_id: item_id
               })
@@ -534,6 +534,50 @@ defmodule Tightbeam.WorkItems do
       end
     end
   end
+
+  defp trace_result(db, call) do
+    id = call.params[:work_item_id]
+
+    case fetch(db, id) do
+      item when not is_nil(item) ->
+        if trace_allowed?(db, call.principal, item) do
+          Tightbeam.JobTrace.build(db, item)
+        else
+          trace_not_found()
+        end
+
+      nil ->
+        trace_not_found()
+    end
+  end
+
+  defp trace_allowed?(_db, {:user, user}, item) when user == item.ownerUserId, do: true
+
+  defp trace_allowed?(db, {:user, user}, _item) do
+    case DB.query(db, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
+      {:ok, [[1]]} -> true
+      _ -> false
+    end
+  end
+
+  defp trace_allowed?(db, {:session, session}, item) do
+    case DB.query(
+           db,
+           """
+           SELECT u.userId, u.isAdmin
+           FROM sessions AS s
+           JOIN users AS u ON u.userId = s.ownerUserId
+           WHERE s.sessionKey = ?1
+           """,
+           [session]
+         ) do
+      {:ok, [[owner, admin]]} -> owner == item.ownerUserId or admin == 1
+      _ -> false
+    end
+  end
+
+  defp trace_allowed?(_db, _principal, _item), do: false
+  defp trace_not_found, do: error("not_found", "work item not found")
 
   defp list_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
@@ -714,7 +758,17 @@ defmodule Tightbeam.WorkItems do
 
     owned_rows =
       Enum.map(old_rows, fn [id, title, name, sha, is_bug, cu, cs, created_at] ->
-        [id, title, name, sha, is_bug, cu, cs, created_at, backfill_owner(db, cu, cs, fallback_owner, id)]
+        [
+          id,
+          title,
+          name,
+          sha,
+          is_bug,
+          cu,
+          cs,
+          created_at,
+          backfill_owner(db, cu, cs, fallback_owner, id)
+        ]
       end)
 
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")

@@ -101,6 +101,20 @@ defmodule Tightbeam.GatewayTest do
          {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
          parent}
 
+    def handle_call(
+          {:prompt_configured, _sid, _model, prompt, before_send, _opts},
+          from,
+          parent
+        ) do
+      case before_send.() do
+        :ok -> handle_call({:prompt, "harness-1", prompt, []}, from, parent)
+        :already_terminal -> {:reply, {:error, :turn_terminal}, parent}
+      end
+    end
+
+    def handle_call({:cancel_session, _sid, before_cancel}, _from, parent),
+      do: {:reply, before_cancel.(), parent}
+
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
@@ -2746,6 +2760,42 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
+  test "conversational turns stay unattributed and bracket-1 nags reverse-link jobRef only",
+       ctx do
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO work_items
+        (id, title, ownerUserId, state, routingWakeId, createdByUser, createdAt)
+      VALUES ('wi_nag', 'Route me', 'flynn', 'open', 'w_nag', 'flynn', 1)
+      """)
+
+    common = [
+      db: ctx.db,
+      conn_registry: ctx.registry,
+      lane_manager: ctx.lane,
+      sender: "process:tightbeam"
+    ]
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
+
+    assert :appended =
+             Gateway.deliver_prompt(
+               "k1",
+               "process:tightbeam",
+               "route it or icebox it",
+               Keyword.put(common, :wake_id, "w_nag")
+             )
+
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId, jobRef FROM turns ORDER BY seq ASC"
+             )
+
+    assert rows == [[nil, nil], [nil, "wi_nag"]]
+  end
+
   test "wake_id dedupes the transaction including its second echo", ctx do
     opts = [
       db: ctx.db,
@@ -3171,6 +3221,55 @@ defmodule Tightbeam.GatewayTest do
 
     refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
              String.starts_with?(message.content, "[context reset]")
+           end)
+  end
+
+  test "a pre-boundary terminal is a quiet no-op without adjudication", ctx do
+    start_supervised!(%{
+      id: :terminal_race_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: "claude-fable-5",
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      db: ctx.db
+    }
+
+    {Tightbeam.LaneManager, lane_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "terminal race",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "canceled")
+
+    assert {:ok, %{}} = runner.(Map.put(turn, :session_key, "k1"))
+    refute_receive {:prompt_started, _}
+    assert Org.get(ctx.db, "k1").adjudication_hold == nil
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM adjudication_episodes")
+
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "unclassified_harness_error" and event.subject == "k1"
            end)
   end
 
