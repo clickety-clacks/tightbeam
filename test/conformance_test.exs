@@ -2514,7 +2514,8 @@ defmodule Tightbeam.ConformanceSupport do
         default_model: "test",
         max_live_sessions_per_user: 50,
         wake_tick_ms: 1_000,
-        db: db
+        db: db,
+        credential_status: fn _provider -> :onboarded end
       })
 
     {handlers, service_pids}

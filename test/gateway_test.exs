@@ -782,6 +782,9 @@ defmodule Tightbeam.GatewayTest do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_no_harness_#{System.unique_integer([:positive])}")
 
+    File.rm_rf!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
     probe = fn
       :claude, _cli_bin -> {:error, :not_found}
       :codex, _cli_bin -> {:error, {:exec_failed, "exit=1 output=\"broken\""}}
@@ -1513,11 +1516,12 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn fails closed when a registered host has no credential server", ctx do
-    base_dir = move_test_base("credential-server-missing")
+    machine = "credential-worker-missing"
+    base_dir = move_test_base("credential-server-missing", machine)
 
     {:ok, _entry} =
-      Placement.register_host(base_dir, "worker", %{
-        ssh: "worker",
+      Placement.register_host(base_dir, machine, %{
+        ssh: machine,
         base_dir: "/remote/tb"
       })
 
@@ -1525,27 +1529,30 @@ defmodule Tightbeam.GatewayTest do
       gateway_config(base_dir, ctx.db, 0)
       |> Map.delete(:credential_status)
 
-    assert GenServer.whereis(Credentials.server("worker")) == nil
+    assert GenServer.whereis(Credentials.server(machine)) == nil
+
+    expected_message =
+      "claude on #{machine} needs onboarding: :credential_server_unavailable; run tightbeam onboard anthropic on #{machine}"
 
     assert %{
              code: "placement_denied",
              detail: %{code: "needs_onboarding"},
-             message:
-               "claude on worker needs onboarding: :credential_server_unavailable; run tightbeam onboard anthropic on worker"
+             message: ^expected_message
            } =
              Gateway.handlers(config)["spawn"].(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{
                  display_name: "No credential owner",
-                 host: "worker",
+                 host: machine,
                  idempotency_key: "spawn-no-credential-owner"
                }
              })
   end
 
   test "register-host supervises credentials and refuses spawn until onboarding", ctx do
-    base_dir = move_test_base("credential-server-registration")
+    machine = "credential-worker-registration"
+    base_dir = move_test_base("credential-server-registration", machine)
     {:ok, credential_supervisor} = Supervisor.start_link([], strategy: :one_for_one)
 
     config =
@@ -1555,33 +1562,35 @@ defmodule Tightbeam.GatewayTest do
 
     handlers = Gateway.handlers(config)
 
-    assert %{host: "worker"} =
+    assert %{host: ^machine} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{
-                 name: "worker",
-                 ssh: "worker",
+                 name: machine,
+                 ssh: machine,
                  base_dir: "/remote/tb"
                }
              })
 
-    server = Credentials.server("worker")
+    server = Credentials.server(machine)
     assert is_pid(GenServer.whereis(server))
     assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
+
+    expected_message =
+      "claude on #{machine} needs onboarding: :missing; run tightbeam onboard anthropic on #{machine}"
 
     assert %{
              code: "placement_denied",
              detail: %{code: "needs_onboarding"},
-             message:
-               "claude on worker needs onboarding: :missing; run tightbeam onboard anthropic on worker"
+             message: ^expected_message
            } =
              handlers["spawn"].(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{
                  display_name: "Fresh remote",
-                 host: "worker",
+                 host: machine,
                  idempotency_key: "spawn-fresh-remote"
                }
              })
@@ -4143,7 +4152,7 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  defp move_test_base(suffix) do
+  defp move_test_base(suffix, remote_host \\ "worker") do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_move_#{suffix}_#{System.unique_integer([:positive])}")
 
@@ -4151,16 +4160,16 @@ defmodule Tightbeam.GatewayTest do
     manifests = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
 
-    File.write!(Path.join(manifests, "default.toml"), """
-    name = "default"
-    where = ["testhost", "worker"]
-    """)
+    File.write!(
+      Path.join(manifests, "default.toml"),
+      "name = \"default\"\nwhere = [\"testhost\", \"#{remote_host}\"]\n"
+    )
 
     Archetypes.load!(base_dir)
     on_exit(fn -> :persistent_term.erase(Archetypes) end)
 
     Application.put_env(:tightbeam, :hosts, %{
-      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
+      remote_host => %{ssh: remote_host, base_dir: "/remote/tb", cli_bin: nil}
     })
 
     base_dir
