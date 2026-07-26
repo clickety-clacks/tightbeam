@@ -77,6 +77,34 @@ defmodule Tightbeam.AdapterHealTest do
          state}
   end
 
+  defmodule RaceDB do
+    @moduledoc false
+    use GenServer
+
+    @doc "Forwards to `real`; runs `before_txn` once, just before transaction #`at`."
+    def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+
+    def init(state), do: {:ok, Map.put(state, :txns, 0)}
+
+    def handle_call({:transaction, fun}, _from, state) do
+      count = state.txns + 1
+
+      state =
+        if count == state.at do
+          state.before_txn.()
+          Map.put(state, :fired, true)
+        else
+          state
+        end
+
+      {:reply, GenServer.call(state.real, {:transaction, fun}, 30_000),
+       Map.put(state, :txns, count)}
+    end
+
+    def handle_call(message, _from, state),
+      do: {:reply, GenServer.call(state.real, message, 30_000), state}
+  end
+
   defmodule WakeSchedulerStub do
     @moduledoc false
     use GenServer
@@ -786,25 +814,46 @@ defmodule Tightbeam.AdapterHealTest do
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "adjudication_heal_lost"))
   end
 
-  test "F3: a ruling that loses to a heal mid-flight is DENIED, not a crash", ctx do
+  test "F3: a ruling that loses to a heal MID-FLIGHT is DENIED, not a crash", ctx do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
     episode = episode(ctx.db)
-    handlers = Gateway.handlers(Map.put(ctx.config, :db, ctx.db))
 
-    # The inverse TOCTOU: the ruling validated the episode as `notified`, then a
-    # heal resolved it before the ruling's own transaction ran.
-    heal(ctx, {7, 2})
-    probe = hold(ctx.db)
+    # The ruling validates the episode as `notified` (a read), then opens its
+    # action transaction. The heal has to land BETWEEN those two — validating
+    # first and healing second is the early stale check, which is a DIFFERENT
+    # branch and the one the previous version of this test was hitting.
+    parent = self()
 
-    assert %{code: "denied"} =
-             handlers["adjudicate"].(%{
-               origin: "user:flynn",
-               principal: {:session, episode.owner_target},
-               params: %{episode: episode.correlation_key, action: "park"}
-             })
+    proxy =
+      start_supervised!(
+        {RaceDB,
+         real: ctx.db,
+         at: 1,
+         before_txn: fn ->
+           heal(ctx, {7, 2})
+           send(parent, {:healed_mid_flight, hold(ctx.db)})
+         end}
+      )
 
-    # Rolled back cleanly: the probe still owns the hold, no park wake persisted.
+    handlers = Gateway.handlers(Map.put(ctx.config, :db, proxy))
+
+    result =
+      handlers["adjudicate"].(%{
+        origin: "user:flynn",
+        principal: {:session, episode.owner_target},
+        params: %{episode: episode.correlation_key, action: "park"}
+      })
+
+    # The heal really did land mid-flight, and really did take the hold.
+    assert_received {:healed_mid_flight, probe}
+    assert is_binary(probe) and probe != "*"
+
+    # The ruling is DENIED — not a MatchError escaping to the wire.
+    assert %{code: "denied"} = result
+
+    # Rolled back cleanly: the probe still owns the hold, and park's own wake was
+    # never left behind on the episode.
     assert hold(ctx.db) == probe
     assert Adjudication.get(ctx.db, "k1", "other").recovery_wake_id == probe
 

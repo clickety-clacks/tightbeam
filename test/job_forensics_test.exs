@@ -585,6 +585,35 @@ defmodule Tightbeam.JobForensicsTest do
     assert answered(db) == ["att_new", "att_newer"]
   end
 
+  test "F5: a STALE pre-v2 aggregate cannot make the resolver reach back", ctx do
+    db = ctx.db
+    work_item(db, "wi_stale")
+    session(db, "supervisor")
+    session(db, "holder", "supervisor")
+    assignment(db, "asg_stale", "wi_stale", "holder")
+    handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
+
+    cutoff = CausalEvents.epoch(db)
+    for id <- ["att_p1", "att_p2", "att_p3"], do: attest(db, id, "asg_stale", cutoff - 9_000)
+
+    # An UNDERSTATED aggregate — the shape a pre-v2 row takes after a prod reset,
+    # and the one that breaks a count-delta bound: delta would be 4-0=4, sweeping
+    # all three historical attests along with the new one. attestCount is a
+    # MUTABLE aggregate, which is exactly why the bound cannot be built on it.
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignment_prods
+        (assignmentId, attemptCount, prodCount, deniedStreak, attestCount)
+      VALUES ('asg_stale', 0, 1, 0, 0)
+      """)
+
+    attest(db, "att_after", "asg_stale", cutoff + 500)
+    evaluate(db, handlers, "holder")
+
+    assert answered(db) == ["att_after"],
+           "the timestamp floor must hold even when the aggregate understates history"
+  end
+
   test "F6: an agent cannot forge wake or turn attribution", ctx do
     db = ctx.db
     work_item(db, "wi_forge")

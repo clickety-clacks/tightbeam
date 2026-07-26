@@ -3405,6 +3405,20 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # DB.transaction CATCHES a raise and RETURNS {:error, exception} — it does not
+  # propagate. A superseded ruling therefore arrives here as a RETURN VALUE, and a
+  # hard {:ok, _} match on it is a MatchError that crashes the wire call instead of
+  # denying the ruling (cross-review round 2, F3). Re-raising OUTSIDE the
+  # transaction is what puts it in reach of adjudicate_action's rescue; the
+  # transaction has already rolled back, so nothing partial survives.
+  defp ruling_transaction(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> {:ok, result}
+      {:error, %AdjudicationSuperseded{} = superseded} -> raise superseded
+      {:error, error} -> raise error
+    end
+  end
+
   # `resolved` with a healToken means a heal won; anything else is the ordinary
   # stale-correlation case the ruling paths have always raised on.
   defp superseded_or_stale(%{status: "resolved", heal_token: token}) when not is_nil(token),
@@ -3430,7 +3444,7 @@ defmodule Tightbeam.Gateway do
     session = Org.get(db, episode.session_key)
 
     {:ok, result} =
-      DB.transaction(db, fn txn ->
+      ruling_transaction(db, fn txn ->
         current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
         if current && Adjudication.resolve_in_txn(txn, current) do
@@ -3489,7 +3503,7 @@ defmodule Tightbeam.Gateway do
     scope = session.harness <> ":" <> session.identity_name
 
     {:ok, {wake_id, delivery}} =
-      DB.transaction(db, fn txn ->
+      ruling_transaction(db, fn txn ->
         current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
         wake =
@@ -3565,7 +3579,7 @@ defmodule Tightbeam.Gateway do
         case strict_apply_current_model(db, session, call.params.model) do
           :ok ->
             {:ok, {delivery, wake_id}} =
-              DB.transaction(db, fn txn ->
+              ruling_transaction(db, fn txn ->
                 current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
                 recovery_prompt =
@@ -3808,6 +3822,9 @@ defmodule Tightbeam.Gateway do
       case transaction_result do
         {:error, %EffortRearmRace{}} ->
           adjudicate_respawn(config, db, call, episode, attempts - 1)
+
+        {:error, %AdjudicationSuperseded{} = superseded} ->
+          raise superseded
 
         {:error, error} ->
           raise error
