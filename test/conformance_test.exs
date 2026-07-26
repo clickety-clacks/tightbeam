@@ -1672,7 +1672,7 @@ defmodule Tightbeam.ConformanceSupport do
               assert {:ok, [[^request_id, ^park_wake_id]]} =
                        DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
 
-              assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+              assert_one_park_and_one_notification!(db)
 
             "resolve-deny-reobligates" ->
               {request_id, _park_wake_id} = open_and_park.()
@@ -1763,6 +1763,22 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
+  # The park wake must not duplicate across re-returns, and the request's owner
+  # notification is exactly one durable ungated wake armed by the winning insert
+  # (escalation-delivery-v1): a replay arms none, so both counts stay at one.
+  defp assert_one_park_and_one_notification!(db) do
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wakes WHERE conditionKind IS NOT NULL")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM wakes WHERE consumer = 'prompt' AND conditionKind IS NULL AND targetGate = 0"
+             )
+
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+  end
+
   def run_park_wake_reuse_contract(fixture) do
     base = temp_dir!("conformance-park-wake-reuse")
     prepare_rule_base!(base, fixture)
@@ -1788,7 +1804,7 @@ defmodule Tightbeam.ConformanceSupport do
                    Wakes.get(db, first_wake_id)
 
           assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
-          assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+          assert_one_park_and_one_notification!(db)
 
           if kase["phase2"] do
             phase2_ids = materialize_world(db, kase["phase2"]["world"], ids)
@@ -1806,7 +1822,7 @@ defmodule Tightbeam.ConformanceSupport do
                      DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
 
             assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
-            assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+            assert_one_park_and_one_notification!(db)
           end
 
           if kase["kind"] == "legibility" do

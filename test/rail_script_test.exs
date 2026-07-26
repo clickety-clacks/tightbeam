@@ -26,7 +26,8 @@ defmodule Tightbeam.RailScriptTest do
     Org,
     Placement,
     RailScript,
-    Rules
+    Rules,
+    Wakes
   }
 
   setup do
@@ -36,6 +37,8 @@ defmodule Tightbeam.RailScriptTest do
     :ok = EventLog.ensure_schema(db)
     :ok = ConditionFacts.ensure_schema(db)
     :ok = Escalation.ensure_schema(db)
+    # Opening a request arms its owner notification wake in the same transaction.
+    :ok = Wakes.ensure_schema(db)
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
 
