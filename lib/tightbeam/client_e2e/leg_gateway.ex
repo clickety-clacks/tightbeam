@@ -33,11 +33,12 @@ defmodule Tightbeam.ClientE2E.LegGateway do
           base_dir: String.t(),
           port: :inet.port_number(),
           os_pid: pos_integer() | nil,
+          os_command: String.t() | nil,
           port_ref: port() | nil,
           log_path: String.t()
         }
 
-  defstruct [:base_dir, :port, :os_pid, :port_ref, :log_path]
+  defstruct [:base_dir, :port, :os_pid, :os_command, :port_ref, :log_path]
 
   @copied ~w(auth homes identity)
 
@@ -101,7 +102,20 @@ defmodule Tightbeam.ClientE2E.LegGateway do
       ])
 
     os_pid = port_ref |> Port.info(:os_pid) |> elem(1)
-    gateway = %__MODULE__{base_dir: base_dir, port: port, os_pid: os_pid, port_ref: port_ref, log_path: log_path}
+
+    gateway = %__MODULE__{
+      base_dir: base_dir,
+      port: port,
+      os_pid: os_pid,
+      # The command line is the pid's IDENTITY. A pid is a reusable integer: on a
+      # busy box the process behind one can be replaced by somebody else's
+      # between capture and signal, and a driver that signals a raw pid set can
+      # then kill another lane's work. Nothing here is signalled unless its
+      # command line still matches what was captured.
+      os_command: process_command(os_pid),
+      port_ref: port_ref,
+      log_path: log_path
+    }
 
     case await_ready(gateway, Keyword.get(opts, :boot_timeout_ms, 60_000)) do
       :ok ->
@@ -182,13 +196,26 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   end
 
   defp signal_exit(gateway, timeout_ms) do
-    _ = System.cmd("kill", ["-TERM", Integer.to_string(gateway.os_pid)], stderr_to_stdout: true)
+    if ours?(gateway) do
+      signal(Integer.to_string(gateway.os_pid), gateway.os_command, "-TERM")
+    end
 
     case await_exit(gateway, timeout_ms) do
       :ok -> :ok
       {:error, :still_running} -> {:error, {:still_running, gateway.os_pid}}
     end
   end
+
+  @doc """
+  Whether this gateway's pid still holds the process we booted.
+
+  False when it has exited (the pid is free, or worse, reused). Every signal in
+  this module is gated on it.
+  """
+  @spec ours?(t()) :: boolean()
+  def ours?(%__MODULE__{os_pid: nil}), do: false
+  def ours?(%__MODULE__{os_command: nil}), do: false
+  def ours?(%__MODULE__{os_pid: pid, os_command: command}), do: process_command(pid) == command
 
   defp await_unreachable(gateway, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
@@ -248,14 +275,21 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   def teardown(%__MODULE__{} = gateway, opts \\ []) do
     # BEFORE the kill: the adapters are only findable while the gateway is still
     # their parent.
-    descendants = if gateway.os_pid, do: descendant_pids(gateway.os_pid), else: []
+    descendants = if ours?(gateway), do: capture_tree(gateway.os_pid), else: []
 
     exit_result =
-      if gateway.os_pid do
-        _ = System.cmd("kill", ["-TERM", Integer.to_string(gateway.os_pid)], stderr_to_stdout: true)
-        await_exit(gateway, Keyword.get(opts, :exit_timeout_ms, 30_000))
-      else
-        :ok
+      cond do
+        is_nil(gateway.os_pid) ->
+          :ok
+
+        # The pid no longer holds the process we booted: it exited and the
+        # number was recycled. Signalling now would hit a stranger.
+        not ours?(gateway) ->
+          :ok
+
+        true ->
+          signal(Integer.to_string(gateway.os_pid), gateway.os_command, "-TERM")
+          await_exit(gateway, Keyword.get(opts, :exit_timeout_ms, 30_000))
       end
 
     if gateway.port_ref && Port.info(gateway.port_ref), do: Port.close(gateway.port_ref)
@@ -292,6 +326,31 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   end
 
   @doc """
+  Captures the descendant tree as `{pid, command}` pairs, so each pid's identity
+  can be re-checked at the moment it is signalled.
+  """
+  @spec capture_tree(pos_integer() | String.t()) :: [{String.t(), String.t() | nil}]
+  def capture_tree(pid), do: Enum.map(descendant_pids(pid), &{&1, process_command(&1)})
+
+  @doc """
+  The command line of a pid right now, or nil if it is gone. This is how a pid's
+  identity is established before anything is signalled.
+  """
+  @spec process_command(pos_integer() | String.t()) :: String.t() | nil
+  def process_command(pid) do
+    case System.cmd("ps", ["-o", "command=", "-p", to_string(pid)], stderr_to_stdout: true) do
+      {out, 0} ->
+        case String.trim(out) do
+          "" -> nil
+          command -> command
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
   SIGTERMs the given pids, then KILLs whatever is still alive.
 
   These are the gateway's harness ADAPTERS. SIGTERM to the gateway does not take
@@ -304,16 +363,37 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   environment of a BEAM-spawned process on macOS, so an env match found nothing
   and cheerfully reported success.
   """
-  @spec reap_descendants([String.t()], non_neg_integer()) :: :ok
+  @spec reap_descendants([{String.t(), String.t() | nil}] | [String.t()], non_neg_integer()) :: :ok
   def reap_descendants([], _timeout_ms), do: :ok
 
-  def reap_descendants(pids, timeout_ms) do
-    for pid <- pids, do: System.cmd("kill", ["-TERM", pid], stderr_to_stdout: true)
-    await_reaped(pids, System.monotonic_time(:millisecond) + timeout_ms)
+  def reap_descendants(captured, timeout_ms) do
+    captured = Enum.map(captured, &normalize_capture/1)
+    for {pid, command} <- captured, do: signal(pid, command, "-TERM")
+    await_reaped(captured, System.monotonic_time(:millisecond) + timeout_ms)
   end
 
-  defp await_reaped(pids, deadline) do
-    remaining = Enum.filter(pids, &alive?/1)
+  defp normalize_capture({pid, command}), do: {to_string(pid), command}
+  defp normalize_capture(pid), do: {to_string(pid), process_command(pid)}
+
+  # Signal ONLY if the pid still holds the process we captured. A pid whose
+  # command line changed has been recycled and belongs to somebody else now;
+  # signalling it is how a cleanup routine kills another lane's work.
+  defp signal(pid, expected_command, flag) do
+    cond do
+      is_nil(expected_command) ->
+        :skipped
+
+      process_command(pid) != expected_command ->
+        :skipped
+
+      true ->
+        System.cmd("kill", [flag, pid], stderr_to_stdout: true)
+        :signalled
+    end
+  end
+
+  defp await_reaped(captured, deadline) do
+    remaining = Enum.filter(captured, fn {pid, command} -> still_ours?(pid, command) end)
 
     cond do
       remaining == [] ->
@@ -321,17 +401,18 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
       System.monotonic_time(:millisecond) >= deadline ->
         # A harness adapter that ignores SIGTERM still must not outlive the org
-        # it was serving.
-        for pid <- remaining, do: System.cmd("kill", ["-KILL", pid], stderr_to_stdout: true)
+        # it was serving — but only if it is still the process we captured.
+        for {pid, command} <- remaining, do: signal(pid, command, "-KILL")
         :ok
 
       true ->
         Process.sleep(250)
-        await_reaped(pids, deadline)
+        await_reaped(captured, deadline)
     end
   end
 
-  defp alive?(pid), do: match?({_, 0}, System.cmd("kill", ["-0", to_string(pid)], stderr_to_stdout: true))
+  defp still_ours?(pid, command),
+    do: not is_nil(command) and process_command(pid) == command
 
   # A guard against the one mistake that is not recoverable: removing a real
   # org.  # A guard against the one mistake that is not recoverable: removing a real
@@ -360,7 +441,9 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   end
 
   defp poll_exit(gateway, deadline) do
-    alive? = match?({_, 0}, System.cmd("kill", ["-0", Integer.to_string(gateway.os_pid)], stderr_to_stdout: true))
+    # "Gone" means the pid no longer holds OUR process — not merely that some
+    # process answers to the number.
+    alive? = ours?(gateway)
 
     cond do
       not alive? -> :ok
