@@ -271,6 +271,90 @@ defmodule Tightbeam.ClientE2ETest do
     end
   end
 
+  describe "the wake oracle (steps 16 and 16b)" do
+    defp wake_observed(overrides \\ %{}) do
+      Map.merge(
+        %{
+          wake_id: "w_1",
+          turn: %{"wakeId" => "w_1", "status" => "delivered"},
+          message_id: "m_1",
+          stamped: %{"id" => "m_1", "sender" => "user:admin"},
+          reply: %{"content" => "anything at all", "replyToMessageId" => "m_1"}
+        },
+        overrides
+      )
+    end
+
+    test "the healthy chain passes" do
+      assert Journeys.wake_oracle_error(wake_observed()) == nil
+    end
+
+    test "reply CONTENT is not asserted — effectiveness is evals' concern, not e2e's" do
+      # The literal the removed assertion demanded, and two answers a competent
+      # agent might give instead. All three pass: the substrate behaved
+      # identically in every case.
+      for content <- ["WAKE OK", "Sure — done.", "I ran it; the answer is 4."] do
+        assert Journeys.wake_oracle_error(wake_observed(%{reply: %{"content" => content}})) == nil
+      end
+
+      # Even an empty reply body passes, because a reply ARRIVED and correlated.
+      assert Journeys.wake_oracle_error(wake_observed(%{reply: %{"content" => ""}})) == nil
+    end
+
+    test "a dispatch that returned no wakeId fails" do
+      assert Journeys.wake_oracle_error(wake_observed(%{wake_id: nil})) =~ "returned no wakeId"
+    end
+
+    test "no turn row for the dispatched wake fails, and names the wake" do
+      error = Journeys.wake_oracle_error(wake_observed(%{turn: nil}))
+      assert error =~ "no turn row was ever created"
+      assert error =~ "w_1"
+    end
+
+    test "REGRESSION: another wake's turn row cannot vouch for this wake" do
+      # The whole point of the wakeId chain: J8 has two wakes in flight, so a
+      # turn row carrying the OTHER wakeId must not satisfy this one.
+      error =
+        Journeys.wake_oracle_error(
+          wake_observed(%{turn: %{"wakeId" => "w_other", "status" => "delivered"}})
+        )
+
+      assert error =~ "not the dispatched"
+      assert error =~ "w_other"
+    end
+
+    test "a turn row naming no delivered message fails" do
+      assert Journeys.wake_oracle_error(wake_observed(%{message_id: nil})) =~
+               "names no delivered message"
+    end
+
+    test "a prompt that never landed as a sender-tagged message fails" do
+      assert Journeys.wake_oracle_error(wake_observed(%{stamped: nil})) =~ "sender-tagged message"
+    end
+
+    test "no correlated assistant reply fails" do
+      assert Journeys.wake_oracle_error(wake_observed(%{reply: nil})) =~ "no assistant reply"
+    end
+
+    test "a non-delivered turn row fails even when every frame arrived" do
+      assert Journeys.wake_oracle_error(
+               wake_observed(%{turn: %{"wakeId" => "w_1", "status" => "queued"}})
+             ) =~ "turn row is queued"
+    end
+
+    test "a failed turn row carries its error text into the row" do
+      error =
+        Journeys.wake_oracle_error(
+          wake_observed(%{
+            turn: %{"wakeId" => "w_1", "status" => "failed", "error" => "adapter died"}
+          })
+        )
+
+      assert error =~ "turn row is failed"
+      assert error =~ "adapter died"
+    end
+  end
+
   describe "the concurrency witness (step 10)" do
     alias Tightbeam.ClientE2E.Substrate
 
