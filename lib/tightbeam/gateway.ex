@@ -2636,12 +2636,7 @@ defmodule Tightbeam.Gateway do
                  {harness, "shared", session.host}
                ) do
           if Adapter.knows_session?(adapter, pointer.harness_session_id) do
-            Adapter.apply_model_strict(
-              adapter,
-              pointer.harness_session_id,
-              new_ref,
-              session.model
-            )
+            Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
           else
             cwd = Placement.holder_workdir(config, session)
             revision = session.identity_revision || Identity.live_revision!(config.base_dir)

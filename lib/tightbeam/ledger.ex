@@ -106,25 +106,17 @@ defmodule Tightbeam.Ledger do
   @spec enqueue_in_txn(Txn.t(), map()) :: integer()
   def enqueue_in_txn(%Txn{} = txn, attrs) do
     now = System.system_time(:millisecond)
-    session_key = Map.fetch!(attrs, :session_key)
-
-    [[model, harness]] =
-      Txn.q(
-        txn,
-        "SELECT model, harness FROM sessions WHERE sessionKey = ?1",
-        [session_key]
-      )
 
     Txn.q(
       txn,
       """
         INSERT INTO turns
           (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
-           assignmentId, jobRef, model, harness, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+           assignmentId, jobRef, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
       """,
       [
-        session_key,
+        Map.fetch!(attrs, :session_key),
         Map.fetch!(attrs, :message_id),
         Map.get(attrs, :wake_id),
         Map.fetch!(attrs, :origin),
@@ -133,8 +125,6 @@ defmodule Tightbeam.Ledger do
         if(Map.get(attrs, :role_fallback, false), do: 1, else: 0),
         Map.get(attrs, :assignment_id),
         Map.get(attrs, :job_ref),
-        model,
-        harness,
         now
       ]
     )
@@ -185,13 +175,23 @@ defmodule Tightbeam.Ledger do
             :busy
 
           [] ->
-            session_filter =
+            {session_filter, selected_mind} =
               case Txn.q(
                      txn,
                      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
                    ) do
                 [[1]] ->
-                  """
+                  mind =
+                    case Txn.q(
+                           txn,
+                           "SELECT model, harness FROM sessions WHERE sessionKey = ?1",
+                           [session_key]
+                         ) do
+                      [[model, harness]] -> {model, harness}
+                      [] -> {nil, nil}
+                    end
+
+                  filter = """
                   AND EXISTS (
                     SELECT 1 FROM sessions AS s
                     WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
@@ -200,21 +200,25 @@ defmodule Tightbeam.Ledger do
                   )
                   """
 
+                  {filter, mind}
+
                 [] ->
-                  ""
+                  {"", {nil, nil}}
               end
 
             Txn.q(
               txn,
               """
-                UPDATE turns SET status = 'running', owner = ?2, startedAt = ?3
+                UPDATE turns
+                SET status = 'running', owner = ?2, startedAt = ?3,
+                    model = ?4, harness = ?5
                 WHERE seq = (SELECT t.seq FROM turns AS t
                              WHERE t.sessionKey = ?1 AND t.status = 'queued'
                                #{session_filter}
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
               """,
-              [session_key, owner, now]
+              [session_key, owner, now, elem(selected_mind, 0), elem(selected_mind, 1)]
             )
 
             if Txn.changes(txn) == 1 do

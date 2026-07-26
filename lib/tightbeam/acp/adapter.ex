@@ -101,6 +101,11 @@ defmodule Tightbeam.Acp.Adapter do
   def apply_model_strict(adapter, session_id, model, prior_model),
     do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
 
+  @doc "Apply a model selection and surface any explicit harness refusal."
+  @spec apply_model(adapter(), String.t(), model_ref()) :: :ok | {:error, term()}
+  def apply_model(adapter, session_id, model),
+    do: GenServer.call(adapter, {:apply_model, session_id, model}, 30_000)
+
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
   this GenServer keeps routing updates, replies when the harness finishes.
@@ -242,7 +247,7 @@ defmodule Tightbeam.Acp.Adapter do
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            }),
          sid = result["sessionId"],
-         :ok <- apply_model(state, sid, model),
+         :ok <- apply_model_to_session(state, sid, model),
          :ok <- set_mode(state, sid) do
       state = %{state | known: MapSet.put(state.known, sid)}
       {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
@@ -261,7 +266,7 @@ defmodule Tightbeam.Acp.Adapter do
            _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
          }) do
       {:ok, _result} ->
-        case apply_model(state, sid, model) do
+        case apply_model_to_session(state, sid, model) do
           :ok ->
             case set_mode_after_load(state, sid) do
               :ok ->
@@ -305,6 +310,10 @@ defmodule Tightbeam.Acp.Adapter do
 
   def handle_call({:apply_model_strict, sid, model, prior_model}, _from, state) do
     {:reply, strict_apply_with_retry(state, sid, model, prior_model, 3), state}
+  end
+
+  def handle_call({:apply_model, sid, model}, _from, state) do
+    {:reply, apply_model_to_session(state, sid, model), state}
   end
 
   def handle_call({:knows_session?, sid}, _from, state),
@@ -448,13 +457,13 @@ defmodule Tightbeam.Acp.Adapter do
 
   ## Model application (the fable-trap rule)
 
-  defp apply_model(state, sid, model_ref) do
-    apply_model(state, sid, model_ref, fn method, params ->
+  defp apply_model_to_session(state, sid, model_ref) do
+    apply_model_to_session(state, sid, model_ref, fn method, params ->
       Conn.request(state.conn, method, params)
     end)
   end
 
-  defp apply_model(state, sid, model_ref, request) do
+  defp apply_model_to_session(state, sid, model_ref, request) do
     {model, effort} = parse_model_ref(model_ref)
 
     with {:ok, _} <-
@@ -573,7 +582,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     with {:ok, result} <- request.("session/new", %{cwd: probe_cwd, mcpServers: []}),
          sid = result["sessionId"],
-         :ok <- apply_model(state, sid, probe_model, request),
+         :ok <- apply_model_to_session(state, sid, probe_model, request),
          {:ok, _} <-
            request.("session/set_mode", %{
              sessionId: sid,

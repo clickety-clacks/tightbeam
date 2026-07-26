@@ -137,11 +137,11 @@ defmodule Tightbeam.GatewayTest do
     end
 
     def handle_call(
-          {:apply_model_strict, sid, model, prior_model},
+          {:apply_model, sid, model},
           _from,
           {parent, opts} = state
         ) do
-      send(parent, {:tune_model_applied, sid, model, prior_model})
+      send(parent, {:tune_model_applied, sid, model})
       {:reply, Keyword.get(opts, :apply_result, :ok), state}
     end
   end
@@ -1978,7 +1978,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
     assert_receive {:tune_residency_checked, "existing-session"}
-    assert_receive {:tune_model_applied, "existing-session", "claude-sonnet-4-6", _prior}
+    assert_receive {:tune_model_applied, "existing-session", "claude-sonnet-4-6"}
     assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
   end
 
@@ -2004,7 +2004,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert_receive {:tune_model_applied, "resident-session", "claude-sonnet-4-6", ^before}
+    assert_receive {:tune_model_applied, "resident-session", "claude-sonnet-4-6"}
     assert Org.get(ctx.db, "k1").model == before
   end
 

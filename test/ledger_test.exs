@@ -105,11 +105,11 @@ defmodule Tightbeam.LedgerTest do
     assert t2.prompt == "next"
   end
 
-  test "enqueue stamps the session's selected mind and a tune affects only the next turn",
+  test "claim stamps the session's selected mind after a queued turn is tuned",
        %{db: db} do
     first = enqueue!(db, "k1", "before tune")
 
-    assert {:ok, [["queued", "claude-sonnet-5[medium]", "claude"]]} =
+    assert {:ok, [["queued", nil, nil]]} =
              DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
 
     :ok =
@@ -118,19 +118,9 @@ defmodule Tightbeam.LedgerTest do
         "UPDATE sessions SET model='gpt-5.6-sol[high]', harness='codex' WHERE sessionKey='k1'"
       )
 
-    second = enqueue!(db, "k1", "after tune")
-
-    assert {:ok,
-            [
-              [^first, "claude-sonnet-5[medium]", "claude"],
-              [^second, "gpt-5.6-sol[high]", "codex"]
-            ]} =
-             DB.query(db, "SELECT seq, model, harness FROM turns ORDER BY seq")
-
     assert {:ok, %{seq: ^first}} = Ledger.claim_next(db, "k1", "lane")
-    assert :ok = Ledger.finish(db, first, "canceled")
 
-    assert {:ok, [["canceled", "claude-sonnet-5[medium]", "claude"]]} =
+    assert {:ok, [["running", "gpt-5.6-sol[high]", "codex"]]} =
              DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
   end
 
