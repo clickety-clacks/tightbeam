@@ -374,6 +374,7 @@ defmodule Tightbeam.ClientE2ETest do
         base_dir: base_dir,
         port: 0,
         os_pid: os_pid,
+        os_command: LegGateway.process_command(os_pid),
         port_ref: nil,
         log_path: Path.join(base_dir, "gateway.log")
       }
@@ -453,7 +454,20 @@ defmodule Tightbeam.ClientE2ETest do
       assert grand in tree, "descendant_pids/1 must descend past direct children"
       assert mid in tree
 
-      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: top, port_ref: nil, log_path: ""}
+      gateway = %LegGateway{
+        base_dir: base_dir,
+        port: 0,
+        os_pid: top,
+        # Identity, verified before anything is signalled — even in a test. A
+        # raw pid on a busy box can be somebody else's process by the time you
+        # signal it.
+        os_command: LegGateway.process_command(top),
+        port_ref: nil,
+        log_path: ""
+      }
+
+      assert gateway.os_command =~ "top.sh", "the fixture's identity must be established first"
+      assert LegGateway.ours?(gateway)
 
       assert LegGateway.teardown(gateway, exit_timeout_ms: 3_000, reap_timeout_ms: 3_000) == :ok
 
@@ -464,11 +478,70 @@ defmodule Tightbeam.ClientE2ETest do
              "the intermediate child (#{mid}) outlived teardown"
     end
 
+    test "a recycled pid is NOT signalled — identity is checked, not just liveness" do
+      # A pid is a reusable integer. If the process we booted has exited and the
+      # number now belongs to somebody else, signalling it kills their work; that
+      # is how a cleanup routine takes out another lane. Here the struct names a
+      # LIVE pid whose command line does not match what was captured.
+      base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-recycled-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base_dir)
+      on_exit(fn -> File.rm_rf!(base_dir) end)
+      ready = Path.join(base_dir, "ready")
+
+      port =
+        Port.open({:spawn_executable, System.find_executable("sh")}, [
+          :binary,
+          :exit_status,
+          args: ["-c", "touch #{ready}; while true; do sleep 1; done"]
+        ])
+
+      bystander = port |> Port.info(:os_pid) |> elem(1)
+      wait_for_file(ready, 5_000)
+
+      # Same pid, a command line from a process that is gone.
+      gateway = %LegGateway{
+        base_dir: base_dir,
+        port: 0,
+        os_pid: bystander,
+        os_command: "/usr/bin/some-other-process --that --exited",
+        port_ref: nil,
+        log_path: ""
+      }
+
+      refute LegGateway.ours?(gateway), "a mismatched command line must not read as ours"
+
+      LegGateway.teardown(gateway, exit_timeout_ms: 1_000, reap_timeout_ms: 1_000)
+
+      assert {_, 0} = System.cmd("kill", ["-0", Integer.to_string(bystander)], stderr_to_stdout: true),
+             "the bystander holding a recycled pid must be left alone"
+
+      System.cmd("kill", ["-KILL", Integer.to_string(bystander)], stderr_to_stdout: true)
+    end
+
+    test "reap_descendants leaves a pid alone once its command line has changed" do
+      # The capture named a command that is not what this pid runs now.
+      port =
+        Port.open({:spawn_executable, System.find_executable("sh")}, [
+          :binary,
+          :exit_status,
+          args: ["-c", "while true; do sleep 1; done"]
+        ])
+
+      bystander = port |> Port.info(:os_pid) |> elem(1) |> Integer.to_string()
+
+      LegGateway.reap_descendants([{bystander, "/bin/nonexistent-captured-command"}], 1_000)
+
+      assert {_, 0} = System.cmd("kill", ["-0", bystander], stderr_to_stdout: true),
+             "a pid whose identity no longer matches the capture must not be signalled"
+
+      System.cmd("kill", ["-KILL", bystander], stderr_to_stdout: true)
+    end
+
     test "a clean stop removes the run-local base_dir and returns :ok" do
       base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-teardown-#{System.unique_integer([:positive])}")
       File.mkdir_p!(base_dir)
 
-      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: nil, port_ref: nil, log_path: ""}
+      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: nil, os_command: nil, port_ref: nil, log_path: ""}
 
       assert LegGateway.teardown(gateway) == :ok
       refute File.exists?(base_dir)
@@ -480,7 +553,7 @@ defmodule Tightbeam.ClientE2ETest do
       File.mkdir_p!(base_dir)
       on_exit(fn -> File.rm_rf!(base_dir) end)
 
-      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: nil, port_ref: nil, log_path: ""}
+      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: nil, os_command: nil, port_ref: nil, log_path: ""}
 
       assert LegGateway.teardown(gateway) == :ok
       assert File.dir?(base_dir)
