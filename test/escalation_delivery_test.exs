@@ -11,7 +11,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
   SQLite trigger and a raising/exiting delivery function — both of which exist
   to make a crash window deterministic.
   """
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
     Adjudication,
