@@ -882,6 +882,29 @@ defmodule Tightbeam.ClientE2ETest do
       assert Enum.sort(Enum.map(leg.rows, & &1.step)) == Enum.sort(Journeys.automated_steps())
     end
 
+    test ":journeys restricts the walk, and a subset leg cannot look like a full one" do
+      # What scripts/client_e2e.exs passes for TIGHTBEAM_CLIENT_E2E_JOURNEYS, so
+      # "did I break restart?" costs one journey instead of the whole leg.
+      {leg, _gateway} =
+        ClientE2E.run_leg(
+          host: "127.0.0.1",
+          port: closed_port(),
+          base_dir: System.tmp_dir!(),
+          harness: registered_harness(),
+          host_name: "testhost",
+          journeys: ["J0"]
+        )
+
+      manual_only = for o <- Journeys.oracles(), match?({:none, _}, o.client), do: o.step
+      j0_steps = for o <- Journeys.oracles(), o.journey == "J0", o.step not in manual_only, do: o.step
+
+      assert Enum.sort(Enum.map(leg.rows, & &1.step)) == Enum.sort(j0_steps)
+
+      # The steps it did not walk are ABSENT, not passing — a subset run has no
+      # way to report the full automated set as green.
+      refute Enum.sort(Enum.map(leg.rows, & &1.step)) == Enum.sort(Journeys.automated_steps())
+    end
+
     test "run_leg REFUSES to guess a harness" do
       # A default harness silently pins one leg and survives a registry change.
       assert_raise KeyError, fn ->
