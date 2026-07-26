@@ -252,45 +252,6 @@ defmodule Tightbeam.EffortCheckinTest do
     assert after_count == before
   end
 
-  test "job-linked initial and deadline effort notifications stamp assignment and job", ctx do
-    personal_key = Org.personal_session_key("h1")
-    session(ctx.db, personal_key, "h1", Placement.local_host_name())
-
-    item =
-      WorkItems.__handle__(ctx.db, "work-item-create", %{
-        verb: "work-item-create",
-        origin: "user:h1",
-        principal: {:user, "h1"},
-        session_key: nil,
-        params: %{title: "Effort trace"}
-      })
-
-    assignment =
-      assignment(ctx, "dispatch", {:user, "h1"}, "holder", %{
-        subject: "linked effort",
-        brief: "linked effort",
-        work_item_id: item.id
-      })
-
-    request = fire_probe(ctx, assignment.id)
-    first_deadline = request.deadline_wake_id
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, first_deadline))
-
-    assert rows(
-             ctx.db,
-             """
-             SELECT assignmentId, jobRef
-             FROM turns
-             WHERE prompt LIKE '%Effort check-in%'
-             ORDER BY seq
-             """,
-             []
-           ) == [
-             [assignment.id, item.id],
-             [assignment.id, item.id]
-           ]
-  end
-
   test "dispatch replay precedes current holder placement and performs no new probe", ctx do
     calls = :counters.new(1, [])
 

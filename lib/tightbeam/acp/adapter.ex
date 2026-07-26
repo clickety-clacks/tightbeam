@@ -24,10 +24,6 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
-  # strict_apply's worst case is THREE Conn.requests at the 60s default (model,
-  # effort, and the rollback on read-back failure) — the timeout must clear all
-  # three so the durable-cancel fallback stays a crash guard, not the normal path.
-  @cancel_boundary_timeout 185_000
 
   defstruct [
     :conn,
@@ -119,46 +115,6 @@ defmodule Tightbeam.Acp.Adapter do
         opts \\ []
       ),
       do: GenServer.call(adapter, {:prompt, session_id, text, opts}, timeout + 5_000)
-
-  @doc """
-  Apply and read back the intended mind, persist it through `before_send`, then
-  send the ACP prompt in one adapter-serialized boundary.
-  """
-  @spec prompt_configured(
-          adapter(),
-          String.t(),
-          model_ref(),
-          String.t(),
-          (-> :ok | :already_terminal),
-          timeout(),
-          keyword()
-        ) ::
-          {:ok, %{stop_reason: String.t(), text: String.t()}} | {:error, term()}
-  def prompt_configured(
-        adapter,
-        session_id,
-        model,
-        text,
-        before_send,
-        timeout \\ Application.get_env(:tightbeam, :turn_timeout_ms, 600_000),
-        opts \\ []
-      ),
-      do:
-        GenServer.call(
-          adapter,
-          {:prompt_configured, session_id, model, text, before_send, opts},
-          timeout + 5_000
-        )
-
-  @doc "Serialize an ACP cancellation against tune and the configured prompt boundary."
-  @spec cancel_session(adapter(), String.t(), (-> result)) :: result when result: term()
-  def cancel_session(adapter, session_id, before_cancel \\ fn -> :ok end),
-    do:
-      GenServer.call(
-        adapter,
-        {:cancel_session, session_id, before_cancel},
-        @cancel_boundary_timeout
-      )
 
   @doc """
   Map one ACP session/update to a typing-indicator status line, or :skip.
@@ -354,31 +310,6 @@ defmodule Tightbeam.Acp.Adapter do
     do: {:reply, MapSet.member?(state.known, sid), state}
 
   def handle_call({:prompt, sid, text, opts}, from, state) do
-    start_prompt(state, sid, text, opts, from)
-  end
-
-  def handle_call({:prompt_configured, sid, model, text, before_send, opts}, from, state) do
-    case strict_apply(state, sid, model, model) do
-      :ok ->
-        case before_send.() do
-          :ok -> start_prompt(state, sid, text, opts, from)
-          :already_terminal -> {:reply, {:error, :turn_terminal}, state}
-        end
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-
-  def handle_call({:cancel_session, sid, before_cancel}, _from, state) do
-    result = before_cancel.()
-    if result == :ok, do: notify_cancel(state.conn, sid)
-    {:reply, result, state}
-  end
-
-  def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
-
-  defp start_prompt(state, sid, text, opts, from) do
     state = put_in(state.chunks[sid], [])
     # Per-turn progress channel: {fun, last_status, seq}. Deduped on text so
     # per-token thought chunks emit ONE "Thinking…" until something changes.
@@ -391,46 +322,23 @@ defmodule Tightbeam.Acp.Adapter do
     # Fire the ACP prompt asynchronously so this GenServer keeps routing
     # session/update chunks while the turn runs.
     parent = self()
-    dispatched = make_ref()
-    conn_monitor = Process.monitor(state.conn)
 
-    prompt_worker =
-      spawn(fn ->
-        result =
-          Conn.request(
-            state.conn,
-            "session/prompt",
-            %{sessionId: sid, prompt: [%{type: "text", text: text}]},
-            timeout: Application.get_env(:tightbeam, :turn_timeout_ms, 600_000),
-            notify_dispatched: {parent, {:prompt_dispatched, dispatched}}
-          )
+    Task.start(fn ->
+      result =
+        Conn.request(
+          state.conn,
+          "session/prompt",
+          %{sessionId: sid, prompt: [%{type: "text", text: text}]},
+          timeout: Application.get_env(:tightbeam, :turn_timeout_ms, 600_000)
+        )
 
-        send(parent, {:prompt_done, sid, from, result})
-      end)
-
-    receive do
-      {:prompt_dispatched, ^dispatched} ->
-        Process.demonitor(conn_monitor, [:flush])
-
-      {:DOWN, ^conn_monitor, :process, _pid, _reason} ->
-        send(parent, {:prompt_done, sid, from, {:error, :prompt_dispatch_failed}})
-    after
-      Application.get_env(:tightbeam, :prompt_dispatch_timeout_ms, 60_000) ->
-        Process.demonitor(conn_monitor, [:flush])
-        Process.exit(prompt_worker, :kill)
-        send(parent, {:prompt_done, sid, from, {:error, :prompt_dispatch_failed}})
-    end
+      send(parent, {:prompt_done, sid, from, result})
+    end)
 
     {:noreply, state}
   end
 
-  defp notify_cancel(conn, sid) do
-    Conn.notify(conn, "session/cancel", %{sessionId: sid})
-  rescue
-    _ -> :ok
-  catch
-    :exit, _ -> :ok
-  end
+  def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
 
   @impl true
   def handle_info({:acp_notification, "account/updated", params}, state) do

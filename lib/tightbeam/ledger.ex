@@ -44,10 +44,6 @@ defmodule Tightbeam.Ledger do
     prompt     TEXT NOT NULL,
     roleRef    TEXT,
     roleFallback INTEGER NOT NULL DEFAULT 0,
-    assignmentId TEXT,
-    jobRef     TEXT,
-    model      TEXT,
-    harness    TEXT,
     status     TEXT NOT NULL DEFAULT 'queued'
                CHECK (status IN ('queued','running','delivered','canceled',
                                  'failed','failed_unknown')),
@@ -74,26 +70,13 @@ defmodule Tightbeam.Ledger do
 
     for ddl <- [
           "ALTER TABLE turns ADD COLUMN roleRef TEXT",
-          "ALTER TABLE turns ADD COLUMN roleFallback INTEGER NOT NULL DEFAULT 0",
-          "ALTER TABLE turns ADD COLUMN assignmentId TEXT",
-          "ALTER TABLE turns ADD COLUMN jobRef TEXT",
-          "ALTER TABLE turns ADD COLUMN model TEXT",
-          "ALTER TABLE turns ADD COLUMN harness TEXT"
+          "ALTER TABLE turns ADD COLUMN roleFallback INTEGER NOT NULL DEFAULT 0"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
         {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
       end
     end
-
-    :ok =
-      DB.execute(
-        db,
-        """
-        CREATE INDEX IF NOT EXISTS turns_job_ref ON turns (jobRef);
-        CREATE INDEX IF NOT EXISTS turns_assignment_id ON turns (assignmentId);
-        """
-      )
 
     result
   end
@@ -111,9 +94,8 @@ defmodule Tightbeam.Ledger do
       txn,
       """
         INSERT INTO turns
-          (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
-           assignmentId, jobRef, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+          (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
       """,
       [
         Map.fetch!(attrs, :session_key),
@@ -123,8 +105,6 @@ defmodule Tightbeam.Ledger do
         Map.fetch!(attrs, :prompt),
         Map.get(attrs, :role_ref),
         if(Map.get(attrs, :role_fallback, false), do: 1, else: 0),
-        Map.get(attrs, :assignment_id),
-        Map.get(attrs, :job_ref),
         now
       ]
     )
@@ -412,23 +392,6 @@ defmodule Tightbeam.Ledger do
       ])
 
     :ok
-  end
-
-  @doc "Persist the adapter-confirmed mind before the ACP prompt send."
-  @spec stamp_mind(db(), integer(), String.t(), String.t()) :: :ok | :already_terminal
-  def stamp_mind(db \\ Tightbeam.DB, seq, model, harness) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        UPDATE turns SET model = ?2, harness = ?3
-        WHERE seq = ?1 AND status = 'running'
-        RETURNING seq
-        """,
-        [seq, model, harness]
-      )
-
-    if rows == [[seq]], do: :ok, else: :already_terminal
   end
 
   @doc "Newest adapter generation stamped by an earlier turn in the session, or nil."

@@ -576,13 +576,6 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [[^expected_prod]]} =
              DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId = ?1", [prod.wake_id])
 
-    assert {:ok, [[nil, nil]]} =
-             DB.query(
-               ctx.db,
-               "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1",
-               [prod.wake_id]
-             )
-
     session(ctx.db, "escalating-holder", ctx.supervisor.session_key)
     assignment(ctx.db, "asg_escalation", "escalating-holder", "investigate", 3)
     escalation_seq = terminal!(ctx.db, "escalating-holder")

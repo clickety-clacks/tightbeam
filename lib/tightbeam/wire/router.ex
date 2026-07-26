@@ -45,7 +45,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host identity-edit identity-status identity-relearn identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail run-tests run-smoke cancel-producer-job rule effort-rule waive revoke-waiver withdraw decision-requests decision-request)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host identity-edit identity-status identity-relearn identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail run-tests run-smoke cancel-producer-job rule effort-rule waive revoke-waiver withdraw decision-requests decision-request)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],

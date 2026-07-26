@@ -121,10 +121,6 @@ pub enum Command {
         identity: Identity,
         work_item_id: String,
     },
-    WorkItemTrace {
-        identity: Identity,
-        work_item_id: String,
-    },
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
@@ -148,7 +144,6 @@ pub enum Command {
         kind: String,
         verdict: Option<String>,
         note: Option<String>,
-        commit_refs: Option<Vec<serde_json::Value>>,
     },
     Attests {
         identity: Identity,
@@ -284,7 +279,6 @@ COMMANDS:
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
   work-item-get <workItemId>
-  work-item-trace <workItemId>
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -312,7 +306,6 @@ COMMANDS:
   run-smoke <assignmentId>
       Queue the committed mechanical producer for an assignment.
   attest <assignmentId> --kind progress|completion|surrender|verdict
-      [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
       File against an assignment. Verdicts require --verdict and may be filed
       by any session or user; lifecycle attests remain holder-filed.
@@ -849,15 +842,6 @@ fn parse_with_optional_catalog(
                 work_item_id: parsed.positional[1].clone(),
             })
         }
-        "work-item-trace" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam work-item-trace <workItemId>".to_owned());
-            }
-            Ok(Command::WorkItemTrace {
-                identity: identity(flags)?,
-                work_item_id: parsed.positional[1].clone(),
-            })
-        }
         "work-item-icebox" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-icebox <workItemId>".to_owned());
@@ -910,19 +894,12 @@ fn parse_with_optional_catalog(
             if kind != "verdict" && verdict.is_some() {
                 return Err("--verdict is only valid when --kind is verdict".to_owned());
             }
-            let commit_refs = nonempty(flags, "commit-refs")
-                .map(|encoded| {
-                    serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
-                        .map_err(|_| "--commit-refs must be a JSON array".to_owned())
-                })
-                .transpose()?;
             Ok(Command::Attest {
                 identity: identity(flags)?,
                 assignment_id,
                 kind,
                 verdict,
                 note: nonempty(flags, "note"),
-                commit_refs,
             })
         }
         "attests" => {
@@ -996,7 +973,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -1213,7 +1190,6 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
-                "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
             ]
@@ -1395,7 +1371,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 

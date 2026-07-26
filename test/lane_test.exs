@@ -2,31 +2,6 @@ defmodule Tightbeam.LaneTest do
   use ExUnit.Case, async: false
 
   alias Tightbeam.{DB, Ledger, EventLog, SessionLane, LaneManager}
-  alias Tightbeam.Acp.Adapter
-
-  defmodule BoundaryAdapter do
-    use GenServer
-
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
-    def init(parent), do: {:ok, parent}
-
-    def handle_call(
-          {:prompt_configured, _sid, _model, _prompt, before_send, _opts},
-          _from,
-          parent
-        ) do
-      reply =
-        case before_send.() do
-          :ok -> {:ok, %{text: "", stop_reason: "end_turn"}}
-          :already_terminal -> {:error, :turn_terminal}
-        end
-
-      {:reply, reply, parent}
-    end
-
-    def handle_call({:cancel_session, _sid, before_cancel}, _from, parent),
-      do: {:reply, before_cancel.(), parent}
-  end
 
   setup do
     db = :"db_#{System.unique_integer([:positive])}"
@@ -166,103 +141,6 @@ defmodule Tightbeam.LaneTest do
     assert SessionLane.cancel_current("k1") == :not_running
     {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq = ?1", [seq1])
     assert status == "canceled"
-  end
-
-  test "cancel remains durable and the lane survives while the adapter boundary is busy", ctx do
-    parent = self()
-    seq = enqueue!(ctx.db, "k1", "hang")
-    adapter = start_supervised!({BoundaryAdapter, parent})
-
-    held =
-      Task.async(fn ->
-        Adapter.prompt_configured(adapter, "sid", "model", "held", fn ->
-          send(parent, :adapter_boundary_held)
-
-          receive do
-            :release_boundary -> :already_terminal
-          end
-        end)
-      end)
-
-    assert_receive :adapter_boundary_held
-
-    lane =
-      start_supervised!(
-        {SessionLane,
-         session_key: "k1",
-         db: ctx.db,
-         task_sup: ctx.task_sup,
-         runner: fn _turn ->
-           send(parent, :busy_cancel_runner_started)
-           receive do: (:never -> {:ok, %{}})
-         end}
-      )
-
-    assert_receive :busy_cancel_runner_started
-
-    spawn(fn ->
-      result =
-        try do
-          SessionLane.cancel_current("k1", fn terminal_seq ->
-            Adapter.cancel_session(adapter, "sid", fn ->
-              Ledger.finish(ctx.db, terminal_seq, "canceled")
-            end)
-          end)
-        catch
-          :exit, reason -> {:exit, reason}
-        end
-
-      send(parent, {:busy_cancel_result, result})
-    end)
-
-    Process.sleep(5_100)
-    assert Process.alive?(lane)
-    send(adapter, :release_boundary)
-    assert {:error, :turn_terminal} = Task.await(held)
-
-    assert eventually(fn ->
-             {:ok, [[status]]} =
-               DB.query(ctx.db, "SELECT status FROM turns WHERE seq = ?1", [seq])
-
-             status == "canceled"
-           end)
-
-    assert Process.alive?(lane)
-  end
-
-  test "cancel remains durable and the lane survives when the adapter is dead", ctx do
-    parent = self()
-    seq = enqueue!(ctx.db, "k1", "hang")
-
-    dead_adapter = spawn(fn -> :ok end)
-    monitor = Process.monitor(dead_adapter)
-    assert_receive {:DOWN, ^monitor, :process, ^dead_adapter, :normal}
-
-    lane =
-      start_supervised!(
-        {SessionLane,
-         session_key: "k1",
-         db: ctx.db,
-         task_sup: ctx.task_sup,
-         runner: fn _turn ->
-           send(parent, :dead_cancel_runner_started)
-           receive do: (:never -> {:ok, %{}})
-         end}
-      )
-
-    assert_receive :dead_cancel_runner_started
-
-    assert {:ok, %{seq: ^seq}} =
-             SessionLane.cancel_current("k1", fn terminal_seq ->
-               Adapter.cancel_session(dead_adapter, "sid", fn ->
-                 Ledger.finish(ctx.db, terminal_seq, "canceled")
-               end)
-             end)
-
-    assert Process.alive?(lane)
-
-    assert {:ok, [["canceled"]]} =
-             DB.query(ctx.db, "SELECT status FROM turns WHERE seq = ?1", [seq])
   end
 
   test "reconcile republishes recovered terminals through the same on_terminal closure", ctx do

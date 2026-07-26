@@ -3,8 +3,7 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, Org, Placement, Projection, Wakes}
+  alias Tightbeam.{EffortCheckin, Org, Projection, Wakes}
 
   defmodule TransitionRace do
     @moduledoc false
@@ -74,7 +73,6 @@ defmodule Tightbeam.Assignments do
     producerCommand TEXT NULL,
     byHarness TEXT NULL,
     byProvider TEXT NULL,
-    commitRefs TEXT NULL,
     ts INTEGER NOT NULL,
     CHECK(
       (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
@@ -118,7 +116,6 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
     ensure_attests_shape(db)
-    ensure_commit_refs_column(db)
     ensure_work_item_column(db)
     ensure_assignment_columns(db)
     :ok = DB.execute(db, @assignment_files_ddl)
@@ -357,7 +354,7 @@ defmodule Tightbeam.Assignments do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
         [assignment_id]
       )
 
@@ -502,9 +499,7 @@ defmodule Tightbeam.Assignments do
                       prompt,
                       sender: call.origin,
                       role_ref: assignment.holderRole,
-                      role_fallback: assignment.holderFallback,
-                      assignment_id: assignment.id,
-                      job_ref: assignment.workItemId
+                      role_fallback: assignment.holderFallback
                     )
 
                   {:created, assignment, delivery}
@@ -596,9 +591,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_result(db, call) do
-    with :ok <- principal_allowed(call.principal, "attest"),
-         :ok <- commit_ref_filing_allowed(db, call),
-         :ok <- valid_commit_refs(call.params[:kind], call.params[:commit_refs]) do
+    with :ok <- principal_allowed(call.principal, "attest") do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
       result = transaction(db, fn txn -> attest_in_txn(txn, call) end)
@@ -975,8 +968,7 @@ defmodule Tightbeam.Assignments do
       producer: nil,
       producer_command: nil,
       by_harness: by_harness,
-      by_provider: by_provider,
-      commit_refs: call.params[:commit_refs]
+      by_provider: by_provider
     })
   end
 
@@ -989,8 +981,8 @@ defmodule Tightbeam.Assignments do
       """
       INSERT INTO attests
         (id, assignmentId, kind, verdictKind, note, bySession, byUser, producer,
-         producerCommand, byHarness, byProvider, commitRefs, ts)
-      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+         producerCommand, byHarness, byProvider, ts)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
       WHERE EXISTS (SELECT 1 FROM assignments WHERE id = ?2 AND state = 'open')
       """,
       [
@@ -1005,7 +997,6 @@ defmodule Tightbeam.Assignments do
         attrs.producer_command,
         attrs.by_harness,
         attrs.by_provider,
-        attrs[:commit_refs] && JSON.encode!(attrs.commit_refs),
         ts
       ]
     )
@@ -1024,7 +1015,6 @@ defmodule Tightbeam.Assignments do
       attrs.producer_command,
       attrs.by_harness,
       attrs.by_provider,
-      attrs[:commit_refs] && JSON.encode!(attrs.commit_refs),
       ts
     ])
   end
@@ -1136,108 +1126,6 @@ defmodule Tightbeam.Assignments do
   end
 
   defp valid_note(_), do: error("invalid_note", "note must be text")
-
-  defp valid_commit_refs(_kind, nil), do: :ok
-
-  defp valid_commit_refs("completion", refs) when is_list(refs) do
-    Enum.reduce_while(refs, :ok, fn ref, :ok ->
-      case validate_commit_ref(ref) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp valid_commit_refs("completion", _refs),
-    do: error("invalid_commit_refs", "commitRefs must be an array")
-
-  defp valid_commit_refs(_kind, _refs),
-    do: error("invalid_commit_refs", "commitRefs are only valid on completion attests")
-
-  defp commit_ref_filing_allowed(db, call) do
-    if is_nil(call.params[:commit_refs]) or call.params[:kind] != "completion" do
-      :ok
-    else
-      assignment_id = call.params[:assignment_id]
-
-      case DB.query(db, "SELECT holderKey, state FROM assignments WHERE id = ?1", [
-             assignment_id
-           ]) do
-        {:ok, []} ->
-          error("unknown_assignment", "unknown assignment: #{assignment_id}")
-
-        {:ok, [[holder, _state]]} when call.principal != {:session, holder} ->
-          error("not_holder", "assignment is held by session #{holder}")
-
-        {:ok, [[_holder, state]]} when state != "open" ->
-          assignment_closed()
-
-        {:ok, [[_holder, "open"]]} ->
-          :ok
-      end
-    end
-  end
-
-  defp validate_commit_ref(ref) when is_map(ref) do
-    normalized = Map.new(ref, fn {key, value} -> {to_string(key), value} end)
-
-    with ["commit", "repo"] <- normalized |> Map.keys() |> Enum.sort(),
-         repo when is_binary(repo) <- normalized["repo"],
-         commit when is_binary(commit) <- normalized["commit"],
-         [host, path] <- String.split(repo, ":", parts: 2),
-         true <- host != "" and Path.type(path) == :absolute,
-         {_output, 0} <- run_git_cat_file(host, path, commit) do
-      :ok
-    else
-      _ -> error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
-    end
-  end
-
-  defp validate_commit_ref(_ref),
-    do: error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
-
-  defp run_git_cat_file(host, path, commit) do
-    base_dir =
-      Application.get_env(
-        :tightbeam,
-        :base_dir,
-        Path.join(System.user_home!(), ".tightbeam")
-      )
-
-    case Placement.hosts(base_dir)[host] do
-      %{ssh: nil} ->
-        run_commit_ref_command(
-          "git",
-          ["-C", path, "cat-file", "-e", "#{commit}^{commit}"],
-          stderr_to_stdout: true
-        )
-
-      %{ssh: destination} when is_binary(destination) ->
-        command =
-          ["git", "-C", path, "cat-file", "-e", "#{commit}^{commit}"]
-          |> Enum.map_join(" ", &shell_quote/1)
-
-        run_commit_ref_command(
-          "ssh",
-          Support.ssh_opts() ++ [destination, "sh", "-c", shell_quote(command)],
-          stderr_to_stdout: true
-        )
-
-      nil ->
-        {:error, :unknown_host}
-    end
-  rescue
-    _ -> {:error, :verification_failed}
-  catch
-    :exit, _ -> {:error, :verification_failed}
-  end
-
-  defp run_commit_ref_command(executable, args, opts) do
-    runner = Application.get_env(:tightbeam, :commit_ref_command, &System.cmd/3)
-    runner.(executable, args, opts)
-  end
-
-  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
 
   defp valid_kind(kind) when kind in ["progress", "completion", "surrender"], do: :ok
   defp valid_kind(_), do: error("invalid_kind", "kind must be progress, completion, or surrender")
@@ -1447,7 +1335,6 @@ defmodule Tightbeam.Assignments do
          producer_command,
          by_harness,
          by_provider,
-         commit_refs,
          ts
        ]) do
     %{
@@ -1462,7 +1349,6 @@ defmodule Tightbeam.Assignments do
       producerCommand: producer_command,
       byHarness: by_harness,
       byProvider: by_provider,
-      commitRefs: commit_refs && JSON.decode!(commit_refs),
       ts: ts
     }
   end
@@ -1499,7 +1385,6 @@ defmodule Tightbeam.Assignments do
         "producerCommand",
         "byHarness",
         "byProvider",
-        "commitRefs",
         "ts"
       ]
 
@@ -1532,13 +1417,6 @@ defmodule Tightbeam.Assignments do
     end
 
     :ok
-  end
-
-  defp ensure_commit_refs_column(db) do
-    case DB.query(db, "ALTER TABLE attests ADD COLUMN commitRefs TEXT") do
-      {:ok, _} -> :ok
-      {:error, reason} -> if inspect(reason) =~ "duplicate column", do: :ok, else: raise(reason)
-    end
   end
 
   defp ensure_work_item_column(db) do
