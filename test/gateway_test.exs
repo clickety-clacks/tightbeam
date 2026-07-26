@@ -1659,6 +1659,77 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "a crash-recovered turn warns that side effects are unknown, not undone", ctx do
+
+    # Boot recovery terminalizes an interrupted turn as "outcome unknown". The
+    # in-chat marker must tell the agent to VERIFY before repeating anything
+    # non-idempotent — re-running `mix test` is fine, re-running a deploy is not.
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "do the thing",
+        sender: "user:flynn"
+      })
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: message.id,
+        origin: "user:flynn",
+        prompt: "do the thing"
+      })
+
+    :ok = DB.execute(ctx.db, "UPDATE turns SET status='running' WHERE seq=#{seq}")
+    _ = Ledger.recover_running(ctx.db)
+
+    assert [%{error: reason}] =
+             ctx.db |> Ledger.unpublished_terminals() |> Enum.filter(&(&1.seq == seq))
+
+    publisher = Gateway.terminal_publisher_for_test(ctx.db)
+    # The marker is appended before the wire publish; the publish leg needs a
+    # live registry that this test does not care about.
+    try do
+      publisher.(%{session_key: "k1", message_id: nil, status: "failed_unknown", error: reason})
+    catch
+      :exit, _ -> :ok
+    end
+
+    marker =
+      ctx.db
+      |> Projection.list_after("k1", nil, 100)
+      |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
+
+    assert marker, "crash recovery must append the turn-failed marker"
+    assert marker.content =~ "side effects are UNKNOWN, not undone"
+    assert marker.content =~ "non-idempotent"
+  end
+
+  test "an ordinary failure with a known reason gets NO unknown-outcome warning", ctx do
+
+    publisher = Gateway.terminal_publisher_for_test(ctx.db)
+
+    try do
+      publisher.(%{
+        session_key: "k2",
+        message_id: nil,
+        status: "failed",
+        error: "model refused the request"
+      })
+    catch
+      :exit, _ -> :ok
+    end
+
+    marker =
+      ctx.db
+      |> Projection.list_after("k2", nil, 100)
+      |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
+
+    assert marker
+    assert marker.content =~ "model refused the request"
+    refute marker.content =~ "side effects are UNKNOWN"
+  end
+
   test "register-host with the LOCAL hostname never touches the boot-owned credential server", ctx do
     local = Tightbeam.Placement.local_host_name()
     base_dir = move_test_base("local-host-reregistration", local)

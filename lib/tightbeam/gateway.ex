@@ -1405,6 +1405,12 @@ defmodule Tightbeam.Gateway do
   # recovered at boot (failed_unknown), task crashes, republished rows. The
   # client learns the truth it was owed — terminal turn-state with the
   # reason, typing/activity cleared, progress label cleared.
+  @doc false
+  # Test seam: the terminal publisher is otherwise only reachable through
+  # children/1's wiring, and the crash-recovery marker is exactly the path
+  # that has no runner closure to drive it from a test.
+  def terminal_publisher_for_test(db), do: terminal_publisher(db)
+
   defp terminal_publisher(db) do
     fn %{session_key: session_key, message_id: message_id, status: status} = row ->
       echo = Projection.get(db, message_id)
@@ -4218,9 +4224,26 @@ defmodule Tightbeam.Gateway do
     append_marker(
       db,
       session_key,
-      "[turn failed]\n\nThe agent could not answer the message above: #{reason}"
+      "[turn failed]\n\nThe agent could not answer the message above: #{reason}" <>
+        unknown_outcome_warning(reason)
     )
   end
+
+  # An interrupted turn's SIDE EFFECTS are unknown, not undone. Tightbeam's
+  # idempotency keys cover tightbeam's own verbs; they say nothing about a
+  # shell command the agent had already issued — a `git push`, a deploy, a
+  # message send may have completed before the process died. Re-running is
+  # correct for `mix test` and dangerous for anything that is not idempotent,
+  # so the marker tells the agent to VERIFY rather than assume either way.
+  # Only the unknown-outcome case gets this: an ordinary failure with a real
+  # reason already knows what happened.
+  defp unknown_outcome_warning("interrupted: outcome unknown") do
+    "\n\nThat turn's side effects are UNKNOWN, not undone: any command it had already " <>
+      "started may have completed. Before repeating anything non-idempotent (pushes, " <>
+      "deploys, sends, migrations), check the world for whether it already happened."
+  end
+
+  defp unknown_outcome_warning(_reason), do: ""
 
   # MARKER MESSAGES (the normative convention lives in Payloads — the seam
   # clients render from): an ordinary appended message so it rides replay
