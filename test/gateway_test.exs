@@ -101,20 +101,6 @@ defmodule Tightbeam.GatewayTest do
          {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
          parent}
 
-    def handle_call(
-          {:prompt_configured, _sid, _model, prompt, before_send, _opts},
-          from,
-          parent
-        ) do
-      case before_send.() do
-        :ok -> handle_call({:prompt, "harness-1", prompt, []}, from, parent)
-        :already_terminal -> {:reply, {:error, :turn_terminal}, parent}
-      end
-    end
-
-    def handle_call({:cancel_session, _sid, before_cancel}, _from, parent),
-      do: {:reply, before_cancel.(), parent}
-
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
@@ -136,6 +122,44 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:close_session_failed, sid})
       {:reply, {:error, :closed}, parent}
+    end
+  end
+
+  defmodule TuneAdapterStub do
+    use GenServer
+
+    def start_link({parent, opts}), do: GenServer.start_link(__MODULE__, {parent, opts})
+    def init(state), do: {:ok, state}
+
+    def handle_call({:knows_session?, sid}, _from, {parent, opts} = state) do
+      send(parent, {:tune_residency_checked, sid})
+      {:reply, Keyword.get(opts, :resident, true), state}
+    end
+
+    def handle_call(
+          {:apply_model_strict, sid, model, prior_model},
+          _from,
+          {parent, opts} = state
+        ) do
+      send(parent, {:tune_model_applied, sid, model, prior_model})
+      {:reply, Keyword.get(opts, :apply_result, :ok), state}
+    end
+  end
+
+  defmodule SlowConnAdapterStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call(:conn, from, parent) do
+      send(parent, {:cancel_conn_waiting, self()})
+
+      receive do
+        :release_cancel_conn -> GenServer.reply(from, parent)
+      end
+
+      {:noreply, parent}
     end
   end
 
@@ -181,6 +205,33 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:prompt, _sid, _prompt, _opts}, _from, parent) do
       send(parent, :unexpected_prompt)
+      {:reply, {:ok, %{text: "unexpected", stop_reason: "end_turn"}}, parent}
+    end
+  end
+
+  defmodule LoadApplyFailureAdapterStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:knows_session?, sid}, _from, parent) do
+      send(parent, {:load_apply_residency, sid})
+      {:reply, false, parent}
+    end
+
+    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:load_apply_failed, sid})
+      {:reply, {:error, {:model_apply_failed, :model_unavailable}}, parent}
+    end
+
+    def handle_call({:new_session, _model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, :unexpected_load_apply_new_session)
+      {:reply, {:ok, "unexpected"}, parent}
+    end
+
+    def handle_call({:prompt, _sid, _prompt, _opts}, _from, parent) do
+      send(parent, :unexpected_load_apply_prompt)
       {:reply, {:ok, %{text: "unexpected", stop_reason: "end_turn"}}, parent}
     end
   end
@@ -785,7 +836,12 @@ defmodule Tightbeam.GatewayTest do
     {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET cliToken = NULL")
 
     base_dir =
-      Path.join(System.tmp_dir!(), "gateway_backfill_#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_backfill_#{:os.getpid()}_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
 
     Gateway.children(gateway_config(base_dir, ctx.db, 0))
 
@@ -1897,7 +1953,7 @@ defmodule Tightbeam.GatewayTest do
              "[from process:tightbeam]\n\nYour override \"review\" was removed by the operator; disregard it."
   end
 
-  test "set_model reload checks out the overridden adapter key", ctx do
+  test "set_model applies a resident harness session before recording the selection", ctx do
     base_dir = role_test_base("override-set-model")
     put_skill!(base_dir, "review", "# Review")
     base = Archetypes.load!(base_dir)["default"]
@@ -1910,7 +1966,7 @@ defmodule Tightbeam.GatewayTest do
     Org.set_identity(ctx.db, "k1", overrides, identity_name)
     Org.append_pointer(ctx.db, "k1", "existing-session", "created")
 
-    adapter = start_supervised!({AdapterStub, self()})
+    adapter = start_supervised!({TuneAdapterStub, {self(), resident: true}})
     start_supervised!({CoordinatorStub, {adapter, self()}})
 
     assert %{ok: true} =
@@ -1921,6 +1977,35 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
+    assert_receive {:tune_residency_checked, "existing-session"}
+    assert_receive {:tune_model_applied, "existing-session", "claude-sonnet-4-6", _prior}
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+  end
+
+  test "set_model records a resident apply failure and leaves the selected model unchanged",
+       ctx do
+    base_dir = role_test_base("resident-set-model-failure")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    before = Org.get(ctx.db, "k1").model
+    Org.append_pointer(ctx.db, "k1", "resident-session", "created")
+
+    adapter =
+      start_supervised!(
+        {TuneAdapterStub, {self(), resident: true, apply_result: {:error, :model_unavailable}}}
+      )
+
+    start_supervised!({CoordinatorStub, adapter})
+
+    assert %{ok: false, reason: :model_unavailable} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    assert_receive {:tune_model_applied, "resident-session", "claude-sonnet-4-6", ^before}
+    assert Org.get(ctx.db, "k1").model == before
   end
 
   test "session_status splits setModel (one row per model) from setReasoning (current model's tiers)",
@@ -2249,6 +2334,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert_receive {:contained_load_session, "existing-session"}
+    refute Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
   end
 
   test "cancel addresses the overridden adapter key", ctx do
@@ -2284,16 +2370,17 @@ defmodule Tightbeam.GatewayTest do
 
     parent = self()
 
-    start_supervised!(
-      {Tightbeam.SessionLane,
-       session_key: "k1",
-       db: ctx.db,
-       task_sup: task_sup,
-       runner: fn _turn ->
-         send(parent, :cancel_runner_started)
-         receive do: (:never -> {:ok, %{}})
-       end}
-    )
+    lane =
+      start_supervised!(
+        {Tightbeam.SessionLane,
+         session_key: "k1",
+         db: ctx.db,
+         task_sup: task_sup,
+         runner: fn _turn ->
+           send(parent, :cancel_runner_started)
+           receive do: (:never -> {:ok, %{}})
+         end}
+      )
 
     assert_receive :cancel_runner_started
 
@@ -2305,6 +2392,114 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
+    assert Process.alive?(lane)
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns ORDER BY seq DESC LIMIT 1")
+  end
+
+  test "cancel stays durable and the lane alive when the adapter is dead", ctx do
+    base_dir = role_test_base("dead-adapter-cancel")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    Org.append_pointer(ctx.db, "k1", "dead-session", "created")
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    task_sup = start_supervised!({Task.Supervisor, name: :dead_cancel_tasks})
+    ensure_global_registry()
+
+    dead_adapter = spawn(fn -> :ok end)
+    monitor = Process.monitor(dead_adapter)
+    assert_receive {:DOWN, ^monitor, :process, ^dead_adapter, :normal}
+    start_supervised!({CoordinatorStub, dead_adapter})
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "cancel dead adapter",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    parent = self()
+
+    lane =
+      start_supervised!(
+        {Tightbeam.SessionLane,
+         session_key: "k1",
+         db: ctx.db,
+         task_sup: task_sup,
+         runner: fn _turn ->
+           send(parent, :dead_adapter_runner_started)
+           receive do: (:never -> {:ok, %{}})
+         end}
+      )
+
+    assert_receive :dead_adapter_runner_started
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["cancel"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{}
+             })
+
+    assert Process.alive?(lane)
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns ORDER BY seq DESC LIMIT 1")
+  end
+
+  test "cancel commits before a slow adapter and leaves the lane alive", ctx do
+    base_dir = role_test_base("slow-adapter-cancel")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    Org.append_pointer(ctx.db, "k1", "slow-session", "created")
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    task_sup = start_supervised!({Task.Supervisor, name: :slow_cancel_tasks})
+    ensure_global_registry()
+    adapter = start_supervised!({SlowConnAdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "cancel slow adapter",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    parent = self()
+
+    lane =
+      start_supervised!(
+        {Tightbeam.SessionLane,
+         session_key: "k1",
+         db: ctx.db,
+         task_sup: task_sup,
+         runner: fn _turn ->
+           send(parent, :slow_adapter_runner_started)
+           receive do: (:never -> {:ok, %{}})
+         end}
+      )
+
+    assert_receive :slow_adapter_runner_started
+
+    cancel =
+      Task.async(fn ->
+        Gateway.handlers(config)["cancel"].(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{}
+        })
+      end)
+
+    assert_receive {:cancel_conn_waiting, ^adapter}
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns ORDER BY seq DESC LIMIT 1")
+
+    assert Process.alive?(lane)
+
+    send(adapter, :release_cancel_conn)
+    assert %{ok: true} = Task.await(cancel)
   end
 
   test "boot migration turns legacy handles into roles idempotently", ctx do
@@ -3224,14 +3419,24 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
-  test "a pre-boundary terminal is a quiet no-op without adjudication", ctx do
-    start_supervised!(%{
-      id: :terminal_race_conn_registry,
-      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-    })
+  test "load model-apply failure fails the turn without forfeiting session context", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :load_apply_failure_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
 
-    adapter = start_supervised!({AdapterStub, self()})
+    adapter = start_supervised!({LoadApplyFailureAdapterStub, self()})
     start_supervised!({CoordinatorStub, adapter})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "load-apply-failure",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
 
     base = gateway_children_base!()
 
@@ -3252,24 +3457,35 @@ defmodule Tightbeam.GatewayTest do
       |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
 
     runner = Keyword.fetch!(lane_opts, :runner)
+    Org.append_pointer(ctx.db, "k1", "load-apply-session", "created")
 
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "terminal race",
+             Gateway.deliver_prompt("k1", "user:flynn", "ping",
                db: ctx.db,
-               conn_registry: ctx.registry,
-               lane_manager: ctx.lane
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "load-apply-failure",
+               client_message_id: "c_load_apply_failure"
              )
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "canceled")
 
-    assert {:ok, %{}} = runner.(Map.put(turn, :session_key, "k1"))
-    refute_receive {:prompt_started, _}
-    assert Org.get(ctx.db, "k1").adjudication_hold == nil
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM adjudication_episodes")
+    assert {:error,
+            %{
+              reason: {:model_apply_failed, :model_unavailable},
+              terminal_publish: failure_publish
+            }} = runner.(Map.put(turn, :session_key, "k1"))
 
-    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "unclassified_harness_error" and event.subject == "k1"
+    failure_publish.("failed")
+    assert_receive {:load_apply_residency, "load-apply-session"}
+    assert_receive {:load_apply_failed, "load-apply-session"}
+    refute_receive :unexpected_load_apply_new_session
+    refute_receive :unexpected_load_apply_prompt
+    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created"]
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "pointer_fallback"))
+
+    refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
+             String.starts_with?(message.content, "[context reset]")
            end)
   end
 

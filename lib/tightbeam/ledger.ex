@@ -106,17 +106,25 @@ defmodule Tightbeam.Ledger do
   @spec enqueue_in_txn(Txn.t(), map()) :: integer()
   def enqueue_in_txn(%Txn{} = txn, attrs) do
     now = System.system_time(:millisecond)
+    session_key = Map.fetch!(attrs, :session_key)
+
+    [[model, harness]] =
+      Txn.q(
+        txn,
+        "SELECT model, harness FROM sessions WHERE sessionKey = ?1",
+        [session_key]
+      )
 
     Txn.q(
       txn,
       """
         INSERT INTO turns
           (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
-           assignmentId, jobRef, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+           assignmentId, jobRef, model, harness, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
       """,
       [
-        Map.fetch!(attrs, :session_key),
+        session_key,
         Map.fetch!(attrs, :message_id),
         Map.get(attrs, :wake_id),
         Map.fetch!(attrs, :origin),
@@ -125,6 +133,8 @@ defmodule Tightbeam.Ledger do
         if(Map.get(attrs, :role_fallback, false), do: 1, else: 0),
         Map.get(attrs, :assignment_id),
         Map.get(attrs, :job_ref),
+        model,
+        harness,
         now
       ]
     )
@@ -412,23 +422,6 @@ defmodule Tightbeam.Ledger do
       ])
 
     :ok
-  end
-
-  @doc "Persist the adapter-confirmed mind before the ACP prompt send."
-  @spec stamp_mind(db(), integer(), String.t(), String.t()) :: :ok | :already_terminal
-  def stamp_mind(db \\ Tightbeam.DB, seq, model, harness) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        UPDATE turns SET model = ?2, harness = ?3
-        WHERE seq = ?1 AND status = 'running'
-        RETURNING seq
-        """,
-        [seq, model, harness]
-      )
-
-    if rows == [[seq]], do: :ok, else: :already_terminal
   end
 
   @doc "Newest adapter generation stamped by an earlier turn in the session, or nil."

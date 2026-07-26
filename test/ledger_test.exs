@@ -7,7 +7,26 @@ defmodule Tightbeam.LedgerTest do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = Ledger.ensure_schema(name)
+    create_test_sessions(name)
     %{db: name}
+  end
+
+  defp create_test_sessions(db) do
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE sessions (
+        sessionKey TEXT PRIMARY KEY,
+        model TEXT NOT NULL,
+        harness TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'active',
+        adjudicationHold TEXT,
+        updatedAt INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO sessions (sessionKey, model, harness)
+      VALUES
+        ('k1', 'claude-sonnet-5[medium]', 'claude'),
+        ('k2', 'claude-sonnet-5[medium]', 'claude');
+      """)
   end
 
   defp enqueue!(db, sk, prompt, opts \\ []) do
@@ -86,34 +105,33 @@ defmodule Tightbeam.LedgerTest do
     assert t2.prompt == "next"
   end
 
-  test "mind stamp is null before the boundary and survives every post-boundary terminal",
+  test "enqueue stamps the session's selected mind and a tune affects only the next turn",
        %{db: db} do
-    pre_seq = enqueue!(db, "pre", "before")
-    assert {:ok, %{seq: ^pre_seq}} = Ledger.claim_next(db, "pre", "lane")
-    assert [^pre_seq] = Ledger.recover_running(db)
+    first = enqueue!(db, "k1", "before tune")
 
-    assert {:ok, [["failed_unknown", nil, nil]]} =
-             DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [pre_seq])
+    assert {:ok, [["queued", "claude-sonnet-5[medium]", "claude"]]} =
+             DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
 
-    queued_seq = enqueue!(db, "retired", "queued")
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE sessions SET model='gpt-5.6-sol[high]', harness='codex' WHERE sessionKey='k1'"
+      )
 
-    assert {:ok, [^queued_seq]} =
-             DB.transaction(db, fn txn ->
-               Ledger.drain_queued_for_retire_in_txn(txn, "retired", "retired")
-             end)
+    second = enqueue!(db, "k1", "after tune")
 
-    assert {:ok, [["canceled", nil, nil]]} =
-             DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [queued_seq])
+    assert {:ok,
+            [
+              [^first, "claude-sonnet-5[medium]", "claude"],
+              [^second, "gpt-5.6-sol[high]", "codex"]
+            ]} =
+             DB.query(db, "SELECT seq, model, harness FROM turns ORDER BY seq")
 
-    for terminal <- ~w(delivered canceled failed failed_unknown) do
-      seq = enqueue!(db, terminal, terminal)
-      assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, terminal, "lane")
-      assert :ok = Ledger.stamp_mind(db, seq, "gpt-5.6-sol[high]", "codex")
-      assert :ok = Ledger.finish(db, seq, terminal)
+    assert {:ok, %{seq: ^first}} = Ledger.claim_next(db, "k1", "lane")
+    assert :ok = Ledger.finish(db, first, "canceled")
 
-      assert {:ok, [[^terminal, "gpt-5.6-sol[high]", "codex"]]} =
-               DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [seq])
-    end
+    assert {:ok, [["canceled", "claude-sonnet-5[medium]", "claude"]]} =
+             DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
   end
 
   test "publication feed: terminal rows surface until marked published", %{db: db} do

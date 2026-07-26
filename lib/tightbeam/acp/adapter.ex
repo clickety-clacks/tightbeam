@@ -24,10 +24,6 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
-  # strict_apply's worst case is THREE Conn.requests at the 60s default (model,
-  # effort, and the rollback on read-back failure) — the timeout must clear all
-  # three so the durable-cancel fallback stays a crash guard, not the normal path.
-  @cancel_boundary_timeout 185_000
 
   defstruct [
     :conn,
@@ -119,46 +115,6 @@ defmodule Tightbeam.Acp.Adapter do
         opts \\ []
       ),
       do: GenServer.call(adapter, {:prompt, session_id, text, opts}, timeout + 5_000)
-
-  @doc """
-  Apply and read back the intended mind, persist it through `before_send`, then
-  send the ACP prompt in one adapter-serialized boundary.
-  """
-  @spec prompt_configured(
-          adapter(),
-          String.t(),
-          model_ref(),
-          String.t(),
-          (-> :ok | :already_terminal),
-          timeout(),
-          keyword()
-        ) ::
-          {:ok, %{stop_reason: String.t(), text: String.t()}} | {:error, term()}
-  def prompt_configured(
-        adapter,
-        session_id,
-        model,
-        text,
-        before_send,
-        timeout \\ Application.get_env(:tightbeam, :turn_timeout_ms, 600_000),
-        opts \\ []
-      ),
-      do:
-        GenServer.call(
-          adapter,
-          {:prompt_configured, session_id, model, text, before_send, opts},
-          timeout + 5_000
-        )
-
-  @doc "Serialize an ACP cancellation against tune and the configured prompt boundary."
-  @spec cancel_session(adapter(), String.t(), (-> result)) :: result when result: term()
-  def cancel_session(adapter, session_id, before_cancel \\ fn -> :ok end),
-    do:
-      GenServer.call(
-        adapter,
-        {:cancel_session, session_id, before_cancel},
-        @cancel_boundary_timeout
-      )
 
   @doc """
   Map one ACP session/update to a typing-indicator status line, or :skip.
@@ -304,21 +260,22 @@ defmodule Tightbeam.Acp.Adapter do
            mcpServers: mcp_servers,
            _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
          }) do
-      {:ok, _} ->
-        # Best-effort: a loaded session already HAS a model. The option's
-        # valid set is populated asynchronously in the harness and can lag
-        # adapter boot, so a refused re-assert here must never cost the
-        # session's memory — continuity outranks the config option.
-        _ = apply_model(state, sid, model)
-
-        case set_mode_after_load(state, sid) do
+      {:ok, _result} ->
+        case apply_model(state, sid, model) do
           :ok ->
-            state = %{state | known: MapSet.put(state.known, sid)}
-            {:reply, :ok, put_in(state.chunks[sid], [])}
+            case set_mode_after_load(state, sid) do
+              :ok ->
+                state = %{state | known: MapSet.put(state.known, sid)}
+                {:reply, :ok, put_in(state.chunks[sid], [])}
 
-          {:error, :contained_sandbox_disable_failed} = error ->
+              {:error, _reason} = error ->
+                state = %{state | known: MapSet.delete(state.known, sid)}
+                {:reply, error, state}
+            end
+
+          {:error, reason} ->
             state = %{state | known: MapSet.delete(state.known, sid)}
-            {:reply, error, state}
+            {:reply, {:error, {:model_apply_failed, reason}}, state}
         end
 
       {:error, error} ->
@@ -355,25 +312,6 @@ defmodule Tightbeam.Acp.Adapter do
 
   def handle_call({:prompt, sid, text, opts}, from, state) do
     start_prompt(state, sid, text, opts, from)
-  end
-
-  def handle_call({:prompt_configured, sid, model, text, before_send, opts}, from, state) do
-    case strict_apply(state, sid, model, model) do
-      :ok ->
-        case before_send.() do
-          :ok -> start_prompt(state, sid, text, opts, from)
-          :already_terminal -> {:reply, {:error, :turn_terminal}, state}
-        end
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-
-  def handle_call({:cancel_session, sid, before_cancel}, _from, state) do
-    result = before_cancel.()
-    if result == :ok, do: notify_cancel(state.conn, sid)
-    {:reply, result, state}
   end
 
   def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
@@ -422,14 +360,6 @@ defmodule Tightbeam.Acp.Adapter do
     end
 
     {:noreply, state}
-  end
-
-  defp notify_cancel(conn, sid) do
-    Conn.notify(conn, "session/cancel", %{sessionId: sid})
-  rescue
-    _ -> :ok
-  catch
-    :exit, _ -> :ok
   end
 
   @impl true
