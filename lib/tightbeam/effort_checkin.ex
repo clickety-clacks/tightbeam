@@ -888,6 +888,7 @@ defmodule Tightbeam.EffortCheckin do
 
   defp deliver_notification(db, request) do
     target = request.expecter_session_key || Org.personal_session_key(request.expecter_user_id)
+    job_ref = assignment_job_ref(db, request.assignment_id)
 
     prompt =
       "Effort check-in #{request.id} for assignment #{request.assignment_id}.\n" <>
@@ -895,11 +896,22 @@ defmodule Tightbeam.EffortCheckin do
         "\nActions: #{Enum.join(request.options || [], ", ")}"
 
     try do
-      Tightbeam.Gateway.deliver_prompt(target, @origin, prompt, db: db, sender: @origin)
+      Tightbeam.Gateway.deliver_prompt(target, @origin, prompt,
+        db: db,
+        sender: @origin,
+        assignment_id: request.assignment_id,
+        job_ref: job_ref
+      )
     rescue
       _ -> :ok
     catch
       :exit, _ -> :ok
+    end
+  end
+
+  defp assignment_job_ref(db, assignment_id) do
+    case DB.query(db, "SELECT workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
+      {:ok, [[job_ref]]} -> job_ref
     end
   end
 

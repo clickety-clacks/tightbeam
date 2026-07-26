@@ -572,6 +572,7 @@ defmodule Tightbeam.Gateway do
         )
       end,
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
+      "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
@@ -729,6 +730,8 @@ defmodule Tightbeam.Gateway do
 
         case Projection.append_in_txn(txn, input) do
           {:appended, message} ->
+            {assignment_id, job_ref} = turn_attribution(txn, opts)
+
             Ledger.enqueue_in_txn(txn, %{
               session_key: target,
               message_id: message.id,
@@ -736,7 +739,9 @@ defmodule Tightbeam.Gateway do
               origin: origin,
               prompt: stamped,
               role_ref: role_ref || opts[:role_ref],
-              role_fallback: role_fallback || opts[:role_fallback] || false
+              role_fallback: role_fallback || opts[:role_fallback] || false,
+              assignment_id: assignment_id,
+              job_ref: job_ref
             })
 
             if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
@@ -759,6 +764,42 @@ defmodule Tightbeam.Gateway do
           other ->
             other
         end
+    end
+  end
+
+  defp turn_attribution(txn, opts) do
+    case {opts[:assignment_id], opts[:job_ref]} do
+      {assignment_id, job_ref} when is_binary(assignment_id) ->
+        {assignment_id, job_ref}
+
+      {nil, nil} ->
+        case opts[:wake_id] do
+          wake_id when is_binary(wake_id) ->
+            case DB.Txn.q(
+                   txn,
+                   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'work_items'",
+                   []
+                 ) do
+              [[1]] ->
+                case DB.Txn.q(
+                       txn,
+                       "SELECT id FROM work_items WHERE routingWakeId = ?1",
+                       [wake_id]
+                     ) do
+                  [[job_ref]] -> {nil, job_ref}
+                  [] -> {nil, nil}
+                end
+
+              [] ->
+                {nil, nil}
+            end
+
+          nil ->
+            {nil, nil}
+        end
+
+      attribution ->
+        attribution
     end
   end
 
@@ -1068,7 +1109,13 @@ defmodule Tightbeam.Gateway do
              {:ok, harness_session_id} <-
                harness_session(config, db, adapter, generation, session, turn.seq),
              {:ok, result} <-
-               Adapter.prompt(adapter, harness_session_id, turn.prompt, 600_000,
+               Adapter.prompt_configured(
+                 adapter,
+                 harness_session_id,
+                 session.model,
+                 turn.prompt,
+                 fn -> Ledger.stamp_mind(db, turn.seq, session.model, session.harness) end,
+                 600_000,
                  progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                ) do
           case Projection.append(db, %{
@@ -1085,6 +1132,9 @@ defmodule Tightbeam.Gateway do
 
           {:ok, %{terminal_publish: terminal_publish}}
         else
+          {:error, :turn_terminal} ->
+            {:ok, %{}}
+
           {:error, reason} ->
             condition = Adjudication.classify(reason)
             adjudication_prompt = adjudication_brief(session, condition)
@@ -1261,7 +1311,10 @@ defmodule Tightbeam.Gateway do
   # tell the harness to stop generating (ACP session/cancel notification —
   # fire-and-forget; the substrate's truth is the ledger row either way).
   defp cancel_result(db, call) do
-    case Tightbeam.SessionLane.cancel_current(call.session_key) do
+    session = Org.get(db, call.session_key)
+    boundary = cancellation_boundary(db, session)
+
+    case Tightbeam.SessionLane.cancel_current(call.session_key, boundary) do
       {:ok, %{message_id: message_id, seq: seq}} ->
         echo = Projection.get(db, message_id)
         correlation = (echo && echo.client_message_id) || message_id
@@ -1279,8 +1332,6 @@ defmodule Tightbeam.Gateway do
               session_key: call.session_key
             })
           )
-
-          harness_cancel(db, session)
         end
 
         Ledger.mark_published(db, seq)
@@ -1291,20 +1342,20 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # Best-effort: the model should stop burning tokens, but a failure here
-  # changes nothing durable (the ledger row is already terminal).
-  defp harness_cancel(db, session) do
+  defp cancellation_boundary(db, session) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
          key = {Harness.parse!(session.harness).id(), "shared", session.host},
          {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
-      Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
-        sessionId: sid
-      })
+      fn seq ->
+        Adapter.cancel_session(adapter, sid, fn -> Ledger.finish(db, seq, "canceled") end)
+      end
+    else
+      _ -> fn seq -> Ledger.finish(db, seq, "canceled") end
     end
   rescue
-    _ -> :ok
+    _ -> fn seq -> Ledger.finish(db, seq, "canceled") end
   catch
-    :exit, _ -> :ok
+    :exit, _ -> fn seq -> Ledger.finish(db, seq, "canceled") end
   end
 
   defp checkout_adapter(session) do

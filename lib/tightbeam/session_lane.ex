@@ -75,9 +75,9 @@ defmodule Tightbeam.SessionLane do
   """
   @spec cancel_current(String.t()) ::
           {:ok, %{seq: integer(), message_id: String.t()}} | :not_running | :no_lane
-  def cancel_current(session_key) do
+  def cancel_current(session_key, cancel_boundary \\ nil) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> GenServer.call(pid, :cancel_current)
+      [{pid, _}] -> GenServer.call(pid, {:cancel_current, cancel_boundary})
       [] -> :no_lane
     end
   end
@@ -104,11 +104,16 @@ defmodule Tightbeam.SessionLane do
   end
 
   @impl true
-  def handle_call(:cancel_current, _from, %{task_ref: nil} = state),
+  def handle_call({:cancel_current, _cancel_boundary}, _from, %{task_ref: nil} = state),
     do: {:reply, :not_running, state}
 
-  def handle_call(:cancel_current, _from, state) do
-    case Ledger.finish(state.db, state.current_seq, "canceled") do
+  def handle_call({:cancel_current, cancel_boundary}, _from, state) do
+    finish =
+      if is_function(cancel_boundary, 1),
+        do: run_cancel_boundary(cancel_boundary, state),
+        else: Ledger.finish(state.db, state.current_seq, "canceled")
+
+    case finish do
       :ok ->
         state.on_terminal.(state.session_key, state.current_seq)
         reply = {:ok, %{seq: state.current_seq, message_id: state.current_message_id}}
@@ -120,6 +125,14 @@ defmodule Tightbeam.SessionLane do
       :already_terminal ->
         {:reply, :not_running, state}
     end
+  end
+
+  defp run_cancel_boundary(cancel_boundary, state) do
+    cancel_boundary.(state.current_seq)
+  rescue
+    _ -> Ledger.finish(state.db, state.current_seq, "canceled")
+  catch
+    :exit, _ -> Ledger.finish(state.db, state.current_seq, "canceled")
   end
 
   @impl true
