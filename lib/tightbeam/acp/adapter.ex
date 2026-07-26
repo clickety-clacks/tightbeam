@@ -24,7 +24,10 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
-  @cancel_boundary_timeout 125_000
+  # strict_apply's worst case is THREE Conn.requests at the 60s default (model,
+  # effort, and the rollback on read-back failure) — the timeout must clear all
+  # three so the durable-cancel fallback stays a crash guard, not the normal path.
+  @cancel_boundary_timeout 185_000
 
   defstruct [
     :conn,
