@@ -393,7 +393,12 @@ defmodule Tightbeam.Adjudication do
                        episode.owner_wake_id
                      ]) do
                   [[prompt]] -> prompt
-                  [] -> "Model adjudication remains unanswered for #{session_key} (#{condition})."
+                  [] ->
+                    # The original brief's wake is gone; this fallback still owes
+                    # the reader the precise cause the episode carries, not just
+                    # the coarse condition it is keyed on.
+                    "Model adjudication remains unanswered for #{session_key} " <>
+                      "(condition=#{condition} cause=#{episode.cause || "unclassified"})."
                 end
 
               next = %{
