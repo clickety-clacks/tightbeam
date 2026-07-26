@@ -74,12 +74,6 @@ defmodule Tightbeam.Application do
       base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
       cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
       port: Application.get_env(:tightbeam, :port, 4_321),
-      harness_binary_probe:
-        Application.get_env(
-          :tightbeam,
-          :harness_binary_probe,
-          &Tightbeam.Placement.harness_binary_probe/2
-        ),
       default_harness: Tightbeam.Harness.default().id(),
       default_model: Application.get_env(:tightbeam, :default_model, "claude-sonnet-5[medium]"),
       max_live_sessions_per_user:

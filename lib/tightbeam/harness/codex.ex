@@ -210,27 +210,7 @@ defmodule Tightbeam.Harness.Codex do
   def probe_cli(target) do
     find = Map.get(target, :find_executable, &System.find_executable/1)
     shim = Path.join(Map.get(target, :cli_bin, ""), "codex")
-
-    discovered =
-      if File.exists?(shim) do
-        nil
-      else
-        find.("codex")
-      end
-
-    if not File.exists?(shim) and is_binary(discovered) and
-         Path.dirname(discovered) != Path.dirname(shim) do
-      File.mkdir_p!(Path.dirname(shim))
-
-      File.write!(
-        shim,
-        "#!/bin/sh\nexec \"#{discovered}\" --dangerously-bypass-hook-trust \"$@\"\n"
-      )
-
-      File.chmod!(shim, 0o755)
-    end
-
-    binary = if File.exists?(shim), do: shim, else: discovered
+    binary = if File.exists?(shim), do: shim, else: find.("codex")
     Support.bounded_probe(binary, target)
   end
 
@@ -352,7 +332,7 @@ defmodule Tightbeam.Harness.Codex do
       containment: [],
       cli_name: "codex",
       cli_version: "codex vector 1.0",
-      probe_path: :shim,
+      probe_path: :discovered,
       auth_events: [
         %{
           case: "positive",

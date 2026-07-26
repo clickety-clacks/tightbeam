@@ -66,9 +66,17 @@ defmodule Tightbeam.ApplicationTest do
     end)
   end
 
-  test "production entry refuses missing harnesses before creating the org store" do
+  test "production entry refuses a broken harness on PATH without creating any org artifact" do
     base =
       Path.join(System.tmp_dir!(), "tb_app_refused_#{System.unique_integer([:positive])}")
+
+    bin_dir =
+      Path.join(System.tmp_dir!(), "tb_app_broken_bin_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(bin_dir)
+    codex = Path.join(bin_dir, "codex")
+    File.write!(codex, "#!/bin/sh\necho broken >&2\nexit 1\n")
+    File.chmod!(codex, 0o755)
 
     previous_base = Application.fetch_env!(:tightbeam, :base_dir)
     previous_autostart = Application.fetch_env!(:tightbeam, :autostart)
@@ -76,13 +84,14 @@ defmodule Tightbeam.ApplicationTest do
 
     Application.put_env(:tightbeam, :base_dir, base)
     Application.put_env(:tightbeam, :autostart, true)
-    System.put_env("PATH", "")
+    System.put_env("PATH", bin_dir)
 
     on_exit(fn ->
       Application.put_env(:tightbeam, :base_dir, previous_base)
       Application.put_env(:tightbeam, :autostart, previous_autostart)
       System.put_env("PATH", previous_path)
       File.rm_rf!(base)
+      File.rm_rf!(bin_dir)
     end)
 
     assert_raise RuntimeError, ~r/no usable harness CLI is installed/, fn ->
@@ -107,22 +116,21 @@ defmodule Tightbeam.ApplicationTest do
 
     previous_base = Application.fetch_env!(:tightbeam, :base_dir)
     previous_autostart = Application.fetch_env!(:tightbeam, :autostart)
-    previous_probe = Application.get_env(:tightbeam, :harness_binary_probe)
+    previous_path = System.get_env("PATH")
+    bin_dir = Path.join(base, "working-cli")
+    codex = Path.join(bin_dir, "codex")
+    File.mkdir_p!(bin_dir)
+    File.write!(codex, "#!/bin/sh\necho 'codex-cli 0.0.0'\n")
+    File.chmod!(codex, 0o755)
 
     Application.put_env(:tightbeam, :base_dir, base)
     Application.put_env(:tightbeam, :autostart, true)
-    Application.put_env(:tightbeam, :harness_binary_probe, fn _harness, _bin -> {:ok, "test"} end)
+    System.put_env("PATH", bin_dir <> ":" <> previous_path)
 
     on_exit(fn ->
       Application.put_env(:tightbeam, :base_dir, previous_base)
       Application.put_env(:tightbeam, :autostart, previous_autostart)
-
-      if previous_probe do
-        Application.put_env(:tightbeam, :harness_binary_probe, previous_probe)
-      else
-        Application.delete_env(:tightbeam, :harness_binary_probe)
-      end
-
+      System.put_env("PATH", previous_path)
       File.rm_rf!(base)
     end)
 

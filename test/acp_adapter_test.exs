@@ -69,6 +69,14 @@ defmodule Tightbeam.Acp.AdapterTest do
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } } } });
             return send({ id: m.id, result: { stopReason: "end_turn" } });
           }
+          if (gateMode === "pass-then-die") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } } } });
+            send({ id: m.id, result: { stopReason: "end_turn" } });
+            return setTimeout(() => {
+              process.stderr.write("x".repeat(20000) + "\nadapter exploded: credential socket closed\n");
+              process.exit(137);
+            }, 25);
+          }
           if (gateMode === "pass-tool") {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call", content: [{ type: "content", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } }] } } });
             return send({ id: m.id, result: { stopReason: "end_turn" } });
@@ -586,10 +594,10 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
       refute Adapter.knows_session?(adapter, "probe-sess")
 
-      assert capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+      assert capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
                "gate wiring-check PASS [gate: tightbeam-probe]"
 
-      refute capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+      refute capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
                "[gate-drift]"
     end
   end
@@ -600,7 +608,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, :no_marker}}
 
-    log = capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!()
+    log = capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!()
     assert log =~ "[gate-drift] raw_updates="
     assert log =~ ~s("sessionUpdate":"drifted_shape")
     assert byte_size(log) < 5_000
@@ -635,33 +643,54 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       refute match?({:ok, _sid}, Task.await(queued))
 
-      assert capture_path |> Path.dirname() |> Path.join("stderr.log") |> File.read!() =~
+      assert capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
                "gate wiring-check FAIL detail=#{detail}"
     end
   end
 
-  test "adapter failure log includes stderr reason and redacts instruction state" do
-    marker = "INSTRUCTION_BLOB_MARKER_DO_NOT_LOG"
-    {adapter, capture_path} = start_adapter(harness: :codex, probe: false)
+  test "a gate-passing adapter that dies reports only its real stderr tail" do
+    {adapter, capture_path} = start_adapter(harness: :codex, gate_mode: "pass-then-die")
+    monitor = Process.monitor(adapter)
+
+    assert_receive {:DOWN, ^monitor, :process, ^adapter,
+                    {:adapter_fault,
+                     %{
+                       reason: {:acp_exit, 137},
+                       stderr: "adapter exploded: credential socket closed"
+                     }}},
+                   2_000
+
     stderr_path = Path.join(Path.dirname(capture_path), "stderr.log")
-    File.write!(stderr_path, "adapter exploded: credential socket closed\n")
+    gate_path = stderr_path <> ".gate.log"
+    assert File.read!(gate_path) =~ "gate wiring-check PASS [gate: tightbeam-probe]"
+    refute File.read!(stderr_path) =~ "gate wiring-check"
+  end
+
+  test "adapter status redacts accumulating chunks and a raising call's guidance message" do
+    chunk_marker = "CHUNK_PAYLOAD_MARKER_DO_NOT_LOG"
+    guidance_marker = "GUIDANCE_PAYLOAD_MARKER_DO_NOT_LOG"
+    {adapter, _capture_path} = start_adapter(harness: :codex, probe: false)
 
     :sys.replace_state(adapter, fn state ->
-      put_in(state.preset.meta.developerInstructions, marker)
+      state
+      |> put_in([Access.key(:chunks), "sensitive-session"], [chunk_marker])
+      |> Map.put(:harness, :missing_harness)
     end)
 
     monitor = Process.monitor(adapter)
 
     log =
       capture_log(fn ->
-        send(adapter, {:acp_exit, 137})
-        assert_receive {:DOWN, ^monitor, :process, ^adapter, reason}
-        assert inspect(reason) =~ "acp_exit"
+        catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], guidance_marker))
+
+        assert_receive {:DOWN, ^monitor, :process, ^adapter, _reason}
         Logger.flush()
       end)
 
-    assert log =~ "adapter exploded: credential socket closed"
-    refute log =~ marker
+    refute log =~ chunk_marker
+    refute log =~ guidance_marker
+    assert log =~ "State: :redacted"
+    assert log =~ ~r/Last message(?: \(from .+?\))?: :redacted/
   end
 
   test "gate wiring-check enforces one absolute deadline and serves no queued session" do

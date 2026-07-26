@@ -52,6 +52,18 @@ defmodule Tightbeam.IdentityTest do
                  end
   end
 
+  test "init tells an empty repository to be removed and re-learned", ctx do
+    dir = Path.join(ctx.base, "identity")
+    File.mkdir_p!(dir)
+    git!(dir, ["init", "-b", "main"])
+
+    assert_raise ArgumentError,
+                 "identity repository is missing required refs: main, tightbeam/upstream, tightbeam/live. Repair with: remove #{dir} and re-boot to re-learn",
+                 fn ->
+                   Identity.init!(ctx.base)
+                 end
+  end
+
   test "init verifies required refs stored only in packed-refs", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")

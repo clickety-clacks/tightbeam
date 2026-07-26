@@ -51,10 +51,14 @@ defmodule Tightbeam.Identity do
 
     if missing != [] do
       repair =
-        Enum.map_join(missing, "; ", fn
-          "main" -> "restore main from a known-good identity backup"
-          ref -> "git -C #{identity_dir} branch #{ref} main"
-        end)
+        if any_ref_exists?(identity_dir) do
+          Enum.map_join(missing, "; ", fn
+            "main" -> "restore main from a known-good identity backup"
+            ref -> "git -C #{identity_dir} branch #{ref} main"
+          end)
+        else
+          "remove #{identity_dir} and re-boot to re-learn"
+        end
 
       raise ArgumentError,
             "identity repository is missing required refs: #{Enum.join(missing, ", ")}. Repair with: #{repair}"
@@ -62,17 +66,23 @@ defmodule Tightbeam.Identity do
   end
 
   defp required_ref_exists?(identity_dir, ref) do
-    git_dir = Path.join(identity_dir, ".git")
     full_ref = "refs/heads/#{ref}"
 
-    File.regular?(Path.join(git_dir, full_ref)) ||
-      case File.read(Path.join(git_dir, "packed-refs")) do
-        {:ok, packed} ->
-          Enum.any?(String.split(packed, "\n"), &String.ends_with?(&1, " #{full_ref}"))
+    case System.cmd("git", ["rev-parse", "--verify", "--quiet", full_ref],
+           cd: identity_dir,
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      {_output, 1} -> false
+      {output, status} -> raise "git rev-parse failed (#{status}): #{String.trim(output)}"
+    end
+  end
 
-        {:error, :enoent} ->
-          false
-      end
+  defp any_ref_exists?(identity_dir) do
+    identity_dir
+    |> git_output!(["for-each-ref", "--format=%(refname)"])
+    |> String.trim()
+    |> Kernel.!=("")
   end
 
   @doc "Resolve the sole publication pointer."

@@ -139,6 +139,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       )
 
     File.write!(path, @fake)
+    stderr_path = path <> ".stderr.log"
 
     coordinator =
       start_supervised!(
@@ -149,7 +150,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              harness: :claude,
              cmd: [System.find_executable("node"), path],
              home: "/tmp",
-             cwd: "/tmp"
+             cwd: "/tmp",
+             stderr_path: stderr_path
            ]
          end,
          db: ctx.db,
@@ -159,17 +161,32 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, adapter, 1} =
              AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
 
+    assert is_pid(Tightbeam.Acp.Adapter.conn(adapter))
     ref = Process.monitor(adapter)
+    File.write!(stderr_path, "adapter transport died: credential socket closed\n")
     send(adapter, {:acp_exit, 137})
 
-    assert_receive {:DOWN, ^ref, :process, ^adapter, {:acp_exit, 137}}, 2_000
+    assert_receive {:DOWN, ^ref, :process, ^adapter,
+                    {:adapter_fault,
+                     %{
+                       reason: {:acp_exit, 137},
+                       stderr: "adapter transport died: credential socket closed"
+                     }}},
+                   2_000
 
     assert eventually(fn ->
              AdapterCoordinator.generation(coordinator, {:claude, "default", "testhost"}) == 2
            end)
 
-    assert [%{kind: "adapter_down"}] =
+    assert [
+             %{
+               kind: "adapter_down",
+               detail: detail
+             }
+           ] =
              ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
+
+    assert detail =~ "adapter transport died: credential socket closed"
   end
 
   test "adapter death bumps generation and records lifecycle", ctx do

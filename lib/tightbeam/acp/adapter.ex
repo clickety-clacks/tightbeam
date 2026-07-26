@@ -434,7 +434,9 @@ defmodule Tightbeam.Acp.Adapter do
 
   @impl GenServer
   def format_status(status) do
-    Map.put(status, :state, :redacted)
+    status
+    |> Map.put(:state, :redacted)
+    |> Map.put(:message, :redacted)
   end
 
   defp maybe_emit_account_update(state, update) do
@@ -715,14 +717,23 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp last_stderr_line(stderr_path) do
-    case File.read(stderr_path) do
-      {:ok, bytes} ->
-        bytes
-        |> String.split("\n", trim: true)
-        |> List.last()
-
-      {:error, _reason} ->
-        nil
+    with {:ok, file} <- :file.open(String.to_charlist(stderr_path), [:read, :binary]) do
+      try do
+        with {:ok, size} <- :file.position(file, :eof),
+             {:ok, _position} <- :file.position(file, max(0, size - 8_192)),
+             {:ok, bytes} <- :file.read(file, 8_192) do
+          bytes
+          |> String.split("\n", trim: true)
+          |> List.last()
+        else
+          :eof -> nil
+          {:error, _reason} -> nil
+        end
+      after
+        :file.close(file)
+      end
+    else
+      _ -> nil
     end
   end
 
@@ -738,7 +749,7 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp gate_log(path, line), do: File.write!(path, line <> "\n", [:append])
+  defp gate_log(path, line), do: File.write!(path <> ".gate.log", line <> "\n", [:append])
 
   @doc """
   Split a model ref into `{model, effort}`; effort is nil when absent.
