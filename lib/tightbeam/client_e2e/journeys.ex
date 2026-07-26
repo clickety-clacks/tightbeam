@@ -1608,16 +1608,20 @@ defmodule Tightbeam.ClientE2E.Journeys do
   # path fast; the deadline keeps a genuinely stuck indicator from hanging the
   # run instead of failing it.
   defp drain_until_settled(client, watermark, session_key, timeout_ms) do
-    drain_until_settled(client, watermark, session_key, System.monotonic_time(:millisecond) + timeout_ms)
+    # Distinct NAME for the loop, not another 4-arity clause of this function:
+    # two same-name/same-arity clauses with identical patterns mean the entry
+    # clause always matches, and this recursed forever adding a fresh deadline
+    # each time. It hung a live run for twenty minutes.
+    drain_settled_loop(client, watermark, session_key, System.monotonic_time(:millisecond) + timeout_ms)
   end
 
-  defp drain_until_settled(client, watermark, session_key, deadline) do
+  defp drain_settled_loop(client, watermark, session_key, deadline) do
     frames = SimClient.frames_since(client, watermark)
 
     cond do
       is_nil(indicator_settled_error(frames, session_key, 0)) -> client
       System.monotonic_time(:millisecond) >= deadline -> client
-      true -> drain_until_settled(SimClient.settle(client, 500), watermark, session_key, deadline)
+      true -> drain_settled_loop(SimClient.settle(client, 500), watermark, session_key, deadline)
     end
   end
 
