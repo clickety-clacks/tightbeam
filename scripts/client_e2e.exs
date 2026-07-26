@@ -81,7 +81,7 @@ defmodule ClientE2ERunner do
     # credential liveness UNKNOWN is an INCOMPLETE/blocker, never permission to
     # boot. Every step the leg would have walked is recorded as blocked rather
     # than omitted.
-    if preflight_row.status != :pass do
+    if ClientE2E.preflight_blocked?(preflight_row) do
       IO.puts("  preflight BLOCKED — leg not booted (SMOKE P3)")
       leg = ClientE2E.blocked_leg(harness, Tightbeam.Placement.local_host_name(), preflight_row)
       IO.puts("leg #{harness}: #{Scorecard.verdict_text(Scorecard.leg_verdict(leg))}")

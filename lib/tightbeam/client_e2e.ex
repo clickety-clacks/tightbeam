@@ -131,6 +131,10 @@ defmodule Tightbeam.ClientE2E do
     Scorecard.add(%Leg{harness: harness, host: host_name}, [preflight_row | blocked])
   end
 
+  @doc "Whether a preflight verdict blocks booting its client-e2e leg."
+  @spec preflight_blocked?(Scorecard.Row.t()) :: boolean()
+  def preflight_blocked?(%{status: status}), do: status != :pass
+
   @doc """
   SMOKE.md's credential PREFLIGHT for one harness leg, as an automated
   scorecard row. Runs BEFORE anything boots — the runbook is explicit that a

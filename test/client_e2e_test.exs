@@ -561,6 +561,12 @@ defmodule Tightbeam.ClientE2ETest do
   end
 
   describe "a non-passing preflight blocks the leg (SMOKE P3)" do
+    test "the runner gate blocks FAIL and INCOMPLETE but not PASS" do
+      refute ClientE2E.preflight_blocked?(Scorecard.pass("P", "auth"))
+      assert ClientE2E.preflight_blocked?(Scorecard.fail("P", "auth", "rejected"))
+      assert ClientE2E.preflight_blocked?(Scorecard.incomplete("P", "auth", "timeout"))
+    end
+
     test "every step is recorded as blocked, and the leg FAILS" do
       row = Scorecard.fail("P-x", "auth x", "OAuth session expired")
       leg = ClientE2E.blocked_leg("x", "testhost", row)
