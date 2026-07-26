@@ -36,6 +36,8 @@ defmodule Tightbeam.WorkItems do
     slateWakeId TEXT NULL,
     createdByUser TEXT NULL,
     createdBySession TEXT NULL,
+    createdInTurnSeq INTEGER NULL,
+    createdContextKnown INTEGER NOT NULL DEFAULT 0,
     createdAt INTEGER NOT NULL,
     CHECK((specRefName IS NULL) = (specRefSha256 IS NULL)),
     CHECK((createdByUser IS NOT NULL) != (createdBySession IS NOT NULL))
@@ -48,7 +50,8 @@ defmodule Tightbeam.WorkItems do
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB) do
     :ok = DB.execute(db, @ddl)
-    ensure_work_items_shape(db)
+    :ok = ensure_work_items_shape(db)
+    ensure_creation_context_columns(db)
   end
 
   @doc false
@@ -81,14 +84,16 @@ defmodule Tightbeam.WorkItems do
           case key && idempotency_item(txn, owner, key) do
             nil ->
               id = "wi_" <> Tightbeam.Id.uuid4()
+              created_in_turn_seq = running_turn_seq(txn, created_by_session)
 
               Txn.q(
                 txn,
                 """
                 INSERT INTO work_items
                   (id, title, specRefName, specRefSha256, isBug, ownerUserId,
-                   state, createdByUser, createdBySession, createdAt)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9)
+                   state, createdByUser, createdBySession, createdInTurnSeq,
+                   createdContextKnown, createdAt)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
                 """,
                 [
                   id,
@@ -99,6 +104,7 @@ defmodule Tightbeam.WorkItems do
                   owner,
                   created_by_user,
                   created_by_session,
+                  created_in_turn_seq,
                   now()
                 ]
               )
@@ -141,6 +147,19 @@ defmodule Tightbeam.WorkItems do
            [owner, key]
          ) do
       [[work_item_id]] -> work_item_id
+      [] -> nil
+    end
+  end
+
+  defp running_turn_seq(_txn, nil), do: nil
+
+  defp running_turn_seq(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+           [session_key]
+         ) do
+      [[seq]] -> seq
       [] -> nil
     end
   end
@@ -761,6 +780,23 @@ defmodule Tightbeam.WorkItems do
 
     unless has_brackets, do: rebuild_work_items(db)
     :ok
+  end
+
+  defp ensure_creation_context_columns(db) do
+    for ddl <- [
+          "ALTER TABLE work_items ADD COLUMN createdInTurnSeq INTEGER NULL",
+          "ALTER TABLE work_items ADD COLUMN createdContextKnown INTEGER NOT NULL DEFAULT 0"
+        ] do
+      case DB.query(db, ddl) do
+        {:ok, _} -> :ok
+        {:error, reason} -> if inspect(reason) =~ "duplicate column", do: :ok, else: raise(reason)
+      end
+    end
+
+    DB.execute(
+      db,
+      "CREATE INDEX IF NOT EXISTS work_items_created_in_turn ON work_items (createdInTurnSeq)"
+    )
   end
 
   defp rebuild_work_items(db) do

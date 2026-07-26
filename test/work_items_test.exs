@@ -9,6 +9,7 @@ defmodule Tightbeam.WorkItemsTest do
     EventLog,
     Gateway,
     Idempotency,
+    Ledger,
     Org,
     Roles,
     Rules,
@@ -24,7 +25,19 @@ defmodule Tightbeam.WorkItemsTest do
     db = :work_items_db
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Tightbeam.CausalEvents,Devices, Idempotency, Org, Roles, Wakes, WorkItems, Assignments, WorkState, EventLog] do
+    for module <- [
+          Tightbeam.CausalEvents,
+          Devices,
+          Idempotency,
+          Ledger,
+          Org,
+          Roles,
+          Wakes,
+          WorkItems,
+          Assignments,
+          WorkState,
+          EventLog
+        ] do
       :ok = module.ensure_schema(db)
     end
 
@@ -85,6 +98,8 @@ defmodule Tightbeam.WorkItemsTest do
              "slateWakeId",
              "createdByUser",
              "createdBySession",
+             "createdInTurnSeq",
+             "createdContextKnown",
              "createdAt"
            ]
 
@@ -142,6 +157,90 @@ defmodule Tightbeam.WorkItemsTest do
     assert session.specRefName == "spec.md"
     assert session.specRefSha256 == @sha
     assert session.isBug
+  end
+
+  test "Proof 1: an item created during a running turn carries that seq with known = 1; created with no running turn carries NULL with known = 1",
+       ctx do
+    running_seq = running_turn!(ctx.db, "holder")
+    during = create(ctx, {:session, "holder"}, %{title: "During turn"})
+
+    assert {:ok, [[^running_seq, 1]]} =
+             creation_context(ctx.db, during.id)
+
+    :ok = Ledger.finish(ctx.db, running_seq, "delivered")
+    idle = create(ctx, {:session, "holder"}, %{title: "No running turn"})
+
+    assert {:ok, [[nil, 1]]} = creation_context(ctx.db, idle.id)
+  end
+
+  test "Proof 3: a bracket-turn create (jobRef, no assignment) stamps the turn", ctx do
+    running_seq = running_turn!(ctx.db, "holder", job_ref: "wi_bracket")
+    item = create(ctx, {:session, "holder"}, %{title: "Bracket create"})
+
+    assert {:ok, [[^running_seq, nil, "wi_bracket"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT w.createdInTurnSeq, t.assignmentId, t.jobRef
+               FROM work_items AS w
+               JOIN turns AS t ON t.seq = w.createdInTurnSeq
+               WHERE w.id = ?1
+               """,
+               [item.id]
+             )
+  end
+
+  test "Proof 4: migration uses two additive columns, existing rows land known = 0, and createdInTurnSeq is indexed" do
+    db = :"c1_migration_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: db,
+      start: {DB, :start_link, [[path: ":memory:", name: db]]}
+    })
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        CREATE TABLE work_items (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 2000),
+          specRefName TEXT NULL,
+          specRefSha256 TEXT NULL,
+          isBug INTEGER NOT NULL DEFAULT 0,
+          ownerUserId TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','iceboxed','closed','failed')),
+          failReason TEXT NULL,
+          routingWakeId TEXT NULL,
+          slateWakeId TEXT NULL,
+          createdByUser TEXT NULL,
+          createdBySession TEXT NULL,
+          createdAt INTEGER NOT NULL
+        );
+        INSERT INTO work_items
+          (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES ('wi_legacy', 'legacy', 'flynn', 'flynn', 1);
+        """
+      )
+
+    :ok = WorkItems.ensure_schema(db)
+
+    assert {:ok, [[nil, 0]]} = creation_context(db, "wi_legacy")
+
+    assert {:ok, indexes} = DB.query(db, "PRAGMA index_list(work_items)")
+
+    assert Enum.any?(indexes, fn [_seq, name | _] ->
+             name == "work_items_created_in_turn"
+           end)
+  end
+
+  test "Proof 5: a cancel-then-arriving create lands known = 1, seq = NULL", ctx do
+    running_seq = running_turn!(ctx.db, "holder")
+    :ok = Ledger.finish(ctx.db, running_seq, "canceled")
+
+    item = create(ctx, {:session, "holder"}, %{title: "Arrived after cancel"})
+
+    assert {:ok, [[nil, 1]]} = creation_context(ctx.db, item.id)
   end
 
   test "update implements the complete PATCH matrix", ctx do
@@ -347,6 +446,29 @@ defmodule Tightbeam.WorkItemsTest do
 
   defp create(ctx, principal, params),
     do: WorkItems.__handle__(ctx.db, "work-item-create", create_call(principal, params))
+
+  defp creation_context(db, work_item_id) do
+    DB.query(
+      db,
+      "SELECT createdInTurnSeq, createdContextKnown FROM work_items WHERE id = ?1",
+      [work_item_id]
+    )
+  end
+
+  defp running_turn!(db, session_key, opts \\ []) do
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: "m_#{System.unique_integer([:positive])}",
+        origin: "user:test",
+        prompt: "create work",
+        assignment_id: Keyword.get(opts, :assignment_id),
+        job_ref: Keyword.get(opts, :job_ref)
+      })
+
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test-owner")
+    seq
+  end
 
   defp update(ctx, principal, id, patch),
     do: WorkItems.__handle__(ctx.db, "work-item-update", update_call(principal, id, patch))

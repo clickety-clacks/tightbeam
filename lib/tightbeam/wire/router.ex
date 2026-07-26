@@ -814,7 +814,10 @@ defmodule Tightbeam.Wire.Router do
   # blanket strip breaks all of those (the CLI round-trip suite proves it), so the
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
-  @substrate_only_params %{"wake" => ~w(assignment_id)a}
+  @substrate_only_params %{
+    "wake" => ~w(assignment_id)a,
+    "work-item-create" => ~w(created_in_turn_seq created_context_known)a
+  }
 
   @doc false
   # Exposed so the Law-0 boundary strip is provable at its own seam.

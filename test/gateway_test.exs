@@ -1,5 +1,6 @@
 defmodule Tightbeam.GatewayTest do
   use Tightbeam.TestCase, async: false
+  import ExUnit.CaptureLog
 
   alias Tightbeam.{
     Adjudication,
@@ -731,6 +732,68 @@ defmodule Tightbeam.GatewayTest do
     assert first["cliToken"] == second["cliToken"]
     assert second["port"] == 5_432
     assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
+  end
+
+  test "Proof 5: the boot audit logs conflicts without mutating and terminates on a synthetic cycle",
+       ctx do
+    first_item = create_work_item(ctx.db, "Audit reviewed")
+    second_item = create_work_item(ctx.db, "Audit conflict")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO assignments
+          (id, subject, holderKey, openedByUser, openedAt, workItemId)
+        VALUES
+          ('asg_audit_target', 'target', 'k1', 'flynn', 1, '#{first_item.id}'),
+          ('asg_audit_conflict', 'conflict', 'k1', 'flynn', 2, '#{second_item.id}');
+        UPDATE assignments
+        SET reviewsAssignmentId = 'asg_audit_target'
+        WHERE id = 'asg_audit_conflict';
+
+        INSERT INTO assignments
+          (id, subject, holderKey, openedByUser, openedAt)
+        VALUES
+          ('asg_cycle_a', 'cycle a', 'k1', 'flynn', 3),
+          ('asg_cycle_b', 'cycle b', 'k1', 'flynn', 4);
+        UPDATE assignments SET reviewsAssignmentId = 'asg_cycle_b' WHERE id = 'asg_cycle_a';
+        UPDATE assignments SET reviewsAssignmentId = 'asg_cycle_a' WHERE id = 'asg_cycle_b';
+        """
+      )
+
+    {:ok, before_rows} =
+      DB.query(
+        ctx.db,
+        """
+        SELECT id, workItemId, reviewsAssignmentId
+        FROM assignments
+        WHERE id LIKE 'asg_audit_%' OR id LIKE 'asg_cycle_%'
+        ORDER BY id
+        """
+      )
+
+    base_dir = role_test_base("review-item-audit")
+
+    log =
+      capture_log(fn ->
+        Gateway.children(gateway_config(base_dir, ctx.db, 0))
+      end)
+
+    assert log =~ "review_item_conflict legacy assignment=asg_audit_conflict"
+    assert log =~ "workItemId=#{second_item.id}"
+    assert log =~ "reviewedWorkItemId=#{inspect(first_item.id)}"
+
+    assert {:ok, ^before_rows} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT id, workItemId, reviewsAssignmentId
+               FROM assignments
+               WHERE id LIKE 'asg_audit_%' OR id LIKE 'asg_cycle_%'
+               ORDER BY id
+               """
+             )
   end
 
   test "children mints a cli token when gateway.json is missing", ctx do
@@ -4334,6 +4397,16 @@ defmodule Tightbeam.GatewayTest do
       harness: "claude",
       provider: "anthropic",
       model: "fable"
+    })
+  end
+
+  defp create_work_item(db, title) do
+    WorkItems.__handle__(db, "work-item-create", %{
+      verb: "work-item-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{title: title}
     })
   end
 

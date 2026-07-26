@@ -183,6 +183,8 @@ defmodule Tightbeam.Gateway do
       :ok = module.ensure_schema(db)
     end
 
+    :ok = Assignments.audit_review_item_conflicts(db)
+
     :ok = Adjudication.reconcile(db)
 
     :ok =
