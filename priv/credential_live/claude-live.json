@@ -1,0 +1,41 @@
+{
+  "recorded_at": "2026-07-26",
+  "request": {
+    "method": "GET",
+    "url": "https://api.anthropic.com/v1/models?limit=1",
+    "source": "claude-cli 2.1.220",
+    "sanitized": true
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "data": [
+        {
+          "type": "model",
+          "id": "recorded-model",
+          "display_name": "Recorded Model",
+          "created_at": "2026-07-26T00:00:00Z",
+          "max_input_tokens": 1000000,
+          "max_tokens": 128000,
+          "capabilities": {
+            "batch": {"supported": true},
+            "citations": {"supported": true},
+            "code_execution": {"supported": true},
+            "context_management": {"supported": true},
+            "effort": {"supported": true},
+            "image_input": {"supported": true},
+            "pdf_input": {"supported": true},
+            "structured_outputs": {"supported": true},
+            "thinking": {"supported": true}
+          }
+        }
+      ],
+      "has_more": true,
+      "first_id": "recorded-model",
+      "last_id": "recorded-model"
+    }
+  }
+}

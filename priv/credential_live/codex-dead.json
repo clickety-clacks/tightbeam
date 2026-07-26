@@ -1,0 +1,18 @@
+{
+  "recorded_at": "2026-07-26",
+  "request": {
+    "method": "GET",
+    "url": "https://chatgpt.com/backend-api/wham/accounts/check",
+    "source": "codex-cli 0.145.0",
+    "sanitized": false
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "detail": "Could not parse your authentication token. Please try signing in again."
+    }
+  }
+}

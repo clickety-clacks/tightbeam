@@ -23,6 +23,8 @@ defmodule Tightbeam.Harness do
   @type target :: map()
   @type launch_plan :: keyword()
   @type desired_home :: map()
+  @type credential_liveness ::
+          :live | {:dead, term()} | {:unknown, term()}
 
   @callback id() :: atom()
   @callback wire_name() :: String.t()
@@ -36,6 +38,7 @@ defmodule Tightbeam.Harness do
   @callback materialize_skills(target(), String.t(), map()) :: map()
   @callback credential_ready?(target(), String.t()) :: boolean()
   @callback harvest_credential(target(), String.t()) :: binary() | nil
+  @callback credential_live?(target(), String.t(), keyword()) :: credential_liveness()
   @callback install_cli_projection(String.t()) :: :ok
   @callback probe_cli(target()) ::
               {:ok, %{bin: String.t(), version: String.t()}}

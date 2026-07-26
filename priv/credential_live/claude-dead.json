@@ -1,0 +1,23 @@
+{
+  "recorded_at": "2026-07-26",
+  "request": {
+    "method": "GET",
+    "url": "https://api.anthropic.com/v1/models?limit=1",
+    "source": "claude-cli 2.1.220",
+    "sanitized": true
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "authentication_error",
+        "message": "Invalid bearer token"
+      },
+      "request_id": "recorded-request"
+    }
+  }
+}

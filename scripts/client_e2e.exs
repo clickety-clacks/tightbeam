@@ -77,11 +77,12 @@ defmodule ClientE2ERunner do
     preflight_row = ClientE2E.preflight(harness, base_dir)
     IO.puts("  preflight #{preflight_row.step}: #{preflight_row.status}")
 
-    # SMOKE P3: a preflight FAIL blocks the leg. Nothing boots, no journey runs,
-    # and every step it would have walked is recorded as blocked rather than
-    # omitted.
-    if preflight_row.status == :fail do
-      IO.puts("  preflight FAILED — leg blocked, gateway not booted (SMOKE P3)")
+    # SMOKE P3: anything other than PASS blocks the leg. In particular,
+    # credential liveness UNKNOWN is an INCOMPLETE/blocker, never permission to
+    # boot. Every step the leg would have walked is recorded as blocked rather
+    # than omitted.
+    if ClientE2E.preflight_blocked?(preflight_row) do
+      IO.puts("  preflight BLOCKED — leg not booted (SMOKE P3)")
       leg = ClientE2E.blocked_leg(harness, Tightbeam.Placement.local_host_name(), preflight_row)
       IO.puts("leg #{harness}: #{Scorecard.verdict_text(Scorecard.leg_verdict(leg))}")
       File.rm_rf(base_dir)

@@ -107,6 +107,10 @@ defmodule Tightbeam.Harness.Fixture do
     do: Tightbeam.Homes.harvest_credential(target, home, "fixture.json")
 
   @impl true
+  def credential_live?(_target, _home, _opts),
+    do: {:unknown, :no_cheap_authenticated_probe}
+
+  @impl true
   def install_cli_projection(_cli_bin), do: :ok
 
   @impl true
@@ -171,6 +175,7 @@ defmodule Tightbeam.Harness.Fixture do
       home_scope: wire_name(),
       home_env: "FIXTURE_HOME",
       credential_file: "fixture.json",
+      credential_live: :unsupported,
       rails_file: "fixture.rails",
       rails: %{"fixture" => true},
       skills_path: Path.join([".fixture", "skills"]),
