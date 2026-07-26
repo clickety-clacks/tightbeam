@@ -156,16 +156,72 @@ defmodule Tightbeam.Dispatch do
             {:error, error}
 
           {:returned, result} ->
-            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, result, principal)
+            payload = outcome_payload(verb, call, {:returned, result})
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
             {:ok, result}
 
           {:raised, exception} ->
             error = %{code: "server_error", message: Exception.message(exception)}
-            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, error, principal)
+            payload = outcome_payload(verb, call, {:raised, exception})
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
             {:error, error}
         end
     end
   end
+
+  # Verbs whose RESULT must not be duplicated into observability. A closed set,
+  # like the handler table. `events.payload` is write-only observability at the
+  # application seam and an agent on the gateway host can read the database
+  # directly, so this is not secret-keeping: it prevents UNBOUNDED STORAGE GROWTH
+  # (a second copy of every transcript on every read, plus content in crash rows)
+  # and keeps the trail to WHAT was read rather than WHAT was returned.
+  #
+  # ADDING THE SECOND VERB: `elided_count/1` defines N as the summed length of the
+  # result's top-level lists. That is exactly the entry/candidate count for a verb
+  # whose result carries ONE page list. A verb returning two lists would have them
+  # summed, and one returning none would report 0 — so a second member either
+  # accepts that meaning of N or brings its own counter.
+  @result_elided ~w(transcript)
+
+  # The CALL is audited with its params — that IS the access trail — and the
+  # RESULT is replaced by a count. Denials are NOT elided: an error map is useful
+  # audit and carries no transcript.
+  #
+  # A crash is elided too, and its PAYLOAD never carries `Exception.message/1`: an
+  # exception message is an uncontrolled channel for whatever the handler was
+  # holding (a MatchError renders `inspect(term)`), so a raise mid-read would
+  # otherwise write message content verbatim into durable storage. That is why
+  # elision keys on the classified handler OUTCOME, not on the event kind.
+  #
+  # SCOPE, stated exactly: the caller's returned error above IS built with
+  # `Exception.message/1`, so it can carry the term the handler held. That is
+  # deliberate and unchanged — the caller just passed authorization for those very
+  # rows, so it is content they were entitled to read, and narrowing it is a
+  # behavior change no spec here authorizes. Elision governs the audit row only.
+  defp outcome_payload(verb, call, outcome) do
+    if verb in @result_elided do
+      elided = %{elided: true, params: Map.get(call, :params, %{})}
+
+      case outcome do
+        {:returned, result} -> Map.put(elided, :count, elided_count(result))
+        {:raised, _exception} -> Map.merge(elided, %{crash: true, code: "server_error"})
+      end
+    else
+      case outcome do
+        {:returned, result} -> result
+        {:raised, exception} -> %{code: "server_error", message: Exception.message(exception)}
+      end
+    end
+  end
+
+  # An elided read returns a page, and the page is the only top-level list it
+  # carries — so the count needs no per-verb knowledge of which key holds it. See
+  # the note on `@result_elided` before adding a second member.
+  defp elided_count(result) when is_map(result) do
+    result |> Map.values() |> Enum.filter(&is_list/1) |> Enum.map(&length/1) |> Enum.sum()
+  end
+
+  defp elided_count(_result), do: 0
 
   defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do

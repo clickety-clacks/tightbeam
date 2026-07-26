@@ -694,6 +694,7 @@ defmodule Tightbeam.Gateway do
       end,
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
       "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
+      "transcript" => fn call -> Tightbeam.Transcript.read(db, call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
