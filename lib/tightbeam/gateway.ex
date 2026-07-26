@@ -64,6 +64,7 @@ defmodule Tightbeam.Gateway do
     Archetypes,
     Artifacts,
     Assignments,
+    CausalEvents,
     ConditionFacts,
     CriticalLeases,
     Placement,
@@ -102,6 +103,16 @@ defmodule Tightbeam.Gateway do
   defmodule EffortRearmRace do
     @moduledoc false
     defexception message: "effort rearm snapshot changed"
+  end
+
+  defmodule HealLost do
+    @moduledoc false
+    defexception message: "a human ruling already owns this adjudication episode"
+  end
+
+  defmodule AdjudicationSuperseded do
+    @moduledoc false
+    defexception message: "an adapter heal already resolved this adjudication episode"
   end
 
   @typedoc "Gateway config (gateway.ts GatewayConfig)."
@@ -149,6 +160,7 @@ defmodule Tightbeam.Gateway do
     for module <- [
           Tightbeam.Assets,
           Artifacts,
+          CausalEvents,
           Adjudication,
           Devices,
           Idempotency,
@@ -262,6 +274,20 @@ defmodule Tightbeam.Gateway do
         adapter_coordinator: Tightbeam.AdapterCoordinator
       })
 
+    # EDGE half of the heal trigger. Off the coordinator's process: the sweep
+    # opens transactions and broadcasts, and the coordinator must never block on
+    # either (adapter checkouts queue behind it). Idempotence is durable — one
+    # probe per (hold, token) — so an at-least-once, unordered invocation is safe.
+    heal_config = Map.put(config, :db, db)
+
+    on_adapter_ready = fn key_name, token ->
+      Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+        adapter_healed(heal_config, db, Adjudication.adapter_fault_cause_for_name(key_name), token)
+      end)
+
+      :ok
+    end
+
     deliver = fn wake ->
       case wake.target_role do
         role when is_binary(role) ->
@@ -323,6 +349,7 @@ defmodule Tightbeam.Gateway do
          adapter_sup: Tightbeam.AdapterSupervisor,
          adapter_opts: adapter_opts,
          db: db,
+         on_adapter_ready: on_adapter_ready,
          name: Tightbeam.AdapterCoordinator},
         {Tightbeam.LaneManager,
          db: db,
@@ -558,7 +585,8 @@ defmodule Tightbeam.Gateway do
         %{
           decision_requests:
             Escalation.list(db, call, call.params[:status] || "open",
-              owner_user_id: caller && caller.owner_user_id
+              owner_user_id: caller && caller.owner_user_id,
+              admin: admin_origin?(db, call.origin)
             )
         }
       end,
@@ -566,7 +594,10 @@ defmodule Tightbeam.Gateway do
         caller = resolve_caller(db, call.origin)
         id = call.params[:request_id] || call.params[:request]
 
-        case Escalation.get(db, call, id, owner_user_id: caller && caller.owner_user_id) do
+        case Escalation.get(db, call, id,
+               owner_user_id: caller && caller.owner_user_id,
+               admin: admin_origin?(db, call.origin)
+             ) do
           nil -> %{code: "not_found", message: "decision request not found"}
           request -> %{decision_request: request}
         end
@@ -843,33 +874,49 @@ defmodule Tightbeam.Gateway do
 
       {nil, nil} ->
         case opts[:wake_id] do
-          wake_id when is_binary(wake_id) ->
-            case DB.Txn.q(
-                   txn,
-                   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'work_items'",
-                   []
-                 ) do
-              [[1]] ->
-                case DB.Txn.q(
-                       txn,
-                       "SELECT id FROM work_items WHERE routingWakeId = ?1",
-                       [wake_id]
-                     ) do
-                  [[job_ref]] -> {nil, job_ref}
-                  [] -> {nil, nil}
-                end
-
-              [] ->
-                {nil, nil}
-            end
-
-          nil ->
-            {nil, nil}
+          wake_id when is_binary(wake_id) -> wake_attribution(txn, wake_id)
+          nil -> {nil, nil}
         end
 
       attribution ->
         attribution
     end
+  end
+
+  # A wake-delivered turn inherits its wake's carriers — the same rule every
+  # other carrier follows. This is what CLOSES v1's prod-turn exclusion ("no
+  # durable carrier"): supervision now stamps wakes.assignmentId, so the prod
+  # turn is attributable, and jobRef follows from the assignment. A bracket wake
+  # has no assignment and keeps resolving its jobRef from the work item.
+  defp wake_attribution(txn, wake_id) do
+    assignment_id =
+      case DB.Txn.q(txn, "SELECT assignmentId FROM wakes WHERE wakeId = ?1", [wake_id]) do
+        [[assignment_id]] -> assignment_id
+        [] -> nil
+      end
+
+    cond do
+      is_binary(assignment_id) ->
+        case DB.Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
+          [[job_ref]] -> {assignment_id, job_ref}
+          [] -> {assignment_id, nil}
+        end
+
+      table?(txn, "work_items") ->
+        case DB.Txn.q(txn, "SELECT id FROM work_items WHERE routingWakeId = ?1", [wake_id]) do
+          [[job_ref]] -> {nil, job_ref}
+          [] -> {nil, nil}
+        end
+
+      true ->
+        {nil, nil}
+    end
+  end
+
+  defp table?(txn, name) do
+    DB.Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name]) == [
+      [1]
+    ]
   end
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
@@ -1173,18 +1220,25 @@ defmodule Tightbeam.Gateway do
         )
       end
 
+      # The failure's STAGE is what classifies its cause; the reason itself is
+      # passed through byte-for-byte (it is the chat bubble and the turn row).
+      adapter_key = adapter_key(session)
+
       outcome =
         with {:ok, adapter, generation} <-
-               checkout_adapter(session),
+               stage(:checkout, checkout_adapter(session)),
              {:ok, harness_session_id} <-
-               harness_session(config, db, adapter, generation, session, turn.seq),
+               stage(:session, harness_session(config, db, adapter, generation, session, turn.seq)),
              {:ok, result} <-
-               Adapter.prompt(
-                 adapter,
-                 harness_session_id,
-                 turn.prompt,
-                 600_000,
-                 progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
+               stage(
+                 :prompt,
+                 Adapter.prompt(
+                   adapter,
+                   harness_session_id,
+                   turn.prompt,
+                   600_000,
+                   progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
+                 )
                ) do
           case Projection.append(db, %{
                  session_key: turn.session_key,
@@ -1200,8 +1254,9 @@ defmodule Tightbeam.Gateway do
 
           {:ok, %{terminal_publish: terminal_publish}}
         else
-          {:error, reason} ->
+          {:error, {failed_stage, reason}} ->
             condition = Adjudication.classify(reason)
+            cause = adjudication_cause(failed_stage, reason, adapter_key)
             adjudication_prompt = adjudication_brief(session, condition)
 
             failure_publish = fn _terminal ->
@@ -1246,7 +1301,10 @@ defmodule Tightbeam.Gateway do
               episode_opts = [
                 claim_window_ms: Map.get(config, :adjudication_claim_window_ms, 300_000),
                 reresolve_seed: turn.session_key,
-                reresolve_rung: 1
+                reresolve_rung: 1,
+                cause: cause,
+                failing_wake_id: turn.wake_id,
+                failing_seq: turn.seq
               ]
 
               episode =
@@ -1279,6 +1337,13 @@ defmodule Tightbeam.Gateway do
                terminal_publish: failure_publish,
                adjudicate_in_txn: adjudicate_in_txn,
                post_commit: fn ->
+                 # LEVEL half of the heal trigger. Reading readiness AFTER the
+                 # hold commits is what closes the lost-edge window: a ready
+                 # that fired before the hold existed (so the edge sweep saw
+                 # nothing to sweep) is still observed here. It runs post-commit
+                 # rather than in the transaction because the coordinator writes
+                 # to the DB, and the txn body executes inside the DB owner.
+                 heal_level_check(config, db, turn.session_key, cause, adapter_key)
                  Wakes.fire_due(config[:wake_scheduler] || Tightbeam.WakeScheduler)
                end
              }}
@@ -1287,6 +1352,32 @@ defmodule Tightbeam.Gateway do
       outcome
     end
   end
+
+  defp stage(stage, {:error, reason}), do: {:error, {stage, reason}}
+  defp stage(_stage, result), do: result
+
+  # Which failures the adapter's own recovery can release, and which are genuine
+  # decisions a human owns (spec s4-operability-v1 §2.1). A cause outside these
+  # two classes stays NULL — indistinguishable from a legacy hold, and equally
+  # never swept.
+  defp adjudication_cause(:checkout, _reason, key), do: Adjudication.adapter_fault_cause(key)
+
+  defp adjudication_cause(:session, {:adapter_unavailable, _reason}, key),
+    do: Adjudication.adapter_fault_cause(key)
+
+  defp adjudication_cause(:session, {:model_apply_failed, _reason}, _key), do: "model_decision"
+
+  defp adjudication_cause(:prompt, reason, key) when reason in [:closed, :prompt_dispatch_failed],
+    do: Adjudication.adapter_fault_cause(key)
+
+  # The adapter died mid-turn (or stopped answering). A runtime adapter fault,
+  # and heal-eligible: the replacement adapter's ready event releases the hold.
+  defp adjudication_cause(:prompt, {:adapter_unavailable, _reason}, key),
+    do: Adjudication.adapter_fault_cause(key)
+
+  defp adjudication_cause(_stage, _reason, _key), do: nil
+
+  defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
   defp adjudication_brief(session, condition) do
     archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
@@ -1570,6 +1661,13 @@ defmodule Tightbeam.Gateway do
                   {:error, {:model_apply_failed, _reason}} = error ->
                     error
 
+                  # An adapter that could not answer has NOT told us the harness
+                  # lost the session; falling back would forfeit the model
+                  # context over an adapter fault and record a false
+                  # pointer_fallback.
+                  {:error, {:adapter_unavailable, _reason}} = error ->
+                    error
+
                   {:error, lost} ->
                     # Spec §pointer chain: reason "fallback" — the harness lost
                     # the session; start fresh, on the record, model context
@@ -1603,11 +1701,43 @@ defmodule Tightbeam.Gateway do
           end
       end
 
-    with {:ok, sid} <- result do
-      :ok = Ledger.stamp_adapter(db, turn_seq, generation)
-      {:ok, sid}
+    case enrich_adapter_unavailable(config, result, adapter_key(session), generation) do
+      {:ok, sid} ->
+        :ok = Ledger.stamp_adapter(db, turn_seq, generation)
+        {:ok, sid}
+
+      error ->
+        error
     end
   end
+
+  # `:noproc` means the adapter died before this call went out, so the call
+  # itself carries no reason — the coordinator's record of that death does.
+  # Without this, a fast-failing boot reaches the turn as an unactionable
+  # ":noproc" (spec s4-operability-v1 §Defect 1: the reason must name the
+  # spawn error).
+  defp enrich_adapter_unavailable(config, {:error, {:adapter_unavailable, :noproc}}, key, generation) do
+    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+
+    # ATTEMPT-SCOPED: ask only for the death of the generation this turn checked
+    # out. If the coordinator has not yet processed that :DOWN — or the record
+    # belongs to a PREVIOUS attempt — we get nil and report the generic reason.
+    # Mislabelling a new death with its predecessor's reason would be worse than
+    # saying less (cross-review F4).
+    reason =
+      case AdapterCoordinator.last_failure(coordinator, key, generation) do
+        nil -> "adapter is not running"
+        failure -> Adapter.failure_text(failure)
+      end
+
+    {:error, {:adapter_unavailable, reason}}
+  rescue
+    _ -> {:error, {:adapter_unavailable, "adapter is not running"}}
+  catch
+    :exit, _ -> {:error, {:adapter_unavailable, "adapter is not running"}}
+  end
+
+  defp enrich_adapter_unavailable(_config, result, _key, _generation), do: result
 
   defp served_snapshot(config, session, harness, revision) do
     snapshot =
@@ -2292,9 +2422,22 @@ defmodule Tightbeam.Gateway do
       creator_session_key: creator_session_key(call[:principal]),
       reresolve: p[:reresolve],
       reresolve_seed: p[:reresolve_seed],
-      reresolve_rung: p[:reresolve_rung]
+      reresolve_rung: p[:reresolve_rung],
+      # SUBSTRATE-ONLY carrier. `wake` is an agent-callable verb, so an arbitrary
+      # params value here would let an agent stamp a conversational wake with any
+      # assignment and have delivery promote that forged carrier into the turn and
+      # the trace — agent-authored attribution, which Law 0 forbids (F6). Only the
+      # substrate's own principal may set it; the router reserves
+      # process:tightbeam, so it cannot be claimed over the wire. Conversational
+      # and owner wakes stay NULL, as the spec requires.
+      assignment_id: substrate_assignment_id(call)
     })
   end
+
+  defp substrate_assignment_id(%{principal: {:process, "tightbeam"}} = call),
+    do: call.params[:assignment_id]
+
+  defp substrate_assignment_id(_call), do: nil
 
   defp creator_session_key({:session, key}), do: key
   defp creator_session_key(_principal), do: nil
@@ -3216,6 +3359,12 @@ defmodule Tightbeam.Gateway do
 
     cond do
       is_nil(episode) or episode.status != "notified" ->
+        # The other direction of the heal-vs-ruling race: this ruling lost to an
+        # adapter heal that already resolved the episode. It is an acknowledged
+        # no-op, not a silent one.
+        if episode && episode.heal_token,
+          do: log_superseded(db, episode, call.params[:action])
+
         %{code: "denied", message: "stale or unknown adjudication episode"}
 
       caller_key != episode.owner_target ->
@@ -3233,19 +3382,69 @@ defmodule Tightbeam.Gateway do
   end
 
   defp adjudicate_action(config, db, call, episode) do
-    case call.params.action do
-      "park" -> adjudicate_park(config, db, call, episode)
-      "swap" -> adjudicate_swap(config, db, call, episode)
-      "respawn" -> adjudicate_respawn(config, db, call, episode)
-      "stop" -> adjudicate_stop(config, db, call, episode)
+    action = fn ->
+      case call.params.action do
+        "park" -> adjudicate_park(config, db, call, episode)
+        "swap" -> adjudicate_swap(config, db, call, episode)
+        "respawn" -> adjudicate_respawn(config, db, call, episode)
+        "stop" -> adjudicate_stop(config, db, call, episode)
+      end
     end
+
+    # A ruling validated as `notified` can still lose to an adapter heal before
+    # its action transaction commits (the inverse TOCTOU of the heal's own CAS).
+    # That is an acknowledged no-op, not a crash: the transaction already rolled
+    # back, so nothing partial survives, and the caller gets the same denial it
+    # would have got a millisecond earlier (F3).
+    try do
+      action.()
+    rescue
+      AdjudicationSuperseded ->
+        log_superseded(db, episode, call.params[:action])
+        %{code: "denied", message: "stale or unknown adjudication episode"}
+    end
+  end
+
+  # DB.transaction CATCHES a raise and RETURNS {:error, exception} — it does not
+  # propagate. A superseded ruling therefore arrives here as a RETURN VALUE, and a
+  # hard {:ok, _} match on it is a MatchError that crashes the wire call instead of
+  # denying the ruling (cross-review round 2, F3). Re-raising OUTSIDE the
+  # transaction is what puts it in reach of adjudicate_action's rescue; the
+  # transaction has already rolled back, so nothing partial survives.
+  defp ruling_transaction(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> {:ok, result}
+      {:error, %AdjudicationSuperseded{} = superseded} -> raise superseded
+      {:error, error} -> raise error
+    end
+  end
+
+  # `resolved` with a healToken means a heal won; anything else is the ordinary
+  # stale-correlation case the ruling paths have always raised on.
+  defp superseded_or_stale(%{status: "resolved", heal_token: token}) when not is_nil(token),
+    do: %AdjudicationSuperseded{}
+
+  defp superseded_or_stale(_episode), do: RuntimeError.exception("stale adjudication episode")
+
+  defp log_superseded(db, episode, action) do
+    EventLog.lifecycle(
+      db,
+      "adjudication_ruling_superseded",
+      episode.session_key,
+      JSON.encode!(%{
+        episodeId: episode.episode_id,
+        cause: episode.cause,
+        healToken: episode.heal_token,
+        action: action
+      })
+    )
   end
 
   defp adjudicate_stop(config, db, call, episode) do
     session = Org.get(db, episode.session_key)
 
     {:ok, result} =
-      DB.transaction(db, fn txn ->
+      ruling_transaction(db, fn txn ->
         current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
         if current && Adjudication.resolve_in_txn(txn, current) do
@@ -3270,7 +3469,7 @@ defmodule Tightbeam.Gateway do
 
           result
         else
-          raise "stale adjudication episode"
+          raise superseded_or_stale(current)
         end
       end)
 
@@ -3304,7 +3503,7 @@ defmodule Tightbeam.Gateway do
     scope = session.harness <> ":" <> session.identity_name
 
     {:ok, {wake_id, delivery}} =
-      DB.transaction(db, fn txn ->
+      ruling_transaction(db, fn txn ->
         current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
         wake =
@@ -3341,11 +3540,7 @@ defmodule Tightbeam.Gateway do
 
           delivery =
             if already_recovered do
-              Txn.q(
-                txn,
-                "UPDATE wakes SET state='canceled' WHERE wakeId=?1 AND state='pending'",
-                [wake.wake_id]
-              )
+              Wakes.cancel_pending_in_txn(txn, wake.wake_id)
 
               delivered =
                 deliver_prompt_in_txn(
@@ -3363,7 +3558,7 @@ defmodule Tightbeam.Gateway do
 
           {wake.wake_id, delivery}
         else
-          raise "stale adjudication episode"
+          raise superseded_or_stale(current)
         end
       end)
 
@@ -3384,7 +3579,7 @@ defmodule Tightbeam.Gateway do
         case strict_apply_current_model(db, session, call.params.model) do
           :ok ->
             {:ok, {delivery, wake_id}} =
-              DB.transaction(db, fn txn ->
+              ruling_transaction(db, fn txn ->
                 current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
                 recovery_prompt =
@@ -3411,7 +3606,7 @@ defmodule Tightbeam.Gateway do
                 end
 
                 unless Adjudication.resolve_in_txn(txn, current, wake_id),
-                  do: raise("stale adjudication episode")
+                  do: raise(superseded_or_stale(current))
 
                 delivery =
                   deliver_prompt_in_txn(
@@ -3589,7 +3784,7 @@ defmodule Tightbeam.Gateway do
           )
 
           unless Adjudication.resolve_in_txn(txn, current, wake_id),
-            do: raise("stale adjudication episode")
+            do: raise(superseded_or_stale(current))
 
           delivery =
             deliver_prompt_in_txn(
@@ -3628,6 +3823,9 @@ defmodule Tightbeam.Gateway do
         {:error, %EffortRearmRace{}} ->
           adjudicate_respawn(config, db, call, episode, attempts - 1)
 
+        {:error, %AdjudicationSuperseded{} = superseded} ->
+          raise superseded
+
         {:error, error} ->
           raise error
 
@@ -3663,6 +3861,128 @@ defmodule Tightbeam.Gateway do
     else
       {:error, error} -> error
     end
+  end
+
+  @doc """
+  Auto-release every session held on an adapter fault for `cause`, because that
+  adapter is ready again at `token` (spec s4-operability-v1 §2 — dark factory: no
+  operator verb exists for this). Idempotent: one probe per (hold, token), so a
+  replayed ready event does nothing.
+
+  The EDGE trigger (a ready event) calls this for all held sessions; the LEVEL
+  trigger (a hold committing while the adapter is already ready) calls it for one.
+  """
+  @spec adapter_healed(map(), DB.server(), String.t(), AdapterCoordinator.heal_token(), keyword()) ::
+          :ok
+  def adapter_healed(config, db, cause, token, opts \\ []) do
+    encoded = AdapterCoordinator.encode_token(token)
+    only = Keyword.get(opts, :session_key)
+
+    Adjudication.heal_candidates(db, cause, token)
+    |> Enum.filter(fn {session_key, _condition} -> is_nil(only) or session_key == only end)
+    |> Enum.each(fn {session_key, condition} ->
+      release_hold(config, db, session_key, condition, cause, encoded)
+    end)
+
+    :ok
+  end
+
+  # ONE atomic transition per held session: resolve the episode, dispose the
+  # owner wake, create the probe wake AND its turn, and narrow the hold
+  # '*' → probeWakeId. The hold narrowing is the CAS that decides every race —
+  # a human ruling that got there first armed its own recovery hold, so '*' no
+  # longer matches and this transition loses cleanly.
+  defp release_hold(config, db, session_key, condition, cause, encoded_token) do
+    result =
+      DB.transaction(db, fn txn ->
+        # The DB is one serialized writer under BEGIN IMMEDIATE, so reading and
+        # then writing in the same transaction IS the compare-and-swap. BOTH
+        # guards are read before any write, so a loser leaves nothing behind:
+        # the session must still be held WIDE, and the episode must still be in a
+        # state a heal may take. A human ruling that resolved the episode is NOT
+        # such a state, and a delayed park leaves the hold wide while doing
+        # exactly that — so the hold alone is not a sufficient guard (F3).
+        held? = Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [session_key])
+        episode = Adjudication.get_in_txn(txn, session_key, condition)
+
+        if held? == [["*"]] and is_map(episode) and Adjudication.heal_eligible?(episode) do
+          probe_wake_id = Adjudication.probe_wake_in_txn(txn, episode, encoded_token)
+
+          unless Adjudication.heal_resolve_in_txn(txn, episode, probe_wake_id, encoded_token),
+            do: raise(HealLost)
+
+          disposition = Adjudication.dispose_owner_wake_in_txn(txn, episode)
+
+          delivery =
+            deliver_prompt_in_txn(
+              txn,
+              session_key,
+              "process:tightbeam",
+              Adjudication.probe_prompt(),
+              wake_id: probe_wake_id,
+              sender: "process:tightbeam",
+              fire_wake_in_txn: true
+            )
+
+          # No probe TURN means no probe terminal to clear the hold; refuse to
+          # narrow the hold rather than wedge the session on a wake that will
+          # never be answered.
+          unless match?({:appended, _target, _message, _opts}, delivery),
+            do: raise("heal probe was not enqueued: #{inspect(delivery)}")
+
+          arm_hold_in_txn(txn, session_key, probe_wake_id)
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "adjudication_hold_healed",
+            session_key,
+            JSON.encode!(%{
+              cause: cause,
+              condition: condition,
+              episodeId: episode.episode_id,
+              healToken: encoded_token,
+              probeWakeId: probe_wake_id,
+              ownerWake: to_string(disposition)
+            })
+          )
+
+          {:released, delivery}
+        else
+          :lost
+        end
+      end)
+
+    case result do
+      {:ok, {:released, delivery}} ->
+        complete_delivery(db, delivery)
+        Wakes.fire_due(config[:wake_scheduler] || Tightbeam.WakeScheduler)
+
+      _ ->
+        # Lost the CAS (a human ruling owns this hold) or the probe could not be
+        # enqueued. Dark != silent: the decision NOT to probe is recorded, and
+        # nothing was written — a raise rolled the attempt back.
+        EventLog.lifecycle(
+          db,
+          "adjudication_heal_lost",
+          session_key,
+          JSON.encode!(%{cause: cause, condition: condition, healToken: encoded_token})
+        )
+    end
+  end
+
+  defp heal_level_check(config, db, session_key, cause, adapter_key) do
+    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+
+    with true <- Adjudication.adapter_fault?(cause),
+         {:ok, token} <- AdapterCoordinator.ready_token(coordinator, adapter_key) do
+      adapter_healed(config, db, cause, token, session_key: session_key)
+    else
+      _ -> :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
   end
 
   defp arm_hold_in_txn(txn, session_key, wake_id) do

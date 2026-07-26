@@ -27,6 +27,7 @@ defmodule Tightbeam.RailRemedyTest do
     start_supervised!({DB, path: ":memory:", name: db})
 
     for module <- [
+          Tightbeam.CausalEvents,
           Devices,
           Idempotency,
           ConditionFacts,

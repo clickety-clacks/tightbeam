@@ -336,6 +336,7 @@ defmodule Tightbeam.GatewayTest do
     end)
 
     for module <- [
+          Tightbeam.CausalEvents,
           Devices,
           Artifacts,
           EventLog,

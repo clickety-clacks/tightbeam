@@ -47,6 +47,7 @@ defmodule Tightbeam.SupervisionTest do
     start_supervised!({DB, path: ":memory:", name: db})
 
     for module <- [
+          Tightbeam.CausalEvents,
           Devices,
           EventLog,
           Idempotency,
@@ -576,7 +577,12 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [[^expected_prod]]} =
              DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId = ?1", [prod.wake_id])
 
-    assert {:ok, [[nil, nil]]} =
+    # v1 excluded prod turns from attribution for want of a durable carrier;
+    # job-forensics-v2 gives the wake one, so the delivered turn now inherits it.
+    # jobRef stays NULL here because this assignment belongs to no work item.
+    assert prod.assignment_id == "asg_1"
+
+    assert {:ok, [["asg_1", nil]]} =
              DB.query(
                ctx.db,
                "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1",

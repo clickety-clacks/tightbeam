@@ -718,11 +718,13 @@ defmodule Tightbeam.Acp.AdapterTest do
       monitor = Process.monitor(adapter)
 
       queued =
-        Task.async(fn ->
-          catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance"))
-        end)
+        Task.async(fn -> Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance") end)
 
-      assert_receive {:DOWN, ^monitor, :process, ^adapter, reason}
+      # A real `node` spawn + gate attestation + death does not reliably fit the
+      # default 100ms budget on a loaded box (pre-existing flake, ~1 run in 6).
+      # Its siblings in this file already use explicit seconds-scale budgets; the
+      # assertion itself is unchanged and still demands the exact reason.
+      assert_receive {:DOWN, ^monitor, :process, ^adapter, reason}, 2_000
 
       expected_reason =
         case gate_mode do
@@ -739,7 +741,25 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       assert reason == expected_reason
 
-      refute match?({:ok, _sid}, Task.await(queued))
+      # S4 defect 1: the queued call gets the DESIGNED reason, not an exit the
+      # lane can only report as :task_crash.
+      # WHICH reason depends on a race the contract covers both sides of: the call
+      # either queued behind the boot (carrying the gate failure) or arrived after
+      # the adapter was already gone (:noproc, which the gateway enriches from the
+      # coordinator's attempt-scoped record). Asserting only `not {:ok, _}` would
+      # pass on a bare exit too — and a bare exit IS the defect.
+      assert {:error, {:adapter_unavailable, queued_reason}} = Task.await(queued)
+
+      case queued_reason do
+        :noproc ->
+          :ok
+
+        text when is_binary(text) ->
+          assert text =~ "gate_attestation_failed"
+
+          if gate_mode == "turn-error",
+            do: assert(text =~ "probe turn failed: adapter transport unavailable")
+      end
 
       assert capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
                "gate wiring-check FAIL detail=#{detail}"
@@ -779,7 +799,8 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     log =
       capture_log(fn ->
-        catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], guidance_marker))
+        assert {:error, {:adapter_unavailable, _reason}} =
+                 Adapter.new_session(adapter, "haiku", "/tmp", [], guidance_marker)
 
         assert_receive {:DOWN, ^monitor, :process, ^adapter, _reason}
         Logger.flush()
@@ -804,15 +825,20 @@ defmodule Tightbeam.Acp.AdapterTest do
     monitor = Process.monitor(adapter)
 
     queued =
-      Task.async(fn ->
-        catch_exit(Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance"))
-      end)
+      Task.async(fn -> Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance") end)
 
     assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, :deadline}},
                    1_000
 
     assert System.monotonic_time(:millisecond) - started < 1_000
-    refute match?({:ok, _sid}, Task.await(queued))
+
+    assert {:error, {:adapter_unavailable, reason}} = Task.await(queued)
+
+    # Same either-side-of-the-race contract as the fails-closed test above.
+    case reason do
+      :noproc -> :ok
+      text when is_binary(text) -> assert text =~ "deadline"
+    end
   end
 
   test "boot without probe opts sends no probe request" do
