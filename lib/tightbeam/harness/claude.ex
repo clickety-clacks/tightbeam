@@ -7,6 +7,64 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_version "0.59.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
+
+  # NOTE FOR FUTURE AGENTS — the claude model vocabulary is NARROWER than the catalog.
+  #
+  # The derived catalog for claude comes from the Anthropic API (`fetch_catalog/1` hits
+  # `/v1/models`), which currently lists 11 models. The claude ACP adapter's
+  # `session/set_config_option {configId: "model"}` accepts only SEVEN values, and
+  # `Acp.Adapter.parse_model_ref/1` strips nothing but an `[effort]` suffix — the base
+  # string goes to the adapter verbatim, so there is NO translation layer to fix. A model
+  # the adapter refuses fails the apply, which runs after EVERY `session/new` and every
+  # `session/load` (never-trust-the-advertised-model), so it recurs on resume, not just
+  # spawn.
+  #
+  # RECORDED LIVE 2026-07-26 against: claude CLI 2.1.220, claude-agent-acp 0.59.0,
+  # @anthropic-ai/claude-agent-sdk 0.3.207. Probe each value with
+  # `session/set_config_option` before trusting this table — it WILL rot, because the
+  # accepted set is whatever the installed CLI currently offers.
+  #
+  #   ACCEPTED  alias `default`  -> Sonnet 5      (same as `sonnet`)
+  #   ACCEPTED  alias `sonnet`   -> Sonnet 5
+  #   ACCEPTED  alias `opus`     -> Opus 4.8      (NOT Opus 5 — see below)
+  #   ACCEPTED  alias `haiku`    -> Haiku 4.5
+  #   ACCEPTED  id `claude-sonnet-5`
+  #   ACCEPTED  id `claude-opus-4-8`
+  #   ACCEPTED  id `claude-haiku-4-5-20251001`
+  #   REJECTED  claude-opus-5, claude-fable-5, claude-opus-4-7, claude-sonnet-4-6,
+  #             claude-opus-4-6, claude-opus-4-5-20251101, claude-sonnet-4-5-20250929,
+  #             claude-opus-4-1-20250805, and the bare alias `fable`
+  #
+  # The accepted ids are EXACTLY the three models the aliases currently resolve to. So
+  # this is not an API-vs-CLI version lag that a mapping table can paper over: the
+  # adapter only accepts the models it is presently offering, by either name.
+  #
+  # WHY THERE IS NO SUBSTITUTION MAP HERE, deliberately: every candidate substitution is
+  # a silent downgrade. `claude-opus-5` -> `opus` delivers Opus 4.8, a different and
+  # older model. `claude-fable-5` has NO equivalent on this adapter version at all.
+  # Mapping either would make a request appear to succeed while delivering something
+  # else, which is the one outcome worse than failing. If a requested claude model is not
+  # in the ACCEPTED list above, it must fail and say so — do not quietly rewrite it.
+  #
+  # WHEN THIS ROTS (a new alias appears, or an accepted value stops being accepted):
+  # re-probe the adapter rather than editing from a changelog. Boot
+  # `node <adapters>/claude-agent-acp`, `initialize`, `session/new`, then read the
+  # `model` entry of the returned `configOptions` for the offered set, and confirm each
+  # candidate with `session/set_config_option`. Update this table and the version stamp
+  # together. Codex does NOT have this problem and needs no equivalent table: its
+  # catalog is read from the CLI's own `models_cache.json`, so catalog and accepted set
+  # come from one artifact and cannot diverge. This asymmetry is the actual finding.
+  @adapter_selectable_models ~w(default sonnet opus haiku claude-sonnet-5 claude-opus-4-8
+                                claude-haiku-4-5-20251001)
+
+  @doc """
+  Model values this adapter version accepts at `session/set_config_option`.
+
+  Narrower than the derived catalog — see the note above the attribute. Anything outside
+  this list is refused by the adapter; it is never silently substituted.
+  """
+  def adapter_selectable_models, do: @adapter_selectable_models
+
   @adapter_replacements [
     {
       "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
