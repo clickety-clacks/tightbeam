@@ -172,48 +172,76 @@ defmodule Tightbeam.RailScriptTest do
     assert System.monotonic_time(:millisecond) - started < 2_500
   end
 
-  # The recorded duration CANNOT identify which timeout layer fired, and this test is
-  # the proof (task #38, reviewer's reproduction). `RailScript.run/5` measures with
-  # `System.monotonic_time` in the calling BEAM process (rail_script.ex:13 and :27), so a
-  # starved or suspended process inflates the measurement without bound — while the port
-  # is an OS process that keeps running and reports on time. The result: a run the BINARY
-  # enforced (a real exit 20 arrived) can record a duration past `timeout_ms + 2_000`,
-  # which is where a naive reading would place the BEAM backstop. The `+2_000` gap at
-  # rail_script.ex:166 is fixed in the CODE; the MEASUREMENT is not, so the windows
-  # overlap and any timing-based layer claim is unsound. The real discriminator —
-  # whether the port reported at all (`{:exit_status, _}` received vs the `after` branch
-  # synthesizing 20 at :188-191) — is not recorded; surfacing it needs a
-  # rails-mechanism-v1 amendment.
-  test "a starved BEAM inflates a binary-enforced run past the backstop threshold", ctx do
-    budget = 2_000
+  # The recorded duration cannot locate a `script_timeout` in either timeout window, so
+  # no timing rule can name the layer (task #38).
+  #
+  # `RailScript.run/5` measures with `System.monotonic_time` in the CALLING BEAM process
+  # (rail_script.ex:13 and :27), while the wrapper is an OS process that keeps running on
+  # its own clock. Starve the caller and the measurement inflates without bound. This runs
+  # the REAL Rust rail-exec against the REAL sleeping `rail-timeout` script (`sleep 30`)
+  # with a 2s budget, so the wrapper's own time-box is what ends the script — then
+  # suspends the caller across the backstop threshold. The measurement lands
+  # past `timeout_ms + 2_000`, which is where a naive reading would place the BEAM
+  # backstop. The `+2_000` gap at rail_script.ex:166 is fixed in the CODE; the MEASUREMENT
+  # is not, so the two windows overlap.
+  #
+  # What this test deliberately does NOT assert: which path `await/3` actually took. That
+  # fact is not recorded anywhere — it IS the finding — so claiming it here would repeat
+  # the defect this test exists to prevent. The observable consequence is asserted
+  # instead: the evidence surface must not name a layer.
+  if File.exists?(@release_binary) do
+    test "starvation puts a real rail-exec timeout past the backstop threshold", ctx do
+      wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+      File.cp!(@release_binary, wrapper)
+      File.chmod!(wrapper, 0o755)
 
-    task =
-      Task.async(fn ->
-        RailScript.run(
-          ctx.db,
-          ctx.base_dir,
-          put_in(rule("rail-timeout").check.timeout_ms, budget),
-          call(),
-          nil
+      budget = 2_000
+
+      task =
+        Task.async(fn ->
+          RailScript.run(
+            ctx.db,
+            ctx.base_dir,
+            put_in(rule("rail-timeout").check.timeout_ms, budget),
+            call(),
+            nil
+          )
+        end)
+
+      # Suspend the measuring process while the wrapper is still alive, and stay suspended
+      # past budget + the 2_000ms backstop margin.
+      Process.sleep(100)
+      true = :erlang.suspend_process(task.pid)
+      Process.sleep(3_900)
+      :erlang.resume_process(task.pid)
+
+      assert {:error, "script_timeout", "timeout"} = Task.await(task, 30_000)
+
+      measured = Tightbeam.RailTimeoutEvidence.duration_ms(ctx.db)
+
+      assert measured >= budget + 2_000,
+             "expected the suspension to inflate the measurement past " <>
+               "#{budget + 2_000}ms, got #{measured}ms"
+
+      # The surface must report the numbers and refuse to conclude. A regression to a
+      # timing-based layer claim fails HERE.
+      evidence =
+        Tightbeam.RailTimeoutEvidence.render(
+          {:deny, %{rule: "fixture-rail", reason: "script_timeout"}},
+          %{db: ctx.db, timeout_ms: budget}
         )
-      end)
 
-    # Suspend the measuring process early, while the port is still alive. The binary goes
-    # on to enforce its own budget and exit 20 with nothing to receive the message.
-    Process.sleep(100)
-    true = :erlang.suspend_process(task.pid)
-    Process.sleep(3_900)
-    :erlang.resume_process(task.pid)
-
-    # A REAL exit status arrived: this is the binary's verdict, not the backstop's.
-    assert {:error, "script_timeout", "timeout"} = Task.await(task, 10_000)
-
-    measured = last_rail_script_duration_ms(ctx.db)
-
-    # ...yet the measurement lands in the window a timing rule would call "backstop".
-    assert measured >= budget + 2_000,
-           "expected the suspension to inflate the measurement past #{budget + 2_000}ms, " <>
-             "got #{measured}ms"
+      assert evidence =~ "LAYER NOT DETERMINED"
+      assert evidence =~ "measured duration : #{measured}ms"
+      assert evidence =~ "Do not infer the layer from these numbers"
+      refute evidence =~ "RAIL-EXEC BINARY (enforcement)"
+      refute evidence =~ "BEAM BACKSTOP (not enforcement)"
+    end
+  else
+    @tag :skip
+    test "starvation puts a real rail-exec timeout past the backstop threshold" do
+      flunk("real rail-exec binary missing: #{@release_binary}; cargo build --release in cli/")
+    end
   end
 
   test "runs at the holder workdir with scratch as its only rail write root", ctx do
@@ -551,13 +579,6 @@ defmodule Tightbeam.RailScriptTest do
     test "real Rust rail-exec matches BEAM framing for pass, deny, and escaped timeout" do
       flunk("release binary is required when this test is enabled")
     end
-  end
-
-  defp last_rail_script_duration_ms(db) do
-    EventLog.lifecycle_events(db)
-    |> Enum.filter(&(&1.kind == "rail_script"))
-    |> List.last()
-    |> then(&JSON.decode!(&1.detail)["duration_ms"])
   end
 
   defp rule(script) do

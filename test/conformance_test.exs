@@ -810,58 +810,11 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_rule_result(case_id, expect, _reason, actual, ctx),
     do:
       flunk(
-        "#{case_id}: expected #{expect}, got #{inspect(actual)}#{timeout_evidence(actual, ctx)}"
+        "#{case_id}: expected #{expect}, got #{inspect(actual)}#{Tightbeam.RailTimeoutEvidence.render(actual, ctx)}"
       )
 
   defp timeout_ctx(db, fixture) do
     %{db: db, timeout_ms: Enum.find_value(fixture["rule"], &get_in(&1, ["check", "timeout_ms"]))}
-  end
-
-  # A `script_timeout` deny does not say which layer produced it. TWO produce it and both
-  # land on exit status 20: the rail-exec binary enforcing the declared `timeout_ms` (real
-  # enforcement — it SIGKILLs the process group and exits 20), and `RailScript.await/3`
-  # giving up on the port at `timeout_ms + 2_000` and SYNTHESIZING status 20 for a wrapper
-  # that never reported (contention — no verdict was rendered).
-  #
-  # Timing CANNOT tell them apart, so this reports evidence and refuses to conclude. The
-  # duration is BEAM-side wall clock (rail_script.ex:13, :27), so a starved or suspended
-  # process inflates it past the backstop threshold on a run the binary actually enforced
-  # — reproduced deterministically in rail_script_test.exs. An earlier version of this
-  # helper DID claim a layer from the duration and mislabelled exactly that case; a
-  # confident mislabel is worse than the ambiguity, because it sends the next
-  # investigator the wrong way. The fact that would settle it — did the port report an
-  # exit status, or did `await/3` synthesize one — is known at the decision point
-  # (rail_script.ex:185 vs :188-191) and is not recorded. Surfacing it needs a
-  # rails-mechanism-v1 amendment (task #38).
-  def timeout_evidence({:deny, %{reason: "script_timeout"}}, %{db: db, timeout_ms: budget})
-      when is_integer(budget) do
-    measured =
-      case rail_script_duration_ms(db) do
-        nil -> "unrecorded (no rail_script lifecycle row)"
-        ms -> "#{ms}ms"
-      end
-
-    "\n  script_timeout evidence — LAYER NOT DETERMINED:" <>
-      "\n    measured duration : #{measured} (BEAM-side wall clock)" <>
-      "\n    declared budget   : #{budget}ms (rail-exec enforces this, exits 20)" <>
-      "\n    backstop threshold: #{budget + 2_000}ms (await/3 synthesizes 20 here)" <>
-      "\n  Both layers report reason=script_timeout and script_exit_class=timeout. The" <>
-      "\n  duration does NOT separate them: it is measured in the BEAM, so scheduler" <>
-      "\n  starvation can inflate it past the backstop threshold on a run rail-exec" <>
-      "\n  genuinely enforced. Do not infer the layer from these numbers. The deciding" <>
-      "\n  fact (did the port report an exit status?) is not recorded — see task #38."
-  end
-
-  def timeout_evidence(_actual, _ctx), do: ""
-
-  def rail_script_duration_ms(db) do
-    EventLog.lifecycle_events(db)
-    |> Enum.filter(&(&1.kind == "rail_script"))
-    |> List.last()
-    |> case do
-      nil -> nil
-      event -> JSON.decode!(event.detail)["duration_ms"]
-    end
   end
 
   defp assert_declared_records!(emits, payload, db) do
@@ -3767,11 +3720,11 @@ defmodule Tightbeam.ConformanceTest do
 
     # Inside the backstop threshold.
     record_rail_script_duration!(db, budget + 40)
-    inside = Corpus.timeout_evidence(timeout_deny, ctx)
+    inside = Tightbeam.RailTimeoutEvidence.render(timeout_deny, ctx)
 
     # Past it — the window an unsound timing rule would call "backstop".
     record_rail_script_duration!(db, budget + 2_000 + 15)
-    past = Corpus.timeout_evidence(timeout_deny, ctx)
+    past = Tightbeam.RailTimeoutEvidence.render(timeout_deny, ctx)
 
     # Both must carry the facts a reader needs: the measurement and both thresholds.
     for evidence <- [inside, past] do
@@ -3794,7 +3747,7 @@ defmodule Tightbeam.ConformanceTest do
     assert strip_measured(inside) == strip_measured(past)
 
     # A genuine refusal must not acquire timeout noise it did not earn.
-    assert Corpus.timeout_evidence(genuine_refusal, ctx) == ""
+    assert Tightbeam.RailTimeoutEvidence.render(genuine_refusal, ctx) == ""
   end
 
   defp strip_measured(evidence) do
