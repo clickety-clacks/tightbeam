@@ -36,6 +36,7 @@ alias Tightbeam.ClientE2E.{LegGateway, Provenance, Scorecard}
 
 defmodule ClientE2ERunner do
   def run do
+    journeys = ClientE2E.configured_journeys()
     template = env!("TIGHTBEAM_CLIENT_E2E_TEMPLATE")
     base_port = env("TIGHTBEAM_CLIENT_E2E_PORT", "12100") |> String.to_integer()
     repo_root = File.cwd!()
@@ -49,7 +50,9 @@ defmodule ClientE2ERunner do
     legs =
       legs()
       |> Enum.with_index()
-      |> Enum.map(fn {harness, index} -> run_leg(harness, template, base_port + index, repo_root) end)
+      |> Enum.map(fn {harness, index} ->
+        run_leg(harness, template, base_port + index, repo_root, journeys)
+      end)
 
     scorecard = %Scorecard{
       legs: legs,
@@ -74,7 +77,7 @@ defmodule ClientE2ERunner do
     end
   end
 
-  defp run_leg(harness, template, port, repo_root) do
+  defp run_leg(harness, template, port, repo_root, journeys) do
     base_dir = Path.expand("~/.tightbeam-client-e2e-#{harness}-#{System.os_time(:second)}")
     IO.puts("\nclient-e2e leg #{harness} port=#{port} base_dir=#{base_dir}")
     LegGateway.provision!(template, base_dir)
@@ -94,11 +97,11 @@ defmodule ClientE2ERunner do
       File.rm_rf(base_dir)
       leg
     else
-      run_booted_leg(harness, base_dir, port, repo_root, preflight_row)
+      run_booted_leg(harness, base_dir, port, repo_root, journeys, preflight_row)
     end
   end
 
-  defp run_booted_leg(harness, base_dir, port, repo_root, preflight_row) do
+  defp run_booted_leg(harness, base_dir, port, repo_root, journeys, preflight_row) do
     try do
       # Boot INSIDE the try so the after-block owns teardown on every path,
       # including a boot that half-succeeds and leaves a process behind.
@@ -131,7 +134,7 @@ defmodule ClientE2ERunner do
               harness: harness,
               model: model_for(harness),
               gateway: gateway,
-              journeys: journeys(),
+              journeys: journeys,
               preflight_row: preflight_row
             )
 
@@ -186,25 +189,6 @@ defmodule ClientE2ERunner do
     case System.get_env("TIGHTBEAM_CLIENT_E2E_HARNESSES") do
       nil -> Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
       value -> value |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
-    end
-  end
-
-  # Journey subset for "did I break restart?" — the registry is still the only
-  # authority on which journeys exist, so an unknown id raises rather than
-  # quietly walking a shorter run that reads as green.
-  defp journeys do
-    case System.get_env("TIGHTBEAM_CLIENT_E2E_JOURNEYS") do
-      nil ->
-        Tightbeam.ClientE2E.Journeys.ids()
-
-      value ->
-        ids = value |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
-        known = Tightbeam.ClientE2E.Journeys.ids()
-
-        case ids -- known do
-          [] -> ids
-          unknown -> raise "unknown journey ids #{inspect(unknown)}; known: #{inspect(known)}"
-        end
     end
   end
 

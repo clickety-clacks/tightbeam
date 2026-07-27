@@ -28,14 +28,35 @@ defmodule Tightbeam.ClientE2ETest do
   alias Tightbeam.Wire.Router
 
   describe "scorecard algebra" do
-    test "a leg passes only when every automated row passed" do
-      leg = %Leg{harness: "claude", host: "eezo"}
+    test "journey coverage makes a green subset INCOMPLETE while failure still wins" do
+      full = green_leg(Journeys.ids())
+      subset = green_leg(["J0"])
 
+      failed_subset =
+        Scorecard.add(
+          subset,
+          Scorecard.fail("2", "pair", "pairing failed", journey: "J0")
+        )
+
+      assert Scorecard.leg_verdict(full) == :pass
+      assert Scorecard.run_verdict(%Scorecard{legs: [full]}, ["claude"]) == :pass
+
+      assert {:incomplete, subset_blockers} = Scorecard.leg_verdict(subset)
+      assert Enum.any?(subset_blockers, &(&1 =~ "journey coverage"))
+
+      assert {:incomplete, run_blockers} =
+               Scorecard.run_verdict(%Scorecard{legs: [subset]}, ["claude"])
+
+      assert Enum.any?(run_blockers, &(&1 =~ "journey coverage"))
+      assert Scorecard.leg_verdict(failed_subset) == :fail
+      assert Scorecard.run_verdict(%Scorecard{legs: [failed_subset]}, ["claude"]) == :fail
+    end
+
+    test "a leg passes only when every automated row passed" do
       passing =
-        Scorecard.add(leg, [
-          Scorecard.pass("P1", "auth claude"),
-          Scorecard.pass("3", "converse", journey: "J1")
-        ])
+        Journeys.ids()
+        |> green_leg()
+        |> Scorecard.add(Scorecard.pass("P1", "auth claude"))
 
       assert Scorecard.leg_verdict(passing) == :pass
     end
@@ -52,10 +73,9 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "manual rows are verdict-neutral" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "eezo"}, [
-          Scorecard.pass("3", "converse", journey: "J1"),
-          Scorecard.manual("16", "wakes", "J8 is not driven by this driver")
-        ])
+        Journeys.ids()
+        |> green_leg()
+        |> Scorecard.add(Scorecard.manual("16", "wakes", "J8 is not driven by this driver"))
 
       assert Scorecard.leg_verdict(leg) == :pass
     end
@@ -71,10 +91,13 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "incomplete rows carry their blockers into the verdict" do
       leg =
-        Scorecard.add(%Leg{harness: "codex", host: "eezo"}, [
-          Scorecard.pass("3", "converse", journey: "J1"),
-          Scorecard.incomplete("13b", "model change", "catalog offered no second model", journey: "J6")
-        ])
+        Journeys.ids()
+        |> green_leg("codex")
+        |> Scorecard.add(
+          Scorecard.incomplete("13b", "model change", "catalog offered no second model",
+            journey: "J6"
+          )
+        )
 
       assert {:incomplete, ["13b: catalog offered no second model"]} = Scorecard.leg_verdict(leg)
     end
@@ -91,7 +114,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a negative-proved divergence passes its row and cites the matrix row" do
       row = Scorecard.pass("4", "tool use", divergence_ref: "harness-support.md#codex-tool-titles")
-      leg = Scorecard.add(%Leg{harness: "codex", host: "eezo"}, row)
+      leg = Journeys.ids() |> green_leg("codex") |> Scorecard.add(row)
 
       assert Scorecard.leg_verdict(leg) == :pass
       assert Scorecard.to_markdown(%Scorecard{legs: [leg]}, ["codex"]) =~ "harness-support.md#codex-tool-titles"
@@ -105,7 +128,7 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "a single-harness run is INCOMPLETE however well its leg did (T-PARITY)" do
-      leg = Scorecard.add(%Leg{harness: "claude", host: "eezo"}, Scorecard.pass("3", "converse"))
+      leg = green_leg(Journeys.ids())
 
       assert {:incomplete, blockers} =
                Scorecard.run_verdict(%Scorecard{legs: [leg]}, ["claude", "codex"])
@@ -860,6 +883,30 @@ defmodule Tightbeam.ClientE2ETest do
   end
 
   describe "the driver cannot pass vacuously" do
+    test "configured journeys resolve the environment against the registry" do
+      variable = "TIGHTBEAM_CLIENT_E2E_JOURNEYS"
+      previous = System.get_env(variable)
+
+      on_exit(fn ->
+        case previous do
+          nil -> System.delete_env(variable)
+          value -> System.put_env(variable, value)
+        end
+      end)
+
+      System.delete_env(variable)
+      assert ClientE2E.configured_journeys() == Journeys.ids()
+
+      System.put_env(variable, "J0, J7")
+      assert ClientE2E.configured_journeys() == ["J0", "J7"]
+
+      System.put_env(variable, "J0,J-unknown")
+
+      assert_raise RuntimeError, ~r/unknown journey ids.*J-unknown/, fn ->
+        ClientE2E.configured_journeys()
+      end
+    end
+
     test "against a closed port the leg FAILS with the client's own transport error" do
       {leg, _gateway} =
         ClientE2E.run_leg(
@@ -950,6 +997,11 @@ defmodule Tightbeam.ClientE2ETest do
   end
 
   defp registered_harness, do: Tightbeam.Harness.all() |> hd() |> then(& &1.wire_name())
+
+  defp green_leg(ids, harness \\ "claude") do
+    rows = Enum.map(ids, &Scorecard.pass(&1, "journey #{&1}", journey: &1))
+    Scorecard.add(%Leg{harness: harness, host: "testhost"}, rows)
+  end
 
   describe "the sim client against a real gateway" do
     setup :real_gateway
