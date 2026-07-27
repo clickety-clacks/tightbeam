@@ -301,10 +301,10 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         return PASS;
     }
 
-    if platform::refused_after_spawn(status.code(), &stdout, &stderr) {
-        return CONTAINED_REFUSED;
-    }
-
+    // No band-30 path exists here, on either platform, and that is the invariant: once a
+    // child has run, nothing it writes or exits with can mean "the containment refused".
+    // Refusal is decided BEFORE the fork — by the linux ruleset build, or by the macOS
+    // profile preflight — so it is never inferred from output the judged party controls.
     let child_code = status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
@@ -377,7 +377,7 @@ fn preload_stdin(input: &[u8]) -> io::Result<(OwnedFd, Option<(File, Vec<u8>)>)>
 #[cfg(target_os = "macos")]
 mod platform {
     use std::io;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     /// Seatbelt is applied by a helper binary, so there is nothing for this process to
     /// hold between staging and exec.
@@ -389,12 +389,42 @@ mod platform {
         pub fn token(&self) -> Token {}
     }
 
-    /// `sandbox-exec` is the only thing that can judge an SBPL profile, and it does that
-    /// after it is spawned — so staging cannot fail here and refusal is detected by
-    /// `refused_after_spawn`. Landlock has the better shape; this is the cost of the
-    /// helper-binary one.
-    pub fn stage(_profile: &str) -> Result<Staged, String> {
-        Ok(Staged)
+    /// Judge the profile HERE, before any script exists, by applying it to `/usr/bin/true`.
+    ///
+    /// `sandbox-exec` announces a refusal with exit 65 plus a `sandbox-exec:` stderr
+    /// prefix, and the wrapper used to infer "contained" from that pair. Both halves are
+    /// CHILD output, so a rail script could forge them:
+    ///
+    ///     echo "sandbox-exec: authored" >&2 ; exit 65
+    ///
+    /// produced band 30 on macOS and band 10 on linux — rail-AUTHORED input deciding the
+    /// verdict, and the OS legible from it. Same family as the fabricated child-exit line
+    /// (#43): a fact was read off a channel the subject of the judgement controls.
+    ///
+    /// An SBPL profile's validity does not depend on the command it wraps, so applying it
+    /// to `/usr/bin/true` is a faithful test of exactly the thing that can fail — and it is
+    /// the same preflight `placement.ex` already runs for adapters. Once it passes, nothing
+    /// the child emits can mean "contained", which is precisely the linux posture: refusal
+    /// is a fact the wrapper observed before the fork, never one parsed afterwards.
+    pub fn stage(profile: &str) -> Result<Staged, String> {
+        let preflight = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(profile)
+            .arg("--")
+            .arg("/usr/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+
+        match preflight {
+            Ok(output) if output.status.success() => Ok(Staged),
+            Ok(output) => Err(format!(
+                "sandbox profile was refused: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => Err(format!("sandbox-exec could not be run: {error}")),
+        }
     }
 
     pub fn command(profile: &str, script: &str) -> Command {
@@ -405,12 +435,6 @@ mod platform {
 
     pub fn impose(_token: Token) -> io::Result<()> {
         Ok(())
-    }
-
-    /// `sandbox-exec` exits 65 with a `sandbox-exec:` stderr prefix and no stdout when it
-    /// cannot apply a profile. Sniffing that is indirect, and stays confined here.
-    pub fn refused_after_spawn(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> bool {
-        code == Some(65) && stdout.is_empty() && stderr.starts_with(b"sandbox-exec:")
     }
 
     pub fn probe_report() -> String {
@@ -465,6 +489,19 @@ mod platform {
     const CREATE_RULESET_VERSION: usize = 1;
     const RULE_PATH_BENEATH: usize = 1;
 
+    // openat2(2), and the resolve flag that refuses a symlink ANYWHERE in the path.
+    // Landed in 5.6 — well below the ABI-3 (kernel 6.2) floor this seam already demands —
+    // so there is no fallback path to audit: a kernel without it cannot pass the floor.
+    const OPENAT2: libc::c_long = 437;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
     // The write-shaped filesystem rights, ABI 1. Read, directory-read, and execute rights
     // are deliberately NOT handled, which leaves them unrestricted everywhere — the linux
     // expression of the profile's `(allow file-read*)` and `(allow process-exec)`. Network
@@ -509,20 +546,25 @@ mod platform {
         | REFER
         | TRUNCATE;
 
-    /// Landlock validates a rule's rights against the TYPE of the inode it attaches to,
-    /// and rejects a right the type cannot express with EINVAL. The valid set differs by
-    /// type, so the mask does too — and it must match the STRICTEST accepted kernel, since
-    /// a right one kernel tolerates on a device another rejects. Getting this wrong is not
-    /// a weakened wall — it is CONTAINED_REFUSED for the whole seam, which is how the whole
-    /// of rails went dark on linux once `/dev/null` (a device) became the sole rail grant.
+    /// Landlock validates a rule's rights against the TYPE of the inode it attaches to and
+    /// rejects a right the type cannot express with EINVAL, so the mask is per type.
+    /// Getting it wrong is not a weakened wall — it is CONTAINED_REFUSED for the whole
+    /// seam, which is how rails went dark on linux once `/dev/null` became a rail grant.
     ///
-    /// - Directory: everything. The `MAKE_*`/`REMOVE_*`/`REFER` family is directory-only;
-    ///   on a non-directory it is exactly what EINVAL'd the full set.
-    /// - Regular file: `WRITE_FILE | TRUNCATE`. A regular file can be written and truncated.
-    /// - Anything else (character/block device, fifo, socket): `WRITE_FILE` only. `TRUNCATE`
-    ///   is meaningless on these — the VFS never truncates a device, so no truncate hook
-    ///   fires and the right is not needed for `>/dev/null` — and a strict kernel rejects
-    ///   granting it there. `/dev/null` is a character device, so this is THE production arm.
+    /// - Directory: everything.
+    /// - Regular file: `WRITE_FILE | TRUNCATE` — a regular file can be written and
+    ///   truncated.
+    /// - Anything else (character/block device, fifo, socket): `WRITE_FILE` only, because
+    ///   `TRUNCATE` is MEANINGLESS on them — the VFS never truncates a device, so no
+    ///   truncate hook fires and the right cannot affect the wall. `/dev/null` is a
+    ///   character device, so this is THE production arm.
+    ///
+    /// The rejected set is the directory-only `MAKE_*`/`REMOVE_*`/`REFER` family: that, and
+    /// only that, is what EINVAL'd on `/dev/null`. `WRITE_FILE | TRUNCATE` is in fact
+    /// ACCEPTED on a device by every kernel measured, ABI 4 and ABI 7 alike — an earlier
+    /// note here blamed a "strict kernel rejecting TRUNCATE", which the CI probe disproves
+    /// (`WRITE_FILE|TRUNCATE -> ok`). Dropping `TRUNCATE` for devices is narrowest-
+    /// appropriate, not a compatibility workaround; do not reintroduce it looking for one.
     ///
     /// This masks by the target's TYPE, a property of the path, not by ABI. Two accepted
     /// kernels still get the same wall for the same path; it is not the by-ABI masking
@@ -592,12 +634,6 @@ mod platform {
         }
 
         Ok(())
-    }
-
-    /// Nothing to sniff: on this platform a containment failure is always observed before
-    /// or during spawn, never inferred from the child's exit.
-    pub fn refused_after_spawn(_code: Option<i32>, _stdout: &[u8], _stderr: &[u8]) -> bool {
-        false
     }
 
     /// Print exactly what this kernel does, right down to which individual right a device
@@ -735,25 +771,20 @@ mod platform {
         out
     }
 
-    /// Mirror `grant` precisely, reporting the intermediate facts: the O_NOFOLLOW open, the
-    /// fstat type, the rights `allowed_rights_for` computes, and the add_rule verdict for
-    /// that computed set. Diagnostic only.
+    /// Mirror `grant` precisely, reporting the intermediate facts: the symlink-free
+    /// resolution, the fstat type, the rights `allowed_rights_for` computes, and the
+    /// add_rule verdict for that computed set. Diagnostic only — but it must use the same
+    /// resolver as the enforcement path, or it stops being evidence about it.
     fn enforcement_trace(root: &str) -> String {
         let cpath = match CString::new(root) {
             Ok(cpath) => cpath,
             Err(_) => return "path has interior NUL".to_owned(),
         };
 
-        let fd = unsafe {
-            libc::open(
-                cpath.as_ptr(),
-                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
+        let parent = match open_root_no_symlinks(&cpath) {
+            Ok(parent) => parent,
+            Err(error) => return format!("openat2(RESOLVE_NO_SYMLINKS) failed: {error}"),
         };
-        if fd < 0 {
-            return format!("open(O_NOFOLLOW) failed: {}", io::Error::last_os_error());
-        }
-        let parent = unsafe { OwnedFd::from_raw_fd(fd) };
 
         let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe { libc::fstat(parent.as_raw_fd(), &mut stat) } != 0 {
@@ -1007,32 +1038,59 @@ mod platform {
     /// accept a path which is not there yet. Omitting a grant is strictly more restrictive,
     /// so the guarantee is never weakened — only a write macOS would have allowed may be
     /// denied. Rail scratch roots are created before the profile is rendered.
-    fn grant(ruleset: &OwnedFd, root: &str, handled: u64) -> Result<(), String> {
-        let path = CString::new(root)
-            .map_err(|_| format!("write root contains an interior NUL: {root}"))?;
+    /// Resolve a write root with NO symlink traversal at ANY component.
+    ///
+    /// `O_NOFOLLOW` was not enough, and the comment that claimed it was is gone with it: it
+    /// refuses only a TRAILING symlink, and combined with `O_PATH` it does not even do
+    /// that — it hands back a descriptor to the symlink itself. Every INTERMEDIATE
+    /// component was still followed, so a directory swapped for a symlink between Elixir's
+    /// `validate_components!/1` and this open would attach the wall to a path nobody
+    /// authorized, and the contained process would write through it.
+    ///
+    /// `RESOLVE_NO_SYMLINKS` is the flag that exists for exactly this: the kernel refuses
+    /// the whole resolution, atomically, if any component is a symlink. That makes the
+    /// wrapper enforce at use-time precisely what Elixir asserted at validation-time,
+    /// instead of trusting that nothing moved in between.
+    fn open_root_no_symlinks(path: &CString) -> io::Result<OwnedFd> {
+        let how = OpenHow {
+            flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_SYMLINKS,
+        };
 
-        // O_NOFOLLOW because `validate_roots!/1` proved this path had no symlink component
-        // at validation time, and this is the moment the grant is actually attached. If the
-        // final component became a symlink in between, ELOOP lands in the error arm below
-        // and the run refuses — rather than attaching the wall to whatever it now points at.
         let fd = unsafe {
-            libc::open(
+            libc::syscall(
+                OPENAT2,
+                libc::AT_FDCWD,
                 path.as_ptr(),
-                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                &how as *const OpenHow,
+                size_of::<OpenHow>(),
             )
         };
 
         if fd < 0 {
-            let error = io::Error::last_os_error();
-
-            if error.raw_os_error() == Some(libc::ENOENT) {
-                return Ok(());
-            }
-
-            return Err(format!("write root {root} could not be opened: {error}"));
+            return Err(io::Error::last_os_error());
         }
 
-        let parent = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+    }
+
+    fn grant(ruleset: &OwnedFd, root: &str, handled: u64) -> Result<(), String> {
+        let path = CString::new(root)
+            .map_err(|_| format!("write root contains an interior NUL: {root}"))?;
+
+        let parent = match open_root_no_symlinks(&path) {
+            Ok(parent) => parent,
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(());
+                }
+
+                // ELOOP here is a symlink that was not there at validation time. Refusing is
+                // the whole point: the alternative is a wall on an unauthorized path.
+                return Err(format!("write root {root} could not be opened: {error}"));
+            }
+        };
         let allowed = allowed_rights_for(&parent, handled, root)?;
 
         let attr = PathBeneathAttr {
@@ -1234,6 +1292,35 @@ mod tests {
         );
 
         fs::remove_dir_all(granted).unwrap();
+    }
+
+    // A rail author must not be able to manufacture a containment verdict, nor read the OS
+    // off one. This script forges BOTH halves of the signal macOS used to infer refusal
+    // from — exit 65 and a `sandbox-exec:` stderr prefix, with empty stdout — and it used
+    // to yield band 30 on macOS against band 10 on linux. Same body, same expectation, both
+    // platforms: the child ran, so the verdict is the child's, and CONTAINED_REFUSED is not
+    // available to it. Refusal is decided before the fork or not at all.
+    #[test]
+    fn a_child_cannot_forge_a_containment_refusal() {
+        let dir = temp_dir();
+        let check = script(
+            &dir,
+            "forges-a-refusal",
+            "echo \"sandbox-exec: authored\" >&2\nexit 65",
+        );
+
+        let status = band(profile_granting(&[&dir]), check, Duration::from_secs(30));
+
+        assert_eq!(
+            status, SCRIPT_ERROR,
+            "a child that ran must not be able to claim the containment refused"
+        );
+        assert_ne!(
+            status, CONTAINED_REFUSED,
+            "band 30 is the wrapper's to give, never the script's to take"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
