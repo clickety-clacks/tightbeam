@@ -55,6 +55,15 @@ defmodule Tightbeam.ToplinesTest do
 
   @statuses ~w(linked from_turn no_turn_observed unrecorded)
 
+  # The spec's normative node shape, sorted. A field added to or dropped from the
+  # telemetry builder reddens proof 2 rather than sliding in unreviewed.
+  @node_keys Enum.sort(
+               ~w(active assignments attests bracket1_armed closing_attests creation_context
+                  fail_reason fan_out finished_at holds id jobs minds open_decision_requests
+                  origin parent since_progress_ms spec_ref_name spec_ref_sha256 started_at
+                  state title turns)a
+             )
+
   # Ordering fixtures need distinct, ASCENDING createdAt values that are still
   # at or after the attribution cutoff — a bare `created_at: 1` would silently
   # turn every proof into a coverage proof.
@@ -177,6 +186,29 @@ defmodule Tightbeam.ToplinesTest do
 
     assert Enum.all?(response.items, &(Enum.sort(Map.keys(&1.parent)) == [:item, :status])),
            "the parent block carries the status and the item and nothing else"
+
+    # The node's own key set is the spec's normative node shape. Pinning it is
+    # what makes "explicitly not reported: any percentage, completion estimate,
+    # confidence score, or confidence grade" enforceable rather than aspirational
+    # — a field added or dropped anywhere in the builder lands here.
+    assert Enum.all?(response.items, &(Enum.sort(Map.keys(&1)) == @node_keys))
+
+    # `title` and the spec pin are the item's own row, verbatim.
+    pinned =
+      item!(ctx.db, "wi_pinned",
+        created_at: at(5),
+        spec_ref_name: "topline-map-v1",
+        spec_ref_sha256: String.duplicate("c", 64)
+      )
+
+    node = node(roster(ctx), pinned)
+    assert node.title == "Item wi_pinned"
+    assert node.spec_ref_name == "topline-map-v1"
+    assert node.spec_ref_sha256 == String.duplicate("c", 64)
+
+    # An unpinned item says so rather than guessing.
+    assert node(roster(ctx), "wi_root").spec_ref_name == nil
+    assert node(roster(ctx), "wi_root").spec_ref_sha256 == nil
   end
 
   ## Proof 3 — edge derivation succeeds through BOTH carriers

@@ -300,6 +300,9 @@ defmodule Tightbeam.Toplines do
 
     %{
       id: item.id,
+      title: item.title,
+      spec_ref_name: item.spec_ref_name,
+      spec_ref_sha256: item.spec_ref_sha256,
       state: item.state,
       fail_reason: item.fail_reason,
       bracket1_armed: not is_nil(item.routing_wake_id),
@@ -324,6 +327,14 @@ defmodule Tightbeam.Toplines do
         ),
       minds: unless(pre_cutoff?, do: minds(union)),
       fan_out: unless(pre_cutoff?, do: fan_out(world, set)),
+      # THE ONE RESIDUAL OVERCLAIM in this response, and a considered limit
+      # rather than an oversight: `running_turn` stays BOOLEAN for a pre-cutoff
+      # item, so an old item whose turns were never attributed reports `false` on
+      # absent evidence. The coverage null rule is scoped to COUNTS, and
+      # `--quiet-over` is defined against `running_turn = false` — nulling it here
+      # would silently drop every pre-cutoff item out of `--quiet-over`, which is
+      # the worse failure. `pending_session_wake` and `holds` carry no such caveat:
+      # both are session-keyed through durable assignment columns.
       active: %{
         running_turn: Enum.any?(union, &(&1.status == "running")),
         pending_session_wake: pending_session_wake?(world, holders)
@@ -647,7 +658,7 @@ defmodule Tightbeam.Toplines do
       DB.query(
         db,
         """
-        SELECT id, ownerUserId, state, failReason, specRefName, specRefSha256,
+        SELECT id, title, ownerUserId, state, failReason, specRefName, specRefSha256,
                routingWakeId, createdByUser, createdBySession, createdInTurnSeq,
                createdContextKnown, createdAt
         FROM work_items#{sql}
@@ -658,6 +669,7 @@ defmodule Tightbeam.Toplines do
 
     Enum.map(rows, fn [
                         id,
+                        title,
                         owner,
                         state,
                         fail_reason,
@@ -672,6 +684,7 @@ defmodule Tightbeam.Toplines do
                       ] ->
       %{
         id: id,
+        title: title,
         owner_user_id: owner,
         state: state,
         fail_reason: fail_reason,
