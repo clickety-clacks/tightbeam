@@ -437,6 +437,17 @@ mod platform {
         | REFER
         | TRUNCATE;
 
+    /// The handled rights that mean anything on a NON-directory. Landlock rejects a
+    /// directory-only right (the `MAKE_*`/`REMOVE_*`/`REFER` family) against a file fd with
+    /// EINVAL, so granting `/dev/null` the full set refused the entire seam — every rail on
+    /// linux went CONTAINED_REFUSED. Rails grant `/dev/null`, so this is the production
+    /// shape and not a corner case.
+    ///
+    /// This masks by the TARGET'S TYPE, which is a property of the path and identical on
+    /// every accepted kernel. It is not the by-ABI masking `HANDLED_WRITE_RIGHTS` exists to
+    /// forbid: no two accepted kernels get different walls because of it.
+    const FILE_WRITE_RIGHTS: u64 = WRITE_FILE | TRUNCATE;
+
     /// A kernel below this cannot restrict `truncate(2)` and therefore cannot deliver the
     /// guarantee, so it refuses rather than under-enforcing. ABI 3 is kernel 6.2.
     const MIN_ABI: libc::c_long = 3;
@@ -648,6 +659,22 @@ mod platform {
     /// accept a path which is not there yet. Omitting a grant is strictly more restrictive,
     /// so the guarantee is never weakened — only a write macOS would have allowed may be
     /// denied. Rail scratch roots are created before the profile is rendered.
+    /// `fstat` is one of the few operations an `O_PATH` descriptor permits, and it answers
+    /// the question without reopening the path — so the type we mask against is the type of
+    /// the very object the grant attaches to.
+    fn is_directory(fd: &OwnedFd, root: &str) -> Result<bool, String> {
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+            return Err(format!(
+                "write root {root} could not be stat'd ({})",
+                io::Error::last_os_error()
+            ));
+        }
+
+        Ok(stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    }
+
     fn grant(ruleset: &OwnedFd, root: &str, handled: u64) -> Result<(), String> {
         let path = CString::new(root)
             .map_err(|_| format!("write root contains an interior NUL: {root}"))?;
@@ -674,8 +701,15 @@ mod platform {
         }
 
         let parent = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        let allowed = if is_directory(&parent, root)? {
+            handled
+        } else {
+            handled & FILE_WRITE_RIGHTS
+        };
+
         let attr = PathBeneathAttr {
-            allowed_access: handled,
+            allowed_access: allowed,
             parent_fd: parent.as_raw_fd(),
         };
 
@@ -849,6 +883,26 @@ mod tests {
 
         fs::remove_dir_all(granted).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    // Rails grant `/dev/null` — a character device, not a directory — so a non-directory
+    // grant is the PRODUCTION shape here, not a corner. Landlock rejects directory-only
+    // rights against a file fd with EINVAL, which took every rail on linux to
+    // CONTAINED_REFUSED until the rights were masked by target type. A refusal is the safe
+    // direction and it still made the seam useless, so it gets a test.
+    #[test]
+    fn a_grant_on_a_non_directory_is_staged_rather_than_refused() {
+        let granted = temp_dir();
+        let profile = profile_granting(&[&granted, Path::new("/dev/null")]);
+        let check = script(&granted, "writes-to-the-sink", "echo noise >/dev/null");
+
+        assert_eq!(
+            band(profile, check, Duration::from_secs(5)),
+            PASS,
+            "granting a non-directory must not refuse the containment"
+        );
+
+        fs::remove_dir_all(granted).unwrap();
     }
 
     #[test]
