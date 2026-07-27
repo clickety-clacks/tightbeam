@@ -37,11 +37,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   end
 
   @doc false
-  def base_dir do
-    System.get_env("TIGHTBEAM_BASE_DIR") ||
-      System.get_env("TIGHTBEAM_HOME") ||
-      Path.join(System.user_home!(), ".tightbeam")
-  end
+  def base_dir, do: Tightbeam.BaseDir.resolve()
 
   @doc false
   def fetch_live(base_dir, timeout_ms \\ @fetch_timeout_ms, options \\ []) do

@@ -179,5 +179,8 @@ defmodule Tightbeam.Application do
     end
   end
 
-  defp default_base_dir, do: Path.join(System.user_home!(), ".tightbeam")
+  # The app config is already set from TIGHTBEAM_BASE_DIR by config/runtime.exs,
+  # so this is only the fallback — but it shares the one definition of the default
+  # so a change cannot land in three places and miss one.
+  defp default_base_dir, do: Tightbeam.BaseDir.default()
 end

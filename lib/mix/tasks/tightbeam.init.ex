@@ -20,7 +20,9 @@ defmodule Mix.Tasks.Tightbeam.Init do
     end
   end
 
-  defp default_base_dir do
-    System.get_env("TIGHTBEAM_HOME") || Path.join(System.user_home!(), ".tightbeam")
-  end
+  # One resolver, shared with the gateway and every other task. This read
+  # TIGHTBEAM_HOME alone, so with TIGHTBEAM_BASE_DIR set it initialized a
+  # DIFFERENT org than the one the service would boot -- and said "already
+  # initialized" if something happened to be at the default path.
+  defp default_base_dir, do: Tightbeam.BaseDir.resolve()
 end
