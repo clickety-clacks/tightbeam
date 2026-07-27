@@ -130,6 +130,53 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert find(report, "harness_binary:codex").level == :warn
   end
 
+  # The exit code is the contract a deploy script gates on, so the difference
+  # between "this credential is dead" and "this task cannot see credentials"
+  # has to be visible THERE, not only in the prose.
+  test "an unverifiable credential is informational and does not fail the run", ctx do
+    unverifiable = {:unavailable, {:needs_onboarding, :credential_server_unavailable}}
+
+    catalog =
+      {:ok, %{"claude" => [], "codex" => []},
+       %{"claude" => unverifiable, "codex" => unverifiable}}
+
+    {status, report} = Doctor.evaluate(catalog, ctx.inputs)
+
+    assert status == 0, "a check that could not be performed must not fail the run"
+    assert report.ready
+
+    auth = find(report, "harness_auth:claude")
+    assert auth.unverifiable
+    assert auth.level == :info
+    refute auth.ok, "it is still not a PASS — nothing was verified"
+    assert auth.detail =~ "UNKNOWN"
+    refute auth.detail =~ "dead_sign_in"
+    refute auth.fix =~ ~r/^Re-onboard/
+
+    # The same blindness reaches default_model through an empty inventory; calling
+    # that "not live" sent the operator to repoint a model that was fine.
+    model = find(report, "default_model")
+    assert model.unverifiable
+    assert model.detail =~ "UNKNOWN"
+    refute model.detail =~ "is not live"
+  end
+
+  # The precision half: only credential_server_unavailable is unverifiable.
+  test "a genuinely dead credential still fails the run", ctx do
+    dead = {:unavailable, {:needs_onboarding, :dead_credential}}
+    catalog = {:ok, %{"claude" => [], "codex" => []}, %{"claude" => dead, "codex" => dead}}
+
+    {status, report} = Doctor.evaluate(catalog, ctx.inputs)
+
+    assert status == 1, "a dead credential is a real failure and must fail the run"
+    refute report.ready
+
+    auth = find(report, "harness_auth:claude")
+    refute auth.unverifiable
+    assert auth.detail =~ "dead_sign_in"
+    assert auth.fix =~ "Re-onboard"
+  end
+
   test "catalog fetch failures are loud and classified for auth and model checks", ctx do
     catalog = {:error, %{"claude" => {:unavailable, :missing_token}}}
     {1, report} = Doctor.evaluate(catalog, ctx.inputs)
