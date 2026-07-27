@@ -954,14 +954,13 @@ fn assemble(
     }
 }
 
+// An explicit --base-dir still wins; everything below it is the shared resolver.
+// This read TIGHTBEAM_HOME only, so `doctor` reported on a different org than the
+// installed service ran -- a health verdict about somebody else's install.
 fn resolve_base_dir(value: Option<String>) -> PathBuf {
     value
-        .or_else(|| std::env::var("TIGHTBEAM_HOME").ok())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            #[allow(deprecated)]
-            std::env::home_dir().unwrap_or_default().join(".tightbeam")
-        })
+        .unwrap_or_else(crate::base_dir::resolve)
 }
 
 fn human(report: &Report) -> String {

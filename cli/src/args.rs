@@ -436,7 +436,7 @@ COMMANDS:
 
 DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
   TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
-  <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
+  <TIGHTBEAM_BASE_DIR|TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
 
 DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
 

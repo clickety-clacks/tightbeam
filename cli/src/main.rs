@@ -1,4 +1,5 @@
 mod args;
+mod base_dir;
 mod ceremonies;
 mod contain;
 mod dispatch;

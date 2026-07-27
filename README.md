@@ -56,8 +56,11 @@ mix tightbeam.init                 # creates <base_dir>/identity
 mix run --no-halt                  # boots the gateway; creates state.db, homes, bin/
 ```
 
-`base_dir` is `TIGHTBEAM_HOME`, else `~/.tightbeam`. `TIGHTBEAM_BASE_DIR`
-selects it for a single run, and `TIGHTBEAM_PORT` overrides the port.
+`base_dir` is `TIGHTBEAM_BASE_DIR`, else `TIGHTBEAM_HOME`, else `~/.tightbeam` —
+the same precedence in the gateway and in the `tightbeam` CLI, which finds the
+gateway through `<base_dir>/gateway.json`. `TIGHTBEAM_PORT` overrides the port.
+Whatever you set for the service, set for the shell you run the CLI from: if they
+disagree, the CLI looks for its gateway in a directory that does not have one.
 
 The first boot creates the base dir and serves, but **cannot run a turn yet**:
 it has no credentials, so it prints a NOT READY summary naming every gap.

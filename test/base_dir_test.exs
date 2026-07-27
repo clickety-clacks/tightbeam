@@ -55,6 +55,13 @@ defmodule Tightbeam.BaseDirTest do
     # This reads source rather than calling functions, deliberately: the resolvers
     # were `defp`, unreachable from a test, which is part of why they drifted
     # unnoticed. A behavioural test cannot see a private duplicate; this can.
+    #
+    # It scans `lib/` only, and that limit cost us: the CLI had THREE more resolvers
+    # in Rust, none of them reading TIGHTBEAM_BASE_DIR, and this assertion could not
+    # see them. The shrdlu smoke found them one commit later, when `tightbeam
+    # onboard` dispatched to an unrelated org. The Rust half of the invariant lives
+    # where it can see — `cli/src/base_dir.rs`, `exactly_one_resolver_exists_in_the_cli`
+    # — and both halves must agree on precedence, empty strings included.
     readers =
       Path.wildcard("lib/**/*.ex")
       |> Enum.reject(&(Path.basename(&1) == "base_dir.ex"))

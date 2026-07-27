@@ -33,15 +33,10 @@ impl HarnessCatalog {
     }
 }
 
+// The projection cache lives in the org, so it must resolve the org the same way
+// the gateway does: this read TIGHTBEAM_HOME only and ignored TIGHTBEAM_BASE_DIR.
 fn home_dir() -> PathBuf {
-    std::env::var("TIGHTBEAM_HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            #[allow(deprecated)]
-            std::env::home_dir().unwrap_or_default().join(".tightbeam")
-        })
+    crate::base_dir::resolve()
 }
 
 fn parse(encoded: &str) -> Result<HarnessCatalog, String> {

@@ -665,14 +665,15 @@ pub fn discover_from(base_dir: &Path) -> Result<Endpoint, String> {
     endpoint_from_gateway_file(&base_dir.join("gateway.json"))
 }
 
+// One resolver, shared with the gateway. This read TIGHTBEAM_HOME alone, so with
+// TIGHTBEAM_BASE_DIR set -- the variable the README documents and both service
+// units set -- discovery looked for gateway.json in a DIFFERENT org than the one
+// the service booted, and found whatever happened to be at the default path.
 fn gateway_config_path<F>(get_env: &F, home_dir: &Path) -> PathBuf
 where
     F: Fn(&str) -> Option<String>,
 {
-    get_env("TIGHTBEAM_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir.join(".tightbeam"))
-        .join("gateway.json")
+    crate::base_dir::resolve_with(get_env, home_dir).join("gateway.json")
 }
 
 fn discover_with<F>(get_env: F, cwd: &Path, home_dir: &Path) -> Result<Endpoint, String>
@@ -1334,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_prefers_complete_env_then_tightbeam_home_then_home() {
+    fn discovery_prefers_complete_env_then_base_dir_then_tightbeam_home_then_home() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1419,6 +1420,29 @@ mod tests {
                 session_file: None,
             })
         );
+
+        // The shrdlu failure, as a test: with TIGHTBEAM_BASE_DIR naming the org --
+        // the variable the README documents and both service units set -- discovery
+        // must read THAT gateway.json. It read ~/.tightbeam's instead, so `tightbeam
+        // onboard` dialled a pre-existing org's port while its own gateway served
+        // elsewhere. Both variables set, disagreeing, is the case that matters:
+        // BASE_DIR wins, exactly as Tightbeam.BaseDir resolves it.
+        let env = HashMap::from([
+            (
+                "TIGHTBEAM_BASE_DIR".to_owned(),
+                configured.display().to_string(),
+            ),
+            ("TIGHTBEAM_HOME".to_owned(), default.display().to_string()),
+        ]);
+        assert_eq!(
+            discover_with(|name| env.get(name).cloned(), &root, &root),
+            Ok(Endpoint {
+                base: "http://127.0.0.1:4321".to_owned(),
+                token: "configured".to_owned(),
+                session_file: None,
+            })
+        );
+
         assert_eq!(
             discover_with(|_| None, &root, &root),
             Ok(Endpoint {
