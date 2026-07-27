@@ -716,9 +716,13 @@ defmodule Tightbeam.PlacementTest do
     refute opts[:probe_model] == config.default_model
     refute File.exists?(Path.join(probe_cwd, "stale"))
 
+    # claude is railed too (T-PARITY): it gets its OWN gate probe, with its own
+    # model alias, and none of codex's trust-bypass env.
     claude_opts = Placement.adapter_opts(config, {:claude, "default", "testhost"})
-    refute Keyword.has_key?(claude_opts, :probe_cwd)
-    refute Keyword.has_key?(claude_opts, :probe_model)
+    assert claude_opts[:probe_cwd] == probe_cwd
+    assert claude_opts[:probe_model] == "sonnet"
+    refute claude_opts[:probe_model] == opts[:probe_model]
+    refute claude_opts[:probe_model] == config.default_model
     refute Enum.any?(claude_opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
     refute Enum.any?(claude_opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
   end
@@ -837,9 +841,12 @@ defmodule Tightbeam.PlacementTest do
                "-rf" in command
            end)
 
+    # claude is railed too (T-PARITY): its own remote probe, its own model alias,
+    # and never codex's trust-bypass env.
     claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
     refute Enum.any?(claude_opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
-    refute Keyword.has_key?(claude_opts, :probe_cwd)
+    assert claude_opts[:probe_cwd] == "/srv/tb/work/gate-probe"
+    assert claude_opts[:probe_model] == "sonnet"
 
     File.rm_rf!(Path.join([base_dir, "identity", "rails"]))
     Rails.load!(base_dir)

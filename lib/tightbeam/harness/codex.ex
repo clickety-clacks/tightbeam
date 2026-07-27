@@ -373,7 +373,7 @@ defmodule Tightbeam.Harness.Codex do
       rails_env: {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})},
       remote_prefix: fn _base, home -> ["CODEX_HOME=#{home}"] end,
       remote_rails_env: "CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'",
-      railed_probe: true,
+      railed_probe: "gpt-5.6-sol[medium]",
       adapter_bin: "codex-acp",
       adapter_package: @adapter_package,
       adapter_bundle: @adapter_bundle,

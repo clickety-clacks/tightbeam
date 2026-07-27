@@ -7,6 +7,10 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_version "0.59.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
+  # The claude ACP adapter's `model` config option accepts ONLY the bare aliases
+  # default|sonnet|opus|haiku — full ids and `fable` are refused (recorded live at
+  # claude-agent-acp 0.59.0 / claude 2.1.220). One source for the gate probe model.
+  @probe_model "sonnet"
   @adapter_replacements [
     {
       "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
@@ -47,6 +51,44 @@ defmodule Tightbeam.Harness.Claude do
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
     common = Keyword.fetch!(opts, :common_env)
+    rails? = Keyword.fetch!(opts, :rails) != nil
+
+    # Mirror of the codex spawn wiring-check: when statutes are compiled into the
+    # home, prove at adapter boot that this harness actually HONORS a deny before
+    # any session runs.
+    probe =
+      if rails? do
+        probe_cwd = Path.join(target.host_config.base_dir, "work/gate-probe")
+
+        if Support.local?(target) do
+          File.rm_rf!(probe_cwd)
+        else
+          Support.run!(
+            target,
+            ["ssh" | Support.ssh_opts()] ++
+              [target.host_config.ssh, "rm", "-rf", probe_cwd]
+          )
+        end
+
+        ensure_opts = [base_dir: target.base_dir, sh: target.sh]
+
+        ensure_opts =
+          case Keyword.fetch!(opts, :sh_out) do
+            nil -> Keyword.put(ensure_opts, :sh_out, target.sh)
+            sh_out -> Keyword.put(ensure_opts, :sh_out, sh_out)
+          end
+
+        Keyword.fetch!(opts, :ensure_workdir).(
+          target.host_config,
+          probe_cwd,
+          "",
+          ensure_opts
+        )
+
+        [probe_cwd: probe_cwd, probe_model: @probe_model]
+      else
+        []
+      end
 
     if Support.local?(target) do
       token_env =
@@ -55,7 +97,7 @@ defmodule Tightbeam.Harness.Claude do
           _ -> []
         end
 
-      [cmd: [binary], env: [{"CLAUDE_CONFIG_DIR", home} | common ++ token_env]]
+      probe ++ [cmd: [binary], env: [{"CLAUDE_CONFIG_DIR", home} | common ++ token_env]]
     else
       token_path = Path.join([target.host_config.base_dir, "auth", "claude", "oauth-token"])
 
@@ -66,12 +108,13 @@ defmodule Tightbeam.Harness.Claude do
           | Keyword.fetch!(opts, :remote_env)
         ]
 
-      [
-        cmd:
-          ["ssh" | Support.ssh_opts()] ++
-            [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
-        env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
-      ]
+      probe ++
+        [
+          cmd:
+            ["ssh" | Support.ssh_opts()] ++
+              [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+          env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
+        ]
     end
   end
 
@@ -112,9 +155,16 @@ defmodule Tightbeam.Harness.Claude do
   def reconcile_home(target, home, desired) do
     rails =
       case desired.rails do
-        nil -> nil
-        bytes when is_binary(bytes) -> bytes
-        settings -> JSON.encode!(settings)
+        nil ->
+          nil
+
+        bytes when is_binary(bytes) ->
+          bytes
+
+        settings ->
+          settings
+          |> update_in(["hooks", "PreToolUse"], &(&1 ++ [Tightbeam.Rails.probe_entry()]))
+          |> JSON.encode!()
       end
 
     desired = %{desired | rails: rails}
@@ -281,7 +331,7 @@ defmodule Tightbeam.Harness.Claude do
         ]
       end,
       remote_rails_env: nil,
-      railed_probe: false,
+      railed_probe: @probe_model,
       adapter_bin: "claude-agent-acp",
       adapter_package: @adapter_package,
       adapter_bundle: @adapter_bundle,
