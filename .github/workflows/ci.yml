@@ -62,17 +62,6 @@ jobs:
       - name: Put the in-repo harness CLI on PATH (suite prerequisite)
         run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
 
-      # The undeclared dependency that lied loudest: the identity suite commits
-      # and MERGES in a real git repo, and git refuses to write a commit without a
-      # committer. `Identity.relearn!/1` runs its merge with no author env, so on
-      # a host with no git identity the merge fails for a reason that is not a
-      # conflict and relearn reports `{:conflict, []}` — a phantom conflict with
-      # nothing to resolve. Every dev mac has a global identity; shrdlu and the
-      # runners have none, which is the whole 2-failure IdentityTest delta.
-      - name: Declare a git identity (suite prerequisite)
-        run: |
-          git config --global user.name "tightbeam ci"
-          git config --global user.email "ci@tightbeam.invalid"
 
       # Cache the dependency DOWNLOADS only — never cli/target. Two reasons, both
       # learned the hard way (2026-07-27): (1) this step used to sit AFTER the cargo
