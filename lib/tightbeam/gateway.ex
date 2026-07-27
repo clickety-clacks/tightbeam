@@ -1188,24 +1188,18 @@ defmodule Tightbeam.Gateway do
     if File.exists?(rust_cli) do
       File.cp!(rust_cli, wrapper)
     else
-      # The fallback points at the RETIRED TypeScript CLI in a sibling checkout.
-      # It used to be written silently, so on a machine without that checkout the
-      # operator got an executable `bin/tightbeam` that failed with a bare
-      # `node: no such file`, and on a machine WITH it they silently got a
-      # different implementation than the gateway that installed it. Boot then
-      # printed its ordinary success line either way.
-      #
-      # Installing the wrapper is unchanged; what changed is that it now says so.
-      entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
-
+      # There is NO fallback. There used to be one, to the retired TypeScript CLI
+      # in a sibling checkout: on a machine that had that checkout the operator
+      # silently got a different implementation than the gateway that installed
+      # it, and on a machine without it an executable that died on a path they
+      # never chose. A fallback to a retired implementation only ever fires where
+      # nobody is watching, so it is gone.
       Logger.warning(
-        "tightbeam CLI not built: #{rust_cli} is missing, so #{wrapper} falls back to " <>
-          "the retired TypeScript CLI at #{entry} " <>
-          "(present: #{File.exists?(entry)}). Build the real one with: " <>
-          "cargo build --release --manifest-path cli/Cargo.toml"
+        "tightbeam CLI not built: #{rust_cli} is missing, so #{wrapper} will refuse " <>
+          "to run. Build it with: cargo build --release --manifest-path cli/Cargo.toml"
       )
 
-      File.write!(wrapper, fallback_wrapper(entry, rust_cli))
+      File.write!(wrapper, refusing_wrapper(rust_cli))
     end
 
     File.chmod!(wrapper, 0o755)
@@ -1214,18 +1208,15 @@ defmodule Tightbeam.Gateway do
     bin_dir
   end
 
-  # A wrapper whose target is absent must FAIL SAYING SO, rather than surfacing
-  # whatever `node` says about a path the operator never chose.
-  defp fallback_wrapper(entry, rust_cli) do
+  # `bin/tightbeam` still EXISTS when the CLI was not built, because its absence
+  # is itself confusing — but it does exactly one thing: say what is missing and
+  # how to build it.
+  defp refusing_wrapper(rust_cli) do
     """
     #!/bin/sh
-    if [ ! -f "#{entry}" ]; then
-      echo "tightbeam CLI is not installed: #{rust_cli} was missing at gateway boot," >&2
-      echo "and the fallback TypeScript CLI at #{entry} does not exist either." >&2
-      echo "Build it with: cargo build --release --manifest-path cli/Cargo.toml" >&2
-      exit 127
-    fi
-    exec node "#{entry}" "$@"
+    echo "tightbeam CLI is not installed: #{rust_cli} was missing when the gateway booted." >&2
+    echo "Build it with: cargo build --release --manifest-path cli/Cargo.toml" >&2
+    exit 127
     """
   end
 
