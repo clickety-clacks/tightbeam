@@ -34,6 +34,12 @@ pub fn contain_probe() -> String {
     platform::probe_report()
 }
 
+/// Stage an exact profile and report per-root, in this process — so a refusal seen by
+/// `rail-exec` can be reproduced against the very profile string it was handed.
+pub fn contain_stage(profile: &str) -> String {
+    platform::stage_report(profile)
+}
+
 /// The OS release string, shared by both platform reports.
 fn os_release() -> String {
     let mut uts = unsafe { std::mem::zeroed::<libc::utsname>() };
@@ -415,6 +421,10 @@ mod platform {
         )
     }
 
+    pub fn stage_report(_profile: &str) -> String {
+        "stage-report is linux-only; macOS applies SBPL via sandbox-exec\n".to_owned()
+    }
+
     #[cfg(test)]
     pub mod test_support {
         use std::path::Path;
@@ -670,6 +680,57 @@ mod platform {
             let _ = writeln!(out, "    {label} -> {verdict}");
         }
         let _ = std::fs::remove_dir_all(&scratch);
+
+        out
+    }
+
+    /// Mirror `stage` on an exact profile, reporting each root on the SHARED ruleset the
+    /// real path uses — so a `rail-exec` refusal can be reproduced against the very profile
+    /// string and root order it was handed. Diagnostic only.
+    pub fn stage_report(profile: &str) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "stage-report for: {profile}");
+
+        let roots = match parse_profile(profile) {
+            Ok(roots) => roots,
+            Err(reason) => {
+                let _ = writeln!(out, "  parse failed: {reason}");
+                return out;
+            }
+        };
+
+        let abi = match probe_abi() {
+            Ok(abi) => abi,
+            Err(reason) => {
+                let _ = writeln!(out, "  probe_abi failed: {reason}");
+                return out;
+            }
+        };
+        let handled = match rights_for_abi(abi) {
+            Ok(handled) => handled,
+            Err(reason) => {
+                let _ = writeln!(out, "  rights_for_abi failed: {reason}");
+                return out;
+            }
+        };
+        let ruleset = match create_ruleset(handled) {
+            Ok(ruleset) => ruleset,
+            Err(reason) => {
+                let _ = writeln!(out, "  create_ruleset failed: {reason}");
+                return out;
+            }
+        };
+
+        // Add each root to the SAME ruleset, in order, exactly as `stage` does.
+        for root in &roots {
+            let verdict = match grant(&ruleset, root, handled) {
+                Ok(()) => "ok".to_owned(),
+                Err(reason) => format!("REFUSED: {reason}"),
+            };
+            let _ = writeln!(out, "  grant {root} -> {verdict}");
+        }
 
         out
     }

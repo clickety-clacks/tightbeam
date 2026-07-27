@@ -250,10 +250,20 @@ defmodule Tightbeam.ContainmentTest do
         ])
 
       case status do
-        0 -> {output, :allowed}
-        10 -> {output, :denied}
-        30 -> flunk("containment was REFUSED, not applied: #{output}")
-        other -> flunk("unexpected rail-exec band #{other}: #{output}")
+        0 ->
+          {output, :allowed}
+
+        10 ->
+          {output, :denied}
+
+        30 ->
+          # Reproduce the exact refusal against the exact profile, in the same binary, so
+          # a CI-only failure is diagnosed from the runner's own per-root breakdown.
+          {stage, _} = System.cmd(@release_binary, ["contain-stage", profile])
+          flunk("containment was REFUSED, not applied: #{output}\nprofile=#{profile}\n#{stage}")
+
+        other ->
+          flunk("unexpected rail-exec band #{other}: #{output}")
       end
     end
   end
