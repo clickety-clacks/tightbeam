@@ -86,7 +86,13 @@ jobs:
       # kernel number. Never fails the job; it only reports.
       - name: Containment environment (diagnostic)
         if: matrix.name == 'linux'
-        run: cli/target/release/tightbeam contain-probe
+        run: |
+          uname -a
+          echo "--- /dev/null as the shell sees it ---"
+          ls -la /dev/null
+          stat /dev/null
+          echo "--- containment probe ---"
+          cli/target/release/tightbeam contain-probe
 
       - name: Cache mix deps
         uses: actions/cache@v4

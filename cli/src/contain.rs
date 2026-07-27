@@ -617,8 +617,9 @@ mod platform {
             Err(reason) => writeln!(out, "  floor      : REFUSED ({reason})"),
         };
 
-        // A directory grant and a device-node grant, each traced right-by-right, so the
-        // exact bit a strict kernel rejects is on the page. This mirrors what `grant` does.
+        // KERNEL-CAPABILITY view: which explicit right sets does add_rule accept, by hand,
+        // opening WITHOUT O_NOFOLLOW. This says what the kernel can do; it does NOT run the
+        // enforcement path's own rights computation.
         for (label, path) in [("directory", "/tmp"), ("device-node", "/dev/null")] {
             let _ = writeln!(out, "  grant[{label}] {path}:");
 
@@ -634,7 +635,83 @@ mod platform {
             }
         }
 
+        // ENFORCEMENT-PATH view: exactly what `grant` does — open WITH O_NOFOLLOW, fstat,
+        // run `allowed_rights_for`, add_rule with the COMPUTED set. If this disagrees with
+        // the kernel-capability view above, the bug is in the enforcement computation, not
+        // the kernel. This is the line the coordinator asked to make the stage path prove.
+        let _ = writeln!(out, "  enforcement-path (what stage actually grants):");
+        for path in ["/tmp", "/dev/null"] {
+            let _ = writeln!(out, "    {path}: {}", enforcement_trace(path));
+        }
+
         out
+    }
+
+    /// Mirror `grant` precisely, reporting the intermediate facts: the O_NOFOLLOW open, the
+    /// fstat type, the rights `allowed_rights_for` computes, and the add_rule verdict for
+    /// that computed set. Diagnostic only.
+    fn enforcement_trace(root: &str) -> String {
+        let cpath = match CString::new(root) {
+            Ok(cpath) => cpath,
+            Err(_) => return "path has interior NUL".to_owned(),
+        };
+
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return format!("open(O_NOFOLLOW) failed: {}", io::Error::last_os_error());
+        }
+        let parent = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(parent.as_raw_fd(), &mut stat) } != 0 {
+            return format!("fstat failed: {}", io::Error::last_os_error());
+        }
+        let ifmt = stat.st_mode & libc::S_IFMT;
+        let typename = match ifmt {
+            libc::S_IFDIR => "dir",
+            libc::S_IFREG => "reg",
+            libc::S_IFCHR => "chr",
+            libc::S_IFBLK => "blk",
+            libc::S_IFLNK => "lnk",
+            libc::S_IFIFO => "fifo",
+            libc::S_IFSOCK => "sock",
+            _ => "other",
+        };
+
+        let computed = match allowed_rights_for(&parent, HANDLED_WRITE_RIGHTS, root) {
+            Ok(rights) => rights,
+            Err(reason) => return format!("st_mode={ifmt:#o}({typename}) rights failed: {reason}"),
+        };
+
+        let ruleset = match create_ruleset(HANDLED_WRITE_RIGHTS) {
+            Ok(ruleset) => ruleset,
+            Err(reason) => return format!("ruleset failed: {reason}"),
+        };
+        let attr = PathBeneathAttr {
+            allowed_access: computed,
+            parent_fd: parent.as_raw_fd(),
+        };
+        let added = unsafe {
+            libc::syscall(
+                ADD_RULE,
+                ruleset.as_raw_fd(),
+                RULE_PATH_BENEATH,
+                &attr as *const PathBeneathAttr,
+                0usize,
+            )
+        };
+        let verdict = if added == 0 {
+            "ok".to_owned()
+        } else {
+            format!("EINVAL/err: {}", io::Error::last_os_error())
+        };
+
+        format!("st_mode={ifmt:#o}({typename}) computed_rights={computed:#x} add_rule={verdict}")
     }
 
     /// One isolated ruleset + one add_rule, reporting ok or the errno — the probe's unit of
