@@ -4,6 +4,8 @@ defmodule Tightbeam.Harness.Claude do
 
   alias Tightbeam.Harness.Support
 
+  require Logger
+
   @adapter_version "0.59.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
@@ -51,9 +53,21 @@ defmodule Tightbeam.Harness.Claude do
   # `node <adapters>/claude-agent-acp`, `initialize`, `session/new`, then read the
   # `model` entry of the returned `configOptions` for the offered set, and confirm each
   # candidate with `session/set_config_option`. Update this table and the version stamp
-  # together. Codex does NOT have this problem and needs no equivalent table: its
-  # catalog is read from the CLI's own `models_cache.json`, so catalog and accepted set
-  # come from one artifact and cannot diverge. This asymmetry is the actual finding.
+  # together.
+  #
+  # ALSO GRANT- AND HOME-DEPENDENT, not only version-dependent. A smoke run recorded
+  # opus-5 and fable-5 "refused on this grant", and JOURNAL.md:804 records the offered
+  # list changing with the home's `settings.json` and the session cwd. So this table
+  # pins THREE things at once, and a different account may legitimately accept more.
+  # That is why the set is injectable (`claude_selectable_models` in the catalog's
+  # options, `:all` to disable) rather than only editable here.
+  #
+  # ON CODEX, qualified: codex reads its catalog from the CLI's own
+  # `models_cache.json` (codex.ex), so its two vocabularies share one artifact and
+  # divergence is structurally unlikely. But acceptance still happens in the external
+  # ACP/CLI process (`acp/adapter.ex` set_config_option), which this repo does not
+  # observe, so "cannot diverge" is NOT proven here — it is unprobed analysis. Nobody
+  # has run the equivalent probe against codex-acp.
   @adapter_selectable_models ~w(default sonnet opus haiku claude-sonnet-5 claude-opus-4-8
                                 claude-haiku-4-5-20251001)
 
@@ -293,6 +307,7 @@ defmodule Tightbeam.Harness.Claude do
          {:ok, models} <- decode_catalog(body),
          {:ok, models} <- fill_capabilities(models, headers, fetch),
          {:ok, entries} <- derive_catalog_entries(models),
+         entries <- keep_selectable(entries, selectable_models(state)),
          entries when entries != [] <- entries do
       {:ok, entries}
     else
@@ -300,6 +315,52 @@ defmodule Tightbeam.Harness.Claude do
       false -> {:error, :missing_token}
       [] -> {:error, :empty_inventory}
       _ -> {:error, :malformed_catalog}
+    end
+  end
+
+  # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
+  # the already-derived entries — no probe, no extra fetch, nothing at boot; the
+  # journal records this path being reverted once for adding live I/O, so it stays
+  # a filter. Effort suffixes are preserved: only the base ref is matched.
+  #
+  # This is a PIN, and it pins three things at once — the CLI version, the grant
+  # (a smoke run recorded opus-5 "refused on this grant"), and any model pins in
+  # the projected home's settings.json. When claude ships a version that accepts
+  # more, or a different grant offers more, THE TABLE is what to re-probe and
+  # update; nothing here discovers it. See the note on @adapter_selectable_models.
+  # Injectable through the same `state.options` seam as claude_fetch/codex_read/
+  # credential_status, for two reasons: a test must be able to exercise catalog
+  # derivation without being coupled to this table, and an operator on a DIFFERENT
+  # GRANT (the accepted set is grant-dependent — a smoke run recorded opus-5
+  # "refused on this grant") must be able to lift the ceiling without editing code.
+  # `:all` disables the filter entirely.
+  defp selectable_models(state),
+    do: Map.get(state.options, :claude_selectable_models, @adapter_selectable_models)
+
+  defp keep_selectable(entries, :all), do: entries
+
+  defp keep_selectable(entries, selectable) do
+    {kept, dropped} =
+      Enum.split_with(entries, fn entry ->
+        entry.ref |> base_ref() |> Kernel.in(selectable)
+      end)
+
+    if dropped != [] do
+      Logger.info(
+        "claude catalog: #{length(dropped)} model(s) the API offers are not selectable by " <>
+          "claude-agent-acp #{@adapter_version} and were withheld: " <>
+          Enum.map_join(dropped, ", ", & &1.ref) <>
+          " — re-probe @adapter_selectable_models in harness/claude.ex if this looks wrong"
+      )
+    end
+
+    kept
+  end
+
+  defp base_ref(ref) do
+    case Regex.run(~r/^(.*?)\[(.*?)\]$/, ref) do
+      [_, base, _effort] -> base
+      _ -> ref
     end
   end
 
@@ -424,7 +485,12 @@ defmodule Tightbeam.Harness.Claude do
           end
         end
 
-        %{base_dir: base, options: %{claude_fetch: fetch}}
+        # The vector's subject is catalog DERIVATION — provider stamping and the
+        # exact source error — using a synthetic model id. The selectable pin is a
+        # separate concern with its own tests, so it is disabled here; leaving it on
+        # would filter `claude-vector` away and turn a derivation vector into a test
+        # of the table.
+        %{base_dir: base, options: %{claude_fetch: fetch, claude_selectable_models: :all}}
       end,
       wire_projection: %{
         "id" => "claude",

@@ -15,7 +15,8 @@ from `<base_dir>/gateway.json`).
 ## Harness parity (normative for every run)
 
 This runbook is a MATRIX, not a list: one full pass PER HARNESS the org
-supports (today: claude on `fable`, codex on `gpt-5.6-sol[medium]`), using a
+supports (today: claude on `claude-sonnet-5[medium]`, codex on
+`gpt-5.6-sol[medium]`), using a
 session of that harness for every step. A smoke run's verdict is
 INCOMPLETE — not passed — until every harness leg has run or been WAIVED by
 name with the blocker stated (e.g. "codex leg waived: no codex grant in the

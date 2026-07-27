@@ -278,50 +278,54 @@ defmodule Tightbeam.GatewayTest do
         ]
       })
 
-    start_supervised!(
-      {ModelCatalog,
-       base_dir: catalog_base,
-       codex_home: Path.join(catalog_base, "codex"),
-       credential_status: fn _provider -> :onboarded end,
-       claude_fetch: fn _, _ -> {:ok, claude_models} end,
-       codex_read: fn _ ->
-         {:ok,
-          JSON.encode!(%{
-            models: [
-              %{
-                slug: "gpt-5.6-sol",
-                display_name: "GPT-5.6 Sol",
-                supported_reasoning_levels: [
-                  %{effort: "low"},
-                  %{effort: "medium"},
-                  %{effort: "high"},
-                  %{effort: "xhigh"},
-                  %{effort: "max"},
-                  %{effort: "ultra"}
-                ]
-              },
-              %{
-                slug: "gpt-5.6-terra",
-                display_name: "GPT-5.6 Terra",
-                supported_reasoning_levels: [
-                  %{effort: "low"},
-                  %{effort: "high"}
-                ]
-              },
-              %{
-                slug: "gpt-5.6-nano",
-                display_name: "GPT-5.6 Nano",
-                supported_reasoning_levels: [%{effort: "turbo"}]
-              },
-              %{
-                slug: "gpt-5.6-classic",
-                display_name: "GPT-5.6 Classic",
-                supported_reasoning_levels: []
-              }
-            ]
-          })}
-       end}
-    )
+    start_supervised!({
+      ModelCatalog,
+      # This suite's subject is the gateway, not the claude selectable-model pin
+      # (tested in model_catalog_test). Leaving the pin on would filter this
+      # fixture to nothing and starve the catalog.
+      base_dir: catalog_base,
+      codex_home: Path.join(catalog_base, "codex"),
+      credential_status: fn _provider -> :onboarded end,
+      claude_selectable_models: :all,
+      claude_fetch: fn _, _ -> {:ok, claude_models} end,
+      codex_read: fn _ ->
+        {:ok,
+         JSON.encode!(%{
+           models: [
+             %{
+               slug: "gpt-5.6-sol",
+               display_name: "GPT-5.6 Sol",
+               supported_reasoning_levels: [
+                 %{effort: "low"},
+                 %{effort: "medium"},
+                 %{effort: "high"},
+                 %{effort: "xhigh"},
+                 %{effort: "max"},
+                 %{effort: "ultra"}
+               ]
+             },
+             %{
+               slug: "gpt-5.6-terra",
+               display_name: "GPT-5.6 Terra",
+               supported_reasoning_levels: [
+                 %{effort: "low"},
+                 %{effort: "high"}
+               ]
+             },
+             %{
+               slug: "gpt-5.6-nano",
+               display_name: "GPT-5.6 Nano",
+               supported_reasoning_levels: [%{effort: "turbo"}]
+             },
+             %{
+               slug: "gpt-5.6-classic",
+               display_name: "GPT-5.6 Classic",
+               supported_reasoning_levels: []
+             }
+           ]
+         })}
+      end
+    })
 
     await_catalog("claude")
     await_catalog("codex")
@@ -851,6 +855,31 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{harness: "claude", provider: "anthropic", model: "claude-fable-5"} =
              Org.get(ctx.db, Org.personal_session_key(device.user_id))
+  end
+
+  # Task #41. A model the adapter cannot select must be refused by NAME and the
+  # operator told what IS available — before, this died deep in the adapter as
+  # "Invalid value for config option model", on every session/new and session/load.
+  test "an unavailable model is refused by name and names what is offered", ctx do
+    base_dir = role_test_base("model-not-offered")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    assert %{code: "model_unavailable", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-opus-5"}
+             })
+
+    assert message =~ ~s(model "claude-opus-5" is not offered by claude)
+
+    # The hint is the point: naming only the rejection makes the operator guess.
+    assert message =~ "offered:"
+    assert message =~ "claude-sonnet-4-6"
+
+    # ...and it must not recommend the very thing it just refused.
+    refute message =~ "offered: claude-opus-5"
   end
 
   test "a catalog missing for want of a GATEWAY credential says so, with the repair", ctx do

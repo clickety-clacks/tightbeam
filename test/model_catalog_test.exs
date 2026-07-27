@@ -481,7 +481,13 @@ defmodule Tightbeam.ModelCatalogTest do
         codex_home: ctx.codex_home,
         claude_fetch: ctx.claude_fetch,
         codex_read: ctx.codex_read,
-        credential_status: fn _provider -> :onboarded end
+        credential_status: fn _provider -> :onboarded end,
+        # These tests exercise catalog DERIVATION (field mapping, effort parsing,
+        # health, sorting) with synthetic and fixture model ids. The claude
+        # selectable-model pin is a separate subject with its own tests below, so
+        # it is disabled here — otherwise every derivation test would silently
+        # become a test of that table.
+        claude_selectable_models: :all
       ]
       |> Keyword.merge(overrides)
 
@@ -501,6 +507,50 @@ defmodule Tightbeam.ModelCatalogTest do
     else
       Process.sleep(5)
       await(fun, attempts - 1)
+    end
+  end
+
+  # Task #41. The catalog must not advertise a model the adapter will refuse, and no
+  # substitution may be smuggled in at the only place a mapping could live.
+  describe "claude selectable-model pin" do
+    test "withholds models the adapter refuses and keeps the ones it accepts", ctx do
+      catalog =
+        start_catalog(ctx,
+          claude_selectable_models: Tightbeam.Harness.Claude.adapter_selectable_models()
+        )
+
+      await_fresh(catalog, "claude")
+      {claude, :fresh} = ModelCatalog.get("claude", catalog)
+      refs = Enum.map(claude, & &1.ref)
+      bases = refs |> Enum.map(&String.replace(&1, ~r/\[.*\]$/, "")) |> Enum.uniq()
+
+      # Only selectable bases survive, and the fixture's refused ones are gone.
+      assert "claude-haiku-4-5-20251001" in bases
+      refute "claude-opus-5" in bases
+      refute "claude-fable-5" in bases
+      refute "claude-sonnet-4-6" in bases
+
+      assert Enum.all?(bases, &(&1 in Tightbeam.Harness.Claude.adapter_selectable_models())),
+             "catalog offered a base the adapter refuses: #{inspect(bases)}"
+
+      # The filter matches the BASE ref, so effort suffixes are preserved, not eaten.
+      assert Enum.any?(refs, &String.contains?(&1, "["))
+    end
+
+    # Where a substitution WOULD live: parse_model_ref is the only transform between a
+    # requested ref and what reaches session/set_config_option. If someone maps a
+    # refused model onto an accepted one, it happens here, and this goes red.
+    test "the only ref transform strips effort and never rewrites the model" do
+      for refused <- ~w(claude-fable-5 claude-opus-5 fable) do
+        assert Tightbeam.Acp.Adapter.parse_model_ref(refused) == {refused, nil},
+               "#{refused} was rewritten — a substitution has been introduced"
+
+        assert Tightbeam.Acp.Adapter.parse_model_ref("#{refused}[medium]") == {refused, "medium"},
+               "#{refused}[medium] did not pass through with only its effort split off"
+      end
+
+      assert Tightbeam.Acp.Adapter.parse_model_ref("claude-sonnet-5[high]") ==
+               {"claude-sonnet-5", "high"}
     end
   end
 

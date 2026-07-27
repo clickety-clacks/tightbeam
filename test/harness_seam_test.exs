@@ -158,5 +158,10 @@ defmodule Tightbeam.HarnessSeamTest do
     assert source =~ "claude CLI 2.1.220"
     assert source =~ "claude-agent-acp 0.59.0"
     assert source =~ "silent downgrade"
+
+    # The codex half is unprobed analysis and must stay labelled as such, so nobody
+    # reads it as a proven property of this repo (review finding 3).
+    assert source =~ "unprobed analysis"
+    refute source =~ "come from one artifact and cannot diverge"
   end
 end
