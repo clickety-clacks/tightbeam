@@ -27,12 +27,14 @@ defmodule Tightbeam.ClientE2E.Scorecard do
 
       any :fail                          -> :fail
       else any :incomplete               -> {:incomplete, blockers}
+      else missing registered journeys   -> {:incomplete, blockers}
       else no automated (non-`:manual`) row -> {:incomplete, ["no automated rows"]}
       else                               -> :pass
 
-  The empty-leg clause is deliberate. A leg that ran nothing is the exact
-  shape of a vacuous pass — the failure this driver exists to prevent — so it
-  reports INCOMPLETE, never PASS.
+  The empty-leg and journey-coverage clauses are deliberate. A leg that ran
+  nothing, or only a strict subset of the journey registry, is the exact shape
+  of a vacuous pass — the failure this driver exists to prevent — so it reports
+  INCOMPLETE, never PASS.
 
   Run verdict is the WORST leg verdict, and a run that did not cover every
   registered harness is INCOMPLETE regardless of how its legs did (T-PARITY:
@@ -123,11 +125,21 @@ defmodule Tightbeam.ClientE2E.Scorecard do
   def leg_verdict(%Leg{rows: rows}) do
     blockers = for %Row{status: :incomplete} = r <- rows, do: blocker_text(r)
     automated = Enum.reject(rows, &(&1.status == :manual))
+    covered_journeys = rows |> Enum.map(& &1.journey) |> Enum.reject(&is_nil/1) |> MapSet.new()
+
+    missing_journeys =
+      Enum.reject(Tightbeam.ClientE2E.Journeys.ids(), &MapSet.member?(covered_journeys, &1))
+
+    coverage_blockers =
+      case missing_journeys do
+        [] -> []
+        missing -> ["journey coverage: no rows for #{Enum.join(missing, ", ")}"]
+      end
 
     cond do
       Enum.any?(rows, &(&1.status == :fail)) -> :fail
-      blockers != [] -> {:incomplete, blockers}
       automated == [] -> {:incomplete, ["no automated rows ran on this leg"]}
+      blockers ++ coverage_blockers != [] -> {:incomplete, blockers ++ coverage_blockers}
       true -> :pass
     end
   end

@@ -22,6 +22,29 @@ defmodule Tightbeam.ClientE2E do
   @default_turn_timeout_ms 180_000
   @default_settle_ms 2_500
 
+  @doc """
+  Resolves `TIGHTBEAM_CLIENT_E2E_JOURNEYS` against the journey registry.
+
+  An unset variable selects the full registry. Unknown ids raise before the
+  runner performs preflight or boots a gateway.
+  """
+  @spec configured_journeys() :: [String.t()]
+  def configured_journeys do
+    case System.get_env("TIGHTBEAM_CLIENT_E2E_JOURNEYS") do
+      nil ->
+        Journeys.ids()
+
+      value ->
+        ids = value |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
+        known = Journeys.ids()
+
+        case ids -- known do
+          [] -> ids
+          unknown -> raise "unknown journey ids #{inspect(unknown)}; known: #{inspect(known)}"
+        end
+    end
+  end
+
   @type opts :: [
           host: String.t(),
           port: :inet.port_number(),
