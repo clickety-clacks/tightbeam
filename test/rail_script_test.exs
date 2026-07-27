@@ -172,6 +172,54 @@ defmodule Tightbeam.RailScriptTest do
     assert System.monotonic_time(:millisecond) - started < 2_500
   end
 
+  # Both timeout layers report the SAME reason and exit class, so a `script_timeout`
+  # deny cannot be read as enforcement-or-contention on its face (task #38). The only
+  # discriminator available is the recorded duration, and it works ONLY because the two
+  # deadlines are separated by the fixed 2_000ms backstop margin in RailScript.await/3.
+  # This pins that separation: if the margin ever collapses, the C5 timeout-layer
+  # diagnosis silently starts lying and this test goes red first.
+  test "the binary's own timeout and the BEAM backstop land on opposite sides of the margin",
+       ctx do
+    binary_budget = 100
+
+    assert {:error, "script_timeout", "timeout"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               put_in(rule("rail-timeout").check.timeout_ms, binary_budget),
+               call(),
+               nil
+             )
+
+    binary_ms = last_rail_script_duration_ms(ctx.db)
+
+    # The binary enforced its own budget: at or past it, but well short of the backstop.
+    assert binary_ms >= binary_budget
+    assert binary_ms < binary_budget + 2_000
+
+    backstop_budget = 10
+    wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+    File.write!(wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
+    File.chmod!(wrapper, 0o755)
+
+    assert {:error, "script_timeout", "timeout"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               put_in(rule("rail-pass").check.timeout_ms, backstop_budget),
+               call(),
+               nil
+             )
+
+    backstop_ms = last_rail_script_duration_ms(ctx.db)
+
+    # The wrapper never reported, so await/3 gave up at budget + the 2_000ms margin.
+    assert backstop_ms >= backstop_budget + 2_000
+
+    # The two are indistinguishable by reason/exit_class and separable only by duration.
+    assert binary_ms < binary_budget + 2_000 and backstop_ms >= backstop_budget + 2_000
+  end
+
   test "runs at the holder workdir with scratch as its only rail write root", ctx do
     workdir = Placement.holder_workdir(%{base_dir: ctx.base_dir, port: 0}, ctx.holder)
     File.write!(Path.join(workdir, ".rail-cwd-marker"), "cwd")
@@ -507,6 +555,13 @@ defmodule Tightbeam.RailScriptTest do
     test "real Rust rail-exec matches BEAM framing for pass, deny, and escaped timeout" do
       flunk("release binary is required when this test is enabled")
     end
+  end
+
+  defp last_rail_script_duration_ms(db) do
+    EventLog.lifecycle_events(db)
+    |> Enum.filter(&(&1.kind == "rail_script"))
+    |> List.last()
+    |> then(&JSON.decode!(&1.detail)["duration_ms"])
   end
 
   defp rule(script) do

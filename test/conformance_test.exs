@@ -748,7 +748,13 @@ defmodule Tightbeam.ConformanceSupport do
       assert_fixture_world(fixture, kase, db, ids)
       seed_script_checkout!(base, fixture, kase, db)
       call = build_call(kase["call"], ids)
-      assert_rule_result(kase["case"], kase["expect"], kase["reason"], Rules.evaluate(db, call))
+      assert_rule_result(
+        kase["case"],
+        kase["expect"],
+        kase["reason"],
+        Rules.evaluate(db, call),
+        timeout_ctx(db, fixture)
+      )
 
       if fixture["name"] == "predicate-prefilter-script-laziness" and
            kase["case"] == "predicate-miss-never-invokes-script" do
@@ -786,7 +792,8 @@ defmodule Tightbeam.ConformanceSupport do
           "#{kase["case"]} phase2",
           phase2["expect"] || kase["expect"],
           kase["reason"],
-          Rules.evaluate(db, phase2_call)
+          Rules.evaluate(db, phase2_call),
+          timeout_ctx(db, fixture)
         )
       end
     after
@@ -794,13 +801,60 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  defp assert_rule_result(_case, "deny", reason, {:deny, %{rule: actual}}),
+  defp assert_rule_result(_case, "deny", reason, {:deny, %{rule: actual}}, _ctx),
     do: assert(actual == reason)
 
-  defp assert_rule_result(_case, "pass", _reason, :ok), do: :ok
+  defp assert_rule_result(_case, "pass", _reason, :ok, _ctx), do: :ok
 
-  defp assert_rule_result(case_id, expect, _reason, actual),
-    do: flunk("#{case_id}: expected #{expect}, got #{inspect(actual)}")
+  defp assert_rule_result(case_id, expect, _reason, actual, ctx),
+    do:
+      flunk("#{case_id}: expected #{expect}, got #{inspect(actual)}#{timeout_layer(actual, ctx)}")
+
+  defp timeout_ctx(db, fixture) do
+    %{db: db, timeout_ms: Enum.find_value(fixture["rule"], &get_in(&1, ["check", "timeout_ms"]))}
+  end
+
+  # A `script_timeout` deny is ambiguous on its face. TWO layers produce it and both
+  # land on exit status 20: the rail-exec binary enforcing the declared `timeout_ms`
+  # (it SIGKILLs the process group and exits 20 — a real script-too-slow verdict), and
+  # `RailScript.await/3` giving up on the port at `timeout_ms + 2_000` and SYNTHESIZING
+  # status 20 for a wrapper that never reported. Only the first is enforcement; the
+  # second is the harness losing the race, which is what makes a red C5 unreadable
+  # under contention (task #38). The recorded `duration_ms` separates them, because the
+  # two deadlines differ by exactly the 2_000ms backstop margin by construction.
+  def timeout_layer({:deny, %{reason: "script_timeout"}}, %{db: db, timeout_ms: budget})
+      when is_integer(budget) do
+    case rail_script_duration_ms(db) do
+      nil ->
+        "\n  timeout layer: UNDETERMINED — no rail_script lifecycle row to measure."
+
+      ms when ms >= budget + 2_000 ->
+        "\n  timeout layer: BEAM BACKSTOP (not enforcement) — measured #{ms}ms >= " <>
+          "timeout_ms(#{budget}) + 2000ms backstop. The wrapper never reported, so " <>
+          "rail-exec rendered NO verdict; this is harness/contention."
+
+      ms when ms >= budget ->
+        "\n  timeout layer: RAIL-EXEC BINARY (enforcement) — measured #{ms}ms >= " <>
+          "declared timeout_ms(#{budget}) and below the +2000ms backstop. The binary " <>
+          "killed the process group; the script genuinely exceeded its budget."
+
+      ms ->
+        "\n  timeout layer: ANOMALOUS — script_timeout at #{ms}ms, under both the " <>
+          "declared timeout_ms(#{budget}) and the +2000ms backstop."
+    end
+  end
+
+  def timeout_layer(_actual, _ctx), do: ""
+
+  def rail_script_duration_ms(db) do
+    EventLog.lifecycle_events(db)
+    |> Enum.filter(&(&1.kind == "rail_script"))
+    |> List.last()
+    |> case do
+      nil -> nil
+      event -> JSON.decode!(event.detail)["duration_ms"]
+    end
+  end
 
   defp assert_declared_records!(emits, payload, db) do
     emits
@@ -3684,6 +3738,52 @@ defmodule Tightbeam.ConformanceTest do
         ] do
       Corpus.run_rail_exec_fixture(fixture!("C5", name))
     end
+  end
+
+  # Task #38: a `script_timeout` deny is produced by BOTH the rail-exec binary enforcing
+  # the declared budget and RailScript.await/3 synthesizing status 20 for a wrapper that
+  # never reported. Reason and exit_class are identical for both, so a red C5 could not
+  # be read as enforcement-vs-contention. The failure surface must now say which layer
+  # fired. (The physical premise — that real durations for the two layers straddle the
+  # +2000ms margin — is pinned in rail_script_test.exs.)
+  test "C5 timeout diagnosis separates the rail-exec verdict from the BEAM backstop" do
+    db = :"c5_timeout_layer_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.EventLog.ensure_schema(db)
+
+    budget = 2_000
+    ctx = %{db: db, timeout_ms: budget}
+    timeout_deny = {:deny, %{rule: "reconcile-with-main", reason: "script_timeout"}}
+    genuine_refusal = {:deny, %{rule: "reconcile-with-main", reason: "rule_denied"}}
+
+    # Layer 1 — the binary enforced its own budget: at/past it, inside the margin.
+    record_rail_script_duration!(db, budget + 40)
+    binary = Corpus.timeout_layer(timeout_deny, ctx)
+    assert binary =~ "RAIL-EXEC BINARY (enforcement)"
+    assert binary =~ "declared timeout_ms(2000)"
+    refute binary =~ "BEAM BACKSTOP"
+
+    # Layer 2 — the wrapper never reported; await/3 gave up past the margin.
+    record_rail_script_duration!(db, budget + 2_000 + 15)
+    backstop = Corpus.timeout_layer(timeout_deny, ctx)
+    assert backstop =~ "BEAM BACKSTOP (not enforcement)"
+    assert backstop =~ "harness/contention"
+    refute backstop =~ "RAIL-EXEC BINARY"
+
+    # The whole point of the task: identical reason, different reported layer.
+    assert binary != backstop
+
+    # A genuine refusal must not acquire timeout noise it did not earn.
+    assert Corpus.timeout_layer(genuine_refusal, ctx) == ""
+  end
+
+  defp record_rail_script_duration!(db, duration_ms) do
+    Tightbeam.EventLog.lifecycle(
+      db,
+      "rail_script",
+      "reconcile-with-main",
+      JSON.encode!(%{exit_class: "timeout", reason: "script_timeout", duration_ms: duration_ms})
+    )
   end
 
   test "handler refusal covers all canonical codes and leaves no assignment survivor" do
