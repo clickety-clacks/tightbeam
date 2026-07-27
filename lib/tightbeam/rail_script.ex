@@ -8,13 +8,14 @@ defmodule Tightbeam.RailScript do
   # Every other class asserts something someone saw: `returned` and `out-of-set` read
   # the wrapper's stdout, `error:<N>` carries the child's own code parsed off wrapper
   # stderr, `timeout` means the wrapper's timer elapsed and it killpg'd the process
-  # group, `contained` means the sandbox refused to apply. When none of those happened
-  # — the port never reported, the child's code was never seen, the substrate itself
-  # crashed — the substrate used to fill in the value the observation would have
-  # carried, and a fabricated `error:1` is indistinguishable from a real one. That is
-  # what made I3's "every failure names itself" unenforceable rather than merely
-  # unenforced. The wrapper cannot produce this string, so its presence is proof no
-  # verdict was observed and its absence is proof one was.
+  # group, `contained` means the sandbox refused to apply. When none of those happened —
+  # the port never reported, the child's code was never seen, no script was spawned at
+  # all, or the substrate itself raised or exited — filling in the value the observation
+  # would have carried produces an `error:1` indistinguishable from a script that really
+  # exited 1. That is what made I3's "every failure names itself" unenforceable rather
+  # than merely unenforced: nothing downstream could tell the two apart. The wrapper
+  # cannot produce this string, so its presence is proof no verdict was observed and its
+  # absence is proof one was.
   #
   # `reason` is deliberately unchanged at every site: fail-closed semantics and the
   # reason-reading consumers stay exactly as they were. Only the class splits.
