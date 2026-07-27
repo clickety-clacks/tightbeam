@@ -1,0 +1,11 @@
+# Pins the toolchain for anyone using rustup: it installs and selects this channel
+# automatically, so `cargo build` cannot silently run against whatever happened to be
+# on PATH. The CLI is edition 2024, which needs Rust >= 1.85.
+#
+# This does NOT help a distro-packaged cargo — apt/dnf builds ignore rustup entirely,
+# and Ubuntu 24.04 LTS ships 1.75. That case is covered by `rust-version` in
+# Cargo.toml, which makes cargo name the real problem, and by the README telling you
+# to install via rustup rather than the distro.
+[toolchain]
+channel = "stable"
+components = ["rustfmt"]

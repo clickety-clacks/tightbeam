@@ -13,10 +13,18 @@ from the failure — see `mix tightbeam.doctor` and the notes below.
 - **Elixir + OTP.** Built against Elixir 1.19 / OTP 28. With no Elixir on PATH
   every command below fails as `mix: command not found`; nothing in this
   repository can report that for you.
-- **Rust toolchain**, to build the `tightbeam` CLI (`cargo build --release
-  --manifest-path cli/Cargo.toml`). If you skip this, gateway boot still
-  succeeds and installs a `bin/tightbeam` that refuses to run, naming what is
-  missing.
+- **Rust >= 1.85**, to build the `tightbeam` CLI (`cargo build --release
+  --manifest-path cli/Cargo.toml`). The CLI is edition 2024, so older toolchains
+  cannot build it at all. **Install via [rustup](https://rustup.rs), not your
+  distro** — Ubuntu 24.04 LTS packages 1.75, which looks like a satisfied
+  prerequisite and then fails the build. `cargo --version` must report 1.85 or
+  newer before you start.
+
+  Do not skip this step and continue. Gateway boot still succeeds without the
+  CLI and installs a `bin/tightbeam` that refuses to run — but the very next
+  documented step, onboarding a credential, *is* that binary. You would get a
+  gateway that looks healthy, cannot be onboarded, cannot run a turn, and
+  reports its problem as missing credentials rather than a missing CLI.
 - **A harness CLI per harness you intend to use** — `claude` and/or `codex` — on
   PATH. `mix tightbeam.doctor` reports each as `harness_binary:<harness>`.
 - **node + npm.** The ACP adapters are npm packages, and the gateway installs

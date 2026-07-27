@@ -59,7 +59,15 @@ Per `service-mode-install-v1.md`, the service must be proven to:
 - survive logout of the disposable account
 - survive reboot
 - run a real turn against its own credentials
-- read nothing from the disposable account's home
+
+An earlier version of this list also demanded the service "read nothing from the
+disposable account's home". That was wrong and is struck: there is no dedicated
+service account — the service runs as the account that installed it, which in a
+test run *is* the disposable one, so its working directory, `ExecStart`, and
+`base_dir` all live there by construction. Following the README made that bullet
+unsatisfiable. What it was really guarding against — a system service outliving
+the account that owns its files — is already handled by the teardown ordering in
+§5: uninstall first, verify no residue, and only then delete the account.
 
 A foreground process is not evidence for any of these.
 

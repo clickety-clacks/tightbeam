@@ -2,6 +2,12 @@
 name = "tightbeam"
 version = "0.1.0"
 edition = "2024"
+# edition 2024 needs Rust >= 1.85. Without this field cargo reports the mismatch as
+# "feature `edition2024` is required ... not stabilized in this version of Cargo",
+# which names a cargo feature rather than the thing to fix. With it, cargo says the
+# package requires a newer rustc and prints the version it found. Ubuntu 24.04 LTS
+# ships 1.75, so this is the first wall a customer hits.
+rust-version = "1.85"
 
 [dependencies]
 libc = "0.2"
