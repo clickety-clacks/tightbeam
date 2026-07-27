@@ -31,18 +31,27 @@ defmodule Tightbeam.RailScript do
     started = System.monotonic_time(:millisecond)
 
     try do
-      {result, context} =
+      {result, context, diagnostic} =
         try do
           File.mkdir_p!(scratch)
           File.chmod!(scratch, 0o700)
           execute(db, base_dir, scratch, rule, call, assignment)
         rescue
-          _ -> {{:error, "script_error", @unreported}, empty_context()}
+          _ -> {{:error, "script_error", @unreported}, empty_context(), nil}
         catch
-          _, _ -> {{:error, "script_error", @unreported}, empty_context()}
+          _, _ -> {{:error, "script_error", @unreported}, empty_context(), nil}
         end
 
-      record(db, rule, call, context, result, System.monotonic_time(:millisecond) - started)
+      record(
+        db,
+        rule,
+        call,
+        context,
+        result,
+        System.monotonic_time(:millisecond) - started,
+        diagnostic
+      )
+
       result
     after
       File.rm_rf!(scratch)
@@ -53,26 +62,29 @@ defmodule Tightbeam.RailScript do
     case invocation_context(db, base_dir, assignment) do
       {:ok, context, cwd} ->
         input = invocation_input(call, context)
-        profile = Containment.profile([scratch])
+        profile = Containment.rail_profile([scratch])
         script = Path.join([base_dir, "identity", "rails", "scripts", rule.check.script])
         wrapper = Path.join([base_dir, "bin", "tightbeam"])
 
-        {run_wrapper(
-           wrapper,
-           profile,
-           rule.check.timeout_ms,
-           script,
-           cwd,
-           scratch,
-           rule,
-           input
-         ), context}
+        {result, diagnostic} =
+          run_wrapper(
+            wrapper,
+            profile,
+            rule.check.timeout_ms,
+            script,
+            cwd,
+            scratch,
+            rule,
+            input
+          )
+
+        {result, context, diagnostic}
 
       {:error, context} ->
         # The holder is missing, is on another host, or its workdir would not open, so
         # no script ran at all. Same fabrication as the rescue above: recording
         # `error:1` here asserted a child exit for a child that was never spawned.
-        {{:error, "script_error", @unreported}, context}
+        {{:error, "script_error", @unreported}, context, nil}
     end
   end
 
@@ -193,8 +205,24 @@ defmodule Tightbeam.RailScript do
         _ -> ""
       end
 
-    classify(status, stdout, stderr, rule.check.returns)
+    result = classify(status, stdout, stderr, rule.check.returns)
+    {result, refusal_diagnostic(result, stderr)}
   end
+
+  # The wrapper names WHY containment could not be applied — kernel below the Landlock
+  # floor, no Landlock at all, a profile it cannot read — on its stderr. That stderr lives
+  # in the scratch dir, and the scratch dir is deleted on the way out, so recording only
+  # `contained` left a host that refuses EVERY rail with nothing for anyone to read. That
+  # is the shape of the outage this seam came from. The adapter path already logs
+  # `DENIED: <reason>`; this carries the same fact into the durable rail row.
+  defp refusal_diagnostic({:error, _reason, "contained"}, stderr) do
+    case String.trim(stderr) do
+      "" -> "refused with no diagnostic on wrapper stderr"
+      text -> String.slice(text, 0, 512)
+    end
+  end
+
+  defp refusal_diagnostic(_result, _stderr), do: nil
 
   defp await(port, output, deadline) do
     remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
@@ -248,7 +276,7 @@ defmodule Tightbeam.RailScript do
   defp classify(status, _stdout, _stderr, _returns),
     do: {:error, "script_error", "error:#{status}"}
 
-  defp record(db, rule, call, context, result, duration_ms) do
+  defp record(db, rule, call, context, result, duration_ms, diagnostic) do
     detail =
       case result do
         {:ok, token, exit_class} ->
@@ -257,6 +285,7 @@ defmodule Tightbeam.RailScript do
         {:error, reason, exit_class} ->
           detail(call, context, exit_class, duration_ms) |> Map.put(:reason, reason)
       end
+      |> put_containment(diagnostic)
 
     try do
       EventLog.lifecycle(db, "rail_script", rule.name, JSON.encode!(detail))
@@ -266,6 +295,9 @@ defmodule Tightbeam.RailScript do
       _, _ -> :ok
     end
   end
+
+  defp put_containment(detail, nil), do: detail
+  defp put_containment(detail, diagnostic), do: Map.put(detail, :containment, diagnostic)
 
   defp detail(call, _context, exit_class, duration_ms) do
     %{

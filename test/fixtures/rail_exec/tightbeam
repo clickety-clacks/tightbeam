@@ -13,10 +13,23 @@ script=$1
 
 case "${script##*/}" in
   rail-timeout) exit 20 ;;
-  rail-contained-refused) exit 30 ;;
+  # The real wrapper always names WHY on stderr before a band-30 exit, and the
+  # substrate has to carry that reason onto a row that outlives the scratch dir.
+  # The double states the same observable so the plumbing is asserted, not assumed.
+  rail-contained-refused)
+    echo "rail-exec: containment not applied: fixture refusal" >&2
+    exit 30
+    ;;
 esac
 
-/usr/bin/sandbox-exec -p "$profile" -- "$script"
+# This double's contract is the EXIT BANDS, nothing else. It used to interpose
+# `sandbox-exec -p "$profile"`, which made it a macOS-only stand-in for a
+# platform-neutral seam and quietly turned every fixture-driven rail test into a
+# macOS-only test. No shell tool can impose Landlock, so a double that contains on one
+# OS and not the other is the parity trap itself. Enforcement is proven against the real
+# mechanism instead — see containment_test.exs and the `cli` suite — and the one rail
+# test that asserted a denied write now runs on the real binary.
+"$script"
 status=$?
 if test "$status" -eq 0; then
   exit 0
