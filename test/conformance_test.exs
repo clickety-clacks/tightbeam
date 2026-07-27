@@ -516,6 +516,11 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
+  # INVARIANT: every clause below runs the contract for THE FIXTURE IT WAS GIVEN,
+  # or names the other fixtures it aggregates explicitly. No `_` catch-all may
+  # substitute a foreign fixture's contract — that reports PASS for a fixture
+  # whose own cases never ran. A fixture with no runner belongs in
+  # `@unsupported_fixtures` with a reason, not in a catch-all.
   def run_pending_fixture(fixture, fixtures, blocker) do
     assert_pending_registration(fixture, blocker)
 
@@ -569,9 +574,6 @@ defmodule Tightbeam.ConformanceSupport do
       {"C6", _, "remedy-episode-idempotent"} ->
         run_remedy_episode_contract(fixture)
 
-      {"C6", _, _} ->
-        run_remedy_episode_contract(find.("C6", "review-remedy-spawn"))
-
       {"C7", _, "adjudication-hold-order"} ->
         run_rules_decide(fixture)
         run_acting_layer(fixture)
@@ -609,10 +611,15 @@ defmodule Tightbeam.ConformanceSupport do
       {"C7", _, "scheduled-wake-suppression"} ->
         run_scheduled_wake_contract(fixture)
 
-      {"C7", _, _} ->
-        run_sweep_ruling_contract(find.("C7", "sweep-never-consumes"))
+      {"C7", _, "sweep-never-consumes"} ->
+        run_sweep_ruling_contract(fixture)
 
-      {"Cap", _, _} ->
+      # Aggregates all five capstone fixtures, so every one of them IS executed —
+      # but it names them, so a SIXTH capstone fixture fails to match loudly
+      # instead of silently inheriting a contract that never covers it.
+      {"Cap", _, name}
+      when name in ~w(capstone-reviewer-loop capstone-yagni-judge capstone-spec-review
+                      capstone-tests-before-success capstone-real-run-before-ship) ->
         run_capstone_contracts(
           find.("Cap", "capstone-reviewer-loop"),
           find.("Cap", "capstone-yagni-judge"),
@@ -3589,13 +3596,32 @@ defmodule Tightbeam.ConformanceTest do
   @corpus Corpus.load_corpus!(@root)
   @fixtures @corpus.fixtures
   @classes @corpus.classes
+  # A fixture listed here is registered, shape-locked and NOT executed, with the
+  # reason visible in the skip. That is the honest state for a fixture whose
+  # runner does not exist yet.
+  #
+  # The seven C6 entries below were previously reported PASS by a catch-all that
+  # ran `review-remedy-spawn`'s contract instead of their own (35 declared cases,
+  # zero executed). A skip that names its gap is strictly better than a green that
+  # claims coverage it does not have.
   @unsupported_fixtures %{
     "C2/handoff-assign" =>
       "missing Rules fact registration/evaluator for call.handoff_complete on assign",
     "C2/handoff-wake" =>
       "missing Rules fact registration/evaluator for call.handoff_complete on wake",
     "C3/two-changes-requested-revert" =>
-      "missing Rules fact registration/evaluator for assignment.changes_requested_count"
+      "missing Rules fact registration/evaluator for assignment.changes_requested_count",
+    "C6/denied-dispatch-release-retry" =>
+      "no runner contract for the lease release/reclaim assertions (mech r7)",
+    "C6/iterate-rewake-target" => "no runner contract for the rewake-target assertions (mech r7)",
+    "C6/multi-statute-episode-closure" =>
+      "no runner contract for per-statute closure ownership (mech r7)",
+    "C6/note-digest-exclusion" =>
+      "no runner contract for effect-neutral digest exclusion (mech r7)",
+    "C6/stale-claimant-fencing" => "no runner contract for occurrence-keyed fencing (mech r7)",
+    "C6/unbound-reviewer-remedy" =>
+      "no runner contract for the unbound-reviewer refusal (mech r7)",
+    "C6/waiver-revoked-mid-fold" => "no runner contract for mid-fold waiver revocation (mech r8)"
   }
 
   test "activation census" do
@@ -3623,12 +3649,49 @@ defmodule Tightbeam.ConformanceTest do
         "#{structured} structured-legibility assertion sets active"
     )
 
+    # The corpus SIZE is unchanged: nothing was deleted. What changed is the
+    # honesty of the split — seven C6 fixtures moved out of "active" (where a
+    # catch-all ran a foreign contract on their behalf) and into named skips.
     assert length(@fixtures) == 72
-    assert active_fixtures == 69
-    assert exact_skips == 3
-    assert activated_fixture_tests == 56
+    assert active_fixtures == 62
+    assert exact_skips == 10
+    assert activated_fixture_tests == 49
     assert activated_class_tests == 5
-    assert activated_tests == 61
+    assert activated_tests == 54
+  end
+
+  # The structural guard for the defect this file used to carry: a catch-all clause
+  # whose fixture NAME is a wildcard, running `find.(...)` to fetch some other
+  # fixture's contract. That reports PASS for a fixture whose own cases never ran,
+  # and it is invisible from the outside — the suite is green either way.
+  #
+  # A clause may aggregate other fixtures, but only when it names the fixture it
+  # matches, so the substitution is a deliberate declaration and not a default.
+  test "no wildcard-name clause substitutes a foreign fixture's contract" do
+    source = Path.expand("conformance_test.exs", __DIR__) |> File.read!()
+
+    body =
+      source
+      |> String.split("def run_pending_fixture(fixture, fixtures, blocker) do", parts: 2)
+      |> List.last()
+      |> String.split("\n  end\n", parts: 2)
+      |> List.first()
+
+    offenders =
+      body
+      |> String.split(~r/\n      (?=\{")/)
+      |> Enum.filter(fn clause ->
+        wildcard_name? = Regex.match?(~r/^\{"[A-Za-z0-9]+", [^,]+, _\}\s*->/, clause)
+        wildcard_name? and String.contains?(clause, "find.(")
+      end)
+      |> Enum.map(&(&1 |> String.split("->") |> List.first() |> String.trim()))
+
+    assert offenders == [],
+           "these clauses match any fixture name and then run a DIFFERENT fixture's " <>
+             "contract, so the matched fixture's own cases never execute: " <>
+             Enum.join(offenders, " | ") <>
+             ". Give the fixture its own contract, name it explicitly, or register it " <>
+             "in @unsupported_fixtures with a reason."
   end
 
   test "corpus phase annotations and case-level blockers are reported exactly" do
