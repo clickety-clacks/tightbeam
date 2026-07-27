@@ -340,6 +340,16 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::Attend { identity, high } => {
+            // The tier only; the turn is the caller's running turn, which the
+            // substrate derives — the CLI never names a turn.
+            let params = if *high {
+                vec!["\"high\":true".to_owned()]
+            } else {
+                vec![]
+            };
+            Ok(request(identity, "attend", vec![], params))
+        }
         Command::Transcript {
             identity,
             session,
@@ -867,6 +877,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
+        | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }

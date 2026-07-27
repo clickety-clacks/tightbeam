@@ -853,6 +853,49 @@ defmodule Tightbeam.GatewayTest do
              Org.get(ctx.db, Org.personal_session_key(device.user_id))
   end
 
+  test "a catalog missing for want of a GATEWAY credential says so, with the repair", ctx do
+    base_dir = role_test_base("catalog-cred-legible")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    # The gateway derives catalogs against its OWN host; force that derivation to
+    # have failed for a missing credential while the target host stays onboarded.
+    :sys.replace_state(ModelCatalog, fn state ->
+      harnesses =
+        Map.new(state.harnesses, fn {name, cache} ->
+          {name,
+           %{
+             cache
+             | entries: [],
+               derived_at: nil,
+               attempted_at: state.now.(),
+               reason: {:needs_onboarding, :no_credential},
+               refreshing: true
+           }}
+        end)
+
+      %{state | harnesses: harnesses}
+    end)
+
+    assert %{code: "catalog_unavailable", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    gateway = Placement.local_host_name()
+
+    # Names what is missing, on which host, for which provider, and the repair.
+    assert message =~ "anthropic has no usable credential on GATEWAY host #{gateway}"
+    assert message =~ ":no_credential"
+    assert message =~ "run tightbeam onboard anthropic on #{gateway}"
+
+    # ...and never regresses to the bare inspected health term, which named
+    # neither the provider, the host, nor the fix (sat-e2e mac-0726a S2).
+    refute message =~ "for claude: {:unavailable,"
+  end
+
   test "children refuses a broken harness on PATH without creating any org artifact", ctx do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_no_harness_#{System.unique_integer([:positive])}")

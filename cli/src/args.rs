@@ -125,6 +125,10 @@ pub enum Command {
         identity: Identity,
         work_item_id: String,
     },
+    Attend {
+        identity: Identity,
+        high: bool,
+    },
     Transcript {
         identity: Identity,
         session: Option<String>,
@@ -332,6 +336,10 @@ COMMANDS:
       idempotent (same key returns the same item).
   work-item-get <workItemId>
   work-item-trace <workItemId>
+  attend [--high]
+      Elect the attention tier of the reply you are about to give, during your
+      own turn. --high marks it high; without the flag it is normal, which is
+      also what electing nothing gives you. Two tiers, no others.
   transcript (--session <key> | --name <displayName>)
              [--before <messageId> | --after <messageId>] [--limit <n>]
       Read a session's conversation from the substrate's own rows. --name is a
@@ -979,6 +987,15 @@ fn parse_with_optional_catalog(
                 work_item_id: parsed.positional[1].clone(),
             })
         }
+        "attend" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam attend [--high]".to_owned());
+            }
+            Ok(Command::Attend {
+                identity: identity(flags)?,
+                high: flags.contains_key("high"),
+            })
+        }
         "transcript" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam transcript (--session <key> | --name <displayName>) [--before <messageId> | --after <messageId>] [--limit <n>]".to_owned());
@@ -1213,7 +1230,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -1430,6 +1447,7 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "attend",
                 "transcript",
                 "topline",
                 "toplines",
@@ -1733,7 +1751,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 

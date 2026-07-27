@@ -48,6 +48,7 @@ defmodule Tightbeam.Ledger do
     jobRef     TEXT,
     model      TEXT,
     harness    TEXT,
+    replyAttention INTEGER NOT NULL DEFAULT 0,
     status     TEXT NOT NULL DEFAULT 'queued'
                CHECK (status IN ('queued','running','delivered','canceled',
                                  'failed','failed_unknown')),
@@ -78,7 +79,8 @@ defmodule Tightbeam.Ledger do
           "ALTER TABLE turns ADD COLUMN assignmentId TEXT",
           "ALTER TABLE turns ADD COLUMN jobRef TEXT",
           "ALTER TABLE turns ADD COLUMN model TEXT",
-          "ALTER TABLE turns ADD COLUMN harness TEXT"
+          "ALTER TABLE turns ADD COLUMN harness TEXT",
+          "ALTER TABLE turns ADD COLUMN replyAttention INTEGER NOT NULL DEFAULT 0"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok

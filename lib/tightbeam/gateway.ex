@@ -695,6 +695,7 @@ defmodule Tightbeam.Gateway do
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
       "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       "transcript" => fn call -> Tightbeam.Transcript.read(db, call) end,
+      "attend" => fn call -> attend_result(db, call) end,
       "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
       "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
@@ -1248,13 +1249,18 @@ defmodule Tightbeam.Gateway do
                    progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                  )
                ) do
+          # THE reply seam. The agent elected an attention tier for this turn (or
+          # elected nothing, which is normal); the substrate copies the election
+          # onto the reply it is appending. Marker and credential-transition
+          # appends are not this seam and stay normal.
           case Projection.append(db, %{
                  session_key: turn.session_key,
                  role: "assistant",
                  content: result.text,
                  sender: "tightbeam",
                  reply_to_message_id: echo && echo.id,
-                 reply_to_client_message_id: echo && echo.client_message_id
+                 reply_to_client_message_id: echo && echo.client_message_id,
+                 attention_tier: elected_attention(db, turn.seq)
                }) do
             {:appended, reply} -> publish_message(db, turn.session_key, reply)
             _ -> :ok
@@ -2916,6 +2922,22 @@ defmodule Tightbeam.Gateway do
            message: "model #{inspect(model)} is not offered by #{harness}"
          }}
 
+      %{health: {:unavailable, {:needs_onboarding, reason}}} ->
+        warn_dead_default(harness, model, configured_default?)
+        provider = Harness.parse!(harness).credential_provider()
+        gateway = Placement.local_host_name()
+
+        {:error,
+         %{
+           code: "catalog_unavailable",
+           message:
+             "cannot validate model #{inspect(model)} for #{harness}: no #{harness} model " <>
+               "catalog, because #{provider} has no usable credential on GATEWAY host " <>
+               "#{gateway} (#{inspect(reason)}). The gateway derives every harness's catalog " <>
+               "on its own host, so it needs its own #{provider} grant regardless of where " <>
+               "sessions are placed; run tightbeam onboard #{provider} on #{gateway}"
+         }}
+
       %{health: health} ->
         warn_dead_default(harness, model, configured_default?)
 
@@ -3145,9 +3167,68 @@ defmodule Tightbeam.Gateway do
   defp maybe_put_opt(opts, _key, nil), do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
+  # The agent ELECTS its reply's attention tier, during its own turn. Two tiers:
+  # normal (0, the default an agent that elects nothing gets) and high (1). The
+  # substrate derives nothing — there is no kind-to-tier mapping and no anti-
+  # inflation rule — and what a client DOES with the tier is the client's business.
+  #
+  # The target turn is never named by the caller: it is the caller session's
+  # running turn, which the lane serializes to exactly one.
+  defp attend_result(db, call) do
+    case call[:principal] do
+      {:session, session_key} ->
+        tier = if call.params[:high] == true, do: 1, else: 0
+
+        {:ok, result} =
+          DB.transaction(db, fn txn ->
+            case running_turn_seq_in_txn(txn, session_key) do
+              nil ->
+                %{code: "no_running_turn", message: "attend elects during your own turn"}
+
+              seq ->
+                DB.Txn.q(txn, "UPDATE turns SET replyAttention = ?2 WHERE seq = ?1", [seq, tier])
+                %{turn_seq: seq, attention: attention_name(tier)}
+            end
+          end)
+
+        result
+
+      _ ->
+        %{code: "invalid", message: "attend requires a session caller"}
+    end
+  end
+
+  defp attention_name(1), do: "high"
+  defp attention_name(_), do: "normal"
+
+  defp running_turn_seq_in_txn(txn, session_key) do
+    case DB.Txn.q(
+           txn,
+           "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+           [session_key]
+         ) do
+      [[seq]] -> seq
+      [] -> nil
+    end
+  end
+
+  defp elected_attention(db, turn_seq) do
+    {:ok, [[tier]]} =
+      DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [turn_seq])
+
+    tier
+  end
+
   defp retire_result(config, db, call) do
     p = call.params
-    owner = String.replace_prefix(call.origin, "user:", "")
+    # Resolve the caller's owner, do not string-strip the origin: an agent's
+    # origin is `agent:<role>`, which stripping leaves intact, so it matched no
+    # ownerUserId and every agent got `not_found` — including for sessions its own
+    # owner controls, which the guidance we ship tells agents to retire.
+    # `resolve_caller/2` handles all three origin classes and yields a nil owner
+    # for a process, which cannot match a NOT NULL ownerUserId, so unknown and
+    # process callers keep getting `not_found`.
+    owner = resolve_caller(db, call.origin)[:owner_user_id]
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do

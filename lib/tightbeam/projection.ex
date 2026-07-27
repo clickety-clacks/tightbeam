@@ -26,7 +26,8 @@ defmodule Tightbeam.Projection do
           reply_to_message_id: String.t() | nil,
           reply_to_client_message_id: String.t() | nil,
           llm_visible_message_id: String.t(),
-          attachments: list()
+          attachments: list(),
+          attention_tier: integer()
         }
 
   @ddl """
@@ -43,7 +44,8 @@ defmodule Tightbeam.Projection do
     replyToMessageId       TEXT,
     replyToClientMessageId TEXT,
     llmVisibleMessageId    TEXT NOT NULL,
-    attachments            TEXT NOT NULL DEFAULT '[]'
+    attachments            TEXT NOT NULL DEFAULT '[]',
+    attentionTier          INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS messages_session ON messages (sessionKey, seq);
   CREATE UNIQUE INDEX IF NOT EXISTS messages_client_dedupe
@@ -58,7 +60,22 @@ defmodule Tightbeam.Projection do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    result = DB.execute(db, @ddl)
+
+    # Additive, nullable-by-default, never backfilled: `CREATE TABLE IF NOT
+    # EXISTS` is inert against a database that already has `messages`, so an
+    # existing store gets the column here. Every pre-existing row reads 0 —
+    # normal attention — which is the same answer as an agent electing nothing.
+    for ddl <- ["ALTER TABLE messages ADD COLUMN attentionTier INTEGER NOT NULL DEFAULT 0"] do
+      case DB.query(db, ddl) do
+        {:ok, _} -> :ok
+        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+      end
+    end
+
+    result
+  end
 
   @doc """
   Append a message, idempotently per client send. Dedupe scope is
@@ -84,7 +101,7 @@ defmodule Tightbeam.Projection do
           Txn.q(txn, """
             SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                    clientMessageId, replyToMessageId, replyToClientMessageId,
-                   llmVisibleMessageId, attachments
+                   llmVisibleMessageId, attachments, attentionTier
             FROM messages
             WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
           """, [Map.fetch!(input, :session_key), device_id, client_message_id])
@@ -105,8 +122,9 @@ defmodule Tightbeam.Projection do
 
         Txn.q(txn, """
           INSERT INTO messages (id, sessionKey, role, content, timestamp, sender, deviceId,
-            clientMessageId, replyToMessageId, replyToClientMessageId, llmVisibleMessageId, attachments)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            clientMessageId, replyToMessageId, replyToClientMessageId, llmVisibleMessageId, attachments,
+            attentionTier)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         """, [
           id,
           Map.fetch!(input, :session_key),
@@ -119,7 +137,8 @@ defmodule Tightbeam.Projection do
           Map.get(input, :reply_to_message_id),
           Map.get(input, :reply_to_client_message_id),
           Map.get(input, :llm_visible_message_id) || client_message_id || id,
-          JSON.encode!(Map.get(input, :attachments, []))
+          JSON.encode!(Map.get(input, :attachments, [])),
+          Map.get(input, :attention_tier, 0)
         ])
 
         [row] = select_by_id(txn, id)
@@ -147,7 +166,7 @@ defmodule Tightbeam.Projection do
         """
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
-                 llmVisibleMessageId, attachments
+                 llmVisibleMessageId, attachments, attentionTier
           FROM messages WHERE id = ?1
         """,
         [id]
@@ -182,7 +201,7 @@ defmodule Tightbeam.Projection do
         """
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
-                 llmVisibleMessageId, attachments
+                 llmVisibleMessageId, attachments, attentionTier
           FROM messages WHERE sessionKey = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3
         """,
         [session_key, after_seq, limit]
@@ -245,7 +264,7 @@ defmodule Tightbeam.Projection do
       """
         SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                clientMessageId, replyToMessageId, replyToClientMessageId,
-               llmVisibleMessageId, attachments
+               llmVisibleMessageId, attachments, attentionTier
         FROM messages WHERE id = ?1
       """,
       [id]
@@ -265,7 +284,8 @@ defmodule Tightbeam.Projection do
          reply_to_message_id,
          reply_to_client_message_id,
          llm_visible_message_id,
-         attachments
+         attachments,
+         attention_tier
        ]) do
     %{
       seq: seq,
@@ -280,7 +300,8 @@ defmodule Tightbeam.Projection do
       reply_to_message_id: reply_to_message_id,
       reply_to_client_message_id: reply_to_client_message_id,
       llm_visible_message_id: llm_visible_message_id,
-      attachments: JSON.decode!(attachments)
+      attachments: JSON.decode!(attachments),
+      attention_tier: attention_tier
     }
   end
 
