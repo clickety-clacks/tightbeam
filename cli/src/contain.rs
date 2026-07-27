@@ -86,6 +86,32 @@ fn run(args: RailExecArgs) -> i32 {
     run_with_input(args, input)
 }
 
+/// Spawn the contained child, retrying only on `ETXTBSY`.
+///
+/// `execve` returns `ETXTBSY` when the file being executed is open for writing by someone
+/// else. It is always transient: it clears the instant the interfering writer closes its
+/// fd or execs. The window is real here because a rail script is written and then run —
+/// and in a multithreaded parent (cargo's test harness spawns tests across threads) one
+/// thread's `fork` inherits the write fd another thread holds on a just-created script,
+/// so the exec sees it busy. The production wrapper is single-threaded when it forks, so
+/// it does not hit this; retrying is cheap insurance that also covers a substrate that
+/// wrote the script from a threaded process. A permanently-busy file exhausts the budget
+/// and still refuses — nothing real is masked.
+fn spawn_contained(command: &mut std::process::Command) -> io::Result<std::process::Child> {
+    const ATTEMPTS: u32 = 40;
+
+    for attempt in 0..ATTEMPTS {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt + 1 < ATTEMPTS => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+
+    unreachable!("the loop returns on the final attempt")
+}
+
 fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     // Staging happens before the fork so a containment that cannot be built is a fact
     // this process observes directly, rather than an exit code to be inferred from a
@@ -141,10 +167,15 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     // here too — `rules.ex` refuses a statute whose check script is not an existing
     // executable, so it cannot. Both bands deny the dispatch either way; this errs toward
     // the one that claims less about the script.
-    let mut child = match command.spawn() {
+    let mut child = match spawn_contained(&mut command) {
         Ok(child) => child,
         Err(error) => {
-            eprintln!("rail-exec: containment not applied: {error}");
+            // Distinct from the stage-time message above: this is a SPAWN failure with the
+            // ruleset already built, so its causes are the OS's (an unexecutable script, a
+            // transient resource limit) rather than a containment that could not be
+            // constructed. Same band — a dispatch that cannot run its contained check is
+            // denied either way — but the two read differently in the log.
+            eprintln!("rail-exec: contained child could not be spawned: {error}");
             return CONTAINED_REFUSED;
         }
     };
