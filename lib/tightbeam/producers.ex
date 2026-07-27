@@ -486,7 +486,7 @@ defmodule Tightbeam.Producers do
   end
 
   defp continue_process_group(os_pid) do
-    case System.cmd("kill", ["-CONT", "-#{os_pid}"], stderr_to_stdout: true) do
+    case System.cmd("kill", ["-CONT", "--", "-#{os_pid}"], stderr_to_stdout: true) do
       {_output, 0} -> :ok
       _ -> {:error, "host-fail: producer process group unavailable"}
     end
@@ -547,8 +547,17 @@ defmodule Tightbeam.Producers do
     end
   end
 
+  # `--` is not decoration: it is what makes a process-group target portable.
+  # BSD kill(1) (macOS) reads a leading `-` on the target as a process group;
+  # procps-ng kill(1) (linux) reads it as another SIGNAL specification, ACCEPTS
+  # the nonsense, delivers nothing, and exits 0 — measured on ubuntu 24.04 /
+  # procps-ng 4.0.4: `kill -CONT -<pgid>` leaves the group in state T and reports
+  # success, and `kill -CONT -999991` also reports success. That silent zero is
+  # what made every local producer job on linux sit STOPped until its timeout,
+  # and made every group cancel report :signalled without signalling. With `--`
+  # both kills deliver, and both report exit 1 for a group that is not there.
   defp deliver_signal(flag, target) do
-    case System.cmd("kill", [flag, target], stderr_to_stdout: true) do
+    case System.cmd("kill", [flag, "--", target], stderr_to_stdout: true) do
       {_output, 0} -> :signalled
       {output, code} -> {:failed, "kill #{flag} #{target} exited #{code}: #{String.trim(output)}"}
     end

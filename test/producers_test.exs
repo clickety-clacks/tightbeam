@@ -681,7 +681,7 @@ defmodule Tightbeam.ProducersTest do
       # it must still be running afterwards.
       assert process_exists?(os_pid)
       assert kill_failures(ctx.db) == []
-      System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+      System.cmd("kill", ["-TERM", "--", "-#{os_pid}"], stderr_to_stdout: true)
     end
 
     test "an unverifiable live pid is refused AND recorded", ctx do
@@ -693,7 +693,7 @@ defmodule Tightbeam.ProducersTest do
 
       assert [{"job-blind", detail}] = kill_failures(ctx.db)
       assert detail =~ "no captured start time"
-      System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+      System.cmd("kill", ["-TERM", "--", "-#{os_pid}"], stderr_to_stdout: true)
     end
 
     test "a nonzero kill exit is reported as failed and recorded", ctx do
@@ -709,7 +709,7 @@ defmodule Tightbeam.ProducersTest do
 
       assert [{"job-exit", detail}] = kill_failures(ctx.db)
       assert detail =~ "exited 1"
-      System.cmd("kill", ["-TERM", "-#{leader}"], stderr_to_stdout: true)
+      System.cmd("kill", ["-TERM", "--", "-#{leader}"], stderr_to_stdout: true)
     end
 
     test "an already-dead pid is a no-op, not a failure", ctx do
@@ -738,8 +738,36 @@ defmodule Tightbeam.ProducersTest do
 
     os_pid = port |> Port.info(:os_pid) |> elem(1)
     started = process_started!(os_pid)
-    System.cmd("kill", ["-CONT", "-#{os_pid}"], stderr_to_stdout: true)
+    # Wait for state T before CONT, exactly as Producers.verify_process_group/2
+    # does in production. A SIGCONT that arrives before the shell has run its own
+    # `kill -STOP $$` is simply lost, and the leader then stays STOPped forever —
+    # so every later observation ("is it gone yet?") reads a process that never
+    # ran. Cheap and invisible on an idle machine, which is why it survived here;
+    # a loaded macOS runner lost the race and reported it as `:signalled` against
+    # a pid the test believed was dead.
+    wait_until_stopped(os_pid)
+    # `--` before the negative target, for the reason Producers.deliver_signal/2
+    # documents: without it procps-ng kill(1) exits 0 and delivers nothing, so on
+    # linux the leader never resumes and never forks the children these tests read.
+    System.cmd("kill", ["-CONT", "--", "-#{os_pid}"], stderr_to_stdout: true)
     %{port: port, os_pid: os_pid, started: started}
+  end
+
+  defp wait_until_stopped(os_pid) do
+    Enum.reduce_while(1..1_000, nil, fn _, _ ->
+      case System.cmd("ps", ["-o", "state=", "-p", Integer.to_string(os_pid)],
+             stderr_to_stdout: true
+           ) do
+        {output, 0} ->
+          # macOS appends flag letters (s, N, +) to the state, so read the first.
+          if String.starts_with?(String.trim(output), "T"),
+            do: {:halt, :stopped},
+            else: Process.sleep(1) && {:cont, nil}
+
+        _ ->
+          Process.sleep(1) && {:cont, nil}
+      end
+    end) || flunk("the spawned leader never reached state T, so its SIGCONT would be lost")
   end
 
   defp process_started!(os_pid) do
@@ -765,10 +793,14 @@ defmodule Tightbeam.ProducersTest do
     end) || flunk("no non-leader child appeared in the producer group")
   end
 
+  # Says so when it gives up. Silently returning nil made the caller assert the
+  # WRONG thing: kill_process_group/4 was then handed a live pid and correctly
+  # reported :signalled, and the failure read as a defect in the signal path
+  # rather than as "the process this test needs dead is still running".
   defp wait_until_gone(os_pid) do
     Enum.reduce_while(1..300, nil, fn _, _ ->
       if process_exists?(os_pid), do: Process.sleep(10) && {:cont, nil}, else: {:halt, :gone}
-    end)
+    end) || flunk("pid #{os_pid} was still there after 3s; it was supposed to exit on its own")
   end
 
   defp kill_failures(db) do

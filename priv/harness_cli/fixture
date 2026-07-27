@@ -1,0 +1,24 @@
+#!/bin/sh
+# The Fixture harness's CLI — the one harness in the registry that is entirely
+# ours, so its CLI can live in the repo instead of on the developer's machine.
+#
+# It exists for exactly one caller: Tightbeam.Harness.Fixture.probe_cli/1, which
+# resolves `fixture` on PATH and runs `--version` through Support.bounded_probe/2.
+# Gateway boot refuses unless SOME registered harness CLI answers that probe, and
+# before this the only answers were the developer's own claude and codex — an
+# undeclared dependency on an installed harness, which is how a macOS-only suite
+# stayed green for the project's whole life.
+#
+# It deliberately answers nothing else. The Fixture harness has no adapter, no
+# credential service and no turn: if a caller ever needs more from this file than
+# a version string, the honest fix is to give the Fixture harness a real CLI, not
+# to teach this stub to imitate one.
+case "$1" in
+  --version)
+    echo "tightbeam-fixture 1 (in-repo harness CLI; probe only)"
+    ;;
+  *)
+    echo "fixture: only --version is implemented; see priv/harness_cli/fixture" >&2
+    exit 64
+    ;;
+esac
