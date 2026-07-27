@@ -106,6 +106,20 @@ defmodule Tightbeam.RailScriptTest do
              ~w(returned out-of-set error:7 timeout contained)
 
     assert Enum.all?(details, &(&1["edge"] == "verb" and &1["verb"] == "post"))
+
+    # A refusal has to say WHY on a row that outlives the run. The wrapper writes its
+    # reason to stderr, that stderr lives in the scratch dir, and the scratch dir is
+    # deleted on the way out — so a host that refuses EVERY rail used to record nothing
+    # but the class `contained`. That is the shape of the outage this seam exists because
+    # of: failing closed, correctly, with nothing for anyone to read.
+    contained = Enum.find(details, &(&1["exit_class"] == "contained"))
+    assert contained["containment"] =~ "fixture refusal"
+
+    # And only a refusal carries it — a normal verdict is not decorated with one.
+    assert Enum.all?(
+             Enum.reject(details, &(&1["exit_class"] == "contained")),
+             &is_nil(&1["containment"])
+           )
   end
 
   test "wrapper infrastructure failure fails closed and remains observable", ctx do
