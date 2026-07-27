@@ -1,0 +1,84 @@
+# The gate for a successful compile and test is EVERY supported platform, not one.
+# This suite ran macOS-only for the project's whole life; the first linux run
+# (2026-07-27, shrdlu) showed 90 failures the mac suite never saw. Both jobs
+# below are the same gates in the same order — a difference in outcome between
+# them is a platform-parity defect by definition, not an environment quirk.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: macos
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # erlef/setup-beam does not support macOS runners; brew supplies the BEAM
+      # there. The linux side pins the exact versions development runs.
+      - name: Install BEAM (linux)
+        if: matrix.name == 'linux'
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+
+      - name: Install BEAM (macos)
+        if: matrix.name == 'macos'
+        run: |
+          brew install elixir
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Toolchain versions (the parity record)
+        run: |
+          elixir --version
+          rustc --version
+
+      - name: Cache mix deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ matrix.name }}-${{ hashFiles('mix.lock') }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            cli/target
+          key: cargo-${{ matrix.name }}-${{ hashFiles('cli/Cargo.lock') }}
+
+      - name: mix deps.get
+        run: mix deps.get
+
+      - name: mix compile
+        run: mix compile
+
+      - name: mix format --check-formatted
+        run: mix format --check-formatted
+
+      - name: mix test
+        run: mix test
+
+      - name: cargo fmt --check
+        working-directory: cli
+        run: cargo fmt --check
+
+      - name: cargo test
+        working-directory: cli
+        run: cargo test
