@@ -268,10 +268,6 @@ defmodule Tightbeam.AttentionTierTest do
 
     assert Payloads.server_message(high.reply)["attentionTier"] == 1
     assert Payloads.server_message(high.echo)["attentionTier"] == 0
-
-    # A message map from before the column existed still encodes, as normal.
-    legacy = Map.delete(high.reply, :attention_tier)
-    assert Payloads.server_message(legacy)["attentionTier"] == 0
   end
 
   ## Proof 5 — the migration is additive

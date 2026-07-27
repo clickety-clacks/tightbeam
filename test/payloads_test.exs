@@ -65,7 +65,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
       reply_to_message_id: nil,
       reply_to_client_message_id: nil,
       llm_visible_message_id: "client-1",
-      attachments: []
+      attachments: [],
+      attention_tier: 0
     }
 
     user = Payloads.server_message(base)

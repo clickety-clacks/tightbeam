@@ -3195,10 +3195,10 @@ defmodule Tightbeam.Gateway do
   end
 
   defp elected_attention(db, turn_seq) do
-    case DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [turn_seq]) do
-      {:ok, [[tier]]} -> tier
-      _ -> 0
-    end
+    {:ok, [[tier]]} =
+      DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [turn_seq])
+
+    tier
   end
 
   defp retire_result(config, db, call) do

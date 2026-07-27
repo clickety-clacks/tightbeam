@@ -107,7 +107,7 @@ defmodule Tightbeam.Wire.Payloads do
       "attachments" => Map.fetch!(m, :attachments),
       # The agent's own election for this reply, emitted verbatim. What a client
       # does with it — pin, push, hide — is the client's business, not ours.
-      "attentionTier" => Map.get(m, :attention_tier, 0)
+      "attentionTier" => Map.fetch!(m, :attention_tier)
     }
     |> put_if_present("deviceId", Map.get(m, :device_id))
     |> put_if_present("clientMessageId", Map.get(m, :client_message_id))
