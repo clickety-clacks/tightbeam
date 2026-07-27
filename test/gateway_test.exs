@@ -1109,8 +1109,24 @@ defmodule Tightbeam.GatewayTest do
       fallback = Path.join(fallback_base, "bin/tightbeam")
       entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
 
-      assert File.read!(fallback) == "#!/bin/sh\nexec node \"#{entry}\" \"$@\"\n"
+      # The fallback is still RETAINED and still execs the node entry — the subject
+      # of this test is unchanged. What it must no longer do is fail as whatever
+      # `node` says about a path the operator never chose: a wrapper whose target is
+      # absent has to name the missing Rust binary and the command that builds it.
+      body = File.read!(fallback)
+      assert body =~ "exec node \"#{entry}\" \"$@\""
+      assert body =~ "tightbeam CLI is not installed"
+      assert body =~ "cargo build --release --manifest-path cli/Cargo.toml"
+      assert body =~ rust_cli
       assert File.stat!(fallback).mode |> Bitwise.band(0o777) == 0o755
+
+      # …and it refuses rather than exec'ing a target that is not there.
+      probe = Path.join(fallback_base, "bin/probe")
+      File.write!(probe, String.replace(body, entry, "/nonexistent/main.js"))
+      File.chmod!(probe, 0o755)
+      assert {refusal, 127} = System.cmd(probe, ["list"], stderr_to_stdout: true)
+      assert refusal =~ "tightbeam CLI is not installed"
+      assert refusal =~ "cargo build --release"
     end)
   end
 

@@ -43,7 +43,11 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     Mix.shell().info(format(report, if(options[:json], do: :json, else: :human)))
 
     if status != 0 do
-      Mix.raise("bootstrap_not_ready")
+      Mix.raise(
+        "bootstrap_not_ready: one or more checks above did not pass. Read the " <>
+          "fix-if-failed column for each FAIL row; rows that say they could not " <>
+          "verify are not failures of the thing they name."
+      )
     end
   end
 
@@ -172,8 +176,8 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     check(
       "harness_auth:#{harness}",
       false,
-      "dead_sign_in: harness=#{harness} reason=#{inspect(reason)}",
-      "Re-onboard the #{harness} harness credential."
+      auth_detail(harness, reason),
+      auth_fix(harness, reason)
     )
   end
 
@@ -181,13 +185,42 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     entries = Map.get(inventories, harness, [])
     ok = entries != []
 
+    reason = Map.get(degraded, harness, :empty_inventory)
+
     detail =
       if ok,
         do: "#{harness} fetched #{length(entries)} live refs",
-        else:
-          "dead_sign_in: harness=#{harness} reason=#{inspect(Map.get(degraded, harness, :empty_inventory))}"
+        else: auth_detail(harness, reason)
 
-    check("harness_auth:#{harness}", ok, detail, "Re-onboard the #{harness} harness credential.")
+    check("harness_auth:#{harness}", ok, detail, auth_fix(harness, reason))
+  end
+
+  # `credential_server_unavailable` is NOT a credential fault — it is this task
+  # being unable to look. The Credentials server does not run inside a bare mix
+  # task, so a healthy org and a never-onboarded one produce the same reason here.
+  # Reporting `dead_sign_in` and "Re-onboard the credential" for it is false twice
+  # over: it asserts a dead sign-in nobody observed, and it sends the operator to
+  # re-onboard a credential that may be perfectly live. Say what happened instead.
+  defp unverifiable_credential?(reason),
+    do: inspect(reason) =~ "credential_server_unavailable"
+
+  defp auth_detail(harness, reason) do
+    if unverifiable_credential?(reason) do
+      "not verified here: the credential server does not run inside a bare mix " <>
+        "task, so #{harness} credential state is UNKNOWN from this command"
+    else
+      "dead_sign_in: harness=#{harness} reason=#{inspect(reason)}"
+    end
+  end
+
+  defp auth_fix(harness, reason) do
+    if unverifiable_credential?(reason) do
+      "Not a credential verdict — do not re-onboard on the strength of this row. " <>
+        "Verify for real with Tightbeam.ClientE2E.preflight/2 for #{harness} " <>
+        "against this base_dir, or read the running gateway's catalog."
+    else
+      "Re-onboard the #{harness} harness credential."
+    end
   end
 
   defp harness_binary_check({:ok, %{version: version}}, harness) do
