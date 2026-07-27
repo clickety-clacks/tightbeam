@@ -3779,14 +3779,15 @@ defmodule Tightbeam.ConformanceTest do
     end
   end
 
-  # Task #38: a `script_timeout` deny is produced by BOTH the rail-exec binary enforcing
-  # the declared budget and RailScript.await/3 synthesizing status 20 for a wrapper that
-  # never reported. Reason and exit_class are identical for both, and the recorded
-  # duration is BEAM-side so starvation makes the windows OVERLAP (reproduced in
-  # rail_script_test.exs). So the surface must report evidence and NAME the ambiguity —
-  # never conclude a layer. This test exists to keep a layer claim from creeping back in:
-  # the same evidence block must appear on both sides of the backstop threshold.
-  test "C5 timeout evidence reports facts and refuses to conclude a layer" do
+  # Tasks #38 and #43: a `script_timeout` deny is produced by BOTH the rail-exec binary
+  # enforcing the declared budget and RailScript.await/3 giving up on a wrapper that never
+  # reported. They mean opposite things. The duration cannot tell them apart — it is
+  # BEAM-side, so starvation makes the windows OVERLAP (reproduced in rail_script_test.exs)
+  # — but the exit class can, because `unreported` is a class the wrapper cannot produce.
+  #
+  # So the two halves asserted here: the class decides the layer, and the duration decides
+  # nothing. Crossing the backstop threshold must not move the conclusion by itself.
+  test "C5 timeout evidence names the layer from the class, never from the duration" do
     db = :"c5_timeout_evidence_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.EventLog.ensure_schema(db)
@@ -3796,33 +3797,40 @@ defmodule Tightbeam.ConformanceTest do
     timeout_deny = {:deny, %{rule: "reconcile-with-main", reason: "script_timeout"}}
     genuine_refusal = {:deny, %{rule: "reconcile-with-main", reason: "rule_denied"}}
 
-    # Inside the backstop threshold.
-    record_rail_script_duration!(db, budget + 40)
+    # Wrapper-reported, inside the backstop threshold.
+    record_rail_script!(db, "timeout", budget + 40)
     inside = Tightbeam.RailTimeoutEvidence.render(timeout_deny, ctx)
 
-    # Past it — the window an unsound timing rule would call "backstop".
-    record_rail_script_duration!(db, budget + 2_000 + 15)
+    # Wrapper-reported, PAST it — the window an unsound timing rule would call "backstop".
+    record_rail_script!(db, "timeout", budget + 2_000 + 15)
     past = Tightbeam.RailTimeoutEvidence.render(timeout_deny, ctx)
 
-    # Both must carry the facts a reader needs: the measurement and both thresholds.
     for evidence <- [inside, past] do
-      assert evidence =~ "LAYER NOT DETERMINED"
+      assert evidence =~ "layer: RAIL-EXEC BINARY (enforcement)"
+      assert evidence =~ "recorded exit class: timeout"
       assert evidence =~ "declared budget   : 2000ms"
       assert evidence =~ "backstop threshold: 4000ms"
-      assert evidence =~ "Do not infer the layer from these numbers"
-
-      # No layer claim, on either side. These are the strings the unsound version emitted.
-      refute evidence =~ "RAIL-EXEC BINARY (enforcement)"
-      refute evidence =~ "BEAM BACKSTOP (not enforcement)"
+      assert evidence =~ "NOT the discriminator"
+      refute evidence =~ "BEAM BACKSTOP"
     end
 
     # The measurements differ and are reported verbatim...
     assert inside =~ "measured duration : 2040ms"
     assert past =~ "measured duration : 4015ms"
 
-    # ...but crossing the threshold must NOT change the conclusion, because there isn't
-    # one. Strip the measurement line and the two blocks are identical.
+    # ...but crossing the threshold does not change the layer, because the duration is not
+    # what names it. Strip the measurement line and the two blocks are identical.
     assert strip_measured(inside) == strip_measured(past)
+
+    # The other layer, at a duration INSIDE the budget — the mirror of the case above, and
+    # proof the class is doing the work in both directions.
+    record_rail_script!(db, "unreported", budget - 500)
+    backstop = Tightbeam.RailTimeoutEvidence.render(timeout_deny, ctx)
+
+    assert backstop =~ "layer: BEAM BACKSTOP (no verdict)"
+    assert backstop =~ "recorded exit class: unreported"
+    assert backstop =~ "no process group kill was observed"
+    refute backstop =~ "RAIL-EXEC BINARY"
 
     # A genuine refusal must not acquire timeout noise it did not earn.
     assert Tightbeam.RailTimeoutEvidence.render(genuine_refusal, ctx) == ""
@@ -3832,12 +3840,16 @@ defmodule Tightbeam.ConformanceTest do
     String.replace(evidence, ~r/measured duration : \d+ms/, "measured duration : <n>ms")
   end
 
-  defp record_rail_script_duration!(db, duration_ms) do
+  defp record_rail_script!(db, exit_class, duration_ms) do
     Tightbeam.EventLog.lifecycle(
       db,
       "rail_script",
       "reconcile-with-main",
-      JSON.encode!(%{exit_class: "timeout", reason: "script_timeout", duration_ms: duration_ms})
+      JSON.encode!(%{
+        exit_class: exit_class,
+        reason: "script_timeout",
+        duration_ms: duration_ms
+      })
     )
   end
 

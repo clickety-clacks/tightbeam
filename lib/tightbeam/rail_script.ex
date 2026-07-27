@@ -3,6 +3,23 @@ defmodule Tightbeam.RailScript do
 
   alias Tightbeam.{Containment, EventLog, Org, Placement}
 
+  # The exit class for a deny reached WITHOUT the observation that names it.
+  #
+  # Every other class asserts something someone saw: `returned` and `out-of-set` read
+  # the wrapper's stdout, `error:<N>` carries the child's own code parsed off wrapper
+  # stderr, `timeout` means the wrapper's timer elapsed and it killpg'd the process
+  # group, `contained` means the sandbox refused to apply. When none of those happened
+  # — the port never reported, the child's code was never seen, the substrate itself
+  # crashed — the substrate used to fill in the value the observation would have
+  # carried, and a fabricated `error:1` is indistinguishable from a real one. That is
+  # what made I3's "every failure names itself" unenforceable rather than merely
+  # unenforced. The wrapper cannot produce this string, so its presence is proof no
+  # verdict was observed and its absence is proof one was.
+  #
+  # `reason` is deliberately unchanged at every site: fail-closed semantics and the
+  # reason-reading consumers stay exactly as they were. Only the class splits.
+  @unreported "unreported"
+
   @type result ::
           {:ok, token :: String.t(), exit_class :: String.t()}
           | {:error, reason :: String.t(), exit_class :: String.t()}
@@ -19,7 +36,7 @@ defmodule Tightbeam.RailScript do
           File.chmod!(scratch, 0o700)
           execute(db, base_dir, scratch, rule, call, assignment)
         rescue
-          _ -> {{:error, "script_error", "error:1"}, empty_context()}
+          _ -> {{:error, "script_error", @unreported}, empty_context()}
         catch
           _, _ -> {{:error, "script_error", "error:1"}, empty_context()}
         end
@@ -51,7 +68,10 @@ defmodule Tightbeam.RailScript do
          ), context}
 
       {:error, context} ->
-        {{:error, "script_error", "error:1"}, context}
+        # The holder is missing, is on another host, or its workdir would not open, so
+        # no script ran at all. Same fabrication as the rescue above: recording
+        # `error:1` here asserted a child exit for a child that was never spawned.
+        {{:error, "script_error", @unreported}, context}
     end
   end
 
@@ -186,8 +206,12 @@ defmodule Tightbeam.RailScript do
         {output |> Enum.reverse() |> IO.iodata_to_binary(), status}
     after
       remaining_ms ->
+        # The wrapper outlived its own time-box plus the margin and never reported. It
+        # was killed here, by the BEAM, having observed neither a killpg nor an exit —
+        # so this is NOT wrapper exit 20, and returning 20 made the two indistinguish-
+        # able in the record. `:unreported` carries the one fact that separates them.
         Port.close(port)
-        {output |> Enum.reverse() |> IO.iodata_to_binary(), 20}
+        {output |> Enum.reverse() |> IO.iodata_to_binary(), :unreported}
     end
   end
 
@@ -199,20 +223,26 @@ defmodule Tightbeam.RailScript do
       else: {:error, "script_out_of_set", "out-of-set"}
   end
 
+  # Exit 10 promises the child's code on wrapper stderr. When it is not there the code
+  # was never observed — the wrapper died before the child, or gave up on its own stdin,
+  # or could not wait. `error:1` asserted a child exit nobody saw, and collided exactly
+  # with a script that really did exit 1.
   defp classify(10, _stdout, stderr, _returns) do
-    code =
-      case Regex.run(~r/tightbeam rail-exec child exit: (\d+)/, stderr) do
-        [_, code] -> code
-        _ -> "1"
-      end
-
-    {:error, "script_error", "error:#{code}"}
+    case Regex.run(~r/tightbeam rail-exec child exit: (\d+)/, stderr) do
+      [_, code] -> {:error, "script_error", "error:#{code}"}
+      _ -> {:error, "script_error", @unreported}
+    end
   end
 
   defp classify(20, _stdout, _stderr, _returns), do: {:error, "script_timeout", "timeout"}
 
   defp classify(30, _stdout, _stderr, _returns),
     do: {:error, "script_contained_refused", "contained"}
+
+  # The wrapper never rendered a verdict. The deny is still a timeout — the substrate's
+  # own deadline is what elapsed — but the class refuses to claim the wrapper's exit 20.
+  defp classify(:unreported, _stdout, _stderr, _returns),
+    do: {:error, "script_timeout", @unreported}
 
   defp classify(status, _stdout, _stderr, _returns),
     do: {:error, "script_error", "error:#{status}"}
