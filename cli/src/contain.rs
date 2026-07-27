@@ -644,6 +644,33 @@ mod platform {
             let _ = writeln!(out, "    {path}: {}", enforcement_trace(path));
         }
 
+        // stage() END-TO-END: the wrapper's actual entry, on multi-root profiles that
+        // mirror a real rail profile (a fresh scratch dir + the fixed /dev/null grant). If
+        // the single-root trace above succeeds but a multi-root stage refuses, the bug is
+        // in accumulating rules on one ruleset, not in any single grant.
+        let _ = writeln!(out, "  stage() end-to-end:");
+        let scratch = std::env::temp_dir().join(format!("tb-probe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&scratch);
+        let scratch = scratch.display().to_string();
+
+        let profiles: &[(&str, String)] = &[
+            ("[/dev/null]", r#"["/dev/null"]"#.to_owned()),
+            ("[/tmp,/dev/null]", r#"["/tmp","/dev/null"]"#.to_owned()),
+            (
+                "[scratch,/dev/null]",
+                format!(r#"["{scratch}","/dev/null"]"#),
+            ),
+        ];
+        for (label, roots) in profiles {
+            let profile = format!(r#"{{"tightbeam_containment":1,"write_roots":{roots}}}"#);
+            let verdict = match stage(&profile) {
+                Ok(_) => "ok".to_owned(),
+                Err(reason) => format!("REFUSED: {reason}"),
+            };
+            let _ = writeln!(out, "    {label} -> {verdict}");
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
         out
     }
 
