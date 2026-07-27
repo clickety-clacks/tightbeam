@@ -1,4 +1,6 @@
+use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Stdio;
 use std::thread;
@@ -73,10 +75,25 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         }
     };
 
+    // Load the child's stdin before the child can run. The input is the call the check
+    // exists to judge, and a check that legitimately ignores it — a constant deny, an
+    // error-path fixture — must not be told it judged nothing. Handing over a live pipe
+    // instead made that a RACE against the child's exit: macOS happened to win it,
+    // because sandbox-exec's own startup delayed the script, and linux loses it, because
+    // there is no helper and the script IS the child. Preloading whatever fits settles it
+    // the same way on both, and leaves genuinely undeliverable input still undelivered.
+    let (child_stdin, remainder) = match preload_stdin(&input) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("rail-exec: script input could not be staged: {error}");
+            return SCRIPT_ERROR;
+        }
+    };
+
     let token = staged.token();
     let mut command = platform::command(&args.profile, &args.script);
     command
-        .stdin(Stdio::piped())
+        .stdin(Stdio::from(child_stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -104,11 +121,19 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         }
     };
 
-    let mut child_stdin = child.stdin.take().expect("piped child stdin");
-    let stdin_writer = thread::spawn(move || {
-        let result = child_stdin.write_all(&input);
-        drop(child_stdin);
-        result
+    // `spawn` borrows the Command, so it still owns the read end we handed it. Holding
+    // that open here would keep the pipe alive after the script exits, and a write to the
+    // tail would hang instead of failing — an undeliverable payload has to be observable.
+    drop(command);
+
+    // Only a payload too big for the pipe needs a writer at all; anything that fit is
+    // already in the child's hands and cannot come undone.
+    let stdin_writer = remainder.map(|(mut pipe, rest)| {
+        thread::spawn(move || {
+            let result = pipe.write_all(&rest);
+            drop(pipe);
+            result
+        })
     });
 
     let mut child_stdout = child.stdout.take().expect("piped child stdout");
@@ -143,7 +168,9 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         }
 
         if status.is_some()
-            && stdin_writer.is_finished()
+            && stdin_writer
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished)
             && stdout_reader.is_finished()
             && stderr_reader.is_finished()
         {
@@ -174,7 +201,10 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         return SCRIPT_TIMEOUT;
     }
 
-    let stdin_delivered = matches!(stdin_writer.join(), Ok(Ok(())));
+    let stdin_delivered = match stdin_writer {
+        None => true,
+        Some(writer) => matches!(writer.join(), Ok(Ok(()))),
+    };
     let stdout = stdout_reader
         .join()
         .ok()
@@ -216,6 +246,67 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         .unwrap_or(1);
     eprintln!("tightbeam rail-exec child exit: {child_code}");
     SCRIPT_ERROR
+}
+
+/// Build the child's stdin pipe and push as much of `input` into it as it will hold,
+/// before anything is spawned.
+///
+/// Returns the read end for the child, and the write end plus the unwritten tail when the
+/// payload was larger than the pipe's capacity. `None` means every byte is already in the
+/// pipe: the child cannot fail to receive it, whether or not it ever reads.
+fn preload_stdin(input: &[u8]) -> io::Result<(OwnedFd, Option<(File, Vec<u8>)>)> {
+    let mut ends = [0 as libc::c_int; 2];
+
+    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let read = unsafe { OwnedFd::from_raw_fd(ends[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(ends[1]) };
+
+    // The write end must not survive into the child: its own copy would hold the pipe
+    // open and the script's read would never see EOF. The read end is dup2'd onto fd 0 by
+    // the spawn, which clears the flag there.
+    for end in [read.as_raw_fd(), write.as_raw_fd()] {
+        if unsafe { libc::fcntl(end, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    // Non-blocking, so a payload past the pipe's capacity stops here instead of
+    // deadlocking against a child that does not exist yet.
+    if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut loaded = 0;
+
+    while loaded < input.len() {
+        let wrote = unsafe {
+            libc::write(
+                write.as_raw_fd(),
+                input[loaded..].as_ptr().cast(),
+                input.len() - loaded,
+            )
+        };
+
+        if wrote <= 0 {
+            break;
+        }
+
+        loaded += wrote as usize;
+    }
+
+    if loaded == input.len() {
+        // Dropping the write end here is what lets the child see EOF.
+        return Ok((read, None));
+    }
+
+    if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok((read, Some((File::from(write), input[loaded..].to_vec()))))
 }
 
 #[cfg(target_os = "macos")]
