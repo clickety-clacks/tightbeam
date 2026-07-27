@@ -300,10 +300,14 @@ defmodule Tightbeam.RailScriptTest do
         end)
 
       # Suspend the measuring process while the wrapper is still alive, and stay suspended
-      # past budget + the 2_000ms backstop margin.
+      # past budget + the 2_000ms backstop margin. 100 + 3_900 cleared that threshold by
+      # exactly nothing, so the run's own clock starting a millisecond late — Task
+      # scheduling latency — failed the assertion (observed at 3_998ms of a needed 4_000).
+      # The margin is the point, not the total: the discriminator has to survive an
+      # inflated measurement, and how far past it we are is arbitrary.
       Process.sleep(100)
       true = :erlang.suspend_process(task.pid)
-      Process.sleep(3_900)
+      Process.sleep(4_400)
       :erlang.resume_process(task.pid)
 
       assert {:error, "script_timeout", "timeout"} = Task.await(task, 30_000)
