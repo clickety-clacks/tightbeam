@@ -45,7 +45,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host identity-edit identity-status identity-relearn identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail run-tests run-smoke cancel-producer-job rule effort-rule waive revoke-waiver withdraw decision-requests decision-request transcript attend)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host identity-edit identity-status identity-relearn identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail run-tests run-smoke cancel-producer-job rule effort-rule waive revoke-waiver withdraw decision-requests decision-request transcript attend toplines topline)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -521,7 +521,11 @@ defmodule Tightbeam.Wire.Router do
   # session, retired `target` syntax, and several targeting fields at once: the
   # router never queries the volunteered target's existence. The retrieval key
   # travels as an ordinary body param instead.
-  @non_target_verbs ~w(transcript)
+  # `toplines`/`topline` join transcript here for the same reason and one more:
+  # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
+  # resolving it as one would turn a roster filter into a session-existence
+  # oracle. Both verbs' selectors travel as ordinary body params.
+  @non_target_verbs ~w(transcript toplines topline)
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
   # number, a boolean or an object — is still a caller volunteering a typed target

@@ -696,6 +696,8 @@ defmodule Tightbeam.Gateway do
       "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       "transcript" => fn call -> Tightbeam.Transcript.read(db, call) end,
       "attend" => fn call -> attend_result(db, call) end,
+      "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
+      "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
