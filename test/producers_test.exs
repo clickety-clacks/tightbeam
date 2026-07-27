@@ -681,7 +681,7 @@ defmodule Tightbeam.ProducersTest do
       # it must still be running afterwards.
       assert process_exists?(os_pid)
       assert kill_failures(ctx.db) == []
-      System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+      System.cmd("kill", ["-TERM", "--", "-#{os_pid}"], stderr_to_stdout: true)
     end
 
     test "an unverifiable live pid is refused AND recorded", ctx do
@@ -693,7 +693,7 @@ defmodule Tightbeam.ProducersTest do
 
       assert [{"job-blind", detail}] = kill_failures(ctx.db)
       assert detail =~ "no captured start time"
-      System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+      System.cmd("kill", ["-TERM", "--", "-#{os_pid}"], stderr_to_stdout: true)
     end
 
     test "a nonzero kill exit is reported as failed and recorded", ctx do
@@ -709,7 +709,7 @@ defmodule Tightbeam.ProducersTest do
 
       assert [{"job-exit", detail}] = kill_failures(ctx.db)
       assert detail =~ "exited 1"
-      System.cmd("kill", ["-TERM", "-#{leader}"], stderr_to_stdout: true)
+      System.cmd("kill", ["-TERM", "--", "-#{leader}"], stderr_to_stdout: true)
     end
 
     test "an already-dead pid is a no-op, not a failure", ctx do
@@ -738,7 +738,10 @@ defmodule Tightbeam.ProducersTest do
 
     os_pid = port |> Port.info(:os_pid) |> elem(1)
     started = process_started!(os_pid)
-    System.cmd("kill", ["-CONT", "-#{os_pid}"], stderr_to_stdout: true)
+    # `--` before the negative target, for the reason Producers.deliver_signal/2
+    # documents: without it procps-ng kill(1) exits 0 and delivers nothing, so on
+    # linux the leader never resumes and never forks the children these tests read.
+    System.cmd("kill", ["-CONT", "--", "-#{os_pid}"], stderr_to_stdout: true)
     %{port: port, os_pid: os_pid, started: started}
   end
 
