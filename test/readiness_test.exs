@@ -179,6 +179,37 @@ defmodule Tightbeam.ReadinessTest do
     end
   end
 
+  test "a blocked harness is NEVER silent, even in a state the constructor cannot make", ctx do
+    # Exhaustive over the row state space: every non-runnable row must render at
+    # least one line explaining itself. The one combination that used to render
+    # nothing (adapter present, credential live, model unknown) is unreachable
+    # through summary/2 today, but the invariant lives in two functions that do
+    # not know about each other.
+    rows =
+      for adapter <- [:present, {:missing, "/p"}],
+          credential <- [:live, {:absent, :missing}, {:unknown, :x}, {:degraded, :y}],
+          model <- [:selectable, {:absent, "m"}, :unknown] do
+        %{
+          harness: "h",
+          adapter: adapter,
+          credential: credential,
+          model: model,
+          runnable?: adapter == :present and credential == :live and model == :selectable
+        }
+      end
+
+    for row <- Enum.reject(rows, & &1.runnable?) do
+      explanation =
+        %{runnable?: false, harnesses: [row]}
+        |> Readiness.render(ctx.config)
+        |> Enum.drop(3)
+        |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "Diagnose") or &1 =~ ~r/^  h:$/))
+
+      refute explanation == [],
+             "blocked row renders no explanation: #{inspect(Map.drop(row, [:harness]))}"
+    end
+  end
+
   ## The derivation this module rests on
 
   test "every registered harness's adapter bin is its package basename", _ctx do

@@ -189,8 +189,25 @@ defmodule Tightbeam.Readiness do
       |> Enum.reject(&is_nil/1)
 
     case gaps do
-      [] -> []
-      lines -> ["", "  #{row.harness}:"] ++ Enum.map(lines, &("    " <> &1))
+      # A row that is NOT runnable must never render silently. `model_state/3`
+      # currently makes `credential: :live` with `model: :unknown` unreachable, so
+      # this is defensive — but the invariant lives in two functions that do not
+      # know about each other, and a blocked harness that explains nothing is the
+      # precise failure this whole summary exists to end.
+      [] when not row.runnable? ->
+        [
+          "",
+          "  #{row.harness}:",
+          "    cannot run turns, and boot could not say why " <>
+            "(adapter=#{inspect(row.adapter)} credential=#{inspect(row.credential)} " <>
+            "model=#{inspect(row.model)}) — please report this, it is a gap in the summary itself"
+        ]
+
+      [] ->
+        []
+
+      lines ->
+        ["", "  #{row.harness}:"] ++ Enum.map(lines, &("    " <> &1))
     end
   end
 
