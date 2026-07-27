@@ -131,6 +131,27 @@ defmodule FeatureSmoke do
       })
 
       await_materialized_skills!(state, cwd, snapshot.skills)
+
+      # One SESSION-principal work-item create, deliberately placed INSIDE this
+      # group's running-turn window (after the wake, before the turn boundary) —
+      # the only window in the run where a session lane has a turn in flight.
+      # A user-principal create can never be stamped, because only a session lane
+      # can have a running turn; this is what gives the toplines board a node whose
+      # creation context was actually RECORDED against a turn.
+      #
+      # A session acting under its OWN credential needs a bound role for the router
+      # to derive its origin — an unbound one is refused `no_role` (found by the
+      # first live run of this check, not by reading the code).
+      role = "local-deploy-#{unique()}"
+      post(state, "role-create", %{"name" => role})
+      ok!(state, "role-bind", %{"name" => role, "sessionKey" => session_key})
+
+      ok!(
+        %{state | token: session_token(state, session_key)} |> Map.put(:as_session, true),
+        "work-item-create",
+        %{"title" => "smoke agent-created wi #{unique()}", "idempotencyKey" => "awi-#{unique()}"}
+      )
+
       await_turn_boundary!(state, session_key)
 
       sentinel_bytes = "durable-local-deployment-#{unique()}\n"
@@ -885,35 +906,70 @@ defmodule FeatureSmoke do
       "toplines sinceProgressMs #{item["sinceProgressMs"]} for #{id} exceeds this run's own age (#{budget}ms) — the progress clock is not tracking live activity"
     )
 
-    # THE TEETH. These rows were written AFTER core-causality C1 merged, so the
-    # substrate LOOKED when it created them. `unrecorded` here means either C1 is
-    # not stamping on the live path or the reader is misreading the bit — the old
-    # pre-C1 smoke database showed every parent as `unrecorded`, and a fresh run
-    # must not.
-    assert(
-      state,
-      get_in(item, ["creationContext", "recorded"]) == true,
-      "post-C1 row #{id} reports no recorded creation context: #{inspect(item["creationContext"])}"
-    )
+    assert_toplines_creation_context(state, item)
+  end
 
+  # THE TEETH. Cross-checks the reader against C1's ACTUAL columns on live rows,
+  # read straight out of the gateway's own database — so this is total over all
+  # four statuses and cannot go flaky on whether a turn happened to still be
+  # running when a create landed.
+  #
+  # `unrecorded` on a row this run wrote would mean either C1 stopped stamping on
+  # the live path or the reader misreads the bit. The old pre-C1 smoke database
+  # showed every parent as `unrecorded`; a fresh run must not.
+  defp assert_toplines_creation_context(state, item) do
+    id = item["id"]
+    {known, seq} = item_creation_columns(state, id)
     status = get_in(item, ["parent", "status"])
 
     assert(
       state,
-      status in ~w(linked from_turn no_turn_observed),
-      "post-C1 row #{id} must not report `unrecorded`; got #{inspect(status)}"
+      known == 1,
+      "post-C1 row #{id} was written with createdContextKnown=#{inspect(known)}: C1 is not stamping on the live create path"
     )
 
-    # A USER creating a work item has no session lane, and only a session lane can
-    # have a turn running — so `no_turn_observed` is the exact four-valued answer:
-    # the substrate looked and nothing was running. A session-created item is free
-    # to report `linked` or `from_turn` instead.
-    if get_in(item, ["origin", "principal"]) == "user" do
-      assert(
-        state,
-        status == "no_turn_observed",
-        "a user-created item cannot have had a turn running; expected no_turn_observed for #{id}, got #{inspect(status)}"
-      )
+    assert(
+      state,
+      get_in(item, ["creationContext", "recorded"]) == true,
+      "row #{id} has known=1 but the reader reports #{inspect(item["creationContext"])}"
+    )
+
+    assert(
+      state,
+      get_in(item, ["creationContext", "turnSeq"]) == seq,
+      "row #{id} carries createdInTurnSeq=#{inspect(seq)} but the reader reports #{inspect(get_in(item, ["creationContext", "turnSeq"]))}"
+    )
+
+    # The column decides the status, exactly: a null seq is the substrate saying it
+    # LOOKED and nothing was running (the root signal, not a root classification),
+    # and a stamped seq must yield an edge — `linked` when the recorded turn names
+    # a caller-visible item, `from_turn` when it names none.
+    expected =
+      if is_nil(seq), do: ["no_turn_observed"], else: ["linked", "from_turn"]
+
+    assert(
+      state,
+      status in expected,
+      "row #{id} with createdInTurnSeq=#{inspect(seq)} must report one of #{inspect(expected)}; got #{inspect(status)}"
+    )
+  end
+
+  # C1's own columns for one item, from the gateway's database — the same direct
+  # read `session_token/2` already uses for things the wire does not surface.
+  defp item_creation_columns(state, work_item_id) do
+    db = Path.join(state.base_dir, "state.db")
+
+    {out, 0} =
+      System.cmd("sqlite3", [
+        db,
+        "SELECT createdContextKnown, COALESCE(createdInTurnSeq, '') FROM work_items " <>
+          "WHERE id = #{sql_quote(work_item_id)}"
+      ])
+
+    case out |> String.trim() |> String.split("|") do
+      [known, ""] -> {String.to_integer(known), nil}
+      [known, seq] -> {String.to_integer(known), String.to_integer(seq)}
+      _ -> fail(state, "no work_items row for #{work_item_id}")
     end
   end
 
