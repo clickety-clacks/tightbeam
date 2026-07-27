@@ -3933,6 +3933,35 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  test "identity relearn reports a non-conflict git failure legibly", ctx do
+    base_dir = role_test_base("identity-relearn-failure")
+    Identity.init!(base_dir)
+    live = Identity.live_revision!(base_dir)
+    hook = Path.join([base_dir, "identity", ".git", "hooks", "pre-merge-commit"])
+
+    File.write!(hook, """
+    #!/bin/sh
+    echo "pre-merge policy rejected relearn" >&2
+    exit 1
+    """)
+
+    File.chmod!(hook, 0o755)
+    relearn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-relearn"]
+
+    assert %{
+             state: "relearn-failed",
+             code: "relearn_failed",
+             message: message,
+             live_revision: ^live
+           } =
+             relearn.(%{
+               origin: "user:flynn",
+               params: %{}
+             })
+
+    assert message =~ "pre-merge policy rejected relearn"
+  end
+
   test "identity apply refreshes one stamped session at a turn boundary without restarting runtime",
        ctx do
     base_dir = role_test_base("identity-apply")
