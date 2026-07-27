@@ -139,6 +139,13 @@ defmodule FeatureSmoke do
       # can have a running turn; this is what gives the toplines board a node whose
       # creation context was actually RECORDED against a turn.
       #
+      # WHAT THIS DOES NOT REACH: `linked`. The only running turn in this window
+      # comes from a plain `wake`, which carries neither `jobRef` nor
+      # `assignmentId`, so derivation finds no candidate and correctly reports
+      # `from_turn`. Reaching `linked` live would need the create to happen inside
+      # the DISPATCH group, whose holder turn carries `assignmentId` — so read the
+      # four accepted statuses below as four accepted, not four proven.
+      #
       # A session acting under its OWN credential needs a bound role for the router
       # to derive its origin — an unbound one is refused `no_role` (found by the
       # first live run of this check, not by reading the code).
