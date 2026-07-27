@@ -99,6 +99,12 @@ defmodule Tightbeam.Readiness do
 
     %{
       harness: wire,
+      # `onboard` takes the CREDENTIAL PROVIDER, not the harness: a credential
+      # belongs to anthropic or openai, and claude/codex are the harnesses that
+      # spend it. Interpolating the harness name here printed a command the CLI
+      # rejects ("provider must be openai or anthropic") on the one surface the
+      # operator is told to act on. The harness already knows its own provider.
+      provider: module.credential_provider(),
       adapter: adapter,
       credential: credential,
       model: model,
@@ -222,9 +228,9 @@ defmodule Tightbeam.Readiness do
 
   defp credential_line(%{credential: :live}), do: nil
 
-  defp credential_line(%{harness: wire, credential: {:absent, reason}}) do
+  defp credential_line(%{provider: provider, credential: {:absent, reason}}) do
     "no credential (#{inspect(reason)}) — the model catalog is empty, so no " <>
-      "model can be selected. Onboard it with: tightbeam onboard #{wire} --as-user <userId>"
+      "model can be selected. Onboard it with: tightbeam onboard #{provider} --as-user <userId>"
   end
 
   defp credential_line(%{harness: wire, credential: {:unknown, reason}}) do

@@ -126,7 +126,13 @@ defmodule Tightbeam.ReadinessTest do
       |> Readiness.render(ctx.config)
       |> Enum.find(&(&1 =~ "no credential"))
 
-    assert line =~ "tightbeam onboard #{module.wire_name()}"
+    # The CLI's `onboard` takes the credential PROVIDER (anthropic|openai), not the
+    # harness (claude|codex). This assertion used to pin wire_name(), so it stayed
+    # green while the summary printed a command the CLI rejects outright — on the
+    # one surface the operator is told to act on. Assert the provider, and assert
+    # the harness name is NOT what gets handed to the verb.
+    assert line =~ "tightbeam onboard #{module.credential_provider()}"
+    refute line =~ "tightbeam onboard #{module.wire_name()}"
   end
 
   test "a default model outside the live catalog is named with the ref", ctx do
@@ -191,6 +197,10 @@ defmodule Tightbeam.ReadinessTest do
           model <- [:selectable, {:absent, "m"}, :unknown] do
         %{
           harness: "h",
+          # Rows here are built directly rather than through harness_row/3, so a
+          # new key must be mirrored or every row crashes instead of rendering —
+          # which this test would report as a silence failure, correctly.
+          provider: :a_provider,
           adapter: adapter,
           credential: credential,
           model: model,
