@@ -1,8 +1,9 @@
 # The gate for a successful compile and test is EVERY supported platform, not one.
-# This suite ran macOS-only for the project's whole life; the first linux run
-# (2026-07-27, shrdlu) showed 90 failures the mac suite never saw. Both jobs
-# below are the same gates in the same order — a difference in outcome between
-# them is a platform-parity defect by definition, not an environment quirk.
+# This suite ran macOS-only for the project's whole life; the first correctly
+# provisioned linux run (2026-07-27, shrdlu) showed 44 failures the mac suite
+# never saw. Both jobs below run the same gates in the same order, on the same
+# pinned BEAM, against the same declared environment — so a difference in outcome
+# between them is a platform-parity defect by definition, and nothing else.
 name: ci
 
 on:
@@ -46,23 +47,28 @@ jobs:
           elixir --version
           rustc --version
 
-      # The suite is not hermetic: gateway boot refuses unless at least one
-      # registered harness CLI probes on PATH, and cli_integration + the rail
-      # tests exec the RELEASE tightbeam binary. On dev machines both are
-      # satisfied by the developer's environment, which is how a macOS-only
-      # dependency on installed harnesses went unnoticed. CI satisfies them
-      # explicitly, pinned to the versions the hosts run.
-      - name: Install harness CLIs (suite prerequisite)
-        run: npm install -g @anthropic-ai/claude-code@2.1.220 @openai/codex@0.145.0
+      # Gateway boot refuses unless at least one REGISTERED harness CLI probes on
+      # PATH. CI used to satisfy that by npm-installing pinned claude and codex,
+      # which is a network dependency, ~40s, and — measured — worth nothing: the
+      # suite's failure set is byte-identical with only the in-repo Fixture CLI on
+      # PATH (26 failures either way, shrdlu 2026-07-27). CI holds no credentials,
+      # so it never drove a real harness turn to begin with; a pinned `--version`
+      # cannot catch a harness that changed under us. That is the LIVE
+      # feature_smoke matrix's job, and it stays its job.
+      #
+      # This is not a mock standing in for claude or codex. Fixture is a
+      # registered harness in the test registry (config/test.exs) and this is its
+      # own CLI: nothing here imitates another harness's behaviour.
+      - name: Put the in-repo harness CLI on PATH (suite prerequisite)
+        run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
 
-      # The third undeclared dependency, and the one that lied loudest: the
-      # identity suite commits and MERGES in a real git repo, and git refuses to
-      # write a commit without a committer. `Identity.relearn!/1` runs its merge
-      # with no author env, so on a host with no git identity the merge fails for
-      # a reason that is not a conflict and relearn reports `{:conflict, []}` —
-      # a phantom conflict with nothing to resolve. Every dev mac has a global
-      # identity; shrdlu and the runners have none, which is the whole 2-failure
-      # IdentityTest delta. Declared here so the suite reads the same everywhere.
+      # The undeclared dependency that lied loudest: the identity suite commits
+      # and MERGES in a real git repo, and git refuses to write a commit without a
+      # committer. `Identity.relearn!/1` runs its merge with no author env, so on
+      # a host with no git identity the merge fails for a reason that is not a
+      # conflict and relearn reports `{:conflict, []}` — a phantom conflict with
+      # nothing to resolve. Every dev mac has a global identity; shrdlu and the
+      # runners have none, which is the whole 2-failure IdentityTest delta.
       - name: Declare a git identity (suite prerequisite)
         run: |
           git config --global user.name "tightbeam ci"

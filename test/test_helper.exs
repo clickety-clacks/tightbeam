@@ -1,20 +1,31 @@
 # The suite is not hermetic, and every dependency it has on the machine around it
 # is named here. It was silent before, and silence is what let a macOS-only suite
 # look green for the project's whole life: on a dev mac the developer's own
-# environment satisfied all three of these by accident, so the first linux run
-# reported 44 failures that were never about linux. A missing dependency now
-# refuses the run and says which one and how to satisfy it, because each of them
-# fails as something else entirely — a phantom identity conflict, a boot that
-# raises "no usable harness CLI", a rail check that exits 127.
+# environment satisfied all of these by accident, so the first linux run reported
+# 44 failures, three of which were never about linux at all. A missing dependency
+# now refuses the run and says which one and how to satisfy it, because each of
+# them fails as something else entirely — a phantom identity conflict with no
+# conflicting paths, a boot that raises "no usable harness CLI", a journey that
+# reports `:enoent` without naming what was not found.
 missing =
   []
   |> then(fn acc ->
     # `git merge` and `git commit` refuse to write without a committer, and
     # Identity.relearn!/1 merges with no author env, so a host with no git
     # identity gets {:conflict, []} — a conflict with no conflicting paths.
-    case System.cmd("git", ["var", "GIT_COMMITTER_IDENT"], stderr_to_stdout: true) do
+    result =
+      try do
+        System.cmd("git", ["var", "GIT_COMMITTER_IDENT"], stderr_to_stdout: true)
+      rescue
+        _ -> {"", :git_missing}
+      end
+
+    case result do
       {_ident, 0} ->
         acc
+
+      {_output, :git_missing} ->
+        ["git on PATH (the identity suite drives a real git repo)." | acc]
 
       {_output, _status} ->
         [
@@ -23,6 +34,16 @@ missing =
             "      git config --global user.email \"you@example.com\""
           | acc
         ]
+    end
+  end)
+  |> then(fn acc ->
+    # acp_conn, acp_adapter and adapter_coordinator run their ACP stubs with
+    # `System.find_executable("node")`, which is nil rather than an error when
+    # node is absent — the port then fails to open on a cmd whose head is nil.
+    if System.find_executable("node") do
+      acc
+    else
+      ["node on PATH (the ACP adapter tests exec their stub servers with it)." | acc]
     end
   end)
   |> then(fn acc ->
