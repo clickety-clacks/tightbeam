@@ -77,7 +77,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
     ready_harnesses =
       Enum.filter(harnesses, fn harness ->
-        Enum.all?(Map.fetch!(harness_checks, harness), & &1.ok)
+        Enum.all?(Map.fetch!(harness_checks, harness), &(&1.ok or &1.unverifiable))
       end)
 
     harness_checks =
@@ -85,6 +85,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         Enum.map(Map.fetch!(harness_checks, harness), fn check ->
           cond do
             check.ok -> check
+            check.unverifiable -> check
             ready_harnesses != [] -> %{check | level: :warn}
             harness != default_harness -> %{check | level: :warn}
             true -> check
@@ -100,7 +101,11 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     ]
 
     checks = [hd(non_harness_checks)] ++ harness_checks ++ tl(non_harness_checks)
-    ready = ready_harnesses != [] and Enum.all?(non_harness_checks, & &1.ok)
+
+    ready =
+      ready_harnesses != [] and
+        Enum.all?(non_harness_checks, &(&1.ok or &1.unverifiable))
+
     {if(ready, do: 0, else: 1), %{checks: checks, ready: ready}}
   end
 
@@ -137,8 +142,8 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
           {:ok, inventories} ->
             default_model_inventory_check(inventories, harness, model, fix)
 
-          {:ok, inventories, _degraded} ->
-            default_model_inventory_check(inventories, harness, model, fix)
+          {:ok, inventories, degraded} ->
+            default_model_inventory_check(inventories, harness, model, fix, degraded)
 
           {:error, degraded} ->
             check(
@@ -151,15 +156,30 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     end
   end
 
-  defp default_model_inventory_check(inventories, harness, model, fix) do
+  defp default_model_inventory_check(inventories, harness, model, fix, degraded \\ %{}) do
     live? = Enum.any?(Map.get(inventories, harness, []), &(&1.ref == model))
+    reason = Map.get(degraded, harness)
 
-    detail =
-      if live?,
-        do: "#{model} is live for #{harness}",
-        else: "#{model} is not live for #{harness}"
+    cond do
+      live? ->
+        check("default_model", true, "#{model} is live for #{harness}", "")
 
-    check("default_model", live?, detail, fix)
+      # An inventory that is empty BECAUSE the credential server could not be
+      # reached says nothing about the model. Concluding "not live" from it sent
+      # the operator to change a default model that was fine. An inventory empty
+      # for any other reason still fails.
+      unverifiable_credential?(reason) ->
+        unverifiable(
+          "default_model",
+          "not verified here: #{harness} inventory is empty because the credential " <>
+            "server is unreachable from a bare mix task, so #{model} liveness is UNKNOWN",
+          "Not a model verdict — do not repoint TIGHTBEAM_DEFAULT_MODEL on the " <>
+            "strength of this row. Check the running gateway's catalog."
+        )
+
+      true ->
+        check("default_model", false, "#{model} is not live for #{harness}", fix)
+    end
   end
 
   defp harness_auth_check({:ok, inventories}, harness) do
@@ -173,12 +193,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   defp harness_auth_check({:error, degraded}, harness) do
     reason = Map.get(degraded, harness, {:catalog_fetch_aborted, degraded})
 
-    check(
-      "harness_auth:#{harness}",
-      false,
-      auth_detail(harness, reason),
-      auth_fix(harness, reason)
-    )
+    auth_check(harness, false, reason)
   end
 
   defp harness_auth_inventory_check(inventories, degraded, harness) do
@@ -187,12 +202,29 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
     reason = Map.get(degraded, harness, :empty_inventory)
 
-    detail =
-      if ok,
-        do: "#{harness} fetched #{length(entries)} live refs",
-        else: auth_detail(harness, reason)
+    auth_check(harness, ok, reason, length(entries))
+  end
 
-    check("harness_auth:#{harness}", ok, detail, auth_fix(harness, reason))
+  defp auth_check(harness, ok, reason, live_refs \\ 0) do
+    cond do
+      ok ->
+        check("harness_auth:#{harness}", true, "#{harness} fetched #{live_refs} live refs", "")
+
+      unverifiable_credential?(reason) ->
+        unverifiable(
+          "harness_auth:#{harness}",
+          auth_detail(harness, reason),
+          auth_fix(harness, reason)
+        )
+
+      true ->
+        check(
+          "harness_auth:#{harness}",
+          false,
+          auth_detail(harness, reason),
+          auth_fix(harness, reason)
+        )
+    end
   end
 
   # `credential_server_unavailable` is NOT a credential fault — it is this task
@@ -201,8 +233,16 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   # Reporting `dead_sign_in` and "Re-onboard the credential" for it is false twice
   # over: it asserts a dead sign-in nobody observed, and it sends the operator to
   # re-onboard a credential that may be perfectly live. Say what happened instead.
-  defp unverifiable_credential?(reason),
-    do: inspect(reason) =~ "credential_server_unavailable"
+  # Matched on the TERM, not on its inspect text. Both producers emit
+  # `{:needs_onboarding, :credential_server_unavailable}` (gateway.ex,
+  # model_catalog.ex) and the catalog wraps it as `{:unavailable, reason}`, so the
+  # wrapper is peeled rather than pattern-matched at every depth. This decides an
+  # EXIT CODE now, so a renamed atom must break the match loudly instead of
+  # sliding past a substring test.
+  defp unverifiable_credential?({:unavailable, reason}), do: unverifiable_credential?(reason)
+  defp unverifiable_credential?({:needs_onboarding, reason}), do: unverifiable_credential?(reason)
+  defp unverifiable_credential?(:credential_server_unavailable), do: true
+  defp unverifiable_credential?(_reason), do: false
 
   defp auth_detail(harness, reason) do
     if unverifiable_credential?(reason) do
@@ -295,7 +335,24 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
   defp check(name, ok, detail, fix) do
     level = if(ok, do: :pass, else: :fail)
-    %{name: name, ok: ok, level: level, detail: detail, fix: if(ok, do: "", else: fix)}
+
+    %{
+      name: name,
+      ok: ok,
+      unverifiable: false,
+      level: level,
+      detail: detail,
+      fix: if(ok, do: "", else: fix)
+    }
+  end
+
+  # A check that could not be PERFORMED is not a check that FAILED. It stays in
+  # the table — the operator must still see the gap — but it cannot decide the
+  # exit status. Before this, `mix tightbeam.doctor` exited non-zero against a
+  # fully healthy org, so any deploy script gating on it was broken by a limit of
+  # the diagnostic rather than by anything wrong with the installation.
+  defp unverifiable(name, detail, fix) do
+    %{name: name, ok: false, unverifiable: true, level: :info, detail: detail, fix: fix}
   end
 
   defp catalog_error(degraded) do

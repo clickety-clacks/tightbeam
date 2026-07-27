@@ -1083,7 +1083,7 @@ defmodule Tightbeam.GatewayTest do
     assert token != ""
   end
 
-  test "children installs the release Rust CLI and retains the node fallback", ctx do
+  test "children installs the release Rust CLI, and refuses instead of falling back", ctx do
     repo_dir =
       Path.join(
         System.tmp_dir!(),
@@ -1107,24 +1107,25 @@ defmodule Tightbeam.GatewayTest do
       File.rm!(rust_cli)
       Gateway.children(gateway_config(fallback_base, ctx.db, 0))
       fallback = Path.join(fallback_base, "bin/tightbeam")
-      entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
-
-      # The fallback is still RETAINED and still execs the node entry — the subject
-      # of this test is unchanged. What it must no longer do is fail as whatever
-      # `node` says about a path the operator never chose: a wrapper whose target is
-      # absent has to name the missing Rust binary and the command that builds it.
       body = File.read!(fallback)
-      assert body =~ "exec node \"#{entry}\" \"$@\""
+
+      # This test's subject is unchanged — what gets installed at bin/tightbeam
+      # when the Rust CLI is absent — but the answer is now the OPPOSITE of its old
+      # name. There is deliberately no fallback: it pointed at the retired
+      # TypeScript CLI in a sibling checkout, so on a machine that had one the
+      # operator silently ran a different implementation than the gateway that
+      # installed it, and on a machine without one an executable that died on a
+      # path they never chose.
+      refute body =~ "exec node"
+      refute body =~ "dist/cli/main.js"
+
       assert body =~ "tightbeam CLI is not installed"
       assert body =~ "cargo build --release --manifest-path cli/Cargo.toml"
       assert body =~ rust_cli
       assert File.stat!(fallback).mode |> Bitwise.band(0o777) == 0o755
 
-      # …and it refuses rather than exec'ing a target that is not there.
-      probe = Path.join(fallback_base, "bin/probe")
-      File.write!(probe, String.replace(body, entry, "/nonexistent/main.js"))
-      File.chmod!(probe, 0o755)
-      assert {refusal, 127} = System.cmd(probe, ["list"], stderr_to_stdout: true)
+      # Executed, not merely matched: it must actually refuse.
+      assert {refusal, 127} = System.cmd(fallback, ["list"], stderr_to_stdout: true)
       assert refusal =~ "tightbeam CLI is not installed"
       assert refusal =~ "cargo build --release"
     end)
