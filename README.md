@@ -19,14 +19,22 @@ from the failure — see `mix tightbeam.doctor` and the notes below.
   missing.
 - **A harness CLI per harness you intend to use** — `claude` and/or `codex` — on
   PATH. `mix tightbeam.doctor` reports each as `harness_binary:<harness>`.
+- **node + npm.** The ACP adapters are npm packages, and the gateway installs
+  them into `<base_dir>/adapters` itself on first spawn. Without npm that
+  install fails and no turn can start.
 - **git**, for the identity repository.
+- **A C toolchain** (`gcc`/`clang` + `make`) — `exqlite` builds a native NIF.
 
 ## Install
 
 ```sh
+git clone https://github.com/clickety-clacks/tightbeam.git
+cd tightbeam
+
 mix deps.get
 mix compile
 cargo build --release --manifest-path cli/Cargo.toml
+
 mix tightbeam.init                 # creates <base_dir>/identity
 mix run --no-halt                  # boots the gateway; creates state.db, homes, bin/
 ```
@@ -34,24 +42,49 @@ mix run --no-halt                  # boots the gateway; creates state.db, homes,
 `base_dir` is `TIGHTBEAM_HOME`, else `~/.tightbeam`. `TIGHTBEAM_BASE_DIR`
 selects it for a single run, and `TIGHTBEAM_PORT` overrides the port.
 
-Then, per harness, onboard a credential:
+The first boot creates the base dir and serves, but **cannot run a turn yet**:
+it has no credentials, so it prints a NOT READY summary naming every gap. Close
+them, then restart. Per harness:
 
 ```sh
 <base_dir>/bin/tightbeam onboard <provider> --as-user <userId>
 ```
 
-## Read this before trusting a green boot
+You do not install the ACP adapters by hand. `<base_dir>/adapters` stays empty
+until the first session spawns, at which point the gateway installs both
+adapters at their pinned versions. A first boot reporting them missing is
+expected, not a failed install.
 
-Boot prints `Running Tightbeam.Wire.Router ... (http)` as its last line **even
-when the gateway cannot run a single turn** — with no credentials it logs two
-`model catalog ... degraded` warnings above that line and then serves anyway.
-A successful boot is not a working installation.
+## Reading the boot summary
 
-`mix tightbeam.doctor` is the closest thing to a readiness check, with one
-documented limitation: it runs as a bare mix task, where the Credentials server
-is not running, so **it cannot determine credential state at all**. Those rows
-say so rather than guessing. To check credentials for real, use
-`Tightbeam.ClientE2E.preflight/2` or read the running gateway's catalog.
+Boot ends with a readiness verdict, because serving is not the same as being
+able to run a turn. A ready install says so in one line. An install with gaps
+says `NOT READY` and then names each one per harness, with the command that
+closes it:
+
+```
+NOT READY: no harness on this instance can run a turn. The gateway is
+serving, so clients can connect, but every turn will fail until the
+gaps below are closed.
+
+  claude:
+    ACP adapter missing at <base_dir>/adapters/node_modules/.bin/claude-agent-acp
+      — no turn can start.
+    no credential (:missing) — the model catalog is empty, so no model can
+      be selected. Onboard it with: tightbeam onboard claude --as-user <userId>
+```
+
+The summary is assembled from state the gateway already has plus one file
+check; it starts nothing and probes nothing. It reports **UNKNOWN** — never a
+failure — for anything it could not look at, such as a credential whose refresh
+had not landed yet, and offers no repair advice for those. A row saying UNKNOWN
+is not a claim that the credential is bad.
+
+`mix tightbeam.doctor` diagnoses further, with one documented limitation: it
+runs as a bare mix task, where the Credentials server is not running, so **it
+cannot determine credential state at all**. Those rows say so rather than
+guessing. To check credentials for real, read the boot summary above or the
+running gateway's catalog.
 
 ## Running it as a service
 
