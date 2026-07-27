@@ -165,8 +165,25 @@ defmodule Tightbeam.SpinupTest do
     commands = receive_commands(6)
     install = Enum.find(commands, &String.contains?(List.last(&1), "npm install"))
     assert List.last(install) =~ "--prefix"
-    assert List.last(install) =~ "@agentclientprotocol/claude-agent-acp"
-    assert List.last(install) =~ "@agentclientprotocol/codex-acp"
+
+    # PINNED, not bare (#47): a bare name resolves to npm's latest, so every
+    # provision installed whatever was published that day while @adapter_version
+    # documented a pin nothing enforced. Measured on main: claude-agent-acp 0.62.0
+    # and codex-acp 1.1.7 against pins of 0.59.0 and 1.1.4.
+    for module <- Tightbeam.Harness.all() do
+      assert List.last(install) =~ "#{module.install_package()}@#{module.adapter_version()}",
+             "#{module.wire_name()} is not installed at its pinned version"
+    end
+
+    # ...and no bare name survives, which is what the pin is protecting against.
+    for module <- Tightbeam.Harness.all() do
+      refute List.last(install) =~ "#{module.install_package()} ",
+             "#{module.wire_name()} still has an unpinned occurrence in the install line"
+
+      refute String.ends_with?(List.last(install), module.install_package()),
+             "#{module.wire_name()} trails the install line unpinned"
+    end
+
     assert Enum.count(commands, &String.contains?(List.last(&1), "test -x")) == 2
     assert [%{detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "deployed adapters"

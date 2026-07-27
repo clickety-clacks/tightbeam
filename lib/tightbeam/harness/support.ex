@@ -399,7 +399,13 @@ defmodule Tightbeam.Harness.Support do
 
     install =
       if locality == :remote and presence == :absent do
-        packages = Enum.map_join(Tightbeam.Harness.all(), " ", & &1.install_package())
+        packages =
+          Enum.map_join(
+            Tightbeam.Harness.all(),
+            " ",
+            &"#{&1.install_package()}@#{&1.adapter_version()}"
+          )
+
         script = "npm install --prefix '<BASE>/adapters' " <> packages
 
         (["ssh" | ssh_opts()] ++
