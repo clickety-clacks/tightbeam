@@ -54,7 +54,7 @@ defmodule Tightbeam.RailRemedyTest do
     Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
 
     # Canonicalize the tmp base: Darwin's System.tmp_dir!/0 sits under the /var
-    # symlink (/var -> /private/var), and Containment.profile/1 (the rail scratch
+    # symlink (/var -> /private/var), and Containment.rail_profile/1 (the rail scratch
     # write-root) refuses uncanonical components, which fails the contained script
     # launch (error:1) instead of letting it return a clean deny.
     tmp_base = to_string(:string.trim(:os.cmd(~c(realpath #{System.tmp_dir!()}))))

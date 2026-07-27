@@ -9,7 +9,7 @@ defmodule Tightbeam.ContainmentTest do
   # ON this platform. The suite ran macOS-only for the project's whole life, so the linux
   # arm had never been executed at all.
   if @darwin? do
-    test "profile renders exact deterministic Seatbelt bytes" do
+    test "rail profile renders exact deterministic Seatbelt bytes" do
       roots = ["/org/work", "/org/home"]
 
       expected = """
@@ -23,8 +23,7 @@ defmodule Tightbeam.ContainmentTest do
       (allow file-write*
         (subpath "/org/work")
         (subpath "/org/home")
-        (subpath "/private/tmp")        ;; claude Terminal per-command workdir
-        (subpath "/dev"))               ;; claude session-new PTY allocation
+        (subpath "/dev/null"))          ;; rail scripts redirect to the discard sink
 
       ;; process lifecycle
       (allow process-fork)
@@ -39,25 +38,62 @@ defmodule Tightbeam.ContainmentTest do
       (allow network-outbound)
       """
 
-      assert Containment.profile(roots) == expected
-      assert Containment.profile(roots) == Containment.profile(roots)
+      assert Containment.rail_profile(roots) == expected
+      assert Containment.rail_profile(roots) == Containment.rail_profile(roots)
+    end
+
+    test "adapter profile still carries the harness additions" do
+      profile = Containment.adapter_profile(["/org/work"])
+
+      assert profile =~ ~s|(subpath "/private/tmp")|
+      assert profile =~ ~s|(subpath "/dev")|
     end
   else
-    test "profile renders exact deterministic Landlock bytes" do
+    test "rail profile renders exact deterministic Landlock bytes" do
       roots = ["/org/work", "/org/home"]
 
       expected =
         ~s({"tightbeam_containment":1,"write_roots":) <>
-          ~s(["/org/work","/org/home","/private/tmp","/dev"]})
+          ~s(["/org/work","/org/home","/dev/null"]})
 
-      assert Containment.profile(roots) == expected
-      assert Containment.profile(roots) == Containment.profile(roots)
+      assert Containment.rail_profile(roots) == expected
+      assert Containment.rail_profile(roots) == Containment.rail_profile(roots)
     end
+
+    test "adapter profile still carries the harness additions" do
+      profile = Containment.adapter_profile(["/org/work"])
+
+      assert profile =~ ~s|"/private/tmp"|
+      assert profile =~ ~s|"/dev"|
+    end
+  end
+
+  # The regression guard for the hole this split closed. A rail check script is not a
+  # harness turn, so a grant added for a harness must never widen the rail wall again —
+  # and on linux `/dev` in a rail profile means `/dev/shm`, a world-writable tmpfs, which
+  # is a durable write channel outside the scratch root that survives its rm_rf. Proven
+  # reachable on shrdlu before the split: the script wrote /dev/shm and returned PASS.
+  test "a rail profile grants no harness addition, and no writable /dev tree" do
+    profile = Containment.rail_profile(["/org/work"])
+    additions = Enum.flat_map(Tightbeam.Harness.all(), & &1.containment_additions())
+
+    # Compared in the platform's GRANT FORM, not as a substring: `/dev` is a substring of
+    # the `/dev/null` grant below, and the whole point is that the tree is not granted
+    # while the single sink is.
+    for {path, _comment} <- additions do
+      refute_grants(profile, path)
+    end
+
+    refute profile =~ "/dev/shm"
+
+    # /dev/null is granted on purpose and is the ONLY fixed grant: a discard sink cannot
+    # carry anything out of the scratch root, and `>/dev/null` is in shipped rail scripts.
+    assert_grants(profile, "/dev/null")
   end
 
   test "profile accepts every explicitly permitted path character" do
     root = "/org/a space/O'Brien/(tools)/$cash;ship/é"
-    assert_grants(Containment.profile([root]), root)
+    assert_grants(Containment.rail_profile([root]), root)
   end
 
   test "profile refuses only unsafe and relative root bytes" do
@@ -70,11 +106,11 @@ defmodule Tightbeam.ContainmentTest do
     ]
 
     for root <- rejected do
-      assert_raise ArgumentError, fn -> Containment.profile([root]) end
+      assert_raise ArgumentError, fn -> Containment.rail_profile([root]) end
     end
 
     for root <- ["/org/homes/../../outside/codex", "/foo//bar", "/foo/bar/"] do
-      assert_grants(Containment.profile([root]), root)
+      assert_grants(Containment.rail_profile([root]), root)
     end
   end
 
@@ -94,15 +130,15 @@ defmodule Tightbeam.ContainmentTest do
     File.ln_s!(target, link)
 
     assert_raise ArgumentError, ~r/symlink component/, fn ->
-      Containment.profile([Path.join(link, "work")])
+      Containment.rail_profile([Path.join(link, "work")])
     end
 
-    assert is_binary(Containment.profile([Path.join(root, "fresh/missing/work")]))
+    assert is_binary(Containment.rail_profile([Path.join(root, "fresh/missing/work")]))
 
     too_long = Path.join(root, String.duplicate("a", 256))
 
     assert_raise ArgumentError, ~r/cannot be validated/, fn ->
-      Containment.profile([too_long])
+      Containment.rail_profile([too_long])
     end
   end
 
@@ -145,7 +181,7 @@ defmodule Tightbeam.ContainmentTest do
     end)
 
     :ok = Containment.validate_roots!([root, auth])
-    profile = Containment.profile([root, auth])
+    profile = Containment.rail_profile([root, auth])
 
     inside = Path.join(root, "inside")
 
@@ -225,10 +261,18 @@ defmodule Tightbeam.ContainmentTest do
   defp q(path), do: "'" <> String.replace(path, "'", "'\\''") <> "'"
 
   # The grant form is per-OS; that a root IS granted is not.
+  defp grant_form(root) do
+    if @darwin?, do: ~s|(subpath "#{root}")|, else: JSON.encode!(root)
+  end
+
   defp assert_grants(profile, root) do
-    if @darwin?,
-      do: assert(profile =~ ~s|(subpath "#{root}")|),
-      else: assert(profile =~ JSON.encode!(root))
+    assert profile =~ grant_form(root),
+           "profile does not grant #{root}: #{profile}"
+  end
+
+  defp refute_grants(profile, root) do
+    refute profile =~ grant_form(root),
+           "profile grants #{root} and must not: #{profile}"
   end
 
   defp canonical(path) do

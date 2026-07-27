@@ -5,8 +5,14 @@ defmodule Tightbeam.Containment do
   The neutral truth is the SET OF WRITE ROOTS. Seatbelt SBPL is macOS's encoding
   of that set, not the set itself, so only the encoding is per-OS: this module
   stays the single authority on which roots are granted, because that draws on
-  product knowledge (`Harness.containment_additions/0`) the wrapper does not
-  have. The wrapper dispatches on its own target OS to apply what it is handed.
+  product knowledge the wrapper does not have. The wrapper dispatches on its own
+  target OS to apply what it is handed.
+
+  There are two seams and they get DIFFERENT grants, named per seam rather than
+  sharing one renderer's list: `rail_profile/1` for a rail check script, and
+  `adapter_profile/1` for a contained harness adapter. Sharing the list is what
+  let a harness-driven grant widen the rail wall by accident, so a caller now has
+  to say which seam it is.
 
   A platform-specific mechanism carries a parity obligation and a per-OS proof
   obligation at the moment it is chosen. Both mechanisms and both obligations
@@ -19,16 +25,40 @@ defmodule Tightbeam.Containment do
   every platform.
   """
 
-  @spec profile([String.t()]) :: String.t()
-  def profile(write_roots) do
-    validate_roots!(write_roots)
+  # A rail check script is not a harness turn, so it gets NO harness additions. It used
+  # to: `containment_additions/0` arrived with the adapter-seam refactor (63fc9e7, two
+  # days after rails were contained in 0be38de) and was appended to the one renderer both
+  # seams happened to share. On macOS that silently widened rail profiles by
+  # `/private/tmp`; on linux it granted `/dev`, and `/dev/shm` is world-writable tmpfs —
+  # a DURABLE write channel outside the scratch root, surviving the scratch rm_rf. Proven
+  # on shrdlu: a rail script under a real rail profile wrote /dev/shm and returned PASS.
+  #
+  # `/dev/null` is granted deliberately and is the only fixed grant: `>/dev/null` is in
+  # shipped conformance rail scripts (c5_script_guards), so the need is measured rather
+  # than assumed, and a discard sink cannot carry anything out of the scratch root. Every
+  # other node under /dev — `/dev/shm` above all — is no longer reachable. Narrower than
+  # before on BOTH platforms, which is the only direction a parity difference may resolve.
+  @rail_grants [{"/dev/null", "rail scripts redirect to the discard sink"}]
 
+  @spec rail_profile([String.t()]) :: String.t()
+  def rail_profile(write_roots) do
+    render(write_roots, @rail_grants)
+  end
+
+  @spec adapter_profile([String.t()]) :: String.t()
+  def adapter_profile(write_roots) do
     additions =
       Tightbeam.Harness.all()
       |> Enum.flat_map(& &1.containment_additions())
       |> Enum.uniq()
 
-    grants = Enum.map(write_roots, &{&1, nil}) ++ additions
+    render(write_roots, additions)
+  end
+
+  defp render(write_roots, extra_grants) do
+    validate_roots!(write_roots)
+
+    grants = Enum.map(write_roots, &{&1, nil}) ++ extra_grants
 
     case :os.type() do
       {:unix, :darwin} -> seatbelt(grants)

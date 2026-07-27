@@ -414,7 +414,17 @@ mod platform {
     // any file it can reach — a write outside its write roots, which is the guarantee.
     const TRUNCATE: u64 = 1 << 14;
 
-    const ABI1_WRITE_RIGHTS: u64 = WRITE_FILE
+    /// Every write-shaped right this seam handles. It is a CONSTANT, not a function of the
+    /// running ABI, and that is the invariant: the highest right here (`TRUNCATE`, ABI 3)
+    /// is exactly the floor, so every accepted kernel enforces IDENTICALLY. There is no
+    /// "use more when offered, mask when not" — masking a write-shaped right would mean
+    /// two accepted kernels with two different write walls, which is the platform-legible
+    /// difference the spec forbids, one level down.
+    ///
+    /// Adding a right above the floor is therefore not a local edit: it needs a decision
+    /// entry and a named policy for hosts that cannot enforce it (raise the floor, or
+    /// surface the gap). Do not quietly `if abi >= N` it in here.
+    const HANDLED_WRITE_RIGHTS: u64 = WRITE_FILE
         | REMOVE_DIR
         | REMOVE_FILE
         | MAKE_CHAR
@@ -423,7 +433,9 @@ mod platform {
         | MAKE_SOCK
         | MAKE_FIFO
         | MAKE_BLOCK
-        | MAKE_SYM;
+        | MAKE_SYM
+        | REFER
+        | TRUNCATE;
 
     /// A kernel below this cannot restrict `truncate(2)` and therefore cannot deliver the
     /// guarantee, so it refuses rather than under-enforcing. ABI 3 is kernel 6.2.
@@ -459,7 +471,7 @@ mod platform {
     /// discover while nothing has been spawned.
     pub fn stage(profile: &str) -> Result<Staged, String> {
         let roots = parse_profile(profile)?;
-        let handled = handled_rights(abi_version()?);
+        let handled = rights_for_abi(probe_abi()?)?;
         let ruleset = create_ruleset(handled)?;
 
         for root in &roots {
@@ -529,7 +541,8 @@ mod platform {
             .collect()
     }
 
-    fn abi_version() -> Result<libc::c_long, String> {
+    /// The syscall half: what ABI does this kernel report, if it knows Landlock at all?
+    fn probe_abi() -> Result<libc::c_long, String> {
         let abi = unsafe {
             libc::syscall(
                 CREATE_RULESET,
@@ -546,29 +559,64 @@ mod platform {
             ));
         }
 
+        Ok(abi)
+    }
+
+    /// The decision half, and deliberately pure: which rights do we handle on a kernel
+    /// reporting `abi`, or why is that kernel refused? Split from the syscall so the
+    /// refusal can be EXECUTED by a test — nothing in the fleet is old enough to reach it,
+    /// and a branch asserted by reading the source is not proof of anything.
+    ///
+    /// Below the floor there is no set of rights that delivers the guarantee, so there is
+    /// no value to return, only a refusal.
+    fn rights_for_abi(abi: libc::c_long) -> Result<u64, String> {
         if abi < MIN_ABI {
             return Err(format!(
                 "landlock ABI {abi} cannot restrict truncate; ABI {MIN_ABI} (kernel 6.2) is the floor"
             ));
         }
 
-        Ok(abi)
+        Ok(HANDLED_WRITE_RIGHTS)
     }
 
-    /// Use every write-shaped right the running kernel offers and mask off the ones it
-    /// does not, so a newer kernel enforces more without an older supported one failing.
-    fn handled_rights(abi: libc::c_long) -> u64 {
-        let mut handled = ABI1_WRITE_RIGHTS;
+    #[cfg(test)]
+    mod floor_tests {
+        use super::*;
 
-        if abi >= 2 {
-            handled |= REFER;
+        // The refusal branch, executed. Until this existed the only band-30 path any test
+        // ran was an unreadable profile; a kernel below the floor was asserted by reading
+        // the source, which the spec's own standard says is not proof.
+        #[test]
+        fn a_kernel_below_the_floor_is_refused_and_says_why() {
+            for abi in 0..MIN_ABI {
+                let refusal = rights_for_abi(abi).expect_err("below the floor must refuse");
+
+                assert!(
+                    refusal.contains("floor"),
+                    "a refusal has to name the floor: {refusal}"
+                );
+                assert!(
+                    refusal.contains("truncate"),
+                    "a refusal has to name what it cannot restrict: {refusal}"
+                );
+            }
         }
 
-        if abi >= 3 {
-            handled |= TRUNCATE;
-        }
+        // Every accepted kernel gets the SAME write wall. Two accepted kernels enforcing
+        // differently would be the platform-legible difference the spec forbids, one level
+        // down from the OS.
+        #[test]
+        fn every_accepted_kernel_handles_exactly_the_same_rights() {
+            for abi in MIN_ABI..=(MIN_ABI + 8) {
+                assert_eq!(rights_for_abi(abi), Ok(HANDLED_WRITE_RIGHTS));
+            }
 
-        handled
+            assert_eq!(
+                HANDLED_WRITE_RIGHTS & TRUNCATE,
+                TRUNCATE,
+                "the floor exists FOR truncate, so truncate must be handled"
+            );
+        }
     }
 
     fn create_ruleset(handled: u64) -> Result<OwnedFd, String> {
@@ -604,7 +652,16 @@ mod platform {
         let path = CString::new(root)
             .map_err(|_| format!("write root contains an interior NUL: {root}"))?;
 
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        // O_NOFOLLOW because `validate_roots!/1` proved this path had no symlink component
+        // at validation time, and this is the moment the grant is actually attached. If the
+        // final component became a symlink in between, ELOOP lands in the error arm below
+        // and the run refuses — rather than attaching the wall to whatever it now points at.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
 
         if fd < 0 {
             let error = io::Error::last_os_error();
