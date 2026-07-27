@@ -2755,48 +2755,73 @@ defmodule Tightbeam.Gateway do
               # stops at the barrier, and live clients are told to drop their
               # local view. No pointer surgery: the old harness session can't
               # load on the new engine → fallback pointer, fresh context.
-              {:ok, [[max_seq]]} =
-                DB.query(
-                  db,
-                  "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
-                  [call.session_key]
-                )
-
-              Org.set_cleared_through(db, call.session_key, max_seq)
-
-              # The TOMBSTONE (harness-support CAP-016: "history barrier +
-              # tombstone"). Without it a swap is indistinguishable from data
-              # loss: the operator sees an empty chat and nothing saying why.
               #
-              # APPENDED AFTER THE BARRIER, deliberately. Its seq is therefore
-              # greater than max_seq, so it sits ABOVE the barrier and survives
-              # the clear it explains — a tombstone buried by its own barrier
-              # would be worse than none. It also precedes the broadcast, so a
-              # client that drops its view and refetches sees the explanation
-              # rather than an empty transcript.
-              #
-              # This is the only record the operator will ever get: the barrier
-              # only ever advances and nothing lowers it, so the marker carries
-              # the whole explanation or the explanation does not exist.
-              Projection.append(db, %{
-                session_key: call.session_key,
-                role: "assistant",
-                sender: "process:tightbeam",
-                content: swap_tombstone(session, harness, model)
-              })
+              # ONE TRANSACTION, both writes. The barrier and its tombstone are a
+              # single fact: history stopped being shown, and here is why. Split
+              # across two transactions, a crash between them left the barrier
+              # moved with no marker — which is precisely the silent burial the
+              # tombstone exists to prevent, just rarer. The MAX(seq) read moved
+              # inside too, so a message landing between the read and the barrier
+              # cannot be buried without being counted.
+              # DB.transaction CATCHES a raise and RETURNS {:error, exception}. A
+              # hard {:ok, _} match here is a MatchError that crashes the wire
+              # call instead of denying it — the trap already documented at
+              # `ruling_transaction/2`, and one this very test caught.
+              barrier =
+                DB.transaction(db, fn txn ->
+                  [[max_seq]] =
+                    Txn.q(
+                      txn,
+                      "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+                      [call.session_key]
+                    )
 
-              broadcast(
-                db,
-                session.owner_user_id,
-                Payloads.stream_history_cleared(call.session_key)
-              )
+                  Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
 
-              %{
-                ok: true,
-                harness: harness,
-                model: model,
-                note: "engine swapped; chat cleared (rows retained); model context starts fresh"
-              }
+                  # Probe seam (same idiom as `on_work_item_interlock`): lets a
+                  # test fail the transaction BETWEEN the two writes and prove the
+                  # barrier rolls back with them. Absent in production.
+                  case Map.get(call, :on_swap_interlock) do
+                    fun when is_function(fun, 1) -> fun.(txn)
+                    _ -> :ok
+                  end
+
+                  Projection.append_marker_in_txn(
+                    txn,
+                    call.session_key,
+                    swap_tombstone(session, harness, model)
+                  )
+                end)
+
+              case barrier do
+                {:error, error} ->
+                  # Rolled back: the barrier did NOT move and the history is
+                  # still shown. The session is already on the new engine, which
+                  # is the safe direction to fail in — an operator sees their
+                  # conversation and a refused swap, never an empty chat with no
+                  # account of why. No broadcast either: there is nothing to tell
+                  # clients to drop.
+                  %{
+                    ok: false,
+                    code: "swap_barrier_failed",
+                    message: describe_error(error)
+                  }
+
+                {:ok, _} ->
+                  broadcast(
+                    db,
+                    session.owner_user_id,
+                    Payloads.stream_history_cleared(call.session_key)
+                  )
+
+                  %{
+                    ok: true,
+                    harness: harness,
+                    model: model,
+                    note:
+                      "engine swapped; chat cleared (rows retained); model context starts fresh"
+                  }
+              end
             else
               {:error, denial} ->
                 denial
@@ -4300,6 +4325,9 @@ defmodule Tightbeam.Gateway do
       "visible transcript starts fresh from this point. This is expected after a " <>
       "harness swap, not a fault."
   end
+
+  defp describe_error(error) when is_exception(error), do: Exception.message(error)
+  defp describe_error(error), do: inspect(error)
 
   defp describe_engine(harness, nil), do: "#{harness}"
   defp describe_engine(harness, model), do: "#{harness} (#{model})"

@@ -483,6 +483,20 @@ defmodule Tightbeam.Org do
     update(db, session_key, "clearedThroughSeq = ?2", [seq])
   end
 
+  @doc false
+  @spec set_cleared_through_in_txn(Txn.t(), String.t(), integer()) :: session()
+  def set_cleared_through_in_txn(%Txn{} = txn, session_key, seq) do
+    must_get(txn, session_key)
+
+    Txn.q(
+      txn,
+      "UPDATE sessions SET clearedThroughSeq = ?2, updatedAt = ?3 WHERE sessionKey = ?1",
+      [session_key, seq, now()]
+    )
+
+    must_get(txn, session_key)
+  end
+
   @doc """
   Retire a session — soft state flip, never a delete: history, provenance, and
   the pointer chain remain queryable. Returns the updated session.

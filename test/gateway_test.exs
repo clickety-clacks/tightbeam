@@ -1624,6 +1624,73 @@ defmodule Tightbeam.GatewayTest do
     assert total == 3, "the two earlier rows must still exist beneath the barrier"
   end
 
+  test "a failure between the barrier and its tombstone rolls BOTH back", ctx do
+    base_dir = role_test_base("swap-atomic")
+    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :swap_atomic_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    Org.create(ctx.db, %{
+      session_key: "atomic",
+      display_name: "Atomic",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "before-model"
+    })
+
+    for body <- ["first", "second"] do
+      Projection.append(ctx.db, %{
+        session_key: "atomic",
+        role: "user",
+        sender: "user:flynn",
+        content: body
+      })
+    end
+
+    before_barrier = Org.get(ctx.db, "atomic").cleared_through_seq
+
+    # Fail INSIDE the transaction, after the barrier write and before the marker
+    # append — the exact window this change closes. Same probe idiom as
+    # `on_work_item_interlock`, which drives a concurrent disposition between an
+    # assignment's two checks.
+    result =
+      handlers["tune"].(%{
+        origin: "user:flynn",
+        session_key: "atomic",
+        on_swap_interlock: fn _txn -> raise "crash between the barrier and its marker" end,
+        params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+      })
+
+    # The verb fails rather than reporting a swap that did not fully happen.
+    refute match?(%{ok: true}, result)
+
+    # THE PROPERTY: the barrier is UNMOVED, not moved-with-no-marker.
+    assert Org.get(ctx.db, "atomic").cleared_through_seq == before_barrier,
+           "the barrier moved without its tombstone — the crash window is still open"
+
+    # And the conversation is still visible: nothing was buried by a swap that
+    # never completed.
+    visible = Projection.list_after(ctx.db, "atomic", nil, 50, before_barrier)
+    assert Enum.map(visible, & &1.content) == ["first", "second"]
+    refute Enum.any?(visible, &(&1.content =~ "[engine swap]"))
+  end
+
   test "spawn admits only its matching reserved remedy principal", ctx do
     base_dir = role_test_base("remedy-spawn")
     Archetypes.load!(base_dir)
