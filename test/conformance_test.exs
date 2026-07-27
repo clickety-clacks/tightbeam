@@ -748,6 +748,7 @@ defmodule Tightbeam.ConformanceSupport do
       assert_fixture_world(fixture, kase, db, ids)
       seed_script_checkout!(base, fixture, kase, db)
       call = build_call(kase["call"], ids)
+
       assert_rule_result(
         kase["case"],
         kase["expect"],
