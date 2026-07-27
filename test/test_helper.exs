@@ -108,7 +108,20 @@ if missing != [] do
   System.halt(1)
 end
 
-ExUnit.start()
+# ExUnit's default assert_receive budget is 100ms, and nobody chose it. Several
+# acp_adapter tests wait on a message that can only arrive after a real `node`
+# ACP stub has booted and completed a handshake, and node's cold start alone eats
+# most of 100ms on a loaded macOS runner: two of three macOS CI samples failed a
+# DIFFERENT subset of that one module (4 then 6 tests, all "no matching message
+# after 100ms" with an empty mailbox), while the same module passes on a quiet dev
+# mac and on the linux runner. That is a budget failure, not a defect the suite
+# found, and a flaky gate cannot arbitrate platform parity.
+#
+# This weakens no assertion. Every one of these tests still requires its exact
+# message and still fails if it never arrives; the only thing that changes is how
+# long a correct message is allowed to take. Tests that assert something must NOT
+# arrive use refute_receive, whose own timeout is untouched.
+ExUnit.start(assert_receive_timeout: 1_000)
 
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 
