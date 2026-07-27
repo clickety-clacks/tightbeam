@@ -1550,6 +1550,80 @@ defmodule Tightbeam.GatewayTest do
              Path.join(auth_dir, "fixture.json")
   end
 
+  test "a harness swap leaves a tombstone ABOVE its own barrier", ctx do
+    base_dir = role_test_base("swap-tombstone")
+    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :swap_tombstone_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    Org.create(ctx.db, %{
+      session_key: "swapme",
+      display_name: "Swap me",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "before-model"
+    })
+
+    # Real prior conversation, so the barrier has something to bury.
+    for body <- ["first", "second"] do
+      Projection.append(ctx.db, %{
+        session_key: "swapme",
+        role: "user",
+        sender: "user:flynn",
+        content: body
+      })
+    end
+
+    assert %{ok: true} =
+             handlers["tune"].(%{
+               origin: "user:flynn",
+               session_key: "swapme",
+               params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+             })
+
+    barrier = Org.get(ctx.db, "swapme").cleared_through_seq
+    visible = Projection.list_after(ctx.db, "swapme", nil, 50, barrier)
+
+    # THE PROPERTY, and the one worth proving rather than assuming: a tombstone
+    # buried by the barrier it explains would be the joke version of this fix.
+    assert [tombstone] = visible,
+           "the swap must leave exactly the tombstone visible, got #{inspect(visible)}"
+
+    assert tombstone.seq > barrier
+    assert tombstone.sender == "process:tightbeam"
+
+    # It names the change, both ends of it, and that nothing was deleted.
+    assert tombstone.content =~ "[engine swap]"
+    assert tombstone.content =~ "claude (before-model)"
+    assert tombstone.content =~ "fixture (fixture-model)"
+    assert tombstone.content =~ "RETAINED"
+    assert tombstone.content =~ "not deleted"
+    assert tombstone.content =~ "expected"
+
+    # And the buried rows really are retained, not deleted — the marker's claim
+    # has to be true, not merely reassuring.
+    {:ok, [[total]]} =
+      DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["swapme"])
+
+    assert total == 3, "the two earlier rows must still exist beneath the barrier"
+  end
+
   test "spawn admits only its matching reserved remedy principal", ctx do
     base_dir = role_test_base("remedy-spawn")
     Archetypes.load!(base_dir)

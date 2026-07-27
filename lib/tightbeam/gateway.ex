@@ -2764,6 +2764,27 @@ defmodule Tightbeam.Gateway do
 
               Org.set_cleared_through(db, call.session_key, max_seq)
 
+              # The TOMBSTONE (harness-support CAP-016: "history barrier +
+              # tombstone"). Without it a swap is indistinguishable from data
+              # loss: the operator sees an empty chat and nothing saying why.
+              #
+              # APPENDED AFTER THE BARRIER, deliberately. Its seq is therefore
+              # greater than max_seq, so it sits ABOVE the barrier and survives
+              # the clear it explains — a tombstone buried by its own barrier
+              # would be worse than none. It also precedes the broadcast, so a
+              # client that drops its view and refetches sees the explanation
+              # rather than an empty transcript.
+              #
+              # This is the only record the operator will ever get: the barrier
+              # only ever advances and nothing lowers it, so the marker carries
+              # the whole explanation or the explanation does not exist.
+              Projection.append(db, %{
+                session_key: call.session_key,
+                role: "assistant",
+                sender: "process:tightbeam",
+                content: swap_tombstone(session, harness, model)
+              })
+
               broadcast(
                 db,
                 session.owner_user_id,
@@ -4263,6 +4284,25 @@ defmodule Tightbeam.Gateway do
          %{code: "ambiguous_ref", message: "model appears in multiple harness inventories"}}
     end
   end
+
+  # Says four things and nothing more: the engine changed, from what to what,
+  # that earlier history is RETAINED rather than deleted, and that this is
+  # expected. `Projection.list_after/5` floors at the barrier — it never deletes
+  # — so "retained but not shown" is literally what happened.
+  defp swap_tombstone(session, harness, model) do
+    from = describe_engine(session.harness, session.model)
+    to = describe_engine(harness, model)
+
+    "[engine swap]\n\n" <>
+      "This session's engine changed from #{from} to #{to}.\n\n" <>
+      "Earlier messages are RETAINED and are not deleted, but they are no longer " <>
+      "shown here: a new engine cannot load the previous engine's session, so the " <>
+      "visible transcript starts fresh from this point. This is expected after a " <>
+      "harness swap, not a fault."
+  end
+
+  defp describe_engine(harness, nil), do: "#{harness}"
+  defp describe_engine(harness, model), do: "#{harness} (#{model})"
 
   defp catalog_provider!(harness, ref) do
     case ModelCatalog.entry(harness, ref) do
