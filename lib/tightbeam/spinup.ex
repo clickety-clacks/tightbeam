@@ -53,9 +53,17 @@ defmodule Tightbeam.Spinup do
         target.patch_adapter.(path)
         {:ok, "adapters present"}
       else
+        # STOPPED SHORT OF SELF-PROVISIONING (#46): priv/harness_bundle.json
+        # declares vector_contract.ensure_adapter with the oracle "local absence
+        # refusal" and a required `local_absent` case, so installing here would
+        # contradict a manifest-declared parity contract. That needs an amendment,
+        # not a lane decision. What IS fixed is the path: the adapter is looked for
+        # under this host's OWN base_dir, not a sibling checkout of the retired
+        # TypeScript project, and the remedy now names the directory that matters.
         message =
           "host #{target.host_name} is not ready for #{module.wire_name()}: adapter missing at #{path} " <>
-            "(install the ACP adapters in the local Tightbeam checkout)"
+            "(install the ACP adapters into #{Path.join(target.host_config.base_dir, "adapters")} " <>
+            "on #{target.host_name})"
 
         {:error, host_unready(message)}
       end

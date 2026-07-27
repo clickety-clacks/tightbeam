@@ -4235,6 +4235,17 @@ defmodule Tightbeam.GatewayTest do
     File.rm_rf!(base_dir)
     File.mkdir_p!(base_dir)
 
+    # Adapters are infrastructure, not the readiness variable under test: spinup
+    # checks the adapter BEFORE credentials, so a test asking for a credentials
+    # denial needs the adapter present regardless. These used to be satisfied by a
+    # sibling checkout that happened to exist on the developer's machine (#46).
+    for bin <- ["claude-agent-acp", "codex-acp"] do
+      adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", bin])
+      File.mkdir_p!(Path.dirname(adapter))
+      File.write!(adapter, "#!/bin/sh\nexit 0\n")
+      File.chmod!(adapter, 0o755)
+    end
+
     if ready? do
       auth_dir = Path.join([base_dir, "auth", "claude"])
       File.mkdir_p!(auth_dir)

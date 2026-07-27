@@ -2540,6 +2540,9 @@ defmodule Tightbeam.ConformanceSupport do
         default_model: "test",
         max_live_sessions_per_user: 50,
         wake_tick_ms: 1_000,
+        # Adapter patching has its own tests; this contract is about remedy
+        # dispatch, and the staged adapter is a stub with no real bundle.
+        patch_adapter: fn _harness, _path -> :ok end,
         db: db,
         # Limitation CATALOG-CREDENTIAL-REFUSAL: remedy fixtures force onboarded status,
         # so this support config cannot observe a needs_onboarding refusal.
@@ -3189,6 +3192,16 @@ defmodule Tightbeam.ConformanceSupport do
   defp prepare_rule_base!(base, fixture, opts \\ []) do
     rules_dir = Path.join(base, "identity/rules")
     File.mkdir_p!(rules_dir)
+
+    # Spawn readiness looks for an adapter under this base_dir; it used to resolve
+    # to a sibling checkout present on the developer's machine (#46).
+    for bin <- ["claude-agent-acp", "codex-acp"] do
+      adapter = Path.join([base, "adapters", "node_modules", ".bin", bin])
+      File.mkdir_p!(Path.dirname(adapter))
+      File.write!(adapter, "#!/bin/sh\nexit 0\n")
+      File.chmod!(adapter, 0o755)
+    end
+
     File.write!(Path.join(rules_dir, "fixture.toml"), serialize_rules(fixture["rule"]))
 
     scripts =

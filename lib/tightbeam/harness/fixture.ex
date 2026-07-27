@@ -21,6 +21,9 @@ defmodule Tightbeam.Harness.Fixture do
   @impl true
   def install_package, do: "@tightbeam/fixture-acp"
 
+  @doc false
+  def adapter_version, do: @adapter_version
+
   @impl true
   def wire_projection do
     JSON.encode!(%{
