@@ -234,7 +234,9 @@ defmodule Tightbeam.Acp.Adapter do
       boot(opts, stderr_path, offset)
     rescue
       error ->
-        {:stop, adapter_failure_reason({:boot_failed, Exception.message(error)}, stderr_path, offset), nil}
+        {:stop,
+         adapter_failure_reason({:boot_failed, Exception.message(error)}, stderr_path, offset),
+         nil}
     end
   end
 

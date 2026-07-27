@@ -1786,7 +1786,6 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "a crash-recovered turn warns that side effects are unknown, not undone", ctx do
-
     # Boot recovery terminalizes an interrupted turn as "outcome unknown". The
     # in-chat marker must tell the agent to VERIFY before repeating anything
     # non-idempotent — re-running `mix test` is fine, re-running a deploy is not.
@@ -1832,7 +1831,6 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "an ordinary failure with a known reason gets NO unknown-outcome warning", ctx do
-
     publisher = Gateway.terminal_publisher_for_test(ctx.db)
 
     try do
@@ -1856,7 +1854,8 @@ defmodule Tightbeam.GatewayTest do
     refute marker.content =~ "side effects are UNKNOWN"
   end
 
-  test "register-host with the LOCAL hostname never touches the boot-owned credential server", ctx do
+  test "register-host with the LOCAL hostname never touches the boot-owned credential server",
+       ctx do
     local = Tightbeam.Placement.local_host_name()
     base_dir = move_test_base("local-host-reregistration", local)
     config = gateway_config(base_dir, ctx.db, 0)

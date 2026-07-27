@@ -112,7 +112,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   ## Proof 1 — statute atomicity
 
-  test "proof 1: a statute request and its owner notification commit or roll back together", ctx do
+  test "proof 1: a statute request and its owner notification commit or roll back together",
+       ctx do
     call = statute_call()
 
     # FAIL-BEFORE: with the prompt-wake insert aborting, the whole intent dies.
@@ -124,7 +125,10 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     # PASS-AFTER: the retry commits both.
     unblock_prompt_wakes!(ctx.db)
-    assert {:decision_pending, id} = Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
+
+    assert {:decision_pending, id} =
+             Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
+
     assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status='open'") == 1
 
     owner_session = Org.personal_session_key("flynn")
@@ -145,7 +149,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   ## Proof 2 — effort-open atomicity (and the assignmentId carrier)
 
-  test "proof 2: an effort request, its deadline wake, and its notification are one commit", ctx do
+  test "proof 2: an effort request, its deadline wake, and its notification are one commit",
+       ctx do
     assignment = dispatch!(ctx)
     probe_wake = bracket_wake(ctx.db, assignment.id)
     generations_before = count(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations")
@@ -222,7 +227,9 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert advanced.lineage_rung == before.lineage_rung + 1
     assert advanced.deadline_wake_id != before.deadline_wake_id
     assert Wakes.get(ctx.db, before.deadline_wake_id).state == "fired"
-    assert %{consumer: "effort_deadline", state: "pending"} = Wakes.get(ctx.db, advanced.deadline_wake_id)
+
+    assert %{consumer: "effort_deadline", state: "pending"} =
+             Wakes.get(ctx.db, advanced.deadline_wake_id)
 
     assert count(
              ctx.db,
@@ -362,7 +369,10 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   test "proof 7: decision-pending replay and open-request conflict arm nothing", ctx do
     call = statute_call()
-    assert {:decision_pending, id} = Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
+
+    assert {:decision_pending, id} =
+             Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
+
     [wake] = notification_wakes(ctx.db)
     drain!(ctx)
 
@@ -382,7 +392,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     # The open-request conflict path: same raiser, statute and action key, no
     # dr_id — the insert loses to `ON CONFLICT DO NOTHING`.
-    assert {:decision_pending, ^id} = Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
+    assert {:decision_pending, ^id} =
+             Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
 
     assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [wake.wake_id]
     assert {message_count(ctx.db), turn_count(ctx.db)} == before
@@ -496,17 +507,17 @@ defmodule Tightbeam.EscalationDeliveryTest do
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
               "notify_stranded_ancestor/2"} => 1,
-             {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4",
-              "remove_override_result/3"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "remove_override_result/3"} =>
+               1,
              {"lib/tightbeam/assignments.ex", "Gateway.deliver_prompt_in_txn/5",
               "open_dispatch_result/2"} => 1,
              {"lib/tightbeam/wakes.ex", "Gateway.deliver_prompt_in_txn/5", "fire_in_txn/2"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "deliver_prompt/4"} =>
                1,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5",
-              "adjudicate_park/4"} => 1,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5",
-              "adjudicate_swap/4"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "adjudicate_park/4"} =>
+               1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "adjudicate_swap/4"} =>
+               1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5",
               "adjudicate_respawn/5"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "release_hold/6"} =>
@@ -621,7 +632,10 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   defp seed_base_dir!(suffix) do
     base_dir =
-      Path.join(System.tmp_dir!(), "escalation_delivery_#{suffix}_#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "escalation_delivery_#{suffix}_#{System.unique_integer([:positive])}"
+      )
 
     File.rm_rf!(base_dir)
     File.mkdir_p!(Path.join([base_dir, "auth", "claude"]))
@@ -768,7 +782,9 @@ defmodule Tightbeam.EscalationDeliveryTest do
   end
 
   defp generation_state(db, wake_id) do
-    [[state]] = rows(db, "SELECT state FROM effort_checkin_generations WHERE wakeId=?1", [wake_id])
+    [[state]] =
+      rows(db, "SELECT state FROM effort_checkin_generations WHERE wakeId=?1", [wake_id])
+
     state
   end
 
@@ -885,6 +901,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
   end
 
   defp sink_label({{:., _, [_mod, name]}, _meta, args}), do: sink_label(name, args)
+
   defp sink_label({name, _meta, args}) when is_atom(name) and is_list(args),
     do: sink_label(name, args)
 

@@ -40,7 +40,10 @@ defmodule Tightbeam.AttentionTierTest do
   defmodule LaneDoorbell do
     @moduledoc false
     use GenServer
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
     def init(parent), do: {:ok, parent}
     def handle_call(_any, _from, parent), do: {:reply, :ok, parent}
   end

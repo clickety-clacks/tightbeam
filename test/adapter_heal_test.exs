@@ -39,7 +39,10 @@ defmodule Tightbeam.AdapterHealTest do
   defmodule LaneDoorbell do
     @moduledoc false
     use GenServer
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
     def init(parent), do: {:ok, parent}
 
     def handle_call({:ensure_lane, key}, _from, parent) do
@@ -243,7 +246,8 @@ defmodule Tightbeam.AdapterHealTest do
 
   ## Proof 1 — the boot failure's DESIGNED reason reaches the turn
 
-  test "proof 1: an adapter whose binary cannot execute fails the TURN with the spawn error", ctx do
+  test "proof 1: an adapter whose binary cannot execute fails the TURN with the spawn error",
+       ctx do
     dir = Path.join(System.tmp_dir!(), "heal_bin_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
@@ -257,7 +261,8 @@ defmodule Tightbeam.AdapterHealTest do
     # proves it does, whichever way that race falls.
     sup =
       start_supervised!(
-        {DynamicSupervisor, strategy: :one_for_one, name: :"heal_adapter_sup_#{:erlang.unique_integer([:positive])}"}
+        {DynamicSupervisor,
+         strategy: :one_for_one, name: :"heal_adapter_sup_#{:erlang.unique_integer([:positive])}"}
       )
 
     start_supervised!(
@@ -317,7 +322,8 @@ defmodule Tightbeam.AdapterHealTest do
 
   ## Proof 2 — fault → hold → heal → auto-release, probe FIRST
 
-  test "proof 2: heal releases the hold via a probe that claims before an older queued turn", ctx do
+  test "proof 2: heal releases the hold via a probe that claims before an older queued turn",
+       ctx do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
 
     {failed_seq, _reason} = run_failing_turn(ctx, "the turn that faults")
@@ -383,7 +389,8 @@ defmodule Tightbeam.AdapterHealTest do
 
   ## Proof 3 — storm freedom, probe-terminal totality, restart stability
 
-  test "proof 3: replaying a token probes nothing; a strictly newer one probes exactly once", ctx do
+  test "proof 3: replaying a token probes nothing; a strictly newer one probes exactly once",
+       ctx do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
 
@@ -513,18 +520,17 @@ defmodule Tightbeam.AdapterHealTest do
     assert hold(ctx.db) != "*"
   end
 
-  test "proof 3: the LEVEL trigger probes a hold that commits after the ready already fired", ctx do
+  test "proof 3: the LEVEL trigger probes a hold that commits after the ready already fired",
+       ctx do
     # No ready EDGE will arrive — the adapter was already ready when the hold
     # committed (the lost-edge case). The post-commit level read must probe.
-    start_supervised!(
-      {CoordinatorStub,
-       checkout: {:error, :degraded}, ready: {:ok, {7, 4}}}
-    )
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}, ready: {:ok, {7, 4}}})
 
     run_failing_turn(ctx, "fault")
 
     assert probe_count(ctx.db) == 1
     assert hold(ctx.db) != "*"
+
     assert AdapterCoordinator.decode_token(episode(ctx.db).heal_token) ==
              {7, 4}
   end
@@ -595,7 +601,8 @@ defmodule Tightbeam.AdapterHealTest do
 
     adapter =
       start_supervised!(
-        {AdapterStub, knows?: false, load_session: {:error, {:model_apply_failed, :model_unavailable}}}
+        {AdapterStub,
+         knows?: false, load_session: {:error, {:model_apply_failed, :model_unavailable}}}
       )
 
     start_supervised!({CoordinatorStub, checkout: {:ok, adapter, 1}})
@@ -674,7 +681,8 @@ defmodule Tightbeam.AdapterHealTest do
     assert is_nil(episode(ctx.db).heal_token), "the loser must not stamp the token"
   end
 
-  test "proof 4: two adapter-fault episodes on one session yield ONE probe; the loser logs", ctx do
+  test "proof 4: two adapter-fault episodes on one session yield ONE probe; the loser logs",
+       ctx do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
 
@@ -695,7 +703,10 @@ defmodule Tightbeam.AdapterHealTest do
     assert hold(ctx.db) != "*"
 
     assert [%{subject: "k1", detail: detail}] =
-             Enum.filter(EventLog.lifecycle_events(ctx.db), &(&1.kind == "adjudication_heal_lost"))
+             Enum.filter(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "adjudication_heal_lost")
+             )
 
     # Exactly one episode stamped the token; the logged loser is the other, and
     # having stamped nothing it stays eligible for a later token.
@@ -786,7 +797,6 @@ defmodule Tightbeam.AdapterHealTest do
 
     assert {true, {first, second}} = same_ms
     assert second > first, "a same-millisecond mint pair must still be strictly increasing"
-
 
     # And the ordering the sweep actually relies on: a later epoch with a RESET
     # generation still outranks an earlier epoch's high generation.
@@ -894,14 +904,18 @@ defmodule Tightbeam.AdapterHealTest do
         {AdapterCoordinator,
          adapter_sup: sup,
          db: ctx.db,
-         adapter_opts: fn _key -> [harness: :claude, cmd: ["/nonexistent/adapter"], home: "/tmp", cwd: "/tmp"] end,
+         adapter_opts: fn _key ->
+           [harness: :claude, cmd: ["/nonexistent/adapter"], home: "/tmp", cwd: "/tmp"]
+         end,
          name: :"f4_coord_#{:erlang.unique_integer([:positive])}"}
       )
 
     key = {:claude, "shared", "testhost"}
     assert {:ok, _pid, generation} = AdapterCoordinator.adapter_for(coordinator, key)
 
-    assert eventually(fn -> AdapterCoordinator.last_failure(coordinator, key, generation) != nil end)
+    assert eventually(fn ->
+             AdapterCoordinator.last_failure(coordinator, key, generation) != nil
+           end)
 
     # The generation that died gets its reason...
     assert AdapterCoordinator.last_failure(coordinator, key, generation)
@@ -953,7 +967,13 @@ defmodule Tightbeam.AdapterHealTest do
 
   defp eventually(fun, tries \\ 60) do
     Enum.reduce_while(1..tries, false, fn _, _ ->
-      if fun.(), do: {:halt, true}, else: (Process.sleep(25); {:cont, false})
+      if fun.(),
+        do: {:halt, true},
+        else:
+          (
+            Process.sleep(25)
+            {:cont, false}
+          )
     end)
   end
 

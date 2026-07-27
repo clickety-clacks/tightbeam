@@ -7,7 +7,16 @@ defmodule Tightbeam.Adjudication do
   keys therefore have no effect.
   """
 
-  alias Tightbeam.{AdapterCoordinator, CausalEvents, DB, EventLog, Idempotency, Supervision, Wakes}
+  alias Tightbeam.{
+    AdapterCoordinator,
+    CausalEvents,
+    DB,
+    EventLog,
+    Idempotency,
+    Supervision,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   @conditions ~w(auth_failed model_unavailable boot_failed quota_exhausted other)
@@ -76,7 +85,8 @@ defmodule Tightbeam.Adjudication do
 
   @doc "Whether a cause is auto-releasable by an adapter heal (NULL/model_decision are not)."
   @spec adapter_fault?(String.t() | nil) :: boolean()
-  def adapter_fault?(cause), do: is_binary(cause) and String.starts_with?(cause, @adapter_fault_prefix)
+  def adapter_fault?(cause),
+    do: is_binary(cause) and String.starts_with?(cause, @adapter_fault_prefix)
 
   @doc "Pluggable runtime classifier. The initial engine deliberately defaults to `other`."
   @spec classify(term()) :: String.t()
@@ -392,7 +402,9 @@ defmodule Tightbeam.Adjudication do
                 case Txn.q(txn, "SELECT prompt FROM wakes WHERE wakeId=?1", [
                        episode.owner_wake_id
                      ]) do
-                  [[prompt]] -> prompt
+                  [[prompt]] ->
+                    prompt
+
                   [] ->
                     # The original brief's wake is gone; this fallback still owes
                     # the reader the precise cause the episode carries, not just

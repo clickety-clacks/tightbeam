@@ -414,7 +414,7 @@ defmodule Tightbeam.ConditionFactsTest do
           )
 
         ids = for [id] <- rows, MapSet.member?(all, id), do: id
-        if length(ids) == 6, do: {:halt, ids}, else: (Process.sleep(50) && {:cont, ids})
+        if length(ids) == 6, do: {:halt, ids}, else: Process.sleep(50) && {:cont, ids}
       end)
 
     assert length(fired_order) == 6, "expected all 6 wakes to fire, got #{inspect(fired_order)}"

@@ -90,6 +90,7 @@ defmodule Tightbeam.EffortCheckinTest do
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000
     }
+
     root = Placement.workdir_path(config, holder)
     init_repo(root)
 

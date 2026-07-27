@@ -7,7 +7,16 @@ defmodule Tightbeam.AdjudicationTest do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
 
-    for module <- [Tightbeam.CausalEvents,EventLog, Org, Ledger, Idempotency, ConditionFacts, Wakes, Adjudication] do
+    for module <- [
+          Tightbeam.CausalEvents,
+          EventLog,
+          Org,
+          Ledger,
+          Idempotency,
+          ConditionFacts,
+          Wakes,
+          Adjudication
+        ] do
       :ok = module.ensure_schema(name)
     end
 
@@ -67,7 +76,8 @@ defmodule Tightbeam.AdjudicationTest do
              end)
   end
 
-  test "the unanswered-escalation re-notify names the precise cause, not just the condition", ctx do
+  test "the unanswered-escalation re-notify names the precise cause, not just the condition",
+       ctx do
     cause = "adapter_fault:claude:shared@testhost"
 
     {:ok, episode} =

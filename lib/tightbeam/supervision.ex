@@ -641,7 +641,7 @@ defmodule Tightbeam.Supervision do
       end
 
     # Supervision prods and escalations already hold their assignment when they
-  # schedule; they stop dropping it. THIS is what unlocks prod-turn attribution.
+    # schedule; they stop dropping it. THIS is what unlocks prod-turn attribution.
     params = %{
       prompt: prompt,
       after_ms: 0,

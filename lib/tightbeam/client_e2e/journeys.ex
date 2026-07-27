@@ -176,8 +176,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       journey: "J6",
       step: "13b",
       label: "model change",
-      action:
-        "POST /api/session-control set_model to a different catalog ref, then post again",
+      action: "POST /api/session-control set_model to a different catalog ref, then post again",
       client:
         "GET /api/session-status reports the new base ref; the payload satisfies the client's decode contract (every field the Swift SessionStatus decoder requires is present); the next turn completes",
       substrate: "sessions.model is the new ref; the following turn row `delivered`"
@@ -212,7 +211,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
       journey: "J7",
       step: "15",
       label: "restart queue survival",
-      action: "queue a second post behind a running one, restart before the first completes, re-send NOTHING",
+      action:
+        "queue a second post behind a running one, restart before the first completes, re-send NOTHING",
       client: "the client reconnects and needs no re-send for the queued work to finish",
       substrate:
         "the queued turn row survives the restart and reaches `delivered`; the interrupted first turn reaches a terminal status"
@@ -221,7 +221,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
       journey: "J8",
       step: "16",
       label: "wakes",
-      action: ~s(wake Main with "reply with exactly: WAKE OK" through /agent/dispatch as the admin),
+      action:
+        ~s(wake Main with "reply with exactly: WAKE OK" through /agent/dispatch as the admin),
       client:
         "the wake's prompt lands in Main as a SENDER-TAGGED user message (provenance from the `sender` field, not text parsing); the assistant answers it",
       substrate: "the delivered message's turn row carries a wakeId and reaches `delivered`"
@@ -328,10 +329,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
   # --- J1: converse ------------------------------------------------------------
 
   defp walk(ctx, "J1") do
-    {ctx, converse} = turn_completes(ctx, ctx.main_key, "hello, who are you?", "3", "converse", "J1")
+    {ctx, converse} =
+      turn_completes(ctx, ctx.main_key, "hello, who are you?", "3", "converse", "J1")
 
     uname = String.trim(elem(System.cmd("uname", ["-s"]), 0))
-    prompt = "Run the shell command `uname -s` and reply with exactly its output and nothing else."
+
+    prompt =
+      "Run the shell command `uname -s` and reply with exactly its output and nothing else."
+
     {ctx, result} = observe_turn(ctx, ctx.main_key, prompt)
 
     tool =
@@ -412,7 +417,11 @@ defmodule Tightbeam.ClientE2E.Journeys do
          ) do
       {:error, reason, client} ->
         {%{ctx | client: client},
-         [Scorecard.fail("8", "cancel", "no typing indicator to cancel (#{inspect(reason)})", journey: "J3")]}
+         [
+           Scorecard.fail("8", "cancel", "no typing indicator to cancel (#{inspect(reason)})",
+             journey: "J3"
+           )
+         ]}
 
       {:ok, _typing, client} ->
         cancel_watermark = SimClient.mark(client)
@@ -471,7 +480,16 @@ defmodule Tightbeam.ClientE2E.Journeys do
             else: nil
 
         turn = Substrate.turn_for_client_message(ctx.base_dir, cmid)
-        {ctx, drained} = turn_completes(ctx, ctx.main_key, "say exactly: DRAINED", "8b", "post-cancel turn", "J3")
+
+        {ctx, drained} =
+          turn_completes(
+            ctx,
+            ctx.main_key,
+            "say exactly: DRAINED",
+            "8b",
+            "post-cancel turn",
+            "J3"
+          )
 
         row =
           cond do
@@ -479,22 +497,31 @@ defmodule Tightbeam.ClientE2E.Journeys do
               Scorecard.fail("8", "cancel", "session-control cancel → #{status}", journey: "J3")
 
             is_nil(canceled) ->
-              Scorecard.fail("8", "cancel", "no canceled prompt_turn_state for the turn", journey: "J3")
+              Scorecard.fail("8", "cancel", "no canceled prompt_turn_state for the turn",
+                journey: "J3"
+              )
 
             get_in(canceled, ["payload", "terminalState"]) != true ->
               Scorecard.fail("8", "cancel", "canceled state was not terminal", journey: "J3")
 
             not is_nil(stray_reply) ->
-              Scorecard.fail("8", "cancel", "an assistant bubble arrived for the canceled turn", journey: "J3")
+              Scorecard.fail("8", "cancel", "an assistant bubble arrived for the canceled turn",
+                journey: "J3"
+              )
 
             indicator_error ->
               Scorecard.fail("8", "cancel", "after the cancel, #{indicator_error}", journey: "J3")
 
             is_nil(turn) or turn["status"] != "canceled" ->
-              Scorecard.fail("8", "cancel", "turn row is #{inspect(turn && turn["status"])}, not canceled", journey: "J3")
+              Scorecard.fail(
+                "8",
+                "cancel",
+                "turn row is #{inspect(turn && turn["status"])}, not canceled", journey: "J3")
 
             drained.status != :pass ->
-              Scorecard.fail("8", "cancel", "the lane did not drain: #{drained.note}", journey: "J3")
+              Scorecard.fail("8", "cancel", "the lane did not drain: #{drained.note}",
+                journey: "J3"
+              )
 
             true ->
               Scorecard.pass("8", "cancel", journey: "J3")
@@ -566,32 +593,61 @@ defmodule Tightbeam.ClientE2E.Journeys do
         true -> indicator_settled_error(frames, ctx.main_key, last_reply_at)
       end
 
-    echoes = for f <- frames, f["type"] == "message", f["role"] == "user", do: f["clientMessageId"]
-    replies = for f <- frames, f["type"] == "message", f["role"] == "assistant", do: f["replyToClientMessageId"]
-    first_reply_index = Enum.find_index(frames, &(&1["type"] == "message" and &1["role"] == "assistant"))
-    echo_indexes = for {f, i} <- Enum.with_index(frames), f["type"] == "message", f["role"] == "user", do: i
+    echoes =
+      for f <- frames, f["type"] == "message", f["role"] == "user", do: f["clientMessageId"]
+
+    replies =
+      for f <- frames,
+          f["type"] == "message",
+          f["role"] == "assistant",
+          do: f["replyToClientMessageId"]
+
+    first_reply_index =
+      Enum.find_index(frames, &(&1["type"] == "message" and &1["role"] == "assistant"))
+
+    echo_indexes =
+      for {f, i} <- Enum.with_index(frames), f["type"] == "message", f["role"] == "user", do: i
+
     turns = Enum.map(ids, &Substrate.turn_for_client_message(ctx.base_dir, &1))
     peak = Substrate.busiest_lane(samples, ctx.main_key)
 
     row =
       cond do
         Enum.take(echoes, 3) != ids ->
-          Scorecard.fail("9", "queueing", "echoes were #{inspect(echoes)}, expected #{inspect(ids)}", journey: "J4")
+          Scorecard.fail(
+            "9",
+            "queueing",
+            "echoes were #{inspect(echoes)}, expected #{inspect(ids)}", journey: "J4")
 
         first_reply_index && Enum.any?(echo_indexes, &(&1 > first_reply_index)) ->
-          Scorecard.fail("9", "queueing", "an echo arrived after the first assistant reply — echoes are not immediate", journey: "J4")
+          Scorecard.fail(
+            "9",
+            "queueing",
+            "an echo arrived after the first assistant reply — echoes are not immediate",
+            journey: "J4"
+          )
 
         Enum.filter(replies, &(&1 in ids)) != ids ->
-          Scorecard.fail("9", "queueing", "assistant replies arrived out of order: #{inspect(replies)}", journey: "J4")
+          Scorecard.fail(
+            "9",
+            "queueing",
+            "assistant replies arrived out of order: #{inspect(replies)}", journey: "J4")
 
         peak > 1 ->
-          Scorecard.fail("9", "queueing", "#{peak} turns were running at once in one lane", journey: "J4")
+          Scorecard.fail("9", "queueing", "#{peak} turns were running at once in one lane",
+            journey: "J4"
+          )
 
         Enum.any?(turns, &(is_nil(&1) or &1["status"] != "delivered")) ->
-          Scorecard.fail("9", "queueing", "turn rows: #{inspect(Enum.map(turns, & &1 && &1["status"]))}", journey: "J4")
+          Scorecard.fail(
+            "9",
+            "queueing",
+            "turn rows: #{inspect(Enum.map(turns, &(&1 && &1["status"])))}", journey: "J4")
 
         indicator_error ->
-          Scorecard.fail("9", "queueing", "across the queued batch, #{indicator_error}", journey: "J4")
+          Scorecard.fail("9", "queueing", "across the queued batch, #{indicator_error}",
+            journey: "J4"
+          )
 
         true ->
           Scorecard.pass("9", "queueing", journey: "J4")
@@ -612,7 +668,13 @@ defmodule Tightbeam.ClientE2E.Journeys do
     session_key = get_in(created, ["stream", "sessionKey"]) || created["sessionKey"]
 
     if status not in [200, 201] or is_nil(session_key) do
-      {ctx, [Scorecard.fail("10", "concurrency", "could not create Smoke B: #{status} #{inspect(created)}", journey: "J5")]}
+      {ctx,
+       [
+         Scorecard.fail(
+           "10",
+           "concurrency",
+           "could not create Smoke B: #{status} #{inspect(created)}", journey: "J5")
+       ]}
     else
       watermark = SimClient.mark(ctx.client)
 
@@ -649,10 +711,30 @@ defmodule Tightbeam.ClientE2E.Journeys do
         end)
 
       frames = SimClient.frames_since(ctx.client, watermark)
-      reply_order = for f <- frames, f["type"] == "message", f["role"] == "assistant", do: f["replyToClientMessageId"]
-      b_reply = Enum.find(frames, &(&1["type"] == "message" and &1["role"] == "assistant" and &1["replyToClientMessageId"] == b_id))
-      cross_talk = Enum.find(frames, &(&1["type"] == "message" and &1["role"] == "assistant" and &1["replyToClientMessageId"] == b_id and &1["sessionKey"] != session_key))
-      turns = Enum.map([slow_id, b_id, done_id], &Substrate.turn_for_client_message(ctx.base_dir, &1))
+
+      reply_order =
+        for f <- frames,
+            f["type"] == "message",
+            f["role"] == "assistant",
+            do: f["replyToClientMessageId"]
+
+      b_reply =
+        Enum.find(
+          frames,
+          &(&1["type"] == "message" and &1["role"] == "assistant" and
+              &1["replyToClientMessageId"] == b_id)
+        )
+
+      cross_talk =
+        Enum.find(
+          frames,
+          &(&1["type"] == "message" and &1["role"] == "assistant" and
+              &1["replyToClientMessageId"] == b_id and &1["sessionKey"] != session_key)
+        )
+
+      turns =
+        Enum.map([slow_id, b_id, done_id], &Substrate.turn_for_client_message(ctx.base_dir, &1))
+
       [slow_turn, b_turn, _done_turn] = turns
 
       # SIMULTANEITY, two independent witnesses, both of which are about ONE
@@ -678,7 +760,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
           _ -> false
         end
 
-      witness = "sampled_together=#{sampled_together?} intervals_overlapped=#{intervals_overlapped?} widest_sample=#{Substrate.widest_sample(samples)}"
+      witness =
+        "sampled_together=#{sampled_together?} intervals_overlapped=#{intervals_overlapped?} widest_sample=#{Substrate.widest_sample(samples)}"
 
       # The PREMISE this journey needs: Main's slow turn must still have been
       # running when Smoke B's reply arrived. When the model answers the slow
@@ -698,13 +781,21 @@ defmodule Tightbeam.ClientE2E.Journeys do
             Scorecard.fail("10", "concurrency", "Smoke B never replied", journey: "J5")
 
           not is_nil(cross_talk) ->
-            Scorecard.fail("10", "concurrency", "cross-talk: a reply landed in the wrong stream", journey: "J5")
+            Scorecard.fail("10", "concurrency", "cross-talk: a reply landed in the wrong stream",
+              journey: "J5"
+            )
 
           Enum.any?(turns, &(is_nil(&1) or &1["status"] != "delivered")) ->
-            Scorecard.fail("10", "concurrency", "turn rows: #{inspect(Enum.map(turns, & &1 && &1["status"]))}", journey: "J5")
+            Scorecard.fail(
+              "10",
+              "concurrency",
+              "turn rows: #{inspect(Enum.map(turns, &(&1 && &1["status"])))}", journey: "J5")
 
           Enum.filter(reply_order, &(&1 in [slow_id, done_id])) != [slow_id, done_id] ->
-            Scorecard.fail("10", "concurrency", "Main's turns completed out of order: #{inspect(reply_order)}", journey: "J5")
+            Scorecard.fail(
+              "10",
+              "concurrency",
+              "Main's turns completed out of order: #{inspect(reply_order)}", journey: "J5")
 
           substrate_concurrent? and client_saw_overlap? ->
             Scorecard.pass("10", "concurrency", journey: "J5")
@@ -895,7 +986,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
     row = Substrate.session(ctx.base_dir, ctx.main_key)
 
     {ctx, next_turn} =
-      turn_completes(ctx, ctx.main_key, "say exactly: MODEL OK", "13b-turn", "post-change turn", "J6")
+      turn_completes(
+        ctx,
+        ctx.main_key,
+        "say exactly: MODEL OK",
+        "13b-turn",
+        "post-change turn",
+        "J6"
+      )
 
     result =
       cond do
@@ -909,16 +1007,29 @@ defmodule Tightbeam.ClientE2E.Journeys do
           )
 
         missing != [] ->
-          Scorecard.fail("13b", "model change", "session-status omits fields the client's decoder requires: #{Enum.join(missing, ", ")}", journey: "J6")
+          Scorecard.fail(
+            "13b",
+            "model change",
+            "session-status omits fields the client's decoder requires: #{Enum.join(missing, ", ")}",
+            journey: "J6"
+          )
 
         base_ref(row["model"]) != base_ref(candidate) ->
-          Scorecard.fail("13b", "model change", "sessions.model is #{inspect(row["model"])}", journey: "J6")
+          Scorecard.fail("13b", "model change", "sessions.model is #{inspect(row["model"])}",
+            journey: "J6"
+          )
 
         next_turn.status != :pass ->
-          Scorecard.fail("13b", "model change", "the turn after the change did not complete: #{next_turn.note}", journey: "J6")
+          Scorecard.fail(
+            "13b",
+            "model change",
+            "the turn after the change did not complete: #{next_turn.note}", journey: "J6")
 
         true ->
-          Scorecard.pass("13b", "model change", journey: "J6", note: "applied #{base_ref(candidate)}")
+          Scorecard.pass("13b", "model change",
+            journey: "J6",
+            note: "applied #{base_ref(candidate)}"
+          )
       end
 
     {ctx, result}
@@ -944,7 +1055,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
     ]
 
     top = for {key, ok?} <- required, not ok?.(Map.get(status, key)), do: key
-    run_state = if is_map(status["run"]) and is_nil(status["run"]["state"]), do: ["run.state"], else: []
+
+    run_state =
+      if is_map(status["run"]) and is_nil(status["run"]["state"]), do: ["run.state"], else: []
+
     top ++ run_state
   end
 
@@ -963,7 +1077,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
       ctx.base_dir |> Substrate.messages(ctx.main_key) |> MapSet.new(& &1["id"])
 
     watermark = SimClient.mark(ctx.client)
-    {:ok, client, cmid} = SimClient.post(ctx.client, ctx.main_key, "Count to 300 slowly, one line per number.")
+
+    {:ok, client, cmid} =
+      SimClient.post(ctx.client, ctx.main_key, "Count to 300 slowly, one line per number.")
 
     {typing, client} =
       await_frame(
@@ -976,14 +1092,19 @@ defmodule Tightbeam.ClientE2E.Journeys do
     ctx = %{ctx | client: client}
 
     if is_nil(typing) do
-      {ctx, Scorecard.fail("14", "restart resilience", "no turn was in flight to interrupt", journey: "J7")}
+      {ctx,
+       Scorecard.fail("14", "restart resilience", "no turn was in flight to interrupt",
+         journey: "J7"
+       )}
     else
       old_pid = ctx.gateway.os_pid
 
       case LegGateway.restart(ctx.gateway) do
         {:error, reason} ->
           {ctx,
-           Scorecard.fail("14", "restart resilience", "restart failed: #{inspect(reason)}", journey: "J7")}
+           Scorecard.fail("14", "restart resilience", "restart failed: #{inspect(reason)}",
+             journey: "J7"
+           )}
 
         {:ok, gateway} ->
           ctx = %{ctx | gateway: gateway}
@@ -994,7 +1115,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
           case reconnect(ctx) do
             {:error, reason} ->
               {ctx,
-               Scorecard.fail("14", "restart resilience", "client could not reconnect after restart: #{inspect(reason)}", journey: "J7")}
+               Scorecard.fail(
+                 "14",
+                 "restart resilience",
+                 "client could not reconnect after restart: #{inspect(reason)}", journey: "J7")}
 
             {:ok, ctx} ->
               j7_drain_verdict(ctx, cmid, old_pid, gateway.os_pid, before_ids)
@@ -1006,7 +1130,12 @@ defmodule Tightbeam.ClientE2E.Journeys do
   defp j7_drain_verdict(ctx, cmid, old_pid, new_pid, before_ids) do
     snapshot = SimClient.find(ctx.client, 0, &(&1["type"] == "stream_snapshot"))
     sync = SimClient.find(ctx.client, 0, &(&1["type"] == "sync_complete"))
-    replayed_ids = SimClient.frames(ctx.client) |> Enum.filter(&(&1["type"] == "message")) |> MapSet.new(& &1["id"])
+
+    replayed_ids =
+      SimClient.frames(ctx.client)
+      |> Enum.filter(&(&1["type"] == "message"))
+      |> MapSet.new(& &1["id"])
+
     kept_ids = ctx.base_dir |> Substrate.messages(ctx.main_key) |> MapSet.new(& &1["id"])
     lost = MapSet.difference(before_ids, kept_ids)
     unreplayed = MapSet.difference(before_ids, replayed_ids)
@@ -1017,16 +1146,31 @@ defmodule Tightbeam.ClientE2E.Journeys do
         {:error, :timeout, row} -> row
       end
 
-    {ctx, fresh} = turn_completes(ctx, ctx.main_key, "say exactly: AFTER RESTART", "14b", "post-restart turn", "J7")
+    {ctx, fresh} =
+      turn_completes(
+        ctx,
+        ctx.main_key,
+        "say exactly: AFTER RESTART",
+        "14b",
+        "post-restart turn",
+        "J7"
+      )
+
     pointer = Substrate.harness_pointer(ctx.base_dir, ctx.main_key)
 
     row =
       cond do
         new_pid == old_pid ->
-          Scorecard.fail("14", "restart resilience", "the gateway pid did not change (#{old_pid})", journey: "J7")
+          Scorecard.fail(
+            "14",
+            "restart resilience",
+            "the gateway pid did not change (#{old_pid})", journey: "J7")
 
         is_nil(snapshot) or is_nil(sync) ->
-          Scorecard.fail("14", "restart resilience", "reconnect did not heal: no stream_snapshot/sync_complete", journey: "J7")
+          Scorecard.fail(
+            "14",
+            "restart resilience",
+            "reconnect did not heal: no stream_snapshot/sync_complete", journey: "J7")
 
         MapSet.size(lost) > 0 ->
           Scorecard.fail(
@@ -1057,7 +1201,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
           )
 
         is_nil(turn) ->
-          Scorecard.fail("14", "restart resilience", "the interrupted turn left no row", journey: "J7")
+          Scorecard.fail("14", "restart resilience", "the interrupted turn left no row",
+            journey: "J7"
+          )
 
         turn["status"] not in ~w(delivered failed failed_unknown) ->
           Scorecard.fail(
@@ -1069,7 +1215,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
           )
 
         fresh.status != :pass ->
-          Scorecard.fail("14", "restart resilience", "a fresh post after the restart did not complete: #{fresh.note}", journey: "J7")
+          Scorecard.fail(
+            "14",
+            "restart resilience",
+            "a fresh post after the restart did not complete: #{fresh.note}", journey: "J7")
 
         true ->
           Scorecard.pass("14", "restart resilience",
@@ -1086,7 +1235,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
   # Step 15: queued (not-yet-running) turns survive a restart and run to
   # delivered without being re-sent.
   defp j7_queue_survival(ctx) do
-    {:ok, client, first} = SimClient.post(ctx.client, ctx.main_key, "Count to 200 slowly, one line per number.")
+    {:ok, client, first} =
+      SimClient.post(ctx.client, ctx.main_key, "Count to 200 slowly, one line per number.")
+
     {:ok, client, second} = SimClient.post(client, ctx.main_key, "say exactly: SURVIVED")
     ctx = %{ctx | client: client}
 
@@ -1097,14 +1248,21 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
     case LegGateway.restart(ctx.gateway) do
       {:error, reason} ->
-        {ctx, Scorecard.fail("15", "restart queue survival", "restart failed: #{inspect(reason)}", journey: "J7")}
+        {ctx,
+         Scorecard.fail("15", "restart queue survival", "restart failed: #{inspect(reason)}",
+           journey: "J7"
+         )}
 
       {:ok, gateway} ->
         ctx = %{ctx | gateway: gateway}
 
         case reconnect(ctx) do
           {:error, reason} ->
-            {ctx, Scorecard.fail("15", "restart queue survival", "client could not reconnect: #{inspect(reason)}", journey: "J7")}
+            {ctx,
+             Scorecard.fail(
+               "15",
+               "restart queue survival",
+               "client could not reconnect: #{inspect(reason)}", journey: "J7")}
 
           {:ok, ctx} ->
             # NOTHING is re-sent here. That is the assertion.
@@ -1128,7 +1286,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
                   )
 
                 is_nil(second_turn) ->
-                  Scorecard.fail("15", "restart queue survival", "the queued turn's row vanished across the restart", journey: "J7")
+                  Scorecard.fail(
+                    "15",
+                    "restart queue survival",
+                    "the queued turn's row vanished across the restart", journey: "J7")
 
                 second_turn["status"] != "delivered" ->
                   Scorecard.fail(
@@ -1138,7 +1299,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
                     journey: "J7"
                   )
 
-                is_nil(first_turn) or first_turn["status"] not in ~w(delivered failed failed_unknown) ->
+                is_nil(first_turn) or
+                    first_turn["status"] not in ~w(delivered failed failed_unknown) ->
                   Scorecard.fail(
                     "15",
                     "restart queue survival",
@@ -1186,7 +1348,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
     case wake(ctx, %{"prompt" => "reply with exactly: WAKE OK"}) do
       {:error, reason} ->
-        {ctx, Scorecard.fail("16", "wakes", "wake dispatch failed: #{inspect(reason)}", journey: "J8")}
+        {ctx,
+         Scorecard.fail("16", "wakes", "wake dispatch failed: #{inspect(reason)}", journey: "J8")}
 
       {:ok, result} ->
         j8_verdict(ctx, watermark, wake_id(result), "16", "wakes", ctx.turn_timeout_ms)
@@ -1309,7 +1472,11 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
     case wake(ctx, %{"prompt" => "reply with exactly: LATER OK", "afterMs" => delay_ms}) do
       {:error, reason} ->
-        {ctx, Scorecard.fail("16b", "scheduled wake", "scheduled wake dispatch failed: #{inspect(reason)}", journey: "J8")}
+        {ctx,
+         Scorecard.fail(
+           "16b",
+           "scheduled wake",
+           "scheduled wake dispatch failed: #{inspect(reason)}", journey: "J8")}
 
       {:ok, result} ->
         id = wake_id(result)
@@ -1392,19 +1559,26 @@ defmodule Tightbeam.ClientE2E.Journeys do
     cond do
       is_nil(live) ->
         {ctx,
-         Scorecard.fail("5", "create stream", "no live stream_created frame (client had to reconnect to see it)",
+         Scorecard.fail(
+           "5",
+           "create stream",
+           "no live stream_created frame (client had to reconnect to see it)", journey: "J2")}
+
+      result.error ->
+        {ctx,
+         Scorecard.fail("5", "create stream", "post in the new stream: #{result.error}",
            journey: "J2"
          )}
 
-      result.error ->
-        {ctx, Scorecard.fail("5", "create stream", "post in the new stream: #{result.error}", journey: "J2")}
-
       is_nil(row) ->
-        {ctx, Scorecard.fail("5", "create stream", "no sessions row for #{session_key}", journey: "J2")}
+        {ctx,
+         Scorecard.fail("5", "create stream", "no sessions row for #{session_key}", journey: "J2")}
 
       row["origin"] != "user:#{ctx.client.user_id}" ->
         {ctx,
-         Scorecard.fail("5", "create stream", "origin was #{inspect(row["origin"])}", journey: "J2")}
+         Scorecard.fail("5", "create stream", "origin was #{inspect(row["origin"])}",
+           journey: "J2"
+         )}
 
       true ->
         {ctx, Scorecard.pass("5", "create stream", journey: "J2")}
@@ -1444,12 +1618,17 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
       get_in(frame, ["stream", "displayName"]) != renamed ->
         {ctx,
-         Scorecard.fail("6", "rename stream", "frame carried #{inspect(get_in(frame, ["stream", "displayName"]))}",
-           journey: "J2"
-         )}
+         Scorecard.fail(
+           "6",
+           "rename stream",
+           "frame carried #{inspect(get_in(frame, ["stream", "displayName"]))}", journey: "J2")}
 
       row["displayName"] != renamed ->
-        {ctx, Scorecard.fail("6", "rename stream", "sessions.displayName is #{inspect(row["displayName"])}", journey: "J2")}
+        {ctx,
+         Scorecard.fail(
+           "6",
+           "rename stream",
+           "sessions.displayName is #{inspect(row["displayName"])}", journey: "J2")}
 
       true ->
         {ctx, Scorecard.pass("6", "rename stream", journey: "J2")}
@@ -1486,13 +1665,17 @@ defmodule Tightbeam.ClientE2E.Journeys do
         {ctx, Scorecard.fail("7", "retire stream", "no live stream_deleted frame", journey: "J2")}
 
       row["state"] != "retired" ->
-        {ctx, Scorecard.fail("7", "retire stream", "sessions.state is #{inspect(row["state"])}", journey: "J2")}
+        {ctx,
+         Scorecard.fail("7", "retire stream", "sessions.state is #{inspect(row["state"])}",
+           journey: "J2"
+         )}
 
       kept < before or kept == 0 ->
         {ctx,
-         Scorecard.fail("7", "retire stream", "messages were not soft-retained (#{before} → #{kept})",
-           journey: "J2"
-         )}
+         Scorecard.fail(
+           "7",
+           "retire stream",
+           "messages were not soft-retained (#{before} → #{kept})", journey: "J2")}
 
       true ->
         {ctx, Scorecard.pass("7", "retire stream", journey: "J2")}
@@ -1538,7 +1721,12 @@ defmodule Tightbeam.ClientE2E.Journeys do
     # clear vouch for a live indicator; the waits below only decide when to
     # stop reading, never what held.
     {_echo, client} =
-      await_frame(client, watermark, &(&1["type"] == "message" and &1["clientMessageId"] == cmid), 30_000)
+      await_frame(
+        client,
+        watermark,
+        &(&1["type"] == "message" and &1["clientMessageId"] == cmid),
+        30_000
+      )
 
     {_reply, client} = await_reply(client, watermark, cmid, ctx)
 
@@ -1679,14 +1867,29 @@ defmodule Tightbeam.ClientE2E.Journeys do
       )
 
     cond do
-      is_nil(echo_at) -> "no echo bubble for the posted message"
-      is_nil(turn) -> "no turn row for the posted message"
-      turn["status"] in ~w(failed failed_unknown) -> "turn row is #{turn["status"]}#{turn_error(turn)}"
-      is_nil(indicator_on_at(frames, key, echo_at)) -> "typing indicator never turned on"
-      is_nil(reply_at) -> "no assistant reply within #{observed.timeout_ms}ms"
-      error = indicator_settled_error(frames, key, reply_at) -> error
-      turn["status"] != "delivered" -> "turn row is #{turn["status"]}#{turn_error(turn)}"
-      true -> nil
+      is_nil(echo_at) ->
+        "no echo bubble for the posted message"
+
+      is_nil(turn) ->
+        "no turn row for the posted message"
+
+      turn["status"] in ~w(failed failed_unknown) ->
+        "turn row is #{turn["status"]}#{turn_error(turn)}"
+
+      is_nil(indicator_on_at(frames, key, echo_at)) ->
+        "typing indicator never turned on"
+
+      is_nil(reply_at) ->
+        "no assistant reply within #{observed.timeout_ms}ms"
+
+      error = indicator_settled_error(frames, key, reply_at) ->
+        error
+
+      turn["status"] != "delivered" ->
+        "turn row is #{turn["status"]}#{turn_error(turn)}"
+
+      true ->
+        nil
     end
   end
 
@@ -1750,7 +1953,12 @@ defmodule Tightbeam.ClientE2E.Journeys do
     # two same-name/same-arity clauses with identical patterns mean the entry
     # clause always matches, and this recursed forever adding a fresh deadline
     # each time. It hung a live run for twenty minutes.
-    drain_settled_loop(client, watermark, session_key, System.monotonic_time(:millisecond) + timeout_ms)
+    drain_settled_loop(
+      client,
+      watermark,
+      session_key,
+      System.monotonic_time(:millisecond) + timeout_ms
+    )
   end
 
   defp drain_settled_loop(client, watermark, session_key, deadline) do

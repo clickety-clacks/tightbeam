@@ -20,7 +20,17 @@ defmodule Tightbeam.CheckTierTest do
     db = :"check_tier_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Tightbeam.CausalEvents,Devices, Idempotency, Org, Roles, WorkItems, Assignments, WorkState, EventLog] do
+    for module <- [
+          Tightbeam.CausalEvents,
+          Devices,
+          Idempotency,
+          Org,
+          Roles,
+          WorkItems,
+          Assignments,
+          WorkState,
+          EventLog
+        ] do
       :ok = module.ensure_schema(db)
     end
 
@@ -72,7 +82,9 @@ defmodule Tightbeam.CheckTierTest do
   test "attest-v1 database rebuild is FK-safe and idempotent" do
     db = :"check_tier_migration_#{System.unique_integer([:positive])}"
     start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
-    for module <- [Tightbeam.CausalEvents,Devices, Org, WorkItems], do: :ok = module.ensure_schema(db)
+
+    for module <- [Tightbeam.CausalEvents, Devices, Org, WorkItems],
+        do: :ok = module.ensure_schema(db)
 
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")

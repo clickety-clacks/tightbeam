@@ -328,7 +328,10 @@ defmodule Tightbeam.Ledger do
 
   defp probe_episode(%Txn{} = txn, seq) do
     episodes_exist? =
-      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudication_episodes'") ==
+      Txn.q(
+        txn,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudication_episodes'"
+      ) ==
         [[1]]
 
     with true <- episodes_exist?,
@@ -395,7 +398,9 @@ defmodule Tightbeam.Ledger do
         # Read before the UPDATE only for the seqs; the re-hold is keyed by seq
         # and so is order-independent.
         sessions_exist? =
-          Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [[1]]
+          Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [
+            [1]
+          ]
 
         Txn.q(
           txn,

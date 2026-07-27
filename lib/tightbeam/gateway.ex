@@ -284,7 +284,12 @@ defmodule Tightbeam.Gateway do
 
     on_adapter_ready = fn key_name, token ->
       Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-        adapter_healed(heal_config, db, Adjudication.adapter_fault_cause_for_name(key_name), token)
+        adapter_healed(
+          heal_config,
+          db,
+          Adjudication.adapter_fault_cause_for_name(key_name),
+          token
+        )
       end)
 
       :ok
@@ -1237,7 +1242,10 @@ defmodule Tightbeam.Gateway do
         with {:ok, adapter, generation} <-
                stage(:checkout, checkout_adapter(session)),
              {:ok, harness_session_id} <-
-               stage(:session, harness_session(config, db, adapter, generation, session, turn.seq)),
+               stage(
+                 :session,
+                 harness_session(config, db, adapter, generation, session, turn.seq)
+               ),
              {:ok, result} <-
                stage(
                  :prompt,
@@ -1246,7 +1254,8 @@ defmodule Tightbeam.Gateway do
                    harness_session_id,
                    turn.prompt,
                    600_000,
-                   progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
+                   progress:
+                     progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                  )
                ) do
           # THE reply seam. The agent elected an attention tier for this turn (or
@@ -1741,7 +1750,12 @@ defmodule Tightbeam.Gateway do
   # Without this, a fast-failing boot reaches the turn as an unactionable
   # ":noproc" (spec s4-operability-v1 §Defect 1: the reason must name the
   # spawn error).
-  defp enrich_adapter_unavailable(config, {:error, {:adapter_unavailable, :noproc}}, key, generation) do
+  defp enrich_adapter_unavailable(
+         config,
+         {:error, {:adapter_unavailable, :noproc}},
+         key,
+         generation
+       ) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
     # ATTEMPT-SCOPED: ask only for the death of the generation this turn checked
@@ -4002,7 +4016,9 @@ defmodule Tightbeam.Gateway do
         # state a heal may take. A human ruling that resolved the episode is NOT
         # such a state, and a delayed park leaves the hold wide while doing
         # exactly that — so the hold alone is not a sufficient guard (F3).
-        held? = Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [session_key])
+        held? =
+          Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [session_key])
+
         episode = Adjudication.get_in_txn(txn, session_key, condition)
 
         if held? == [["*"]] and is_map(episode) and Adjudication.heal_eligible?(episode) do
