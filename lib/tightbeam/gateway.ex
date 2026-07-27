@@ -2914,6 +2914,22 @@ defmodule Tightbeam.Gateway do
            message: "model #{inspect(model)} is not offered by #{harness}"
          }}
 
+      %{health: {:unavailable, {:needs_onboarding, reason}}} ->
+        warn_dead_default(harness, model, configured_default?)
+        provider = Harness.parse!(harness).credential_provider()
+        gateway = Placement.local_host_name()
+
+        {:error,
+         %{
+           code: "catalog_unavailable",
+           message:
+             "cannot validate model #{inspect(model)} for #{harness}: no #{harness} model " <>
+               "catalog, because #{provider} has no usable credential on GATEWAY host " <>
+               "#{gateway} (#{inspect(reason)}). The gateway derives every harness's catalog " <>
+               "on its own host, so it needs its own #{provider} grant regardless of where " <>
+               "sessions are placed; run tightbeam onboard #{provider} on #{gateway}"
+         }}
+
       %{health: health} ->
         warn_dead_default(harness, model, configured_default?)
 
