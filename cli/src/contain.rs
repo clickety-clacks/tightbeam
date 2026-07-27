@@ -11,6 +11,14 @@ const SCRIPT_ERROR: i32 = 10;
 const SCRIPT_TIMEOUT: i32 = 20;
 const CONTAINED_REFUSED: i32 = 30;
 
+// WHAT CONTAINMENT IS FOR: keeping agents ON THE RAILS. It is not a defence against a
+// malicious agent and it is not a security boundary. A circumvention that requires an
+// agent to be deliberately hostile is explicitly out of scope — a standing product
+// ruling, not a per-change default. Weigh a hardening by whether it keeps honest work
+// inside its lines (parity, correctness, legibility) and decline it when the only story
+// that reaches it is malice. Reviewers do not hold this frame and will raise
+// security-shaped findings by default; that alone does not make them work.
+//
 // Containment is per-OS; the bands above are not. `probe.rs` puts its per-OS collectors
 // behind one seam (`collect_linux` / `collect_darwin`) and this follows that shape, at
 // compile time rather than runtime because the mechanisms are syscalls rather than data.
@@ -1051,6 +1059,15 @@ mod platform {
     /// the whole resolution, atomically, if any component is a symlink. That makes the
     /// wrapper enforce at use-time precisely what Elixir asserted at validation-time,
     /// instead of trusting that nothing moved in between.
+    ///
+    /// SCOPE NOTE — do not read this as precedent. Reaching the window this closes needs
+    /// an agent to deliberately swap a path component mid-run, and deliberate
+    /// circumvention is explicitly out of scope (see the module header). It was built
+    /// before that ruling was applied, and it stays only because `openat2` is kernel 5.6 —
+    /// far below the ABI-3 floor this seam already demands — so it needs no fallback and
+    /// carries no ongoing cost. It earns its keep on a second, in-scope ground: the
+    /// wrapper now enforces exactly what Elixir validated, so the two halves cannot drift.
+    /// A future hardening whose ONLY story is a hostile agent does not get built.
     fn open_root_no_symlinks(path: &CString) -> io::Result<OwnedFd> {
         let how = OpenHow {
             flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,

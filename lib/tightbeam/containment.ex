@@ -2,6 +2,19 @@ defmodule Tightbeam.Containment do
   @moduledoc """
   Write-root validation, and containment profile rendering for the host's OS.
 
+  ## What containment is for
+
+  Containment keeps agents ON THE RAILS. It is not a defence against a malicious
+  agent, and it is not a security boundary. A circumvention that requires an agent
+  to be deliberately hostile is explicitly OUT OF SCOPE: we do not design for it,
+  and a finding premised on it is not work.
+
+  This is a standing product ruling, not a default to be re-litigated per change.
+  Weigh a proposed hardening by whether it keeps honest work inside its lines —
+  parity, correctness, legibility — and decline it when the only story that
+  reaches it is malice. Reviewers do not hold this frame and will raise
+  security-shaped findings by default; that alone does not make them work.
+
   The neutral truth is the SET OF WRITE ROOTS. Seatbelt SBPL is macOS's encoding
   of that set, not the set itself, so only the encoding is per-OS: this module
   stays the single authority on which roots are granted, because that draws on
