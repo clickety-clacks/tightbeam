@@ -543,8 +543,15 @@ const TOPLINE_USAGE: &str = "usage: tightbeam topline (--under <workItemId> | --
 
 /// Every roster-filter flag, in one place, so the assignment-mode refusal and the
 /// filter builder cannot drift apart.
-const ROSTER_FILTER_FLAGS: &[&str] =
-    &["origin", "owner", "state", "quiet-over", "spec", "spec-sha", "session"];
+const ROSTER_FILTER_FLAGS: &[&str] = &[
+    "origin",
+    "owner",
+    "state",
+    "quiet-over",
+    "spec",
+    "spec-sha",
+    "session",
+];
 
 fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, String> {
     // The origin enum is closed HERE: the reader treats anything but user or
@@ -1585,10 +1592,19 @@ mod tests {
             .expect("assignment selection dispatches")
             .body_json;
 
-        assert!(body.contains(r#""assignments":["asg_a","asg_b"]"#), "got {body}");
+        assert!(
+            body.contains(r#""assignments":["asg_a","asg_b"]"#),
+            "got {body}"
+        );
 
         for absent in [
-            "origin", "owner", "state", "quietOver", "spec", "specSha", "session",
+            "origin",
+            "owner",
+            "state",
+            "quietOver",
+            "spec",
+            "specSha",
+            "session",
         ] {
             assert!(
                 !body.contains(&format!("\"{absent}\"")),

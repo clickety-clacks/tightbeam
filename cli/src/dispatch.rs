@@ -389,10 +389,11 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         // filter the reader would then ignore.
         Command::Topline {
             identity,
-            selection: ToplineSelection::Under {
-                work_item_id,
-                filters,
-            },
+            selection:
+                ToplineSelection::Under {
+                    work_item_id,
+                    filters,
+                },
         } => {
             let mut params = filter_params(filters);
             params.push(string_field("under", work_item_id));
@@ -411,7 +412,10 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 identity,
                 "topline",
                 vec![],
-                vec![format!("\"assignments\":{}", serde_json::Value::Array(list))],
+                vec![format!(
+                    "\"assignments\":{}",
+                    serde_json::Value::Array(list)
+                )],
             ))
         }
         Command::WorkItemIcebox {
