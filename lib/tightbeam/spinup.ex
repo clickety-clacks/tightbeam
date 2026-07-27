@@ -76,7 +76,17 @@ defmodule Tightbeam.Spinup do
 
         {_output, _exit} ->
           install_dir = Path.join(target.host_config.base_dir, "adapters")
-          packages = Enum.map_join(Harness.all(), " ", & &1.install_package())
+
+          # `name@version`, not a bare name: npm resolves a bare name to LATEST, so
+          # every provision pulled whatever was published that day while
+          # @adapter_version documented a pin nothing enforced. Measured before this
+          # change, BOTH adapters had drifted past their pins. The patch anchors and
+          # the local patcher's exact-version assertion are written against the
+          # pinned release, so the install has to land that release — an unpinned
+          # tree makes the patcher raise. Versions stay in the harness modules; this
+          # seam only asks each of them for its own.
+          packages =
+            Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
           install =
             "npm install --prefix #{shell_quote(install_dir)} " <> packages
