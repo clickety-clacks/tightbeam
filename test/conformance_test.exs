@@ -9,8 +9,10 @@ defmodule Tightbeam.ConformanceProducerRegistry do
   def init(state), do: {:ok, state}
 
   @impl true
-  def handle_call({:register_process, job_id, port, os_pid}, _from, state) do
-    {:reply, :ok, Map.put(state, job_id, %{port: port, os_pid: os_pid})}
+  # Tracks ProducerRunner's real arity: registration carries the captured process
+  # start time, which every later signal is verified against (task #45).
+  def handle_call({:register_process, job_id, port, os_pid, started}, _from, state) do
+    {:reply, :ok, Map.put(state, job_id, %{port: port, os_pid: os_pid, started: started})}
   end
 
   @impl true
