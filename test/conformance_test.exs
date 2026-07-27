@@ -809,43 +809,50 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp assert_rule_result(case_id, expect, _reason, actual, ctx),
     do:
-      flunk("#{case_id}: expected #{expect}, got #{inspect(actual)}#{timeout_layer(actual, ctx)}")
+      flunk(
+        "#{case_id}: expected #{expect}, got #{inspect(actual)}#{timeout_evidence(actual, ctx)}"
+      )
 
   defp timeout_ctx(db, fixture) do
     %{db: db, timeout_ms: Enum.find_value(fixture["rule"], &get_in(&1, ["check", "timeout_ms"]))}
   end
 
-  # A `script_timeout` deny is ambiguous on its face. TWO layers produce it and both
-  # land on exit status 20: the rail-exec binary enforcing the declared `timeout_ms`
-  # (it SIGKILLs the process group and exits 20 — a real script-too-slow verdict), and
-  # `RailScript.await/3` giving up on the port at `timeout_ms + 2_000` and SYNTHESIZING
-  # status 20 for a wrapper that never reported. Only the first is enforcement; the
-  # second is the harness losing the race, which is what makes a red C5 unreadable
-  # under contention (task #38). The recorded `duration_ms` separates them, because the
-  # two deadlines differ by exactly the 2_000ms backstop margin by construction.
-  def timeout_layer({:deny, %{reason: "script_timeout"}}, %{db: db, timeout_ms: budget})
+  # A `script_timeout` deny does not say which layer produced it. TWO produce it and both
+  # land on exit status 20: the rail-exec binary enforcing the declared `timeout_ms` (real
+  # enforcement — it SIGKILLs the process group and exits 20), and `RailScript.await/3`
+  # giving up on the port at `timeout_ms + 2_000` and SYNTHESIZING status 20 for a wrapper
+  # that never reported (contention — no verdict was rendered).
+  #
+  # Timing CANNOT tell them apart, so this reports evidence and refuses to conclude. The
+  # duration is BEAM-side wall clock (rail_script.ex:13, :27), so a starved or suspended
+  # process inflates it past the backstop threshold on a run the binary actually enforced
+  # — reproduced deterministically in rail_script_test.exs. An earlier version of this
+  # helper DID claim a layer from the duration and mislabelled exactly that case; a
+  # confident mislabel is worse than the ambiguity, because it sends the next
+  # investigator the wrong way. The fact that would settle it — did the port report an
+  # exit status, or did `await/3` synthesize one — is known at the decision point
+  # (rail_script.ex:185 vs :188-191) and is not recorded. Surfacing it needs a
+  # rails-mechanism-v1 amendment (task #38).
+  def timeout_evidence({:deny, %{reason: "script_timeout"}}, %{db: db, timeout_ms: budget})
       when is_integer(budget) do
-    case rail_script_duration_ms(db) do
-      nil ->
-        "\n  timeout layer: UNDETERMINED — no rail_script lifecycle row to measure."
+    measured =
+      case rail_script_duration_ms(db) do
+        nil -> "unrecorded (no rail_script lifecycle row)"
+        ms -> "#{ms}ms"
+      end
 
-      ms when ms >= budget + 2_000 ->
-        "\n  timeout layer: BEAM BACKSTOP (not enforcement) — measured #{ms}ms >= " <>
-          "timeout_ms(#{budget}) + 2000ms backstop. The wrapper never reported, so " <>
-          "rail-exec rendered NO verdict; this is harness/contention."
-
-      ms when ms >= budget ->
-        "\n  timeout layer: RAIL-EXEC BINARY (enforcement) — measured #{ms}ms >= " <>
-          "declared timeout_ms(#{budget}) and below the +2000ms backstop. The binary " <>
-          "killed the process group; the script genuinely exceeded its budget."
-
-      ms ->
-        "\n  timeout layer: ANOMALOUS — script_timeout at #{ms}ms, under both the " <>
-          "declared timeout_ms(#{budget}) and the +2000ms backstop."
-    end
+    "\n  script_timeout evidence — LAYER NOT DETERMINED:" <>
+      "\n    measured duration : #{measured} (BEAM-side wall clock)" <>
+      "\n    declared budget   : #{budget}ms (rail-exec enforces this, exits 20)" <>
+      "\n    backstop threshold: #{budget + 2_000}ms (await/3 synthesizes 20 here)" <>
+      "\n  Both layers report reason=script_timeout and script_exit_class=timeout. The" <>
+      "\n  duration does NOT separate them: it is measured in the BEAM, so scheduler" <>
+      "\n  starvation can inflate it past the backstop threshold on a run rail-exec" <>
+      "\n  genuinely enforced. Do not infer the layer from these numbers. The deciding" <>
+      "\n  fact (did the port report an exit status?) is not recorded — see task #38."
   end
 
-  def timeout_layer(_actual, _ctx), do: ""
+  def timeout_evidence(_actual, _ctx), do: ""
 
   def rail_script_duration_ms(db) do
     EventLog.lifecycle_events(db)
@@ -3743,12 +3750,13 @@ defmodule Tightbeam.ConformanceTest do
 
   # Task #38: a `script_timeout` deny is produced by BOTH the rail-exec binary enforcing
   # the declared budget and RailScript.await/3 synthesizing status 20 for a wrapper that
-  # never reported. Reason and exit_class are identical for both, so a red C5 could not
-  # be read as enforcement-vs-contention. The failure surface must now say which layer
-  # fired. (The physical premise — that real durations for the two layers straddle the
-  # +2000ms margin — is pinned in rail_script_test.exs.)
-  test "C5 timeout diagnosis separates the rail-exec verdict from the BEAM backstop" do
-    db = :"c5_timeout_layer_#{System.unique_integer([:positive])}"
+  # never reported. Reason and exit_class are identical for both, and the recorded
+  # duration is BEAM-side so starvation makes the windows OVERLAP (reproduced in
+  # rail_script_test.exs). So the surface must report evidence and NAME the ambiguity —
+  # never conclude a layer. This test exists to keep a layer claim from creeping back in:
+  # the same evidence block must appear on both sides of the backstop threshold.
+  test "C5 timeout evidence reports facts and refuses to conclude a layer" do
+    db = :"c5_timeout_evidence_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.EventLog.ensure_schema(db)
 
@@ -3757,25 +3765,40 @@ defmodule Tightbeam.ConformanceTest do
     timeout_deny = {:deny, %{rule: "reconcile-with-main", reason: "script_timeout"}}
     genuine_refusal = {:deny, %{rule: "reconcile-with-main", reason: "rule_denied"}}
 
-    # Layer 1 — the binary enforced its own budget: at/past it, inside the margin.
+    # Inside the backstop threshold.
     record_rail_script_duration!(db, budget + 40)
-    binary = Corpus.timeout_layer(timeout_deny, ctx)
-    assert binary =~ "RAIL-EXEC BINARY (enforcement)"
-    assert binary =~ "declared timeout_ms(2000)"
-    refute binary =~ "BEAM BACKSTOP"
+    inside = Corpus.timeout_evidence(timeout_deny, ctx)
 
-    # Layer 2 — the wrapper never reported; await/3 gave up past the margin.
+    # Past it — the window an unsound timing rule would call "backstop".
     record_rail_script_duration!(db, budget + 2_000 + 15)
-    backstop = Corpus.timeout_layer(timeout_deny, ctx)
-    assert backstop =~ "BEAM BACKSTOP (not enforcement)"
-    assert backstop =~ "harness/contention"
-    refute backstop =~ "RAIL-EXEC BINARY"
+    past = Corpus.timeout_evidence(timeout_deny, ctx)
 
-    # The whole point of the task: identical reason, different reported layer.
-    assert binary != backstop
+    # Both must carry the facts a reader needs: the measurement and both thresholds.
+    for evidence <- [inside, past] do
+      assert evidence =~ "LAYER NOT DETERMINED"
+      assert evidence =~ "declared budget   : 2000ms"
+      assert evidence =~ "backstop threshold: 4000ms"
+      assert evidence =~ "Do not infer the layer from these numbers"
+
+      # No layer claim, on either side. These are the strings the unsound version emitted.
+      refute evidence =~ "RAIL-EXEC BINARY (enforcement)"
+      refute evidence =~ "BEAM BACKSTOP (not enforcement)"
+    end
+
+    # The measurements differ and are reported verbatim...
+    assert inside =~ "measured duration : 2040ms"
+    assert past =~ "measured duration : 4015ms"
+
+    # ...but crossing the threshold must NOT change the conclusion, because there isn't
+    # one. Strip the measurement line and the two blocks are identical.
+    assert strip_measured(inside) == strip_measured(past)
 
     # A genuine refusal must not acquire timeout noise it did not earn.
-    assert Corpus.timeout_layer(genuine_refusal, ctx) == ""
+    assert Corpus.timeout_evidence(genuine_refusal, ctx) == ""
+  end
+
+  defp strip_measured(evidence) do
+    String.replace(evidence, ~r/measured duration : \d+ms/, "measured duration : <n>ms")
   end
 
   defp record_rail_script_duration!(db, duration_ms) do
