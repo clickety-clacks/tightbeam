@@ -306,8 +306,9 @@ defmodule Tightbeam.Identity do
   end
 
   @doc "Import the next source snapshot and merge it into main."
-  @spec relearn!(String.t()) :: {:ok, String.t()} | {:conflict, [String.t()]}
-  def relearn!(base_dir) do
+  @spec relearn!(String.t(), String.t()) ::
+          {:ok, String.t()} | {:conflict, [String.t()]} | {:error, String.t()}
+  def relearn!(base_dir, author) do
     init!(base_dir)
     dir = identity_dir(base_dir)
     require_clean_main!(dir)
@@ -322,10 +323,17 @@ defmodule Tightbeam.Identity do
            "git",
            ["merge", "--no-ff", @upstream, "-m", "merge: relearn agentic-engineering"],
            cd: dir,
-           stderr_to_stdout: true
+           stderr_to_stdout: true,
+           env: git_env(author)
          ) do
-      {_output, 0} -> {:ok, publish_live!(dir)}
-      {_output, _status} -> {:conflict, conflict_paths(dir)}
+      {_output, 0} ->
+        {:ok, publish_live!(dir)}
+
+      {output, _status} ->
+        case conflict_paths(dir) do
+          [] -> {:error, String.trim(output)}
+          paths -> {:conflict, paths}
+        end
     end
   end
 
@@ -632,25 +640,22 @@ defmodule Tightbeam.Identity do
   end
 
   defp git!(dir, args, author \\ nil) do
-    env =
-      case author do
-        nil ->
-          []
-
-        name ->
-          local = String.replace(name, ~r/[^A-Za-z0-9_.+-]/, "-")
-
-          [
-            {"GIT_AUTHOR_NAME", name},
-            {"GIT_AUTHOR_EMAIL", "#{local}@tightbeam.local"},
-            {"GIT_COMMITTER_NAME", name},
-            {"GIT_COMMITTER_EMAIL", "#{local}@tightbeam.local"}
-          ]
-      end
-
-    case System.cmd("git", args, cd: dir, stderr_to_stdout: true, env: env) do
+    case System.cmd("git", args, cd: dir, stderr_to_stdout: true, env: git_env(author)) do
       {_output, 0} -> :ok
       {output, status} -> raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
     end
+  end
+
+  defp git_env(nil), do: []
+
+  defp git_env(name) do
+    local = String.replace(name, ~r/[^A-Za-z0-9_.+-]/, "-")
+
+    [
+      {"GIT_AUTHOR_NAME", name},
+      {"GIT_AUTHOR_EMAIL", "#{local}@tightbeam.local"},
+      {"GIT_COMMITTER_NAME", name},
+      {"GIT_COMMITTER_EMAIL", "#{local}@tightbeam.local"}
+    ]
   end
 end

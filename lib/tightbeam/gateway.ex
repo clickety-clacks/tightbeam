@@ -1867,8 +1867,8 @@ defmodule Tightbeam.Gateway do
     %{state: "published", live_revision: revision}
   end
 
-  defp identity_relearn_result(config, _call) do
-    case Identity.relearn!(config.base_dir) do
+  defp identity_relearn_result(config, call) do
+    case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, revision} ->
         Archetypes.load!(config.base_dir)
         %{state: "published", live_revision: revision}
@@ -1877,6 +1877,14 @@ defmodule Tightbeam.Gateway do
         %{
           state: "relearn-conflicted",
           conflicting_paths: paths,
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
+
+      {:error, message} ->
+        %{
+          state: "relearn-failed",
+          code: "relearn_failed",
+          message: message,
           live_revision: Identity.live_revision!(config.base_dir)
         }
     end

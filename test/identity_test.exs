@@ -241,10 +241,14 @@ defmodule Tightbeam.IdentityTest do
     text = '#include "coder.md"'
     """)
 
-    assert {:ok, revision} = Identity.relearn!(ctx.base)
+    assert {:ok, revision} = Identity.relearn!(ctx.base, "relearn operator")
     assert revision == Identity.live_revision!(ctx.base)
     next_upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
     assert git!(dir, ["rev-parse", "#{next_upstream}^"]) == prior_upstream
+
+    assert git!(dir, ["log", "-1", "--format=%an <%ae>"]) ==
+             "relearn operator <relearn-operator@tightbeam.local>"
+
     assert File.read!(Path.join(ctx.base, "identity/guidance/coder.md")) == "local-role"
     refute File.exists?(Path.join(ctx.base, "identity/skills/role-skill"))
   end
@@ -254,18 +258,40 @@ defmodule Tightbeam.IdentityTest do
     dir = Path.join(ctx.base, "identity")
     live = Identity.live_revision!(ctx.base)
     File.write!(Path.join(dir, "guidance/dirty.md"), "dirty")
-    assert_raise ArgumentError, ~r/dirty/, fn -> Identity.relearn!(ctx.base) end
+    assert_raise ArgumentError, ~r/dirty/, fn -> Identity.relearn!(ctx.base, "test") end
     File.rm!(Path.join(dir, "guidance/dirty.md"))
 
     Identity.edit!(ctx.base, "coder", :guidance, "local-change", "test")
     stable = Identity.live_revision!(ctx.base)
     File.write!(Path.join(ctx.source, "guidance/coder.md"), "source-change")
-    assert {:conflict, ["guidance/coder.md"]} = Identity.relearn!(ctx.base)
+    assert {:conflict, ["guidance/coder.md"]} = Identity.relearn!(ctx.base, "test")
     assert Identity.live_revision!(ctx.base) == stable
     assert stable != live
     assert Identity.status(ctx.base).state == :relearn_conflicted
     assert :ok = Identity.abort_relearn!(ctx.base)
     assert Identity.live_revision!(ctx.base) == stable
+  end
+
+  test "relearn surfaces a non-conflict merge failure with git's reason", ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    live = Identity.live_revision!(ctx.base)
+    hook = Path.join(dir, ".git/hooks/pre-merge-commit")
+
+    File.write!(hook, """
+    #!/bin/sh
+    echo "pre-merge policy rejected relearn" >&2
+    exit 1
+    """)
+
+    File.chmod!(hook, 0o755)
+
+    result = Identity.relearn!(ctx.base, "test")
+
+    assert {:error, message} = result
+    assert message =~ "pre-merge policy rejected relearn"
+    refute match?({:conflict, _paths}, result)
+    assert Identity.live_revision!(ctx.base) == live
   end
 
   test "live is the only publication and one stamped OID cannot mix revisions", ctx do
