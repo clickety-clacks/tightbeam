@@ -2,6 +2,11 @@
 # automatically, so `cargo build` cannot silently run against whatever happened to be
 # on PATH. The CLI is edition 2024, which needs Rust >= 1.85.
 #
+# It lives at the REPO ROOT, not in cli/: rustup resolves toolchain files from the
+# working directory upward, and the documented build runs from the root with
+# --manifest-path cli/..., so a file inside cli/ is never on that search path. It was
+# there first and silently did nothing.
+#
 # This does NOT help a distro-packaged cargo — apt/dnf builds ignore rustup entirely,
 # and Ubuntu 24.04 LTS ships 1.75. That case is covered by `rust-version` in
 # Cargo.toml, which makes cargo name the real problem, and by the README telling you

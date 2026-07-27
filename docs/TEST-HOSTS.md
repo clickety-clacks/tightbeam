@@ -51,6 +51,21 @@ and publish, reset the account, and retry from step one.
 Capture per run: installed commit/version, every step with its exit status, and the
 resulting service health.
 
+## 3a. Bootstrap the first client BEFORE onboarding
+
+The published procedure's order is **boot → connect first client → onboard**, and
+it is not optional: a fresh org has no users, `onboard` is admin-only, and the
+first client to pair is auto-approved and becomes that admin
+(`Devices.pair/2` — zero users means `allowlisted` + a minted token, instantly).
+Running `onboard` first returns `forbidden: admin required` and there is no other
+way to create the admin. A run that skips this reports a sequencing mistake as a
+product defect — that already happened once.
+
+On a headless test host there is no GUI client, so pair with
+`Tightbeam.ClientE2E.SimClient.pair/3`, which opens a pairing socket, sends
+`pair_request`, reads `pair_result`, and closes. That is the same wire ceremony a
+real client performs; it is not a mock of the gateway side.
+
 ## 4. Verification — not "a process is running"
 
 Per `service-mode-install-v1.md`, the service must be proven to:

@@ -60,12 +60,29 @@ mix run --no-halt                  # boots the gateway; creates state.db, homes,
 selects it for a single run, and `TIGHTBEAM_PORT` overrides the port.
 
 The first boot creates the base dir and serves, but **cannot run a turn yet**:
-it has no credentials, so it prints a NOT READY summary naming every gap. Close
-them, then restart. Per harness:
+it has no credentials, so it prints a NOT READY summary naming every gap.
+
+### Connect your first client — do this BEFORE onboarding
+
+A fresh org has no users. **The first client to connect is auto-approved and its
+user becomes the admin** (the cold-start rule, `Devices.pair/2`): point your
+client at `TIGHTBEAM_ADVERTISED_URL`, pair with a claimed name, and it succeeds
+instantly — no approval step, because there is nobody yet to approve it.
+
+Do this first. Onboarding is admin-only, so running it before any client has
+paired fails with `forbidden: admin required` and there is no other way to
+create that first admin.
+
+Every client after this one pairs as `pending` and must be approved by the admin.
+
+### Then onboard a credential, per provider
 
 ```sh
 <base_dir>/bin/tightbeam onboard <provider> --as-user <userId>
 ```
+
+`<provider>` is the credential provider — **`anthropic`** or **`openai`** — not
+the harness name. `<userId>` is the admin created by that first pairing.
 
 You do not install the ACP adapters by hand. `<base_dir>/adapters` stays empty
 until the first session spawns, at which point the gateway installs both
