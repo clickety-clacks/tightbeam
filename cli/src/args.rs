@@ -140,9 +140,7 @@ pub enum Command {
     },
     Topline {
         identity: Identity,
-        under: Option<String>,
-        assignments: Option<Vec<String>>,
-        filters: ToplineFilters,
+        selection: ToplineSelection,
     },
     WorkItemIcebox {
         identity: Identity,
@@ -217,6 +215,22 @@ pub enum Command {
         value: String,
     },
     Assimilate(AssimilateArgs),
+}
+
+/// `topline`'s two selections. Assignment selection carries NO filters: the spec
+/// scopes roster filters to the roster and `--under`, and assignment selection has
+/// no filter surface at all. Making that a TYPE distinction rather than a runtime
+/// check is deliberate — re-attaching filters to assignment mode is a compile
+/// error, not a request that succeeds while quietly ignoring half of what was
+/// asked (found in code review of the first cut, which sent filters the reader
+/// then discarded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToplineSelection {
+    Under {
+        work_item_id: String,
+        filters: ToplineFilters,
+    },
+    Assignments(Vec<String>),
 }
 
 /// Roster filters, identical for `toplines` and `topline --under`. They select
@@ -338,7 +352,7 @@ COMMANDS:
       No percentages and no completion estimates: the rows do not support them.
         tightbeam toplines --origin user --state open --as-user flynn
         tightbeam toplines --quiet-over 2h --as-user flynn
-  topline (--under <workItemId> | --assignments <id,...>) [roster filters]
+  topline (--under <workItemId> [roster filters] | --assignments <id,...>)
       --under walks one item's causal subtree (the anchor plus its visible
       linked descendants). --assignments names an explicit assignment set and
       reports the items they resolve to; an assignment belonging to no item
@@ -526,6 +540,11 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
 const TOPLINES_USAGE: &str = "usage: tightbeam toplines [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
 const TOPLINE_USAGE: &str = "usage: tightbeam topline (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+
+/// Every roster-filter flag, in one place, so the assignment-mode refusal and the
+/// filter builder cannot drift apart.
+const ROSTER_FILTER_FLAGS: &[&str] =
+    &["origin", "owner", "state", "quiet-over", "spec", "spec-sha", "session"];
 
 fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, String> {
     // The origin enum is closed HERE: the reader treats anything but user or
@@ -1009,7 +1028,7 @@ fn parse_with_optional_catalog(
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
             });
-            match (&under, &assignments) {
+            let selection = match (under, assignments) {
                 (Some(_), Some(_)) | (None, None) => {
                     return Err(
                         "topline requires exactly one of --under <workItemId> or --assignments <id,...>"
@@ -1021,13 +1040,32 @@ fn parse_with_optional_catalog(
                 (None, Some(ids)) if ids.is_empty() => {
                     return Err("--assignments requires at least one assignment id".to_owned())
                 }
-                _ => {}
-            }
+                (None, Some(ids)) => {
+                    // Refuse EARLY and LOUDLY. Accepting a filter here and dropping
+                    // it later would promise a narrowing the contract cannot make:
+                    // `--assignments X --state closed` would happily return an OPEN
+                    // item. Naming the offered flags beats a generic usage line.
+                    let offered = ROSTER_FILTER_FLAGS
+                        .iter()
+                        .filter(|flag| flags.contains_key(**flag))
+                        .map(|flag| format!("--{flag}"))
+                        .collect::<Vec<_>>();
+                    if !offered.is_empty() {
+                        return Err(format!(
+                            "--assignments selects an explicit assignment set and takes no roster filters; drop {}",
+                            offered.join(", ")
+                        ));
+                    }
+                    ToplineSelection::Assignments(ids)
+                }
+                (Some(work_item_id), None) => ToplineSelection::Under {
+                    work_item_id,
+                    filters: topline_filters(flags)?,
+                },
+            };
             Ok(Command::Topline {
                 identity: identity(flags)?,
-                under,
-                assignments,
-                filters: topline_filters(flags)?,
+                selection,
             })
         }
         "work-item-icebox" => {
@@ -1483,6 +1521,115 @@ mod tests {
                 if harnesses == vec!["fixture".to_owned()]
                     && parsed_catalog == catalog
         ));
+    }
+
+    // The blocking code-review finding on the first cut: the CLI attached roster
+    // filters to BOTH topline modes and sent them, while the reader selects solely
+    // by assignment id — so `--assignments X --state closed` could return an OPEN
+    // item after the CLI had promised the filter was applied.
+    #[test]
+    fn assignment_selection_refuses_every_roster_filter() {
+        for (flag, value) in [
+            ("origin", "user"),
+            ("owner", "flynn"),
+            ("state", "closed"),
+            ("quiet-over", "2h"),
+            ("spec", "topline-map-v1"),
+            ("spec-sha", &"a".repeat(64)[..]),
+            ("session", "agent:coder:app"),
+        ] {
+            let error = parse(strings(&[
+                "topline",
+                "--assignments",
+                "asg_x",
+                &format!("--{flag}"),
+                value,
+                "--as-user",
+                "flynn",
+            ]))
+            .expect_err(&format!("--{flag} must be refused in assignment mode"));
+
+            assert!(
+                error.contains("takes no roster filters") && error.contains(&format!("--{flag}")),
+                "refusal must NAME the offered flag, got: {error}"
+            );
+        }
+    }
+
+    // The structural half: assignment selection has no filters field, so nothing
+    // can be attached to it, and the built request carries only the id list. This
+    // is what fails if someone re-attaches filters to this mode.
+    #[test]
+    fn assignment_selection_sends_only_the_id_list() {
+        let command = parse(strings(&[
+            "topline",
+            "--assignments",
+            "asg_a,asg_b",
+            "--as-user",
+            "flynn",
+        ]))
+        .expect("bare assignment selection parses");
+
+        assert_eq!(
+            command,
+            Command::Topline {
+                identity: Identity::User("flynn".to_owned()),
+                selection: ToplineSelection::Assignments(vec![
+                    "asg_a".to_owned(),
+                    "asg_b".to_owned()
+                ]),
+            }
+        );
+
+        let body = crate::dispatch::build_request(&command)
+            .expect("assignment selection dispatches")
+            .body_json;
+
+        assert!(body.contains(r#""assignments":["asg_a","asg_b"]"#), "got {body}");
+
+        for absent in [
+            "origin", "owner", "state", "quietOver", "spec", "specSha", "session",
+        ] {
+            assert!(
+                !body.contains(&format!("\"{absent}\"")),
+                "assignment mode must send no roster filter, found {absent} in {body}"
+            );
+        }
+    }
+
+    // --under keeps its filters: the fix narrows assignment mode ONLY.
+    #[test]
+    fn under_selection_still_carries_roster_filters() {
+        let command = parse(strings(&[
+            "topline",
+            "--under",
+            "wi_abc",
+            "--state",
+            "closed",
+            "--origin",
+            "user",
+            "--as-user",
+            "flynn",
+        ]))
+        .expect("--under with filters parses");
+
+        match &command {
+            Command::Topline {
+                selection: ToplineSelection::Under { filters, .. },
+                ..
+            } => {
+                assert_eq!(filters.state.as_deref(), Some("closed"));
+                assert_eq!(filters.origin.as_deref(), Some("user"));
+            }
+            other => panic!("expected --under selection, got {other:?}"),
+        }
+
+        let body = crate::dispatch::build_request(&command)
+            .expect("under selection dispatches")
+            .body_json;
+
+        assert!(body.contains(r#""under":"wi_abc""#), "got {body}");
+        assert!(body.contains(r#""state":"closed""#), "got {body}");
     }
 
     #[test]

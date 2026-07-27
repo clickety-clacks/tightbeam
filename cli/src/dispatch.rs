@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::args::{Command, Identity, Target};
+use crate::args::{Command, Identity, Target, ToplineSelection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
@@ -380,30 +380,39 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "toplines", vec![], params))
         }
+        // Every selector travels as an ordinary body PARAM: both verbs are declared
+        // non-target at the router, and --session is a COHORT FILTER over creator
+        // identity, not a target to resolve.
+        //
+        // The two arms are separate because assignment selection has NO filters to
+        // send — `filter_params` is unreachable from it, so nothing can leak a
+        // filter the reader would then ignore.
         Command::Topline {
             identity,
-            under,
-            assignments,
-            filters,
+            selection: ToplineSelection::Under {
+                work_item_id,
+                filters,
+            },
         } => {
-            // Every selector travels as an ordinary body PARAM: both verbs are
-            // declared non-target at the router, and --session here is a COHORT
-            // FILTER over creator identity, not a target to resolve.
             let mut params = filter_params(filters);
-            if let Some(under) = under {
-                params.push(string_field("under", under));
-            }
-            if let Some(ids) = assignments {
-                let list = ids
-                    .iter()
-                    .map(|id| serde_json::Value::String(id.clone()))
-                    .collect::<Vec<_>>();
-                params.push(format!(
-                    "\"assignments\":{}",
-                    serde_json::Value::Array(list)
-                ));
-            }
+            params.push(string_field("under", work_item_id));
             Ok(request(identity, "topline", vec![], params))
+        }
+        Command::Topline {
+            identity,
+            selection: ToplineSelection::Assignments(ids),
+        } => {
+            let list = ids
+                .iter()
+                .map(|id| serde_json::Value::String(id.clone()))
+                .collect::<Vec<_>>();
+
+            Ok(request(
+                identity,
+                "topline",
+                vec![],
+                vec![format!("\"assignments\":{}", serde_json::Value::Array(list))],
+            ))
         }
         Command::WorkItemIcebox {
             identity,
