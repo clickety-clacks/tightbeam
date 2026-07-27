@@ -171,7 +171,13 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     let _ = io::stderr().write_all(&stderr);
 
     if !stdin_delivered {
-        eprintln!("tightbeam rail-exec child exit: 1");
+        // The script never received the call it was supposed to judge, so whatever it
+        // exited with is not a verdict on anything. This used to print the child-exit
+        // line the substrate parses, with a made-up `1` in it — on this side of the
+        // seam, where the substrate has no way to disagree. Say what happened instead;
+        // the line the substrate parses is now only ever written when a child exit was
+        // actually observed, and its absence classifies as unreported.
+        eprintln!("rail-exec: script input undelivered; no child verdict");
         return SCRIPT_ERROR;
     }
 
@@ -289,6 +295,28 @@ mod tests {
                 script: check,
             },
             b"{}\n".to_vec(),
+        );
+        assert_eq!(status, SCRIPT_ERROR);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A script that exits without reading makes the stdin write fail once the pipe
+    // buffer fills, so the check judged nothing. The band is right and always was; what
+    // this pins is that the path is reachable at all, since the stderr half of the same
+    // fix — no fabricated child-exit line — is asserted end to end in
+    // `rail_exec_undelivered_stdin.rs`, where the real binary's real bytes cross the
+    // seam the substrate parses.
+    #[test]
+    fn undelivered_stdin_has_the_script_error_band() {
+        let dir = temp_dir();
+        let check = script(&dir, "ignores-stdin", "exit 0");
+        let status = run_with_input(
+            RailExecArgs {
+                profile: permissive_profile(),
+                timeout: Duration::from_secs(5),
+                script: check,
+            },
+            vec![b'x'; 512 * 1024],
         );
         assert_eq!(status, SCRIPT_ERROR);
         fs::remove_dir_all(dir).unwrap();

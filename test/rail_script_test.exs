@@ -154,13 +154,18 @@ defmodule Tightbeam.RailScriptTest do
              )
   end
 
+  # This test used to assert `"timeout"` here — the SAME pair the fixture wrapper returns
+  # when it genuinely times out — which is what locked the two origins together in the
+  # record. Same subject, and now the proof they are distinguishable: the reason is
+  # identical because both really are timeouts, and the class differs because only one of
+  # them was reported by the wrapper (task #43).
   test "BEAM backstop closes a wrapper that outlives its timeout", ctx do
     wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
     File.write!(wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
     File.chmod!(wrapper, 0o755)
     started = System.monotonic_time(:millisecond)
 
-    assert {:error, "script_timeout", "timeout"} =
+    assert {:error, "script_timeout", "unreported"} =
              RailScript.run(
                ctx.db,
                ctx.base_dir,
@@ -170,6 +175,169 @@ defmodule Tightbeam.RailScriptTest do
              )
 
     assert System.monotonic_time(:millisecond) - started < 2_500
+
+    # The wrapper-reported timeout, through the same call, for contrast.
+    File.cp!(Path.expand("fixtures/rail_exec/tightbeam", __DIR__), wrapper)
+    File.chmod!(wrapper, 0o755)
+
+    assert {:error, "script_timeout", "timeout"} =
+             RailScript.run(ctx.db, ctx.base_dir, rule("rail-timeout"), call(), nil)
+  end
+
+  # Every class other than this one asserts an observation: `returned`/`out-of-set` read
+  # the wrapper's stdout, `error:<N>` carries a child code parsed off wrapper stderr,
+  # `timeout` means the wrapper's own timer elapsed, `contained` means the sandbox refused
+  # to apply. Each of the paths below reaches a deny WITHOUT the observation, and each
+  # used to record the value the observation would have carried — so a fabricated
+  # `error:1` was byte-identical to a script that really did exit 1, and the invariant
+  # "every failure names itself" could not be checked by anything (task #43).
+  #
+  # The `reason` column is deliberately unchanged from what each path recorded before.
+  test "a deny reached without an observation is classed unreported, not fabricated", ctx do
+    # Wrapper exit 10 promises the child's code on its stderr; here there is none.
+    wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+    File.write!(wrapper, "#!/bin/sh\nIFS= read -r _input\nexit 10\n")
+    File.chmod!(wrapper, 0o755)
+
+    assert {:error, "script_error", "unreported"} =
+             RailScript.run(ctx.db, ctx.base_dir, rule("rail-pass"), call(), nil)
+
+    # A substrate crash inside run/5 — a non-integer timeout raises in run_wrapper, which
+    # the rescue catches. No script was ever spawned.
+    assert {:error, "script_error", "unreported"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               put_in(rule("rail-pass").check.timeout_ms, :not_an_integer),
+               call(),
+               nil
+             )
+
+    # The holder named by the assignment does not exist, so invocation_context refuses
+    # before any script runs.
+    assert {:error, "script_error", "unreported"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               rule("rail-pass"),
+               call(),
+               %{holder_key: "no-such-holder"}
+             )
+
+    # The collision this closes: a script that really exits 1 still reports its own code,
+    # and it is no longer the same string as any of the three above.
+    script = Path.join([ctx.base_dir, "identity", "rails", "scripts", "rail-exit-1"])
+    File.write!(script, "#!/bin/sh\nexit 1\n")
+    File.chmod!(script, 0o755)
+    File.cp!(Path.expand("fixtures/rail_exec/tightbeam", __DIR__), wrapper)
+    File.chmod!(wrapper, 0o755)
+
+    assert {:error, "script_error", "error:1"} =
+             RailScript.run(ctx.db, ctx.base_dir, rule("rail-exit-1"), call(), nil)
+
+    # All four are observable as separate rows carrying their own class.
+    classes =
+      EventLog.lifecycle_events(ctx.db)
+      |> Enum.filter(&(&1.kind == "rail_script"))
+      |> Enum.map(&JSON.decode!(&1.detail)["exit_class"])
+
+    assert classes == ~w(unreported unreported unreported error:1)
+  end
+
+  # The `catch` half of the same rescue, which takes exits and throws rather than raises.
+  # Reached in production when the DB process is down: `invocation_context` calls
+  # `Org.get`, which exits `:noproc`. Nothing was spawned and nothing was observed, and
+  # the row that would have recorded it cannot be written either — so the returned class
+  # is the only place this can be said (task #43).
+  test "a substrate exit is classed unreported, like a substrate raise", ctx do
+    stop_supervised!(Tightbeam.DB)
+
+    assert {:error, "script_error", "unreported"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               rule("rail-pass"),
+               call(),
+               %{holder_key: ctx.holder.session_key}
+             )
+  end
+
+  # The recorded duration cannot locate a `script_timeout` in either timeout window, so
+  # no timing rule can name the layer (task #38).
+  #
+  # `RailScript.run/5` measures with `System.monotonic_time` in the CALLING BEAM process
+  # (rail_script.ex:13 and :27), while the wrapper is an OS process that keeps running on
+  # its own clock. Starve the caller and the measurement inflates without bound. This runs
+  # the REAL Rust rail-exec against the REAL sleeping `rail-timeout` script (`sleep 30`)
+  # with a 2s budget, so the wrapper's own time-box is what ends the script — then
+  # suspends the caller across the backstop threshold. The measurement lands
+  # past `timeout_ms + 2_000`, which is where a naive reading would place the BEAM
+  # backstop. The `+2_000` gap at rail_script.ex:166 is fixed in the CODE; the MEASUREMENT
+  # is not, so the two windows overlap.
+  #
+  # Task #43 recorded the fact that DOES separate them, so this test now carries both
+  # halves: the duration still misleads, and the exit class still reads binary-enforced
+  # under exactly that inflation. A discriminator that survives the condition which broke
+  # the timing rule is the point — if someone rebuilds the layer claim on top of the
+  # duration, the second assertion here is what fails.
+  if File.exists?(@release_binary) do
+    test "starvation puts a real rail-exec timeout past the backstop threshold", ctx do
+      wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+      File.cp!(@release_binary, wrapper)
+      File.chmod!(wrapper, 0o755)
+
+      budget = 2_000
+
+      task =
+        Task.async(fn ->
+          RailScript.run(
+            ctx.db,
+            ctx.base_dir,
+            put_in(rule("rail-timeout").check.timeout_ms, budget),
+            call(),
+            nil
+          )
+        end)
+
+      # Suspend the measuring process while the wrapper is still alive, and stay suspended
+      # past budget + the 2_000ms backstop margin.
+      Process.sleep(100)
+      true = :erlang.suspend_process(task.pid)
+      Process.sleep(3_900)
+      :erlang.resume_process(task.pid)
+
+      assert {:error, "script_timeout", "timeout"} = Task.await(task, 30_000)
+
+      measured = Tightbeam.RailTimeoutEvidence.duration_ms(ctx.db)
+
+      assert measured >= budget + 2_000,
+             "expected the suspension to inflate the measurement past " <>
+               "#{budget + 2_000}ms, got #{measured}ms"
+
+      # The binary ran its timer to expiry and reported exit 20 — under a measurement
+      # that says otherwise. The class is what the wrapper reported, so it is unmoved.
+      assert Tightbeam.RailTimeoutEvidence.exit_class(ctx.db) == "timeout"
+
+      evidence =
+        Tightbeam.RailTimeoutEvidence.render(
+          {:deny, %{rule: "fixture-rail", reason: "script_timeout"}},
+          %{db: ctx.db, timeout_ms: budget}
+        )
+
+      # Named from the class, not from the numbers. A layer claim rebuilt on the
+      # duration would read the other way here, because the duration is past the
+      # backstop threshold on a run rail-exec genuinely enforced.
+      assert evidence =~ "layer: RAIL-EXEC BINARY (enforcement)"
+      assert evidence =~ "recorded exit class: timeout"
+      assert evidence =~ "measured duration : #{measured}ms"
+      assert evidence =~ "NOT the discriminator"
+      refute evidence =~ "BEAM BACKSTOP"
+    end
+  else
+    @tag :skip
+    test "starvation puts a real rail-exec timeout past the backstop threshold" do
+      flunk("real rail-exec binary missing: #{@release_binary}; cargo build --release in cli/")
+    end
   end
 
   test "runs at the holder workdir with scratch as its only rail write root", ctx do
@@ -234,7 +402,9 @@ defmodule Tightbeam.RailScriptTest do
 
     refute File.exists?(expected_workdir)
 
-    assert {:error, "script_error", "error:1"} =
+    # The class used to be `error:1` — a child exit for a child that was never spawned,
+    # and the same string a script that really exits 1 produces (task #43).
+    assert {:error, "script_error", "unreported"} =
              RailScript.run(
                ctx.db,
                ctx.base_dir,
@@ -501,10 +671,48 @@ defmodule Tightbeam.RailScriptTest do
 
       assert System.monotonic_time(:millisecond) - started < 1_000
     end
+
+    # The fabrication this closes lived on the WRAPPER's side of the seam: the substrate
+    # parses `tightbeam rail-exec child exit: <N>` off wrapper stderr and has no way to
+    # disagree with it, so a made-up line there was undetectable by construction. The
+    # `cli` suite asserts the binary's bytes; this asserts what the substrate ends up
+    # recording, with the real binary in the path (task #43).
+    test "a check whose input never arrived records unreported, not a child exit", ctx do
+      wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+      File.cp!(@release_binary, wrapper)
+      File.chmod!(wrapper, 0o755)
+
+      script = Path.join([ctx.base_dir, "identity", "rails", "scripts", "rail-ignores-stdin"])
+      File.write!(script, "#!/bin/sh\nexit 0\n")
+      File.chmod!(script, 0o755)
+
+      # Over the pipe buffer, so the write blocks until the unreading script exits and
+      # then fails. The script exits ZERO — `error:1` was false about the number AND
+      # about there having been a child failure at all.
+      oversized = call(%{work_item_id: String.duplicate("x", 512 * 1024)})
+
+      assert {:error, "script_error", "unreported"} =
+               RailScript.run(
+                 ctx.db,
+                 ctx.base_dir,
+                 put_in(rule("rail-ignores-stdin").check.timeout_ms, 5_000),
+                 oversized,
+                 nil
+               )
+
+      assert [%{kind: "rail_script", detail: detail}] = EventLog.lifecycle_events(ctx.db)
+      assert JSON.decode!(detail)["exit_class"] == "unreported"
+    end
   else
     @tag skip:
            "real rail-exec integration binary missing: #{@release_binary}; run cargo build --release in cli/"
     test "real Rust rail-exec matches BEAM framing for pass, deny, and escaped timeout" do
+      flunk("release binary is required when this test is enabled")
+    end
+
+    @tag skip:
+           "real rail-exec integration binary missing: #{@release_binary}; run cargo build --release in cli/"
+    test "a check whose input never arrived records unreported, not a child exit" do
       flunk("release binary is required when this test is enabled")
     end
   end
