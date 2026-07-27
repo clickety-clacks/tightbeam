@@ -658,6 +658,125 @@ defmodule Tightbeam.ProducersTest do
     end)
   end
 
+  # Task #45. A signal's only failure channel on Unix is the exit status, so these
+  # pin the three outcomes the cancel path must tell apart. Before the fix every one
+  # of them returned a bare `:ok` and the job was recorded cancelled regardless.
+  describe "producer kill verification" do
+    test "a verified live group is signalled and records nothing", ctx do
+      %{os_pid: os_pid, started: started} = spawn_leader("sleep 30")
+
+      assert :signalled = Producers.kill_process_group(ctx.db, "job-ok", os_pid, started)
+      assert kill_failures(ctx.db) == []
+      wait_until_gone(os_pid)
+    end
+
+    test "a pid whose start time changed is NOT signalled", ctx do
+      %{os_pid: os_pid, started: started} = spawn_leader("sleep 30")
+      stale = started <> " (stale)"
+
+      assert {:noop, why} = Producers.kill_process_group(ctx.db, "job-recycled", os_pid, stale)
+      assert why =~ "recycled"
+
+      # The refusal is the point: a pid we cannot match is somebody else's now, so
+      # it must still be running afterwards.
+      assert process_exists?(os_pid)
+      assert kill_failures(ctx.db) == []
+      System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+    end
+
+    test "an unverifiable live pid is refused AND recorded", ctx do
+      %{os_pid: os_pid} = spawn_leader("sleep 30")
+
+      assert {:failed, why} = Producers.kill_process_group(ctx.db, "job-blind", os_pid, nil)
+      assert why =~ "no captured start time"
+      assert process_exists?(os_pid)
+
+      assert [{"job-blind", detail}] = kill_failures(ctx.db)
+      assert detail =~ "no captured start time"
+      System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+    end
+
+    test "a nonzero kill exit is reported as failed and recorded", ctx do
+      # A non-leader child: `kill -TERM -<pid>` finds no process GROUP with that id,
+      # so the kernel refuses with a nonzero exit. Identity still verifies, which is
+      # what isolates the exit-status check from the identity check.
+      %{os_pid: leader} = spawn_leader("sleep 30 & sleep 30")
+      child = non_leader_child(leader)
+      started = process_started!(child)
+
+      assert {:failed, why} = Producers.kill_process_group(ctx.db, "job-exit", child, started)
+      assert why =~ "exited"
+
+      assert [{"job-exit", detail}] = kill_failures(ctx.db)
+      assert detail =~ "exited 1"
+      System.cmd("kill", ["-TERM", "-#{leader}"], stderr_to_stdout: true)
+    end
+
+    test "an already-dead pid is a no-op, not a failure", ctx do
+      %{os_pid: os_pid, started: started} = spawn_leader("true")
+      wait_until_gone(os_pid)
+
+      assert {:noop, why} = Producers.kill_process_group(ctx.db, "job-gone", os_pid, started)
+      assert why =~ "already gone"
+      assert kill_failures(ctx.db) == []
+    end
+  end
+
+  defp spawn_leader(command) do
+    shell = System.find_executable("sh")
+
+    port =
+      Port.open({:spawn_executable, shell}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        :hide,
+        {:args,
+         ["-c", "kill -STOP $$; exec \"$1\" -lc \"$2\"", "tightbeam-producer", shell, command]},
+        {:cd, System.tmp_dir!()}
+      ])
+
+    os_pid = port |> Port.info(:os_pid) |> elem(1)
+    started = process_started!(os_pid)
+    System.cmd("kill", ["-CONT", "-#{os_pid}"], stderr_to_stdout: true)
+    %{port: port, os_pid: os_pid, started: started}
+  end
+
+  defp process_started!(os_pid) do
+    {output, 0} =
+      System.cmd("ps", ["-o", "lstart=", "-p", Integer.to_string(os_pid)], stderr_to_stdout: true)
+
+    String.trim(output)
+  end
+
+  defp non_leader_child(leader) do
+    Enum.reduce_while(1..200, nil, fn _, _ ->
+      {out, _} =
+        System.cmd("ps", ["-o", "pid=", "-g", Integer.to_string(leader)], stderr_to_stdout: true)
+
+      out
+      |> String.split()
+      |> Enum.map(&String.to_integer/1)
+      |> Enum.reject(&(&1 == leader))
+      |> case do
+        [child | _] -> {:halt, child}
+        [] -> Process.sleep(10) && {:cont, nil}
+      end
+    end) || flunk("no non-leader child appeared in the producer group")
+  end
+
+  defp wait_until_gone(os_pid) do
+    Enum.reduce_while(1..300, nil, fn _, _ ->
+      if process_exists?(os_pid), do: Process.sleep(10) && {:cont, nil}, else: {:halt, :gone}
+    end)
+  end
+
+  defp kill_failures(db) do
+    EventLog.lifecycle_events(db)
+    |> Enum.filter(&(&1.kind == "producer_kill_failed"))
+    |> Enum.map(&{&1.subject, &1.detail})
+  end
+
   defp process_exists?(pid) do
     case System.cmd("ps", ["-p", Integer.to_string(pid), "-o", "pid="], stderr_to_stdout: true) do
       {output, 0} -> String.trim(output) != ""
