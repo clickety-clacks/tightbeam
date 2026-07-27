@@ -52,26 +52,82 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "credentials present"
   end
 
-  test "local adapter missing denies with the base_dir path, not a sibling checkout", ctx do
-    sandbox = Path.join(ctx.base_dir, "cwd")
-    File.mkdir_p!(sandbox)
+  # The gateway host used to be the only machine that could not supply its own adapters:
+  # it refused and told the operator to go install them by hand, on the host tightbeam
+  # was standing on. It provisions now, through the same mechanism the remote path uses
+  # and at the same pinned versions (#46).
+  test "local adapter missing provisions the pinned adapters into the host's base_dir", ctx do
+    adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
+    credential = Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+    File.mkdir_p!(Path.dirname(credential))
+    File.write!(credential, "test-token")
+    parent = self()
 
-    result =
-      File.cd!(sandbox, fn ->
-        Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "testhost", db: ctx.db)
-      end)
+    sh = fn command ->
+      send(parent, {:command, command})
+      # Stand in for npm by leaving the executable npm would leave — the local branch
+      # confirms the install with File.exists?, so a mock that reports success without
+      # producing the binary would prove the wrong thing.
+      File.mkdir_p!(Path.dirname(adapter))
+      File.write!(adapter, "#!/bin/sh\n")
+      File.chmod!(adapter, 0o755)
+      {"", 0}
+    end
 
-    expected = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
-    assert {:error, %{code: "host_unready", message: message}} = result
-    assert message =~ "adapter missing"
-    assert message =~ expected
+    assert :ok =
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "testhost",
+               db: ctx.db,
+               sh: sh,
+               patch_adapter: no_patch()
+             )
 
-    # The remedy names the host's own adapters directory. It used to send the
-    # operator to a sibling checkout of the retired TypeScript project (#46).
+    assert [["sh", "-c", script]] = receive_commands(1)
+
+    # Local means local: no ssh hop to reach the machine tightbeam is running on.
+    refute script =~ "ssh"
+    assert script =~ "npm install --prefix"
+    assert script =~ Path.join(ctx.base_dir, "adapters")
+
+    # Every harness at its pin, asserted per harness rather than by naming packages —
+    # a partial pin has to fail for the harness that lost it (#47).
+    for module <- Tightbeam.Harness.all() do
+      assert script =~ "#{module.install_package()}@#{module.adapter_version()}",
+             "#{module.wire_name()} is not installed at its pinned version"
+    end
+
+    assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
+    assert detail =~ "deployed adapters"
+  end
+
+  test "local adapter install failure names the npm remedy for this host", ctx do
+    sh = fn _command -> {"npm error code E404\nnot found", 1} end
+
+    assert {:error, %{code: "host_unready", message: message}} =
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "testhost",
+               db: ctx.db,
+               sh: sh
+             )
+
+    assert message =~ "adapter deployment failed"
+    assert message =~ "E404"
     assert message =~ Path.join(ctx.base_dir, "adapters")
-    refute message =~ "local Tightbeam checkout"
-    refute message =~ "src/tightbeam/node_modules"
-    assert [%{kind: "spinup", detail: "reached;" <> _}] = EventLog.lifecycle_events(ctx.db)
+    assert message =~ "on testhost"
+    assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
+    assert detail =~ "DENIED:"
+  end
+
+  test "local install that leaves no binary says so instead of proceeding", ctx do
+    adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
+    sh = fn _command -> {"", 0} end
+
+    assert {:error, %{code: "host_unready", message: message}} =
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "testhost",
+               db: ctx.db,
+               sh: sh
+             )
+
+    assert message =~ "adapter still missing at #{adapter} after deployment"
+    assert message =~ "reinstall the ACP adapters on testhost"
   end
 
   test "local directory setup failure names the permissions remedy", ctx do

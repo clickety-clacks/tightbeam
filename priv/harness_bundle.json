@@ -72,7 +72,7 @@
         "remote_present",
         "remote_absent"
       ],
-      "oracle": "local absence refusal, remote install contribution string, patched fake-bundle bytes, and preserved bundle mode equal the vector's expected form"
+      "oracle": "local absence installation, local and remote install contribution strings, patched fake-bundle bytes, and preserved bundle mode equal the vector's expected form"
     },
     "session_config": {
       "required_cases": [
