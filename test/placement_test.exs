@@ -490,6 +490,33 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(stage)
   end
 
+  # #46: the local adapter must resolve under the host's OWN base_dir for EVERY
+  # harness. This existed only for codex, so restoring claude's sibling-checkout
+  # path passed the whole suite — the exact regression the ticket is about.
+  test "every harness resolves its local adapter under base_dir, never a sibling checkout",
+       %{base_dir: base_dir} do
+    config = %{base_dir: base_dir, cwd: "/work", cli_bin: Path.join(base_dir, "bin")}
+
+    for module <- Tightbeam.Harness.all() do
+      opts = Placement.adapter_opts(config, {module.id(), "shared", "testhost"})
+      binary = hd(opts[:cmd])
+
+      assert String.ends_with?(
+               binary,
+               Path.join(["adapters", "node_modules", ".bin", Path.basename(binary)])
+             ),
+             "#{module.wire_name()} local adapter is not under <base_dir>/adapters: #{binary}"
+
+      # The base_dir's unique final segment, rather than a prefix compare: macOS
+      # resolves /var through /private and the two sides disagree on which form.
+      assert String.contains?(binary, Path.basename(base_dir)),
+             "#{module.wire_name()} local adapter is not inside this org's base_dir: #{binary}"
+
+      refute binary =~ "src/tightbeam/node_modules",
+             "#{module.wire_name()} still resolves to the retired sibling checkout: #{binary}"
+    end
+  end
+
   test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir} do
     parent = self()
 
@@ -506,7 +533,10 @@ defmodule Tightbeam.PlacementTest do
 
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
-    expected_binary = Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
+    # The adapter lives under the host's OWN base_dir, not a sibling checkout (#46).
+    expected_binary =
+      Path.join([base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
+
     expected_home = Path.join([base_dir, "homes", "testhost", "codex"])
 
     assert opts[:harness] == :codex
@@ -711,7 +741,10 @@ defmodule Tightbeam.PlacementTest do
 
     assert ["/usr/bin/sandbox-exec", "-p", profile, binary] = opts[:cmd]
 
-    assert binary == Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
+    # Under the host's OWN base_dir, not a sibling checkout (#46). Compared by
+    # suffix plus a realpath'd prefix because macOS resolves /var via /private.
+    assert String.ends_with?(binary, "adapters/node_modules/.bin/codex-acp")
+    assert String.starts_with?(binary, File.cd!(base_dir, &File.cwd!/0))
 
     work_root = Path.join(canonical_base, "work")
     home = Path.join([canonical_base, "homes", "testhost", "codex"])

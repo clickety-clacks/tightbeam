@@ -381,7 +381,7 @@ defmodule Tightbeam.Harness.Support do
            code: "host_unready",
            message:
              "host vector is not ready for #{profile.wire_name}: adapter missing at #{adapter} " <>
-               "(install the ACP adapters in the local Tightbeam checkout)"
+               "(install the ACP adapters into <BASE>/adapters on vector)"
          }},
       install_contribution: "",
       bundle: profile.source,
@@ -837,10 +837,10 @@ defmodule Tightbeam.Harness.Support do
   defp vector(case_name, expected, input, support \\ :supported),
     do: %{case: case_name, expected: expected, input: input, support: support}
 
-  defp adapter_path(base, adapter_bin, :local),
-    do: Path.join([base, "node_modules", ".bin", adapter_bin])
-
-  defp adapter_path(base, adapter_bin, :remote),
+  # One shape for both localities (#46): the adapter lives under the host's own
+  # base_dir. Local used to resolve to a sibling checkout of the retired
+  # TypeScript project, which is the coupling this removed.
+  defp adapter_path(base, adapter_bin, _locality),
     do: Path.join([base, "adapters", "node_modules", ".bin", adapter_bin])
 
   defp install_fake_adapter!(adapter, profile) do

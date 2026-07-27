@@ -528,18 +528,18 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   defp adapter_binary(target) do
+    # One path for both localities, as fixture.ex already does: the adapter lives
+    # under the host's own base_dir. The local branch used to point at a sibling
+    # checkout of the RETIRED TypeScript project, so the gateway's turn path
+    # depended on a directory nothing in this repo owns or installs.
     Map.get(target, :adapter_binary) ||
-      if Support.local?(target) do
-        Path.expand("../tightbeam/node_modules/.bin/codex-acp", File.cwd!())
-      else
-        Path.join([
-          target.host_config.base_dir,
-          "adapters",
-          "node_modules",
-          ".bin",
-          "codex-acp"
-        ])
-      end
+      Path.join([
+        target.host_config.base_dir,
+        "adapters",
+        "node_modules",
+        ".bin",
+        "codex-acp"
+      ])
   end
 
   defp patch_remote(target, path, detail) do
