@@ -329,6 +329,15 @@ defmodule Tightbeam.Harness.Support do
             Process.put({ref, :checks}, checks + 1)
             if presence == :absent and checks == 0, do: {"", 1}, else: {"", 0}
 
+          String.contains?(joined, "npm install") ->
+            # npm's whole job here is to leave an executable at the adapter path, and the
+            # local branch confirms it with File.exists? rather than a shelled test. A
+            # mock that returns 0 without producing the artifact would make the local
+            # install look like it had failed, so the stand-in produces it.
+            File.write!(adapter, "#!/bin/sh\n")
+            File.chmod!(adapter, 0o755)
+            {"", 0}
+
           true ->
             {"", 0}
         end
@@ -371,56 +380,47 @@ defmodule Tightbeam.Harness.Support do
     end)
   end
 
-  defp expected_adapter(profile, :local, :absent) do
-    adapter = adapter_path("<BASE>", profile.adapter_bin, :local)
-
-    %{
-      result:
-        {:error,
-         %{
-           code: "host_unready",
-           message:
-             "host vector is not ready for #{profile.wire_name}: adapter missing at #{adapter} " <>
-               "(install the ACP adapters into <BASE>/adapters on vector)"
-         }},
-      install_contribution: "",
-      bundle: profile.source,
-      mode: 0o751
-    }
-  end
-
   defp expected_adapter(profile, locality, presence) do
     detail =
       case {locality, presence} do
         {:local, :present} -> "adapters present"
+        {:local, :absent} -> "deployed adapters"
         {:remote, :present} -> "adapters present" <> profile.remote_patch_detail
         {:remote, :absent} -> "deployed adapters" <> profile.remote_patch_detail
       end
 
-    install =
-      if locality == :remote and presence == :absent do
-        packages =
-          Enum.map_join(
-            Tightbeam.Harness.all(),
-            " ",
-            &"#{&1.install_package()}@#{&1.adapter_version()}"
-          )
-
-        script = "npm install --prefix '<BASE>/adapters' " <> packages
-
-        (["ssh" | ssh_opts()] ++
-           ["vector@remote", "sh", "-c", shell_quote(script)])
-        |> Enum.join(" ")
-      else
-        ""
-      end
-
     %{
       result: {:ok, detail},
-      install_contribution: install,
+      install_contribution: expected_install_contribution(locality, presence),
       bundle: profile.patched,
       mode: 0o751
     }
+  end
+
+  # An absent adapter is provisioned on BOTH localities: the gateway host is no longer
+  # the one machine that cannot supply its own. The two contribution strings differ only
+  # in how the command reaches the host, which is the point — the script, and with it the
+  # pinned package set, is shared.
+  defp expected_install_contribution(_locality, :present), do: ""
+
+  defp expected_install_contribution(locality, :absent) do
+    packages =
+      Enum.map_join(
+        Tightbeam.Harness.all(),
+        " ",
+        &"#{&1.install_package()}@#{&1.adapter_version()}"
+      )
+
+    script = "npm install --prefix '<BASE>/adapters' " <> packages
+
+    case locality do
+      :local ->
+        Enum.join(["sh", "-c", script], " ")
+
+      :remote ->
+        (["ssh" | ssh_opts()] ++ ["vector@remote", "sh", "-c", shell_quote(script)])
+        |> Enum.join(" ")
+    end
   end
 
   defp session_config_vectors(_module, profile) do

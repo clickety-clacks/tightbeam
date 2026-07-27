@@ -53,19 +53,7 @@ defmodule Tightbeam.Spinup do
         target.patch_adapter.(path)
         {:ok, "adapters present"}
       else
-        # STOPPED SHORT OF SELF-PROVISIONING (#46): priv/harness_bundle.json
-        # declares vector_contract.ensure_adapter with the oracle "local absence
-        # refusal" and a required `local_absent` case, so installing here would
-        # contradict a manifest-declared parity contract. That needs an amendment,
-        # not a lane decision. What IS fixed is the path: the adapter is looked for
-        # under this host's OWN base_dir, not a sibling checkout of the retired
-        # TypeScript project, and the remedy now names the directory that matters.
-        message =
-          "host #{target.host_name} is not ready for #{module.wire_name()}: adapter missing at #{path} " <>
-            "(install the ACP adapters into #{Path.join(target.host_config.base_dir, "adapters")} " <>
-            "on #{target.host_name})"
-
-        {:error, host_unready(message)}
+        provision_adapter(target, module, path, :local)
       end
     else
       check = remote_command(target.host_config.ssh, "test -x #{shell_quote(path)}")
@@ -75,50 +63,80 @@ defmodule Tightbeam.Spinup do
           target.remote_patch.(path, "adapters present")
 
         {_output, _exit} ->
-          install_dir = Path.join(target.host_config.base_dir, "adapters")
-
-          # `name@version`, not a bare name: npm resolves a bare name to LATEST, so
-          # every provision pulled whatever was published that day while
-          # @adapter_version documented a pin nothing enforced. Measured before this
-          # change, BOTH adapters had drifted past their pins. The patch anchors and
-          # the local patcher's exact-version assertion are written against the
-          # pinned release, so the install has to land that release — an unpinned
-          # tree makes the patcher raise. Versions stay in the harness modules; this
-          # seam only asks each of them for its own.
-          packages =
-            Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
-
-          install =
-            "npm install --prefix #{shell_quote(install_dir)} " <> packages
-
-          case target.sh.(remote_command(target.host_config.ssh, install)) do
-            {_output, 0} ->
-              case target.sh.(check) do
-                {_output, 0} ->
-                  target.remote_patch.(path, "deployed adapters")
-
-                {output, _exit} ->
-                  {:error,
-                   host_unready(
-                     "host #{target.host_name} is not ready for #{module.wire_name()}: adapter still missing at #{path} after deployment: #{String.trim(output)}" <>
-                       " (reinstall the ACP adapters on #{target.host_name}, then verify the ACP adapter installation on #{target.host_name} produced an executable at #{path})"
-                   )}
-              end
-
-            {output, _exit} ->
-              {:error,
-               host_unready(
-                 "host #{target.host_name} is not ready for #{module.wire_name()}: adapter deployment failed: #{String.trim(output)}" <>
-                   " " <>
-                   adapter_deployment_remedy(
-                     output,
-                     install_dir,
-                     target.host_name
-                   )
-               )}
-          end
+          provision_adapter(target, module, path, {:remote, check})
       end
     end
+  end
+
+  # One provisioning mechanism for both localities. The gateway host used to be the only
+  # machine that could not supply its own adapters — it refused and told the operator to
+  # go install them by hand, on the host tightbeam is standing on. The asymmetry made
+  # sense while "local" meant a developer's clone, whose node_modules belong to the
+  # developer; it stopped making sense the moment tightbeam became something installed
+  # on a machine with a bare base_dir, which is every production host.
+  #
+  # The two localities differ in exactly two places: how a command reaches the host, and
+  # how presence is observed. Everything downstream — the pinned package set, the
+  # re-check after installing, the failure remedies — is shared, so a fix to either one
+  # cannot drift to only one side.
+  defp provision_adapter(target, module, path, locality) do
+    install_dir = Path.join(target.host_config.base_dir, "adapters")
+    command = install_command(target, install_dir, locality)
+
+    case target.sh.(command) do
+      {_output, 0} ->
+        confirm_adapter(target, module, path, locality)
+
+      {output, _exit} ->
+        {:error,
+         host_unready(
+           "host #{target.host_name} is not ready for #{module.wire_name()}: adapter deployment failed: #{String.trim(output)}" <>
+             " " <> adapter_deployment_remedy(output, install_dir, target.host_name)
+         )}
+    end
+  end
+
+  # `name@version`, not a bare name: npm resolves a bare name to LATEST, so every
+  # provision pulled whatever was published that day while @adapter_version documented a
+  # pin nothing enforced. Measured before that change, BOTH adapters had drifted past
+  # their pins. The patch anchors and the local patcher's exact-version assertion are
+  # written against the pinned release, so the install has to land that release — an
+  # unpinned tree makes the patcher raise. Versions stay in the harness modules; this
+  # seam only asks each of them for its own.
+  defp install_command(target, install_dir, locality) do
+    packages =
+      Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
+
+    script = "npm install --prefix #{shell_quote(install_dir)} " <> packages
+
+    case locality do
+      :local -> ["sh", "-c", script]
+      {:remote, _check} -> remote_command(target.host_config.ssh, script)
+    end
+  end
+
+  defp confirm_adapter(target, module, path, :local) do
+    if File.exists?(path) do
+      target.patch_adapter.(path)
+      {:ok, "deployed adapters"}
+    else
+      {:error, host_unready(still_missing(target, module, path, ""))}
+    end
+  end
+
+  defp confirm_adapter(target, module, path, {:remote, check}) do
+    case target.sh.(check) do
+      {_output, 0} ->
+        target.remote_patch.(path, "deployed adapters")
+
+      {output, _exit} ->
+        {:error, host_unready(still_missing(target, module, path, String.trim(output)))}
+    end
+  end
+
+  defp still_missing(target, module, path, output) do
+    "host #{target.host_name} is not ready for #{module.wire_name()}: adapter still missing at #{path} after deployment: #{output}" <>
+      " (reinstall the ACP adapters on #{target.host_name}, then verify the ACP adapter installation on #{target.host_name} produced an executable at #{path})"
   end
 
   defp ensure_host(target, module) do
