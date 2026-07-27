@@ -122,7 +122,9 @@ defmodule Tightbeam.Toplines do
   end
 
   defp children_index(world) do
-    Enum.group_by(world.linked, fn {_child, parent} -> parent end, fn {child, _parent} -> child end)
+    Enum.group_by(world.linked, fn {_child, parent} -> parent end, fn {child, _parent} ->
+      child
+    end)
   end
 
   ## --assignments — explicit selection, all-or-nothing on unknown/invisible
@@ -371,7 +373,11 @@ defmodule Tightbeam.Toplines do
   # EVER held, closed assignments included — a history count, not a
   # current-holder count.
   defp jobs(world, set) do
-    world.assignments_by_id |> rows_for(set) |> Enum.map(& &1.holder_key) |> Enum.uniq() |> length()
+    world.assignments_by_id
+    |> rows_for(set)
+    |> Enum.map(& &1.holder_key)
+    |> Enum.uniq()
+    |> length()
   end
 
   # Verdict slugs are shape-validated only; there is no durable

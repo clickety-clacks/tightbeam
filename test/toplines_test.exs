@@ -174,6 +174,7 @@ defmodule Tightbeam.ToplinesTest do
     assert node(response, "wi_root").creation_context == %{recorded: true, turn_seq: nil}
     assert node(response, "wi_unrecorded").creation_context == %{recorded: false, turn_seq: nil}
     assert response.edge_basis == "concurrent_turn"
+
     assert Enum.all?(response.items, &(Enum.sort(Map.keys(&1.parent)) == [:item, :status])),
            "the parent block carries the status and the item and nothing else"
   end
@@ -188,7 +189,12 @@ defmodule Tightbeam.ToplinesTest do
 
     # Carrier 1 — a bracket nag carries the work-item id with NO assignment.
     turn!(ctx.db, 20, "s_lane", job_ref: "wi_bracket_parent", assignment_id: nil)
-    item!(ctx.db, "wi_child_job_ref", created_at: at(3), context_known: 1, created_in_turn_seq: 20)
+
+    item!(ctx.db, "wi_child_job_ref",
+      created_at: at(3),
+      context_known: 1,
+      created_in_turn_seq: 20
+    )
 
     # Carrier 2 — an assignment-only turn whose assignment resolves TRANSITIVELY
     # through a NULL-workItemId review assignment.
@@ -343,7 +349,13 @@ defmodule Tightbeam.ToplinesTest do
     assert Assignments.resolved_work_item_id(ctx.db, "asg_r") == "wi_B"
 
     attest!(ctx.db, "att_r", "asg_r", by_session: "s_holder_r", ts: 3_000_000)
-    turn!(ctx.db, 60, "s_holder_r", assignment_id: "asg_r", job_ref: nil, model: "m-r", harness: "claude")
+
+    turn!(ctx.db, 60, "s_holder_r",
+      assignment_id: "asg_r",
+      job_ref: nil,
+      model: "m-r",
+      harness: "claude"
+    )
 
     # A child created during that assignment-only turn: derivation must resolve B.
     item!(ctx.db, "wi_child", created_at: at(5), context_known: 1, created_in_turn_seq: 60)
@@ -369,7 +381,12 @@ defmodule Tightbeam.ToplinesTest do
            "edge derivation uses the same resolution rule the turn union does"
 
     # An ORDINARY null-pin review still follows its chain.
-    assignment!(ctx.db, "asg_plain_review", work_item_id: nil, reviews: "asg_a", holder: "s_holder_r")
+    assignment!(ctx.db, "asg_plain_review",
+      work_item_id: nil,
+      reviews: "asg_a",
+      holder: "s_holder_r"
+    )
+
     assert Assignments.resolved_work_item_id(ctx.db, "asg_plain_review") == "wi_A"
     assert node(roster(ctx), "wi_A").assignments.open == 2
 
@@ -399,7 +416,8 @@ defmodule Tightbeam.ToplinesTest do
 
   ## Proof 7 — the turn union, from both arms, deduped by seq
 
-  test "proof 7: a bracket nag, a review turn and a both-keys turn each count exactly once", ctx do
+  test "proof 7: a bracket nag, a review turn and a both-keys turn each count exactly once",
+       ctx do
     session!(ctx.db, "s_holder", "flynn")
     item!(ctx.db, "wi_union")
     assignment!(ctx.db, "asg_union", work_item_id: "wi_union", holder: "s_holder")
@@ -408,6 +426,7 @@ defmodule Tightbeam.ToplinesTest do
     # assignment and NO jobRef; either arm alone undercounts.
     turn!(ctx.db, 70, "s_holder", job_ref: "wi_union", assignment_id: nil, ended_at: 3_100_000)
     turn!(ctx.db, 71, "s_holder", job_ref: nil, assignment_id: "asg_union", ended_at: 3_200_000)
+
     turn!(ctx.db, 72, "s_holder",
       job_ref: "wi_union",
       assignment_id: "asg_union",
@@ -456,6 +475,7 @@ defmodule Tightbeam.ToplinesTest do
     # And the match is on the CURRENT terminal state even when a later,
     # non-matching transition exists after the matching one.
     disposition!(ctx.db, "wi_cycle", from: "closed", to: "iceboxed")
+
     assert node(roster(ctx), "wi_cycle").finished_at ==
              disposition_at(ctx.db, "wi_cycle", "closed")
 
@@ -609,6 +629,7 @@ defmodule Tightbeam.ToplinesTest do
     assert old.creation_context == %{recorded: false, turn_seq: nil}
 
     turn!(ctx.db, 90, "s_holder", job_ref: "wi_old")
+
     item!(ctx.db, "wi_old_known",
       created_at: @cutoff - 2,
       context_known: 1,
@@ -627,7 +648,14 @@ defmodule Tightbeam.ToplinesTest do
     session!(ctx.db, "s_lane", "flynn")
     item!(ctx.db, "wi_parent", created_at: at(1), state: "open")
     turn!(ctx.db, 100, "s_lane", job_ref: "wi_parent")
-    item!(ctx.db, "wi_kid", created_at: at(2), state: "closed", context_known: 1, created_in_turn_seq: 100)
+
+    item!(ctx.db, "wi_kid",
+      created_at: at(2),
+      state: "closed",
+      context_known: 1,
+      created_in_turn_seq: 100
+    )
+
     # Two more closed siblings with an equal createdAt, to pin the tiebreak.
     item!(ctx.db, "wi_zz", created_at: at(3), state: "closed")
     item!(ctx.db, "wi_aa", created_at: at(3), state: "closed")
@@ -639,7 +667,8 @@ defmodule Tightbeam.ToplinesTest do
           :under -> read(ctx, :topline, %{under: "wi_parent", state: "closed"})
         end
 
-      assert root_ids(response) == ["wi_kid"] or root_ids(response) == ["wi_kid", "wi_aa", "wi_zz"],
+      assert root_ids(response) == ["wi_kid"] or
+               root_ids(response) == ["wi_kid", "wi_aa", "wi_zz"],
              "#{kind} roots were #{inspect(root_ids(response))}"
 
       kid = Enum.find(response.roots, &(&1.id == "wi_kid"))
@@ -712,7 +741,8 @@ defmodule Tightbeam.ToplinesTest do
 
   ## Proof 13 — deterministic order under every filter combination
 
-  test "proof 13: roster order is createdAt ASC then id ASC under every filter combination", ctx do
+  test "proof 13: roster order is createdAt ASC then id ASC under every filter combination",
+       ctx do
     session!(ctx.db, "s_creator", "flynn")
 
     # Equal createdAt across three ids forces the id tiebreak to do the work.
@@ -819,7 +849,9 @@ defmodule Tightbeam.ToplinesTest do
     refusals =
       for verb <- ["toplines", "topline"],
           key <- ["s_real", "s_does_not_exist"] do
-        response = post_dispatch(opts, %{verb: verb, asUser: "flynn", sessionKey: key, params: %{}})
+        response =
+          post_dispatch(opts, %{verb: verb, asUser: "flynn", sessionKey: key, params: %{}})
+
         assert response.status == 400
         {verb, JSON.decode!(response.resp_body)}
       end
@@ -827,7 +859,15 @@ defmodule Tightbeam.ToplinesTest do
     for verb <- ["toplines", "topline"] do
       bodies = for {^verb, body} <- refusals, do: body
       assert length(bodies) == 2
-      assert Enum.uniq(bodies) == [%{"error" => %{"code" => "invalid_message", "message" => "#{verb} takes no typed target"}}]
+
+      assert Enum.uniq(bodies) == [
+               %{
+                 "error" => %{
+                   "code" => "invalid_message",
+                   "message" => "#{verb} takes no typed target"
+                 }
+               }
+             ]
     end
   end
 
@@ -901,7 +941,12 @@ defmodule Tightbeam.ToplinesTest do
     # A conversational-turn child, the block the invisible-parent case must be
     # indistinguishable from.
     turn!(db, 201, "s_lane", job_ref: nil, assignment_id: nil)
-    item!(db, "wi_conversational_child", created_at: at(3), context_known: 1, created_in_turn_seq: 201)
+
+    item!(db, "wi_conversational_child",
+      created_at: at(3),
+      context_known: 1,
+      created_in_turn_seq: 201
+    )
 
     if invisible? do
       item!(db, "wi_theirs", owner: "kay", created_at: at(4))
@@ -928,7 +973,11 @@ defmodule Tightbeam.ToplinesTest do
       turn!(db, 203, "s_lane", job_ref: nil)
     end
 
-    item!(db, "wi_hidden_parent_child", created_at: at(5), context_known: 1, created_in_turn_seq: 203)
+    item!(db, "wi_hidden_parent_child",
+      created_at: at(5),
+      context_known: 1,
+      created_in_turn_seq: 203
+    )
   end
 
   ## Helpers — direct row fixtures
