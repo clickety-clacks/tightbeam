@@ -18,6 +18,8 @@ defmodule Tightbeam.Application do
 
   use Application
 
+  require Logger
+
   @impl true
   def start(_type, _args) do
     if Application.get_env(:tightbeam, :autostart, true) do
@@ -29,12 +31,41 @@ defmodule Tightbeam.Application do
           {:ok, _pid} = Supervisor.start_child(supervisor, child)
         end)
 
+        # LAST, deliberately: Bandit's "Running ... (http)" has already been
+        # logged by now, and that line reads as a verdict. On an org that cannot
+        # run a single turn it was the wrong one, so the real verdict goes after
+        # it. Assembled from what boot already knows; it starts nothing and
+        # cannot fail the boot.
+        report_readiness(config)
+
         {:ok, supervisor}
       end
     else
       # Test env: unit tests own their supervision; boot the tree explicitly.
       Supervisor.start_link([], strategy: :one_for_one, name: Tightbeam.Supervisor)
     end
+  end
+
+  # Never allowed to break a boot that would otherwise have succeeded: this is a
+  # message, and a message that crashes the thing it describes is worse than no
+  # message. Failing to SAY the gateway is unready must not itself make it so.
+  defp report_readiness(config) do
+    # ASYNC on purpose. The catalog refresh boot kicked off is still in flight at
+    # this instant, so reading now would report `unknown` on every healthy start.
+    # Waiting for a refresh already running is not a new probe, and boot does not
+    # wait for us: start/2 has already returned.
+    Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+      Tightbeam.Readiness.await_settled()
+
+      config
+      |> Tightbeam.Readiness.summary()
+      |> Tightbeam.Readiness.render(config)
+      |> Enum.each(&Logger.info/1)
+    end)
+  rescue
+    error -> Logger.warning("readiness summary unavailable: #{Exception.message(error)}")
+  catch
+    kind, reason -> Logger.warning("readiness summary unavailable: #{inspect({kind, reason})}")
   end
 
   @doc "The production child list (also started manually by the app test)."
