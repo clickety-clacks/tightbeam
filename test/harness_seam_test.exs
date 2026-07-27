@@ -126,4 +126,37 @@ defmodule Tightbeam.HarnessSeamTest do
                cd: scan_root
              )
   end
+
+  # Task #41 (Flynn: "hard code it and leave a note"). The claude adapter accepts a
+  # NARROWER model vocabulary than the derived catalog, and every substitution for a
+  # refused model is a silent downgrade — `claude-opus-5` -> `opus` delivers Opus 4.8,
+  # and `claude-fable-5` has no equivalent at all. This pins the recorded table AND the
+  # rule that no substitution is smuggled in later: a request the adapter refuses must
+  # fail, not quietly become a different model.
+  test "the recorded claude model vocabulary never substitutes a refused model" do
+    selectable = Tightbeam.Harness.Claude.adapter_selectable_models()
+
+    # Recorded live 2026-07-26 (claude CLI 2.1.220 / claude-agent-acp 0.59.0):
+    # the four aliases plus exactly the three ids those aliases resolve to.
+    assert Enum.sort(selectable) ==
+             Enum.sort(~w(default sonnet opus haiku claude-sonnet-5 claude-opus-4-8
+                          claude-haiku-4-5-20251001))
+
+    # Values the adapter REFUSES must never appear here — listing one would make the
+    # gateway offer a model the adapter cannot select.
+    for refused <- ~w(fable claude-fable-5 claude-opus-5 claude-opus-4-7 claude-sonnet-4-6
+                      claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
+                      claude-opus-4-1-20250805) do
+      refute refused in selectable,
+             "#{refused} is refused by claude-agent-acp 0.59.0 and must not be listed " <>
+               "as selectable; if a newer adapter accepts it, re-probe and update the " <>
+               "note in claude.ex together with the version stamp"
+    end
+
+    # The note is the load-bearing half — it must carry the version it was probed at.
+    source = File.read!(Path.join(File.cwd!(), "lib/tightbeam/harness/claude.ex"))
+    assert source =~ "claude CLI 2.1.220"
+    assert source =~ "claude-agent-acp 0.59.0"
+    assert source =~ "silent downgrade"
+  end
 end
