@@ -3,7 +3,7 @@
 # unit tests don't cover). Reads port+token from <base_dir>/gateway.json.
 #
 #   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
-#   TIGHTBEAM_SMOKE_MODEL_CLAUDE=fable \
+#   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5[medium]' \
 #   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol[medium]' \
 #   mix run --no-start scripts/feature_smoke.exs
 #

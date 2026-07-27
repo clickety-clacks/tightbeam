@@ -2955,7 +2955,9 @@ defmodule Tightbeam.Gateway do
         {:error,
          %{
            code: "model_unavailable",
-           message: "model #{inspect(model)} is not offered by #{harness}"
+           message:
+             "model #{inspect(model)} is not offered by #{harness}" <>
+               offered_models_hint(harness)
          }}
 
       %{health: {:unavailable, {:needs_onboarding, reason}}} ->
@@ -2986,6 +2988,19 @@ defmodule Tightbeam.Gateway do
       false ->
         warn_dead_default(harness, model, configured_default?)
         {:error, %{code: "model_unavailable", message: "model must be specified"}}
+    end
+  end
+
+  # A refusal that names only the rejected value makes the operator guess. The
+  # catalog is already in hand, so say what IS offered — harness-agnostic, and for
+  # claude it reflects the selectable filter rather than the raw API list.
+  defp offered_models_hint(harness) do
+    case ModelCatalog.get(harness, ModelCatalog) do
+      {[_ | _] = entries, _health} ->
+        "; offered: " <> (entries |> Enum.map(& &1.ref) |> Enum.sort() |> Enum.join(", "))
+
+      _ ->
+        ""
     end
   end
 
