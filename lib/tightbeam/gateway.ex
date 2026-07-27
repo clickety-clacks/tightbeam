@@ -1188,14 +1188,45 @@ defmodule Tightbeam.Gateway do
     if File.exists?(rust_cli) do
       File.cp!(rust_cli, wrapper)
     else
+      # The fallback points at the RETIRED TypeScript CLI in a sibling checkout.
+      # It used to be written silently, so on a machine without that checkout the
+      # operator got an executable `bin/tightbeam` that failed with a bare
+      # `node: no such file`, and on a machine WITH it they silently got a
+      # different implementation than the gateway that installed it. Boot then
+      # printed its ordinary success line either way.
+      #
+      # Installing the wrapper is unchanged; what changed is that it now says so.
       entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
-      File.write!(wrapper, "#!/bin/sh\nexec node \"#{entry}\" \"$@\"\n")
+
+      Logger.warning(
+        "tightbeam CLI not built: #{rust_cli} is missing, so #{wrapper} falls back to " <>
+          "the retired TypeScript CLI at #{entry} " <>
+          "(present: #{File.exists?(entry)}). Build the real one with: " <>
+          "cargo build --release --manifest-path cli/Cargo.toml"
+      )
+
+      File.write!(wrapper, fallback_wrapper(entry, rust_cli))
     end
 
     File.chmod!(wrapper, 0o755)
     Enum.each(Harness.all(), fn module -> :ok = module.install_cli_projection(bin_dir) end)
 
     bin_dir
+  end
+
+  # A wrapper whose target is absent must FAIL SAYING SO, rather than surfacing
+  # whatever `node` says about a path the operator never chose.
+  defp fallback_wrapper(entry, rust_cli) do
+    """
+    #!/bin/sh
+    if [ ! -f "#{entry}" ]; then
+      echo "tightbeam CLI is not installed: #{rust_cli} was missing at gateway boot," >&2
+      echo "and the fallback TypeScript CLI at #{entry} does not exist either." >&2
+      echo "Build it with: cargo build --release --manifest-path cli/Cargo.toml" >&2
+      exit 127
+    fi
+    exec node "#{entry}" "$@"
+    """
   end
 
   defp turn_runner(config) do
