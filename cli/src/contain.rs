@@ -29,6 +29,29 @@ pub fn rail_exec(args: &[String]) -> Result<i32, String> {
     Ok(run(args))
 }
 
+/// A human-readable report of what this host's containment mechanism can actually do.
+pub fn contain_probe() -> String {
+    platform::probe_report()
+}
+
+/// The OS release string, shared by both platform reports.
+fn os_release() -> String {
+    let mut uts = unsafe { std::mem::zeroed::<libc::utsname>() };
+
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return format!("uname failed ({})", io::Error::last_os_error());
+    }
+
+    let bytes: Vec<u8> = uts
+        .release
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn parse(args: &[String]) -> Result<RailExecArgs, String> {
     if args.len() != 6 || args[0] != "--profile" || args[2] != "--timeout-ms" || args[4] != "--" {
         return Err(
@@ -353,6 +376,14 @@ mod platform {
         code == Some(65) && stdout.is_empty() && stderr.starts_with(b"sandbox-exec:")
     }
 
+    pub fn probe_report() -> String {
+        format!(
+            "containment probe\n  os.release: {}\n  mechanism : seatbelt (sandbox-exec)\n  \
+             note      : macOS applies SBPL via the helper binary; there is no ABI to report.\n",
+            super::os_release()
+        )
+    }
+
     #[cfg(test)]
     pub mod test_support {
         use std::path::Path;
@@ -437,16 +468,26 @@ mod platform {
         | REFER
         | TRUNCATE;
 
-    /// The handled rights that mean anything on a NON-directory. Landlock rejects a
-    /// directory-only right (the `MAKE_*`/`REMOVE_*`/`REFER` family) against a file fd with
-    /// EINVAL, so granting `/dev/null` the full set refused the entire seam — every rail on
-    /// linux went CONTAINED_REFUSED. Rails grant `/dev/null`, so this is the production
-    /// shape and not a corner case.
+    /// Landlock validates a rule's rights against the TYPE of the inode it attaches to,
+    /// and rejects a right the type cannot express with EINVAL. The valid set differs by
+    /// type, so the mask does too — and it must match the STRICTEST accepted kernel, since
+    /// a right one kernel tolerates on a device another rejects. Getting this wrong is not
+    /// a weakened wall — it is CONTAINED_REFUSED for the whole seam, which is how the whole
+    /// of rails went dark on linux once `/dev/null` (a device) became the sole rail grant.
     ///
-    /// This masks by the TARGET'S TYPE, which is a property of the path and identical on
-    /// every accepted kernel. It is not the by-ABI masking `HANDLED_WRITE_RIGHTS` exists to
-    /// forbid: no two accepted kernels get different walls because of it.
-    const FILE_WRITE_RIGHTS: u64 = WRITE_FILE | TRUNCATE;
+    /// - Directory: everything. The `MAKE_*`/`REMOVE_*`/`REFER` family is directory-only;
+    ///   on a non-directory it is exactly what EINVAL'd the full set.
+    /// - Regular file: `WRITE_FILE | TRUNCATE`. A regular file can be written and truncated.
+    /// - Anything else (character/block device, fifo, socket): `WRITE_FILE` only. `TRUNCATE`
+    ///   is meaningless on these — the VFS never truncates a device, so no truncate hook
+    ///   fires and the right is not needed for `>/dev/null` — and a strict kernel rejects
+    ///   granting it there. `/dev/null` is a character device, so this is THE production arm.
+    ///
+    /// This masks by the target's TYPE, a property of the path, not by ABI. Two accepted
+    /// kernels still get the same wall for the same path; it is not the by-ABI masking
+    /// `HANDLED_WRITE_RIGHTS` forbids.
+    const REGULAR_FILE_WRITE_RIGHTS: u64 = WRITE_FILE | TRUNCATE;
+    const SPECIAL_FILE_WRITE_RIGHTS: u64 = WRITE_FILE;
 
     /// A kernel below this cannot restrict `truncate(2)` and therefore cannot deliver the
     /// guarantee, so it refuses rather than under-enforcing. ABI 3 is kernel 6.2.
@@ -516,6 +557,94 @@ mod platform {
     /// or during spawn, never inferred from the child's exit.
     pub fn refused_after_spawn(_code: Option<i32>, _stdout: &[u8], _stderr: &[u8]) -> bool {
         false
+    }
+
+    /// Print exactly what this kernel does, right down to which individual right a device
+    /// grant accepts — so a CI runner's EINVAL is diagnosed from its own output rather than
+    /// inferred from a kernel version. Every line is evidence; nothing here enforces.
+    pub fn probe_report() -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "containment probe");
+        let _ = writeln!(out, "  os.release: {}", super::os_release());
+        let _ = writeln!(out, "  mechanism : landlock");
+
+        let abi = match probe_abi() {
+            Ok(abi) => {
+                let _ = writeln!(out, "  landlock.abi: {abi}");
+                abi
+            }
+            Err(reason) => {
+                let _ = writeln!(out, "  landlock.abi: UNAVAILABLE ({reason})");
+                return out;
+            }
+        };
+
+        let _ = match rights_for_abi(abi) {
+            Ok(_) => writeln!(out, "  floor      : ABI {MIN_ABI} met"),
+            Err(reason) => writeln!(out, "  floor      : REFUSED ({reason})"),
+        };
+
+        // A directory grant and a device-node grant, each traced right-by-right, so the
+        // exact bit a strict kernel rejects is on the page. This mirrors what `grant` does.
+        for (label, path) in [("directory", "/tmp"), ("device-node", "/dev/null")] {
+            let _ = writeln!(out, "  grant[{label}] {path}:");
+
+            let combos: &[(&str, u64)] = &[
+                ("HANDLED_WRITE_RIGHTS", HANDLED_WRITE_RIGHTS),
+                ("WRITE_FILE|TRUNCATE", REGULAR_FILE_WRITE_RIGHTS),
+                ("WRITE_FILE", SPECIAL_FILE_WRITE_RIGHTS),
+            ];
+
+            for (name, rights) in combos {
+                let result = trace_grant(path, *rights);
+                let _ = writeln!(out, "    {name:>22} -> {result}");
+            }
+        }
+
+        out
+    }
+
+    /// One isolated ruleset + one add_rule, reporting ok or the errno — the probe's unit of
+    /// evidence. Never used on the enforcement path.
+    fn trace_grant(path: &str, rights: u64) -> String {
+        let ruleset = match create_ruleset(HANDLED_WRITE_RIGHTS) {
+            Ok(ruleset) => ruleset,
+            Err(reason) => return format!("ruleset failed: {reason}"),
+        };
+
+        let cpath = match CString::new(path) {
+            Ok(cpath) => cpath,
+            Err(_) => return "path has interior NUL".to_owned(),
+        };
+
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return format!("open failed: {}", io::Error::last_os_error());
+        }
+        let parent = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        let attr = PathBeneathAttr {
+            allowed_access: rights,
+            parent_fd: parent.as_raw_fd(),
+        };
+
+        let added = unsafe {
+            libc::syscall(
+                ADD_RULE,
+                ruleset.as_raw_fd(),
+                RULE_PATH_BENEATH,
+                &attr as *const PathBeneathAttr,
+                0usize,
+            )
+        };
+
+        if added == 0 {
+            "ok".to_owned()
+        } else {
+            format!("EINVAL/err: {}", io::Error::last_os_error())
+        }
     }
 
     /// Elixir owns which roots are granted; only the encoding is per-OS. An envelope this
@@ -654,15 +783,11 @@ mod platform {
         Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
 
-    /// A granted root that does not exist is OMITTED rather than refused: Landlock rules
-    /// attach to an open directory, while Seatbelt `subpath` rules are prefix matches that
-    /// accept a path which is not there yet. Omitting a grant is strictly more restrictive,
-    /// so the guarantee is never weakened — only a write macOS would have allowed may be
-    /// denied. Rail scratch roots are created before the profile is rendered.
-    /// `fstat` is one of the few operations an `O_PATH` descriptor permits, and it answers
-    /// the question without reopening the path — so the type we mask against is the type of
-    /// the very object the grant attaches to.
-    fn is_directory(fd: &OwnedFd, root: &str) -> Result<bool, String> {
+    /// Mask `handled` down to the rights valid for the inode `fd` refers to. `fstat` is
+    /// one of the few operations an `O_PATH` descriptor permits, so the type we mask
+    /// against is the type of the very object the grant attaches to — no reopen, no TOCTOU
+    /// window between deciding the type and using the fd.
+    fn allowed_rights_for(fd: &OwnedFd, handled: u64, root: &str) -> Result<u64, String> {
         let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
 
         if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
@@ -672,9 +797,20 @@ mod platform {
             ));
         }
 
-        Ok(stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+        let mask = match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => handled,
+            libc::S_IFREG => REGULAR_FILE_WRITE_RIGHTS,
+            _ => SPECIAL_FILE_WRITE_RIGHTS,
+        };
+
+        Ok(handled & mask)
     }
 
+    /// A granted root that does not exist is OMITTED rather than refused: Landlock rules
+    /// attach to an open path, while Seatbelt `subpath` rules are prefix matches that
+    /// accept a path which is not there yet. Omitting a grant is strictly more restrictive,
+    /// so the guarantee is never weakened — only a write macOS would have allowed may be
+    /// denied. Rail scratch roots are created before the profile is rendered.
     fn grant(ruleset: &OwnedFd, root: &str, handled: u64) -> Result<(), String> {
         let path = CString::new(root)
             .map_err(|_| format!("write root contains an interior NUL: {root}"))?;
@@ -701,12 +837,7 @@ mod platform {
         }
 
         let parent = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        let allowed = if is_directory(&parent, root)? {
-            handled
-        } else {
-            handled & FILE_WRITE_RIGHTS
-        };
+        let allowed = allowed_rights_for(&parent, handled, root)?;
 
         let attr = PathBeneathAttr {
             allowed_access: allowed,
@@ -835,6 +966,10 @@ mod tests {
     // APPLIED and a write outside the granted roots is DENIED. One body, both mechanisms,
     // identical assertions — a rail author cannot tell from a verdict which OS ran it.
     // Asserting that a profile string renders is not proof of anything and never was.
+    //
+    // The timeouts here are a generous CEILING, not a thing under test: the scripts finish
+    // in milliseconds and the assertion is the band, so the budget only has to outlast a
+    // loaded CI runner scheduling the child. 5s lost that race under parallel `cargo test`.
     #[test]
     fn a_write_outside_the_granted_roots_is_denied_and_leaves_nothing_behind() {
         let granted = temp_dir();
@@ -848,7 +983,7 @@ mod tests {
             &format!("printf ok > '{}'", inside.display()),
         );
         assert_eq!(
-            band(profile.clone(), writes_inside, Duration::from_secs(5)),
+            band(profile.clone(), writes_inside, Duration::from_secs(30)),
             PASS
         );
         assert_eq!(fs::read_to_string(&inside).unwrap(), "ok");
@@ -860,7 +995,7 @@ mod tests {
             &format!("printf no > '{}'", denied.display()),
         );
         assert_eq!(
-            band(profile.clone(), writes_outside, Duration::from_secs(5)),
+            band(profile.clone(), writes_outside, Duration::from_secs(30)),
             SCRIPT_ERROR
         );
         assert!(!denied.exists(), "a write outside the granted roots landed");
@@ -876,7 +1011,7 @@ mod tests {
             &format!("printf no > '{}'", escape.display()),
         );
         assert_eq!(
-            band(profile, writes_through_link, Duration::from_secs(5)),
+            band(profile, writes_through_link, Duration::from_secs(30)),
             SCRIPT_ERROR
         );
         assert!(!target.exists(), "a symlink escaped the granted roots");
@@ -897,7 +1032,7 @@ mod tests {
         let check = script(&granted, "writes-to-the-sink", "echo noise >/dev/null");
 
         assert_eq!(
-            band(profile, check, Duration::from_secs(5)),
+            band(profile, check, Duration::from_secs(30)),
             PASS,
             "granting a non-directory must not refuse the containment"
         );
@@ -950,7 +1085,7 @@ mod tests {
         let status = run_with_input(
             RailExecArgs {
                 profile: permissive_profile(),
-                timeout: Duration::from_secs(5),
+                timeout: Duration::from_secs(30),
                 script: check,
             },
             vec![b'x'; 512 * 1024],

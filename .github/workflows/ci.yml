@@ -78,6 +78,16 @@ jobs:
         working-directory: cli
         run: cargo build --release
 
+      # Make the runner's containment environment VISIBLE. Three fleet hosts at one
+      # kernel version are not the platform gate; this job is. When a Landlock grant
+      # behaves differently here than on the fleet, this prints the OS release, the
+      # Landlock ABI, and a right-by-right grant trace for a directory and a device
+      # node — so the cause is read from the runner's own output, not guessed from a
+      # kernel number. Never fails the job; it only reports.
+      - name: Containment environment (diagnostic)
+        if: matrix.name == 'linux'
+        run: cli/target/release/tightbeam contain-probe
+
       - name: Cache mix deps
         uses: actions/cache@v4
         with:
