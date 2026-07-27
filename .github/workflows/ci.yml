@@ -47,6 +47,19 @@ jobs:
           elixir --version
           rustc --version
 
+      # The suite is not hermetic: gateway boot refuses unless at least one
+      # registered harness CLI probes on PATH, and cli_integration + the rail
+      # tests exec the RELEASE tightbeam binary. On dev machines both are
+      # satisfied by the developer's environment, which is how a macOS-only
+      # dependency on installed harnesses went unnoticed. CI satisfies them
+      # explicitly, pinned to the versions the hosts run.
+      - name: Install harness CLIs (suite prerequisite)
+        run: npm install -g @anthropic-ai/claude-code@2.1.220 @openai/codex@0.145.0
+
+      - name: cargo build --release (suite prerequisite)
+        working-directory: cli
+        run: cargo build --release
+
       - name: Cache mix deps
         uses: actions/cache@v4
         with:
