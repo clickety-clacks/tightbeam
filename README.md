@@ -95,12 +95,18 @@ cannot determine credential state at all**. Those rows say so rather than
 guessing. To check credentials for real, read the boot summary above or the
 running gateway's catalog.
 
-## Running it as a service
+## Installing as a service
 
-Nothing here is tightbeam-specific policy — it is the ordinary way to run a
-long-lived process on each platform. Pick your init system and keep three
-properties: **start on boot**, **restart on failure**, and **a stable
-environment**.
+**This is how Tight Beam is meant to run, and it is part of installation — not an
+optional extra afterwards.** `mix run --no-halt` is a foreground process bound to
+your terminal: it dies when you log out and does not come back after a reboot.
+An install that leaves you with a foreground process is not finished.
+
+The service must **start with no interactive login**, **survive logout**,
+**survive reboot**, and **restart on failure**.
+
+This same procedure is what runs on a test machine. There is no separate test
+install — the only difference is which machine you point it at.
 
 ### The environment that matters
 
@@ -113,15 +119,29 @@ environment**.
 | `TIGHTBEAM_DEFAULT_MODEL` | Must be a live ref for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
 | `CODEX_PATH` | Pin the codex binary. Harness CLIs auto-update underneath you; an unpinned one changes behaviour without warning. |
 
-Run the service as an ordinary user, not root. It needs write access to
-`TIGHTBEAM_BASE_DIR` and read access to the harness CLIs on `PATH`.
+Run the service **as an ordinary user, not root** — set the account explicitly
+(`User=` / `UserName=`) rather than letting the init system default to root. It
+needs write access to `TIGHTBEAM_BASE_DIR` and read access to the harness CLIs on
+`PATH`. No dedicated service account is required: run it as the account that
+installed it.
+
+**On credentials, because earlier guidance here was wrong.** A service that starts
+before any login still reaches the harness credentials. Tight Beam does not rely on
+the invoking user's keychain or `~/.claude` / `~/.codex`: it stores tokens under
+`<base_dir>/auth/<harness>/`, projects a harness home under
+`<base_dir>/homes/<machine>/<harness>/`, and hands both to the CLI explicitly at
+spawn (`CLAUDE_CONFIG_DIR` + `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_HOME`). That is what
+makes a boot-time service viable at all, and it is why `base_dir` must live
+somewhere durable rather than inside a home directory you might discard.
 
 ### macOS — launchd
 
-`~/Library/LaunchAgents/com.tightbeam.gateway.plist`, loaded with
-`launchctl bootstrap gui/$(id -u) <path>` and started at login. Use a LaunchAgent
-(per-user) rather than a LaunchDaemon: the harness CLIs keep credentials in the
-user's keychain and home directory, so a root daemon cannot see them.
+`/Library/LaunchDaemons/com.tightbeam.gateway.plist`, owned `root:wheel` mode
+`644`, loaded with `sudo launchctl bootstrap system <path>`.
+
+Use a **LaunchDaemon**, not a LaunchAgent. A LaunchAgent is per-user and starts at
+*login*, so it dies at logout and does not exist until someone signs in — it cannot
+meet the requirements above. `UserName` keeps the process off root.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -130,6 +150,7 @@ user's keychain and home directory, so a root daemon cannot see them.
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.tightbeam.gateway</string>
+  <key>UserName</key><string>you</string>
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/mix</string>
@@ -159,12 +180,16 @@ user's keychain and home directory, so a root daemon cannot see them.
 clean stop. launchd does not rotate logs — point them at a path you rotate, or
 `newsyslog.conf` will not do it for you.
 
+Verify: `sudo launchctl print system/com.tightbeam.gateway`.
+
 ### Linux — systemd
 
-`~/.config/systemd/user/tightbeam.service`, enabled with
-`systemctl --user enable --now tightbeam`. Use a **user** unit for the same
-credential-visibility reason as above, and run `loginctl enable-linger <user>`
-or the service will stop when you log out.
+`/etc/systemd/system/tightbeam.service`, enabled with
+`sudo systemctl enable --now tightbeam`.
+
+Use a **system** unit. A user unit stops at logout unless you also enable
+lingering, and it will not start until that user's manager does — `WantedBy=
+multi-user.target` starts at boot with no login at all.
 
 ```ini
 [Unit]
@@ -174,24 +199,76 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-WorkingDirectory=%h/src/tightbeam_ex
-ExecStart=/usr/local/bin/mix run --no-halt
+User=you
+Group=you
+WorkingDirectory=/home/you/src/tightbeam_ex
+ExecStart=/home/you/.local/bin/mix run --no-halt
 Environment=MIX_ENV=dev
 Environment=TIGHTBEAM_LOCAL_HOST_NAME=gibson
-Environment=TIGHTBEAM_BASE_DIR=%h/.tightbeam
+Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
 Environment=TIGHTBEAM_PORT=11373
 Environment=TIGHTBEAM_ADVERTISED_URL=ws://gibson.local:11373
+Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 ```
 
-`Restart=on-failure` rather than `always`, so a deliberate stop stays stopped.
-Logs go to the journal — `journalctl --user -u tightbeam -f`. Give
-`TimeoutStopSec` room: shutdown drains in-flight turns.
+`User=`/`Group=` are required in a system unit — without them systemd runs it as
+root. `%h` does NOT work here: in a system unit it expands to `/root`, not to the
+user's home, so every path is spelled out. Set `PATH` explicitly too — a system
+unit inherits almost none of your login environment, and `mix`, `elixir`, `node`
+and the harness CLIs must all be findable.
+
+`WantedBy=multi-user.target` is what makes it start at boot with nobody logged in.
+`Restart=on-failure` rather than `always`, so a deliberate `systemctl stop` stays
+stopped. Logs go to the journal — `journalctl -u tightbeam -f` (no `--user`).
+Give `TimeoutStopSec` room: shutdown drains in-flight turns.
+
+Verify: `systemctl is-enabled tightbeam` reports `enabled` (starts at boot) and
+`systemctl is-active tightbeam` reports `active`.
+
+### Verifying the service — the four things that define it
+
+A running process proves none of these. Check them explicitly:
+
+| property | Linux | macOS |
+|---|---|---|
+| starts with no login | `systemctl is-enabled tightbeam` → `enabled` | `sudo launchctl print system/com.tightbeam.gateway` |
+| survives logout | log out, then re-check `is-active` | log out, then re-check `print` |
+| survives reboot | reboot; `is-active` without intervention | reboot; `print` without intervention |
+| restarts on failure | kill the pid; it returns | kill the pid; it returns |
+
+Then confirm it can actually work — read the boot summary below, and run a real
+turn. A service that starts perfectly and cannot run a turn is not installed.
+
+### Uninstalling
+
+**NOT YET IMPLEMENTED.** There is no `tightbeam uninstall`. Until there is,
+removal is manual, and the order matters — stop the service before removing
+anything it holds open:
+
+```sh
+# Linux
+sudo systemctl disable --now tightbeam
+sudo rm /etc/systemd/system/tightbeam.service
+sudo systemctl daemon-reload
+
+# macOS
+sudo launchctl bootout system/com.tightbeam.gateway
+sudo rm /Library/LaunchDaemons/com.tightbeam.gateway.plist
+```
+
+Then verify nothing is left: no unit or plist, no process, nothing listening on
+your `TIGHTBEAM_PORT`.
+
+`base_dir` is **left alone** by the steps above, and that is deliberate — it holds
+your identity repo, sessions, work items, and credentials. Removing the service
+does not throw away the org. Delete `base_dir` yourself only when you mean to
+destroy that state; it is not recoverable.
 
 ### Confirming it actually came up
 
