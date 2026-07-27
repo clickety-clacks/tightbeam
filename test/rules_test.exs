@@ -20,7 +20,17 @@ defmodule Tightbeam.RulesTest do
     db = :"rules_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Tightbeam.CausalEvents,Devices, Idempotency, Org, Roles, WorkItems, Assignments, WorkState, EventLog],
+    for module <- [
+          Tightbeam.CausalEvents,
+          Devices,
+          Idempotency,
+          Org,
+          Roles,
+          WorkItems,
+          Assignments,
+          WorkState,
+          EventLog
+        ],
         do: :ok = module.ensure_schema(db)
 
     base_dir =

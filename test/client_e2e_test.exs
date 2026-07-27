@@ -21,7 +21,19 @@ defmodule Tightbeam.ClientE2ETest do
 
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, EventLog, Gateway, Idempotency, Ledger, Org, Projection, Rules}
+  alias Tightbeam.{
+    ConnRegistry,
+    DB,
+    Devices,
+    EventLog,
+    Gateway,
+    Idempotency,
+    Ledger,
+    Org,
+    Projection,
+    Rules
+  }
+
   alias Tightbeam.ClientE2E
   alias Tightbeam.ClientE2E.{Journeys, Scorecard, SimClient}
   alias Tightbeam.ClientE2E.Scorecard.Leg
@@ -113,16 +125,25 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "a negative-proved divergence passes its row and cites the matrix row" do
-      row = Scorecard.pass("4", "tool use", divergence_ref: "harness-support.md#codex-tool-titles")
+      row =
+        Scorecard.pass("4", "tool use", divergence_ref: "harness-support.md#codex-tool-titles")
+
       leg = Journeys.ids() |> green_leg("codex") |> Scorecard.add(row)
 
       assert Scorecard.leg_verdict(leg) == :pass
-      assert Scorecard.to_markdown(%Scorecard{legs: [leg]}, ["codex"]) =~ "harness-support.md#codex-tool-titles"
+
+      assert Scorecard.to_markdown(%Scorecard{legs: [leg]}, ["codex"]) =~
+               "harness-support.md#codex-tool-titles"
     end
 
     test "the run verdict is the worst leg verdict" do
       good = Scorecard.add(%Leg{harness: "claude", host: "eezo"}, Scorecard.pass("3", "converse"))
-      bad = Scorecard.add(%Leg{harness: "codex", host: "eezo"}, Scorecard.fail("3", "converse", "no reply"))
+
+      bad =
+        Scorecard.add(
+          %Leg{harness: "codex", host: "eezo"},
+          Scorecard.fail("3", "converse", "no reply")
+        )
 
       assert Scorecard.run_verdict(%Scorecard{legs: [good, bad]}, ["claude", "codex"]) == :fail
     end
@@ -195,7 +216,10 @@ defmodule Tightbeam.ClientE2ETest do
     @session "agent:main:clawline:user:main"
 
     defp echo(cmid), do: %{"type" => "message", "role" => "user", "clientMessageId" => cmid}
-    defp reply(cmid), do: %{"type" => "message", "role" => "assistant", "replyToClientMessageId" => cmid}
+
+    defp reply(cmid),
+      do: %{"type" => "message", "role" => "assistant", "replyToClientMessageId" => cmid}
+
     defp typing(active), do: %{"type" => "typing", "active" => active, "sessionKey" => @session}
 
     defp oracle(frames, opts \\ []) do
@@ -444,7 +468,10 @@ defmodule Tightbeam.ClientE2ETest do
       assert Substrate.turns_overlapped?(running, %{"startedAt" => now - 1_000, "endedAt" => now})
       assert Substrate.turns_overlapped?(%{"startedAt" => now - 1_000, "endedAt" => nil}, running)
       # Still bounded by its start: something that ended before it began cannot overlap.
-      refute Substrate.turns_overlapped?(running, %{"startedAt" => now - 9_000, "endedAt" => now - 6_000})
+      refute Substrate.turns_overlapped?(running, %{
+               "startedAt" => now - 9_000,
+               "endedAt" => now - 6_000
+             })
     end
   end
 
@@ -456,7 +483,12 @@ defmodule Tightbeam.ClientE2ETest do
     # never fire. A survivor that ignores SIGTERM is the cheapest way to hold
     # the real contract.
     test "a process that outlives SIGTERM returns :still_running and KEEPS the base_dir" do
-      base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-teardown-#{System.unique_integer([:positive])}")
+      base_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "tightbeam-client-e2e-teardown-#{System.unique_integer([:positive])}"
+        )
+
       File.mkdir_p!(Path.join(base_dir, "homes"))
       on_exit(fn -> File.rm_rf!(base_dir) end)
 
@@ -504,7 +536,12 @@ defmodule Tightbeam.ClientE2ETest do
       # would be checking that a function agrees with itself. And the
       # SIGTERM-ignorer is the GRANDCHILD: with a direct child, dropping the
       # recursive descent from descendant_pids/1 would still pass.
-      base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-reap-#{System.unique_integer([:positive])}")
+      base_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "tightbeam-client-e2e-reap-#{System.unique_integer([:positive])}"
+        )
+
       File.mkdir_p!(base_dir)
       on_exit(fn -> File.rm_rf!(base_dir) end)
 
@@ -590,7 +627,12 @@ defmodule Tightbeam.ClientE2ETest do
       # number now belongs to somebody else, signalling it kills their work; that
       # is how a cleanup routine takes out another lane. Here the struct names a
       # LIVE pid whose command line does not match what was captured.
-      base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-recycled-#{System.unique_integer([:positive])}")
+      base_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "tightbeam-client-e2e-recycled-#{System.unique_integer([:positive])}"
+        )
+
       File.mkdir_p!(base_dir)
       on_exit(fn -> File.rm_rf!(base_dir) end)
       ready = Path.join(base_dir, "ready")
@@ -619,7 +661,8 @@ defmodule Tightbeam.ClientE2ETest do
 
       LegGateway.teardown(gateway, exit_timeout_ms: 1_000, reap_timeout_ms: 1_000)
 
-      assert {_, 0} = System.cmd("kill", ["-0", Integer.to_string(bystander)], stderr_to_stdout: true),
+      assert {_, 0} =
+               System.cmd("kill", ["-0", Integer.to_string(bystander)], stderr_to_stdout: true),
              "the bystander holding a recycled pid must be left alone"
 
       System.cmd("kill", ["-KILL", Integer.to_string(bystander)], stderr_to_stdout: true)
@@ -645,10 +688,22 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "a clean stop removes the run-local base_dir and returns :ok" do
-      base_dir = Path.join(System.tmp_dir!(), "tightbeam-client-e2e-teardown-#{System.unique_integer([:positive])}")
+      base_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "tightbeam-client-e2e-teardown-#{System.unique_integer([:positive])}"
+        )
+
       File.mkdir_p!(base_dir)
 
-      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: nil, os_command: nil, port_ref: nil, log_path: ""}
+      gateway = %LegGateway{
+        base_dir: base_dir,
+        port: 0,
+        os_pid: nil,
+        os_command: nil,
+        port_ref: nil,
+        log_path: ""
+      }
 
       assert LegGateway.teardown(gateway) == :ok
       refute File.exists?(base_dir)
@@ -656,11 +711,20 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a base_dir this driver did not provision is NEVER removed" do
       # The one unrecoverable mistake is deleting a real org.
-      base_dir = Path.join(System.tmp_dir!(), "somebody-elses-org-#{System.unique_integer([:positive])}")
+      base_dir =
+        Path.join(System.tmp_dir!(), "somebody-elses-org-#{System.unique_integer([:positive])}")
+
       File.mkdir_p!(base_dir)
       on_exit(fn -> File.rm_rf!(base_dir) end)
 
-      gateway = %LegGateway{base_dir: base_dir, port: 0, os_pid: nil, os_command: nil, port_ref: nil, log_path: ""}
+      gateway = %LegGateway{
+        base_dir: base_dir,
+        port: 0,
+        os_pid: nil,
+        os_command: nil,
+        port_ref: nil,
+        log_path: ""
+      }
 
       assert LegGateway.teardown(gateway) == :ok
       assert File.dir?(base_dir)
@@ -798,14 +862,19 @@ defmodule Tightbeam.ClientE2ETest do
 
       assert {:dirty, sha, fingerprint, listing} = Provenance.stamp(ctx.repo)
       assert listing =~ "tracked.txt"
-      assert Provenance.to_header({:dirty, sha, fingerprint, listing}) =~ "DIRTY (diff #{fingerprint})"
+
+      assert Provenance.to_header({:dirty, sha, fingerprint, listing}) =~
+               "DIRTY (diff #{fingerprint})"
     end
 
     test "UNTRACKED content changes the fingerprint" do
       # `git diff HEAD` omits untracked files, so the previous fingerprint gave
       # two different untracked driver sources the same empty-diff hash.
       listing = "?? probe.exs\n"
-      dir = Path.join(System.tmp_dir!(), "client-e2e-untracked-#{System.unique_integer([:positive])}")
+
+      dir =
+        Path.join(System.tmp_dir!(), "client-e2e-untracked-#{System.unique_integer([:positive])}")
+
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf!(dir) end)
       path = Path.join(dir, "probe.exs")
@@ -943,7 +1012,9 @@ defmodule Tightbeam.ClientE2ETest do
         )
 
       manual_only = for o <- Journeys.oracles(), match?({:none, _}, o.client), do: o.step
-      j0_steps = for o <- Journeys.oracles(), o.journey == "J0", o.step not in manual_only, do: o.step
+
+      j0_steps =
+        for o <- Journeys.oracles(), o.journey == "J0", o.step not in manual_only, do: o.step
 
       assert Enum.sort(Enum.map(leg.rows, & &1.step)) == Enum.sort(j0_steps)
 
@@ -1037,7 +1108,12 @@ defmodule Tightbeam.ClientE2ETest do
       :ok =
         Tightbeam.ClientE2E.WS.send_text(
           client.ws,
-          JSON.encode!(%{"type" => "message", "id" => "nope", "sessionKey" => key, "content" => "hi"})
+          JSON.encode!(%{
+            "type" => "message",
+            "id" => "nope",
+            "sessionKey" => key,
+            "content" => "hi"
+          })
         )
 
       assert {:ok, frame, client} =

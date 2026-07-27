@@ -171,10 +171,11 @@ defmodule Tightbeam.ClientE2E.Scorecard do
 
       true ->
         blockers =
-          parity_blockers ++ Enum.flat_map(verdicts, fn
-            {:incomplete, list} -> list
-            _ -> []
-          end)
+          parity_blockers ++
+            Enum.flat_map(verdicts, fn
+              {:incomplete, list} -> list
+              _ -> []
+            end)
 
         if blockers == [], do: :pass, else: {:incomplete, blockers}
     end
@@ -203,7 +204,10 @@ defmodule Tightbeam.ClientE2E.Scorecard do
     body =
       Enum.map(steps, fn {step, label} ->
         cells = Enum.map(legs, &cell_text(find_row(&1, step)))
-        notes = legs |> Enum.map(&note_text(&1, step)) |> Enum.reject(&is_nil/1) |> Enum.join("; ")
+
+        notes =
+          legs |> Enum.map(&note_text(&1, step)) |> Enum.reject(&is_nil/1) |> Enum.join("; ")
+
         "| #{step} #{label} | " <> Enum.join(cells, " | ") <> " | #{notes} |"
       end)
 

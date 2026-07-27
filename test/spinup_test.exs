@@ -26,6 +26,7 @@ defmodule Tightbeam.SpinupTest do
     credential = Path.join([ctx.base_dir, "auth", "claude", "oauth-token"])
     File.mkdir_p!(Path.dirname(credential))
     File.write!(credential, "test-token")
+    stage_claude!(ctx.base_dir)
     parent = self()
 
     sh = fn command ->
@@ -36,7 +37,8 @@ defmodule Tightbeam.SpinupTest do
     assert :ok =
              Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :claude, "testhost",
                db: ctx.db,
-               sh: sh
+               sh: sh,
+               patch_adapter: no_patch()
              )
 
     refute_received {:unexpected_shell, _}
@@ -50,7 +52,7 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "credentials present"
   end
 
-  test "local adapter missing denies with its resolved path", ctx do
+  test "local adapter missing denies with the base_dir path, not a sibling checkout", ctx do
     sandbox = Path.join(ctx.base_dir, "cwd")
     File.mkdir_p!(sandbox)
 
@@ -59,11 +61,16 @@ defmodule Tightbeam.SpinupTest do
         Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "testhost", db: ctx.db)
       end)
 
-    expected = Path.expand("../tightbeam/node_modules/.bin/codex-acp", sandbox)
+    expected = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
     assert {:error, %{code: "host_unready", message: message}} = result
     assert message =~ "adapter missing"
     assert message =~ expected
-    assert message =~ "install the ACP adapters in the local Tightbeam checkout"
+
+    # The remedy names the host's own adapters directory. It used to send the
+    # operator to a sibling checkout of the retired TypeScript project (#46).
+    assert message =~ Path.join(ctx.base_dir, "adapters")
+    refute message =~ "local Tightbeam checkout"
+    refute message =~ "src/tightbeam/node_modules"
     assert [%{kind: "spinup", detail: "reached;" <> _}] = EventLog.lifecycle_events(ctx.db)
   end
 
@@ -80,9 +87,13 @@ defmodule Tightbeam.SpinupTest do
 
   test "missing credentials denies with path and setup ceremony", ctx do
     auth_dir = Path.join([ctx.base_dir, "auth", "claude"])
+    stage_claude!(ctx.base_dir)
 
     assert {:error, %{code: "host_unready", message: message}} =
-             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :claude, "testhost", db: ctx.db)
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :claude, "testhost",
+               db: ctx.db,
+               patch_adapter: no_patch()
+             )
 
     assert message =~ "no claude credentials in #{auth_dir}"
     assert message =~ "run the setup ceremony on testhost"
@@ -154,8 +165,25 @@ defmodule Tightbeam.SpinupTest do
     commands = receive_commands(6)
     install = Enum.find(commands, &String.contains?(List.last(&1), "npm install"))
     assert List.last(install) =~ "--prefix"
-    assert List.last(install) =~ "@agentclientprotocol/claude-agent-acp"
-    assert List.last(install) =~ "@agentclientprotocol/codex-acp"
+
+    # PINNED, not bare (#47): a bare name resolves to npm's latest, so every
+    # provision installed whatever was published that day while @adapter_version
+    # documented a pin nothing enforced. Measured on main: claude-agent-acp 0.62.0
+    # and codex-acp 1.1.7 against pins of 0.59.0 and 1.1.4.
+    for module <- Tightbeam.Harness.all() do
+      assert List.last(install) =~ "#{module.install_package()}@#{module.adapter_version()}",
+             "#{module.wire_name()} is not installed at its pinned version"
+    end
+
+    # ...and no bare name survives, which is what the pin is protecting against.
+    for module <- Tightbeam.Harness.all() do
+      refute List.last(install) =~ "#{module.install_package()} ",
+             "#{module.wire_name()} still has an unpinned occurrence in the install line"
+
+      refute String.ends_with?(List.last(install), module.install_package()),
+             "#{module.wire_name()} trails the install line unpinned"
+    end
+
     assert Enum.count(commands, &String.contains?(List.last(&1), "test -x")) == 2
     assert [%{detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "deployed adapters"
@@ -262,4 +290,18 @@ defmodule Tightbeam.SpinupTest do
       1_000 -> flunk("timed out collecting spinup commands")
     end
   end
+
+  # The adapter lives under the host's OWN base_dir now (no sibling checkout), so
+  # "already present" has to be staged there.
+  # Adapter presence only — patching has its own tests, and is injected as a
+  # no-op here so these stay about presence and credentials.
+  defp stage_claude!(base_dir) do
+    path = Path.join([base_dir, "adapters", "node_modules", ".bin", "claude-agent-acp"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "#!/bin/sh\nexit 0\n")
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp no_patch, do: fn _harness, _path -> :ok end
 end

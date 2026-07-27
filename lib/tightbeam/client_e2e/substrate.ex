@@ -104,7 +104,9 @@ defmodule Tightbeam.ClientE2E.Substrate do
   @spec running_by_session(base_dir()) :: %{String.t() => non_neg_integer()}
   def running_by_session(base_dir) do
     base_dir
-    |> query("SELECT sessionKey, COUNT(*) AS n FROM turns WHERE status = 'running' GROUP BY sessionKey")
+    |> query(
+      "SELECT sessionKey, COUNT(*) AS n FROM turns WHERE status = 'running' GROUP BY sessionKey"
+    )
     |> Map.new(&{&1["sessionKey"], &1["n"]})
   end
 
@@ -191,8 +193,12 @@ defmodule Tightbeam.ClientE2E.Substrate do
     row = turn_by_wake_id(base_dir, wake_id)
 
     cond do
-      is_map(row) and row["status"] in ~w(delivered canceled failed failed_unknown) -> row
-      System.monotonic_time(:millisecond) >= deadline -> row || last
+      is_map(row) and row["status"] in ~w(delivered canceled failed failed_unknown) ->
+        row
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        row || last
+
       true ->
         Process.sleep(200)
         poll_wake_turn(base_dir, wake_id, deadline, row || last)

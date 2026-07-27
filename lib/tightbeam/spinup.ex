@@ -53,9 +53,17 @@ defmodule Tightbeam.Spinup do
         target.patch_adapter.(path)
         {:ok, "adapters present"}
       else
+        # STOPPED SHORT OF SELF-PROVISIONING (#46): priv/harness_bundle.json
+        # declares vector_contract.ensure_adapter with the oracle "local absence
+        # refusal" and a required `local_absent` case, so installing here would
+        # contradict a manifest-declared parity contract. That needs an amendment,
+        # not a lane decision. What IS fixed is the path: the adapter is looked for
+        # under this host's OWN base_dir, not a sibling checkout of the retired
+        # TypeScript project, and the remedy now names the directory that matters.
         message =
           "host #{target.host_name} is not ready for #{module.wire_name()}: adapter missing at #{path} " <>
-            "(install the ACP adapters in the local Tightbeam checkout)"
+            "(install the ACP adapters into #{Path.join(target.host_config.base_dir, "adapters")} " <>
+            "on #{target.host_name})"
 
         {:error, host_unready(message)}
       end
@@ -68,7 +76,17 @@ defmodule Tightbeam.Spinup do
 
         {_output, _exit} ->
           install_dir = Path.join(target.host_config.base_dir, "adapters")
-          packages = Enum.map_join(Harness.all(), " ", & &1.install_package())
+
+          # `name@version`, not a bare name: npm resolves a bare name to LATEST, so
+          # every provision pulled whatever was published that day while
+          # @adapter_version documented a pin nothing enforced. Measured before this
+          # change, BOTH adapters had drifted past their pins. The patch anchors and
+          # the local patcher's exact-version assertion are written against the
+          # pinned release, so the install has to land that release — an unpinned
+          # tree makes the patcher raise. Versions stay in the harness modules; this
+          # seam only asks each of them for its own.
+          packages =
+            Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
           install =
             "npm install --prefix #{shell_quote(install_dir)} " <> packages

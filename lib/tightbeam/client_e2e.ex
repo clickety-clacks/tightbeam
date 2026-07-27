@@ -239,7 +239,8 @@ defmodule Tightbeam.ClientE2E do
   """
   @spec catalog_gated?(module(), String.t()) :: boolean()
   def catalog_gated?(module, base_dir) do
-    scratch = Path.join(System.tmp_dir!(), "client-e2e-gate-#{System.unique_integer([:positive])}")
+    scratch =
+      Path.join(System.tmp_dir!(), "client-e2e-gate-#{System.unique_integer([:positive])}")
 
     try do
       File.mkdir_p!(scratch)

@@ -113,8 +113,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert wait_until(fn ->
              match?(
-               %{"claude:default@testhost" =>
-                   %{circuit: :open, consecutive_failures: 1}},
+               %{"claude:default@testhost" => %{circuit: :open, consecutive_failures: 1}},
                AdapterCoordinator.health(coordinator)
              )
            end)

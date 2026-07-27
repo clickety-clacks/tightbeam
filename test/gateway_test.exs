@@ -278,50 +278,54 @@ defmodule Tightbeam.GatewayTest do
         ]
       })
 
-    start_supervised!(
-      {ModelCatalog,
-       base_dir: catalog_base,
-       codex_home: Path.join(catalog_base, "codex"),
-       credential_status: fn _provider -> :onboarded end,
-       claude_fetch: fn _, _ -> {:ok, claude_models} end,
-       codex_read: fn _ ->
-         {:ok,
-          JSON.encode!(%{
-            models: [
-              %{
-                slug: "gpt-5.6-sol",
-                display_name: "GPT-5.6 Sol",
-                supported_reasoning_levels: [
-                  %{effort: "low"},
-                  %{effort: "medium"},
-                  %{effort: "high"},
-                  %{effort: "xhigh"},
-                  %{effort: "max"},
-                  %{effort: "ultra"}
-                ]
-              },
-              %{
-                slug: "gpt-5.6-terra",
-                display_name: "GPT-5.6 Terra",
-                supported_reasoning_levels: [
-                  %{effort: "low"},
-                  %{effort: "high"}
-                ]
-              },
-              %{
-                slug: "gpt-5.6-nano",
-                display_name: "GPT-5.6 Nano",
-                supported_reasoning_levels: [%{effort: "turbo"}]
-              },
-              %{
-                slug: "gpt-5.6-classic",
-                display_name: "GPT-5.6 Classic",
-                supported_reasoning_levels: []
-              }
-            ]
-          })}
-       end}
-    )
+    start_supervised!({
+      ModelCatalog,
+      # This suite's subject is the gateway, not the claude selectable-model pin
+      # (tested in model_catalog_test). Leaving the pin on would filter this
+      # fixture to nothing and starve the catalog.
+      base_dir: catalog_base,
+      codex_home: Path.join(catalog_base, "codex"),
+      credential_status: fn _provider -> :onboarded end,
+      claude_selectable_models: :all,
+      claude_fetch: fn _, _ -> {:ok, claude_models} end,
+      codex_read: fn _ ->
+        {:ok,
+         JSON.encode!(%{
+           models: [
+             %{
+               slug: "gpt-5.6-sol",
+               display_name: "GPT-5.6 Sol",
+               supported_reasoning_levels: [
+                 %{effort: "low"},
+                 %{effort: "medium"},
+                 %{effort: "high"},
+                 %{effort: "xhigh"},
+                 %{effort: "max"},
+                 %{effort: "ultra"}
+               ]
+             },
+             %{
+               slug: "gpt-5.6-terra",
+               display_name: "GPT-5.6 Terra",
+               supported_reasoning_levels: [
+                 %{effort: "low"},
+                 %{effort: "high"}
+               ]
+             },
+             %{
+               slug: "gpt-5.6-nano",
+               display_name: "GPT-5.6 Nano",
+               supported_reasoning_levels: [%{effort: "turbo"}]
+             },
+             %{
+               slug: "gpt-5.6-classic",
+               display_name: "GPT-5.6 Classic",
+               supported_reasoning_levels: []
+             }
+           ]
+         })}
+      end
+    })
 
     await_catalog("claude")
     await_catalog("codex")
@@ -853,6 +857,74 @@ defmodule Tightbeam.GatewayTest do
              Org.get(ctx.db, Org.personal_session_key(device.user_id))
   end
 
+  # Task #41. A model the adapter cannot select must be refused by NAME and the
+  # operator told what IS available — before, this died deep in the adapter as
+  # "Invalid value for config option model", on every session/new and session/load.
+  test "an unavailable model is refused by name and names what is offered", ctx do
+    base_dir = role_test_base("model-not-offered")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    assert %{code: "model_unavailable", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-opus-5"}
+             })
+
+    assert message =~ ~s(model "claude-opus-5" is not offered by claude)
+
+    # The hint is the point: naming only the rejection makes the operator guess.
+    assert message =~ "offered:"
+    assert message =~ "claude-sonnet-4-6"
+
+    # ...and it must not recommend the very thing it just refused.
+    refute message =~ "offered: claude-opus-5"
+  end
+
+  test "a catalog missing for want of a GATEWAY credential says so, with the repair", ctx do
+    base_dir = role_test_base("catalog-cred-legible")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    # The gateway derives catalogs against its OWN host; force that derivation to
+    # have failed for a missing credential while the target host stays onboarded.
+    :sys.replace_state(ModelCatalog, fn state ->
+      harnesses =
+        Map.new(state.harnesses, fn {name, cache} ->
+          {name,
+           %{
+             cache
+             | entries: [],
+               derived_at: nil,
+               attempted_at: state.now.(),
+               reason: {:needs_onboarding, :no_credential},
+               refreshing: true
+           }}
+        end)
+
+      %{state | harnesses: harnesses}
+    end)
+
+    assert %{code: "catalog_unavailable", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    gateway = Placement.local_host_name()
+
+    # Names what is missing, on which host, for which provider, and the repair.
+    assert message =~ "anthropic has no usable credential on GATEWAY host #{gateway}"
+    assert message =~ ":no_credential"
+    assert message =~ "run tightbeam onboard anthropic on #{gateway}"
+
+    # ...and never regresses to the bare inspected health term, which named
+    # neither the provider, the host, nor the fix (sat-e2e mac-0726a S2).
+    refute message =~ "for claude: {:unavailable,"
+  end
+
   test "children refuses a broken harness on PATH without creating any org artifact", ctx do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_no_harness_#{System.unique_integer([:positive])}")
@@ -1011,7 +1083,7 @@ defmodule Tightbeam.GatewayTest do
     assert token != ""
   end
 
-  test "children installs the release Rust CLI and retains the node fallback", ctx do
+  test "children installs the release Rust CLI, and refuses instead of falling back", ctx do
     repo_dir =
       Path.join(
         System.tmp_dir!(),
@@ -1035,10 +1107,27 @@ defmodule Tightbeam.GatewayTest do
       File.rm!(rust_cli)
       Gateway.children(gateway_config(fallback_base, ctx.db, 0))
       fallback = Path.join(fallback_base, "bin/tightbeam")
-      entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
+      body = File.read!(fallback)
 
-      assert File.read!(fallback) == "#!/bin/sh\nexec node \"#{entry}\" \"$@\"\n"
+      # This test's subject is unchanged — what gets installed at bin/tightbeam
+      # when the Rust CLI is absent — but the answer is now the OPPOSITE of its old
+      # name. There is deliberately no fallback: it pointed at the retired
+      # TypeScript CLI in a sibling checkout, so on a machine that had one the
+      # operator silently ran a different implementation than the gateway that
+      # installed it, and on a machine without one an executable that died on a
+      # path they never chose.
+      refute body =~ "exec node"
+      refute body =~ "dist/cli/main.js"
+
+      assert body =~ "tightbeam CLI is not installed"
+      assert body =~ "cargo build --release --manifest-path cli/Cargo.toml"
+      assert body =~ rust_cli
       assert File.stat!(fallback).mode |> Bitwise.band(0o777) == 0o755
+
+      # Executed, not merely matched: it must actually refuse.
+      assert {refusal, 127} = System.cmd(fallback, ["list"], stderr_to_stdout: true)
+      assert refusal =~ "tightbeam CLI is not installed"
+      assert refusal =~ "cargo build --release"
     end)
   end
 
@@ -1743,7 +1832,6 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "a crash-recovered turn warns that side effects are unknown, not undone", ctx do
-
     # Boot recovery terminalizes an interrupted turn as "outcome unknown". The
     # in-chat marker must tell the agent to VERIFY before repeating anything
     # non-idempotent — re-running `mix test` is fine, re-running a deploy is not.
@@ -1789,7 +1877,6 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "an ordinary failure with a known reason gets NO unknown-outcome warning", ctx do
-
     publisher = Gateway.terminal_publisher_for_test(ctx.db)
 
     try do
@@ -1813,7 +1900,8 @@ defmodule Tightbeam.GatewayTest do
     refute marker.content =~ "side effects are UNKNOWN"
   end
 
-  test "register-host with the LOCAL hostname never touches the boot-owned credential server", ctx do
+  test "register-host with the LOCAL hostname never touches the boot-owned credential server",
+       ctx do
     local = Tightbeam.Placement.local_host_name()
     base_dir = move_test_base("local-host-reregistration", local)
     config = gateway_config(base_dir, ctx.db, 0)
@@ -1901,116 +1989,6 @@ defmodule Tightbeam.GatewayTest do
 
     assert Org.get(ctx.db, session_key).host == "worker"
     assert_receive {:spinup_command, ["ssh" | _]}
-  end
-
-  @tag :skip
-  test "superseded skill-rm command", ctx do
-    base_dir = role_test_base("skill-rm")
-    manifests = Path.join([base_dir, "identity", "archetypes"])
-    File.mkdir_p!(manifests)
-    skill_dir = Path.join([base_dir, "identity", "skills", "swift"])
-    File.mkdir_p!(skill_dir)
-    File.write!(Path.join(skill_dir, "SKILL.md"), "# Swift")
-
-    File.write!(Path.join(manifests, "coder.toml"), """
-    name = "coder"
-    skills = ["swift"]
-    """)
-
-    Archetypes.load!(base_dir)
-
-    active =
-      Org.create(ctx.db, %{
-        session_key: "agent:coder-active",
-        display_name: "Coder active",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: "fable"
-      })
-
-    retired =
-      Org.create(ctx.db, %{
-        session_key: "agent:coder-retired",
-        display_name: "Coder retired",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: "fable"
-      })
-
-    Org.retire(ctx.db, retired.session_key)
-
-    remove =
-      Gateway.handlers(
-        gateway_config(base_dir, ctx.db, 0)
-        |> Map.put(:conn_registry, ctx.registry)
-        |> Map.put(:lane_manager, ctx.lane)
-      )["skill-rm"]
-
-    result = remove.(%{origin: "user:flynn", params: %{name: "swift"}})
-
-    assert result.notified == [active.session_key]
-
-    assert {"skill-rm: swift|user:flynn|user-flynn@tightbeam.local\n", 0} =
-             System.cmd(
-               "git",
-               ["log", "-1", "--format=%s|%an|%ae"],
-               cd: Path.join(base_dir, "identity")
-             )
-
-    assert result.manifest_warnings == [
-             "archetype coder still elects swift in identity/archetypes/coder.toml — " <>
-               "edit it before the next restart (boot validation is fail-closed)"
-           ]
-
-    expected =
-      "The skill \"swift\" has been removed from this org's library. " <>
-        "Disregard it, including anything from it already in your context."
-
-    assert {:ok, [["process:tightbeam", "[from process:tightbeam]\n\n" <> ^expected]]} =
-             DB.query(
-               ctx.db,
-               "SELECT origin, prompt FROM turns WHERE sessionKey = ?1",
-               [active.session_key]
-             )
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM turns WHERE sessionKey = ?1",
-               [retired.session_key]
-             )
-  end
-
-  @tag :skip
-  test "superseded missing skill-rm command", ctx do
-    base_dir = role_test_base("skill-rm-missing")
-    Archetypes.load!(base_dir)
-
-    remove = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["skill-rm"]
-
-    assert %{code: "unknown_skill", message: "unknown skill: missing"} =
-             remove.(%{origin: "user:flynn", params: %{name: "missing"}})
-
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
-  end
-
-  @tag :skip
-  test "superseded skill-list command", ctx do
-    base_dir = role_test_base("skill-list-member")
-    put_skill!(base_dir, "review", "# Review")
-    Archetypes.load!(base_dir)
-    list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["skill-list"]
-
-    assert %{skills: skills} = list.(%{origin: "user:flynn", params: %{}})
-    assert Enum.any?(skills, &(&1.name == "review"))
   end
 
   test "kungfu-scaffold is admin-tier and commits a real starter that composes cleanly", ctx do
@@ -2180,137 +2158,6 @@ defmodule Tightbeam.GatewayTest do
                "SELECT overrides, identityName FROM sessions WHERE sessionKey = ?1",
                [session.session_key]
              )
-  end
-
-  @tag :skip
-  test "superseded live home override projection",
-       ctx do
-    base_dir = role_test_base("override-pin")
-    put_skill!(base_dir, "review", "# Preserved review content")
-    base = Archetypes.load!(base_dir)["default"]
-
-    {:ok, overrides} =
-      Archetypes.normalize_overrides(base_dir, base, %{"skills_add" => ["review"]})
-
-    config =
-      gateway_config(base_dir, ctx.db, 0)
-      |> Map.put(:conn_registry, ctx.registry)
-      |> Map.put(:lane_manager, ctx.lane)
-
-    start_supervised!(%{
-      id: :override_pin_conn_registry,
-      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-    })
-
-    identity_name = Placement.identity_name(config, base, overrides, :claude)
-
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:override-pin",
-        display_name: "Pinned",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        overrides: overrides,
-        identity_name: identity_name,
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: "fable"
-      })
-
-    home = Placement.deliver_home(config, {:claude, identity_name, "testhost"})
-    old_stamp = File.read!(Path.join(home, ".tightbeam-manifest"))
-    marker = Path.join(home, "old-home-marker")
-    File.write!(marker, "remove on regeneration")
-
-    handlers = Gateway.handlers(config)
-    removed = handlers["skill-rm"].(%{origin: "user:flynn", params: %{name: "review"}})
-    assert removed.notified == [session.session_key]
-
-    pinned = Path.join([base_dir, "identity", "pinned", identity_name, "review", "SKILL.md"])
-    assert File.read!(pinned) == "# Preserved review content"
-    refute File.exists?(Path.join([Archetypes.skills_dir(base_dir), "review"]))
-
-    assert File.read_link!(Path.join(home, "skills/review")) == Path.dirname(pinned)
-    assert Org.get(ctx.db, session.session_key).identity_name == identity_name
-    refute File.exists?(marker)
-    refute File.read!(Path.join(home, ".tightbeam-manifest")) == old_stamp
-
-    manifest = home |> Path.join(".tightbeam-manifest") |> File.read!() |> JSON.decode!()
-
-    assert %{
-             "name" => "review",
-             "provenance" => "override",
-             "linkage" => "pinned"
-           } in manifest["skills"]
-
-    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
-
-    Application.put_env(:tightbeam, :hosts, %{
-      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: "/remote/tb/bin"}
-    })
-
-    parent = self()
-
-    sh = fn command ->
-      send(parent, {:pinned_command, command})
-      if "cat" in command, do: {"", 1}, else: {"", 0}
-    end
-
-    assert Placement.deliver_home(
-             Map.put(config, :sh, sh),
-             {:claude, identity_name, "worker"},
-             sh: sh
-           ) == "/remote/tb/homes/#{identity_name}/claude"
-
-    assert Enum.any?(collect_tagged_commands(:pinned_command, []), fn command ->
-             Enum.any?(command, &String.contains?(&1, "/identity/pinned/#{identity_name}/review"))
-           end)
-
-    preserved_prompt =
-      "The skill \"review\" was removed from the library, but your session elected it at " <>
-        "spawn, so your copy is preserved. Use \"tune\" override removal if you no longer want it."
-
-    assert {:ok, [["[from process:tightbeam]\n\n" <> ^preserved_prompt]]} =
-             DB.query(
-               ctx.db,
-               "SELECT prompt FROM turns WHERE sessionKey = ?1 ORDER BY seq LIMIT 1",
-               [session.session_key]
-             )
-
-    assert %{code: "denied"} =
-             handlers["tune"].(%{
-               origin: "user:other",
-               session_key: session.session_key,
-               params: %{setting: "remove_override", skill: "review"}
-             })
-
-    assert %{ok: true, identity_name: "default", overrides: nil} =
-             handlers["tune"].(%{
-               origin: "user:flynn",
-               session_key: session.session_key,
-               params: %{setting: "remove_override", skill: "review"}
-             })
-
-    updated = Org.get(ctx.db, session.session_key)
-    assert updated.overrides == nil
-    assert updated.identity_name == "default"
-    refute File.exists?(Path.join([base_dir, "identity", "pinned", identity_name]))
-
-    assert Enum.any?(Projection.list_after(ctx.db, session.session_key, nil, 100), fn message ->
-             String.starts_with?(message.content, "[context reset]")
-           end)
-
-    assert {:ok, [[tune_prompt]]} =
-             DB.query(
-               ctx.db,
-               "SELECT prompt FROM turns WHERE sessionKey = ?1 ORDER BY seq DESC LIMIT 1",
-               [session.session_key]
-             )
-
-    assert tune_prompt ==
-             "[from process:tightbeam]\n\nYour override \"review\" was removed by the operator; disregard it."
   end
 
   test "set_model applies a resident harness session before recording the selection", ctx do
@@ -4387,6 +4234,17 @@ defmodule Tightbeam.GatewayTest do
 
     File.rm_rf!(base_dir)
     File.mkdir_p!(base_dir)
+
+    # Adapters are infrastructure, not the readiness variable under test: spinup
+    # checks the adapter BEFORE credentials, so a test asking for a credentials
+    # denial needs the adapter present regardless. These used to be satisfied by a
+    # sibling checkout that happened to exist on the developer's machine (#46).
+    for bin <- ["claude-agent-acp", "codex-acp"] do
+      adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", bin])
+      File.mkdir_p!(Path.dirname(adapter))
+      File.write!(adapter, "#!/bin/sh\nexit 0\n")
+      File.chmod!(adapter, 0o755)
+    end
 
     if ready? do
       auth_dir = Path.join([base_dir, "auth", "claude"])

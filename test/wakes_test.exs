@@ -3,7 +3,7 @@ defmodule Tightbeam.WakesTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.{ConditionFacts, DB, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -11,6 +11,9 @@ defmodule Tightbeam.WakesTest do
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = ConditionFacts.ensure_schema(name)
     :ok = Wakes.ensure_schema(name)
+    # The undeliverable/failed paths record best-effort, which SWALLOWS a missing
+    # table — without this the lifecycle assertions below would pass vacuously.
+    :ok = EventLog.ensure_schema(name)
     %{db: name, scheduler: scheduler}
   end
 
@@ -103,7 +106,7 @@ defmodule Tightbeam.WakesTest do
     assert is_integer(fired_at)
   end
 
-  test "unknown internal consumer logs loudly and is dropped instead of retried", %{
+  test "unknown internal consumer is consumed as canceled, never claimed as fired", %{
     db: db,
     scheduler: scheduler
   } do
@@ -130,11 +133,27 @@ defmodule Tightbeam.WakesTest do
         assert :ok = Wakes.fire_due(scheduler)
       end)
 
-    assert log =~ "unknown internal consumer"
+    assert log =~ "undeliverable"
     assert log =~ "missing_consumer"
     assert length(Regex.scan(~r/missing_consumer/, log)) == 1
-    assert %{state: "fired", fired_at: fired_at} = Wakes.get(db, wake.wake_id)
-    assert is_integer(fired_at)
+
+    # CONSUMED, so the sweep does not spin on a code bug — but never claimed as
+    # delivered. `fired` is this substrate's word for delivered, and a wake nobody
+    # could deliver must not wear it: this path carries owner decision
+    # notifications, so a consumer-name typo would otherwise eat a decision
+    # request while the row said it was delivered.
+    assert %{state: "canceled", canceled_at: canceled_at, fired_at: nil} =
+             Wakes.get(db, wake.wake_id)
+
+    assert is_integer(canceled_at)
+
+    # The durable record carries WHY, since `canceled` alone cannot distinguish a
+    # deliberate cancel from an undeliverable wake.
+    assert [%{kind: "wake_undeliverable", subject: subject, detail: detail}] =
+             Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "wake_undeliverable"))
+
+    assert subject == wake.wake_id
+    assert detail =~ "missing_consumer"
   end
 
   test "exiting internal consumer leaves its wake pending and does not crash the scheduler", %{
@@ -159,9 +178,29 @@ defmodule Tightbeam.WakesTest do
         due_at: System.system_time(:millisecond)
       })
 
-    assert :ok = Wakes.fire_due(scheduler)
+    log = capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
+
     assert Process.alive?(scheduler_pid)
     assert Wakes.get(db, wake.wake_id).state == "pending"
+
+    # Retrying is correct — a consumer can fail transiently and succeed later.
+    # Retrying SILENTLY was not: a consumer raising every tick was
+    # indistinguishable from an idle scheduler, so each attempt is now recorded.
+    assert log =~ "consumer_boom"
+
+    assert [%{subject: subject, detail: detail}] =
+             Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "wake_delivery_failed"))
+
+    assert subject == wake.wake_id
+    assert detail =~ "consumer_boom"
+
+    # One row per attempt, so the repetition is itself visible.
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert length(
+             Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "wake_delivery_failed"))
+           ) ==
+             2
   end
 
   test "future wakes are not claimed", %{db: db, scheduler: scheduler} do

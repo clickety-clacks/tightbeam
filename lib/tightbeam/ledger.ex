@@ -48,6 +48,7 @@ defmodule Tightbeam.Ledger do
     jobRef     TEXT,
     model      TEXT,
     harness    TEXT,
+    replyAttention INTEGER NOT NULL DEFAULT 0,
     status     TEXT NOT NULL DEFAULT 'queued'
                CHECK (status IN ('queued','running','delivered','canceled',
                                  'failed','failed_unknown')),
@@ -78,7 +79,8 @@ defmodule Tightbeam.Ledger do
           "ALTER TABLE turns ADD COLUMN assignmentId TEXT",
           "ALTER TABLE turns ADD COLUMN jobRef TEXT",
           "ALTER TABLE turns ADD COLUMN model TEXT",
-          "ALTER TABLE turns ADD COLUMN harness TEXT"
+          "ALTER TABLE turns ADD COLUMN harness TEXT",
+          "ALTER TABLE turns ADD COLUMN replyAttention INTEGER NOT NULL DEFAULT 0"
         ] do
       case DB.query(db, ddl) do
         {:ok, _} -> :ok
@@ -326,7 +328,10 @@ defmodule Tightbeam.Ledger do
 
   defp probe_episode(%Txn{} = txn, seq) do
     episodes_exist? =
-      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudication_episodes'") ==
+      Txn.q(
+        txn,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudication_episodes'"
+      ) ==
         [[1]]
 
     with true <- episodes_exist?,
@@ -393,7 +398,9 @@ defmodule Tightbeam.Ledger do
         # Read before the UPDATE only for the seqs; the re-hold is keyed by seq
         # and so is order-independent.
         sessions_exist? =
-          Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [[1]]
+          Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [
+            [1]
+          ]
 
         Txn.q(
           txn,

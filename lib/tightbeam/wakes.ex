@@ -528,14 +528,10 @@ defmodule Tightbeam.Wakes do
           consumer ->
             case Map.fetch(consumers, consumer) do
               {:ok, internal_consumer} ->
-                attempt_delivery(fn -> internal_consumer.(wake) end)
+                attempt_internal_delivery(db, wake, internal_consumer)
 
               :error ->
-                Logger.error(
-                  "dropping wake #{wake.wake_id} for unknown internal consumer #{inspect(consumer)}"
-                )
-
-                mark_fired(db, wake.wake_id)
+                undeliverable(db, wake, "unknown internal consumer #{inspect(consumer)}")
                 false
             end
         end
@@ -547,6 +543,55 @@ defmodule Tightbeam.Wakes do
 
     evaluate_conditions(state, :tick)
     :ok
+  end
+
+  # A wake nobody can deliver is still CONSUMED — leaving it pending would spin the
+  # sweep forever on what is necessarily a code bug — but it is recorded as
+  # `canceled`, NEVER as `fired`. `fired` is this substrate's word for delivered,
+  # and claiming it for a delivery that never happened makes the durable row lie:
+  # this path carries owner decision notifications, so a consumer-name typo would
+  # silently eat a decision request while the record showed it delivered.
+  #
+  # No new state value: `canceled` already means "will not be delivered", and the
+  # named lifecycle row carries WHY. Recording is best-effort so an unavailable
+  # sink cannot fail the sweep, matching the swallow-but-write idiom in
+  # `Supervision.safe_evaluate/3`.
+  defp undeliverable(db, wake, reason) do
+    Logger.error("wake #{wake.wake_id} undeliverable: #{reason}")
+    transaction!(db, fn txn -> cancel_pending_in_txn(txn, wake.wake_id) end)
+    best_effort_lifecycle(db, "wake_undeliverable", wake.wake_id, reason)
+  end
+
+  # An internal consumer that RAISES keeps its wake pending, so the next tick
+  # retries it — correct, because a consumer can fail transiently and succeed
+  # later. What was wrong is that it retried in total silence: the `false` an
+  # internal delivery returns is discarded by the prompt-only `mark_fired` guard
+  # below, so a consumer raising on every tick was indistinguishable from an idle
+  # scheduler. One row per failed attempt, so the repetition is itself visible.
+  defp attempt_internal_delivery(db, wake, internal_consumer) do
+    internal_consumer.(wake)
+    true
+  rescue
+    error -> internal_delivery_failed(db, wake, Exception.message(error))
+  catch
+    kind, reason -> internal_delivery_failed(db, wake, inspect({kind, reason}))
+  end
+
+  defp internal_delivery_failed(db, wake, detail) do
+    Logger.error(
+      "internal wake consumer #{inspect(wake.consumer)} failed for #{wake.wake_id}: #{detail}"
+    )
+
+    best_effort_lifecycle(db, "wake_delivery_failed", wake.wake_id, detail)
+    false
+  end
+
+  defp best_effort_lifecycle(db, kind, subject, detail) do
+    EventLog.lifecycle(db, kind, subject, detail)
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   defp attempt_delivery(delivery) do

@@ -165,7 +165,7 @@ defmodule Tightbeam.Producers do
            %{} = holder <- Org.get(db, holder_key),
            :ok <- local_holder(config, holder),
            workdir <- Placement.holder_workdir(config, holder) do
-        run_local(job, workdir, runner)
+        run_local(db, job, workdir, runner)
       else
         nil -> {:error, "host-fail: holder unavailable"}
         {:error, reason} -> {:error, reason}
@@ -355,7 +355,7 @@ defmodule Tightbeam.Producers do
     if won?, do: :failed, else: :noop
   end
 
-  defp run_local(job, workdir, runner) do
+  defp run_local(db, job, workdir, runner) do
     shell = System.find_executable("sh") || "/bin/sh"
     env = minimal_env(workdir)
 
@@ -381,28 +381,39 @@ defmodule Tightbeam.Producers do
       )
 
     os_pid = port |> Port.info(:os_pid) |> elem(1)
+    # Capture identity while the group is still STOPped, before anything can
+    # signal it — this is the value every later signal is checked against.
+    started = process_started(os_pid)
 
     with :ok <- verify_process_group(os_pid),
-         :ok <- Tightbeam.ProducerRunner.register_process(runner, job.id, port, os_pid),
+         :ok <-
+           Tightbeam.ProducerRunner.register_process(runner, job.id, port, os_pid, started),
          :ok <- continue_process_group(os_pid) do
-      await_exit(port, System.monotonic_time(:millisecond) + job.timeout_ms, os_pid)
+      await_exit(
+        db,
+        job.id,
+        port,
+        System.monotonic_time(:millisecond) + job.timeout_ms,
+        os_pid,
+        started
+      )
     else
       :cancelled ->
-        kill_port(port, os_pid)
+        kill_port(db, job.id, port, os_pid, started)
         {:error, "cancelled"}
 
       {:error, reason} ->
-        kill_process(port, os_pid)
+        kill_process(db, job.id, port, os_pid, started)
         {:error, reason}
     end
   end
 
-  defp await_exit(port, deadline, process_group) do
+  defp await_exit(db, job_id, port, deadline, process_group, started) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
       {^port, {:data, _output}} ->
-        await_exit(port, deadline, process_group)
+        await_exit(db, job_id, port, deadline, process_group, started)
 
       {^port, {:exit_status, status}} ->
         {:ok, status}
@@ -411,7 +422,7 @@ defmodule Tightbeam.Producers do
         {:error, "cancelled"}
     after
       remaining ->
-        kill_port(port, process_group)
+        kill_port(db, job_id, port, process_group, started)
         {:error, "timeout"}
     end
   end
@@ -430,9 +441,9 @@ defmodule Tightbeam.Producers do
   defp kill(nil, _job_id), do: :ok
   defp kill(runner, job_id), do: Tightbeam.ProducerRunner.kill(runner, job_id)
 
-  defp kill_port(port, process_group) do
+  defp kill_port(db, job_id, port, process_group, started) do
     if Port.info(port) do
-      kill_process_group(process_group)
+      kill_process_group(db, job_id, process_group, started)
       Port.close(port)
     end
 
@@ -483,19 +494,118 @@ defmodule Tightbeam.Producers do
     _ -> {:error, "host-fail: producer process group unavailable"}
   end
 
-  defp kill_process(port, os_pid) do
-    System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
-    if Port.info(port), do: Port.close(port)
-    :ok
-  rescue
-    _ -> :ok
+  # A signal's ONLY failure channel on Unix is the exit status, so it must be read:
+  # a kill that failed is otherwise byte-identical to one that worked, and the job
+  # gets recorded cancelled while its process group keeps running in the holder's
+  # workdir — the database lying about what is running.
+  #
+  # Identity first, and the identity is the process START TIME, not the command
+  # line. The wrapper `exec`s, which rewrites argv completely — measured:
+  # `/bin/sh -c kill -STOP $$; exec ... tightbeam-producer /bin/sh sleep 5` becomes
+  # plain `sleep 5`. Comparing command lines therefore refuses EVERY signal after
+  # CONT, silently disabling cancellation (that is how the first cut of this fix
+  # broke two producer tests). Start time survives exec, is stable for the whole
+  # life of the process, and a recycled pid cannot share it; `ps -o lstart=` returns
+  # nothing once the process is gone. Resolution is one second, so a pid recycled
+  # within the same second as its predecessor would collide — vanishingly unlikely,
+  # and strictly better than signalling something unverified.
+  #
+  # Three outcomes, and the distinction is the point:
+  #   :signalled      — the signal was delivered and the kernel accepted it.
+  #   {:noop, why}    — the target is already gone (pid absent, or recycled and so
+  #                     no longer ours). Nothing to kill; cancel is achieved.
+  #   {:failed, why}  — the process is THERE and we did not kill it. The caller
+  #                     must not report a clean cancel.
+  defp signal_group(os_pid, expected_started, flag),
+    do: signal_target(os_pid, expected_started, flag, "-#{os_pid}")
+
+  defp signal_pid(os_pid, expected_started, flag),
+    do: signal_target(os_pid, expected_started, flag, Integer.to_string(os_pid))
+
+  defp signal_target(os_pid, nil, _flag, _target) do
+    # Nothing captured. If the process is gone there was never anything to kill; if
+    # it is STILL THERE we cannot prove it is ours, so refuse and say so.
+    case process_started(os_pid) do
+      nil -> {:noop, "pid #{os_pid} gone; no identity was captured"}
+      _ -> {:failed, "no captured start time — refused to signal an unverifiable pid"}
+    end
   end
 
-  defp kill_process_group(os_pid) do
-    System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
-    :ok
+  defp signal_target(os_pid, expected, flag, target) do
+    case process_started(os_pid) do
+      nil ->
+        {:noop, "pid #{os_pid} already gone"}
+
+      ^expected ->
+        deliver_signal(flag, target)
+
+      other ->
+        {:noop,
+         "pid #{os_pid} recycled — captured start #{inspect(expected)}, now " <>
+           "#{inspect(other)}; " <>
+           "NOT signalling"}
+    end
+  end
+
+  defp deliver_signal(flag, target) do
+    case System.cmd("kill", [flag, target], stderr_to_stdout: true) do
+      {_output, 0} -> :signalled
+      {output, code} -> {:failed, "kill #{flag} #{target} exited #{code}: #{String.trim(output)}"}
+    end
+  rescue
+    error -> {:failed, "kill #{flag} #{target} raised: #{Exception.message(error)}"}
+  catch
+    kind, reason -> {:failed, "kill #{flag} #{target} threw: #{inspect({kind, reason})}"}
+  end
+
+  defp process_started(os_pid) do
+    case System.cmd("ps", ["-o", "lstart=", "-p", Integer.to_string(os_pid)],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> String.trim(output)
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  # Named event row rather than a schema value: producer_jobs.state has no
+  # "cancel attempted, outcome unknown" member and inventing one is a migration.
+  # Idiom follows supervision.ex's best_effort_lifecycle — swallow, but leave a row.
+  defp kill_failed(nil, _job_id, _detail), do: :ok
+
+  defp kill_failed(db, job_id, detail) do
+    EventLog.lifecycle(db, "producer_kill_failed", to_string(job_id), detail)
   rescue
     _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp kill_process(db, job_id, port, os_pid, expected_started) do
+    outcome = signal_pid(os_pid, expected_started, "-KILL")
+    if Port.info(port), do: Port.close(port)
+
+    case outcome do
+      {:failed, why} -> kill_failed(db, job_id, "KILL pid #{os_pid}: #{why}")
+      _ -> :ok
+    end
+
+    outcome
+  end
+
+  @doc false
+  def kill_process_group(db, job_id, os_pid, expected_started) do
+    outcome = signal_group(os_pid, expected_started, "-TERM")
+
+    case outcome do
+      {:failed, why} -> kill_failed(db, job_id, "TERM group #{os_pid}: #{why}")
+      _ -> :ok
+    end
+
+    outcome
   end
 
   defp local_holder(config, holder) do
@@ -710,8 +820,8 @@ defmodule Tightbeam.ProducerRunner do
 
   def nudge(server \\ __MODULE__), do: GenServer.cast(server, :drain)
 
-  def register_process(server, job_id, port, os_pid),
-    do: GenServer.call(server, {:register_process, job_id, port, os_pid})
+  def register_process(server, job_id, port, os_pid, started),
+    do: GenServer.call(server, {:register_process, job_id, port, os_pid, started})
 
   def unregister_process(server, job_id),
     do: GenServer.cast(server, {:unregister_process, job_id})
@@ -751,8 +861,10 @@ defmodule Tightbeam.ProducerRunner do
   def handle_cast({:kill, job_id}, state) do
     state =
       case state.processes[job_id] do
-        %{port: port, os_pid: os_pid} ->
-          Task.start(fn -> best_effort_kill(port, os_pid) end)
+        %{port: port, os_pid: os_pid} = process ->
+          db = state.db
+          started = Map.get(process, :started)
+          Task.start(fn -> best_effort_kill(db, job_id, port, os_pid, started) end)
           state
 
         nil ->
@@ -765,11 +877,12 @@ defmodule Tightbeam.ProducerRunner do
   end
 
   @impl true
-  def handle_call({:register_process, job_id, port, os_pid}, _from, state) do
+  def handle_call({:register_process, job_id, port, os_pid, started}, _from, state) do
     if MapSet.member?(state.pending_kills, job_id) do
       {:reply, :cancelled, update_in(state.pending_kills, &MapSet.delete(&1, job_id))}
     else
-      {:reply, :ok, put_in(state.processes[job_id], %{port: port, os_pid: os_pid})}
+      {:reply, :ok,
+       put_in(state.processes[job_id], %{port: port, os_pid: os_pid, started: started})}
     end
   end
 
@@ -816,8 +929,12 @@ defmodule Tightbeam.ProducerRunner do
     end
   end
 
-  defp best_effort_kill(port, os_pid) do
-    System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+  # "Best effort" still owes an honest record: nothing awaits this Task, so an
+  # unobserved failure here is exactly how a job gets marked cancelled while its
+  # group keeps running. Producers.kill_process_group/4 reads the exit status and
+  # writes a producer_kill_failed row when the process is still there.
+  defp best_effort_kill(db, job_id, port, os_pid, started) do
+    Producers.kill_process_group(db, job_id, os_pid, started)
 
     if Port.info(port), do: Port.close(port)
     :ok

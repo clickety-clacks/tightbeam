@@ -56,7 +56,10 @@ defmodule Tightbeam.IdempotencyTest do
 
     # The staging table is gone and the widened CHECK is live.
     assert {:ok, [[0]]} =
-             DB.query(db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'wire_idempotency_old'")
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM sqlite_master WHERE name = 'wire_idempotency_old'"
+             )
 
     assert :ok =
              Idempotency.put(db, %{

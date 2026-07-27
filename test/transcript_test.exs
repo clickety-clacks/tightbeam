@@ -207,7 +207,10 @@ defmodule Tightbeam.TranscriptTest do
 
     # `--name` lastActivityAt reflects visible rows only.
     [candidate] = read(ctx, %{name: "Coder Session"}).candidates
-    {:ok, [[visible_at]]} = DB.query(ctx.db, "SELECT timestamp FROM messages WHERE id = ?1", [List.last(fresh)])
+
+    {:ok, [[visible_at]]} =
+      DB.query(ctx.db, "SELECT timestamp FROM messages WHERE id = ?1", [List.last(fresh)])
+
     assert candidate.last_activity_at == visible_at
   end
 
@@ -303,7 +306,10 @@ defmodule Tightbeam.TranscriptTest do
     assert %{"result" => %{"sessionKey" => "owned"}} = JSON.decode!(ok.resp_body)
 
     {:ok, [[event_session_key]]} =
-      DB.query(ctx.db, "SELECT sessionKey FROM events WHERE verb = 'transcript' AND kind = 'verb'")
+      DB.query(
+        ctx.db,
+        "SELECT sessionKey FROM events WHERE verb = 'transcript' AND kind = 'verb'"
+      )
 
     assert is_nil(event_session_key)
 
@@ -328,7 +334,12 @@ defmodule Tightbeam.TranscriptTest do
       # A number, a boolean and an object — the same gap as null.
       %{verb: "transcript", asUser: "flynn", sessionKey: 42, params: %{sessionKey: "owned"}},
       %{verb: "transcript", asUser: "flynn", sessionKey: true, params: %{sessionKey: "owned"}},
-      %{verb: "transcript", asUser: "flynn", sessionKey: %{key: "owned"}, params: %{sessionKey: "owned"}}
+      %{
+        verb: "transcript",
+        asUser: "flynn",
+        sessionKey: %{key: "owned"},
+        params: %{sessionKey: "owned"}
+      }
     ]
 
     before_events = verb_event_count(ctx.db)
@@ -376,7 +387,12 @@ defmodule Tightbeam.TranscriptTest do
         "UPDATE turns SET model='fable', harness='claude', assignmentId='asg_1', jobRef='wi_1' WHERE seq=#{turn_seq}"
       )
 
-    reply_id = message!(ctx.db, "owned", "assistant", "the real reply", reply_to: prompt_id, sender: "tightbeam")
+    reply_id =
+      message!(ctx.db, "owned", "assistant", "the real reply",
+        reply_to: prompt_id,
+        sender: "tightbeam"
+      )
+
     marker_id = message!(ctx.db, "owned", "assistant", "[context cleared]")
 
     page = read(ctx, %{session_key: "owned", limit: 50})
@@ -474,7 +490,10 @@ defmodule Tightbeam.TranscriptTest do
     refute raw_payload(ctx.db, "verb") =~ body
 
     {:ok, [[event_session_key]]} =
-      DB.query(ctx.db, "SELECT sessionKey FROM events WHERE kind = 'verb' AND verb = 'transcript'")
+      DB.query(
+        ctx.db,
+        "SELECT sessionKey FROM events WHERE kind = 'verb' AND verb = 'transcript'"
+      )
 
     assert is_nil(event_session_key)
   end

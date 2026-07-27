@@ -4,9 +4,81 @@ defmodule Tightbeam.Harness.Claude do
 
   alias Tightbeam.Harness.Support
 
+  require Logger
+
   @adapter_version "0.59.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
+
+  # NOTE FOR FUTURE AGENTS — the claude model vocabulary is NARROWER than the catalog.
+  #
+  # The derived catalog for claude comes from the Anthropic API (`fetch_catalog/1` hits
+  # `/v1/models`), which currently lists 11 models. The claude ACP adapter's
+  # `session/set_config_option {configId: "model"}` accepts only SEVEN values, and
+  # `Acp.Adapter.parse_model_ref/1` strips nothing but an `[effort]` suffix — the base
+  # string goes to the adapter verbatim, so there is NO translation layer to fix. A model
+  # the adapter refuses fails the apply, which runs after EVERY `session/new` and every
+  # `session/load` (never-trust-the-advertised-model), so it recurs on resume, not just
+  # spawn.
+  #
+  # RECORDED LIVE 2026-07-26 against: claude CLI 2.1.220, claude-agent-acp 0.59.0,
+  # @anthropic-ai/claude-agent-sdk 0.3.207. Probe each value with
+  # `session/set_config_option` before trusting this table — it WILL rot, because the
+  # accepted set is whatever the installed CLI currently offers.
+  #
+  #   ACCEPTED  alias `default`  -> Sonnet 5      (same as `sonnet`)
+  #   ACCEPTED  alias `sonnet`   -> Sonnet 5
+  #   ACCEPTED  alias `opus`     -> Opus 4.8      (NOT Opus 5 — see below)
+  #   ACCEPTED  alias `haiku`    -> Haiku 4.5
+  #   ACCEPTED  id `claude-sonnet-5`
+  #   ACCEPTED  id `claude-opus-4-8`
+  #   ACCEPTED  id `claude-haiku-4-5-20251001`
+  #   REJECTED  claude-opus-5, claude-fable-5, claude-opus-4-7, claude-sonnet-4-6,
+  #             claude-opus-4-6, claude-opus-4-5-20251101, claude-sonnet-4-5-20250929,
+  #             claude-opus-4-1-20250805, and the bare alias `fable`
+  #
+  # The accepted ids are EXACTLY the three models the aliases currently resolve to. So
+  # this is not an API-vs-CLI version lag that a mapping table can paper over: the
+  # adapter only accepts the models it is presently offering, by either name.
+  #
+  # WHY THERE IS NO SUBSTITUTION MAP HERE, deliberately: every candidate substitution is
+  # a silent downgrade. `claude-opus-5` -> `opus` delivers Opus 4.8, a different and
+  # older model. `claude-fable-5` has NO equivalent on this adapter version at all.
+  # Mapping either would make a request appear to succeed while delivering something
+  # else, which is the one outcome worse than failing. If a requested claude model is not
+  # in the ACCEPTED list above, it must fail and say so — do not quietly rewrite it.
+  #
+  # WHEN THIS ROTS (a new alias appears, or an accepted value stops being accepted):
+  # re-probe the adapter rather than editing from a changelog. Boot
+  # `node <adapters>/claude-agent-acp`, `initialize`, `session/new`, then read the
+  # `model` entry of the returned `configOptions` for the offered set, and confirm each
+  # candidate with `session/set_config_option`. Update this table and the version stamp
+  # together.
+  #
+  # ALSO GRANT- AND HOME-DEPENDENT, not only version-dependent. A smoke run recorded
+  # opus-5 and fable-5 "refused on this grant", and JOURNAL.md:804 records the offered
+  # list changing with the home's `settings.json` and the session cwd. So this table
+  # pins THREE things at once, and a different account may legitimately accept more.
+  # That is why the set is injectable (`claude_selectable_models` in the catalog's
+  # options, `:all` to disable) rather than only editable here.
+  #
+  # ON CODEX, qualified: codex reads its catalog from the CLI's own
+  # `models_cache.json` (codex.ex), so its two vocabularies share one artifact and
+  # divergence is structurally unlikely. But acceptance still happens in the external
+  # ACP/CLI process (`acp/adapter.ex` set_config_option), which this repo does not
+  # observe, so "cannot diverge" is NOT proven here — it is unprobed analysis. Nobody
+  # has run the equivalent probe against codex-acp.
+  @adapter_selectable_models ~w(default sonnet opus haiku claude-sonnet-5 claude-opus-4-8
+                                claude-haiku-4-5-20251001)
+
+  @doc """
+  Model values this adapter version accepts at `session/set_config_option`.
+
+  Narrower than the derived catalog — see the note above the attribute. Anything outside
+  this list is refused by the adapter; it is never silently substituted.
+  """
+  def adapter_selectable_models, do: @adapter_selectable_models
+
   @adapter_replacements [
     {
       "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
@@ -235,6 +307,7 @@ defmodule Tightbeam.Harness.Claude do
          {:ok, models} <- decode_catalog(body),
          {:ok, models} <- fill_capabilities(models, headers, fetch),
          {:ok, entries} <- derive_catalog_entries(models),
+         entries <- keep_selectable(entries, selectable_models(state)),
          entries when entries != [] <- entries do
       {:ok, entries}
     else
@@ -242,6 +315,52 @@ defmodule Tightbeam.Harness.Claude do
       false -> {:error, :missing_token}
       [] -> {:error, :empty_inventory}
       _ -> {:error, :malformed_catalog}
+    end
+  end
+
+  # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
+  # the already-derived entries — no probe, no extra fetch, nothing at boot; the
+  # journal records this path being reverted once for adding live I/O, so it stays
+  # a filter. Effort suffixes are preserved: only the base ref is matched.
+  #
+  # This is a PIN, and it pins three things at once — the CLI version, the grant
+  # (a smoke run recorded opus-5 "refused on this grant"), and any model pins in
+  # the projected home's settings.json. When claude ships a version that accepts
+  # more, or a different grant offers more, THE TABLE is what to re-probe and
+  # update; nothing here discovers it. See the note on @adapter_selectable_models.
+  # Injectable through the same `state.options` seam as claude_fetch/codex_read/
+  # credential_status, for two reasons: a test must be able to exercise catalog
+  # derivation without being coupled to this table, and an operator on a DIFFERENT
+  # GRANT (the accepted set is grant-dependent — a smoke run recorded opus-5
+  # "refused on this grant") must be able to lift the ceiling without editing code.
+  # `:all` disables the filter entirely.
+  defp selectable_models(state),
+    do: Map.get(state.options, :claude_selectable_models, @adapter_selectable_models)
+
+  defp keep_selectable(entries, :all), do: entries
+
+  defp keep_selectable(entries, selectable) do
+    {kept, dropped} =
+      Enum.split_with(entries, fn entry ->
+        entry.ref |> base_ref() |> Kernel.in(selectable)
+      end)
+
+    if dropped != [] do
+      Logger.info(
+        "claude catalog: #{length(dropped)} model(s) the API offers are not selectable by " <>
+          "claude-agent-acp #{@adapter_version} and were withheld: " <>
+          Enum.map_join(dropped, ", ", & &1.ref) <>
+          " — re-probe @adapter_selectable_models in harness/claude.ex if this looks wrong"
+      )
+    end
+
+    kept
+  end
+
+  defp base_ref(ref) do
+    case Regex.run(~r/^(.*?)\[(.*?)\]$/, ref) do
+      [_, base, _effort] -> base
+      _ -> ref
     end
   end
 
@@ -366,7 +485,12 @@ defmodule Tightbeam.Harness.Claude do
           end
         end
 
-        %{base_dir: base, options: %{claude_fetch: fetch}}
+        # The vector's subject is catalog DERIVATION — provider stamping and the
+        # exact source error — using a synthetic model id. The selectable pin is a
+        # separate concern with its own tests, so it is disabled here; leaving it on
+        # would filter `claude-vector` away and turn a derivation vector into a test
+        # of the table.
+        %{base_dir: base, options: %{claude_fetch: fetch, claude_selectable_models: :all}}
       end,
       wire_projection: %{
         "id" => "claude",
@@ -512,18 +636,18 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   defp adapter_binary(target) do
+    # One path for both localities, as fixture.ex already does: the adapter lives
+    # under the host's own base_dir. The local branch used to point at a sibling
+    # checkout of the RETIRED TypeScript project, so the gateway's turn path
+    # depended on a directory nothing in this repo owns or installs.
     Map.get(target, :adapter_binary) ||
-      if Support.local?(target) do
-        Path.expand("../tightbeam/node_modules/.bin/claude-agent-acp", File.cwd!())
-      else
-        Path.join([
-          target.host_config.base_dir,
-          "adapters",
-          "node_modules",
-          ".bin",
-          "claude-agent-acp"
-        ])
-      end
+      Path.join([
+        target.host_config.base_dir,
+        "adapters",
+        "node_modules",
+        ".bin",
+        "claude-agent-acp"
+      ])
   end
 
   defp patch_remote(target, path, detail) do

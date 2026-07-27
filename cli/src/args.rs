@@ -125,6 +125,10 @@ pub enum Command {
         identity: Identity,
         work_item_id: String,
     },
+    Attend {
+        identity: Identity,
+        high: bool,
+    },
     Transcript {
         identity: Identity,
         session: Option<String>,
@@ -132,6 +136,15 @@ pub enum Command {
         before: Option<String>,
         after: Option<String>,
         limit: Option<String>,
+    },
+    Toplines {
+        identity: Identity,
+        filters: ToplineFilters,
+        tree: bool,
+    },
+    Topline {
+        identity: Identity,
+        selection: ToplineSelection,
     },
     WorkItemIcebox {
         identity: Identity,
@@ -206,6 +219,36 @@ pub enum Command {
         value: String,
     },
     Assimilate(AssimilateArgs),
+}
+
+/// `topline`'s two selections. Assignment selection carries NO filters: the spec
+/// scopes roster filters to the roster and `--under`, and assignment selection has
+/// no filter surface at all. Making that a TYPE distinction rather than a runtime
+/// check is deliberate — re-attaching filters to assignment mode is a compile
+/// error, not a request that succeeds while quietly ignoring half of what was
+/// asked (found in code review of the first cut, which sent filters the reader
+/// then discarded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToplineSelection {
+    Under {
+        work_item_id: String,
+        filters: ToplineFilters,
+    },
+    Assignments(Vec<String>),
+}
+
+/// Roster filters, identical for `toplines` and `topline --under`. They select
+/// which authorized nodes APPEAR; they never change authorization, edge
+/// derivation, or causal reachability.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToplineFilters {
+    pub origin: Option<String>,
+    pub owner: Option<String>,
+    pub state: Option<String>,
+    pub quiet_over_ms: Option<String>,
+    pub spec: Option<String>,
+    pub spec_sha: Option<String>,
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +336,10 @@ COMMANDS:
       idempotent (same key returns the same item).
   work-item-get <workItemId>
   work-item-trace <workItemId>
+  attend [--high]
+      Elect the attention tier of the reply you are about to give, during your
+      own turn. --high marks it high; without the flag it is normal, which is
+      also what electing nothing gives you. Two tiers, no others.
   transcript (--session <key> | --name <displayName>)
              [--before <messageId> | --after <messageId>] [--limit <n>]
       Read a session's conversation from the substrate's own rows. --name is a
@@ -300,6 +347,25 @@ COMMANDS:
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
+  toplines [--origin user|session|all] [--owner <userId>] [--state <state>]
+           [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
+           [--session <key>] [--tree]
+      The work telemetry the substrate already knows: every work item you can
+      see, with its assignment/job/attest/turn counts, who holds it, whether
+      anything is running, and how long it has been quiet. --tree renders the
+      causal forest instead of a flat roster. Parent edges are derived from the
+      turn that was RUNNING when each item was created, so they record
+      concurrency, not proven causality — every node states its own
+      epistemic status (linked, from_turn, no_turn_observed, unrecorded).
+      No percentages and no completion estimates: the rows do not support them.
+        tightbeam toplines --origin user --state open --as-user flynn
+        tightbeam toplines --quiet-over 2h --as-user flynn
+  topline (--under <workItemId> [roster filters] | --assignments <id,...>)
+      --under walks one item's causal subtree (the anchor plus its visible
+      linked descendants). --assignments names an explicit assignment set and
+      reports the items they resolve to; an assignment belonging to no item
+      comes back in noItem rather than being silently dropped.
+        tightbeam topline --under wi_abc123 --as-user flynn
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -399,7 +465,7 @@ pub fn render_help(catalog: Option<&HarnessCatalog>) -> String {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
-    "abort", "all", "dry-run", "help", "json", "manifest", "resolve", "rm",
+    "abort", "all", "dry-run", "help", "json", "manifest", "resolve", "rm", "tree",
 ];
 
 #[derive(Debug)]
@@ -455,6 +521,10 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
 }
 
 pub fn parse_after(text: &str) -> Result<String, String> {
+    parse_duration("after", text)
+}
+
+fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
     let (digits, multiplier) = if let Some(value) = text.strip_suffix("ms") {
         (value, 1.0)
     } else if let Some(value) = text.strip_suffix('s') {
@@ -464,10 +534,10 @@ pub fn parse_after(text: &str) -> Result<String, String> {
     } else if let Some(value) = text.strip_suffix('h') {
         (value, 3_600_000.0)
     } else {
-        return Err(bad_after(text));
+        return Err(bad_duration(flag, text));
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(bad_after(text));
+        return Err(bad_duration(flag, text));
     }
     let value = digits
         .parse::<f64>()
@@ -475,8 +545,52 @@ pub fn parse_after(text: &str) -> Result<String, String> {
     Ok(js_number_json(value * multiplier))
 }
 
-fn bad_after(text: &str) -> String {
-    format!("bad --after value: {text} (use e.g. 30s, 5m, 2h)")
+const TOPLINES_USAGE: &str = "usage: tightbeam toplines [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
+
+const TOPLINE_USAGE: &str = "usage: tightbeam topline (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+
+/// Every roster-filter flag, in one place, so the assignment-mode refusal and the
+/// filter builder cannot drift apart.
+const ROSTER_FILTER_FLAGS: &[&str] = &[
+    "origin",
+    "owner",
+    "state",
+    "quiet-over",
+    "spec",
+    "spec-sha",
+    "session",
+];
+
+fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, String> {
+    // The origin enum is closed HERE: the reader treats anything but user or
+    // session as "all", so an unrecognised value must never reach it silently.
+    let origin = nonempty(flags, "origin");
+    if let Some(value) = &origin {
+        if !matches!(value.as_str(), "user" | "session" | "all") {
+            return Err(format!(
+                "bad --origin value: {value} (use user, session, or all)"
+            ));
+        }
+    }
+    // --spec-sha narrows a --spec cohort; alone it selects nothing nameable.
+    if flags.contains_key("spec-sha") && nonempty(flags, "spec").is_none() {
+        return Err("--spec-sha requires --spec <name>".to_owned());
+    }
+    Ok(ToplineFilters {
+        origin,
+        owner: nonempty(flags, "owner"),
+        state: nonempty(flags, "state"),
+        quiet_over_ms: nonempty(flags, "quiet-over")
+            .map(|value| parse_duration("quiet-over", &value))
+            .transpose()?,
+        spec: nonempty(flags, "spec"),
+        spec_sha: nonempty(flags, "spec-sha"),
+        session: nonempty(flags, "session"),
+    })
+}
+
+fn bad_duration(flag: &str, text: &str) -> String {
+    format!("bad --{flag} value: {text} (use e.g. 30s, 5m, 2h)")
 }
 
 fn number_coercion(text: &str) -> f64 {
@@ -873,6 +987,15 @@ fn parse_with_optional_catalog(
                 work_item_id: parsed.positional[1].clone(),
             })
         }
+        "attend" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam attend [--high]".to_owned());
+            }
+            Ok(Command::Attend {
+                identity: identity(flags)?,
+                high: flags.contains_key("high"),
+            })
+        }
         "transcript" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam transcript (--session <key> | --name <displayName>) [--before <messageId> | --after <messageId>] [--limit <n>]".to_owned());
@@ -902,6 +1025,71 @@ fn parse_with_optional_catalog(
                 // a JSON number so the handler receives an integer, not a string.
                 limit: nonempty(flags, "limit")
                     .map(|value| js_number_json(number_coercion(&value))),
+            })
+        }
+        "toplines" => {
+            if parsed.positional.len() != 1 {
+                return Err(TOPLINES_USAGE.to_owned());
+            }
+            Ok(Command::Toplines {
+                identity: identity(flags)?,
+                filters: topline_filters(flags)?,
+                tree: flags.contains_key("tree"),
+            })
+        }
+        "topline" => {
+            if parsed.positional.len() != 1 {
+                return Err(TOPLINE_USAGE.to_owned());
+            }
+            let under = nonempty(flags, "under");
+            // Two different selections, never guessed between: --under walks the
+            // causal forest, --assignments names an explicit assignment set.
+            let assignments = flags.get("assignments").map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
+            let selection = match (under, assignments) {
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(
+                        "topline requires exactly one of --under <workItemId> or --assignments <id,...>"
+                            .to_owned(),
+                    )
+                }
+                // Empty input is a USAGE error, not an empty result: the caller
+                // named a set and named nothing in it.
+                (None, Some(ids)) if ids.is_empty() => {
+                    return Err("--assignments requires at least one assignment id".to_owned())
+                }
+                (None, Some(ids)) => {
+                    // Refuse EARLY and LOUDLY. Accepting a filter here and dropping
+                    // it later would promise a narrowing the contract cannot make:
+                    // `--assignments X --state closed` would happily return an OPEN
+                    // item. Naming the offered flags beats a generic usage line.
+                    let offered = ROSTER_FILTER_FLAGS
+                        .iter()
+                        .filter(|flag| flags.contains_key(**flag))
+                        .map(|flag| format!("--{flag}"))
+                        .collect::<Vec<_>>();
+                    if !offered.is_empty() {
+                        return Err(format!(
+                            "--assignments selects an explicit assignment set and takes no roster filters; drop {}",
+                            offered.join(", ")
+                        ));
+                    }
+                    ToplineSelection::Assignments(ids)
+                }
+                (Some(work_item_id), None) => ToplineSelection::Under {
+                    work_item_id,
+                    filters: topline_filters(flags)?,
+                },
+            };
+            Ok(Command::Topline {
+                identity: identity(flags)?,
+                selection,
             })
         }
         "work-item-icebox" => {
@@ -1042,7 +1230,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
         )),
     }
 }
@@ -1259,7 +1447,10 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "attend",
                 "transcript",
+                "topline",
+                "toplines",
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
@@ -1357,6 +1548,124 @@ mod tests {
         ));
     }
 
+    // The blocking code-review finding on the first cut: the CLI attached roster
+    // filters to BOTH topline modes and sent them, while the reader selects solely
+    // by assignment id — so `--assignments X --state closed` could return an OPEN
+    // item after the CLI had promised the filter was applied.
+    #[test]
+    fn assignment_selection_refuses_every_roster_filter() {
+        for (flag, value) in [
+            ("origin", "user"),
+            ("owner", "flynn"),
+            ("state", "closed"),
+            ("quiet-over", "2h"),
+            ("spec", "topline-map-v1"),
+            ("spec-sha", &"a".repeat(64)[..]),
+            ("session", "agent:coder:app"),
+        ] {
+            let error = parse(strings(&[
+                "topline",
+                "--assignments",
+                "asg_x",
+                &format!("--{flag}"),
+                value,
+                "--as-user",
+                "flynn",
+            ]))
+            .expect_err(&format!("--{flag} must be refused in assignment mode"));
+
+            assert!(
+                error.contains("takes no roster filters") && error.contains(&format!("--{flag}")),
+                "refusal must NAME the offered flag, got: {error}"
+            );
+        }
+    }
+
+    // The structural half: assignment selection has no filters field, so nothing
+    // can be attached to it, and the built request carries only the id list. This
+    // is what fails if someone re-attaches filters to this mode.
+    #[test]
+    fn assignment_selection_sends_only_the_id_list() {
+        let command = parse(strings(&[
+            "topline",
+            "--assignments",
+            "asg_a,asg_b",
+            "--as-user",
+            "flynn",
+        ]))
+        .expect("bare assignment selection parses");
+
+        assert_eq!(
+            command,
+            Command::Topline {
+                identity: Identity::User("flynn".to_owned()),
+                selection: ToplineSelection::Assignments(vec![
+                    "asg_a".to_owned(),
+                    "asg_b".to_owned()
+                ]),
+            }
+        );
+
+        let body = crate::dispatch::build_request(&command)
+            .expect("assignment selection dispatches")
+            .body_json;
+
+        assert!(
+            body.contains(r#""assignments":["asg_a","asg_b"]"#),
+            "got {body}"
+        );
+
+        for absent in [
+            "origin",
+            "owner",
+            "state",
+            "quietOver",
+            "spec",
+            "specSha",
+            "session",
+        ] {
+            assert!(
+                !body.contains(&format!("\"{absent}\"")),
+                "assignment mode must send no roster filter, found {absent} in {body}"
+            );
+        }
+    }
+
+    // --under keeps its filters: the fix narrows assignment mode ONLY.
+    #[test]
+    fn under_selection_still_carries_roster_filters() {
+        let command = parse(strings(&[
+            "topline",
+            "--under",
+            "wi_abc",
+            "--state",
+            "closed",
+            "--origin",
+            "user",
+            "--as-user",
+            "flynn",
+        ]))
+        .expect("--under with filters parses");
+
+        match &command {
+            Command::Topline {
+                selection: ToplineSelection::Under { filters, .. },
+                ..
+            } => {
+                assert_eq!(filters.state.as_deref(), Some("closed"));
+                assert_eq!(filters.origin.as_deref(), Some("user"));
+            }
+            other => panic!("expected --under selection, got {other:?}"),
+        }
+
+        let body = crate::dispatch::build_request(&command)
+            .expect("under selection dispatches")
+            .body_json;
+
+        assert!(body.contains(r#""under":"wi_abc""#), "got {body}");
+        assert!(body.contains(r#""state":"closed""#), "got {body}");
+    }
+
     #[test]
     fn parses_all_duration_units() {
         assert_eq!(parse_after("30s"), Ok("30000".to_owned()));
@@ -1442,7 +1751,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, transcript, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
         );
     }
 

@@ -64,6 +64,16 @@ defmodule Tightbeam.RailRemedyTest do
 
     File.mkdir_p!(Path.join(base_dir, "identity/rules"))
 
+    # Spawn readiness checks for an adapter under this base_dir. It used to resolve
+    # to a sibling checkout that happened to exist on the developer's machine (#46),
+    # so these spawn-remedy tests passed without ever staging one.
+    for bin <- ["claude-agent-acp", "codex-acp"] do
+      adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", bin])
+      File.mkdir_p!(Path.dirname(adapter))
+      File.write!(adapter, "#!/bin/sh\nexit 0\n")
+      File.chmod!(adapter, 0o755)
+    end
+
     handlers =
       Gateway.handlers(%{
         db: db,

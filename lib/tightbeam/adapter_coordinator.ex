@@ -432,7 +432,14 @@ defmodule Tightbeam.AdapterCoordinator do
 
         # Boot is LAZY: a spawned pid proves nothing. failures/circuit are
         # reset only by {:adapter_ready, key} — the completed-boot signal.
-        entry = %{entry | pid: pid, monitor: ref, generation: generation, timer: nil, ready: false}
+        entry = %{
+          entry
+          | pid: pid,
+            monitor: ref,
+            generation: generation,
+            timer: nil,
+            ready: false
+        }
 
         state = %{
           state
@@ -447,7 +454,12 @@ defmodule Tightbeam.AdapterCoordinator do
         circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
 
-        timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(state, failures))
+        timer =
+          Process.send_after(
+            self(),
+            {:restart_adapter, key, generation},
+            backoff(state, failures)
+          )
 
         entry = %{
           entry
@@ -476,7 +488,8 @@ defmodule Tightbeam.AdapterCoordinator do
     }
   end
 
-  defp backoff(state, failures), do: min(state.backoff_base_ms * Integer.pow(2, max(failures - 1, 0)), 60_000)
+  defp backoff(state, failures),
+    do: min(state.backoff_base_ms * Integer.pow(2, max(failures - 1, 0)), 60_000)
 
   defp grant_slot(borrower, state) do
     slot = make_ref()

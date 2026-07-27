@@ -117,7 +117,11 @@ defmodule Tightbeam.ProjectionTest do
     {:appended, _} =
       Projection.append(db, %{session_key: "OTHER", role: "assistant", content: "noise"})
 
-    assert Enum.map(Projection.list_after(db, "k1", nil, 10), & &1.content) == ["one", "two", "three"]
+    assert Enum.map(Projection.list_after(db, "k1", nil, 10), & &1.content) == [
+             "one",
+             "two",
+             "three"
+           ]
 
     assert Enum.map(Projection.list_after(db, "k1", hd(messages).id, 10), & &1.content) == [
              "two",

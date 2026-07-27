@@ -284,7 +284,12 @@ defmodule Tightbeam.Gateway do
 
     on_adapter_ready = fn key_name, token ->
       Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-        adapter_healed(heal_config, db, Adjudication.adapter_fault_cause_for_name(key_name), token)
+        adapter_healed(
+          heal_config,
+          db,
+          Adjudication.adapter_fault_cause_for_name(key_name),
+          token
+        )
       end)
 
       :ok
@@ -695,6 +700,9 @@ defmodule Tightbeam.Gateway do
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
       "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       "transcript" => fn call -> Tightbeam.Transcript.read(db, call) end,
+      "attend" => fn call -> attend_result(db, call) end,
+      "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
+      "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
@@ -1180,14 +1188,36 @@ defmodule Tightbeam.Gateway do
     if File.exists?(rust_cli) do
       File.cp!(rust_cli, wrapper)
     else
-      entry = Path.expand("../tightbeam/dist/cli/main.js", File.cwd!())
-      File.write!(wrapper, "#!/bin/sh\nexec node \"#{entry}\" \"$@\"\n")
+      # There is NO fallback. There used to be one, to the retired TypeScript CLI
+      # in a sibling checkout: on a machine that had that checkout the operator
+      # silently got a different implementation than the gateway that installed
+      # it, and on a machine without it an executable that died on a path they
+      # never chose. A fallback to a retired implementation only ever fires where
+      # nobody is watching, so it is gone.
+      Logger.warning(
+        "tightbeam CLI not built: #{rust_cli} is missing, so #{wrapper} will refuse " <>
+          "to run. Build it with: cargo build --release --manifest-path cli/Cargo.toml"
+      )
+
+      File.write!(wrapper, refusing_wrapper(rust_cli))
     end
 
     File.chmod!(wrapper, 0o755)
     Enum.each(Harness.all(), fn module -> :ok = module.install_cli_projection(bin_dir) end)
 
     bin_dir
+  end
+
+  # `bin/tightbeam` still EXISTS when the CLI was not built, because its absence
+  # is itself confusing — but it does exactly one thing: say what is missing and
+  # how to build it.
+  defp refusing_wrapper(rust_cli) do
+    """
+    #!/bin/sh
+    echo "tightbeam CLI is not installed: #{rust_cli} was missing when the gateway booted." >&2
+    echo "Build it with: cargo build --release --manifest-path cli/Cargo.toml" >&2
+    exit 127
+    """
   end
 
   defp turn_runner(config) do
@@ -1234,7 +1264,10 @@ defmodule Tightbeam.Gateway do
         with {:ok, adapter, generation} <-
                stage(:checkout, checkout_adapter(session)),
              {:ok, harness_session_id} <-
-               stage(:session, harness_session(config, db, adapter, generation, session, turn.seq)),
+               stage(
+                 :session,
+                 harness_session(config, db, adapter, generation, session, turn.seq)
+               ),
              {:ok, result} <-
                stage(
                  :prompt,
@@ -1243,16 +1276,22 @@ defmodule Tightbeam.Gateway do
                    harness_session_id,
                    turn.prompt,
                    600_000,
-                   progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation)
+                   progress:
+                     progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                  )
                ) do
+          # THE reply seam. The agent elected an attention tier for this turn (or
+          # elected nothing, which is normal); the substrate copies the election
+          # onto the reply it is appending. Marker and credential-transition
+          # appends are not this seam and stay normal.
           case Projection.append(db, %{
                  session_key: turn.session_key,
                  role: "assistant",
                  content: result.text,
                  sender: "tightbeam",
                  reply_to_message_id: echo && echo.id,
-                 reply_to_client_message_id: echo && echo.client_message_id
+                 reply_to_client_message_id: echo && echo.client_message_id,
+                 attention_tier: elected_attention(db, turn.seq)
                }) do
             {:appended, reply} -> publish_message(db, turn.session_key, reply)
             _ -> :ok
@@ -1733,7 +1772,12 @@ defmodule Tightbeam.Gateway do
   # Without this, a fast-failing boot reaches the turn as an unactionable
   # ":noproc" (spec s4-operability-v1 §Defect 1: the reason must name the
   # spawn error).
-  defp enrich_adapter_unavailable(config, {:error, {:adapter_unavailable, :noproc}}, key, generation) do
+  defp enrich_adapter_unavailable(
+         config,
+         {:error, {:adapter_unavailable, :noproc}},
+         key,
+         generation
+       ) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
     # ATTEMPT-SCOPED: ask only for the death of the generation this turn checked
@@ -2911,7 +2955,25 @@ defmodule Tightbeam.Gateway do
         {:error,
          %{
            code: "model_unavailable",
-           message: "model #{inspect(model)} is not offered by #{harness}"
+           message:
+             "model #{inspect(model)} is not offered by #{harness}" <>
+               offered_models_hint(harness)
+         }}
+
+      %{health: {:unavailable, {:needs_onboarding, reason}}} ->
+        warn_dead_default(harness, model, configured_default?)
+        provider = Harness.parse!(harness).credential_provider()
+        gateway = Placement.local_host_name()
+
+        {:error,
+         %{
+           code: "catalog_unavailable",
+           message:
+             "cannot validate model #{inspect(model)} for #{harness}: no #{harness} model " <>
+               "catalog, because #{provider} has no usable credential on GATEWAY host " <>
+               "#{gateway} (#{inspect(reason)}). The gateway derives every harness's catalog " <>
+               "on its own host, so it needs its own #{provider} grant regardless of where " <>
+               "sessions are placed; run tightbeam onboard #{provider} on #{gateway}"
          }}
 
       %{health: health} ->
@@ -2926,6 +2988,19 @@ defmodule Tightbeam.Gateway do
       false ->
         warn_dead_default(harness, model, configured_default?)
         {:error, %{code: "model_unavailable", message: "model must be specified"}}
+    end
+  end
+
+  # A refusal that names only the rejected value makes the operator guess. The
+  # catalog is already in hand, so say what IS offered — harness-agnostic, and for
+  # claude it reflects the selectable filter rather than the raw API list.
+  defp offered_models_hint(harness) do
+    case ModelCatalog.get(harness, ModelCatalog) do
+      {[_ | _] = entries, _health} ->
+        "; offered: " <> (entries |> Enum.map(& &1.ref) |> Enum.sort() |> Enum.join(", "))
+
+      _ ->
+        ""
     end
   end
 
@@ -3143,9 +3218,68 @@ defmodule Tightbeam.Gateway do
   defp maybe_put_opt(opts, _key, nil), do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
+  # The agent ELECTS its reply's attention tier, during its own turn. Two tiers:
+  # normal (0, the default an agent that elects nothing gets) and high (1). The
+  # substrate derives nothing — there is no kind-to-tier mapping and no anti-
+  # inflation rule — and what a client DOES with the tier is the client's business.
+  #
+  # The target turn is never named by the caller: it is the caller session's
+  # running turn, which the lane serializes to exactly one.
+  defp attend_result(db, call) do
+    case call[:principal] do
+      {:session, session_key} ->
+        tier = if call.params[:high] == true, do: 1, else: 0
+
+        {:ok, result} =
+          DB.transaction(db, fn txn ->
+            case running_turn_seq_in_txn(txn, session_key) do
+              nil ->
+                %{code: "no_running_turn", message: "attend elects during your own turn"}
+
+              seq ->
+                DB.Txn.q(txn, "UPDATE turns SET replyAttention = ?2 WHERE seq = ?1", [seq, tier])
+                %{turn_seq: seq, attention: attention_name(tier)}
+            end
+          end)
+
+        result
+
+      _ ->
+        %{code: "invalid", message: "attend requires a session caller"}
+    end
+  end
+
+  defp attention_name(1), do: "high"
+  defp attention_name(_), do: "normal"
+
+  defp running_turn_seq_in_txn(txn, session_key) do
+    case DB.Txn.q(
+           txn,
+           "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+           [session_key]
+         ) do
+      [[seq]] -> seq
+      [] -> nil
+    end
+  end
+
+  defp elected_attention(db, turn_seq) do
+    {:ok, [[tier]]} =
+      DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [turn_seq])
+
+    tier
+  end
+
   defp retire_result(config, db, call) do
     p = call.params
-    owner = String.replace_prefix(call.origin, "user:", "")
+    # Resolve the caller's owner, do not string-strip the origin: an agent's
+    # origin is `agent:<role>`, which stripping leaves intact, so it matched no
+    # ownerUserId and every agent got `not_found` — including for sessions its own
+    # owner controls, which the guidance we ship tells agents to retire.
+    # `resolve_caller/2` handles all three origin classes and yields a nil owner
+    # for a process, which cannot match a NOT NULL ownerUserId, so unknown and
+    # process callers keep getting `not_found`.
+    owner = resolve_caller(db, call.origin)[:owner_user_id]
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
@@ -3919,7 +4053,9 @@ defmodule Tightbeam.Gateway do
         # state a heal may take. A human ruling that resolved the episode is NOT
         # such a state, and a delayed park leaves the hold wide while doing
         # exactly that — so the hold alone is not a sufficient guard (F3).
-        held? = Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [session_key])
+        held? =
+          Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [session_key])
+
         episode = Adjudication.get_in_txn(txn, session_key, condition)
 
         if held? == [["*"]] and is_map(episode) and Adjudication.heal_eligible?(episode) do

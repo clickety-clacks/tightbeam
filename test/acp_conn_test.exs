@@ -96,8 +96,12 @@ defmodule Tightbeam.Acp.ConnTest do
 
   defp eventually(fun, tries \\ 40) do
     cond do
-      fun.() -> true
-      tries == 0 -> false
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
       true ->
         Process.sleep(50)
         eventually(fun, tries - 1)

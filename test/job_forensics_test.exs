@@ -45,8 +45,14 @@ defmodule Tightbeam.JobForensicsTest do
   setup do
     db = :"forensics_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    registry = start_supervised!({Tightbeam.ConnRegistry, name: :"forensics_reg_#{System.unique_integer([:positive])}"})
-    lane = start_supervised!({LaneDoorbell, :"forensics_lane_#{System.unique_integer([:positive])}"})
+
+    registry =
+      start_supervised!(
+        {Tightbeam.ConnRegistry, name: :"forensics_reg_#{System.unique_integer([:positive])}"}
+      )
+
+    lane =
+      start_supervised!({LaneDoorbell, :"forensics_lane_#{System.unique_integer([:positive])}"})
 
     for module <- [
           CausalEvents,
@@ -190,6 +196,7 @@ defmodule Tightbeam.JobForensicsTest do
 
   test "proof 7: a failed disposition records its failReason", %{db: db} do
     work_item(db, "wi_fail")
+
     assert %{workItem: %{state: "failed"}} =
              dispose(db, "work-item-fail", "wi_fail", %{reason: "wontfix"})
 
@@ -347,7 +354,8 @@ defmodule Tightbeam.JobForensicsTest do
     assert is_integer(Wakes.get(db, a.wake_id).canceled_at)
 
     # Path 2: the substrate-internal cancel (escalation retarget, park supersede).
-    b = Wakes.schedule(db, %{session_key: "k1", origin: "process:tightbeam", prompt: "b", due_at: 1})
+    b =
+      Wakes.schedule(db, %{session_key: "k1", origin: "process:tightbeam", prompt: "b", due_at: 1})
 
     {:ok, true} = DB.transaction(db, fn txn -> Wakes.cancel_pending_in_txn(txn, b.wake_id) end)
     assert is_integer(Wakes.get(db, b.wake_id).canceled_at)
@@ -360,7 +368,10 @@ defmodule Tightbeam.JobForensicsTest do
 
     # No cancel path anywhere may write state without the timestamp.
     assert {:ok, [[0]]} =
-             DB.query(db, "SELECT count(*) FROM wakes WHERE state='canceled' AND canceledAt IS NULL")
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE state='canceled' AND canceledAt IS NULL"
+             )
   end
 
   test "proof 6: the trace carries a wake_canceled entry", %{db: db} do
@@ -568,7 +579,9 @@ defmodule Tightbeam.JobForensicsTest do
     # the bound cannot be coming from the counter — only the timestamp floor can
     # keep these three out.
     cutoff = CausalEvents.epoch(db)
-    for id <- ["att_old_a", "att_old_b", "att_old_c"], do: attest(db, id, "asg_pre", cutoff - 5_000)
+
+    for id <- ["att_old_a", "att_old_b", "att_old_c"],
+        do: attest(db, id, "asg_pre", cutoff - 5_000)
 
     assert answered(db) == []
 
@@ -627,8 +640,12 @@ defmodule Tightbeam.JobForensicsTest do
         origin: "user:flynn",
         principal: principal,
         session_key: "agent-session",
-        params: %{prompt: "an ordinary conversational wake", after_ms: 0, nudge: false,
-                  assignment_id: "asg_victim"}
+        params: %{
+          prompt: "an ordinary conversational wake",
+          after_ms: 0,
+          nudge: false,
+          assignment_id: "asg_victim"
+        }
       })
     end
 
@@ -667,7 +684,9 @@ defmodule Tightbeam.JobForensicsTest do
   # pending-wake gate halts before the ladder while one exists — delivery is what
   # clears it in production, so fire it here.
   defp evaluate(db, handlers, session_key) do
-    {:ok, _} = DB.query(db, "UPDATE wakes SET state = 'fired', firedAt = 1 WHERE state = 'pending'")
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET state = 'fired', firedAt = 1 WHERE state = 'pending'")
+
     seq = turn(db, session_key, status: "delivered")
     Supervision.evaluate(db, handlers, 3, session_key, seq)
   end

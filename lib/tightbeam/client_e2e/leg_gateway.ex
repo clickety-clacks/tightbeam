@@ -337,8 +337,11 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   def descendant_pids(pid) do
     children =
       case System.cmd("pgrep", ["-P", to_string(pid)], stderr_to_stdout: true) do
-        {out, 0} -> out |> String.split("\n", trim: true) |> Enum.filter(&Regex.match?(~r/^\d+$/, &1))
-        _ -> []
+        {out, 0} ->
+          out |> String.split("\n", trim: true) |> Enum.filter(&Regex.match?(~r/^\d+$/, &1))
+
+        _ ->
+          []
       end
 
     children ++ Enum.flat_map(children, &descendant_pids/1)
@@ -357,9 +360,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   """
   @spec process_command(pos_integer() | String.t()) :: String.t() | nil
   def process_command(pid) do
-    case System.cmd("ps", ["-ww", "-o", "command=", "-p", to_string(pid)],
-           stderr_to_stdout: true
-         ) do
+    case System.cmd("ps", ["-ww", "-o", "command=", "-p", to_string(pid)], stderr_to_stdout: true) do
       {out, 0} ->
         case String.trim(out) do
           "" -> nil
@@ -384,7 +385,8 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   environment of a BEAM-spawned process on macOS, so an env match found nothing
   and cheerfully reported success.
   """
-  @spec reap_descendants([{String.t(), String.t() | nil}] | [String.t()], non_neg_integer()) :: :ok
+  @spec reap_descendants([{String.t(), String.t() | nil}] | [String.t()], non_neg_integer()) ::
+          :ok
   def reap_descendants([], _timeout_ms), do: :ok
 
   def reap_descendants(captured, timeout_ms) do
@@ -454,8 +456,12 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
   defp poll_ready(gateway, deadline) do
     cond do
-      ready?(gateway) -> :ok
-      System.monotonic_time(:millisecond) >= deadline -> {:error, :timeout}
+      ready?(gateway) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :timeout}
+
       true ->
         Process.sleep(500)
         poll_ready(gateway, deadline)
@@ -473,8 +479,12 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     alive? = ours?(gateway)
 
     cond do
-      not alive? -> :ok
-      System.monotonic_time(:millisecond) >= deadline -> {:error, :still_running}
+      not alive? ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :still_running}
+
       true ->
         Process.sleep(250)
         poll_exit(gateway, deadline)

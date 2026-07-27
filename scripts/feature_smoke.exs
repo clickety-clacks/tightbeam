@@ -3,7 +3,7 @@
 # unit tests don't cover). Reads port+token from <base_dir>/gateway.json.
 #
 #   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
-#   TIGHTBEAM_SMOKE_MODEL_CLAUDE=fable \
+#   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5[medium]' \
 #   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol[medium]' \
 #   mix run --no-start scripts/feature_smoke.exs
 #
@@ -48,6 +48,7 @@ defmodule FeatureSmoke do
       |> check_effort_without_effect()
       |> check_flagship_review_loop()
       |> check_escalation_to_owner()
+      |> check_toplines_board()
       |> finish_leg()
     end)
   end
@@ -130,6 +131,34 @@ defmodule FeatureSmoke do
       })
 
       await_materialized_skills!(state, cwd, snapshot.skills)
+
+      # One SESSION-principal work-item create, deliberately placed INSIDE this
+      # group's running-turn window (after the wake, before the turn boundary) —
+      # the only window in the run where a session lane has a turn in flight.
+      # A user-principal create can never be stamped, because only a session lane
+      # can have a running turn; this is what gives the toplines board a node whose
+      # creation context was actually RECORDED against a turn.
+      #
+      # WHAT THIS DOES NOT REACH: `linked`. The only running turn in this window
+      # comes from a plain `wake`, which carries neither `jobRef` nor
+      # `assignmentId`, so derivation finds no candidate and correctly reports
+      # `from_turn`. Reaching `linked` live would need the create to happen inside
+      # the DISPATCH group, whose holder turn carries `assignmentId` — so read the
+      # four accepted statuses below as four accepted, not four proven.
+      #
+      # A session acting under its OWN credential needs a bound role for the router
+      # to derive its origin — an unbound one is refused `no_role` (found by the
+      # first live run of this check, not by reading the code).
+      role = "local-deploy-#{unique()}"
+      post(state, "role-create", %{"name" => role})
+      ok!(state, "role-bind", %{"name" => role, "sessionKey" => session_key})
+
+      ok!(
+        %{state | token: session_token(state, session_key)} |> Map.put(:as_session, true),
+        "work-item-create",
+        %{"title" => "smoke agent-created wi #{unique()}", "idempotencyKey" => "awi-#{unique()}"}
+      )
+
       await_turn_boundary!(state, session_key)
 
       sentinel_bytes = "durable-local-deployment-#{unique()}\n"
@@ -776,6 +805,231 @@ defmodule FeatureSmoke do
       true ->
         Process.sleep(100)
         await_effort_request!(state, assignment_id, prior_id, deadline)
+    end
+  end
+
+  # --- toplines: the board must reflect the work THIS run just did -----------
+  # Runs LAST so every earlier group's material exists: work items, direct and
+  # dispatched assignments, the flagship review chain, and their attests. Every
+  # expectation is DERIVED — from this run's salt, from `work-item-get`'s DIRECT
+  # assignments, and from the `attests` verb — so no number here can rot when an
+  # earlier group changes what it does.
+  defp check_toplines_board(state) do
+    roster = ok!(state, "toplines", %{})
+
+    assert(
+      state,
+      roster["edgeBasis"] == "concurrent_turn",
+      "toplines must state its edge basis: #{inspect(roster["edgeBasis"])}"
+    )
+
+    assert(
+      state,
+      is_integer(get_in(roster, ["coverage", "attributionCutoff"])),
+      "toplines must report its coverage cutoff: #{inspect(roster["coverage"])}"
+    )
+
+    mine = this_run(roster["items"] || [])
+
+    # Non-vacuous: the earlier groups created work items under this run's salt,
+    # so an empty database cannot pass this check.
+    assert(
+      state,
+      mine != [],
+      "toplines roster shows none of this run's items; titles were #{inspect(Enum.map(roster["items"] || [], & &1["title"]))}"
+    )
+
+    Enum.each(mine, &assert_toplines_node(state, &1))
+    assert_toplines_state_filter(state, mine)
+    assert_toplines_forest(state, mine)
+
+    pass(
+      state,
+      "toplines board reflects this run: #{length(mine)} items, resolved membership, live progress clock, recorded creation context"
+    )
+  end
+
+  defp assert_toplines_node(state, item) do
+    id = item["id"]
+    direct = ok!(state, "work-item-get", %{"workItemId" => id})["assignments"] || []
+    resolved = item["assignments"]["open"] + item["assignments"]["closed"]
+
+    # RESOLVED is a SUPERSET of DIRECT. A review assignment is pinned to no item
+    # and reaches its story only through `reviewsAssignmentId`, so the flagship
+    # item's resolved count exceeds its direct count — asserted as an inequality
+    # rather than a literal so it survives a change to the flagship loop.
+    assert(
+      state,
+      resolved >= length(direct),
+      "toplines resolved membership (#{resolved}) is below DIRECT (#{length(direct)}) for #{id}"
+    )
+
+    assert(
+      state,
+      item["jobs"] >= length(Enum.uniq(Enum.map(direct, & &1["holderKey"]))),
+      "toplines jobs (#{item["jobs"]}) undercounts the holders that ever held #{id}"
+    )
+
+    # The explicit assignment surface must map every DIRECT id back to THIS item
+    # — the two surfaces reading the SAME membership function, on live rows.
+    Enum.each(direct, fn asg ->
+      selected = ok!(state, "topline", %{"assignments" => [asg["id"]]})
+
+      assert(
+        state,
+        Enum.map(selected["items"] || [], & &1["id"]) == [id],
+        "topline --assignments #{asg["id"]} should resolve to #{id}, got #{inspect(selected)}"
+      )
+
+      assert(
+        state,
+        (selected["noItem"] || []) == [],
+        "a pinned assignment must not land in noItem: #{inspect(selected)}"
+      )
+    end)
+
+    # Attests: the DIRECT sum is a FLOOR, not the total. The reviewer's verdict
+    # lands on the review assignment, which no direct read of this item returns —
+    # only RESOLVED attribution sees it.
+    direct_attests =
+      Enum.reduce(direct, 0, fn asg, acc ->
+        acc + length(ok!(state, "attests", %{"assignmentId" => asg["id"]})["attests"] || [])
+      end)
+
+    assert(
+      state,
+      item["attests"]["total"] >= direct_attests,
+      "toplines attests (#{item["attests"]["total"]}) undercounts #{id}'s direct attests (#{direct_attests})"
+    )
+
+    # This run just happened, so the progress clock cannot be claiming more quiet
+    # time than the run has been alive. A clock anchored at the coverage cutoff
+    # instead of at live activity fails here.
+    budget = run_elapsed_ms() + 60_000
+
+    assert(
+      state,
+      item["sinceProgressMs"] <= budget,
+      "toplines sinceProgressMs #{item["sinceProgressMs"]} for #{id} exceeds this run's own age (#{budget}ms) — the progress clock is not tracking live activity"
+    )
+
+    assert_toplines_creation_context(state, item)
+  end
+
+  # THE TEETH. Cross-checks the reader against C1's ACTUAL columns on live rows,
+  # read straight out of the gateway's own database — so this is total over all
+  # four statuses and cannot go flaky on whether a turn happened to still be
+  # running when a create landed.
+  #
+  # `unrecorded` on a row this run wrote would mean either C1 stopped stamping on
+  # the live path or the reader misreads the bit. The old pre-C1 smoke database
+  # showed every parent as `unrecorded`; a fresh run must not.
+  defp assert_toplines_creation_context(state, item) do
+    id = item["id"]
+    {known, seq} = item_creation_columns(state, id)
+    status = get_in(item, ["parent", "status"])
+
+    assert(
+      state,
+      known == 1,
+      "post-C1 row #{id} was written with createdContextKnown=#{inspect(known)}: C1 is not stamping on the live create path"
+    )
+
+    assert(
+      state,
+      get_in(item, ["creationContext", "recorded"]) == true,
+      "row #{id} has known=1 but the reader reports #{inspect(item["creationContext"])}"
+    )
+
+    assert(
+      state,
+      get_in(item, ["creationContext", "turnSeq"]) == seq,
+      "row #{id} carries createdInTurnSeq=#{inspect(seq)} but the reader reports #{inspect(get_in(item, ["creationContext", "turnSeq"]))}"
+    )
+
+    # The column decides the status, exactly: a null seq is the substrate saying it
+    # LOOKED and nothing was running (the root signal, not a root classification),
+    # and a stamped seq must yield an edge — `linked` when the recorded turn names
+    # a caller-visible item, `from_turn` when it names none.
+    expected =
+      if is_nil(seq), do: ["no_turn_observed"], else: ["linked", "from_turn"]
+
+    assert(
+      state,
+      status in expected,
+      "row #{id} with createdInTurnSeq=#{inspect(seq)} must report one of #{inspect(expected)}; got #{inspect(status)}"
+    )
+  end
+
+  # C1's own columns for one item, from the gateway's database — the same direct
+  # read `session_token/2` already uses for things the wire does not surface.
+  defp item_creation_columns(state, work_item_id) do
+    db = Path.join(state.base_dir, "state.db")
+
+    {out, 0} =
+      System.cmd("sqlite3", [
+        db,
+        "SELECT createdContextKnown, COALESCE(createdInTurnSeq, '') FROM work_items " <>
+          "WHERE id = #{sql_quote(work_item_id)}"
+      ])
+
+    case out |> String.trim() |> String.split("|") do
+      [known, ""] -> {String.to_integer(known), nil}
+      [known, seq] -> {String.to_integer(known), String.to_integer(seq)}
+      _ -> fail(state, "no work_items row for #{work_item_id}")
+    end
+  end
+
+  # `--state` must select exactly the subset the unfiltered roster already shows
+  # in that state, in the same order — derived from the roster, never hardcoded.
+  defp assert_toplines_state_filter(state, mine) do
+    ids = Enum.map(mine, & &1["id"])
+
+    Enum.each(Enum.uniq(Enum.map(mine, & &1["state"])), fn wanted ->
+      expected = mine |> Enum.filter(&(&1["state"] == wanted)) |> Enum.map(& &1["id"])
+
+      got =
+        ok!(state, "toplines", %{"state" => wanted})["items"]
+        |> Enum.map(& &1["id"])
+        |> Enum.filter(&(&1 in ids))
+
+      assert(
+        state,
+        got == expected,
+        "toplines --state #{wanted} returned #{inspect(got)}, expected #{inspect(expected)}"
+      )
+    end)
+  end
+
+  # The forest carries the same nodes as the roster: nesting changes shape, never
+  # membership.
+  defp assert_toplines_forest(state, mine) do
+    forest = ok!(state, "toplines", %{"tree" => true})
+    nested = forest["roots"] |> List.wrap() |> Enum.flat_map(&flatten_node/1) |> this_run()
+
+    assert(
+      state,
+      Enum.sort(Enum.map(nested, & &1["id"])) == Enum.sort(Enum.map(mine, & &1["id"])),
+      "--tree node set diverges from the roster: #{inspect(Enum.map(nested, & &1["id"]))}"
+    )
+  end
+
+  defp flatten_node(node) do
+    [node | node["children"] |> List.wrap() |> Enum.flat_map(&flatten_node/1)]
+  end
+
+  defp this_run(items) do
+    salt = Process.get(:salt, "")
+    Enum.filter(items, &String.contains?(&1["title"] || "", salt))
+  end
+
+  # The salt IS the run's start second, so the run can bound its own clock
+  # assertions without a literal. An unparseable salt yields 0, which only makes
+  # the assertion stricter.
+  defp run_elapsed_ms do
+    case Integer.parse(Process.get(:salt, "")) do
+      {started_at_s, _rest} -> max(System.os_time(:second) - started_at_s, 0) * 1000
+      :error -> 0
     end
   end
 

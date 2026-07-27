@@ -6,6 +6,10 @@ satellite daemon: sshd is the transport, rsync materializes non-secret
 session identity, and the gateway does the rest. Prerequisite: the gateway host can ssh to the
 satellite non-interactively (shared keys — you bring these).
 The gateway host also needs at least one registered harness CLI installed and on PATH.
+It ALSO needs its own credential for every harness you intend to spawn, even when
+those sessions only ever run on satellites: the gateway derives each harness's model
+catalog on its own host, and a spawn is refused when the catalog is missing (see
+§What failure looks like). A satellite grant does not cover the gateway.
 
 ## On the satellite (one-time, by the operator)
 
@@ -73,3 +77,9 @@ circuit-open after repeated failures, visible in `/version`, turns fail fast
 with a reason. Fix connectivity; the circuit closes on the next successful
 start. Nothing on the satellite supervises anything — the gateway owns all
 lifecycle.
+
+A spawn refused `catalog_unavailable` naming a **GATEWAY host** is the
+prerequisite above, not a satellite fault: the satellite's own grant is fine and
+the gateway simply cannot derive that harness's catalog. The message names the
+provider, the gateway host, and the repair (`tightbeam onboard <provider>` on the
+gateway). Onboarding the satellite again will not fix it.

@@ -81,7 +81,8 @@ defmodule Tightbeam.DB do
 
     @doc "Run one SQL statement inside the transaction; returns rows (positional lists)."
     @spec q(t(), String.t(), [term()]) :: [Tightbeam.DB.row()]
-    def q(%__MODULE__{conn: conn}, sql, params \\ []), do: Tightbeam.DB.run_query(conn, sql, params)
+    def q(%__MODULE__{conn: conn}, sql, params \\ []),
+      do: Tightbeam.DB.run_query(conn, sql, params)
 
     @doc "Execute a statement without results inside the transaction."
     @spec exec(t(), String.t()) :: :ok

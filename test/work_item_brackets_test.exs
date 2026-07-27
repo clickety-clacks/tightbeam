@@ -208,7 +208,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   ## Proof 5 — terminal dispositions transition, cancel both brackets, refuse work, no-op, reopen.
 
-  test "Proof 5: dispositions transition, cancel both brackets, refuse work, no-op, reopen", ctx do
+  test "Proof 5: dispositions transition, cancel both brackets, refuse work, no-op, reopen",
+       ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Disposed"})
     {:ok, a} = disp_assign(ctx, {:user, "flynn"}, "holder", "w", item.id)
     complete(ctx, "holder", a.id)
@@ -241,6 +242,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # close and fail transition and refuse too.
     close_item = create(ctx, {:user, "flynn"}, %{title: "Closeable"})
+
     assert %{ok: true, workItem: %{state: "closed"}} =
              dispose(ctx, "work-item-close", {:user, "flynn"}, close_item.id)
 
@@ -248,6 +250,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
              disp_assign(ctx, {:user, "flynn"}, "holder", "x", close_item.id)
 
     fail_item = create(ctx, {:user, "flynn"}, %{title: "Failable"})
+
     assert %{ok: true, workItem: %{state: "failed"}} =
              dispose(ctx, "work-item-fail", {:user, "flynn"}, fail_item.id)
 
@@ -257,7 +260,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   ## Disposition authority — owner-or-admin, resolved through the session's user.
 
-  test "disposition authority: an admin session disposes a foreign item; a non-admin cannot", ctx do
+  test "disposition authority: an admin session disposes a foreign item; a non-admin cannot",
+       ctx do
     eves_item = create(ctx, {:user, "eve"}, %{title: "Eve's item"})
 
     # A non-admin session (dana) cannot dispose another user's item.
@@ -292,7 +296,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   ## Proof 7 — effort-checkin coexistence: both machineries close in one transaction.
 
-  test "Proof 7: a dispatched assignment closes through effort-cancel and slate-arm together", ctx do
+  test "Proof 7: a dispatched assignment closes through effort-cancel and slate-arm together",
+       ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Coexist"})
     {:ok, d} = disp_dispatch(ctx, {:user, "flynn"}, "holder", "w", item.id)
 
@@ -430,7 +435,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # work-item-fail disposes and cancels bracket 2.
     assert %{ok: true, workItem: %{state: "failed", failReason: "shipped elsewhere"}} =
-             dispose(ctx, "work-item-fail", {:user, "flynn"}, item.id, %{reason: "shipped elsewhere"})
+             dispose(ctx, "work-item-fail", {:user, "flynn"}, item.id, %{
+               reason: "shipped elsewhere"
+             })
 
     assert slate_wake_id(ctx.db, item.id) == nil
   end
@@ -505,7 +512,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   ## Proof 13 — failReason column truth.
 
-  test "Proof 13: work-item-fail --reason persists and surfaces; icebox/close leave it NULL", ctx do
+  test "Proof 13: work-item-fail --reason persists and surfaces; icebox/close leave it NULL",
+       ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Reasoned"})
 
     assert %{workItem: %{failReason: "cannot repro"}} =
@@ -516,7 +524,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert WorkState.item_detail(ctx.db, item.id).workItem.failReason == "cannot repro"
 
     closed = create(ctx, {:user, "flynn"}, %{title: "Closed"})
-    assert %{workItem: %{failReason: nil}} = dispose(ctx, "work-item-close", {:user, "flynn"}, closed.id)
+
+    assert %{workItem: %{failReason: nil}} =
+             dispose(ctx, "work-item-close", {:user, "flynn"}, closed.id)
 
     iceboxed = create(ctx, {:user, "flynn"}, %{title: "Iced"})
 
@@ -684,7 +694,10 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp get(ctx, id),
-    do: ctx.handlers["work-item-get"].(work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: id}))
+    do:
+      ctx.handlers["work-item-get"].(
+        work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: id})
+      )
 
   defp list(ctx),
     do: ctx.handlers["work-item-list"].(work_item_call("work-item-list", {:user, "flynn"}, %{}))
@@ -696,11 +709,21 @@ defmodule Tightbeam.WorkItemBracketsTest do
       )
 
   defp work_item_call(verb, principal, params) do
-    %{verb: verb, origin: origin(principal), principal: principal, session_key: nil, params: params}
+    %{
+      verb: verb,
+      origin: origin(principal),
+      principal: principal,
+      session_key: nil,
+      params: params
+    }
   end
 
   defp disp_assign(ctx, principal, holder, subject, work_item_id, opts \\ []) do
-    Dispatch.dispatch(ctx.db, ctx.handlers, assign_call(principal, holder, subject, work_item_id, opts))
+    Dispatch.dispatch(
+      ctx.db,
+      ctx.handlers,
+      assign_call(principal, holder, subject, work_item_id, opts)
+    )
   end
 
   defp assign_call(principal, holder, subject, work_item_id, opts \\ []) do

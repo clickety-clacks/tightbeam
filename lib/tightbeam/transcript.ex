@@ -123,8 +123,8 @@ defmodule Tightbeam.Transcript do
           session_key: session.session_key,
           display_name: session.display_name,
           messages: entries,
-          oldest_id: entries != [] && List.first(entries).id || nil,
-          newest_id: entries != [] && List.last(entries).id || nil,
+          oldest_id: (entries != [] && List.first(entries).id) || nil,
+          newest_id: (entries != [] && List.last(entries).id) || nil,
           has_more_before: flags.before,
           has_more_after: flags.after
         }
@@ -295,7 +295,9 @@ defmodule Tightbeam.Transcript do
       db
       |> candidate_rows(name)
       |> Enum.filter(&readable?(caller, &1))
-      |> Enum.map(&Map.take(&1, [:session_key, :display_name, :state, :owner_user_id, :last_activity_at]))
+      |> Enum.map(
+        &Map.take(&1, [:session_key, :display_name, :state, :owner_user_id, :last_activity_at])
+      )
 
     %{candidates: candidates}
   end

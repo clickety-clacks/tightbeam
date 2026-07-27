@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::args::{Command, Identity, Target};
+use crate::args::{Command, Identity, Target, ToplineSelection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
@@ -38,6 +38,28 @@ fn object(fields: Vec<String>) -> String {
 
 fn string_field(name: &str, value: &str) -> String {
     format!("\"{name}\":{}", quoted(value))
+}
+
+/// Roster filters, shared verbatim by `toplines` and `topline --under` — the
+/// spec says "the same roster filters", so there is one builder, not two lists.
+fn filter_params(filters: &crate::args::ToplineFilters) -> Vec<String> {
+    let mut params = Vec::new();
+    for (name, value) in [
+        ("origin", &filters.origin),
+        ("owner", &filters.owner),
+        ("state", &filters.state),
+        ("spec", &filters.spec),
+        ("specSha", &filters.spec_sha),
+        ("session", &filters.session),
+    ] {
+        if let Some(value) = value {
+            params.push(string_field(name, value));
+        }
+    }
+    if let Some(ms) = &filters.quiet_over_ms {
+        params.push(format!("\"quietOver\":{ms}"));
+    }
+    params
 }
 
 fn params_field(fields: Vec<String>) -> String {
@@ -318,6 +340,16 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::Attend { identity, high } => {
+            // The tier only; the turn is the caller's running turn, which the
+            // substrate derives — the CLI never names a turn.
+            let params = if *high {
+                vec!["\"high\":true".to_owned()]
+            } else {
+                vec![]
+            };
+            Ok(request(identity, "attend", vec![], params))
+        }
         Command::Transcript {
             identity,
             session,
@@ -346,6 +378,55 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params.push(format!("\"limit\":{limit}"));
             }
             Ok(request(identity, "transcript", vec![], params))
+        }
+        Command::Toplines {
+            identity,
+            filters,
+            tree,
+        } => {
+            let mut params = filter_params(filters);
+            if *tree {
+                params.push("\"tree\":true".to_owned());
+            }
+            Ok(request(identity, "toplines", vec![], params))
+        }
+        // Every selector travels as an ordinary body PARAM: both verbs are declared
+        // non-target at the router, and --session is a COHORT FILTER over creator
+        // identity, not a target to resolve.
+        //
+        // The two arms are separate because assignment selection has NO filters to
+        // send — `filter_params` is unreachable from it, so nothing can leak a
+        // filter the reader would then ignore.
+        Command::Topline {
+            identity,
+            selection:
+                ToplineSelection::Under {
+                    work_item_id,
+                    filters,
+                },
+        } => {
+            let mut params = filter_params(filters);
+            params.push(string_field("under", work_item_id));
+            Ok(request(identity, "topline", vec![], params))
+        }
+        Command::Topline {
+            identity,
+            selection: ToplineSelection::Assignments(ids),
+        } => {
+            let list = ids
+                .iter()
+                .map(|id| serde_json::Value::String(id.clone()))
+                .collect::<Vec<_>>();
+
+            Ok(request(
+                identity,
+                "topline",
+                vec![],
+                vec![format!(
+                    "\"assignments\":{}",
+                    serde_json::Value::Array(list)
+                )],
+            ))
         }
         Command::WorkItemIcebox {
             identity,
@@ -796,7 +877,10 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
+        | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
+        | Command::Toplines { identity, .. }
+        | Command::Topline { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
