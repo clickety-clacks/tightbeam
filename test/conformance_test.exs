@@ -3608,7 +3608,7 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp temp_dir!(prefix) do
     # Canonicalize the tmp base: on Darwin System.tmp_dir!/0 sits under the /var
-    # symlink (/var -> /private/var), and Containment.profile/1 refuses write
+    # symlink (/var -> /private/var), and Containment.rail_profile/1 refuses write
     # roots with unresolved symlink components.
     base = to_string(:string.trim(:os.cmd(~c(realpath #{System.tmp_dir!()}))))
     path = Path.join(base, "#{prefix}-#{System.unique_integer([:positive])}")
@@ -4038,7 +4038,7 @@ defmodule Tightbeam.ConformanceTest do
 
     assert status == 0, output
     assert output =~ "0 failures"
-    assert output =~ "sandbox-exec enforces resolved write roots and preserves stdout"
+    assert output =~ "containment enforces resolved write roots and preserves stdout"
   end
 
   for fixture <- @fixtures do

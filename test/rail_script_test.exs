@@ -106,6 +106,20 @@ defmodule Tightbeam.RailScriptTest do
              ~w(returned out-of-set error:7 timeout contained)
 
     assert Enum.all?(details, &(&1["edge"] == "verb" and &1["verb"] == "post"))
+
+    # A refusal has to say WHY on a row that outlives the run. The wrapper writes its
+    # reason to stderr, that stderr lives in the scratch dir, and the scratch dir is
+    # deleted on the way out — so a host that refuses EVERY rail used to record nothing
+    # but the class `contained`. That is the shape of the outage this seam exists because
+    # of: failing closed, correctly, with nothing for anyone to read.
+    contained = Enum.find(details, &(&1["exit_class"] == "contained"))
+    assert contained["containment"] =~ "fixture refusal"
+
+    # And only a refusal carries it — a normal verdict is not decorated with one.
+    assert Enum.all?(
+             Enum.reject(details, &(&1["exit_class"] == "contained")),
+             &is_nil(&1["containment"])
+           )
   end
 
   test "wrapper infrastructure failure fails closed and remains observable", ctx do
@@ -300,10 +314,14 @@ defmodule Tightbeam.RailScriptTest do
         end)
 
       # Suspend the measuring process while the wrapper is still alive, and stay suspended
-      # past budget + the 2_000ms backstop margin.
+      # past budget + the 2_000ms backstop margin. 100 + 3_900 cleared that threshold by
+      # exactly nothing, so the run's own clock starting a millisecond late — Task
+      # scheduling latency — failed the assertion (observed at 3_998ms of a needed 4_000).
+      # The margin is the point, not the total: the discriminator has to survive an
+      # inflated measurement, and how far past it we are is arbitrary.
       Process.sleep(100)
       true = :erlang.suspend_process(task.pid)
-      Process.sleep(3_900)
+      Process.sleep(4_400)
       :erlang.resume_process(task.pid)
 
       assert {:error, "script_timeout", "timeout"} = Task.await(task, 30_000)
@@ -357,17 +375,48 @@ defmodule Tightbeam.RailScriptTest do
     assert File.exists?(Path.join(workdir, ".rail-cwd-marker"))
     refute File.exists?(Path.join(workdir, "rail-write"))
     assert Path.wildcard(Path.join([ctx.base_dir, "rails", "scratch", "*"])) == []
+  end
 
-    assert {:error, "script_error", _exit_class} =
-             RailScript.run(
-               ctx.db,
-               ctx.base_dir,
-               rule("rail-write-workdir"),
-               call(%{assignment_id: "a1"}),
-               assignment
-             )
+  # The write wall is the real mechanism's to enforce, so it is asserted against the real
+  # binary. It used to ride on the fixture double, which interposed `sandbox-exec` — so
+  # this assertion held on macOS and could not hold on linux, which is how a macOS-only
+  # containment mechanism stayed invisible under a green suite.
+  if File.exists?(@release_binary) do
+    test "a rail script cannot write outside its scratch root", ctx do
+      wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+      File.cp!(@release_binary, wrapper)
+      File.chmod!(wrapper, 0o755)
 
-    refute File.exists?(Path.join(workdir, "rail-forbidden-write"))
+      workdir = Placement.holder_workdir(%{base_dir: ctx.base_dir, port: 0}, ctx.holder)
+      File.write!(Path.join(workdir, ".rail-cwd-marker"), "cwd")
+      assignment = %{holder_key: ctx.holder.session_key}
+
+      assert {:ok, "pass", "returned"} =
+               RailScript.run(
+                 ctx.db,
+                 ctx.base_dir,
+                 put_in(rule("rail-cwd-scratch").check.timeout_ms, 10_000),
+                 call(%{assignment_id: "a1"}),
+                 assignment
+               )
+
+      assert {:error, "script_error", _exit_class} =
+               RailScript.run(
+                 ctx.db,
+                 ctx.base_dir,
+                 put_in(rule("rail-write-workdir").check.timeout_ms, 10_000),
+                 call(%{assignment_id: "a1"}),
+                 assignment
+               )
+
+      refute File.exists?(Path.join(workdir, "rail-forbidden-write"))
+    end
+  else
+    @tag skip:
+           "real rail-exec integration binary missing: #{@release_binary}; run cargo build --release in cli/"
+    test "a rail script cannot write outside its scratch root" do
+      flunk("release binary is required when this test is enabled")
+    end
   end
 
   test "remote holder fails closed before ensuring its workdir", ctx do

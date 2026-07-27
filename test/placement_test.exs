@@ -3,6 +3,8 @@ defmodule Tightbeam.PlacementTest do
 
   alias Tightbeam.{Archetypes, DB, EventLog, Homes, Identity, Org, Placement, Rails}
 
+  @darwin? :os.type() == {:unix, :darwin}
+
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base_dir)
@@ -749,8 +751,12 @@ defmodule Tightbeam.PlacementTest do
     work_root = Path.join(canonical_base, "work")
     home = Path.join([canonical_base, "homes", "testhost", "codex"])
 
-    assert profile =~
-             ~s|(subpath "#{work_root}")\n  (subpath "#{home}")\n  (subpath "#{auth_dir}")|
+    # The grant FORM is per-OS — SBPL subpaths on macOS, a Landlock envelope on linux —
+    # but that these three roots are granted, in this order, is not. The argv below is
+    # still macOS-only: adapter containment is unreachable while every adapter key is
+    # "shared", and making its applier per-OS belongs with task #36 (see the shared
+    # containment spec). The profile it would pass is already correct on both.
+    assert profile =~ ordered_grants([work_root, home, auth_dir])
 
     assert_receive {:probe,
                     [
@@ -1102,5 +1108,11 @@ defmodule Tightbeam.PlacementTest do
   defp canonical(path) do
     {resolved, 0} = System.cmd("/bin/realpath", [path])
     String.trim(resolved)
+  end
+
+  defp ordered_grants(roots) do
+    if @darwin?,
+      do: Enum.map_join(roots, "\n  ", &~s|(subpath "#{&1}")|),
+      else: Enum.map_join(roots, ",", &JSON.encode!/1)
   end
 end

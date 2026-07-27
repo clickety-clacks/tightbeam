@@ -765,6 +765,10 @@ defmodule Tightbeam.Placement do
 
       probe_result =
         try do
+          # macOS-only, like the argv below. Unreachable while every adapter key is
+          # "shared" (#36); whoever enables adapter containment owns making both sites
+          # per-OS under shared specs tightbeam-containment.md. The PROFILE is already
+          # correct on both platforms — only the applier here is not.
           sh.(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"])
         rescue
           error -> {:raised, error}
@@ -787,7 +791,7 @@ defmodule Tightbeam.Placement do
 
       profile =
         try do
-          Containment.profile(write_roots)
+          Containment.adapter_profile(write_roots)
         rescue
           error in [ArgumentError] ->
             containment_refused!(config, key, Exception.message(error))
@@ -802,6 +806,9 @@ defmodule Tightbeam.Placement do
         "assembled; fs=workdir network=open; write-roots=#{Enum.join(write_roots, ",")}"
       )
 
+      # macOS-only applier; see the probe above and #36. `adapter_profile/1` renders for
+      # the host's OS, so on linux this argv would hand a Landlock envelope to a binary
+      # that does not exist — the site to fix is here, not the profile.
       opts
       |> Keyword.put(:cmd, ["/usr/bin/sandbox-exec", "-p", profile, binary])
       |> Keyword.put(:contained, true)

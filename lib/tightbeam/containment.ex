@@ -1,27 +1,91 @@
 defmodule Tightbeam.Containment do
   @moduledoc """
-  macOS Seatbelt profile rendering and write-root validation.
+  Write-root validation, and containment profile rendering for the host's OS.
+
+  ## What containment is for
+
+  Containment keeps agents ON THE RAILS. It is not a defence against a malicious
+  agent, and it is not a security boundary. A circumvention that requires an agent
+  to be deliberately hostile is explicitly OUT OF SCOPE: we do not design for it,
+  and a finding premised on it is not work.
+
+  This is a standing product ruling, not a default to be re-litigated per change.
+  Weigh a proposed hardening by whether it keeps honest work inside its lines —
+  parity, correctness, legibility — and decline it when the only story that
+  reaches it is malice. Reviewers do not hold this frame and will raise
+  security-shaped findings by default; that alone does not make them work.
+
+  The neutral truth is the SET OF WRITE ROOTS. Seatbelt SBPL is macOS's encoding
+  of that set, not the set itself, so only the encoding is per-OS: this module
+  stays the single authority on which roots are granted, because that draws on
+  product knowledge the wrapper does not have. The wrapper dispatches on its own
+  target OS to apply what it is handed.
+
+  There are two seams and they get DIFFERENT grants, named per seam rather than
+  sharing one renderer's list: `rail_profile/1` for a rail check script, and
+  `adapter_profile/1` for a contained harness adapter. Sharing the list is what
+  let a harness-driven grant widen the rail wall by accident, so a caller now has
+  to say which seam it is.
+
+  A platform-specific mechanism carries a parity obligation and a per-OS proof
+  obligation at the moment it is chosen. Both mechanisms and both obligations
+  are written down in the shared containment spec; a supported platform without
+  a named mechanism raises here rather than rendering something inapplicable.
 
   Profile rendering validates every write root, including filesystem
   canonicality, so a configured grant can never silently miss its real path.
+  Validation is neutral truth about the filesystem and runs identically on
+  every platform.
   """
 
-  @spec profile([String.t()]) :: String.t()
-  def profile(write_roots) do
-    validate_roots!(write_roots)
+  # A rail check script is not a harness turn, so it gets NO harness additions. It used
+  # to: `containment_additions/0` arrived with the adapter-seam refactor (63fc9e7, two
+  # days after rails were contained in 0be38de) and was appended to the one renderer both
+  # seams happened to share. On macOS that silently widened rail profiles by
+  # `/private/tmp`; on linux it granted `/dev`, and `/dev/shm` is world-writable tmpfs —
+  # a DURABLE write channel outside the scratch root, surviving the scratch rm_rf. Proven
+  # on shrdlu: a rail script under a real rail profile wrote /dev/shm and returned PASS.
+  #
+  # `/dev/null` is granted deliberately and is the only fixed grant: `>/dev/null` is in
+  # shipped conformance rail scripts (c5_script_guards), so the need is measured rather
+  # than assumed, and a discard sink cannot carry anything out of the scratch root. Every
+  # other node under /dev — `/dev/shm` above all — is no longer reachable. Narrower than
+  # before on BOTH platforms, which is the only direction a parity difference may resolve.
+  @rail_grants [{"/dev/null", "rail scripts redirect to the discard sink"}]
 
+  @spec rail_profile([String.t()]) :: String.t()
+  def rail_profile(write_roots) do
+    render(write_roots, @rail_grants)
+  end
+
+  @spec adapter_profile([String.t()]) :: String.t()
+  def adapter_profile(write_roots) do
     additions =
       Tightbeam.Harness.all()
       |> Enum.flat_map(& &1.containment_additions())
       |> Enum.uniq()
 
-    grants =
-      write_roots
-      |> Enum.map(&{&1, nil})
-      |> Kernel.++(additions)
+    render(write_roots, additions)
+  end
+
+  defp render(write_roots, extra_grants) do
+    validate_roots!(write_roots)
+
+    grants = Enum.map(write_roots, &{&1, nil}) ++ extra_grants
+
+    case :os.type() do
+      {:unix, :darwin} -> seatbelt(grants)
+      {:unix, :linux} -> landlock(grants)
+      other -> raise ArgumentError, "no containment mechanism for #{inspect(other)}"
+    end
+  end
+
+  defp seatbelt(grants) do
+    rendered =
+      grants
       |> Enum.with_index()
       |> Enum.map_join("\n", fn {{path, comment}, index} ->
-        closing = if index == length(write_roots) + length(additions) - 1, do: ")", else: ""
+        closing = if index == length(grants) - 1, do: ")", else: ""
         line = ~s|  (subpath "#{path}")#{closing}|
         if comment, do: String.pad_trailing(line, 34) <> ";; " <> comment, else: line
       end)
@@ -35,7 +99,7 @@ defmodule Tightbeam.Containment do
 
     ;; writes: deny-by-default; org trees + spike-required system paths
     (allow file-write*
-    #{grants}
+    #{rendered}
 
     ;; process lifecycle
     (allow process-fork)
@@ -49,6 +113,17 @@ defmodule Tightbeam.Containment do
     ;; network — v1 posture: open egress
     (allow network-outbound)
     """
+  end
+
+  # Landlock consumes a set of path rules, so the grant list is the whole profile: the
+  # wrapper handles the write-shaped access rights and grants them beneath these paths,
+  # leaving reads, execs, and network unhandled — the same posture the SBPL above states
+  # in prose. Rendered by hand rather than by encoding a map, so the bytes are
+  # deterministic and assertable; `validate_roots!/1` has already refused the bytes that
+  # would need escaping.
+  defp landlock(grants) do
+    roots = Enum.map_join(grants, ",", fn {path, _comment} -> JSON.encode!(path) end)
+    ~s({"tightbeam_containment":1,"write_roots":[#{roots}]})
   end
 
   @spec validate_roots!([String.t()]) :: :ok
