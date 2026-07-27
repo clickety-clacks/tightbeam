@@ -38,7 +38,7 @@ defmodule Tightbeam.RailScript do
         rescue
           _ -> {{:error, "script_error", @unreported}, empty_context()}
         catch
-          _, _ -> {{:error, "script_error", "error:1"}, empty_context()}
+          _, _ -> {{:error, "script_error", @unreported}, empty_context()}
         end
 
       record(db, rule, call, context, result, System.monotonic_time(:millisecond) - started)

@@ -244,6 +244,24 @@ defmodule Tightbeam.RailScriptTest do
     assert classes == ~w(unreported unreported unreported error:1)
   end
 
+  # The `catch` half of the same rescue, which takes exits and throws rather than raises.
+  # Reached in production when the DB process is down: `invocation_context` calls
+  # `Org.get`, which exits `:noproc`. Nothing was spawned and nothing was observed, and
+  # the row that would have recorded it cannot be written either — so the returned class
+  # is the only place this can be said (task #43).
+  test "a substrate exit is classed unreported, like a substrate raise", ctx do
+    stop_supervised!(Tightbeam.DB)
+
+    assert {:error, "script_error", "unreported"} =
+             RailScript.run(
+               ctx.db,
+               ctx.base_dir,
+               rule("rail-pass"),
+               call(),
+               %{holder_key: ctx.holder.session_key}
+             )
+  end
+
   # The recorded duration cannot locate a `script_timeout` in either timeout window, so
   # no timing rule can name the layer (task #38).
   #
