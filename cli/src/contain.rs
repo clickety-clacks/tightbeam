@@ -113,6 +113,11 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         });
     }
 
+    // A failed spawn is read as a refusal on both platforms. On macOS that is exactly what
+    // it means; on linux the script is the command, so an unexecutable script would land
+    // here too — `rules.ex` refuses a statute whose check script is not an existing
+    // executable, so it cannot. Both bands deny the dispatch either way; this errs toward
+    // the one that claims less about the script.
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
