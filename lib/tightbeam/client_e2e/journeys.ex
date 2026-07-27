@@ -516,7 +516,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
               Scorecard.fail(
                 "8",
                 "cancel",
-                "turn row is #{inspect(turn && turn["status"])}, not canceled", journey: "J3")
+                "turn row is #{inspect(turn && turn["status"])}, not canceled",
+                journey: "J3"
+              )
 
             drained.status != :pass ->
               Scorecard.fail("8", "cancel", "the lane did not drain: #{drained.note}",
@@ -617,7 +619,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
           Scorecard.fail(
             "9",
             "queueing",
-            "echoes were #{inspect(echoes)}, expected #{inspect(ids)}", journey: "J4")
+            "echoes were #{inspect(echoes)}, expected #{inspect(ids)}",
+            journey: "J4"
+          )
 
         first_reply_index && Enum.any?(echo_indexes, &(&1 > first_reply_index)) ->
           Scorecard.fail(
@@ -631,7 +635,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
           Scorecard.fail(
             "9",
             "queueing",
-            "assistant replies arrived out of order: #{inspect(replies)}", journey: "J4")
+            "assistant replies arrived out of order: #{inspect(replies)}",
+            journey: "J4"
+          )
 
         peak > 1 ->
           Scorecard.fail("9", "queueing", "#{peak} turns were running at once in one lane",
@@ -642,7 +648,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
           Scorecard.fail(
             "9",
             "queueing",
-            "turn rows: #{inspect(Enum.map(turns, &(&1 && &1["status"])))}", journey: "J4")
+            "turn rows: #{inspect(Enum.map(turns, &(&1 && &1["status"])))}",
+            journey: "J4"
+          )
 
         indicator_error ->
           Scorecard.fail("9", "queueing", "across the queued batch, #{indicator_error}",
@@ -673,7 +681,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
          Scorecard.fail(
            "10",
            "concurrency",
-           "could not create Smoke B: #{status} #{inspect(created)}", journey: "J5")
+           "could not create Smoke B: #{status} #{inspect(created)}",
+           journey: "J5"
+         )
        ]}
     else
       watermark = SimClient.mark(ctx.client)
@@ -789,13 +799,17 @@ defmodule Tightbeam.ClientE2E.Journeys do
             Scorecard.fail(
               "10",
               "concurrency",
-              "turn rows: #{inspect(Enum.map(turns, &(&1 && &1["status"])))}", journey: "J5")
+              "turn rows: #{inspect(Enum.map(turns, &(&1 && &1["status"])))}",
+              journey: "J5"
+            )
 
           Enum.filter(reply_order, &(&1 in [slow_id, done_id])) != [slow_id, done_id] ->
             Scorecard.fail(
               "10",
               "concurrency",
-              "Main's turns completed out of order: #{inspect(reply_order)}", journey: "J5")
+              "Main's turns completed out of order: #{inspect(reply_order)}",
+              journey: "J5"
+            )
 
           substrate_concurrent? and client_saw_overlap? ->
             Scorecard.pass("10", "concurrency", journey: "J5")
@@ -1023,7 +1037,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
           Scorecard.fail(
             "13b",
             "model change",
-            "the turn after the change did not complete: #{next_turn.note}", journey: "J6")
+            "the turn after the change did not complete: #{next_turn.note}",
+            journey: "J6"
+          )
 
         true ->
           Scorecard.pass("13b", "model change",
@@ -1118,7 +1134,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
                Scorecard.fail(
                  "14",
                  "restart resilience",
-                 "client could not reconnect after restart: #{inspect(reason)}", journey: "J7")}
+                 "client could not reconnect after restart: #{inspect(reason)}",
+                 journey: "J7"
+               )}
 
             {:ok, ctx} ->
               j7_drain_verdict(ctx, cmid, old_pid, gateway.os_pid, before_ids)
@@ -1164,13 +1182,17 @@ defmodule Tightbeam.ClientE2E.Journeys do
           Scorecard.fail(
             "14",
             "restart resilience",
-            "the gateway pid did not change (#{old_pid})", journey: "J7")
+            "the gateway pid did not change (#{old_pid})",
+            journey: "J7"
+          )
 
         is_nil(snapshot) or is_nil(sync) ->
           Scorecard.fail(
             "14",
             "restart resilience",
-            "reconnect did not heal: no stream_snapshot/sync_complete", journey: "J7")
+            "reconnect did not heal: no stream_snapshot/sync_complete",
+            journey: "J7"
+          )
 
         MapSet.size(lost) > 0 ->
           Scorecard.fail(
@@ -1218,7 +1240,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
           Scorecard.fail(
             "14",
             "restart resilience",
-            "a fresh post after the restart did not complete: #{fresh.note}", journey: "J7")
+            "a fresh post after the restart did not complete: #{fresh.note}",
+            journey: "J7"
+          )
 
         true ->
           Scorecard.pass("14", "restart resilience",
@@ -1262,7 +1286,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
              Scorecard.fail(
                "15",
                "restart queue survival",
-               "client could not reconnect: #{inspect(reason)}", journey: "J7")}
+               "client could not reconnect: #{inspect(reason)}",
+               journey: "J7"
+             )}
 
           {:ok, ctx} ->
             # NOTHING is re-sent here. That is the assertion.
@@ -1289,7 +1315,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
                   Scorecard.fail(
                     "15",
                     "restart queue survival",
-                    "the queued turn's row vanished across the restart", journey: "J7")
+                    "the queued turn's row vanished across the restart",
+                    journey: "J7"
+                  )
 
                 second_turn["status"] != "delivered" ->
                   Scorecard.fail(
@@ -1476,7 +1504,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
          Scorecard.fail(
            "16b",
            "scheduled wake",
-           "scheduled wake dispatch failed: #{inspect(reason)}", journey: "J8")}
+           "scheduled wake dispatch failed: #{inspect(reason)}",
+           journey: "J8"
+         )}
 
       {:ok, result} ->
         id = wake_id(result)
@@ -1562,7 +1592,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
          Scorecard.fail(
            "5",
            "create stream",
-           "no live stream_created frame (client had to reconnect to see it)", journey: "J2")}
+           "no live stream_created frame (client had to reconnect to see it)",
+           journey: "J2"
+         )}
 
       result.error ->
         {ctx,
@@ -1621,14 +1653,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
          Scorecard.fail(
            "6",
            "rename stream",
-           "frame carried #{inspect(get_in(frame, ["stream", "displayName"]))}", journey: "J2")}
+           "frame carried #{inspect(get_in(frame, ["stream", "displayName"]))}",
+           journey: "J2"
+         )}
 
       row["displayName"] != renamed ->
         {ctx,
          Scorecard.fail(
            "6",
            "rename stream",
-           "sessions.displayName is #{inspect(row["displayName"])}", journey: "J2")}
+           "sessions.displayName is #{inspect(row["displayName"])}",
+           journey: "J2"
+         )}
 
       true ->
         {ctx, Scorecard.pass("6", "rename stream", journey: "J2")}
@@ -1675,7 +1711,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
          Scorecard.fail(
            "7",
            "retire stream",
-           "messages were not soft-retained (#{before} → #{kept})", journey: "J2")}
+           "messages were not soft-retained (#{before} → #{kept})",
+           journey: "J2"
+         )}
 
       true ->
         {ctx, Scorecard.pass("7", "retire stream", journey: "J2")}
