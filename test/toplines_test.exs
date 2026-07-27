@@ -440,13 +440,24 @@ defmodule Tightbeam.ToplinesTest do
     assert is_integer(closed.finished_at)
     assert closed.finished_at == disposition_at(ctx.db, "wi_cycle", "closed")
 
-    # A terminal item whose transition predates the event table has no matching
-    # event, so finished_at is null rather than invented.
+    # A terminal item whose transition predates the event table has no MATCHING
+    # event, so finished_at is null rather than invented. The non-matching event
+    # staged alongside it is what makes this bite: "no matching event" is not
+    # "no events at all", and a reader that took the latest transition
+    # regardless of toState would report this item as finished at that event.
     item!(ctx.db, "wi_pre_event", state: "failed", fail_reason: "no history")
+    disposition!(ctx.db, "wi_pre_event", from: "open", to: "closed")
+
     pre_event = node(roster(ctx), "wi_pre_event")
     assert pre_event.finished_at == nil
     assert pre_event.state == "failed"
     assert pre_event.fail_reason == "no history"
+
+    # And the match is on the CURRENT terminal state even when a later,
+    # non-matching transition exists after the matching one.
+    disposition!(ctx.db, "wi_cycle", from: "closed", to: "iceboxed")
+    assert node(roster(ctx), "wi_cycle").finished_at ==
+             disposition_at(ctx.db, "wi_cycle", "closed")
 
     # closing_attests: completed and surrendered REQUIRE a non-null closing
     # attest; revoked requires it to be null, so a revoked close is represented
@@ -1139,6 +1150,22 @@ defmodule Tightbeam.ToplinesTest do
       session_key: nil,
       params: %{work_item_id: id}
     })
+  end
+
+  # A disposition event with no disposition: the reader must key on the event's
+  # own toState, and only a directly staged row can put a non-matching
+  # transition after the matching one.
+  defp disposition!(db, item_id, from: from_state, to: to_state) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        CausalEvents.append_in_txn(txn, %{
+          kind: "disposition_transition",
+          job_ref: item_id,
+          detail: %{workItemId: item_id, fromState: from_state, toState: to_state}
+        })
+      end)
+
+    :ok
   end
 
   defp disposition_at(db, item_id, to_state) do
