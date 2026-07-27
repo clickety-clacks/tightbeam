@@ -72,6 +72,12 @@ jobs:
       - name: mix format --check-formatted
         run: mix format --check-formatted
 
+      # The suite's real-binary tests — rail-exec enforcement among them — skip themselves
+      # when this is absent, which would leave the containment proof unrun on both jobs.
+      - name: cargo build --release
+        working-directory: cli
+        run: cargo build --release
+
       - name: mix test
         run: mix test
 

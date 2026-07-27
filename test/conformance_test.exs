@@ -4038,7 +4038,7 @@ defmodule Tightbeam.ConformanceTest do
 
     assert status == 0, output
     assert output =~ "0 failures"
-    assert output =~ "sandbox-exec enforces resolved write roots and preserves stdout"
+    assert output =~ "containment enforces resolved write roots and preserves stdout"
   end
 
   for fixture <- @fixtures do

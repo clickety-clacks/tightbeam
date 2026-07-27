@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,13 @@ const PASS: i32 = 0;
 const SCRIPT_ERROR: i32 = 10;
 const SCRIPT_TIMEOUT: i32 = 20;
 const CONTAINED_REFUSED: i32 = 30;
+
+// Containment is per-OS; the bands above are not. `probe.rs` puts its per-OS collectors
+// behind one seam (`collect_linux` / `collect_darwin`) and this follows that shape, at
+// compile time rather than runtime because the mechanisms are syscalls rather than data.
+// Every arm applies real containment or refuses — there is no unconfined arm, and a
+// platform with no named mechanism fails to compile rather than running a script loose.
+// See shared specs tightbeam-containment.md.
 
 struct RailExecArgs {
     profile: String,
@@ -55,18 +62,26 @@ fn run(args: RailExecArgs) -> i32 {
 }
 
 fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    // Staging happens before the fork so a containment that cannot be built is a fact
+    // this process observes directly, rather than an exit code to be inferred from a
+    // helper. No script has been spawned at this point, so the refusal is exact.
+    let staged = match platform::stage(&args.profile) {
+        Ok(staged) => staged,
+        Err(reason) => {
+            eprintln!("rail-exec: containment not applied: {reason}");
+            return CONTAINED_REFUSED;
+        }
+    };
+
+    let token = staged.token();
+    let mut command = platform::command(&args.profile, &args.script);
     command
-        .arg("-p")
-        .arg(&args.profile)
-        .arg("--")
-        .arg(&args.script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -74,14 +89,17 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
-            Ok(())
+
+            // Last, in the forked child, so it binds this process and everything it
+            // execs. A failure here fails the spawn, which is CONTAINED_REFUSED below.
+            platform::impose(token)
         });
     }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            eprintln!("sandbox-exec: {error}");
+            eprintln!("rail-exec: containment not applied: {error}");
             return CONTAINED_REFUSED;
         }
     };
@@ -188,7 +206,7 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         return PASS;
     }
 
-    if profile_apply_failed(status.code(), &stdout, &stderr) {
+    if platform::refused_after_spawn(status.code(), &stdout, &stderr) {
         return CONTAINED_REFUSED;
     }
 
@@ -200,8 +218,355 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     SCRIPT_ERROR
 }
 
-fn profile_apply_failed(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> bool {
-    code == Some(65) && stdout.is_empty() && stderr.starts_with(b"sandbox-exec:")
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::io;
+    use std::process::Command;
+
+    /// Seatbelt is applied by a helper binary, so there is nothing for this process to
+    /// hold between staging and exec.
+    pub type Token = ();
+
+    pub struct Staged;
+
+    impl Staged {
+        pub fn token(&self) -> Token {}
+    }
+
+    /// `sandbox-exec` is the only thing that can judge an SBPL profile, and it does that
+    /// after it is spawned — so staging cannot fail here and refusal is detected by
+    /// `refused_after_spawn`. Landlock has the better shape; this is the cost of the
+    /// helper-binary one.
+    pub fn stage(_profile: &str) -> Result<Staged, String> {
+        Ok(Staged)
+    }
+
+    pub fn command(profile: &str, script: &str) -> Command {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command.arg("-p").arg(profile).arg("--").arg(script);
+        command
+    }
+
+    pub fn impose(_token: Token) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// `sandbox-exec` exits 65 with a `sandbox-exec:` stderr prefix and no stdout when it
+    /// cannot apply a profile. Sniffing that is indirect, and stays confined here.
+    pub fn refused_after_spawn(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> bool {
+        code == Some(65) && stdout.is_empty() && stderr.starts_with(b"sandbox-exec:")
+    }
+
+    #[cfg(test)]
+    pub mod test_support {
+        use std::path::Path;
+
+        pub fn permissive_profile() -> String {
+            "(version 1)\n(allow default)".to_owned()
+        }
+
+        /// The same shape `Tightbeam.Containment.profile/1` renders: deny writes by
+        /// default, read and exec anywhere, write only beneath the granted roots.
+        pub fn profile_granting(roots: &[&Path]) -> String {
+            let grants = roots
+                .iter()
+                .map(|root| format!("  (subpath \"{}\")", root.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            format!(
+                "(version 1)\n(deny default)\n(allow file-read*)\n(allow process-fork)\n\
+                 (allow process-exec)\n(allow signal (target self))\n(allow mach-lookup)\n\
+                 (allow sysctl-read)\n(allow file-write*\n{grants})\n"
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::ffi::CString;
+    use std::io;
+    use std::mem::size_of;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::process::Command;
+
+    const CREATE_RULESET: libc::c_long = 444;
+    const ADD_RULE: libc::c_long = 445;
+    const RESTRICT_SELF: libc::c_long = 446;
+    const CREATE_RULESET_VERSION: usize = 1;
+    const RULE_PATH_BENEATH: usize = 1;
+
+    // The write-shaped filesystem rights, ABI 1. Read, directory-read, and execute rights
+    // are deliberately NOT handled, which leaves them unrestricted everywhere — the linux
+    // expression of the profile's `(allow file-read*)` and `(allow process-exec)`. Network
+    // access is likewise unhandled, expressing the v1 open-egress posture.
+    const WRITE_FILE: u64 = 1 << 1;
+    const REMOVE_DIR: u64 = 1 << 4;
+    const REMOVE_FILE: u64 = 1 << 5;
+    const MAKE_CHAR: u64 = 1 << 6;
+    const MAKE_DIR: u64 = 1 << 7;
+    const MAKE_REG: u64 = 1 << 8;
+    const MAKE_SOCK: u64 = 1 << 9;
+    const MAKE_FIFO: u64 = 1 << 10;
+    const MAKE_BLOCK: u64 = 1 << 11;
+    const MAKE_SYM: u64 = 1 << 12;
+    // ABI 2. Handled so renames and links WITHIN a granted root work; left unhandled,
+    // Landlock denies every cross-directory rename, which macOS does not.
+    const REFER: u64 = 1 << 13;
+    // ABI 3. Without it `truncate(2)` is unrestricted, so a contained process could zero
+    // any file it can reach — a write outside its write roots, which is the guarantee.
+    const TRUNCATE: u64 = 1 << 14;
+
+    const ABI1_WRITE_RIGHTS: u64 = WRITE_FILE
+        | REMOVE_DIR
+        | REMOVE_FILE
+        | MAKE_CHAR
+        | MAKE_DIR
+        | MAKE_REG
+        | MAKE_SOCK
+        | MAKE_FIFO
+        | MAKE_BLOCK
+        | MAKE_SYM;
+
+    /// A kernel below this cannot restrict `truncate(2)` and therefore cannot deliver the
+    /// guarantee, so it refuses rather than under-enforcing. ABI 3 is kernel 6.2.
+    const MIN_ABI: libc::c_long = 3;
+
+    #[repr(C)]
+    struct RulesetAttr {
+        handled_access_fs: u64,
+    }
+
+    #[repr(C, packed)]
+    struct PathBeneathAttr {
+        allowed_access: u64,
+        parent_fd: RawFd,
+    }
+
+    /// The staged ruleset's descriptor. `fork` copies the descriptor table, so the child
+    /// keeps its own reference and the parent is free to drop this afterwards.
+    pub type Token = RawFd;
+
+    pub struct Staged {
+        ruleset: OwnedFd,
+    }
+
+    impl Staged {
+        pub fn token(&self) -> Token {
+            self.ruleset.as_raw_fd()
+        }
+    }
+
+    /// Build the ruleset in the parent, before the fork: allocation and path opening do
+    /// not belong in `pre_exec`, and every way this can fail is a refusal we would rather
+    /// discover while nothing has been spawned.
+    pub fn stage(profile: &str) -> Result<Staged, String> {
+        let roots = parse_profile(profile)?;
+        let handled = handled_rights(abi_version()?);
+        let ruleset = create_ruleset(handled)?;
+
+        for root in &roots {
+            grant(&ruleset, root, handled)?;
+        }
+
+        Ok(Staged { ruleset })
+    }
+
+    /// No helper binary: the script is the child, so it is also the process-group leader —
+    /// the same shape macOS has under `sandbox-exec`, with one less process in it.
+    pub fn command(_profile: &str, script: &str) -> Command {
+        Command::new(script)
+    }
+
+    pub fn impose(token: Token) -> io::Result<()> {
+        // Landlock requires no_new_privs so a restricted process cannot escape through a
+        // setuid binary.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if unsafe { libc::syscall(RESTRICT_SELF, token, 0usize) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Nothing to sniff: on this platform a containment failure is always observed before
+    /// or during spawn, never inferred from the child's exit.
+    pub fn refused_after_spawn(_code: Option<i32>, _stdout: &[u8], _stderr: &[u8]) -> bool {
+        false
+    }
+
+    /// Elixir owns which roots are granted; only the encoding is per-OS. An envelope this
+    /// cannot read is a refusal, which is why an unparseable profile has the same band on
+    /// both platforms.
+    fn parse_profile(profile: &str) -> Result<Vec<String>, String> {
+        let envelope: serde_json::Value = serde_json::from_str(profile)
+            .map_err(|error| format!("profile is not a containment envelope: {error}"))?;
+
+        match envelope
+            .get("tightbeam_containment")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(1) => {}
+            Some(version) => return Err(format!("unknown containment envelope version {version}")),
+            None => return Err("profile carries no tightbeam_containment version".to_owned()),
+        }
+
+        let roots = envelope
+            .get("write_roots")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "profile carries no write_roots array".to_owned())?;
+
+        if roots.is_empty() {
+            return Err("profile grants no write roots".to_owned());
+        }
+
+        roots
+            .iter()
+            .map(|root| match root.as_str() {
+                Some(path) if path.starts_with('/') => Ok(path.to_owned()),
+                _ => Err(format!("write root is not an absolute path: {root}")),
+            })
+            .collect()
+    }
+
+    fn abi_version() -> Result<libc::c_long, String> {
+        let abi = unsafe {
+            libc::syscall(
+                CREATE_RULESET,
+                std::ptr::null::<RulesetAttr>(),
+                0usize,
+                CREATE_RULESET_VERSION,
+            )
+        };
+
+        if abi < 0 {
+            return Err(format!(
+                "landlock is unavailable on this kernel ({})",
+                io::Error::last_os_error()
+            ));
+        }
+
+        if abi < MIN_ABI {
+            return Err(format!(
+                "landlock ABI {abi} cannot restrict truncate; ABI {MIN_ABI} (kernel 6.2) is the floor"
+            ));
+        }
+
+        Ok(abi)
+    }
+
+    /// Use every write-shaped right the running kernel offers and mask off the ones it
+    /// does not, so a newer kernel enforces more without an older supported one failing.
+    fn handled_rights(abi: libc::c_long) -> u64 {
+        let mut handled = ABI1_WRITE_RIGHTS;
+
+        if abi >= 2 {
+            handled |= REFER;
+        }
+
+        if abi >= 3 {
+            handled |= TRUNCATE;
+        }
+
+        handled
+    }
+
+    fn create_ruleset(handled: u64) -> Result<OwnedFd, String> {
+        let attr = RulesetAttr {
+            handled_access_fs: handled,
+        };
+
+        let fd = unsafe {
+            libc::syscall(
+                CREATE_RULESET,
+                &attr as *const RulesetAttr,
+                size_of::<RulesetAttr>(),
+                0usize,
+            )
+        };
+
+        if fd < 0 {
+            return Err(format!(
+                "landlock ruleset could not be created ({})",
+                io::Error::last_os_error()
+            ));
+        }
+
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+    }
+
+    /// A granted root that does not exist is OMITTED rather than refused: Landlock rules
+    /// attach to an open directory, while Seatbelt `subpath` rules are prefix matches that
+    /// accept a path which is not there yet. Omitting a grant is strictly more restrictive,
+    /// so the guarantee is never weakened — only a write macOS would have allowed may be
+    /// denied. Rail scratch roots are created before the profile is rendered.
+    fn grant(ruleset: &OwnedFd, root: &str, handled: u64) -> Result<(), String> {
+        let path = CString::new(root)
+            .map_err(|_| format!("write root contains an interior NUL: {root}"))?;
+
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(());
+            }
+
+            return Err(format!("write root {root} could not be opened: {error}"));
+        }
+
+        let parent = unsafe { OwnedFd::from_raw_fd(fd) };
+        let attr = PathBeneathAttr {
+            allowed_access: handled,
+            parent_fd: parent.as_raw_fd(),
+        };
+
+        let added = unsafe {
+            libc::syscall(
+                ADD_RULE,
+                ruleset.as_raw_fd(),
+                RULE_PATH_BENEATH,
+                &attr as *const PathBeneathAttr,
+                0usize,
+            )
+        };
+
+        if added != 0 {
+            return Err(format!(
+                "write root {root} could not be granted ({})",
+                io::Error::last_os_error()
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub mod test_support {
+        use std::path::Path;
+
+        /// Landlock cannot express "allow everything" other than by granting the write
+        /// rights on `/`, so the permissive case still builds and imposes a real ruleset
+        /// rather than skipping containment.
+        pub fn permissive_profile() -> String {
+            profile_granting(&[Path::new("/")])
+        }
+
+        pub fn profile_granting(roots: &[&Path]) -> String {
+            let grants = roots
+                .iter()
+                .map(|root| serde_json::Value::from(root.display().to_string()).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            format!("{{\"tightbeam_containment\":1,\"write_roots\":[{grants}]}}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -214,6 +579,8 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
+    // Canonical, because a write root reached through a symlinked ancestor (Darwin's
+    // /var -> /private/var) is not the path the kernel checks against on either platform.
     fn temp_dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "tightbeam-rail-exec-{}-{}",
@@ -221,7 +588,7 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
-        path
+        fs::canonicalize(&path).unwrap()
     }
 
     fn script(dir: &Path, name: &str, body: &str) -> String {
@@ -233,8 +600,17 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
-    fn permissive_profile() -> String {
-        "(version 1)\n(allow default)".to_owned()
+    use platform::test_support::{permissive_profile, profile_granting};
+
+    fn band(profile: String, script_path: String, timeout: Duration) -> i32 {
+        run_with_input(
+            RailExecArgs {
+                profile,
+                timeout,
+                script: script_path,
+            },
+            b"{}\n".to_vec(),
+        )
     }
 
     #[test]
@@ -259,13 +635,67 @@ mod tests {
         let status = run_with_input(
             RailExecArgs {
                 profile: permissive_profile(),
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(30),
                 script: check,
             },
             b"{}\n".to_vec(),
         );
         assert_eq!(status, PASS);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // The proof obligation this platform owes, executed on this platform: containment is
+    // APPLIED and a write outside the granted roots is DENIED. One body, both mechanisms,
+    // identical assertions — a rail author cannot tell from a verdict which OS ran it.
+    // Asserting that a profile string renders is not proof of anything and never was.
+    #[test]
+    fn a_write_outside_the_granted_roots_is_denied_and_leaves_nothing_behind() {
+        let granted = temp_dir();
+        let outside = temp_dir();
+        let profile = profile_granting(&[&granted]);
+
+        let inside = granted.join("inside");
+        let writes_inside = script(
+            &granted,
+            "writes-inside",
+            &format!("printf ok > '{}'", inside.display()),
+        );
+        assert_eq!(
+            band(profile.clone(), writes_inside, Duration::from_secs(5)),
+            PASS
+        );
+        assert_eq!(fs::read_to_string(&inside).unwrap(), "ok");
+
+        let denied = outside.join("denied");
+        let writes_outside = script(
+            &granted,
+            "writes-outside",
+            &format!("printf no > '{}'", denied.display()),
+        );
+        assert_eq!(
+            band(profile.clone(), writes_outside, Duration::from_secs(5)),
+            SCRIPT_ERROR
+        );
+        assert!(!denied.exists(), "a write outside the granted roots landed");
+
+        // A symlink inside a granted root is not a way out of it: both mechanisms check
+        // the resolved path, so the escape is denied and the target never appears.
+        let escape = granted.join("escape");
+        let target = outside.join("through-link");
+        std::os::unix::fs::symlink(&target, &escape).unwrap();
+        let writes_through_link = script(
+            &granted,
+            "writes-through-link",
+            &format!("printf no > '{}'", escape.display()),
+        );
+        assert_eq!(
+            band(profile, writes_through_link, Duration::from_secs(5)),
+            SCRIPT_ERROR
+        );
+        assert!(!target.exists(), "a symlink escaped the granted roots");
+
+        fs::remove_dir_all(granted).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
@@ -275,7 +705,7 @@ mod tests {
         let status = run_with_input(
             RailExecArgs {
                 profile: "(version 1) (this-is-invalid)".into(),
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(30),
                 script: check,
             },
             b"{}\n".to_vec(),
@@ -291,7 +721,7 @@ mod tests {
         let status = run_with_input(
             RailExecArgs {
                 profile: permissive_profile(),
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(30),
                 script: check,
             },
             b"{}\n".to_vec(),

@@ -357,17 +357,48 @@ defmodule Tightbeam.RailScriptTest do
     assert File.exists?(Path.join(workdir, ".rail-cwd-marker"))
     refute File.exists?(Path.join(workdir, "rail-write"))
     assert Path.wildcard(Path.join([ctx.base_dir, "rails", "scratch", "*"])) == []
+  end
 
-    assert {:error, "script_error", _exit_class} =
-             RailScript.run(
-               ctx.db,
-               ctx.base_dir,
-               rule("rail-write-workdir"),
-               call(%{assignment_id: "a1"}),
-               assignment
-             )
+  # The write wall is the real mechanism's to enforce, so it is asserted against the real
+  # binary. It used to ride on the fixture double, which interposed `sandbox-exec` — so
+  # this assertion held on macOS and could not hold on linux, which is how a macOS-only
+  # containment mechanism stayed invisible under a green suite.
+  if File.exists?(@release_binary) do
+    test "a rail script cannot write outside its scratch root", ctx do
+      wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+      File.cp!(@release_binary, wrapper)
+      File.chmod!(wrapper, 0o755)
 
-    refute File.exists?(Path.join(workdir, "rail-forbidden-write"))
+      workdir = Placement.holder_workdir(%{base_dir: ctx.base_dir, port: 0}, ctx.holder)
+      File.write!(Path.join(workdir, ".rail-cwd-marker"), "cwd")
+      assignment = %{holder_key: ctx.holder.session_key}
+
+      assert {:ok, "pass", "returned"} =
+               RailScript.run(
+                 ctx.db,
+                 ctx.base_dir,
+                 put_in(rule("rail-cwd-scratch").check.timeout_ms, 10_000),
+                 call(%{assignment_id: "a1"}),
+                 assignment
+               )
+
+      assert {:error, "script_error", _exit_class} =
+               RailScript.run(
+                 ctx.db,
+                 ctx.base_dir,
+                 put_in(rule("rail-write-workdir").check.timeout_ms, 10_000),
+                 call(%{assignment_id: "a1"}),
+                 assignment
+               )
+
+      refute File.exists?(Path.join(workdir, "rail-forbidden-write"))
+    end
+  else
+    @tag skip:
+           "real rail-exec integration binary missing: #{@release_binary}; run cargo build --release in cli/"
+    test "a rail script cannot write outside its scratch root" do
+      flunk("release binary is required when this test is enabled")
+    end
   end
 
   test "remote holder fails closed before ensuring its workdir", ctx do

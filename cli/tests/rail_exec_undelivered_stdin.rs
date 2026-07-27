@@ -15,6 +15,14 @@ use std::{fs, thread};
 const PARSED_PREFIX: &str = "tightbeam rail-exec child exit:";
 const SCRIPT_ERROR: i32 = 10;
 
+// A permissive profile is still a real profile on both platforms: the wrapper imposes it
+// either way, so a hardcoded SBPL string here would refuse containment on linux and turn
+// every assertion below into a CONTAINED_REFUSED.
+#[cfg(target_os = "macos")]
+const PERMISSIVE_PROFILE: &str = "(version 1)\n(allow default)";
+#[cfg(target_os = "linux")]
+const PERMISSIVE_PROFILE: &str = r#"{"tightbeam_containment":1,"write_roots":["/"]}"#;
+
 fn script(name: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "tightbeam-rail-exec-stdin-{}-{name}",
@@ -34,7 +42,7 @@ fn rail_exec(script_path: &std::path::Path, input: Vec<u8>) -> (i32, String) {
         .args([
             "rail-exec",
             "--profile",
-            "(version 1)\n(allow default)",
+            PERMISSIVE_PROFILE,
             "--timeout-ms",
             "5000",
             "--",

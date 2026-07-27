@@ -1,9 +1,22 @@
 defmodule Tightbeam.Containment do
   @moduledoc """
-  macOS Seatbelt profile rendering and write-root validation.
+  Write-root validation, and containment profile rendering for the host's OS.
+
+  The neutral truth is the SET OF WRITE ROOTS. Seatbelt SBPL is macOS's encoding
+  of that set, not the set itself, so only the encoding is per-OS: this module
+  stays the single authority on which roots are granted, because that draws on
+  product knowledge (`Harness.containment_additions/0`) the wrapper does not
+  have. The wrapper dispatches on its own target OS to apply what it is handed.
+
+  A platform-specific mechanism carries a parity obligation and a per-OS proof
+  obligation at the moment it is chosen. Both mechanisms and both obligations
+  are written down in the shared containment spec; a supported platform without
+  a named mechanism raises here rather than rendering something inapplicable.
 
   Profile rendering validates every write root, including filesystem
   canonicality, so a configured grant can never silently miss its real path.
+  Validation is neutral truth about the filesystem and runs identically on
+  every platform.
   """
 
   @spec profile([String.t()]) :: String.t()
@@ -15,13 +28,21 @@ defmodule Tightbeam.Containment do
       |> Enum.flat_map(& &1.containment_additions())
       |> Enum.uniq()
 
-    grants =
-      write_roots
-      |> Enum.map(&{&1, nil})
-      |> Kernel.++(additions)
+    grants = Enum.map(write_roots, &{&1, nil}) ++ additions
+
+    case :os.type() do
+      {:unix, :darwin} -> seatbelt(grants)
+      {:unix, :linux} -> landlock(grants)
+      other -> raise ArgumentError, "no containment mechanism for #{inspect(other)}"
+    end
+  end
+
+  defp seatbelt(grants) do
+    rendered =
+      grants
       |> Enum.with_index()
       |> Enum.map_join("\n", fn {{path, comment}, index} ->
-        closing = if index == length(write_roots) + length(additions) - 1, do: ")", else: ""
+        closing = if index == length(grants) - 1, do: ")", else: ""
         line = ~s|  (subpath "#{path}")#{closing}|
         if comment, do: String.pad_trailing(line, 34) <> ";; " <> comment, else: line
       end)
@@ -35,7 +56,7 @@ defmodule Tightbeam.Containment do
 
     ;; writes: deny-by-default; org trees + spike-required system paths
     (allow file-write*
-    #{grants}
+    #{rendered}
 
     ;; process lifecycle
     (allow process-fork)
@@ -49,6 +70,17 @@ defmodule Tightbeam.Containment do
     ;; network — v1 posture: open egress
     (allow network-outbound)
     """
+  end
+
+  # Landlock consumes a set of path rules, so the grant list is the whole profile: the
+  # wrapper handles the write-shaped access rights and grants them beneath these paths,
+  # leaving reads, execs, and network unhandled — the same posture the SBPL above states
+  # in prose. Rendered by hand rather than by encoding a map, so the bytes are
+  # deterministic and assertable; `validate_roots!/1` has already refused the bytes that
+  # would need escaping.
+  defp landlock(grants) do
+    roots = Enum.map_join(grants, ",", fn {path, _comment} -> JSON.encode!(path) end)
+    ~s({"tightbeam_containment":1,"write_roots":[#{roots}]})
   end
 
   @spec validate_roots!([String.t()]) :: :ok
