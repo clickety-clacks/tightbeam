@@ -10,6 +10,24 @@ use crate::args::{AssimilateArgs, Identity};
 use crate::dispatch::{self, RequestSpec};
 use crate::harnesses::HarnessCatalog;
 
+/// Read the staging path out of a `begin` phase response.
+///
+/// The wire is camelCase in BOTH directions: `router.ex`'s `wire_value/1` lower-camelizes
+/// every atom key on the way out, so the gateway's `staging_path` (gateway.ex, onboard
+/// begin) ships as `stagingPath`. This read used `"staging_path"` and therefore could
+/// never match — `onboard` failed with "onboarding did not return a staging path" on
+/// every machine, for every provider, before any network call to the provider. The
+/// request side was camelCase all along (`asUser`), so only the response read was wrong.
+///
+/// Split out as a pure function purely so the wire shape can be pinned by a test;
+/// `dispatch::send` does its own I/O and cannot be exercised from a unit test.
+fn staging_path(ready: &serde_json::Value) -> Result<&str, String> {
+    ready
+        .get("stagingPath")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "onboarding did not return a staging path".to_owned())
+}
+
 pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
     let machine = std::env::var("TIGHTBEAM_MACHINE").ok();
     let begin = dispatch::build_onboard_phase_request(
@@ -21,10 +39,7 @@ pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
     );
     let ready = dispatch::send(&begin)?
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
-    let staging = ready
-        .get("staging_path")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
+    let staging = staging_path(&ready)?;
 
     let interactive = run_provider_onboarding(provider, staging);
 
@@ -813,6 +828,34 @@ mod tests {
             probe_failure(&auth),
             "ssh authentication failed; set up ssh keys for non-interactive access"
         );
+    }
+
+    #[test]
+    fn staging_path_reads_the_wire_shape_the_gateway_actually_sends() {
+        // Verbatim from a live gateway on shrdlu (2026-07-27), captured off the wire
+        // during the production-install smoke. Every response key is lower-camelCase
+        // because router.ex camelizes atom keys on the way out.
+        let ready: serde_json::Value = serde_json::from_str(
+            r#"{"provider":"anthropic","stagingPath":"/tmp/tightbeam-anthropic-onboard-7","status":"ready"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            staging_path(&ready).unwrap(),
+            "/tmp/tightbeam-anthropic-onboard-7"
+        );
+    }
+
+    #[test]
+    fn staging_path_rejects_the_snake_case_key_that_never_shipped() {
+        // The bug this pins: reading "staging_path" matched nothing, so onboard failed
+        // identically on every machine. A snake_case body must NOT satisfy the read --
+        // otherwise a future "be liberal in what you accept" edit would hide a real
+        // wire-contract break instead of surfacing it.
+        let wrong: serde_json::Value =
+            serde_json::from_str(r#"{"staging_path":"/tmp/x","status":"ready"}"#).unwrap();
+
+        assert!(staging_path(&wrong).is_err());
     }
 
     #[test]
