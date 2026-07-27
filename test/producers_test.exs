@@ -770,11 +770,31 @@ defmodule Tightbeam.ProducersTest do
     end) || flunk("the spawned leader never reached state T, so its SIGCONT would be lost")
   end
 
+  # Poll, don't one-shot. Production reads the LEADER pid it holds through the port and
+  # only AFTER verify_process_group/2 has polled it into state T (producers.ex), and its
+  # process_started/1 returns nil rather than crashing — so production never races a
+  # not-yet-visible process. This helper reads a CHILD discovered by a `ps -g` scan, and
+  # on a loaded macOS runner `ps -p <child>` can return {"", 1} in the window before that
+  # child is resolvable, which the one-shot `{output, 0} = ...` turned into a MatchError
+  # that read as a producer defect. Wait for the pid to become observable, matching
+  # wait_until_stopped/2 and verify_process_group/2; flunk clearly if it never does —
+  # that WOULD be a real fault, and it still surfaces.
   defp process_started!(os_pid) do
-    {output, 0} =
-      System.cmd("ps", ["-o", "lstart=", "-p", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    Enum.reduce_while(1..1_000, nil, fn _, _ ->
+      case System.cmd("ps", ["-o", "lstart=", "-p", Integer.to_string(os_pid)],
+             stderr_to_stdout: true
+           ) do
+        {output, 0} ->
+          case String.trim(output) do
+            "" -> Process.sleep(1) && {:cont, nil}
+            started -> {:halt, started}
+          end
 
-    String.trim(output)
+        _ ->
+          Process.sleep(1) && {:cont, nil}
+      end
+    end) ||
+      flunk("pid #{os_pid} never became observable to `ps -o lstart` within the poll window")
   end
 
   defp non_leader_child(leader) do

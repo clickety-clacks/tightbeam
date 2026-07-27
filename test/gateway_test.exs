@@ -3607,7 +3607,14 @@ defmodule Tightbeam.GatewayTest do
              "sessionKey" => "k1"
            }
 
-    assert_receive {:prompt_started, ^adapter}, 1_000
+    # Proven late, not lost. This fails only intermittently on loaded macOS CI (2 of 5
+    # samples) while the SAME runner Task completes successfully (Task.await below), so the
+    # message is genuinely sent and received — just after the 1s global budget, because the
+    # runner's full turn (rsync staging + adapter drive) competes for schedulers under load.
+    # #56 gave a bare node handshake 1s for the same reason (fdb2a21); a whole turn needs
+    # more. assert_receive still fails if the message never arrives, so a genuinely lost
+    # message is not hidden — only cold-runner latency is tolerated.
+    assert_receive {:prompt_started, ^adapter}, 15_000
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
