@@ -78,21 +78,20 @@ defmodule Tightbeam.ReadinessTest do
     assert Enum.any?(lines, &(&1 =~ "serving"))
   end
 
-  test "one runnable harness says READY and does not nag about the rest", ctx do
-    [module | _] = Harness.all()
-    install_adapter!(ctx.base, module)
-    catalog = catalog!(%{module.wire_name() => live("m[medium]")})
+  test "a fully ready install says so in ONE line and says nothing else", ctx do
+    for module <- Harness.all(), do: install_adapter!(ctx.base, module)
+    catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m[medium]")}))
 
     summary = Readiness.summary(ctx.config, catalog)
     assert summary.runnable?
+    names = Enum.map_join(Harness.all(), ", ", & &1.wire_name())
 
-    [first | rest] = Readiness.render(summary, ctx.config)
-    assert first == "READY: #{module.wire_name()} can run turns."
-
-    # A working install states it and stops. Anything further must be a REAL gap
-    # on another harness, never a restatement of the good news.
-    refute Enum.any?(rest, &(&1 =~ "READY"))
-    refute Enum.any?(rest, &(&1 =~ module.wire_name() <> ":"))
+    # EXACT output, not "does not contain". A working install states it and stops.
+    # "Does not nag" is guarded twice — the ready harness is rejected before
+    # rendering, AND a gapless row renders nothing — so an assertion that only
+    # forbids certain substrings passes when EITHER guard holds and cannot tell
+    # you the other has gone. Pinning the whole render makes both load-bearing.
+    assert Readiness.render(summary, ctx.config) == ["READY: #{names} can run turns."]
   end
 
   ## Naming the gap and the fix — the identity-check standard
