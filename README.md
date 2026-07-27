@@ -24,12 +24,21 @@ from the failure — see `mix tightbeam.doctor` and the notes below.
   install fails and no turn can start.
 - **git**, for the identity repository.
 - **A C toolchain** (`gcc`/`clang` + `make`) — `exqlite` builds a native NIF.
+- **Hex and rebar3**, Elixir's package and build tools. They do NOT ship with
+  Elixir. Without them `mix deps.get` cannot fetch anything, and on a machine
+  that has never had them it stops on an interactive prompt — `Shall I install
+  Hex? [Yn]` — which fails outright under any non-interactive install. Install
+  them explicitly with the first two commands below rather than answering that
+  prompt; `--if-missing` makes both a no-op when you already have them.
 
 ## Install
 
 ```sh
 git clone https://github.com/clickety-clacks/tightbeam.git
 cd tightbeam
+
+mix local.hex --force --if-missing      # Hex; no-op if already installed
+mix local.rebar --force --if-missing    # rebar3, to build Erlang deps
 
 mix deps.get
 mix compile
