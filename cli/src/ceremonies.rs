@@ -123,17 +123,50 @@ fn run_openai_onboarding(staging: &str) -> Result<(), String> {
     }
 }
 
+/// `script(1)` argument order, which is NOT portable.
+///
+/// The wrapper exists only to give `claude setup-token` a TTY (it refuses to run
+/// without one) and to capture the transcript `capture_setup_token` parses. The two
+/// implementations take the command in incompatible ways:
+///
+/// - BSD/macOS: `script [-q] <file> <command> [args...]`
+/// - util-linux: `script [-q] -c "<command>" <file>` — extra trailing args are an
+///   error, so the BSD form fails with "unexpected number of arguments"
+///
+/// Shipping only the BSD form made the entire Anthropic credential path unreachable
+/// on every Linux host: it failed before contacting Anthropic, so no credential or
+/// network fix could help, and the openai path worked because it execs `codex`
+/// directly with no wrapper. Found on shrdlu during the production-install smoke.
+///
+/// Dispatched at COMPILE time, like the containment seam: a platform with no named
+/// form fails to build rather than failing at a customer's terminal.
+#[cfg(target_os = "macos")]
+fn script_args(transcript: &str) -> Vec<String> {
+    vec![
+        "-q".to_owned(),
+        transcript.to_owned(),
+        "claude".to_owned(),
+        "setup-token".to_owned(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn script_args(transcript: &str) -> Vec<String> {
+    vec![
+        "-q".to_owned(),
+        "-c".to_owned(),
+        "claude setup-token".to_owned(),
+        transcript.to_owned(),
+    ]
+}
+
 fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
     let transcript = PathBuf::from(staging).join("setup-token.log");
+    let transcript_path = transcript
+        .to_str()
+        .ok_or_else(|| "invalid onboarding staging path".to_owned())?;
     let status = ProcessCommand::new("script")
-        .args([
-            "-q",
-            transcript
-                .to_str()
-                .ok_or_else(|| "invalid onboarding staging path".to_owned())?,
-            "claude",
-            "setup-token",
-        ])
+        .args(script_args(transcript_path))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -827,6 +860,30 @@ mod tests {
         assert_eq!(
             probe_failure(&auth),
             "ssh authentication failed; set up ssh keys for non-interactive access"
+        );
+    }
+
+    /// The BSD and util-linux forms are mutually incompatible, and shipping only the
+    /// BSD one made Anthropic onboarding impossible on every Linux host. Each arm is
+    /// asserted on its own platform, so the CI matrix proves both rather than proving
+    /// whichever one the developer happens to be sitting on.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn script_args_use_the_bsd_form_on_macos() {
+        assert_eq!(
+            script_args("/tmp/t.log"),
+            vec!["-q", "/tmp/t.log", "claude", "setup-token"]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn script_args_use_the_util_linux_form_on_linux() {
+        // util-linux takes the command via -c and allows at most one file argument;
+        // trailing args are "unexpected number of arguments" and exit 1.
+        assert_eq!(
+            script_args("/tmp/t.log"),
+            vec!["-q", "-c", "claude setup-token", "/tmp/t.log"]
         );
     }
 
