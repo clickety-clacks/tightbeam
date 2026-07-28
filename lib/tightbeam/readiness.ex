@@ -244,11 +244,16 @@ defmodule Tightbeam.Readiness do
   defp adapter_line(%{adapter: :present}), do: nil
   defp adapter_line(%{adapter: {:unknown, _reason}}), do: nil
 
+  # The fallback command is PINNED and `--no-save`, exactly like the one `assimilate`
+  # runs. An operator who follows a remedy verbatim gets whatever it says, so a bare
+  # package name here installs npm's latest and floats the adapter off its pin — the
+  # drift the install site was fixed to prevent, reintroduced by the sentence that
+  # tells someone how to do it by hand (#47).
   defp adapter_line(%{harness: wire, adapter: {:missing, path}}) do
     "ACP adapter missing at #{path} — no turn can start. " <>
       "Install it with: tightbeam assimilate --harness #{wire} (or npm install " <>
-      "--prefix #{path |> Path.dirname() |> Path.dirname() |> Path.dirname()} " <>
-      "#{package_for(wire)})"
+      "--prefix #{path |> Path.dirname() |> Path.dirname() |> Path.dirname()} --no-save " <>
+      "#{package_for(wire)}@#{version_for(wire)})"
   end
 
   defp credential_line(%{credential: :live}), do: nil
@@ -286,6 +291,14 @@ defmodule Tightbeam.Readiness do
   defp package_for(wire) do
     Enum.find_value(Harness.all(), wire, fn module ->
       if module.wire_name() == wire, do: module.install_package()
+    end)
+  end
+
+  # Asked of the harness module, like the package name and like `Spinup` asks it, so
+  # the remedy cannot drift from the version assimilate would actually install.
+  defp version_for(wire) do
+    Enum.find_value(Harness.all(), "latest", fn module ->
+      if module.wire_name() == wire, do: module.adapter_version()
     end)
   end
 end

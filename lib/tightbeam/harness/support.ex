@@ -502,7 +502,7 @@ defmodule Tightbeam.Harness.Support do
         &"#{&1.install_package()}@#{&1.adapter_version()}"
       )
 
-    script = "npm install --prefix '<BASE>/adapters' " <> packages
+    script = "npm install --prefix '<BASE>/adapters' --no-save " <> packages
 
     case locality do
       :local ->

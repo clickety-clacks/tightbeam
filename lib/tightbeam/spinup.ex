@@ -107,7 +107,13 @@ defmodule Tightbeam.Spinup do
     packages =
       Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
-    script = "npm install --prefix #{shell_quote(install_dir)} " <> packages
+    # `--no-save`, because npm records a CARET RANGE for a version it installed
+    # exactly: `npm install pkg@1.1.4` writes `"^1.1.4"` into package.json, so the
+    # pin held only until the next bare `npm install` in that directory floated it
+    # forward. The directory is ours and nothing else installs there, so there is
+    # no manifest worth writing — the pin lives in the harness module, and the only
+    # record that matters is what is on disk.
+    script = "npm install --prefix #{shell_quote(install_dir)} --no-save " <> packages
 
     case locality do
       :local -> ["sh", "-c", script]
