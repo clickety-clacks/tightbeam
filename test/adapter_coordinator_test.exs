@@ -167,6 +167,50 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert detail =~ "adapter transport died: credential socket closed"
   end
 
+  test "an adapter dying with a draining gateway is lifecycle, not an [error]", ctx do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
+    File.write!(path, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_opts: fn _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :"coordinator_#{System.unique_integer([:positive])}"}
+      )
+
+    assert {:ok, adapter, 1} =
+             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+
+    assert is_pid(Tightbeam.Acp.Adapter.conn(adapter))
+    ref = Process.monitor(adapter)
+
+    :persistent_term.put({Tightbeam.Application, :draining}, true)
+    on_exit(fn -> :persistent_term.erase({Tightbeam.Application, :draining}) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(adapter, {:acp_exit, 255})
+
+        # {:shutdown, reason} is the demotion: OTP emits no crash report for a
+        # shutdown tuple, and the wrapped reason still reaches the coordinator's
+        # adapter_down row. A spontaneous death (the test above) keeps the bare
+        # fault reason and with it the [error] report.
+        assert_receive {:DOWN, ^ref, :process, ^adapter, {:shutdown, {:acp_exit, 255}}}, 2_000
+      end)
+
+    refute log =~ "[error]"
+    assert log =~ "adapter exited with the draining gateway"
+  end
+
   test "adapter death bumps generation and records lifecycle", ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)

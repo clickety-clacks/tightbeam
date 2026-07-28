@@ -16,6 +16,7 @@ defmodule Tightbeam.Acp.Adapter do
   """
 
   use GenServer
+  require Logger
   alias Tightbeam.{Harness}
   alias Tightbeam.Acp.Conn
 
@@ -496,10 +497,19 @@ defmodule Tightbeam.Acp.Adapter do
   # death is recorded, the next turn boots a replacement and re-adopts
   # sessions. (Found by the soak driver's A3 audit: an adapter SIGKILL
   # left zero substrate records.)
-  def handle_info({:acp_exit, status}, state),
-    do:
-      {:stop, adapter_failure_reason({:acp_exit, status}, state.stderr_path, state.stderr_offset),
-       state}
+  def handle_info({:acp_exit, status}, state) do
+    reason = adapter_failure_reason({:acp_exit, status}, state.stderr_path, state.stderr_offset)
+
+    # A draining gateway takes its harnesses down with it — that death is
+    # lifecycle, not fault (#98). {:shutdown, reason} keeps the detail for the
+    # coordinator's adapter_down row while OTP skips the [error] crash report.
+    if Tightbeam.Application.draining?() do
+      Logger.info("adapter exited with the draining gateway: #{inspect(reason)}")
+      {:stop, {:shutdown, reason}, state}
+    else
+      {:stop, reason, state}
+    end
+  end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
