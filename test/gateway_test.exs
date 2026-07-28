@@ -1344,16 +1344,9 @@ defmodule Tightbeam.GatewayTest do
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.put(:effort_checkin_horizon_ms, 1)
-      |> Map.put(:effort_probe, fn _session, _root, _baseline, _config ->
-        {:ok,
-         %{
-           stamp: "/tmp/effort.stamp",
-           prior: "observed",
-           writes: 0,
-           entries: 1,
-           digest: "same"
-         }}
-      end)
+      # Injected at the SHELL: the real observation command is built, run and
+      # parsed; only what a filesystem would have said is supplied.
+      |> Map.put(:sh, fn _invocation -> {"B\tobserved\t0\n/w\n", 0} end)
 
     {Wakes, wake_opts} =
       config
@@ -3416,16 +3409,9 @@ defmodule Tightbeam.GatewayTest do
 
     config =
       gateway_config(base_dir, ctx.db, 0)
-      |> Map.put(:effort_probe, fn _session, _root, _baseline, _config ->
-        {:ok,
-         %{
-           stamp: "/tmp/effort.stamp",
-           prior: "observed",
-           writes: 0,
-           entries: 1,
-           digest: "same"
-         }}
-      end)
+      # Injected at the SHELL: the real observation command is built, run and
+      # parsed; only what a filesystem would have said is supplied.
+      |> Map.put(:sh, fn _invocation -> {"B\tobserved\t0\n/w\n", 0} end)
 
     item =
       Assignments.__handle__(ctx.db, "dispatch", %{

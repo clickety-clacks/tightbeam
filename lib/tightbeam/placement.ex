@@ -200,50 +200,43 @@ defmodule Tightbeam.Placement do
   since the prior stamp, plus the current listing.
 
   No git anywhere. Arming lays an empty stamp file; a later observation asks
-  `find -newer` what has been written since, diffs the listing for created and
-  deleted paths, then lays the NEXT stamp and removes the one it consumed — so a
-  stamp lives exactly as long as the generation that owns it, and dies with the
-  workspace it sits in. The stamp directory is pruned from the walk, so a stamp
-  can never perturb its own probe.
+  `find -newer` what has been written since and diffs the listing for created
+  and deleted paths, then lays the NEXT stamp — so a stamp lives as long as the
+  generation that owns it and dies with the workspace it sits in. The stamp
+  directory is pruned from the walk, so a stamp can never perturb its own probe.
 
-  Local and satellite holders use the same bounded shell probe.
+  ONE mechanism. Local and satellite holders run the same bounded shell probe,
+  and nothing may substitute a different observation for it: a caller that could
+  replace this wholesale is a pluggable probe framework, which the spec's
+  Non-goals refuse. Tests inject at the SHELL (`:sh`), so the command is always
+  the one production builds, runs and parses.
   """
   @spec effort_observation(map(), map(), String.t(), term()) ::
           {:ok, map()} | {:error, String.t()}
   def effort_observation(config, session, root, baseline \\ nil) do
-    case Map.get(config, :effort_probe) do
-      fun when is_function(fun, 4) ->
-        fun.(session, root, baseline, config)
+    host = Map.fetch!(hosts(config.base_dir), session.host)
+    stamp_dir = Path.join(workdir_path(config, session), @effort_stamp_dir)
+    stamp = Path.join(stamp_dir, "#{Tightbeam.Id.uuid4()}.stamp")
+    command = effort_observation_command(root, stamp_dir, stamp, prior_stamp(baseline))
+    runner = Map.get(config, :sh, &system_cmd/1)
 
-      _ ->
-        host = Map.fetch!(hosts(config.base_dir), session.host)
-        stamp_dir = Path.join(workdir_path(config, session), @effort_stamp_dir)
-        stamp = Path.join(stamp_dir, "#{Tightbeam.Id.uuid4()}.stamp")
-        command = effort_observation_command(root, stamp_dir, stamp, prior_stamp(baseline))
-        runner = Map.get(config, :sh, &system_cmd/1)
+    invocation =
+      if host.ssh == nil do
+        ["sh", "-lc", command]
+      else
+        ["ssh" | @ssh_opts] ++ [host.ssh, "sh", "-lc", shell_quote(command)]
+      end
 
-        invocation =
-          if host.ssh == nil do
-            ["sh", "-lc", command]
-          else
-            ["ssh" | @ssh_opts] ++ [host.ssh, "sh", "-lc", shell_quote(command)]
-          end
+    result =
+      if host.ssh == nil do
+        run_probe(runner, invocation)
+      else
+        run_bounded(runner, invocation, Map.get(config, :effort_probe_timeout_ms, 8_000))
+      end
 
-        result =
-          if host.ssh == nil do
-            run_probe(runner, invocation)
-          else
-            run_bounded(
-              runner,
-              invocation,
-              Map.get(config, :effort_probe_timeout_ms, 8_000)
-            )
-          end
-
-        case result do
-          {:ok, output} -> parse_effort_observation(output, stamp)
-          {:error, reason} -> {:error, reason}
-        end
+    case result do
+      {:ok, output} -> parse_effort_observation(output, stamp)
+      {:error, reason} -> {:error, reason}
     end
   end
 
