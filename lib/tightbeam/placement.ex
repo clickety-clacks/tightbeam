@@ -252,16 +252,21 @@ defmodule Tightbeam.Placement do
   defp prior_stamp(_baseline), do: nil
 
   @doc """
-  Existence-check paths on the host that holds them — the write-detection half
-  of referent verification, and the same shape as the effort probe: one bounded
-  invocation per host, local or over ssh.
+  Stat paths on the host that holds them — the write-detection half of referent
+  verification, and the same shape as the effort probe: one bounded invocation
+  per host, local or over ssh.
+
+  A present path returns its mtime, so the answer is evidence of a write and not
+  merely of existence. `stat` spells its format differently on BSD and GNU, so
+  the command tries both; a host with neither reports the path unverifiable
+  rather than guessing.
 
   A host that cannot be reached reports THAT. The answer is about the check, so
   a caller can never turn it into a statement about the claim that named the
   path, or about the credential that failed to reach the host.
   """
   @spec check_origins(map(), String.t(), [String.t()]) ::
-          %{String.t() => :present | :absent | {:error, String.t()}}
+          %{String.t() => {:present, integer()} | :absent | {:error, String.t()}}
   def check_origins(_config, _host_name, []), do: %{}
 
   def check_origins(config, host_name, paths) do
@@ -298,7 +303,13 @@ defmodule Tightbeam.Placement do
     """
     set -u
     for p in #{Enum.map_join(paths, " ", &shell_quote/1)}; do
-      if test -e "$p"; then printf 'P\\t%s\\n' "$p"; else printf 'A\\t%s\\n' "$p"; fi
+      if test ! -e "$p"; then
+        printf 'A\\t0\\t%s\\n' "$p"
+      elif m=$(stat -f %m "$p" 2>/dev/null) || m=$(stat -c %Y "$p" 2>/dev/null); then
+        printf 'P\\t%s\\t%s\\n' "$m" "$p"
+      else
+        printf 'U\\t0\\t%s\\n' "$p"
+      fi
     done
     """
   end
@@ -308,9 +319,10 @@ defmodule Tightbeam.Placement do
       output
       |> String.split("\n", trim: true)
       |> Enum.reduce(%{}, fn line, acc ->
-        case String.split(line, "\t", parts: 2) do
-          ["P", path] -> Map.put(acc, path, :present)
-          ["A", path] -> Map.put(acc, path, :absent)
+        case String.split(line, "\t", parts: 3) do
+          ["P", mtime, path] -> Map.put(acc, path, {:present, String.to_integer(mtime)})
+          ["A", _mtime, path] -> Map.put(acc, path, :absent)
+          ["U", _mtime, path] -> Map.put(acc, path, {:error, "this host has no usable stat"})
           _ -> acc
         end
       end)
@@ -422,6 +434,14 @@ defmodule Tightbeam.Placement do
   # Portable shell: no git, no mktemp, no GNU-only find predicates. A vanished
   # file mid-walk is not a probe failure, so the walk's own stderr is dropped and
   # only the explicit preconditions (a readable root, a writable stamp) fail.
+  #
+  # ORDER IS LOAD-BEARING. The next stamp is laid BEFORE the walk, so a write
+  # that lands between the two is newer than the new stamp and is caught by the
+  # next probe — at worst counted twice, never missed. And the prior stamp is
+  # never removed: two observers can read the same armed generation (observation
+  # runs before the CAS that picks a winner), and a loser deleting the stamp the
+  # winner's row points at would silently blind the next bracket. A stamp per
+  # generation accumulates in the workdir and dies with the workspace.
   defp effort_observation_command(root, stamp_dir, stamp, prior) do
     """
     set -u
@@ -433,6 +453,7 @@ defmodule Tightbeam.Placement do
     mkdir -p "$stampdir" || exit 1
     priorState=none
     writes=0
+    : > "$stamp" || exit 1
     if test -n "$prior"; then
       if test -e "$prior"; then
         priorState=observed
@@ -441,8 +462,6 @@ defmodule Tightbeam.Placement do
         priorState=missing
       fi
     fi
-    : > "$stamp" || exit 1
-    test -z "$prior" || rm -f "$prior"
     printf 'B\\t%s\\t%s\\n' "$priorState" "$writes"
     find "$root" -path "$stampdir" -prune -o -print 2>/dev/null
     """
