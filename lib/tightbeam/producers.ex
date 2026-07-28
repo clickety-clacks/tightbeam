@@ -625,8 +625,17 @@ defmodule Tightbeam.Producers do
   end
 
   defp local_holder(config, holder) do
-    host = Placement.hosts(config.base_dir)[holder.host]
-    if host && host.ssh == nil, do: :ok, else: {:error, "host-fail: remote holder deferred"}
+    case Placement.hosts(config.base_dir)[holder.host] do
+      nil ->
+        {:error,
+         "host-fail: no host named #{holder.host} is registered: assimilate it or correct the placement"}
+
+      %{ssh: nil} ->
+        :ok
+
+      _remote ->
+        {:error, "host-fail: remote holder deferred"}
+    end
   end
 
   defp assignment_holder(db, assignment_id) do

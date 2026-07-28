@@ -357,6 +357,31 @@ defmodule Tightbeam.ProducersTest do
              event.subject == remote_assignment.id and
                event.detail =~ "remote holder deferred"
            end)
+
+    # An UNREGISTERED holder host is a different fact than a remote one, and the
+    # detail has to discriminate: the deferral string sends an operator to
+    # ssh/placement when the actual repair is assimilate (#97).
+    ghost = session(ctx.db, "ghost", "flynn", "claude", "anthropic", "ghost-host")
+    ghost_assignment = assignment(ctx.db, ghost.session_key, "ghost")
+    assert Placement.hosts(ctx.base_dir)["ghost-host"] == nil
+
+    %{queued: ghost_id} =
+      Producers.__handle__(
+        ctx.db,
+        "run-tests",
+        producer_call("run-tests", {:user, "flynn"}, ghost_assignment.id),
+        config: producer_config,
+        runner: runner
+      )
+
+    assert_wait(fn -> Producers.get(ctx.db, ghost_id).state == "failed" end)
+    assert Assignments.list_attests(ctx.db, ghost_assignment.id) == []
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.subject == ghost_assignment.id and
+               event.detail =~ "no host named ghost-host is registered" and
+               not (event.detail =~ "remote holder deferred")
+           end)
   end
 
   test "run-smoke is symmetric and retiring a holder cancels its queued jobs", ctx do
