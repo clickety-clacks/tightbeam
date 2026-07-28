@@ -472,10 +472,12 @@ defmodule Tightbeam.Credentials do
       sh: state.sh
     }
 
+  # No anthropic entry: the subscription ceremony lives in the Rust CLI
+  # (`ceremonies.rs`), which is what an operator actually runs and the only copy
+  # that reads the token off a replayed screen and validates it before banking.
   defp default_onboarders do
     onboarders = %{
-      openai: &onboard_openai/1,
-      anthropic: &onboard_anthropic/1
+      openai: &onboard_openai/1
     }
 
     if @fixture_provider? do
@@ -606,56 +608,6 @@ defmodule Tightbeam.Credentials do
       end
     after
       File.rm_rf!(temporary)
-    end
-  end
-
-  defp onboard_anthropic(_state) do
-    transcript =
-      Path.join(
-        System.tmp_dir!(),
-        "tightbeam-claude-setup-token-#{System.unique_integer([:positive])}.log"
-      )
-
-    try do
-      case System.cmd("script", ["-q", transcript, "claude", "setup-token"],
-             stderr_to_stdout: true
-           ) do
-        {output, 0} ->
-          bytes = File.read!(transcript) <> output
-
-          case capture_setup_token(bytes) do
-            {:ok, token} ->
-              {:ok,
-               %{
-                 bytes: token,
-                 expires_at: System.system_time(:second) + 365 * 24 * 60 * 60,
-                 subscription_status: "supported"
-               }}
-
-            :error ->
-              {:error, :setup_token_not_captured}
-          end
-
-        {output, _status} ->
-          if String.contains?(String.downcase(output), "subscription") do
-            {:error, {:unsupported, :no_subscription}}
-          else
-            {:error, {:setup_token_failed, String.trim(output)}}
-          end
-      end
-    after
-      File.rm(transcript)
-    end
-  end
-
-  defp capture_setup_token(output) do
-    output
-    |> String.split(~r/\s+/, trim: true)
-    |> Enum.reverse()
-    |> Enum.find(&String.starts_with?(&1, "sk-ant-oat"))
-    |> case do
-      nil -> :error
-      token -> {:ok, token}
     end
   end
 
