@@ -108,29 +108,39 @@ Per `service-mode-install-v1.md`, prove the service:
 A foreground process is not evidence for any of these, and a green unit file is
 not evidence for logout, reboot, or a turn.
 
-## 5. End-of-run cleanup — uninstall, then remove only what this run added
+## 5. End of run — the installation STAYS
 
-Tight Beam does not stay behind on a test host. Run this even when the smoke
-failed part-way.
+**Do not uninstall.** The smoke installs Tight Beam and then runs the complete
+functional and system test sequence against that installation; the install is the
+thing the rest of the run is performed on, so tearing it down ends the run early
+and destroys the only environment those tests have. Uninstall is not a product
+proof and is not a smoke gate (Flynn, 2026-07-28). Earlier revisions of this
+runbook required it as phase 4, which is why a working shrdlu install came within
+one step of being deleted while functional coverage was still outstanding.
 
-1. **Uninstall via the documented production path** — the same one a customer
-   runs. This is itself a test of that path; capture it as evidence.
-2. **Remove the Tight Beam-owned test state** introduced by the run: the clone,
-   `base_dir` (`state.db`, `identity/`, `auth/`, `homes/`, `bin/`), any staging
-   dirs under `/tmp`, and the **test credentials this run onboarded** — they live
-   in `base_dir/auth/`, so removing `base_dir` removes them. The operator's own
-   `~/.claude` / `~/.codex` are NOT test state and stay.
-3. **Remove prerequisites this run installed**, and only those. Establish
-   provenance before deleting anything — mtimes against the run's start, or your
-   own record of what you installed. If provenance is ambiguous, **leave it and
-   report it**; a wrongly-removed toolchain breaks unrelated work on a shared box.
-4. **Verify residue**: no unit or plist, no process, nothing on the gateway port,
-   no `base_dir`, no clone.
-5. **Confirm unrelated state survived** — the account itself, its own credentials,
-   and every unrelated service. On shrdlu that means openclaw-gateway,
-   subspace-daemon, postgresql and docker still `active`.
+Clean only **temporary test artifacts that are not part of the installed
+product**:
+
+1. Scratch clones and bundles used to run suites, staging dirs under `/tmp`, and
+   any probe output written outside `base_dir`.
+2. Nothing else. The unit, `base_dir` (`state.db`, `identity/`, `auth/`, `homes/`,
+   `bin/`), the installed CLI, and the credentials the run onboarded are the
+   installed product — they stay.
+
+**Prerequisites this run installed stay too.** Removing a toolchain from a shared
+box to tidy up breaks unrelated work; if you want provenance on record, record it
+rather than acting on it. If provenance is ambiguous, **report it and leave it**.
+
+**Confirm unrelated state survived** — the operator account, its own credentials,
+and every unrelated service. On shrdlu that means openclaw-gateway,
+subspace-daemon, postgresql and docker still `active`.
 
 **Never delete or reset the operator account.** There is no account teardown.
+
+Removing an installation is an ordinary operator action, documented in the README
+for the customer who wants it. If a run genuinely needs the host returned to a
+Tight-Beam-free state — a clean-start baseline for the *next* run, or an explicit
+instruction — that is a deliberate, separately-authorized step, not this one.
 
 ## Host-specific notes
 
