@@ -64,6 +64,12 @@ the gateway log is the record.
 `<base_dir>/setup-token-failure.log`, and the refusal says why. Report the
 refusal reason before re-arming; codes are single-use.
 
+**Scanning a ceremony's working directory for leaked secrets: match regular
+files only** (`find … -type f`, or exclude non-regular files). A ceremony's
+workdir contains the FIFO carrying its stdin, and `grep` on a named pipe blocks
+forever waiting for a writer — the scan hangs on its own artifact and looks like
+a wedged host.
+
 ## Proving a credential is LIVE
 
 A banked credential is not a working one. Dead auth does not fail as "auth"
@@ -119,10 +125,19 @@ correct.
 
 ## Prerequisites and how they fail
 
-The harness CLI must be on the PATH a NON-INTERACTIVE ssh session sees — a
-binary reachable only through a login shell profile does not count, and that is
-the PATH both the assimilate probe and the ceremony judge. A missing binary is
-refused by name, with the PATH that was searched printed alongside.
+The harness CLI must be on the PATH of whoever actually invokes it, and that
+differs by role:
+
+- **On a satellite** — the PATH a NON-INTERACTIVE ssh session sees. A binary
+  reachable only through a login shell profile does not count. This is what the
+  assimilate probe and a remote ceremony judge.
+- **On the gateway host** — the PATH the gateway SERVICE runs with (its unit's
+  `Environment=PATH`). Adapters are children of the gateway, so they inherit it.
+  A gateway-host binary can be absent from the non-interactive ssh PATH and
+  still be perfectly reachable by every adapter.
+
+A missing binary is refused by name, with the PATH that was searched printed
+alongside.
 
 Two ways an install can succeed and still be invisible:
 

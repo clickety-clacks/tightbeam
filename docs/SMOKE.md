@@ -61,13 +61,20 @@ harness CLIs is `docs/SATELLITE.md`.
 
 Verify it cheaply, then get on with the run. Per `{host, harness}` in scope:
 
-P1. **Binary present** on the PATH a NON-INTERACTIVE ssh session sees:
-    `ssh <host> <binary> --version`. A login-shell-only binary does not count.
-P2. **Credential live** — read it off the gateway's boot summary, or
-    `tightbeam list` and check that host's catalog for that harness is
-    non-empty. A live credential yields models; a dead one yields none.
+P2. **Credential live — AUTHORITATIVE.** Read it off the gateway's boot summary,
+    or `tightbeam list` and check that host's catalog for that harness is
+    non-empty. A live credential yields models; a dead one yields none. A
+    non-empty catalog is also proof the binary was reachable by whoever needed
+    to reach it.
+P1. **Binary present — EXPLANATORY, never a verdict on its own.** Its job is to
+    explain a P2 failure. The PATH depends on the role: a **satellite** is judged
+    on the non-interactive ssh PATH (`ssh <host> <binary> --version`); the
+    **gateway host** is judged on the gateway service's own `Environment=PATH`,
+    which its adapters inherit. A gateway-host binary absent from the
+    non-interactive ssh PATH is not a failure — failing a host on P1 alone
+    waives healthy legs.
 
-FAIL FAST on either. Do not repair auth inside a smoke run, and do not infer
+FAIL FAST on P2. Do not repair auth inside a smoke run, and do not infer
 liveness from a login prompt or a file's presence:
 
 - binary missing → `docs/SATELLITE.md`
@@ -118,6 +125,14 @@ on 2026-07-25:
   nothing like its cause. For feature smoke, copy the whole template org
   including `state.db` (minus logs and `work/`) and let `TIGHTBEAM_PORT`
   rewrite `gateway.json` at boot.
+- **`feature_smoke.exs` is a LOCAL-HOST HERMETIC driver, and only that.** It
+  runs one leg per registry harness, every one of them on
+  `Placement.local_host_name()` — there is no host dimension. It also spawns
+  into the `reviewer` archetype and commits a rule fixture into the identity
+  repo as a side effect, so it wants an org it may mutate. **The satellite
+  host×harness matrix is agent-driven through the journeys below, and
+  deliberately has no script**: real-host e2e is a runbook plus a flexible
+  agent, and a host-blind script cannot reach a satellite at all.
 - **`feature_smoke.exs` runs with `mix run --no-start`.** A plain `mix run`
   boots a second gateway that OVERWRITES `gateway.json` and silently redirects
   the smoke away from the gateway under test. The script enumerates
