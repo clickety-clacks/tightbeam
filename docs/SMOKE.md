@@ -363,6 +363,11 @@ the tool call, with the statute text delivered only as the denial reason.
 Roles are substrate-level — run once per harness leg (bind to that leg's
 session where a binding is called for). ⌥ all steps are CLI/dispatch.
 
+Note on the `role create` / `role bind` / `role rm` spellings below: those are
+gateway verbs (`role-create`, `role-bind`, `role-rm`, `role-list`) dispatched
+through the ⌥ CLI/dispatch annotation. **The CLI exposes no `role` command**, so
+the literal syntax will not run as written — reach the verbs through dispatch.
+
 25. [manual] Typed target seam: `wake --user <admin>` lands in the admin's Main;
     `wake --role <admin-id>` FAILS with "unknown role" (the field is the
     type — a user id in the role field is a role lookup, period);

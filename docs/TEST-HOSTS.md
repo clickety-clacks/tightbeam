@@ -82,6 +82,18 @@ On a headless host there is no GUI client, so pair with
 `pair_request`, reads `pair_result`, closes. That is the same wire ceremony a real
 client performs, not a mock of the gateway side.
 
+**Then CONNECT — pairing alone does not give the owner a Main stream.** Main is
+seeded when a client subscribes to `chat` over the WebSocket (`socket.ex`), not by
+`pair`, so a run that pairs and stops has an org whose owner has no Main. Nothing
+errors at that point; the damage surfaces later and elsewhere. A role wake that
+falls back to the owner's Main **queues indefinitely with no error** — observed
+sitting for ~8 minutes — and anything addressing Main by key returns
+`unknown sessionKey`. Both read as product defects and are neither.
+
+So on a headless host the order is **pair, then `SimClient.connect/4`**, and only
+then assert SMOKE.md §0 step 2's "catalog shows one Main stream" — that PASS
+condition presumes a connected client.
+
 ## 3b. Credentials are always onboarded fresh — never adopted
 
 Tight Beam's onboarding stages into an isolated directory and installs only the
