@@ -166,6 +166,19 @@ fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
     let transcript_path = transcript
         .to_str()
         .ok_or_else(|| "invalid onboarding staging path".to_owned())?;
+
+    // Create the transcript owner-only BEFORE `script` does. It opens the file
+    // O_WRONLY|O_CREAT|O_TRUNC and leaves the mode of a file that already exists
+    // alone, so this is the only place 0600 can be established -- and on a successful
+    // run this file holds a live year-long credential in cleartext.
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&transcript)
+        .map_err(|error| error.to_string())?;
+
     let status = ProcessCommand::new("script")
         .args(script_args(transcript_path))
         .stdin(Stdio::inherit())
@@ -173,17 +186,27 @@ fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
         .stderr(Stdio::inherit())
         .status()
         .map_err(|error| error.to_string())?;
-    let output = fs::read_to_string(&transcript).unwrap_or_default();
+
+    // Bytes, not `read_to_string`: one invalid UTF-8 byte anywhere in a pty transcript
+    // made that call fail, and `unwrap_or_default` turned the failure into an empty
+    // string -- indistinguishable from claude having printed nothing at all.
+    let raw = fs::read(&transcript).unwrap_or_default();
 
     if !status.success() {
-        if output.to_ascii_lowercase().contains("subscription") {
+        // Read the SCREEN, not the byte stream. The TUI positions each word with a
+        // cursor jump instead of writing the spaces between them, so a phrase is only
+        // reliably contiguous once the transcript has been replayed.
+        let screen = crate::screen::displayed_lines(&raw).join("\n");
+        if screen.to_ascii_lowercase().contains("subscription") {
             return Err("needs_onboarding: unsupported (no subscription)".to_owned());
         }
         return Err(format!("Anthropic setup-token onboarding failed: {status}"));
     }
 
-    let token = capture_setup_token(&output)
-        .ok_or_else(|| "Anthropic setup-token was not captured".to_owned())?;
+    let token = match crate::screen::capture_setup_token(&raw) {
+        Some(token) => token,
+        None => return Err(capture_failed(&raw)),
+    };
     let path = PathBuf::from(staging).join("oauth-token");
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -192,18 +215,62 @@ fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
         .mode(0o600)
         .open(path)
         .map_err(|error| error.to_string())?;
-    writeln!(file, "{token}").map_err(|error| error.to_string())
+    writeln!(file, "{token}").map_err(|error| error.to_string())?;
+
+    // The preserved evidence is only worth keeping while a failure is unexplained.
+    let _ = fs::remove_file(preserved_transcript());
+    Ok(())
 }
 
-fn capture_setup_token(output: &str) -> Option<String> {
-    output.split_whitespace().rev().find_map(|word| {
-        let token = word
-            .trim_matches(|character: char| {
-                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-            })
-            .to_owned();
-        token.starts_with("sk-ant-oat").then_some(token)
-    })
+/// Where a transcript is kept when the token could not be read out of it.
+///
+/// One fixed path, so at most one such file exists: the next attempt overwrites it and
+/// a successful capture deletes it. It is not a log to accumulate -- it can contain a
+/// live credential, which is why it is written 0600 and why it does not linger.
+fn preserved_transcript() -> PathBuf {
+    crate::base_dir::resolve().join("setup-token-failure.log")
+}
+
+/// Say what was looked for, and keep the evidence needed to work out why it was absent.
+///
+/// The transcript used to be destroyed on this path by BOTH sides: `onboard` removes
+/// the staging directory before cancelling, and the gateway's `cancel_onboard` does its
+/// own `File.rm_rf!` on it (`Tightbeam.Credentials`). So merely declining to delete it
+/// here would not have been enough -- it has to be copied out before the cancel. Two of
+/// the operator's single-use authorization codes were spent with nothing left to
+/// diagnose from, and the message blamed token parsing without saying what it parsed.
+fn capture_failed(raw: &[u8]) -> String {
+    let destination = preserved_transcript();
+    let kept = fs::create_dir_all(destination.parent().unwrap_or(&destination))
+        .and_then(|()| {
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&destination)
+        })
+        .and_then(|mut file| file.write_all(raw));
+
+    let evidence = match kept {
+        Ok(()) => format!(
+            "The transcript is preserved at {} (mode 0600, replaced by the next attempt \
+             and removed after a successful capture). Treat it as a credential: if claude \
+             displayed a token, it is in there.",
+            destination.display()
+        ),
+        Err(error) => format!(
+            "The transcript could NOT be preserved ({}), and the staging directory is \
+             about to be removed, so this attempt leaves nothing to diagnose from.",
+            error
+        ),
+    };
+
+    format!(
+        "Anthropic setup-token was not captured: claude ran and exited successfully, but \
+         {}. {evidence}",
+        crate::screen::refusal_reason(raw)
+    )
 }
 
 fn validate_harnesses(harnesses: &[String], catalog: &HarnessCatalog) -> Result<(), String> {
@@ -718,15 +785,6 @@ mod tests {
         assert!(transcript.contains("fixture-package"));
         assert!(!transcript.contains("claude-package"));
         assert!(!transcript.contains("codex-package"));
-    }
-
-    #[test]
-    fn captures_the_non_rotating_claude_setup_token() {
-        assert_eq!(
-            capture_setup_token("browser output\nsk-ant-oat01-example\r\n"),
-            Some("sk-ant-oat01-example".to_owned())
-        );
-        assert_eq!(capture_setup_token("no token here"), None);
     }
 
     #[test]

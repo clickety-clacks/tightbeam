@@ -6,6 +6,7 @@ mod dispatch;
 mod harnesses;
 mod preflight;
 mod probe;
+mod screen;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
