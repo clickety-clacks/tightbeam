@@ -10,9 +10,7 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
 
-  # Same ceiling the local httpc call carries, so a wedged vendor endpoint costs
-  # the same either side of the ssh seam and never strands a refresh in flight.
-  @catalog_timeout_s 10
+  @api_base "https://api.anthropic.com"
 
   # NOTE FOR FUTURE AGENTS — the claude model vocabulary is NARROWER than the catalog.
   #
@@ -66,9 +64,10 @@ defmodule Tightbeam.Harness.Claude do
   # That is why the set is injectable (`claude_selectable_models` in the catalog's
   # options, `:all` to disable) rather than only editable here.
   #
-  # ON CODEX, qualified: codex reads its catalog from the CLI's own
-  # `models_cache.json` (codex.ex), so its two vocabularies share one artifact and
-  # divergence is structurally unlikely. But acceptance still happens in the external
+  # ON CODEX, qualified: codex's catalog comes from the same account endpoint the
+  # CLI itself consults, filtered by that CLI's own version (codex.ex), so its two
+  # vocabularies share one source and divergence is structurally unlikely. But
+  # acceptance still happens in the external
   # ACP/CLI process (`acp/adapter.ex` set_config_option), which this repo does not
   # observe, so "cannot diverge" is NOT proven here — it is unprobed analysis. Nobody
   # has run the equivalent probe against codex-acp.
@@ -358,20 +357,19 @@ defmodule Tightbeam.Harness.Claude do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
 
     fn path ->
-      # curl's own stderr is folded into stdout so a failure carries a reason
-      # (401, DNS, TLS); ssh's is NOT, because an ssh warning on a SUCCESSFUL
-      # connection would land in the middle of the JSON body.
-      script =
-        "set -eu\n" <>
-          "token=$(cat #{token_path})\n" <>
-          "exec curl -sS -f --max-time #{@catalog_timeout_s} " <>
-          ~s(-H "authorization: Bearer $token" ) <>
-          ~s(-H "anthropic-version: 2023-06-01" ) <>
-          "'https://api.anthropic.com#{path}' 2>&1\n"
+      # The script's own stderr is folded into its stdout so a failure carries a
+      # reason; ssh's is NOT, because an ssh warning on a SUCCESSFUL connection
+      # would land in the middle of the JSON body.
+      script = """
+      exec 2>&1
+      set -eu
+      token=$(cat #{token_path})
+      exec #{Support.catalog_curl("#{@api_base}#{path}", ["authorization: Bearer $token", "anthropic-version: 2023-06-01"])}
+      """
 
-      case sh.(["ssh" | Support.ssh_opts()] ++ [dest, "sh", "-c", Support.shell_quote(script)]) do
-        {body, 0} -> {:ok, body}
-        {output, status} -> {:error, {:remote_catalog_probe_failed, status, String.trim(output)}}
+      case Support.catalog_probe(sh, Support.catalog_probe_argv(dest, script)) do
+        {:ok, body, _trailer} -> {:ok, body}
+        {:error, reason} -> {:error, reason}
       end
     end
   end
@@ -674,7 +672,7 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   defp http_get(path, headers) do
-    url = String.to_charlist("https://api.anthropic.com" <> path)
+    url = String.to_charlist(@api_base <> path)
 
     ssl = [
       verify: :verify_peer,
@@ -682,12 +680,18 @@ defmodule Tightbeam.Harness.Claude do
       customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
     ]
 
-    case :httpc.request(:get, {url, headers}, [ssl: ssl, timeout: 10_000], body_format: :binary) do
+    # One ceiling either side of the ssh seam, so a wedged vendor endpoint costs
+    # the same locally as remotely and never strands a refresh in flight.
+    timeout = Support.catalog_probe_timeout_s() * 1_000
+
+    case :httpc.request(:get, {url, headers}, [ssl: ssl, timeout: timeout], body_format: :binary) do
       {:ok, {{_version, status, _reason}, _response_headers, body}} when status in 200..299 ->
         {:ok, body}
 
-      {:ok, {{_version, status, _reason}, _response_headers, _body}} ->
-        {:error, {:http_status, status}}
+      # The BODY, not just the code: a 401 here says the grant needs signing in
+      # again, which is the sentence the operator acts on (#81's subject).
+      {:ok, {{_version, status, _reason}, _response_headers, body}} ->
+        {:error, {:http_status, status, String.trim(to_string(body))}}
 
       {:error, reason} ->
         {:error, {:network, reason}}

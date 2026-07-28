@@ -51,10 +51,11 @@ missing, so check them before you start.
   for the harnesses it runs itself. See `SATELLITE.md` §What failure looks like.
 - **Each such catalog is actually live**, not merely credentialled. The gateway's
   boot summary reads READY for `<harness> on <satellite>`; a spawn refused
-  `catalog_unavailable` names the host to repair. On a fresh org the codex catalog
-  additionally requires `models_cache.json` in that host's codex home, written by
-  codex itself — finding **#67**, still open: the refusal now names the owning host
-  rather than the gateway, but nothing generates the cache.
+  `catalog_unavailable` names the host to repair. Nothing has to be seeded: each
+  catalog is one HTTPS call the owning host makes with its own grant. Codex's is
+  additionally filtered by that host's `codex --version`, so an outdated binary
+  there yields an empty catalog — the refusal says so and names the binary rather
+  than the grant.
 - **`TIGHTBEAM_ADVERTISED_URL` is set** to an address the satellite can reach.
 - The gateway is `active` and its boot summary reads READY for those `{host,
   harness}` pairs.

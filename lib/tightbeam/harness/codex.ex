@@ -6,6 +6,10 @@ defmodule Tightbeam.Harness.Codex do
 
   @adapter_version "1.1.4"
   @adapter_package "codex-acp"
+  # Recorded live 2026-07-28 against codex-cli 0.145.0. The platform route
+  # (api.openai.com/v1/models) is CLOSED to this token — 403, missing scope
+  # `api.model.read` — so do not "fix" this to the obvious URL.
+  @models_url "https://chatgpt.com/backend-api/codex/models"
   @adapter_bundle "index.js"
   @adapter_replacements [
     {
@@ -320,59 +324,77 @@ defmodule Tightbeam.Harness.Codex do
 
   def classify_subagent_event(_update), do: :skip
 
-  # `models_cache.json` is written by codex itself, in codex's home, on the host
-  # where codex runs. The gateway's copy describes the gateway's account, so a
-  # satellite's catalog is read on the satellite — one bounded ssh `cat`, no
-  # credential in either direction. `cat` exits 1 on a missing file and ssh exits
-  # 255 when it cannot reach the host, which is what separates "codex never ran
-  # here" from "this host is unreachable".
+  # The catalog is the ACCOUNT's, so it is derived on the host that holds the
+  # account — one HTTPS call made BY that host. This replaced reading codex's
+  # `models_cache.json`, which was only ever a copy of this answer, and only on a
+  # host where codex had already run (#67). Nothing reads that file now.
+  #
+  # Two facts the probe needs exist only on the owning host, and both are taken
+  # there: the access token out of `auth.json`, and the version of the `codex`
+  # binary. Neither is interpolated into a command line by us — the remote shell
+  # expands both — so no credential transits and none appears in a process table.
   @impl true
   def fetch_catalog(state) do
-    {home, read} =
-      case Map.get(state, :host_config, %{ssh: nil}).ssh do
-        # Both test seams describe the LOCAL codex — a `codex_home` override that
-        # also redirected satellites would read the gateway's cache and call it
-        # the satellite's, which is the whole defect.
-        nil ->
-          {Map.get(state.options, :codex_home) || home_path(state),
-           Map.get(state.options, :codex_read, &File.read/1)}
+    case probe(state) do
+      {:ok, body, trailer} ->
+        with {:ok, models} <- decode_catalog(body),
+             {:ok, entries} <- derive_catalog_entries(models),
+             entries when entries != [] <- entries do
+          {:ok, entries}
+        else
+          {:error, reason} -> {:error, reason}
+          [] -> {:error, {:empty_catalog_for_client_version, client_version(trailer)}}
+          _ -> {:error, :malformed_catalog}
+        end
 
-        dest ->
-          {home_path(state), remote_read(state, dest)}
-      end
-
-    with {:ok, body} <- read.(Path.join(home, "models_cache.json")),
-         {:ok, models} <- decode_catalog(body),
-         {:ok, entries} <- derive_catalog_entries(models),
-         entries when entries != [] <- entries do
-      {:ok, entries}
-    else
-      {:error, :enoent} -> {:error, :missing_cache}
-      {:error, reason} -> {:error, reason}
-      [] -> {:error, :empty_inventory}
-      _ -> {:error, :malformed_catalog}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp home_path(state) do
-    Tightbeam.Homes.home_path(
-      state.base_dir,
-      Map.get(state, :host_name) || Tightbeam.Placement.local_host_name(),
-      id()
+  defp probe(state) do
+    sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
+    auth = Path.join([state.base_dir, "auth", "codex", "auth.json"])
+
+    Support.catalog_probe(
+      sh,
+      Support.catalog_probe_argv(
+        Map.get(state, :host_config, %{ssh: nil}).ssh,
+        probe_script(auth)
+      )
     )
   end
 
-  defp remote_read(state, dest) do
-    sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
+  # `client_version` is a SILENT filter: every model carries a
+  # `minimal_client_version` and the server drops the ones the caller is too old
+  # for — returning 200 with an EMPTY list, not an error. So the version must be
+  # the one the `codex` binary on THAT host reports (it is an operator
+  # prerequisite there, #76). A constant in our source would filter the catalog
+  # to nothing and blame the account. It rides back on the status line so the
+  # refusal can name the version that produced an empty answer.
+  defp probe_script(auth_path) do
+    node_program =
+      ~s|const fs=require("fs");| <>
+        ~s|process.stdout.write(JSON.parse(fs.readFileSync("#{auth_path}","utf8")).tokens.access_token)|
 
-    fn path ->
-      case sh.(["ssh" | Support.ssh_opts()] ++ [dest, "cat", path]) do
-        {body, 0} -> {:ok, body}
-        {_output, 1} -> {:error, :enoent}
-        {_output, status} -> {:error, {:remote_cache_read_failed, status}}
-      end
-    end
+    curl =
+      Support.catalog_curl(
+        "#{@models_url}?client_version=${raw##* }",
+        [~s|authorization: Bearer $token|],
+        " ${raw##* }"
+      )
+
+    """
+    exec 2>&1
+    set -eu
+    token=$(node -e '#{node_program}')
+    raw=$(codex --version)
+    exec #{curl}
+    """
   end
+
+  defp client_version([version | _]), do: version
+  defp client_version(_), do: :unknown
 
   @impl true
   def conformance_vectors do
@@ -468,7 +490,13 @@ defmodule Tightbeam.Harness.Codex do
       catalog_expected: %{
         "valid" => {:ok, [valid_entry]},
         "malformed" => {:error, :malformed_catalog},
-        "unavailable" => {:error, :missing_cache}
+        # The vendor's own sentence for a grant that needs signing in again — the
+        # probe carries the 401 BODY, not just the code, because that is what the
+        # operator acts on.
+        "unavailable" =>
+          {:error,
+           {:http_status, 401,
+            ~s({"detail":"Could not parse your authentication token. Please try signing in again."})}}
       },
       catalog_state: fn case_name, base ->
         body =
@@ -483,18 +511,24 @@ defmodule Tightbeam.Harness.Codex do
             ]
           })
 
-        read = fn _path ->
+        # One HTTPS call made BY the owning host, so the seam is the runner and
+        # the vector is a RESPONSE: body, then curl's status on a trailing line,
+        # then the `codex --version` that decided what the server would list.
+        sh = fn _command ->
           case case_name do
-            "valid" -> {:ok, body}
-            "malformed" -> {:ok, "{}"}
-            "unavailable" -> {:error, :enoent}
+            "valid" ->
+              {body <> "\n200 0.145.0", 0}
+
+            "malformed" ->
+              {"{}\n200 0.145.0", 0}
+
+            "unavailable" ->
+              {~s({"detail":"Could not parse your authentication token. Please try signing in again."}) <>
+                 "\n401 0.145.0", 0}
           end
         end
 
-        %{
-          base_dir: base,
-          options: %{codex_home: Path.join(base, "home"), codex_read: read}
-        }
+        %{base_dir: base, options: %{sh: sh}}
       end,
       wire_projection: %{
         "id" => "codex",

@@ -186,7 +186,7 @@ defmodule Tightbeam.ClientE2E do
 
   defp probe_credential(module, step, label, base_dir, opts) do
     home = Tightbeam.Homes.home_path(base_dir, Tightbeam.Placement.local_host_name(), module.id())
-    target = target(base_dir)
+    target = target(base_dir, opts)
     opts = Keyword.put_new(opts, :transport, &Tightbeam.Harness.Support.credential_transport/2)
 
     cond do
@@ -200,7 +200,7 @@ defmodule Tightbeam.ClientE2E do
       true ->
         case module.credential_live?(target, home, opts) do
           :live ->
-            grade_live(module, step, label, base_dir)
+            grade_live(module, step, label, base_dir, opts)
 
           {:dead, reason} ->
             Scorecard.fail(step, label, "credential rejected: #{inspect(reason)}")
@@ -211,8 +211,8 @@ defmodule Tightbeam.ClientE2E do
     end
   end
 
-  defp grade_live(module, step, label, base_dir) do
-    case module.fetch_catalog(target(base_dir)) do
+  defp grade_live(module, step, label, base_dir, opts) do
+    case module.fetch_catalog(target(base_dir, opts)) do
       {:ok, [_ | _]} ->
         Scorecard.pass(step, label,
           note: "credential store ready; authenticated liveness probe returned :live"
@@ -262,13 +262,18 @@ defmodule Tightbeam.ClientE2E do
 
   # The registry's target shape: `ssh: nil` is what marks the host local, and
   # the leg's gateway is always the local one.
-  defp target(base_dir) do
+  defp target(base_dir, opts \\ []) do
+    # `sh` belongs in `options` as well as at the top level: catalog derivation
+    # reads its runner from there (every catalog is now a script the owning host
+    # runs), while credential probes read the top-level one.
+    runner = Keyword.get(opts, :sh, &System.cmd(hd(&1), tl(&1), stderr_to_stdout: true))
+
     %{
       base_dir: base_dir,
       host_config: %{base_dir: base_dir, ssh: nil},
       host_name: Tightbeam.Placement.local_host_name(),
-      options: %{},
-      sh: &System.cmd(hd(&1), tl(&1), stderr_to_stdout: true)
+      options: %{sh: runner},
+      sh: runner
     }
   end
 

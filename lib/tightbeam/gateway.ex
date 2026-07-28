@@ -3116,6 +3116,23 @@ defmodule Tightbeam.Gateway do
                "#{provider} on #{host}"
          }}
 
+      # The codex models endpoint filters by the caller's client_version and says
+      # nothing about it: too old a binary and every model is dropped, with a 200.
+      # Blaming the account here would send the operator to re-onboard a grant
+      # that was never the problem.
+      %{health: {:unavailable, {:empty_catalog_for_client_version, version}}} ->
+        warn_dead_default(host, harness, model, configured_default?)
+
+        {:error,
+         %{
+           code: "catalog_unavailable",
+           message:
+             "cannot validate model #{inspect(model)} for #{harness} on host #{host}: the " <>
+               "provider returned an EMPTY model list for client_version #{inspect(version)}, " <>
+               "which is the #{harness} binary's own version on #{host}. The credential is " <>
+               "not implicated; upgrade #{harness} on #{host}"
+         }}
+
       %{health: health} ->
         warn_dead_default(host, harness, model, configured_default?)
 

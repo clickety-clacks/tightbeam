@@ -32,6 +32,7 @@ end
 
 defmodule Tightbeam.ConformanceSupport do
   import ExUnit.Assertions
+  import Tightbeam.TestCase, only: [catalog_reply: 1]
 
   alias Tightbeam.{
     Adjudication,
@@ -2526,20 +2527,20 @@ defmodule Tightbeam.ConformanceSupport do
         start_named_service(ModelCatalog, fn ->
           ModelCatalog.start_link(
             base_dir: base,
-            codex_home: Path.join(base, "codex"),
             credential_status: fn _provider -> :onboarded end,
             claude_fetch: fn _, _ -> {:error, :unused} end,
-            codex_read: fn _ ->
-              {:ok,
-               JSON.encode!(%{
-                 models: [
-                   %{
-                     slug: "test",
-                     display_name: "Test",
-                     supported_reasoning_levels: []
-                   }
-                 ]
-               })}
+            sh: fn _command ->
+              catalog_reply(
+                JSON.encode!(%{
+                  models: [
+                    %{
+                      slug: "test",
+                      display_name: "Test",
+                      supported_reasoning_levels: []
+                    }
+                  ]
+                })
+              )
             end
           )
         end)

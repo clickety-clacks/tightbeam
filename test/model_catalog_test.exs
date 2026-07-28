@@ -5,19 +5,18 @@ defmodule Tightbeam.ModelCatalogTest do
 
   @fixtures Path.join(__DIR__, "fixtures/model_catalog")
   @host "testhost"
-  @secret "sk-ant-oat01-NEVER-ON-A-COMMAND-LINE"
+  @claude_secret "sk-ant-oat01-NEVER-ON-A-COMMAND-LINE"
+  @codex_secret "ey-codex-access-NEVER-ON-A-COMMAND-LINE"
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "model-catalog-#{System.unique_integer([:positive])}")
     token_dir = Path.join([base_dir, "auth", "claude"])
-    codex_home = Path.join(base_dir, "codex-home")
     File.mkdir_p!(token_dir)
-    File.mkdir_p!(codex_home)
     File.write!(Path.join(token_dir, "oauth-token"), "fixture-token")
 
     claude_json = fixture_body("claude_models.jsonc")
     claude_detail_json = fixture_body("claude_model_detail.jsonc")
-    codex_json = fixture_body("codex_models_cache.jsonc")
+    codex_json = fixture_body("codex_models.jsonc")
 
     claude_fetch = fn
       "/v1/models?limit=100", _headers ->
@@ -27,7 +26,9 @@ defmodule Tightbeam.ModelCatalogTest do
         {:ok, claude_detail_json}
     end
 
-    codex_read = fn _path -> {:ok, codex_json} end
+    # Codex has no local-file path any more: on every host the catalog is one
+    # HTTPS call the host itself makes, so the seam is the runner, not a reader.
+    codex_sh = fn _command -> catalog_reply(codex_json) end
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -36,9 +37,9 @@ defmodule Tightbeam.ModelCatalogTest do
 
     %{
       base_dir: base_dir,
-      codex_home: codex_home,
       claude_fetch: claude_fetch,
-      codex_read: codex_read
+      codex_json: codex_json,
+      codex_sh: codex_sh
     }
   end
 
@@ -200,9 +201,7 @@ defmodule Tightbeam.ModelCatalogTest do
         ]
       })
 
-    codex_read = fn _path -> {:ok, codex_json} end
-
-    catalog = start_catalog(ctx, codex_read: codex_read)
+    catalog = start_catalog(ctx, sh: fn _command -> catalog_reply(codex_json) end)
     await_fresh(catalog, "codex")
 
     {codex, :fresh} = ModelCatalog.get(@host, "codex", catalog)
@@ -238,10 +237,8 @@ defmodule Tightbeam.ModelCatalogTest do
       end
     end
 
-    codex_read = fn malformed ->
-      fn _path ->
-        {:ok, JSON.encode!(%{models: [codex_valid, malformed]})}
-      end
+    codex_sh = fn malformed ->
+      fn _command -> catalog_reply(JSON.encode!(%{models: [codex_valid, malformed]})) end
     end
 
     for {label, harness, overrides} <- [
@@ -275,24 +272,24 @@ defmodule Tightbeam.ModelCatalogTest do
            ]},
           {:codex_missing_slug, "codex",
            [
-             codex_read:
-               codex_read.(%{
+             sh:
+               codex_sh.(%{
                  display_name: "Missing Slug",
                  supported_reasoning_levels: []
                })
            ]},
           {:codex_missing_supported_reasoning_levels, "codex",
            [
-             codex_read:
-               codex_read.(%{
+             sh:
+               codex_sh.(%{
                  slug: "gpt-missing-supported-reasoning-levels",
                  display_name: "Missing Supported Reasoning Levels"
                })
            ]},
           {:codex_null_supported_reasoning_levels, "codex",
            [
-             codex_read:
-               codex_read.(%{
+             sh:
+               codex_sh.(%{
                  slug: "gpt-null-supported-reasoning-levels",
                  display_name: "Null Supported Reasoning Levels",
                  supported_reasoning_levels: nil
@@ -361,7 +358,7 @@ defmodule Tightbeam.ModelCatalogTest do
       {ModelCatalog,
        name: missing,
        base_dir: Path.join(ctx.base_dir, "missing"),
-       codex_home: Path.join(ctx.base_dir, "missing-codex"),
+       sh: ctx.codex_sh,
        credential_status: fn _provider -> :onboarded end}
     )
 
@@ -371,12 +368,21 @@ defmodule Tightbeam.ModelCatalogTest do
     end)
   end
 
-  test "failed fetch, malformed JSON, and missing cache degrade without crashing readers", ctx do
+  test "failed fetch, malformed JSON, and a refused grant degrade without crashing readers",
+       ctx do
     for {label, opts, harness, reason} <- [
           {:failed, [claude_fetch: fn _, _ -> {:error, :network_down} end], "claude",
            :network_down},
           {:malformed, [claude_fetch: fn _, _ -> {:ok, "{"} end], "claude", :malformed_json},
-          {:missing_cache, [codex_read: fn _ -> {:error, :enoent} end], "codex", :missing_cache}
+          # The vendor's own sentence, verbatim — this is the 401 body the live
+          # endpoint returns for a grant that needs signing in again.
+          {:refused_grant,
+           [
+             sh: fn _command ->
+               catalog_reply(~s({"detail":"Could not parse your authentication token."}), 401)
+             end
+           ], "codex",
+           {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})}}
         ] do
       name = unique_name(label)
       catalog = start_catalog(ctx, Keyword.put(opts, :name, name))
@@ -399,14 +405,13 @@ defmodule Tightbeam.ModelCatalogTest do
       {ModelCatalog,
        name: name,
        base_dir: ctx.base_dir,
-       codex_home: ctx.codex_home,
        claude_fetch: fn path, headers ->
          send(parent, :provider_io)
          ctx.claude_fetch.(path, headers)
        end,
-       codex_read: fn path ->
+       sh: fn command ->
          send(parent, :provider_io)
-         ctx.codex_read.(path)
+         ctx.codex_sh.(command)
        end}
     )
 
@@ -476,15 +481,25 @@ defmodule Tightbeam.ModelCatalogTest do
 
   # per-host-catalogs-v1. Credentials are host-local, so entitlements are, so a
   # catalog is a fact about ONE host's account and is established on that host.
+  # per-host-catalogs-v1. Credentials are host-local, so entitlements are, so a
+  # catalog is a fact about ONE host's account and is established on that host.
+  # Both harnesses now do the same thing: a script on the owning host reads a
+  # local credential, makes one HTTPS call, and returns JSON.
   describe "per-host catalogs" do
     setup ctx do
-      # The satellite's base_dir is a REAL directory holding a REAL token, so the
-      # no-token-bytes assertion below has something to catch. If the probe ever
-      # read this file locally and interpolated it, the secret would appear in
-      # the command line the test captures.
+      # The satellite's base_dir is a REAL directory holding REAL grants, so the
+      # no-token-bytes assertions have something to catch. If either probe ever
+      # read these files locally and interpolated them, the secret would appear
+      # in the command line the test captures.
       satellite_base = Path.join(ctx.base_dir, "satellite-root")
       File.mkdir_p!(Path.join([satellite_base, "auth", "claude"]))
-      File.write!(Path.join([satellite_base, "auth", "claude", "oauth-token"]), @secret)
+      File.mkdir_p!(Path.join([satellite_base, "auth", "codex"]))
+      File.write!(Path.join([satellite_base, "auth", "claude", "oauth-token"]), @claude_secret)
+
+      File.write!(
+        Path.join([satellite_base, "auth", "codex", "auth.json"]),
+        JSON.encode!(%{tokens: %{access_token: @codex_secret}})
+      )
 
       {:ok, _entry} =
         Placement.register_host(ctx.base_dir, "satellite", %{
@@ -496,11 +511,10 @@ defmodule Tightbeam.ModelCatalogTest do
       %{satellite_base: satellite_base}
     end
 
-    test "the claude probe runs on the owning host and its token never reaches a command line",
-         ctx do
+    test "each host's catalog is its own, and neither token reaches a command line", ctx do
       parent = self()
 
-      satellite_body =
+      satellite_claude =
         JSON.encode!(%{
           data: [
             %{
@@ -514,7 +528,11 @@ defmodule Tightbeam.ModelCatalogTest do
 
       sh = fn command ->
         send(parent, {:probe, command})
-        if claude_probe?(command), do: {satellite_body, 0}, else: {"", 1}
+
+        case claude_probe?(command) do
+          true -> catalog_reply(satellite_claude)
+          false -> catalog_reply(ctx.codex_json)
+        end
       end
 
       catalog = start_catalog(ctx, sh: sh)
@@ -529,74 +547,93 @@ defmodule Tightbeam.ModelCatalogTest do
       {local, :fresh} = ModelCatalog.get(@host, "claude", catalog)
       refute Enum.any?(local, &(&1.ref == "satellite-only"))
 
-      command = claude_command!()
+      # The eurisko method: the token is read by the shell ON the owning host, so
+      # no byte of it is in the argv, and each script says so literally.
+      claude = probe_command!(:claude)
+      claude_line = Enum.join(claude, " ")
+      refute claude_line =~ @claude_secret
 
-      # The eurisko method: the token is read by the REMOTE shell, so no byte of
-      # it is in the argv, and the script says so literally.
-      joined = Enum.join(command, " ")
-      refute joined =~ @secret
-      refute joined =~ "Bearer #{@secret}"
-
-      assert joined =~
+      assert claude_line =~
                "token=$(cat #{Path.join([ctx.satellite_base, "auth", "claude", "oauth-token"])})"
 
-      assert joined =~ ~s(-H "authorization: Bearer $token")
-      assert ["ssh" | rest] = command
-      assert "sat.example" in rest
+      assert claude_line =~ ~s(-H "authorization: Bearer $token")
+      assert ["ssh" | claude_rest] = claude
+      assert "sat.example" in claude_rest
+
+      codex = probe_command!(:codex, "sat.example")
+      codex_line = Enum.join(codex, " ")
+      refute codex_line =~ @codex_secret
+      assert codex_line =~ "token=$(node -e "
+      assert codex_line =~ Path.join([ctx.satellite_base, "auth", "codex", "auth.json"])
+      assert codex_line =~ ~s(-H "authorization: Bearer $token")
+
+      # The gateway's own codex probe is the same script without the ssh: one
+      # shape for both localities, each reading its own host's grant.
+      local_codex = probe_command!(:codex, :local)
+      assert ["sh", "-c", script] = local_codex
+      assert script =~ Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+      refute script =~ ctx.satellite_base
     end
 
-    test "codex reads the owning host's home, and a host where codex never ran names itself",
-         ctx do
+    test "the codex client_version comes from the binary on the owning host", ctx do
       parent = self()
 
       sh = fn command ->
         send(parent, {:probe, command})
-        # `cat` exits 1 on a missing file: codex has never run on this host.
-        {"cat: no such file", 1}
+        catalog_reply(ctx.codex_json)
       end
 
       catalog = start_catalog(ctx, sh: sh)
+      await_fresh(catalog, "codex", "satellite")
+
+      command = probe_command!(:codex, "sat.example")
+      line = Enum.join(command, " ")
+
+      # `client_version` silently filters the catalog, so it must be the version
+      # the codex binary ON THAT HOST reports. A constant in our source would
+      # return 200 with an empty list and blame the account.
+      assert line =~ "raw=$(codex --version)"
+      assert line =~ "client_version=${raw##* }"
+      refute line =~ ~r/client_version=\d/
+
+      # It is read from the host that runs the turn: the satellite's own auth.json.
+      assert line =~ Path.join([ctx.satellite_base, "auth", "codex", "auth.json"])
+    end
+
+    test "a 200 with an empty model list names the client_version that produced it", ctx do
+      # The endpoint's silent filter: too old a client and every model is dropped,
+      # with no error at all. The reason has to carry the version or the operator
+      # is left blaming a perfectly good grant.
+      sh = fn _command -> catalog_reply(JSON.encode!(%{models: []})) end
+      catalog = start_catalog(ctx, sh: sh)
 
       await(fn ->
-        ModelCatalog.get("satellite", "codex", catalog) == {[], {:unavailable, :missing_cache}}
+        ModelCatalog.get(@host, "codex", catalog) ==
+          {[], {:unavailable, {:empty_catalog_for_client_version, "0.145.0"}}}
       end)
-
-      # ...while the gateway's own codex catalog, read from its own home, is fine.
-      await_fresh(catalog, "codex")
-
-      command = codex_command!()
-
-      assert command ==
-               ["ssh" | Tightbeam.Harness.Support.ssh_opts()] ++
-                 [
-                   "sat.example",
-                   "cat",
-                   Path.join([
-                     ctx.satellite_base,
-                     "homes",
-                     "satellite",
-                     "codex",
-                     "models_cache.json"
-                   ])
-                 ]
     end
 
     test "an unreachable host degrades only its own entries", ctx do
-      # 255 is ssh's own "could not connect", distinct from cat's 1.
-      sh = fn _command -> {"", 255} end
+      # 255 is ssh's own "could not connect".
+      sh = fn command ->
+        if Enum.member?(command, "sat.example"),
+          do: {"", 255},
+          else: catalog_reply(ctx.codex_json)
+      end
+
       catalog = start_catalog(ctx, sh: sh)
 
       await(fn ->
         match?({[], {:unavailable, _}}, ModelCatalog.get("satellite", "claude", catalog))
       end)
 
-      assert {[], {:unavailable, {:remote_catalog_probe_failed, 255, ""}}} =
+      assert {[], {:unavailable, {:probe_failed, 255, ""}}} =
                ModelCatalog.get("satellite", "claude", catalog)
 
-      assert {[], {:unavailable, {:remote_cache_read_failed, 255}}} =
+      assert {[], {:unavailable, {:probe_failed, 255, ""}}} =
                ModelCatalog.get("satellite", "codex", catalog)
 
-      # The gateway's entries are established from local disk and stay fresh.
+      # The gateway's own entries are established here and stay fresh.
       await_fresh(catalog, "claude")
       await_fresh(catalog, "codex")
     end
@@ -604,19 +641,23 @@ defmodule Tightbeam.ModelCatalogTest do
 
   defp claude_probe?(command), do: Enum.any?(command, &String.contains?(&1, "api.anthropic.com"))
 
-  defp claude_command! do
+  defp probe_command!(harness, dest \\ nil) do
     receive do
-      {:probe, command} -> if claude_probe?(command), do: command, else: claude_command!()
-    after
-      1_000 -> flunk("no claude probe command was constructed")
-    end
-  end
+      {:probe, command} ->
+        matches_harness? = claude_probe?(command) == (harness == :claude)
 
-  defp codex_command! do
-    receive do
-      {:probe, command} -> if claude_probe?(command), do: codex_command!(), else: command
+        matches_dest? =
+          case dest do
+            nil -> true
+            :local -> hd(command) == "sh"
+            name -> Enum.member?(command, name)
+          end
+
+        if matches_harness? and matches_dest?,
+          do: command,
+          else: probe_command!(harness, dest)
     after
-      1_000 -> flunk("no codex probe command was constructed")
+      1_000 -> flunk("no #{harness} probe command was constructed")
     end
   end
 
@@ -627,9 +668,8 @@ defmodule Tightbeam.ModelCatalogTest do
       [
         name: name,
         base_dir: ctx.base_dir,
-        codex_home: ctx.codex_home,
         claude_fetch: ctx.claude_fetch,
-        codex_read: ctx.codex_read,
+        sh: ctx.codex_sh,
         credential_status: fn _provider -> :onboarded end,
         # These tests exercise catalog DERIVATION (field mapping, effort parsing,
         # health, sorting) with synthetic and fixture model ids. The claude

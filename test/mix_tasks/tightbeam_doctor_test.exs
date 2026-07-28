@@ -1,6 +1,8 @@
 defmodule Mix.Tasks.Tightbeam.DoctorTest do
   use ExUnit.Case, async: true
 
+  import Tightbeam.TestCase, only: [catalog_reply: 1]
+
   alias Mix.Tasks.Tightbeam.Doctor
 
   setup do
@@ -61,7 +63,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert find(passing, "harness_auth:claude").ok
     assert find(passing, "harness_auth:codex").ok
 
-    fixture = Path.expand("../fixtures/model_catalog/codex_models_cache.jsonc", __DIR__)
+    fixture = Path.expand("../fixtures/model_catalog/codex_models.jsonc", __DIR__)
     codex_json = fixture_body(fixture)
 
     # fetch_live blocks in await_fresh until every harness inventory reports a
@@ -77,7 +79,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
           :anthropic -> {:needs_onboarding, :dead_credential}
           _provider -> :onboarded
         end,
-        codex_read: fn _path -> {:ok, codex_json} end
+        sh: fn _command -> catalog_reply(codex_json) end
       )
 
     assert {:ok, %{"claude" => [], "codex" => [_ | _]}, %{"claude" => reason}} = catalog

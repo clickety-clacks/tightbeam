@@ -18,8 +18,9 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   - `auth/` — credentials are STORE ROWS, not loose files: the backing file,
     the home symlink, and the `.tightbeam/credential.json` metadata row all
     have to arrive together.
-  - `homes/` — the codex model catalog reads `models_cache.json` from the
-    projected home; without it every spawn dies `catalog_unavailable`.
+  - `homes/` — the harness homes themselves. The codex model catalog no
+    longer lives here: it is one HTTPS call the host makes with its own
+    grant, so nothing has to be seeded for a spawn to find a model.
   - `identity/` — archetypes, guidance and rails, WITH its git repo: the
     identity seam refuses to work from a dirty tree, so the copy keeps
     `.git` and commits nothing.

@@ -784,20 +784,6 @@ defmodule Tightbeam.ClientE2ETest do
       File.mkdir_p!(home)
       File.write!(Path.join(store, "auth.json"), "{}")
 
-      File.write!(
-        Path.join(home, "models_cache.json"),
-        JSON.encode!(%{
-          "models" => [
-            %{
-              "slug" => "recorded-model",
-              "display_name" => "Recorded Model",
-              "supported_reasoning_levels" => [],
-              "max_input_tokens" => 1_000
-            }
-          ]
-        })
-      )
-
       on_exit(fn -> File.rm_rf!(base_dir) end)
       %{base_dir: base_dir}
     end
@@ -807,8 +793,26 @@ defmodule Tightbeam.ClientE2ETest do
         {:ok, %{status: 200, headers: %{}, body: "{}"}}
       end
 
+      # A live grant is not the whole bar: the row only passes once the catalog
+      # this host can actually derive is non-empty, which is now one HTTPS call
+      # the host makes rather than a file someone seeded.
+      catalog = fn _command ->
+        catalog_reply(
+          JSON.encode!(%{
+            "models" => [
+              %{
+                "slug" => "recorded-model",
+                "display_name" => "Recorded Model",
+                "supported_reasoning_levels" => [],
+                "max_input_tokens" => 1_000
+              }
+            ]
+          })
+        )
+      end
+
       assert %{status: :pass} =
-               ClientE2E.preflight("codex", ctx.base_dir, transport: transport)
+               ClientE2E.preflight("codex", ctx.base_dir, transport: transport, sh: catalog)
     end
 
     test ":dead fails", ctx do

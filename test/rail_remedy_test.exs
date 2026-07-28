@@ -1015,20 +1015,20 @@ defmodule Tightbeam.RailRemedyTest do
         start_supervised!(
           {ModelCatalog,
            base_dir: ctx.base_dir,
-           codex_home: Path.join(ctx.base_dir, "codex"),
            credential_status: fn _provider -> :onboarded end,
            claude_fetch: fn _, _ -> {:error, :unused} end,
-           codex_read: fn _ ->
-             {:ok,
-              JSON.encode!(%{
-                models: [
-                  %{
-                    slug: "test",
-                    display_name: "Test",
-                    supported_reasoning_levels: []
-                  }
-                ]
-              })}
+           sh: fn _command ->
+             catalog_reply(
+               JSON.encode!(%{
+                 models: [
+                   %{
+                     slug: "test",
+                     display_name: "Test",
+                     supported_reasoning_levels: []
+                   }
+                 ]
+               })
+             )
            end}
         )
 

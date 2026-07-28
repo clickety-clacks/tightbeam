@@ -283,21 +283,18 @@ defmodule Tightbeam.GatewayTest do
       # This suite's subject is the gateway, not the claude selectable-model pin
       # (tested in model_catalog_test). Leaving the pin on would filter this
       # fixture to nothing and starve the catalog.
-      # The REMOTE probes for any registered satellite, through the one runner
-      # seam both harnesses use. Tests that register a host get a catalog for it
-      # without an ssh ever leaving this machine.
+      # Every catalog probe that runs a script: codex on both localities, claude
+      # on satellites. Tests that register a host get a catalog for it without an
+      # ssh ever leaving this machine.
       base_dir: catalog_base,
-      codex_home: Path.join(catalog_base, "codex"),
       credential_status: fn _provider -> :onboarded end,
       claude_selectable_models: :all,
       claude_fetch: fn _, _ -> {:ok, claude_models} end,
       sh: fn command ->
-        if Enum.any?(command, &String.contains?(&1, "api.anthropic.com")),
-          do: {claude_models, 0},
-          else: {codex_models(), 0}
-      end,
-      codex_read: fn _ ->
-        {:ok, codex_models()}
+        case catalog_probe_harness(command) do
+          :claude -> catalog_reply(claude_models)
+          :codex -> catalog_reply(codex_models())
+        end
       end
     })
 
@@ -2299,6 +2296,33 @@ defmodule Tightbeam.GatewayTest do
              retune.("worker-only-model")
 
     assert gateway_message =~ "on host testhost"
+  end
+
+  # The codex models endpoint filters by client_version and reports nothing about
+  # it — a too-old binary yields 200 with an empty list. The refusal must not
+  # blame the grant, because re-onboarding will not change a thing.
+  test "an empty catalog from a client_version filter blames the binary, not the grant", ctx do
+    base_dir = role_test_base("client-version-empty")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    degrade_host_catalog(
+      "testhost",
+      "codex",
+      {:empty_catalog_for_client_version, "0.99.0"}
+    )
+
+    assert %{code: "catalog_unavailable", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol[medium]"}
+             })
+
+    assert message =~ "EMPTY model list for client_version \"0.99.0\""
+    assert message =~ "upgrade codex on testhost"
+    assert message =~ "credential is not implicated"
+    refute message =~ "onboard"
   end
 
   # Acceptance 2: the gateway no longer needs a credential for a harness it does

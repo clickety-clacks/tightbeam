@@ -13,7 +13,8 @@ defmodule Tightbeam.TestCase do
 
   using do
     quote do
-      import Tightbeam.TestCase, only: [register_hosts: 2]
+      import Tightbeam.TestCase,
+        only: [register_hosts: 2, catalog_reply: 1, catalog_reply: 2, catalog_probe_harness: 1]
     end
   end
 
@@ -42,6 +43,25 @@ defmodule Tightbeam.TestCase do
     Enum.each(hosts, fn {name, config} ->
       {:ok, _entry} = Tightbeam.Placement.register_host(base_dir, name, config)
     end)
+  end
+
+  @doc """
+  Wrap a catalog body the way the probe's shell hands it back.
+
+  Both harness catalogs are now one HTTPS call made BY the host that owns the
+  credential, so a test supplies a RESPONSE, not a file. curl cannot return a
+  status any other way than printing it, so it rides on a trailing line, with
+  whatever the probe learned on that host after it — for codex, the `codex
+  --version` that decided which models the server would even list.
+  """
+  def catalog_reply(body, status \\ 200)
+  def catalog_reply(body, status), do: {body <> "\n#{status} 0.145.0", 0}
+
+  @doc "Which harness a captured catalog-probe argv belongs to."
+  def catalog_probe_harness(argv) do
+    if argv |> List.last() |> String.contains?("api.anthropic.com"),
+      do: :claude,
+      else: :codex
   end
 
   # Per-test scratch dirs are named with System.unique_integer/1, which is unique

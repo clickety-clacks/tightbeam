@@ -91,9 +91,11 @@ on 2026-07-25:
   row (`auth/<harness>/.tightbeam/credential.json` with `"onboarded": true`).
   The sanctioned path is `tightbeam onboard <provider>` on the host; the
   manual recipe above is for smoke orgs only.
-- **Codex model catalog** reads `homes/<machine>/codex/models_cache.json` —
-  seed it (copy from a live `~/.codex/models_cache.json`) or every spawn dies
-  `catalog_unavailable`.
+- **Codex model catalog** needs nothing seeded. It is one HTTPS call the host
+  makes with its own grant, filtered by the version of that host's `codex`
+  binary — so a working credential and a current `codex` on PATH are the whole
+  requirement. An outdated `codex` yields an EMPTY catalog with no error from
+  the provider; the refusal names the version and says to upgrade the binary.
 - **Default model must match default harness** (`TIGHTBEAM_DEFAULT_HARNESS` /
   `TIGHTBEAM_DEFAULT_MODEL`, or archetype `[defaults]`); the claude default
   against a codex org fails `model_unavailable` at spawn.
@@ -143,7 +145,7 @@ on 2026-07-25:
   `lib/tightbeam/harness/claude.ex`.
 
   Each registered harness must have its credential preflight and catalog
-  bootstrap complete first (including Codex `models_cache.json`). The gateway
+  bootstrap complete first. The gateway
   still needs `TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500`. Success is reported
   separately as `feature-smoke leg <wire>: <n> checks PASS`; absence of any
   registered leg is not a pass.

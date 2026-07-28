@@ -20,8 +20,88 @@ defmodule Tightbeam.Harness.Support do
   def system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
 
   # For probes whose STDOUT is the answer: ssh chatters on stderr even when it
-  # succeeds, and a warning spliced into a JSON body is a malformed catalog.
+  # succeeds, and a warning spliced into a JSON body is a malformed catalog. The
+  # SCRIPT's own stderr is merged inside the script (`exec 2>&1`), so a failure
+  # still carries its reason; only ssh's is kept out.
   def system_cmd_out([command | args]), do: System.cmd(command, args)
+
+  # Generous enough for a slow model-list response, bounded because a probe runs
+  # inside the catalog's refresh task: an unbounded one leaves the entry
+  # `refreshing: true` forever, which is a liveness hole, not a slow answer.
+  @catalog_probe_timeout_s 30
+
+  @doc false
+  def catalog_probe_timeout_s, do: @catalog_probe_timeout_s
+
+  @doc """
+  The argv for a catalog probe on `dest` (nil = this machine).
+
+  A catalog is derived on the host that owns the credential, and for codex it
+  also needs a fact only that host's binary can state, so the probe is a script
+  either way — the only difference is whether ssh carries it. Non-login `sh -c`
+  on purpose: a login shell's profile banner would land in the middle of the
+  JSON body, and SATELLITE.md already requires the harness CLIs to be on a PATH
+  a non-login ssh shell can see.
+  """
+  @spec catalog_probe_argv(String.t() | nil, String.t()) :: [String.t()]
+  def catalog_probe_argv(nil, script), do: ["sh", "-c", script]
+
+  def catalog_probe_argv(dest, script),
+    do: ["ssh" | @ssh_opts] ++ [dest, "sh", "-c", shell_quote(script)]
+
+  @doc """
+  The curl line every catalog probe ends in.
+
+  `-f` is deliberately absent: on 400 or 401 both vendors return a JSON body
+  that names the actual problem — an outdated `client_version`, a grant that
+  needs signing in again — and that sentence is the one the operator needs.
+  curl has no way to hand back a status except to print it, so it rides in on a
+  trailing line, followed by whatever else the probe learned ON the host.
+  """
+  @spec catalog_curl(String.t(), [String.t()], String.t()) :: String.t()
+  def catalog_curl(url, headers, trailer \\ "") do
+    header_args = Enum.map_join(headers, " ", &~s(-H "#{&1}"))
+
+    ~s(curl -sS --max-time #{@catalog_probe_timeout_s} ) <>
+      ~s(-w "\\n%{http_code}#{trailer}" ) <> header_args <> " " <> ~s("#{url}")
+  end
+
+  @doc """
+  Run a catalog probe and split the body from its trailing status line.
+
+  Returns the fields after the status untouched, for whatever the probe was
+  asked to report back about the host it ran on.
+  """
+  @spec catalog_probe(fun(), [String.t()]) ::
+          {:ok, String.t(), [String.t()]} | {:error, term()}
+  def catalog_probe(sh, argv) do
+    case sh.(argv) do
+      {output, 0} ->
+        {body, last_line} = split_trailing_line(output)
+
+        case String.split(last_line, " ", trim: true) do
+          [status | trailer] ->
+            case Integer.parse(status) do
+              {code, ""} when code in 200..299 -> {:ok, body, trailer}
+              {code, ""} -> {:error, {:http_status, code, String.trim(body)}}
+              _ -> {:error, {:probe_unrecognized, String.trim(output)}}
+            end
+
+          [] ->
+            {:error, {:probe_unrecognized, String.trim(output)}}
+        end
+
+      {output, exit} ->
+        {:error, {:probe_failed, exit, String.trim(output)}}
+    end
+  end
+
+  defp split_trailing_line(output) do
+    case output |> String.trim_trailing("\n") |> String.split("\n") |> Enum.split(-1) do
+      {body, [last]} -> {Enum.join(body, "\n"), last}
+      _ -> {output, ""}
+    end
+  end
 
   @doc false
   def owned_home_entries(credential_file, rails_file) do

@@ -1,4 +1,8 @@
-// Captured 2026-07-25 from ~/.codex/models_cache.json; real gpt-5.6-sol row trimmed to consumed fields.
+// RE-CAPTURED 2026-07-28 from the route we now call: GET
+// chatgpt.com/backend-api/codex/models?client_version=0.145.0 (codex-cli 0.145.0).
+// Byte-identical to the 2026-07-25 capture of ~/.codex/models_cache.json, which is
+// what established that the cache was only ever a copy of this answer. Real
+// gpt-5.6-sol row trimmed to consumed fields.
 // Right-sizing: assert only consumed fields and relied-on invariants; additive unconsumed fields must not fail.
 {
   "models": [
