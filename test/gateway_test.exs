@@ -2606,6 +2606,91 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k1").model == before
   end
 
+  describe "session status reports its host's credential kind" do
+    setup ctx do
+      base =
+        Path.join(
+          System.tmp_dir!(),
+          "gateway-credential-kind-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(base)
+      on_exit(fn -> File.rm_rf!(base) end)
+      Archetypes.load!(role_test_base("session-status-credential-kind"))
+
+      # `Credentials.server/1` resolves to the local name, so the session's host
+      # must BE this machine for the status read to reach the owner started here.
+      Application.put_env(:tightbeam, :local_host_name, "kindhost")
+
+      Org.create(ctx.db, %{
+        session_key: "k-kind",
+        display_name: "Kind",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "kindhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "claude-sonnet-5[medium]"
+      })
+
+      %{cred_base: base}
+    end
+
+    defp bank!(base, kind) do
+      {:ok, server} =
+        Credentials.start_link(name: Credentials, base_dir: base, machine: "kindhost")
+
+      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      File.write!(Path.join(staging, "oauth-token"), "credential-bytes")
+      :ok = Credentials.finish_onboard(:anthropic, kind, server)
+      server
+    end
+
+    test "an API-key host reports apiKey", ctx do
+      server = bank!(ctx.cred_base, :api_key)
+      on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+
+      assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
+    end
+
+    test "a subscription host reports subscription", ctx do
+      server = bank!(ctx.cred_base, :subscription)
+      on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+
+      assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "subscription"
+    end
+
+    test "a host with no credential reports its own state, not a missing field", ctx do
+      {:ok, server} =
+        Credentials.start_link(name: Credentials, base_dir: ctx.cred_base, machine: "kindhost")
+
+      on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+
+      display = Gateway.session_status("k-kind", ctx.db).display
+
+      # Absence is a VALUE. A client that saw the field vanish could not tell
+      # "no credential here" from a decoder change.
+      assert Map.has_key?(display, :credentialKind)
+      assert display.credentialKind == "none"
+    end
+
+    # The test that distinguishes "resolved at read time" from "stamped on the
+    # row" — a row-stamped implementation passes all three above and fails this.
+    test "the reported kind flips when the host is re-onboarded on the other kind", ctx do
+      server = bank!(ctx.cred_base, :subscription)
+      assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "subscription"
+
+      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      File.write!(Path.join(staging, "oauth-token"), "an-api-key")
+      :ok = Credentials.finish_onboard(:anthropic, :api_key, server)
+      on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+
+      # The session row was never touched between the two reads.
+      assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
+    end
+  end
+
   test "session_status splits setModel (one row per model) from setReasoning (current model's tiers)",
        ctx do
     Archetypes.load!(role_test_base("session-status-reasoning"))

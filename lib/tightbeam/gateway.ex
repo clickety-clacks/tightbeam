@@ -1184,6 +1184,7 @@ defmodule Tightbeam.Gateway do
             provider: session.provider,
             harness: session.harness,
             host: session.host,
+            credentialKind: credential_kind(session),
             authMode: nil,
             reasoningLevel: effort,
             thinkingLevel: nil,
@@ -1243,6 +1244,35 @@ defmodule Tightbeam.Gateway do
   end
 
   defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
+
+  # Which KIND of credential this session's turns actually run on — an API key or
+  # a subscription. A fact about {the session's host, its harness's provider},
+  # read HERE rather than stored on the session row: a stored value would go
+  # stale the moment the host is re-onboarded on the other kind, and a client
+  # seeing that flip is the point.
+  #
+  # Absence is its own value, not a missing field: "none" says there is no
+  # credential on that host for that provider, which is a different sentence from
+  # "there is one and it stopped working" — and a client watching the field
+  # simply vanish could not tell either from a decoder change.
+  defp credential_kind(session) do
+    provider = Harness.parse!(session.harness).credential_provider()
+    server = Tightbeam.Credentials.server(session.host)
+
+    case GenServer.whereis(server) do
+      nil -> wire_credential_kind(:none)
+      _pid -> wire_credential_kind(Tightbeam.Credentials.kind(provider, server))
+    end
+  end
+
+  # DO NOT "simplify" this into an atom passthrough. `Router.wire_value/1` lower-
+  # camelizes KEYS only; an atom VALUE encodes verbatim, so `:api_key` would
+  # reach the client as "api_key" and its decoder would fall through to whatever
+  # it does with an unknown kind. The camelizer is not doing this work and cannot
+  # be made to. The wire vocabulary is stated once, here.
+  defp wire_credential_kind(:api_key), do: "apiKey"
+  defp wire_credential_kind(:subscription), do: "subscription"
+  defp wire_credential_kind(:none), do: "none"
 
   defp defaults(config, db) do
     module = Harness.module!(config.default_harness)
@@ -2963,6 +2993,12 @@ defmodule Tightbeam.Gateway do
                     ok: true,
                     harness: harness,
                     model: model,
+                    # The swap may have crossed providers, and the new provider's
+                    # credential on this host may be a different kind. This is
+                    # the one moment the value changes without the client polling
+                    # status. The router camelizes the key to `credentialKind`,
+                    # matching the session-status shape.
+                    credential_kind: credential_kind(Map.put(session, :harness, harness)),
                     note:
                       "engine swapped; chat cleared (rows retained); model context starts fresh"
                   }

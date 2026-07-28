@@ -989,6 +989,44 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(vacant.resp_body)["error"]["message"] =~ "vacant"
   end
 
+  # The credential kind reaches the client as "apiKey", and it is NOT the
+  # camelizer that makes it so. `wire_value/1` lower-camelizes KEYS only; an atom
+  # VALUE encodes verbatim. This pins that fact, so the day someone "simplifies"
+  # Gateway.wire_credential_kind/1 into an atom passthrough, this goes red here
+  # rather than silently shipping "api_key" to a decoder that has no case for it.
+  test "the wire camelizes keys but never values, so the credential kind is a literal", ctx do
+    Org.create(ctx.db, %{
+      session_key: "k1",
+      display_name: "Kind",
+      owner_user_id: ctx.device.user_id,
+      origin: "user:#{ctx.device.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: "claude-sonnet-5"
+    })
+
+    opts =
+      Keyword.put(ctx.opts, :session_status, fn _key ->
+        %{sessionKey: "k1", display: %{credential_kind: :api_key}}
+      end)
+
+    conn =
+      Plug.Test.conn(:get, "/api/session-status?sessionKey=k1")
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> ctx.device.token)
+      |> Router.call(Router.init(opts))
+
+    assert conn.status == 200
+
+    # The KEY camelized (credential_kind -> credentialKind). The VALUE did not:
+    # the atom shipped verbatim as "api_key", which is not a kind the client
+    # knows. That is the whole reason `Gateway.wire_credential_kind/1` emits the
+    # literal instead of leaning on this transform.
+    assert conn.resp_body =~ ~s("credentialKind":"api_key")
+    refute conn.resp_body =~ "apiKey"
+  end
+
   test "facts-read routes as a read verb and list sessions use createdAt on the wire", ctx do
     parent = self()
 
