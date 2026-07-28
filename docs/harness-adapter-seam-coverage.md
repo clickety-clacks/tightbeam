@@ -104,6 +104,25 @@ closed world. The specifically closed-world subjects are:
 | `test/model_catalog_test.exs`, `test/spinup_test.exs`, `test/placement_test.exs`, `test/homes_test.exs`, `test/acp_adapter_test.exs`, `test/subagent_markers_test.exs` | parity oracles | retain subjects and add the spec's seam/parity cases |
 | `docs/**`, `priv/**`, `scripts/**`, test fixtures | docs/fixture carve-out | no production dispatch; names may remain as examples/oracles |
 
+## Credential kinds and the seam surface
+
+A host holds one credential per provider, of either KIND (API key or
+subscription), recorded in `credential.json`. Three seams dispatch on it; the
+rest do not, and the split is worth stating because it decides where a kind
+argument belongs.
+
+| Seam | Kind-dispatched? | Why |
+|---|---|---|
+| `prepare_launch/3` | YES for claude, NO for codex | claude carries its credential in an environment variable whose NAME is the kind; codex reads its own `auth.json`, so its plan is kind-invariant — pinned by running both kinds through the conformance vectors rather than assumed |
+| `fetch_catalog/1` | YES, both | claude: one route, two headers. codex: two ROUTES answering in two SHAPES, so two derivations |
+| `credential_live?/3` | YES, both | no single call authenticates both kinds on either provider |
+| `credential_ready?/2`, `harvest_credential/2`, `reconcile_home/3`, `owned_home_entries/0` | NO | they name the FILE, and the file is the same for both kinds |
+
+The kind is never read by a harness module. It is resolved by the caller that
+already knows `{host, provider}` — `ModelCatalog`, `Placement`, the e2e
+preflight — and injected, so `Tightbeam.Credentials` stays the one authority and
+the harness modules stay stateless.
+
 ## Findings
 
 Every discovered production coupling maps to a required seam operation,

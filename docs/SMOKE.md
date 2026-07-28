@@ -62,21 +62,70 @@ in scope is LIVE, per {harness × host}: the gateway machine and every
 satellite a leg will place sessions on.
 
 P1. claude, per host: run the registry preflight. Its bounded authenticated
-    probe calls `GET https://api.anthropic.com/v1/models?limit=1` with the
-    host-local OAuth grant. Repair an explicit rejection with
-    `tightbeam onboard anthropic` ON that host; never harvest or copy a
-    rotating Claude login.
-P2. codex, per host: run the registry preflight. Its bounded authenticated
-    probe calls
-    `GET https://chatgpt.com/backend-api/wham/accounts/check` with the
-    host-local ChatGPT grant and account header. Login status/presence is not
-    liveness. If the codex leg is waived for a missing grant, say so here.
+    probe calls `GET https://api.anthropic.com/v1/models?limit=1` — the same
+    route for either credential kind, with the header that host's kind
+    requires: `Authorization: Bearer` for a subscription setup-token,
+    `x-api-key` for an API key. The kind comes from that host's
+    `credential.json`, never from a guess about the file. Repair an explicit
+    rejection ON that host with `tightbeam onboard anthropic` (subscription) or
+    `printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key`; never
+    harvest or copy a rotating Claude login, and never copy a key between
+    machines either.
+P2. codex, per host: run the registry preflight. The two kinds cannot share a
+    probe here — a ChatGPT grant is refused by the platform route (403, missing
+    scope `api.model.read`) and an API key cannot reach the account route — so
+    the probe follows the host's recorded kind:
+      subscription → `GET https://chatgpt.com/backend-api/wham/accounts/check`
+                     with the host-local ChatGPT grant and account header;
+      api key      → `GET https://api.openai.com/v1/models` with the key from
+                     `auth.json`'s own `OPENAI_API_KEY` field.
+    Login status/presence is not liveness. If the codex leg is waived for a
+    missing grant, say so here.
 P3. Rule: a preflight FAIL blocks that {harness × host} leg until fixed or
     waived by name. After a clean preflight, any downstream auth-shaped
     failure is a FINDING (something rotated or leaked mid-run), never
     noise to shrug at. The result map is pinned for every preflight surface:
     `:live` → PASS; `{:dead, reason}` → FAIL; `{:unknown, reason}` →
     INCOMPLETE/blocker, never PASS.
+    A host whose credential store records NO kind is a preflight FAIL with its
+    own remedy: re-run onboarding so the metadata records one. It is not an
+    excuse to probe with a guessed kind — the two kinds reach different routes,
+    so a guess produces a confident answer about the wrong endpoint.
+
+### Credential kinds
+
+A host holds ONE credential per provider, of either kind, and it is host-local
+config: a satellite may run claude on an API key while the gateway runs it on a
+subscription. Each session reports its own as `display.credentialKind`
+(`"apiKey" | "subscription" | "none"`).
+
+    # subscription (interactive, unchanged)
+    tightbeam onboard anthropic
+    tightbeam onboard openai
+
+    # API key (non-interactive; the key is read from stdin and never leaves the host)
+    printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
+    printenv OPENAI_API_KEY    | tightbeam onboard openai    --api-key
+
+`--api-key` will not read from a terminal — a key typed at a prompt lands in
+shell scrollback. The ceremony validates the key against the provider BEFORE
+banking it; a rejection names the provider, the host and the kind, and leaves
+the existing credential untouched.
+
+**UNVERIFIED CELLS.** State these in any run report that touches an api-key
+host, rather than letting a green scorecard imply more than it proved:
+
+| cell | status |
+|---|---|
+| anthropic `x-api-key` header shape | recorded live — a 401 to an invalid key names the header |
+| openai platform route accepts api keys | recorded live — 401 `invalid_api_key`, where a subscription token gets 403 naming the missing scope `api.model.read` |
+| a valid key returns 200 on either route | one-shot capture; see `priv/credential_live/CAPTURE-LEDGER.md` |
+| openai `/v1/models` response SHAPE | same capture — it drives `derive_platform_entries/1` in `harness/codex.ex` |
+| codex-acp / claude-agent-acp run a turn on api-key auth | **NOT VERIFIED, not budgeted.** Expected, not observed. |
+
+The last row is the one to say out loud. Everything above it is about reaching
+the vendor; that row is about the harness actually working, and nothing in the
+suite or the smoke proves it yet.
 
 ## Fresh-org provisioning (what "auth seeded" actually means)
 
@@ -86,9 +135,15 @@ on 2026-07-25:
 
 - **Credentials are store rows, not loose files.** Each provider needs all
   three: the store backing file (`auth/codex/auth.json`; claude
-  `auth/claude/oauth-token` — a full 108-char `sk-ant-oat…` setup token), the
-  home symlink (`homes/<machine>/<harness>/…` → store file), and the metadata
-  row (`auth/<harness>/.tightbeam/credential.json` with `"onboarded": true`).
+  `auth/claude/oauth-token`), the home symlink
+  (`homes/<machine>/<harness>/…` → store file), and the metadata row
+  (`auth/<harness>/.tightbeam/credential.json` with `"onboarded": true` AND
+  `"kind": "subscription" | "api_key"`). The KIND is what every credential seam
+  dispatches on; a store row without one is not usable, because nothing infers
+  it from the file. The claude backing file holds whichever kind is active — a
+  full 108-char `sk-ant-oat…` setup token under a subscription, an
+  `sk-ant-api…` key under the other. That filename is historical and is NOT
+  evidence of the kind.
   The sanctioned path is `tightbeam onboard <provider>` on the host; the
   manual recipe above is for smoke orgs only.
 - **Codex model catalog** needs nothing seeded. It is one HTTPS call the host
