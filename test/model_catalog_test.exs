@@ -757,6 +757,7 @@ defmodule Tightbeam.ModelCatalogTest do
         claude_fetch: ctx.claude_fetch,
         sh: ctx.codex_sh,
         credential_status: fn _provider -> :onboarded end,
+        credential_kind: fn _provider -> :subscription end,
         # These tests exercise catalog DERIVATION (field mapping, effort parsing,
         # health, sorting) with synthetic and fixture model ids. The claude
         # selectable-model pin is a separate subject with its own tests below, so

@@ -1,0 +1,25 @@
+{
+  "recorded_at": "2026-07-28",
+  "request": {
+    "method": "GET",
+    "url": "https://api.openai.com/v1/models",
+    "header": "authorization",
+    "source": "curl from eezo, deliberately invalid key",
+    "sanitized": true,
+    "note": "401 invalid_api_key, NOT the 403 missing-scope api.model.read that a ChatGPT subscription token gets from this same route. That contrast is the evidence the platform route treats API keys as first-class."
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "error": {
+        "message": "Incorrect API key provided: sk-proj-***. You can find your API key at https://platform.openai.com/account/api-keys.",
+        "type": "invalid_request_error",
+        "param": null,
+        "code": "invalid_api_key"
+      }
+    }
+  }
+}

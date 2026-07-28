@@ -161,6 +161,7 @@ defmodule Tightbeam.AttentionTierTest do
       onboarding_lease_ms: 1_800_000,
       db: db,
       credential_status: fn _ -> :onboarded end,
+      credential_kind: fn _ -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end
     }
 

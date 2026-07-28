@@ -695,6 +695,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
       db: db,
       effort_checkin_horizon_ms: 1,
       credential_status: fn _provider -> :onboarded end,
+      credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end,
       effort_probe: fn _session, _root, _config ->
         {:ok, %{repos: [%{path: ".", head: "same", tracked: "same"}], untracked: []}}

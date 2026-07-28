@@ -288,6 +288,7 @@ defmodule Tightbeam.GatewayTest do
       # ssh ever leaving this machine.
       base_dir: catalog_base,
       credential_status: fn _provider -> :onboarded end,
+      credential_kind: fn _provider -> :subscription end,
       claude_selectable_models: :all,
       claude_fetch: fn _, _ -> {:ok, claude_models} end,
       sh: fn command ->
@@ -2637,35 +2638,41 @@ defmodule Tightbeam.GatewayTest do
       %{cred_base: base}
     end
 
-    defp bank!(base, kind) do
-      {:ok, server} =
-        Credentials.start_link(name: Credentials, base_dir: base, machine: "kindhost")
+    # start_supervised! rather than start_link: this server registers under the
+    # module name that `Credentials.server/1` resolves to for the local host, so
+    # a leaked one would answer for every later test in the run. ExUnit owning
+    # its lifecycle is what keeps that from happening.
+    defp owner!(base) do
+      start_supervised!({Credentials, name: Credentials, base_dir: base, machine: "kindhost"})
+      Credentials
+    end
 
-      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, "oauth-token"), "credential-bytes")
-      :ok = Credentials.finish_onboard(:anthropic, kind, server)
+    defp bank!(base, kind) do
+      server = owner!(base)
+      bank_into!(server, kind)
       server
     end
 
+    defp bank_into!(server, kind) do
+      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      File.write!(Path.join(staging, "oauth-token"), "credential-bytes")
+      :ok = Credentials.finish_onboard(:anthropic, kind, server)
+    end
+
     test "an API-key host reports apiKey", ctx do
-      server = bank!(ctx.cred_base, :api_key)
-      on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+      bank!(ctx.cred_base, :api_key)
 
       assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
     end
 
     test "a subscription host reports subscription", ctx do
-      server = bank!(ctx.cred_base, :subscription)
-      on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+      bank!(ctx.cred_base, :subscription)
 
       assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "subscription"
     end
 
     test "a host with no credential reports its own state, not a missing field", ctx do
-      {:ok, server} =
-        Credentials.start_link(name: Credentials, base_dir: ctx.cred_base, machine: "kindhost")
-
-      on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+      owner!(ctx.cred_base)
 
       display = Gateway.session_status("k-kind", ctx.db).display
 
@@ -2681,10 +2688,7 @@ defmodule Tightbeam.GatewayTest do
       server = bank!(ctx.cred_base, :subscription)
       assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "subscription"
 
-      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, "oauth-token"), "an-api-key")
-      :ok = Credentials.finish_onboard(:anthropic, :api_key, server)
-      on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+      bank_into!(server, :api_key)
 
       # The session row was never touched between the two reads.
       assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
@@ -4809,6 +4813,7 @@ defmodule Tightbeam.GatewayTest do
       onboarding_lease_ms: 1_800_000,
       db: db,
       credential_status: fn _provider -> :onboarded end,
+      credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end
     }
   end

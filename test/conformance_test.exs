@@ -2528,6 +2528,7 @@ defmodule Tightbeam.ConformanceSupport do
           ModelCatalog.start_link(
             base_dir: base,
             credential_status: fn _provider -> :onboarded end,
+            credential_kind: fn _provider -> :subscription end,
             claude_fetch: fn _, _ -> {:error, :unused} end,
             sh: fn _command ->
               catalog_reply(
@@ -2563,7 +2564,8 @@ defmodule Tightbeam.ConformanceSupport do
         db: db,
         # Limitation CATALOG-CREDENTIAL-REFUSAL: remedy fixtures force onboarded status,
         # so this support config cannot observe a needs_onboarding refusal.
-        credential_status: fn _provider -> :onboarded end
+        credential_status: fn _provider -> :onboarded end,
+        credential_kind: fn _provider -> :subscription end
       })
 
     {handlers, service_pids}

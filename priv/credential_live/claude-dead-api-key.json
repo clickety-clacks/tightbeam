@@ -1,0 +1,24 @@
+{
+  "recorded_at": "2026-07-28",
+  "request": {
+    "method": "GET",
+    "url": "https://api.anthropic.com/v1/models?limit=1",
+    "header": "x-api-key",
+    "source": "curl from eezo, deliberately invalid key",
+    "sanitized": true
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "authentication_error",
+        "message": "API key is invalid."
+      },
+      "request_id": "recorded-request"
+    }
+  }
+}

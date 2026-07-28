@@ -78,6 +78,8 @@ defmodule Tightbeam.RailRemedyTest do
       Gateway.handlers(%{
         db: db,
         credential_status: fn _provider -> :onboarded end,
+        credential_kind: fn _provider -> :subscription end,
+        credential_kind: fn _provider -> :subscription end,
         patch_adapter: fn _harness, _path -> :ok end
       })
 
@@ -1000,6 +1002,7 @@ defmodule Tightbeam.RailRemedyTest do
       onboarding_lease_ms: 1_800_000,
       db: ctx.db,
       credential_status: fn _provider -> :onboarded end,
+      credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end
     })
   end
@@ -1017,6 +1020,9 @@ defmodule Tightbeam.RailRemedyTest do
           {ModelCatalog,
            base_dir: ctx.base_dir,
            credential_status: fn _provider -> :onboarded end,
+           credential_kind: fn _provider -> :subscription end,
+           credential_kind: fn _provider -> :subscription end,
+           credential_kind: fn _provider -> :subscription end,
            claude_fetch: fn _, _ -> {:error, :unused} end,
            sh: fn _command ->
              catalog_reply(
