@@ -229,7 +229,8 @@ record the whole path it took. An agent that reaches for ssh on M4 has told us t
 product's own path was not visible from where it was standing.
 
 > **Known gap — the live hypothesis this probe exists to check.** The shrdlu run
-> (`docs/smoke-runs/2026-07-28-91901ff-shrdlu-prod-service.md`, step 29) found
+> (run record `2026-07-28-91901ff-shrdlu-prod-service.md` in
+> `~/shared-workspace/tightbeam_ex/smoke-runs/`, step 29) found
 > **zero** occurrences of `wake --user`, `wake --role` or `[from …]` in the probe
 > session's composed guidance. Reading the source, that is the shape of composition,
 > not a packaging accident:
@@ -303,7 +304,8 @@ participating host.
 
 ## Scorecard
 
-`docs/smoke-runs/<date>-<short-sha>-inter-node-comms.md`. One row per {placement ×
+`~/shared-workspace/tightbeam_ex/smoke-runs/<date>-<short-sha>-inter-node-comms.md`
+(run records live outside the repo). One row per {placement ×
 harness-pair × path}, columns for A–E. Header carries gateway commit, every
 participating host and its role, the **archetype and model each probe session
 carried** (§E is unreadable without them), and which cells were waived.

@@ -194,7 +194,7 @@ on 2026-07-25:
   The claude model must be one the ADAPTER accepts, which is a narrower set than the
   derived catalog — `fable` and `claude-fable-5` are both refused, and a refusal fails
   the model apply on every `session/new` and `session/load`. The recipe above used to
-  say `fable`; every real run in `docs/smoke-runs/` used `claude-sonnet-5[medium]`
+  say `fable`; every real run on record used `claude-sonnet-5[medium]`
   instead, which is why the stale value was never caught. The accepted list and how to
   re-probe it live in the note above `@adapter_selectable_models` in
   `lib/tightbeam/harness/claude.ex`.
@@ -341,8 +341,9 @@ the same facade `tb wake` posts. Step 16b is J8's scheduled variant.
 
 ## Recording results — the scorecard
 
-Every run produces a SCORECARD: copy `docs/smoke-runs/TEMPLATE.md` to
-`docs/smoke-runs/<date>-<short-sha>.md` and fill it in — one column per
+Every run produces a SCORECARD. Run records live outside the repo, in
+`~/shared-workspace/tightbeam_ex/smoke-runs/`: copy `TEMPLATE.md` there to
+`<date>-<short-sha>.md` and fill it in — one column per
 {harness x host} leg, one row per step (P1..P3, 1..33), each cell
 PASS / FAIL(note) / WAIVED(blocker) / N/A[harness-only]. The scorecard also
 carries a copy of the harness-support matrix's rows with a verified?

@@ -224,7 +224,8 @@ Re-verify unrelated workloads are still running, on both hosts.
 
 ## Scorecard
 
-`docs/smoke-runs/<date>-<short-sha>-assimilation-<host-name>.md`, one row per
+`~/shared-workspace/tightbeam_ex/smoke-runs/<date>-<short-sha>-assimilation-<host-name>.md`
+(run records live outside the repo), one row per
 section §1–§7 with PASS / FAIL(note) / WAIVED(blocker) / NOT VERIFIED(reason) /
 BLOCKED(blocker). Header carries gateway commit, gateway host, satellite host,
 harnesses assimilated, and the retain-or-return decision.
