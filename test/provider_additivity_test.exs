@@ -41,6 +41,7 @@ defmodule Tightbeam.ProviderAdditivityTest do
 
     onboard =
       Gateway.handlers(%{base_dir: base, db: db, onboarding_lease_ms: 1_800_000})["onboard"]
+
     call = %{origin: "user:fixture-admin", params: %{provider: "fixture-provider"}}
 
     assert %{provider: :fixture_provider, status: "ready", staging_path: staging_path} =
