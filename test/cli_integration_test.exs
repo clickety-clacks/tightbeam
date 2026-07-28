@@ -51,6 +51,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     for module <- [
           Tightbeam.CausalEvents,
+          Tightbeam.Artifacts,
           Assets,
           Devices,
           ConditionFacts,

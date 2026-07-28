@@ -894,14 +894,12 @@ defmodule Tightbeam.EffortCheckin do
       artifacts:
         count_since(
           txn,
-          "artifacts",
           "SELECT COUNT(*) FROM artifacts WHERE createdBySession = ?1 AND rowid > ?2",
           [generation.holder_key, generation.artifact_watermark]
         ),
       attests:
         count_since(
           txn,
-          "attests",
           "SELECT COUNT(*) FROM attests WHERE assignmentId = ?1 AND rowid > ?2",
           [generation.assignment_id, generation.attest_watermark]
         ),
@@ -932,10 +930,14 @@ defmodule Tightbeam.EffortCheckin do
            generation.assignment_id
          ]) do
       [[item]] when is_binary(item) ->
+        # 'metadata' only. A 'composition' doorbell says the item gained or lost
+        # an assignment — substrate structure, not the holder updating anything,
+        # and the DISPATCH THAT ARMS THIS BRACKET emits one after the arming
+        # transaction commits. Counting it would let every bracket read its own
+        # arming as effect and swallow the first prod on the production path.
         count_since(
           txn,
-          "work_item_events",
-          "SELECT COUNT(*) FROM work_item_events WHERE workItemId = ?1 AND id > ?2",
+          "SELECT COUNT(*) FROM work_item_events WHERE workItemId = ?1 AND id > ?2 AND kind = 'metadata'",
           [item, generation.work_item_watermark]
         )
 
@@ -959,26 +961,17 @@ defmodule Tightbeam.EffortCheckin do
     turns
   end
 
-  defp count_since(txn, table, sql, params) do
-    if table?(txn, table) do
-      [[count]] = Txn.q(txn, sql, params)
-      count
-    else
-      0
-    end
+  # No table guards. A channel whose table is missing is a broken substrate, not
+  # a channel that observed nothing — reading it as zero would fire a prod off
+  # the breakage. The gateway creates all four tables at boot.
+  defp count_since(txn, sql, params) do
+    [[count]] = Txn.q(txn, sql, params)
+    count
   end
 
   defp cursor(txn, table, column) do
-    if table?(txn, table) do
-      [[cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(#{column}), 0) FROM #{table}")
-      cursor
-    else
-      0
-    end
-  end
-
-  defp table?(txn, table) do
-    Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [table]) == [[1]]
+    [[cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(#{column}), 0) FROM #{table}")
+    cursor
   end
 
   defp evidence(generation, channels) do

@@ -28,6 +28,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     for module <- [
           Tightbeam.CausalEvents,
+          Tightbeam.Artifacts,
           Devices,
           ConditionFacts,
           Idempotency,

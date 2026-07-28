@@ -28,6 +28,7 @@ defmodule Tightbeam.AssignmentsTest do
           Tightbeam.CausalEvents,
           Tightbeam.Escalation,
           Tightbeam.EffortCheckin,
+          Tightbeam.Artifacts,
           Devices,
           ConditionFacts,
           Idempotency,
