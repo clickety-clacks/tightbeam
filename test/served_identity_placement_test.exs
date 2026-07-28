@@ -8,14 +8,13 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
       Path.join(System.tmp_dir!(), "tb-served-placement-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(base)
-    old_hosts = Application.get_env(:tightbeam, :hosts)
     old_local = Application.get_env(:tightbeam, :local_host_name)
     old_url = Application.get_env(:tightbeam, :advertised_url)
 
     Application.put_env(:tightbeam, :local_host_name, "eezo")
     Application.put_env(:tightbeam, :advertised_url, "http://eezo:4321")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base, %{
       "worker" => %{ssh: "agent@worker", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"}
     })
 
@@ -24,10 +23,6 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     on_exit(fn ->
       File.rm_rf!(base)
       :persistent_term.erase(Tightbeam.Rails)
-
-      if old_hosts,
-        do: Application.put_env(:tightbeam, :hosts, old_hosts),
-        else: Application.delete_env(:tightbeam, :hosts)
 
       if old_local,
         do: Application.put_env(:tightbeam, :local_host_name, old_local),
@@ -93,7 +88,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     File.write!(Path.join(home, "hooks.json"), "old")
     File.write!(Path.join(home, ".tightbeam/manifest"), "stale")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(ctx.base, %{
       "worker" => %{ssh: "agent@worker", base_dir: remote, cli_bin: "/srv/bin"}
     })
 

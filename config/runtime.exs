@@ -60,24 +60,12 @@ if value = System.get_env("TIGHTBEAM_ADVERTISED_URL") do
   config :tightbeam, :advertised_url, value
 end
 
-# Hosts are instance config (spec §Placement): JSON map of
-# name => {"ssh": destination-or-null, "base_dir": path, "cli_bin": path?}.
-# The gateway's own machine is merged in by Placement.hosts/1 under its
-# real hostname (override: TIGHTBEAM_LOCAL_HOST_NAME).
-if value = System.get_env("TIGHTBEAM_HOSTS") do
-  hosts =
-    for {name, h} <- JSON.decode!(value), into: %{} do
-      {name,
-       %{
-         ssh: h["ssh"],
-         base_dir: Map.fetch!(h, "base_dir"),
-         cli_bin: h["cli_bin"],
-         adapter_bin_dir: h["adapter_bin_dir"]
-       }}
-    end
-
-  config :tightbeam, :hosts, hosts
-end
+# Hosts are NOT configured here. `tightbeam assimilate` registers them into
+# <base_dir>/hosts.json, which Placement.hosts/1 reads. A TIGHTBEAM_HOSTS env
+# var used to layer a second host store over that registry and WIN on collision,
+# so a stale entry silently overrode what assimilate had just recorded and the
+# resulting failure pointed at the satellite. Removed 2026-07-28: unrequested
+# surface, one authority, and the gateway's own machine is added by hosts/1.
 
 if value = System.get_env("TIGHTBEAM_DRAIN_TIMEOUT_MS") do
   config :tightbeam, :drain_timeout_ms, String.to_integer(value)

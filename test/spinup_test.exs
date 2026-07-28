@@ -9,15 +9,7 @@ defmodule Tightbeam.SpinupTest do
     File.mkdir_p!(base_dir)
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = EventLog.ensure_schema(db)
-    old_hosts = Application.get_env(:tightbeam, :hosts)
-
-    on_exit(fn ->
-      File.rm_rf!(base_dir)
-
-      if old_hosts,
-        do: Application.put_env(:tightbeam, :hosts, old_hosts),
-        else: Application.delete_env(:tightbeam, :hosts)
-    end)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
 
     %{base_dir: base_dir, db: db}
   end
@@ -160,7 +152,7 @@ defmodule Tightbeam.SpinupTest do
   test "remote readiness uses quoted commands and records allow", ctx do
     remote_base = "/srv/tight beam/o'hare"
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(ctx.base_dir, %{
       "worker" => %{ssh: "worker.example", base_dir: remote_base, cli_bin: nil}
     })
 
@@ -329,7 +321,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   defp configure_remote(local_base) do
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(local_base, %{
       "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
     })
 

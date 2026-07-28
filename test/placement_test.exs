@@ -16,16 +16,11 @@ defmodule Tightbeam.PlacementTest do
     Archetypes.load!(base_dir)
     Rails.load!(base_dir)
 
-    old_hosts = Application.get_env(:tightbeam, :hosts)
     old_url = Application.get_env(:tightbeam, :advertised_url)
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
       :persistent_term.erase(Tightbeam.Rails)
-
-      if old_hosts,
-        do: Application.put_env(:tightbeam, :hosts, old_hosts),
-        else: Application.delete_env(:tightbeam, :hosts)
 
       if old_url,
         do: Application.put_env(:tightbeam, :advertised_url, old_url),
@@ -123,7 +118,7 @@ defmodule Tightbeam.PlacementTest do
   test "hosts registers the gateway machine under its real name; nothing redefines it", %{
     base_dir: base_dir
   } do
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "remote" => %{ssh: "worker", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"},
       "testhost" => %{ssh: "forbidden", base_dir: "/wrong", cli_bin: "/wrong/bin"}
     })
@@ -158,7 +153,7 @@ defmodule Tightbeam.PlacementTest do
     old_base = Path.join(base_dir, "old-local")
     new_base = Path.join(base_dir, "new-local")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "old-local" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
       "new-local" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
     })
@@ -301,7 +296,7 @@ defmodule Tightbeam.PlacementTest do
     old_base = Path.join(base_dir, "old-remove-error")
     new_base = Path.join(base_dir, "new-remove-error")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "old-remove-error" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
       "new-remove-error" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
     })
@@ -323,7 +318,7 @@ defmodule Tightbeam.PlacementTest do
   test "move_workdir rsyncs local to remote", %{base_dir: base_dir} do
     old_base = Path.join(base_dir, "old-local")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "old-local" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
       "remote" => %{ssh: "remote", base_dir: "/remote/tb", cli_bin: nil}
     })
@@ -373,7 +368,7 @@ defmodule Tightbeam.PlacementTest do
   test "move_workdir rsyncs remote to local", %{base_dir: base_dir} do
     new_base = Path.join(base_dir, "new-local")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "remote" => %{ssh: "remote", base_dir: "/remote/tb", cli_bin: nil},
       "new-local" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
     })
@@ -432,7 +427,7 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "move_workdir stages remote to remote through the gateway", %{base_dir: base_dir} do
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "old-remote" => %{ssh: "old-remote", base_dir: "/old/tb", cli_bin: nil},
       "new-remote" => %{ssh: "new-remote", base_dir: "/new/tb", cli_bin: nil}
     })
@@ -606,7 +601,7 @@ defmodule Tightbeam.PlacementTest do
   test "adapter_opts embeds every remote agent env in the ssh command", %{base_dir: base_dir} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "worker" => %{
         ssh: "codex@worker",
         base_dir: "/srv/tb",
@@ -669,7 +664,7 @@ defmodule Tightbeam.PlacementTest do
   } do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "worker" => %{ssh: "codex@worker", base_dir: "/srv/tb", cli_bin: "/srv/tb/bin"}
     })
 
@@ -832,7 +827,7 @@ defmodule Tightbeam.PlacementTest do
     write_containment_manifest(canonical_base, "default", "workdir")
     Archetypes.load!(canonical_base)
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "alias" => %{ssh: nil, base_dir: canonical_base, cli_bin: nil}
     })
 
@@ -878,7 +873,7 @@ defmodule Tightbeam.PlacementTest do
     write_containment_manifest(base_dir, "default", "workdir")
     Archetypes.load!(base_dir)
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
     })
 
@@ -1015,7 +1010,7 @@ defmodule Tightbeam.PlacementTest do
     Path.join([base_dir, "work", digest])
   end
 
-  test "hosts.json registry merges under env config and register_host records", %{} do
+  test "hosts.json is the one registry; register_host records and updates in place", %{} do
     base = Path.join(System.tmp_dir!(), "tb-reg-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
     on_exit(fn -> File.rm_rf!(base) end)
@@ -1032,18 +1027,10 @@ defmodule Tightbeam.PlacementTest do
     assert hosts["work-1"].base_dir == "/home/u/.tightbeam"
     assert hosts["testhost"].ssh == nil
 
-    # env config overrides the registry entry-for-entry
-    Application.put_env(:tightbeam, :hosts, %{
-      "work-1" => %{ssh: "override", base_dir: "/o", cli_bin: nil}
-    })
-
-    on_exit(fn -> Application.delete_env(:tightbeam, :hosts) end)
-    assert Placement.hosts(base)["work-1"].ssh == "override"
-
     # re-register updates in place
     assert {:ok, _} = Placement.register_host(base, "work-1", %{ssh: "w2", base_dir: "/z"})
-    Application.delete_env(:tightbeam, :hosts)
     assert Placement.hosts(base)["work-1"].ssh == "w2"
+    assert Placement.hosts(base)["work-1"].base_dir == "/z"
   end
 
   test "where [\"*\"] grants any configured host; empty stays an error upstream" do

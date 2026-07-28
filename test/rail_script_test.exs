@@ -421,17 +421,12 @@ defmodule Tightbeam.RailScriptTest do
 
   test "remote holder fails closed before ensuring its workdir", ctx do
     remote_base = Path.join(ctx.base_dir, "remote-host")
-    prior_hosts = Application.get_env(:tightbeam, :hosts)
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(ctx.base_dir, %{
       "remote-testhost" => %{ssh: nil, base_dir: remote_base, cli_bin: nil}
     })
 
-    on_exit(fn ->
-      if prior_hosts,
-        do: Application.put_env(:tightbeam, :hosts, prior_hosts),
-        else: Application.delete_env(:tightbeam, :hosts)
-    end)
+    on_exit(fn -> nil end)
 
     remote_holder =
       Org.create(ctx.db, %{

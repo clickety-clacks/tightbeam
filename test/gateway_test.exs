@@ -330,13 +330,8 @@ defmodule Tightbeam.GatewayTest do
     await_catalog("claude")
     await_catalog("codex")
     await_catalog("fixture")
-    old_hosts = Application.get_env(:tightbeam, :hosts)
 
     on_exit(fn ->
-      if old_hosts,
-        do: Application.put_env(:tightbeam, :hosts, old_hosts),
-        else: Application.delete_env(:tightbeam, :hosts)
-
       File.rm_rf!(catalog_base)
     end)
 
@@ -3574,7 +3569,7 @@ defmodule Tightbeam.GatewayTest do
 
     Application.put_env(:tightbeam, :advertised_url, "https://new-gateway.example")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base, %{
       "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
     })
 
@@ -4485,19 +4480,9 @@ defmodule Tightbeam.GatewayTest do
     Archetypes.load!(base_dir)
     on_exit(fn -> :persistent_term.erase(Archetypes) end)
 
-    previous_hosts = Application.get_env(:tightbeam, :hosts)
-
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(base_dir, %{
       remote_host => %{ssh: remote_host, base_dir: "/remote/tb", cli_bin: nil}
     })
-
-    on_exit(fn ->
-      if previous_hosts do
-        Application.put_env(:tightbeam, :hosts, previous_hosts)
-      else
-        Application.delete_env(:tightbeam, :hosts)
-      end
-    end)
 
     base_dir
   end

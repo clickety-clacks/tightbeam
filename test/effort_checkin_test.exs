@@ -633,15 +633,8 @@ defmodule Tightbeam.EffortCheckinTest do
 
   test "proof 7: placement satellite probe is bounded and SSH failure is unobservable", ctx do
     satellite = %{ctx.holder | host: "satellite"}
-    prior_hosts = Application.get_env(:tightbeam, :hosts)
 
-    on_exit(fn ->
-      if prior_hosts,
-        do: Application.put_env(:tightbeam, :hosts, prior_hosts),
-        else: Application.delete_env(:tightbeam, :hosts)
-    end)
-
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(ctx.base_dir, %{
       "satellite" => %{ssh: "satellite.example", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 
@@ -846,15 +839,7 @@ defmodule Tightbeam.EffortCheckinTest do
     Archetypes.load!(ctx.base_dir)
     on_exit(fn -> :persistent_term.erase(Archetypes) end)
 
-    prior_hosts = Application.get_env(:tightbeam, :hosts)
-
-    on_exit(fn ->
-      if prior_hosts,
-        do: Application.put_env(:tightbeam, :hosts, prior_hosts),
-        else: Application.delete_env(:tightbeam, :hosts)
-    end)
-
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(ctx.base_dir, %{
       "satellite" => %{ssh: "satellite.example", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 

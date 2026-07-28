@@ -11,11 +11,37 @@ defmodule Tightbeam.TestCase do
     {Tightbeam.Application, :draining}
   ]
 
+  using do
+    quote do
+      import Tightbeam.TestCase, only: [register_hosts: 2]
+    end
+  end
+
   setup do
     assert_hermetic_tmp!()
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
     :ok
+  end
+
+  @doc """
+  Register satellite hosts the way the product does.
+
+  `assimilate` records a host through `Placement.register_host/3`, which writes
+  `<base_dir>/hosts.json` — the one host store. Tests used to inject
+  `Application.put_env(:tightbeam, :hosts, …)`, a SECOND store that existed only
+  because `TIGHTBEAM_HOSTS` did; both are gone. Beyond removing the duplication,
+  this scopes host config to the test's own base_dir instead of global app env,
+  so two tests can no longer see each other's hosts.
+
+  This is assimilate's recording step, not the whole verb: the rest of it probes
+  ssh and installs adapters on a real machine, which a test naming a fictional
+  host cannot do.
+  """
+  def register_hosts(base_dir, hosts) do
+    Enum.each(hosts, fn {name, config} ->
+      {:ok, _entry} = Tightbeam.Placement.register_host(base_dir, name, config)
+    end)
   end
 
   # Per-test scratch dirs are named with System.unique_integer/1, which is unique

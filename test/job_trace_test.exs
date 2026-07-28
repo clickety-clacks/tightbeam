@@ -223,15 +223,20 @@ defmodule Tightbeam.JobTraceTest do
 
   test "commit refs verify on the named host only after holder authorization", %{db: db} do
     parent = self()
-    old_hosts = Application.get_env(:tightbeam, :hosts)
     old_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
-      restore_env(:hosts, old_hosts)
       restore_env(:commit_ref_command, old_runner)
     end)
 
-    Application.put_env(:tightbeam, :hosts, %{
+    # Hosts live in <base_dir>/hosts.json now, so the test has to name the base_dir
+    # the code under test will read — Assignments resolves it from :base_dir.
+    base_dir = Path.join(System.tmp_dir!(), "tb-job-trace-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(base_dir)
+    Application.put_env(:tightbeam, :base_dir, base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    register_hosts(base_dir, %{
       "remote-test" => %{ssh: "git@remote-test", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 

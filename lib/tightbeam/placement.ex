@@ -4,9 +4,9 @@ defmodule Tightbeam.Placement do
   exist. Everything else addresses identity; this module turns a host NAME
   into an adapter command, a delivered shared home, and an allow/deny answer.
 
-  Hosts are INSTANCE CONFIG, never DB rows: `Application.get_env(:tightbeam,
-  :hosts)` maps name => %{ssh: destination-or-nil, base_dir: path, cli_bin:
-  path-or-nil}. The gateway's own machine is always registered under its
+  Hosts are INSTANCE CONFIG, never DB rows: `<base_dir>/hosts.json` maps
+  name => %{ssh: destination-or-nil, base_dir: path, cli_bin:
+  path-or-nil}, written by `assimilate`. The gateway's own machine is under its
   REAL hostname (`local_host_name/0`; ssh: nil) — never under an indexical
   like "local", because the org's vocabulary must match the operator's
   ("spawn on eezo" has to resolve on eezo, including on eezo itself). Which
@@ -85,16 +85,22 @@ defmodule Tightbeam.Placement do
 
   @doc """
   The known hosts map with the gateway's own machine always present under
-  `local_host_name/0` (ssh: nil, base_dir = the gateway's base_dir). Merge
-  order, weakest first: the instance registry (`<base_dir>/hosts.json`,
-  written only by `register_host/3` — the register-host verb's recorder),
-  then env config (:tightbeam, :hosts — a deploy-time override), then the
-  gateway's own entry. Nothing may redefine the gateway's own entry.
+  `local_host_name/0` (ssh: nil, base_dir = the gateway's base_dir).
+
+  ONE source: the instance registry `<base_dir>/hosts.json`, written only by
+  `register_host/3` — what `assimilate` records through. Then the gateway's own
+  entry, which nothing may redefine.
+
+  There was a second source until 2026-07-28: a `TIGHTBEAM_HOSTS` env var merged
+  in ON TOP of the registry, so a stale env entry silently won over what
+  assimilate had just written for the same name, and the gateway then dialled a
+  different ssh destination than the one it had reported installing. Removed —
+  two stores for one fact is the same defect as the four base_dir resolvers.
   """
   @spec hosts(String.t()) :: %{optional(String.t()) => host_config()}
   def hosts(base_dir) do
-    registry_hosts(base_dir)
-    |> Map.merge(Application.get_env(:tightbeam, :hosts, %{}))
+    base_dir
+    |> registry_hosts()
     |> Map.put(local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
   end
 

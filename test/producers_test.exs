@@ -325,11 +325,10 @@ defmodule Tightbeam.ProducersTest do
     remote = session(ctx.db, "remote", "flynn", "claude", "anthropic", "remote-host")
     remote_assignment = assignment(ctx.db, remote.session_key, "remote")
 
-    Application.put_env(:tightbeam, :hosts, %{
+    register_hosts(ctx.base_dir, %{
       "remote-host" => %{ssh: "remote", base_dir: "/remote"}
     })
 
-    on_exit(fn -> Application.delete_env(:tightbeam, :hosts) end)
     producer_config = %{tests: "printf remote > #{shell_quote(remote_marker)}", timeout_ms: 5_000}
     {_sup, runner} = start_runner(ctx, producer_config)
 
