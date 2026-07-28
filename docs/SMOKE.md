@@ -52,80 +52,31 @@ Per-harness annotations for the existing sections:
   path the Operations pointer names. PASS for codex is the agent quoting
   skill content it read on demand, not a claim of native discovery.
 
-## Preflight: credential validity (FIRST, before anything boots)
+## Preflight: harnesses are installed and logged in
 
-Dead OAuth does not fail as "auth" downstream — it masquerades (an expired
-claude grant surfaces as "Invalid value for config option model: <ref>",
-because no auth → no model catalog → every value invalid; this cost a
-diagnostic hour on 2026-07-18). So the run starts by proving every grant
-in scope is LIVE, per {harness × host}: the gateway machine and every
-satellite a leg will place sessions on.
+The smoke ASSUMES every harness it exercises is already installed and logged in
+on every host a leg will place sessions on. Onboarding is a separate activity
+with its own runbook: `docs/ONBOARDING.md`. Installing a satellite and its
+harness CLIs is `docs/SATELLITE.md`.
 
-P1. claude, per host: run the registry preflight. Its bounded authenticated
-    probe calls `GET https://api.anthropic.com/v1/models?limit=1` — the same
-    route for either credential kind, with the header that host's kind
-    requires: `Authorization: Bearer` for a subscription setup-token,
-    `x-api-key` for an API key. The kind comes from that host's
-    `credential.json`, never from a guess about the file. Repair an explicit
-    rejection ON that host with `tightbeam onboard anthropic` (subscription) or
-    `printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key`; never
-    harvest or copy a rotating Claude login, and never copy a key between
-    machines either.
-P2. codex, per host: run the registry preflight. The two kinds cannot share a
-    probe here — a ChatGPT grant is refused by the platform route (403, missing
-    scope `api.model.read`) and an API key cannot reach the account route — so
-    the probe follows the host's recorded kind:
-      subscription → `GET https://chatgpt.com/backend-api/wham/accounts/check`
-                     with the host-local ChatGPT grant and account header;
-      api key      → `GET https://api.openai.com/v1/models` with the key from
-                     `auth.json`'s own `OPENAI_API_KEY` field.
-    Login status/presence is not liveness. If the codex leg is waived for a
-    missing grant, say so here.
-P3. Rule: a preflight FAIL blocks that {harness × host} leg until fixed or
-    waived by name. After a clean preflight, any downstream auth-shaped
-    failure is a FINDING (something rotated or leaked mid-run), never
-    noise to shrug at. The result map is pinned for every preflight surface:
-    `:live` → PASS; `{:dead, reason}` → FAIL; `{:unknown, reason}` →
-    INCOMPLETE/blocker, never PASS.
-    A host whose credential store records NO kind is a preflight FAIL with its
-    own remedy: re-run onboarding so the metadata records one. It is not an
-    excuse to probe with a guessed kind — the two kinds reach different routes,
-    so a guess produces a confident answer about the wrong endpoint.
+Verify it cheaply, then get on with the run. Per `{host, harness}` in scope:
 
-### Credential kinds
+P1. **Binary present** on the PATH a NON-INTERACTIVE ssh session sees:
+    `ssh <host> <binary> --version`. A login-shell-only binary does not count.
+P2. **Credential live** — read it off the gateway's boot summary, or
+    `tightbeam list` and check that host's catalog for that harness is
+    non-empty. A live credential yields models; a dead one yields none.
 
-A host holds ONE credential per provider, of either kind, and it is host-local
-config: a satellite may run claude on an API key while the gateway runs it on a
-subscription. Each session reports its own as `display.credentialKind`
-(`"apiKey" | "subscription" | "none"`).
+FAIL FAST on either. Do not repair auth inside a smoke run, and do not infer
+liveness from a login prompt or a file's presence:
 
-    # subscription (interactive, unchanged)
-    tightbeam onboard anthropic
-    tightbeam onboard openai
+- binary missing → `docs/SATELLITE.md`
+- credential missing, dead, or kind unrecorded → `docs/ONBOARDING.md`
 
-    # API key (non-interactive; the key is read from stdin and never leaves the host)
-    printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
-    printenv OPENAI_API_KEY    | tightbeam onboard openai    --api-key
-
-`--api-key` will not read from a terminal — a key typed at a prompt lands in
-shell scrollback. The ceremony validates the key against the provider BEFORE
-banking it; a rejection names the provider, the host and the kind, and leaves
-the existing credential untouched.
-
-**UNVERIFIED CELLS.** State these in any run report that touches an api-key
-host, rather than letting a green scorecard imply more than it proved:
-
-| cell | status |
-|---|---|
-| anthropic `x-api-key` header shape | recorded live — a 401 to an invalid key names the header |
-| openai platform route accepts api keys | recorded live — 401 `invalid_api_key`, where a subscription token gets 403 naming the missing scope `api.model.read` |
-| a valid key returns 200 on either route | one-shot capture; see `priv/credential_live/CAPTURE-LEDGER.md` |
-| openai `/v1/models` response SHAPE | same capture — it drives `derive_platform_entries/1` in `harness/codex.ex` |
-| codex-acp / claude-agent-acp run a turn on api-key auth | **NOT VERIFIED, not budgeted.** Expected, not observed. |
-
-The last row is the one to say out loud. Everything above it is about reaching
-the vendor; that row is about the harness actually working, and nothing in the
-suite or the smoke proves it yet.
+A `{host, harness}` that fails preflight is either fixed before the run or
+carried as a NAMED WAIVER in the scorecard. After a clean preflight, any
+downstream auth-shaped failure is a FINDING — something rotated or leaked
+mid-run — never noise to shrug at.
 
 ## Fresh-org provisioning (what "auth seeded" actually means)
 
@@ -133,19 +84,11 @@ A fresh base_dir is NOT ready after copying files around; each item below is a
 seam with its own shape, and every one of these was rediscovered the hard way
 on 2026-07-25:
 
-- **Credentials are store rows, not loose files.** Each provider needs all
-  three: the store backing file (`auth/codex/auth.json`; claude
-  `auth/claude/oauth-token`), the home symlink
-  (`homes/<machine>/<harness>/…` → store file), and the metadata row
-  (`auth/<harness>/.tightbeam/credential.json` with `"onboarded": true` AND
-  `"kind": "subscription" | "api_key"`). The KIND is what every credential seam
-  dispatches on; a store row without one is not usable, because nothing infers
-  it from the file. The claude backing file holds whichever kind is active — a
-  full 108-char `sk-ant-oat…` setup token under a subscription, an
-  `sk-ant-api…` key under the other. That filename is historical and is NOT
-  evidence of the kind.
-  The sanctioned path is `tightbeam onboard <provider>` on the host; the
-  manual recipe above is for smoke orgs only.
+- **Credentials are store rows, not loose files** — three parts per provider,
+  and the metadata row's `kind` is what every credential seam dispatches on.
+  Copying an org's `auth/` around does not make a host logged in. See
+  `docs/ONBOARDING.md` for the layout and the only sanctioned path to create
+  it (`tightbeam onboard <provider>`, run on that host).
 - **Codex model catalog** needs nothing seeded. It is one HTTPS call the host
   makes with its own grant, filtered by the version of that host's `codex`
   binary — so a working credential and a current `codex` on PATH are the whole
