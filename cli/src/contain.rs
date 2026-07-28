@@ -1241,6 +1241,14 @@ mod tests {
     // The timeouts here are a generous CEILING, not a thing under test: the scripts finish
     // in milliseconds and the assertion is the band, so the budget only has to outlast a
     // loaded CI runner scheduling the child. 5s lost that race under parallel `cargo test`.
+    //
+    // What the ceiling has to beat, MEASURED rather than guessed (#51): the wrapper's whole
+    // turnaround on `echo pass` — fork, exec, sandbox-exec, reap, drain three pipes — is
+    // 64ms mean idle, and 132ms mean / 308ms worst at 32 spinning hogs on 16 cores. The
+    // 1s budgets this replaced were 3x that worst case, which is what produced ~2 failures
+    // in 20 runs; 30s is ~100x it. That is the difference between a budget racing the
+    // machine and a budget that only trips on a hang, and it is why the number is large
+    // and arbitrary rather than tuned — tuning it would put it back in the racing regime.
     #[test]
     fn a_write_outside_the_granted_roots_is_denied_and_leaves_nothing_behind() {
         let granted = temp_dir();
@@ -1460,16 +1468,29 @@ mod tests {
                 escaped_pid_path.display()
             ),
         );
-        // 2s, where the siblings above use 40ms, because the escape has to have HAPPENED
-        // for this test to be about anything: at 40ms the group kill can land on the child
-        // before it reaches setsid(), leaving nothing holding the reader open and a test
-        // that passes without exercising the seam. perl forks and detaches in tens of
-        // milliseconds, so this is a ceiling on the escape, and the check below is what
-        // proves the escape occurred rather than assuming it.
+        // Three quantities have to stay ordered here, and this budget sits in the middle:
+        //
+        //     escape latency  <  BUDGET  <  descendant lifetime (30s)
+        //
+        // The left side is why the siblings' 40ms will not do — at 40ms the group kill
+        // lands before perl reaches setsid(), nothing escapes to hold the reader open, and
+        // the test passes without exercising the seam. The right side is what makes the
+        // wrapper time out at all rather than returning when the pipe closes.
+        //
+        // MEASURED, through this binary with this script (#51): the escape — wrapper spawn,
+        // sandbox-exec, perl start, fork, setsid, pid write — is 84ms mean / 320ms worst
+        // idle, and 205ms mean / 1219ms WORST while the rest of the suite runs. The 2s this
+        // replaces was 1.6x that worst case, and it failed 2 runs in 20 of the full release
+        // suite: the kill beat setsid, no descendant escaped, and the pid never arrived.
+        // A budget that close to the thing it is racing is the defect #51 filed, which the
+        // band tests above escaped by moving to a ceiling three orders of magnitude clear.
+        // This one cannot go that far — it is paid in wall time, since the wrapper returns
+        // when the budget expires — so 8s buys ~6.5x over the worst observed escape while
+        // staying ~4x clear of the descendant's life.
         let status = run_with_input(
             RailExecArgs {
                 profile: permissive_profile(),
-                timeout: Duration::from_secs(2),
+                timeout: Duration::from_secs(8),
                 script: check,
             },
             b"{}\n".to_vec(),
