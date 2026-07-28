@@ -824,6 +824,103 @@ defmodule Tightbeam.EffortCheckinTest do
     assert length(prods(ctx.db, "holder")) == 1
   end
 
+  test "acceptance 6: an attest verifies the artifacts the holder recorded, and never rejects",
+       ctx do
+    register_hosts(ctx.base_dir, %{
+      "satellite" => %{ssh: "satellite.example", base_dir: "/srv/tightbeam", cli_bin: nil}
+    })
+
+    item = work_item!(ctx.db, "referent verification")
+    assignment = dispatch_for_item(ctx, {:session, "parent"}, "holder", "build it", item.id)
+
+    # One local artifact that is really there, one that is not, one on another
+    # machine, and one naming a machine this org has never heard of.
+    File.write!(Path.join(ctx.root, "report.md"), "the thing I claimed")
+    artifact!(ctx.db, "holder", item.id, "report.md")
+    artifact!(ctx.db, "holder", item.id, "vanished.md")
+    artifact!(ctx.db, "holder", item.id, "satellite:/srv/www/index.html")
+    artifact!(ctx.db, "holder", item.id, "atlantis:/srv/www/index.html")
+
+    test_pid = self()
+
+    # Only the ssh leg is faked; the local leg runs the real shell against the
+    # real filesystem, so present/absent here is a genuine write-detection.
+    reachable =
+      Map.put(ctx.config, :sh, fn invocation ->
+        if Enum.any?(invocation, &(&1 == "satellite.example")) do
+          send(test_pid, {:origin_check, invocation})
+          {"P\t/srv/www/index.html\n", 0}
+        else
+          System.cmd(hd(invocation), tl(invocation), stderr_to_stdout: true)
+        end
+      end)
+
+    %{referents: referents} =
+      assignment(%{ctx | config: reachable}, "attest", {:session, "holder"}, nil, %{
+        assignment_id: assignment.id,
+        kind: "progress",
+        note: "wired the vhost up"
+      })
+
+    by_origin = Map.new(referents, &{&1.originPath, &1})
+
+    assert by_origin["report.md"].status == "present"
+    assert by_origin["report.md"].host == Placement.local_host_name()
+    assert by_origin["vanished.md"].status == "absent"
+
+    # The remote one was checked over ssh, on its own host, in one bounded call.
+    assert by_origin["satellite:/srv/www/index.html"].status == "present"
+    assert by_origin["satellite:/srv/www/index.html"].host == "satellite"
+
+    assert_receive {:origin_check,
+                    [
+                      "ssh",
+                      "-o",
+                      "BatchMode=yes",
+                      "-o",
+                      "ConnectTimeout=5",
+                      "satellite.example"
+                      | _
+                    ]}
+
+    # An origin naming a machine the org does not have says exactly that.
+    unknown = by_origin["atlantis:/srv/www/index.html"]
+    assert unknown.status == "unverifiable"
+    assert unknown.reason =~ "atlantis"
+    assert unknown.reason =~ "not a registered host"
+
+    # The attest itself stands: filed, readable, never rejected by any of this.
+    assert [%{kind: "progress", note: "wired the vhost up"}] =
+             Assignments.__handle__(ctx.db, "attests", %{
+               verb: "attests",
+               origin: "agent:holder",
+               principal: {:session, "holder"},
+               params: %{assignment_id: assignment.id}
+             }).attests
+
+    # An unreachable host reports the CHECK's failure, and says nothing about
+    # the claim or the credential that could not reach it.
+    unreachable =
+      Map.put(ctx.config, :sh, fn invocation ->
+        if Enum.any?(invocation, &(&1 == "satellite.example")),
+          do: {"ssh: connect to host satellite.example port 22: Host is down", 255},
+          else: System.cmd(hd(invocation), tl(invocation), stderr_to_stdout: true)
+      end)
+
+    %{referents: offline} =
+      assignment(%{ctx | config: unreachable}, "attest", {:session, "holder"}, nil, %{
+        assignment_id: assignment.id,
+        kind: "progress",
+        note: "still going"
+      })
+
+    remote = Enum.find(offline, &(&1.host == "satellite"))
+    assert remote.status == "unverifiable"
+    assert remote.reason =~ "Host is down"
+    refute remote.reason =~ "credential"
+    refute remote.reason =~ "claim"
+  end
+
   test "an attest, and a work-item update, are each effect on their own", ctx do
     item = work_item!(ctx.db, "channel coverage")
 

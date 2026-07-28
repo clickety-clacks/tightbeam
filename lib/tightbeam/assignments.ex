@@ -658,11 +658,119 @@ defmodule Tightbeam.Assignments do
         best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
       end
 
-      result
+      # The claim is filed; now check what it pointed at. Verification runs
+      # AFTER the transaction and never changes it: a referent that cannot be
+      # checked is a fact about the check, not a verdict on the attest.
+      case result do
+        %{assignment: assignment} -> Map.put(result, :referents, referents(db, call, assignment))
+        _ -> result
+      end
     end
   rescue
     TransitionRace -> assignment_closed()
   end
+
+  # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
+  # "Artifacts are the referents" — an attest's referents are the artifacts the
+  # HOLDER recorded, not a separate list it declares. Each is verified by
+  # write-detection of its originPath on the host that holds it. Released and
+  # archived rows are out of custody, so their originPath means nothing and they
+  # are not checked.
+  defp referents(db, call, assignment) do
+    config = effort_config(call)
+    holder = Org.get(db, assignment.holderKey)
+
+    {sql, params} =
+      case assignment.workItemId do
+        nil ->
+          {"createdBySession = ?1", [assignment.holderKey]}
+
+        item ->
+          {"createdBySession = ?1 AND workItemId = ?2", [assignment.holderKey, item]}
+      end
+
+    case DB.query(
+           db,
+           "SELECT artifactId, originPath FROM artifacts WHERE #{sql} AND state = 'in-workspace' ORDER BY createdAt, artifactId",
+           params
+         ) do
+      {:ok, rows} -> verified_referents(config, holder, rows)
+      {:error, _reason} -> []
+    end
+  rescue
+    _ -> []
+  end
+
+  defp verified_referents(_config, nil, _rows), do: []
+  defp verified_referents(_config, _holder, []), do: []
+
+  defp verified_referents(config, holder, rows) do
+    resolved = Enum.map(rows, fn [id, origin] -> resolve_origin(config, holder, id, origin) end)
+
+    checks =
+      resolved
+      |> Enum.filter(& &1.host)
+      |> Enum.group_by(& &1.host, & &1.path)
+      |> Enum.map(fn {host, paths} ->
+        {host, Placement.check_origins(config, host, Enum.uniq(paths))}
+      end)
+      |> Map.new()
+
+    Enum.map(resolved, fn referent ->
+      status =
+        cond do
+          referent.reason -> {:error, referent.reason}
+          true -> checks[referent.host][referent.path]
+        end
+
+      %{
+        artifactId: referent.artifact_id,
+        originPath: referent.origin,
+        host: referent.host,
+        path: referent.path,
+        status: referent_status(status),
+        reason: referent_reason(status)
+      }
+    end)
+  end
+
+  # `host:/absolute/path` names a machine, exactly as commitRefs' repo does.
+  # Anything else belongs to the holder's own host: absolute as written, relative
+  # to the workdir the holder works in.
+  defp resolve_origin(config, holder, artifact_id, origin) do
+    base = %{artifact_id: artifact_id, origin: origin, host: nil, path: nil, reason: nil}
+
+    case String.split(origin, ":", parts: 2) do
+      [name, path] when path != "" ->
+        cond do
+          Path.type(path) != :absolute ->
+            %{base | host: holder.host, path: local_origin_path(config, holder, origin)}
+
+          Map.has_key?(Placement.hosts(config.base_dir), name) ->
+            %{base | host: name, path: path}
+
+          true ->
+            %{base | reason: "origin names host #{name}, which is not a registered host"}
+        end
+
+      _ ->
+        %{base | host: holder.host, path: local_origin_path(config, holder, origin)}
+    end
+  end
+
+  defp local_origin_path(config, holder, origin) do
+    if Path.type(origin) == :absolute,
+      do: origin,
+      else: Path.join(Placement.workdir_path(config, holder), origin)
+  end
+
+  defp referent_status(:present), do: "present"
+  defp referent_status(:absent), do: "absent"
+  defp referent_status(_), do: "unverifiable"
+
+  defp referent_reason({:error, reason}), do: reason
+  defp referent_reason(nil), do: "the check returned no answer for this path"
+  defp referent_reason(_), do: nil
 
   defp revoke_result(db, call) do
     with :ok <- principal_allowed(call.principal, "revoke-assignment") do

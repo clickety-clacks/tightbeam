@@ -252,6 +252,75 @@ defmodule Tightbeam.Placement do
   defp prior_stamp(_baseline), do: nil
 
   @doc """
+  Existence-check paths on the host that holds them — the write-detection half
+  of referent verification, and the same shape as the effort probe: one bounded
+  invocation per host, local or over ssh.
+
+  A host that cannot be reached reports THAT. The answer is about the check, so
+  a caller can never turn it into a statement about the claim that named the
+  path, or about the credential that failed to reach the host.
+  """
+  @spec check_origins(map(), String.t(), [String.t()]) ::
+          %{String.t() => :present | :absent | {:error, String.t()}}
+  def check_origins(_config, _host_name, []), do: %{}
+
+  def check_origins(config, host_name, paths) do
+    case hosts(config.base_dir)[host_name] do
+      nil ->
+        Map.new(paths, &{&1, {:error, "no host named #{host_name} is registered"}})
+
+      host ->
+        command = check_origins_command(paths)
+        runner = Map.get(config, :sh, &system_cmd/1)
+
+        invocation =
+          if host.ssh == nil do
+            ["sh", "-lc", command]
+          else
+            ["ssh" | @ssh_opts] ++ [host.ssh, "sh", "-lc", shell_quote(command)]
+          end
+
+        result =
+          if host.ssh == nil do
+            run_probe(runner, invocation)
+          else
+            run_bounded(runner, invocation, Map.get(config, :effort_probe_timeout_ms, 8_000))
+          end
+
+        case result do
+          {:ok, output} -> parse_origin_checks(output, paths)
+          {:error, reason} -> Map.new(paths, &{&1, {:error, reason}})
+        end
+    end
+  end
+
+  defp check_origins_command(paths) do
+    """
+    set -u
+    for p in #{Enum.map_join(paths, " ", &shell_quote/1)}; do
+      if test -e "$p"; then printf 'P\\t%s\\n' "$p"; else printf 'A\\t%s\\n' "$p"; fi
+    done
+    """
+  end
+
+  defp parse_origin_checks(output, paths) do
+    seen =
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.reduce(%{}, fn line, acc ->
+        case String.split(line, "\t", parts: 2) do
+          ["P", path] -> Map.put(acc, path, :present)
+          ["A", path] -> Map.put(acc, path, :absent)
+          _ -> acc
+        end
+      end)
+
+    Map.new(paths, fn path ->
+      {path, Map.get(seen, path, {:error, "the check returned no answer for this path"})}
+    end)
+  end
+
+  @doc """
   Record (or update) a host in the instance registry — the DUMB half of
   assimilation: the CLI ceremony prepares the machine; this writes the fact.
   Admin gating happens in the verb handler, not here. Returns the stored

@@ -795,7 +795,11 @@ defmodule Tightbeam.Gateway do
         Assignments.__handle__(
           db,
           "attest",
-          Map.put(call, :on_assignment_change, assignment_change)
+          call
+          |> Map.put(:on_assignment_change, assignment_change)
+          # Referent verification reaches hosts, so it needs the same placement
+          # config (and the same injectable runner) the effort probe uses.
+          |> Map.put(:effort_config, config)
         )
       end,
       "attests" => fn call -> Assignments.__handle__(db, "attests", call) end,
