@@ -1,10 +1,13 @@
 //! Interactive `setup` and `assimilate` ceremonies.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::args::{AssimilateArgs, Identity};
 use crate::dispatch::{self, RequestSpec};
@@ -29,6 +32,19 @@ fn staging_path(ready: &serde_json::Value) -> Result<&str, String> {
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())
 }
 
+/// How long the gateway's lease on this ceremony runs, read off the same `begin` reply as
+/// the staging path (and camelCase for the same reason).
+///
+/// The ceremony watchdog and the server-side lease must expire together, so the TTL is one
+/// fact owned by `production_config` and carried on the wire. A gateway too old to send it
+/// falls back to the CLI's own bound rather than running unbounded.
+fn lease_timeout(ready: &serde_json::Value) -> Duration {
+    ready
+        .get("leaseTtlMs")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(CEREMONY_FALLBACK_TIMEOUT, Duration::from_millis)
+}
+
 pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
@@ -46,8 +62,9 @@ pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
     let ready = dispatch::send(&begin)?
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
     let staging = staging_path(&ready)?;
+    let timeout = lease_timeout(&ready);
 
-    let interactive = run_provider_onboarding(provider, staging);
+    let interactive = run_provider_onboarding(provider, staging, timeout);
 
     if let Err(reason) = interactive {
         let _ = fs::remove_dir_all(staging);
@@ -146,10 +163,147 @@ fn unnamed_machine(because: &str) -> String {
     )
 }
 
-fn run_provider_onboarding(provider: &str, staging: &str) -> Result<(), String> {
+/// How long a ceremony may hold the terminal before the watchdog reaps it.
+///
+/// The gateway's `begin` reply carries the lease TTL it just started, so the CLI bound and
+/// the server bound are one fact with one home. This fallback covers only a gateway too old
+/// to send the field; a permanent second constant here would drift from `production_config`
+/// the first time either side is tuned.
+const CEREMONY_FALLBACK_TIMEOUT: Duration = Duration::from_secs(1_800);
+
+/// Hands the controlling terminal to a child's process group, and takes it back on drop.
+///
+/// A ceremony child must lead its OWN process group so the watchdog can signal the whole
+/// tree (`script` -> `claude` -> node) without ever signalling the CLI itself. But a new
+/// process group is a BACKGROUND group, and a background process that reads the controlling
+/// terminal is stopped with SIGTTIN. Measured under a pty before this was written:
+///
+///     NEW-PGRP CHILD:   60878 TN   sh -c read x; echo GOT-INPUT
+///     SAME-PGRP CHILD:  read succeeded, GOT-INPUT printed
+///
+/// State T. A watchdog built the obvious way parks the ceremony against the terminal --
+/// manufacturing exactly the orphan it exists to reap. Handing the terminal over is what
+/// keeps an interactive ceremony interactive.
+struct TerminalHandoff {
+    fd: libc::c_int,
+    previous: libc::pid_t,
+}
+
+impl TerminalHandoff {
+    fn to(pgid: libc::pid_t) -> Option<Self> {
+        let fd = libc::STDIN_FILENO;
+        // Not a tty (piped, or a test): there is no terminal to hand over, and
+        // tcsetpgrp would fail. The watchdog still works; nothing can SIGTTIN.
+        if unsafe { libc::isatty(fd) } != 1 {
+            return None;
+        }
+        let previous = unsafe { libc::tcgetpgrp(fd) };
+        if previous < 0 {
+            return None;
+        }
+        set_terminal_group(fd, pgid).then_some(Self { fd, previous })
+    }
+}
+
+impl Drop for TerminalHandoff {
+    fn drop(&mut self) {
+        set_terminal_group(self.fd, self.previous);
+    }
+}
+
+/// SIGTTOU is ignored across the call because the RESTORE is issued by this process after
+/// it has become a background process -- and tcsetpgrp from a background process raises
+/// SIGTTOU at itself, whose default action stops it. Without this the CLI is stopped by its
+/// own cleanup.
+fn set_terminal_group(fd: libc::c_int, pgid: libc::pid_t) -> bool {
+    unsafe {
+        let saved = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let moved = libc::tcsetpgrp(fd, pgid) == 0;
+        libc::signal(libc::SIGTTOU, saved);
+        moved
+    }
+}
+
+/// Run an interactive ceremony bounded by `timeout`, terminating its whole process group if
+/// it outlives that. `what` names the ceremony in the timeout error: "timed out" alone does
+/// not tell an operator which process was killed on their terminal.
+///
+/// codex self-limits its device-auth at 15 minutes. `claude setup-token` does not, and an
+/// abandoned one was found alive after two days against a deleted binary -- that asymmetry
+/// is why this wrapper exists rather than trusting the vendor CLIs.
+fn run_bounded(
+    mut command: ProcessCommand,
+    what: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let pgid = child.id() as libc::pid_t;
+
+    // Set it on this side too: the child may not have reached its own setpgid yet, and the
+    // terminal handoff below needs the group to exist. Both sides racing to set the same
+    // value is the standard job-control fix; the redundant call is harmless.
+    unsafe {
+        libc::setpgid(pgid, pgid);
+    }
+
+    let _terminal = TerminalHandoff::to(pgid);
+
+    // The child is in its new (background) group from the instant it execs, but the handoff
+    // above cannot happen until after spawn returns. A child that reaches a terminal read
+    // inside that window takes SIGTTIN and STOPS -- and once the terminal is its own,
+    // nothing would ever CONT it: the ceremony would hang forever holding a lease. One
+    // SIGCONT after the handoff closes the window. It is a no-op for a child that never
+    // stopped, which is the overwhelmingly common case.
+    unsafe {
+        libc::killpg(pgid, libc::SIGCONT);
+    }
+
+    let started = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+
+        if started.elapsed() >= timeout {
+            // TERM the group, give it a moment to clean up, then KILL what ignored it.
+            // These children are RUNNING, so TERM is delivered at once -- the
+            // TERM-before-CONT ordering matters only for an already-STOPped process,
+            // which is the producer fixture's case and not this one.
+            unsafe {
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+            thread::sleep(Duration::from_secs(2));
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+
+            return Err(format!(
+                "{what} did not finish within {}s; terminated it and its process group ({pgid})",
+                timeout.as_secs()
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_provider_onboarding(provider: &str, staging: &str, timeout: Duration) -> Result<(), String> {
     match provider {
-        "openai" => run_openai_onboarding(staging),
-        "anthropic" => run_anthropic_onboarding(staging),
+        "openai" => run_openai_onboarding(staging, timeout),
+        "anthropic" => run_anthropic_onboarding(staging, timeout),
         #[cfg(test)]
         "fixture-provider" => std::fs::write(
             std::path::Path::new(staging).join("fixture.json"),
@@ -228,16 +382,17 @@ fn this_host() -> String {
         .unwrap_or_else(|| "this machine".to_owned())
 }
 
-fn run_openai_onboarding(staging: &str) -> Result<(), String> {
+fn run_openai_onboarding(staging: &str, timeout: Duration) -> Result<(), String> {
     let codex = harness_cli("openai")?;
-    let status = ProcessCommand::new(&codex)
+    let mut command = ProcessCommand::new(&codex);
+    command
         .args(["login", "--device-auth"])
         .env("CODEX_HOME", staging)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|error| error.to_string())?;
+        .stderr(Stdio::inherit());
+
+    let status = run_bounded(command, "codex device-code login", timeout)?;
 
     if status.success() {
         Ok(())
@@ -283,7 +438,7 @@ fn script_args(transcript: &str, claude: &str) -> Vec<String> {
     ]
 }
 
-fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
+fn run_anthropic_onboarding(staging: &str, timeout: Duration) -> Result<(), String> {
     let claude = harness_cli("anthropic")?;
     require_on_path(
         "script",
@@ -314,13 +469,14 @@ fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
         .open(&transcript)
         .map_err(|error| error.to_string())?;
 
-    let status = ProcessCommand::new("script")
+    let mut command = ProcessCommand::new("script");
+    command
         .args(script_args(transcript_path, &claude))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|error| error.to_string())?;
+        .stderr(Stdio::inherit());
+
+    let status = run_bounded(command, "claude setup-token (under script(1))", timeout)?;
 
     // Bytes, not `read_to_string`: one invalid UTF-8 byte anywhere in a pty transcript
     // made that call fail, and `unwrap_or_default` turned the failure into an empty
@@ -792,7 +948,11 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
 
         assert_eq!(
-            run_provider_onboarding("fixture-provider", staging.to_str().unwrap()),
+            run_provider_onboarding(
+                "fixture-provider",
+                staging.to_str().unwrap(),
+                CEREMONY_FALLBACK_TIMEOUT
+            ),
             Ok(())
         );
         assert_eq!(
@@ -801,6 +961,56 @@ mod tests {
         );
 
         std::fs::remove_dir_all(staging).unwrap();
+    }
+
+    #[test]
+    fn a_ceremony_outliving_its_lease_is_killed_with_its_whole_group() {
+        // The stub forks a GRANDCHILD and records its pid, so this asserts the whole group
+        // died rather than just the process we spawned. A wrapper that killed only its
+        // direct child would leave the grandchild behind -- which is the eurisko orphan's
+        // exact shape: `script` gone, `claude setup-token` still running.
+        let marker = std::env::temp_dir().join(format!(
+            "tightbeam-ceremony-watchdog-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = ProcessCommand::new("sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    "sleep 300 & printf '%s' \"$!\" > '{}'; wait",
+                    marker.display()
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let error = run_bounded(command, "a stub ceremony", Duration::from_secs(1)).unwrap_err();
+
+        // Named, not merely "timed out": an operator has to know what was killed on their
+        // terminal.
+        assert!(error.contains("a stub ceremony"), "unnamed: {error}");
+        assert!(error.contains("process group"), "no group named: {error}");
+
+        // Absence from the process table, not elapsed time. A clock assertion under
+        // parallel test load fails toward a false PASS, which is the shape tracked in #86.
+        let grandchild = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !grandchild.is_empty(),
+            "the stub never recorded a grandchild"
+        );
+
+        let alive = ProcessCommand::new("ps")
+            .args(["-o", "pid=", "-p", grandchild.trim()])
+            .output()
+            .map(|out| !out.stdout.trim_ascii().is_empty())
+            .unwrap_or(false);
+        assert!(!alive, "grandchild {grandchild} outlived the group kill");
     }
 
     #[derive(Default)]
