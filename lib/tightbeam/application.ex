@@ -58,7 +58,7 @@ defmodule Tightbeam.Application do
       Tightbeam.Readiness.await_settled()
 
       config
-      |> Tightbeam.Readiness.summary()
+      |> Tightbeam.Readiness.summary(Tightbeam.ModelCatalog, Tightbeam.Archetypes.all())
       |> Tightbeam.Readiness.render(config)
       |> Enum.each(&Logger.info/1)
     end)

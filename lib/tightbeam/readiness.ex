@@ -86,9 +86,14 @@ defmodule Tightbeam.Readiness do
   @doc """
   Assemble the readiness of every registered harness from what boot already
   knows. `catalog` is the `ModelCatalog` server; it is read, never started.
+  `archetypes` is the loaded manifest map (`Archetypes.all/0` in production).
   """
-  @spec summary(map(), GenServer.server()) :: %{harnesses: [harness_row()], runnable?: boolean()}
-  def summary(config, catalog \\ ModelCatalog) do
+  @spec summary(map(), GenServer.server(), %{optional(String.t()) => map()}) :: %{
+          harnesses: [harness_row()],
+          runnable?: boolean(),
+          unplaceable_archetypes: [%{name: String.t(), where: [String.t()]}]
+        }
+  def summary(config, catalog \\ ModelCatalog, archetypes \\ %{}) do
     local = Placement.local_host_name()
     hosts = config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort()
 
@@ -97,7 +102,23 @@ defmodule Tightbeam.Readiness do
         harness_row(module, host, host == local, config, catalog)
       end
 
-    %{harnesses: rows, runnable?: Enum.any?(rows, & &1.runnable?)}
+    %{
+      harnesses: rows,
+      runnable?: Enum.any?(rows, & &1.runnable?),
+      unplaceable_archetypes: unplaceable_archetypes(archetypes, hosts)
+    }
+  end
+
+  # An archetype whose where names ONLY unregistered hosts can place nothing, and
+  # today it fails silently at spawn time instead of being named here (#95). A
+  # partial intersection is NOT flagged — the registered subset still places —
+  # and ["*"] places anywhere by definition.
+  defp unplaceable_archetypes(archetypes, hosts) do
+    for {name, archetype} <- Enum.sort(archetypes),
+        archetype.where != ["*"],
+        Enum.all?(archetype.where, &(&1 not in hosts)) do
+      %{name: name, where: archetype.where}
+    end
   end
 
   defp harness_row(module, host, local?, config, catalog) do
@@ -191,7 +212,7 @@ defmodule Tightbeam.Readiness do
   readiness summary that nags on every healthy boot trains people to skip it.
   """
   @spec render(%{harnesses: [harness_row()], runnable?: boolean()}, map()) :: [String.t()]
-  def render(%{runnable?: true, harnesses: rows}, _config) do
+  def render(%{runnable?: true, harnesses: rows} = summary, _config) do
     ready =
       rows
       |> Enum.filter(& &1.runnable?)
@@ -200,17 +221,35 @@ defmodule Tightbeam.Readiness do
     blocked = Enum.reject(rows, & &1.runnable?)
 
     ["READY: #{ready} can run turns."] ++
-      Enum.flat_map(blocked, &harness_lines/1)
+      Enum.flat_map(blocked, &harness_lines/1) ++
+      archetype_lines(summary)
   end
 
-  def render(%{runnable?: false, harnesses: rows}, config) do
+  def render(%{runnable?: false, harnesses: rows} = summary, config) do
     [
       "NOT READY: no harness on any host can run a turn. The gateway is",
       "serving, so clients can connect, but every turn will fail until the",
       "gaps below are closed."
     ] ++
       Enum.flat_map(rows, &harness_lines/1) ++
+      archetype_lines(summary) ++
       ["", "Diagnose further with: mix tightbeam.doctor (base_dir #{config.base_dir})"]
+  end
+
+  # `Map.get`, not a pattern: tests build summary maps by hand and a summary
+  # without the key must render as one without unplaceable archetypes.
+  defp archetype_lines(summary) do
+    case Map.get(summary, :unplaceable_archetypes, []) do
+      [] ->
+        []
+
+      unplaceable ->
+        [""] ++
+          Enum.map(unplaceable, fn %{name: name, where: where} ->
+            "archetype #{name}: no host in its where (#{Enum.join(where, ", ")}) is " <>
+              "registered — sessions cannot be placed with it"
+          end)
+    end
   end
 
   defp harness_lines(row) do

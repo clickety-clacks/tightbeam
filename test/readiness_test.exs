@@ -156,6 +156,43 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "TIGHTBEAM_DEFAULT_MODEL"
   end
 
+  test "an archetype whose where names no registered host is called out", ctx do
+    catalog = catalog!(%{})
+
+    archetypes = %{
+      "default" => %{name: "default", where: ["testhost"]},
+      "recon" => %{name: "recon", where: ["eezo", "racter"]}
+    }
+
+    lines =
+      ctx.config
+      |> Readiness.summary(catalog, archetypes)
+      |> Readiness.render(ctx.config)
+
+    line = Enum.find(lines, &(&1 =~ "archetype recon"))
+    assert line, "the dangling archetype must be named"
+    assert line =~ "eezo"
+    assert line =~ "racter"
+    assert line =~ "cannot be placed"
+    refute Enum.any?(lines, &(&1 =~ "archetype default"))
+  end
+
+  test "a partial intersection and an anywhere grant are NOT flagged", ctx do
+    # Both can still place: the registered subset serves the first, and ["*"]
+    # places anywhere by definition. Flagging either would nag on healthy orgs.
+    catalog = catalog!(%{})
+
+    archetypes = %{
+      "mixed" => %{name: "mixed", where: ["testhost", "eezo"]},
+      "roamer" => %{name: "roamer", where: ["*"]}
+    }
+
+    summary = Readiness.summary(ctx.config, catalog, archetypes)
+    assert summary.unplaceable_archetypes == []
+
+    refute summary |> Readiness.render(ctx.config) |> Enum.any?(&(&1 =~ "archetype"))
+  end
+
   ## Doctor's lesson: unverifiable is not failed
 
   test "a credential boot could not look at is UNKNOWN, never asserted dead", ctx do
