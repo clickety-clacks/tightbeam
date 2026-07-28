@@ -160,8 +160,77 @@ fn run_provider_onboarding(provider: &str, staging: &str) -> Result<(), String> 
     }
 }
 
+/// The vendor binary a provider's ceremony invokes, checked to be reachable first.
+///
+/// Both legs used to discover this the hard way. openai exec'd `codex` and surfaced the
+/// raw `No such file or directory (os error 2)`, naming nothing. anthropic ran `claude`
+/// under script(1), which on linux exits 0 regardless of its child, so a missing claude
+/// produced an empty transcript and the message blamed token parsing for a
+/// `command not found` that had leaked past incidentally.
+///
+/// The NAME comes from the harness projection's `cli_binary`, the same field
+/// assimilate's probe uses, so a renamed vendor binary follows the catalog rather than
+/// this file -- and the name checked here is the name exec'd below, so the two cannot
+/// drift apart. The provider-to-harness pairing is not in the projection, so it lives
+/// here; it is the pairing `Harness.credential_provider/0` states on the Elixir side.
+/// When the catalog cannot be reached the harness's own name is used, which is what both
+/// binaries are called today.
+fn harness_cli(provider: &str) -> Result<String, String> {
+    let harness = match provider {
+        "openai" => "codex",
+        "anthropic" => "claude",
+        _ => return Err(format!("unsupported provider: {provider}")),
+    };
+    let binary = crate::harnesses::load_optional()
+        .and_then(|catalog| {
+            catalog
+                .harnesses
+                .iter()
+                .find(|projection| projection.wire_name == harness)
+                .map(|projection| projection.cli_binary.clone())
+        })
+        .unwrap_or_else(|| harness.to_owned());
+
+    let search_path = search_path();
+    require_on_path(
+        &binary,
+        &search_path,
+        &preflight::missing_harness_cli(&binary, harness, &this_host(), &search_path),
+    )?;
+    Ok(binary)
+}
+
+/// The search path is passed in rather than read here, so the check is exercisable
+/// without mutating the process environment -- and so a test cannot pass merely because
+/// the developer's own machine happens to have the vendor CLI installed.
+fn require_on_path(binary: &str, search_path: &str, absent: &str) -> Result<(), String> {
+    match preflight::on_path(binary, search_path) {
+        Some(_) => Ok(()),
+        None => Err(absent.to_owned()),
+    }
+}
+
+fn search_path() -> String {
+    std::env::var("PATH").unwrap_or_default()
+}
+
+/// This machine, for a message an operator reads. Not the registered host name -- the
+/// refusal is about a PATH on the box in front of them, so its own idea of its name is
+/// the useful one.
+fn this_host() -> String {
+    ProcessCommand::new("uname")
+        .arg("-n")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "this machine".to_owned())
+}
+
 fn run_openai_onboarding(staging: &str) -> Result<(), String> {
-    let status = ProcessCommand::new("codex")
+    let codex = harness_cli("openai")?;
+    let status = ProcessCommand::new(&codex)
         .args(["login", "--device-auth"])
         .env("CODEX_HOME", staging)
         .stdin(Stdio::inherit())
@@ -195,26 +264,39 @@ fn run_openai_onboarding(staging: &str) -> Result<(), String> {
 /// Dispatched at COMPILE time, like the containment seam: a platform with no named
 /// form fails to build rather than failing at a customer's terminal.
 #[cfg(target_os = "macos")]
-fn script_args(transcript: &str) -> Vec<String> {
+fn script_args(transcript: &str, claude: &str) -> Vec<String> {
     vec![
         "-q".to_owned(),
         transcript.to_owned(),
-        "claude".to_owned(),
+        claude.to_owned(),
         "setup-token".to_owned(),
     ]
 }
 
 #[cfg(target_os = "linux")]
-fn script_args(transcript: &str) -> Vec<String> {
+fn script_args(transcript: &str, claude: &str) -> Vec<String> {
     vec![
         "-q".to_owned(),
         "-c".to_owned(),
-        "claude setup-token".to_owned(),
+        format!("{claude} setup-token"),
         transcript.to_owned(),
     ]
 }
 
 fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
+    let claude = harness_cli("anthropic")?;
+    require_on_path(
+        "script",
+        &search_path(),
+        &preflight::missing_system_tool(
+            "script",
+            "`claude setup-token` refuses to run without a TTY, so onboarding runs it under \
+             script(1) and reads the token off the transcript.",
+            &this_host(),
+            &search_path(),
+        ),
+    )?;
+
     let transcript = PathBuf::from(staging).join("setup-token.log");
     let transcript_path = transcript
         .to_str()
@@ -233,7 +315,7 @@ fn run_anthropic_onboarding(staging: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     let status = ProcessCommand::new("script")
-        .args(script_args(transcript_path))
+        .args(script_args(transcript_path, &claude))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1134,12 +1216,15 @@ mod tests {
     /// BSD one made Anthropic onboarding impossible on every Linux host. Each arm is
     /// asserted on its own platform, so the CI matrix proves both rather than proving
     /// whichever one the developer happens to be sitting on.
+    /// The binary is passed in rather than baked in, so the name checked for on PATH is
+    /// the name actually run. `renamed-claude` is used here for exactly that reason: a
+    /// literal would let the two drift apart without any test noticing.
     #[test]
     #[cfg(target_os = "macos")]
     fn script_args_use_the_bsd_form_on_macos() {
         assert_eq!(
-            script_args("/tmp/t.log"),
-            vec!["-q", "/tmp/t.log", "claude", "setup-token"]
+            script_args("/tmp/t.log", "renamed-claude"),
+            vec!["-q", "/tmp/t.log", "renamed-claude", "setup-token"]
         );
     }
 
@@ -1149,8 +1234,8 @@ mod tests {
         // util-linux takes the command via -c and allows at most one file argument;
         // trailing args are "unexpected number of arguments" and exit 1.
         assert_eq!(
-            script_args("/tmp/t.log"),
-            vec!["-q", "-c", "claude setup-token", "/tmp/t.log"]
+            script_args("/tmp/t.log", "renamed-claude"),
+            vec!["-q", "-c", "renamed-claude setup-token", "/tmp/t.log"]
         );
     }
 
@@ -1226,5 +1311,80 @@ mod tests {
             assert!(reason.contains("REGISTERED"), "{reason}");
             assert!(reason.contains("onboard ITSELF"), "{reason}");
         }
+    }
+
+    /// Both legs failed on a missing harness CLI and neither said so: openai surfaced a
+    /// bare `No such file or directory (os error 2)`, and anthropic reported that the
+    /// setup-token "was not captured" -- blaming token parsing for a `command not found`.
+    /// Now each names the binary, this host, the PATH it searched, and the repair.
+    #[test]
+    fn both_onboarding_legs_refuse_by_name_when_the_harness_cli_is_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-absent-harness-cli-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let empty = root.display().to_string();
+
+        for (binary, harness) in [("codex", "codex"), ("claude", "claude")] {
+            let reason = require_on_path(
+                binary,
+                &empty,
+                &preflight::missing_harness_cli(binary, harness, "eurisko", &empty),
+            )
+            .unwrap_err();
+            assert!(reason.contains(binary), "{reason}");
+            assert!(reason.contains("eurisko"), "{reason}");
+            assert!(
+                reason.contains(&empty),
+                "the PATH searched must be shown: {reason}"
+            );
+            assert!(
+                reason.contains(&format!("Install {binary} on eurisko and re-run")),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("os error 2") && !reason.contains("not captured"),
+                "neither old message may survive: {reason}"
+            );
+        }
+
+        // script(1) is not a vendor CLI, so it says why onboarding needs it rather than
+        // whose job the software is.
+        let reason = preflight::missing_system_tool(
+            "script",
+            "`claude setup-token` refuses to run without a TTY.",
+            "eurisko",
+            &empty,
+        );
+        assert!(reason.contains("without a TTY"), "{reason}");
+        assert!(!reason.contains("vendors' software"), "{reason}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The binary comes from the projection, so a renamed vendor CLI follows the catalog.
+    /// The test catalog names it `claude`, which is also the fallback -- so this asserts
+    /// the lookup path exists rather than that the two happen to agree.
+    #[test]
+    fn the_harness_cli_name_comes_from_the_projection() {
+        let catalog = crate::harnesses::catalog().unwrap();
+        for (provider, harness) in [("openai", "codex"), ("anthropic", "claude")] {
+            let projected = catalog
+                .harnesses
+                .iter()
+                .find(|projection| projection.wire_name == harness)
+                .map(|projection| projection.cli_binary.clone());
+            assert_eq!(
+                projected,
+                Some(harness.to_owned()),
+                "{provider}: the projection must state {harness}'s CLI binary"
+            );
+        }
+        assert_eq!(
+            harness_cli("nonesuch"),
+            Err("unsupported provider: nonesuch".to_owned())
+        );
     }
 }

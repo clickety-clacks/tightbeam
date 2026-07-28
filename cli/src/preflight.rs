@@ -12,6 +12,10 @@
 //! read by counting stdout lines, so it guessed which tool was missing and could not
 //! see a third one at all.
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
 use crate::harnesses::HarnessCatalog;
 
 const RUNTIME_BINARIES: [&str; 3] = ["node", "npm", "rsync"];
@@ -153,6 +157,48 @@ pub fn report(observation: &Observation) -> Vec<String> {
     lines
 }
 
+/// Resolve `binary` against a PATH, the way execvp will.
+///
+/// Shared with the onboarding ceremonies: `assimilate` asks this question of a satellite
+/// over ssh, `onboard` asks it of the machine the operator is sitting at, and both should
+/// answer it the same way.
+pub fn on_path(binary: &str, search_path: &str) -> Option<PathBuf> {
+    search_path
+        .split(':')
+        .filter(|directory| !directory.is_empty())
+        .map(|directory| Path::new(directory).join(binary))
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// The same refusal as `verdict`, for a harness CLI missing on THIS machine.
+///
+/// An onboarding ceremony runs where the operator is, so the PATH that matters is this
+/// process's rather than a non-interactive ssh session's -- but the rest of the prose is
+/// deliberately the satellite wording. An operator who has read one of these should
+/// recognise the other, and both refusals are about the same boundary: Tight Beam
+/// installs its own plumbing, never the vendors' software.
+pub fn missing_harness_cli(binary: &str, harness: &str, host: &str, search_path: &str) -> String {
+    format!(
+        "{binary} is missing on {host}: it is not on this shell's PATH. It is the CLI \
+         harness {harness} invokes directly, and onboarding {harness} on this host \
+         presupposes it -- Tight Beam installs its own plumbing (adapters, CLI, base dir) \
+         and never the vendors' software. Install {binary} on {host} and re-run.\n\
+         PATH searched: {search_path}"
+    )
+}
+
+/// The same shape for a tool that is neither ours nor a vendor's harness.
+pub fn missing_system_tool(binary: &str, purpose: &str, host: &str, search_path: &str) -> String {
+    format!(
+        "{binary} is missing on {host}: it is not on this shell's PATH. {purpose} Install \
+         {binary} on {host} and re-run.\nPATH searched: {search_path}"
+    )
+}
+
 pub fn verdict(
     requirements: &[Requirement],
     observation: &Observation,
@@ -205,6 +251,7 @@ pub fn verdict(
 mod tests {
     use super::*;
     use crate::harnesses::HarnessProjection;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn catalog() -> HarnessCatalog {
         HarnessCatalog {
@@ -339,5 +386,59 @@ mod tests {
         assert_eq!(lines[1], "  node: /usr/bin/node");
         assert_eq!(lines[2], "  npm: MISSING");
         assert_eq!(lines[3], "  base dir: absent (would be created)");
+    }
+
+    /// Both refusals name the binary, the host, and the repair, and both say whose job
+    /// the vendor's software is -- the point of sharing the prose with `verdict`.
+    #[test]
+    fn a_local_refusal_names_the_binary_the_host_the_path_and_the_repair() {
+        let reason = missing_harness_cli("claude", "claude", "eurisko", "/usr/bin:/bin");
+        assert!(
+            reason.starts_with("claude is missing on eurisko"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("harness claude invokes directly"),
+            "{reason}"
+        );
+        assert!(reason.contains("never the vendors' software"), "{reason}");
+        assert!(
+            reason.contains("Install claude on eurisko and re-run"),
+            "{reason}"
+        );
+        assert!(reason.contains("PATH searched: /usr/bin:/bin"), "{reason}");
+    }
+
+    #[test]
+    fn on_path_finds_only_executables_and_reports_where_it_looked() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-on-path-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("runnable"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(bin.join("runnable"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(bin.join("not-runnable"), "data").unwrap();
+        fs::set_permissions(
+            bin.join("not-runnable"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let path = bin.display().to_string();
+        assert_eq!(on_path("runnable", &path), Some(bin.join("runnable")));
+        assert_eq!(
+            on_path("not-runnable", &path),
+            None,
+            "a readable file that cannot be executed is not on PATH for exec purposes"
+        );
+        assert_eq!(on_path("absent", &path), None);
+        // An empty PATH entry must not be read as the current directory.
+        assert_eq!(on_path("runnable", ""), None);
+        fs::remove_dir_all(root).unwrap();
     }
 }
