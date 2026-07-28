@@ -333,10 +333,20 @@ the tool call, with the statute text delivered only as the denial reason.
     projected home's `hooks.json` and restart the adapter.
     PASS: the adapter REFUSES to boot with `gate_attestation_failed`, and no
     codex session is served. Restore by changing MANIFEST BYTES: edit a
-    statute, or delete the home's `.tightbeam/manifest` stamp, then restart
-    so ownership-scoped regeneration rewrites `hooks.json`. Confirm the
-    home's `sessions/`, history, transcripts, and memory remain byte-identical.
+    statute, or delete the home's `.tightbeam/manifest` stamp, then **spawn a
+    session** — regeneration is ownership-scoped to projection, which happens at
+    SPAWN, not at gateway restart. A restart alone does not rewrite `hooks.json`,
+    and waiting for one to leaves the adapter looping on `wiring-check FAIL`.
+    Then confirm regeneration is real rather than cached: the rewritten
+    `hooks.json` must carry the edited statute's current text.
     This demonstrates silent-misconfig detection, NOT tamper resistance.
+
+    Do NOT assert that `sessions/`, history, transcripts and memory stay
+    byte-identical while the gateway is up. A failed attestation is a RETRY
+    LOOP, and every failed boot writes durable state — rollouts accumulate and
+    the sqlite files change, so the comparison is unevaluable, not failing. If
+    you want it, stop the gateway first and compare against a snapshot taken
+    while it was already stopped.
 21. [manual] Negative control: an adjacent, allowed command of the same tool
     (`git log`, `git diff`) runs without any refusal text appearing.
     PASS: normal output, no `[gate: ...]` anywhere.
