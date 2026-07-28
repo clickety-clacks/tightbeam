@@ -2901,7 +2901,21 @@ defmodule Tightbeam.Gateway do
             module = Harness.parse!(harness)
             harness_atom = module.id()
 
-            model = p[:model] || config.default_model
+            # Composed against the NEW harness, exactly as `set_model` composes against
+            # the current one. A picker offers base refs -- `setModel.options` and
+            # `modelCatalog.models` both advertise one row per model, deliberately, with
+            # the effort tier owned by the reasoning picker -- but the catalog only ever
+            # holds an effort-bearing model as `id[effort]`. So the value a client is
+            # told to send was refused here as "not offered by <harness> on <host>",
+            # while the same value through `set_model` was accepted. The advertised
+            # shape was never wrong; this path just never learned to compose (#69).
+            model =
+              compose_model_selection(
+                session.host,
+                harness,
+                session.model,
+                p[:model] || config.default_model
+              )
 
             with :ok <- validate_credential(config, harness, session.host),
                  :ok <-

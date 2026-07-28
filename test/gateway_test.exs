@@ -3639,6 +3639,51 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k1") == before
   end
 
+  # The value a client is TOLD to send must be a value this accepts. `setModel.options`
+  # and `modelCatalog.models` advertise one row per model with a base ref, deliberately
+  # — the effort tier belongs to the reasoning picker — while the catalog only holds an
+  # effort-bearing model as `id[effort]`. `set_model` composes the two and has since
+  # cbc8d2e; `set_harness` did not, so the same bare id round-tripped through one verb
+  # and was refused by the other as "not offered by codex on testhost" (#69).
+  test "set_harness accepts the bare model id the picker advertises", ctx do
+    base_dir = role_test_base("harness-bare-model")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.load!(base_dir)
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    start_supervised!(%{
+      id: :harness_bare_model_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    assert %{ok: true, harness: "codex"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+             })
+
+    # Composed, not passed through: the tier is real information and the session must
+    # end up on a ref the catalog actually offers.
+    assert Org.get(ctx.db, "k1").model == "gpt-5.6-sol[medium]"
+
+    # And the value under test is one the picker really does advertise for this
+    # session, so the case cannot keep passing if the advertised shape drifts. Read
+    # after the swap, because that is when the picker is offering codex's models.
+    advertised =
+      Gateway.session_status("k1", ctx.db).capabilities.setModel.options
+      |> Enum.map(& &1.value)
+
+    assert "gpt-5.6-sol" in advertised
+    refute Enum.any?(advertised, &String.contains?(&1, "["))
+  end
+
   test "set_harness keeps an overridden identity name and projects the new harness home", ctx do
     base_dir = role_test_base("harness-override")
     codex_auth = Path.join([base_dir, "auth", "codex"])
