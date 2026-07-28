@@ -253,6 +253,70 @@ defmodule Tightbeam.IdentityTest do
     refute File.exists?(Path.join(ctx.base, "identity/skills/role-skill"))
   end
 
+  # A host with NO git identity anywhere: no global config, no system config, and
+  # nothing in the environment. That is a fresh satellite, and it is where #58 was
+  # found -- `relearn!` reported a phantom `{:conflict, []}` because git refused the
+  # merge commit for want of a committer and the empty conflict list was read as one.
+  # Nothing proved that fix, so CI could not have caught it coming back.
+  #
+  # Both write paths are covered, because both supply their own committer and both
+  # are reachable on such a host: `edit!` was observed on shrdlu committing cleanly
+  # as `user:flynn <user-flynn@tightbeam.local>` with no host identity present, and
+  # that observation was the only evidence it worked.
+  test "relearn and edit both commit on a host with no git identity at all", ctx do
+    # `useConfigOnly` is what makes this a real bare host rather than a tidied one.
+    # Emptying the config is not enough: git falls back to GUESSING an identity from
+    # the passwd entry and the hostname, so a machine with no configured identity
+    # still commits -- as "Mike Manzano <mike@eezo…>" here. That fallback is what
+    # made this environment untestable by simply clearing config, and it is off on
+    # a fresh satellite, where the commit genuinely has nowhere to get a committer.
+    bare_config = Path.join(ctx.root, "bare-gitconfig")
+    File.write!(bare_config, "[user]\n\tuseConfigOnly = true\n")
+
+    System.put_env("GIT_CONFIG_GLOBAL", bare_config)
+    System.put_env("GIT_CONFIG_SYSTEM", bare_config)
+
+    for key <- ~w(GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL) do
+      System.delete_env(key)
+    end
+
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+
+    # The environment really is bare: git itself cannot commit here unaided, so a
+    # pass below is the substrate supplying an identity rather than one leaking in
+    # from the developer's machine.
+    File.write!(Path.join(dir, "scratch.md"), "probe")
+    {_, 0} = System.cmd("git", ["-C", dir, "add", "scratch.md"], stderr_to_stdout: true)
+
+    {output, status} =
+      System.cmd("git", ["-C", dir, "commit", "-m", "unaided"], stderr_to_stdout: true)
+
+    # STAGED first, so this fails for want of a committer and not for want of a
+    # change. An unstaged probe exits non-zero with "nothing to commit", which would
+    # make this precondition pass on any machine and prove nothing at all.
+    assert status != 0
+    assert output =~ "user.useConfigOnly" or output =~ "tell me who you are"
+
+    {_, 0} = System.cmd("git", ["-C", dir, "reset", "scratch.md"], stderr_to_stdout: true)
+    File.rm!(Path.join(dir, "scratch.md"))
+
+    assert Identity.edit!(ctx.base, "coder", :guidance, "no-identity-edit", "user:flynn")
+
+    assert git!(dir, ["log", "-1", "--format=%an <%ae>", "main"]) ==
+             "user:flynn <user-flynn@tightbeam.local>"
+
+    File.write!(Path.join(ctx.source, "guidance/new.md"), "new-source")
+
+    assert {:ok, revision} = Identity.relearn!(ctx.base, "relearn operator")
+    assert revision == Identity.live_revision!(ctx.base)
+
+    assert git!(dir, ["log", "-1", "--format=%an <%ae>"]) ==
+             "relearn operator <relearn-operator@tightbeam.local>"
+
+    assert File.read!(Path.join(dir, "guidance/coder.md")) == "no-identity-edit"
+  end
+
   test "dirty and conflicted relearns never move live", ctx do
     Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
