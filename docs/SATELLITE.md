@@ -2,9 +2,8 @@
 
 > **This page explains what a satellite is and what its operator must do by hand.
 > To bring one up and prove it, run `docs/ASSIMILATION-E2E.md`** — that is the
-> golden path and the scored one. The manual host declaration below predates the
-> `assimilate` verb; see that runbook's Q4 for the open question about which host
-> registration route wins when both are used.
+> golden path and the scored one. `tightbeam assimilate` is the only way to register
+> a host; there is no manual declaration.
 
 A satellite is a machine where agent *harnesses* run while the substrate,
 ledger, and stores stay on the gateway host (spec §Placement). There is no
@@ -24,9 +23,13 @@ catalog on its own host, and a spawn is refused when the catalog is missing (see
 2. **Credentials** — run Tight Beam onboarding independently on this
    machine: `tightbeam onboard openai` for Codex device-code, and
    `tightbeam onboard anthropic` for Claude setup-token. Never copy,
-   harvest, scp, or rsync credentials between machines. In an operator
-   shell, set `TIGHTBEAM_MACHINE` to this host's registered name alongside
-   the gateway discovery variables; agent shells receive it automatically.
+   harvest, scp, or rsync credentials between machines. Gateway discovery
+   needs no operator env — step 4's file supplies it. An operator shell must
+   still export `TIGHTBEAM_MACHINE=<this host's registered name>`: the gateway
+   defaults an unnamed onboarding machine to its OWN hostname, so without it
+   the ceremony stages credentials on the gateway while the provider CLI writes
+   them here. That name is in the provisioned file, and the CLI will read it
+   from there (#84); agent shells receive it automatically today.
 3. **Runtime + adapters** — install node and the ACP adapter packages
    (`@agentclientprotocol/claude-agent-acp`, `codex-acp`) at a path of your
    choosing. Also install `rsync` (standard on macOS/Linux).
@@ -38,28 +41,45 @@ catalog on its own host, and a spawn is refused when the catalog is missing (see
    them and cannot stand in for them. A host without them assimilates fine and
    then cannot run anything, failing at the onboarding ceremony with a bare
    `command not found`. Assimilate does not yet check for them (#76).
-4. **Agent CLI** — put a `tightbeam` executable on a path of your choosing
-   (the reference CLI is `node <checkout>/dist/cli/main.js`; a shim script
-   suffices). Agents on this host reach the gateway via the TIGHTBEAM_URL /
-   TIGHTBEAM_TOKEN env the gateway injects — no gateway.json needed here.
+5. **Agent CLI** — `assimilate` ships the `tightbeam` binary into
+   `<base_dir>/bin`. Agents on this host reach the gateway through the
+   TIGHTBEAM_URL / TIGHTBEAM_TOKEN env the gateway injects into every adapter
+   launch, carrying that session's own token; they need nothing on disk. An
+   **operator** shell has no session and no injected env, so the gateway writes
+   `<base_dir>/gateway.json` here — `{"url": "<advertised url>", "cliToken":
+   "<org token>", "machine": "<this host's registered name>"}`, mode 0600 — and
+   that file is what makes step 2's
+   `tightbeam onboard` work on this machine. It names the advertised url; the
+   gateway host's own gateway.json carries a port instead, and 127.0.0.1 is
+   correct only there. It is written at `register-host` (assimilation's last
+   step) and re-written for every registered host at gateway boot, so a rotated
+   org token or a host assimilated by an older build heals with a restart, not a
+   ceremony. Note what it holds: the ORG token, which is broader than the
+   per-session token the gateway injects into agents here.
 
 ## On the gateway host (config)
 
-Declare the host and how to reach it (name is yours; "local" is reserved):
+One variable, and it is required before any remote host is registered:
 
 ```sh
 export TIGHTBEAM_ADVERTISED_URL="http://<gateway-tailnet-addr>:<port>"
-export TIGHTBEAM_HOSTS='{
-  "work-1": {
-    "ssh": "work-1",
-    "base_dir": "/Users/you/.tightbeam",
-    "cli_bin": "/Users/you/.tightbeam/bin"
-  }
-}'
 ```
 
-`ssh` is anything your ssh config resolves. `advertised_url` must be
-reachable FROM the satellite (never 127.0.0.1).
+It must be reachable **from the satellite** — never `127.0.0.1`. A satellite's
+adapters and its operator CLI both reach the gateway by this address, so
+registering a remote host without it fails at registration rather than at first
+turn.
+
+Hosts are **not** declared by hand. `tightbeam assimilate <ssh-dest> --name <name>`
+probes the machine, installs Tight Beam's plumbing, and records the host in
+`<base_dir>/hosts.json` — the one registry. The name is yours; `local` is
+reserved, and the gateway's own machine is always present under its real hostname.
+Run `docs/ASSIMILATION-E2E.md` for the full procedure.
+
+A `TIGHTBEAM_HOSTS` env var used to be the way to declare a host. It was **removed**
+in `8c0dfa0`: it layered a second store over the registry and won on collision, so
+a stale entry silently overrode what assimilate had just written and the gateway
+dialled a destination it had never installed to. Nothing reads it now.
 
 ## Allow and use it
 

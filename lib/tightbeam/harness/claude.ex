@@ -106,11 +106,15 @@ defmodule Tightbeam.Harness.Claude do
   def install_package, do: "@agentclientprotocol/claude-agent-acp"
 
   @impl true
+  def cli_binary, do: "claude"
+
+  @impl true
   def wire_projection do
     JSON.encode!(%{
       "id" => "claude",
       "wire_name" => wire_name(),
       "install_package" => install_package(),
+      "cli_binary" => cli_binary(),
       "process_markers" => ["claude-agent-acp"]
     })
   end
@@ -259,7 +263,7 @@ defmodule Tightbeam.Harness.Claude do
   @impl true
   def probe_cli(target) do
     find = Map.get(target, :find_executable, &System.find_executable/1)
-    Support.bounded_probe(find.("claude"), target)
+    Support.bounded_probe(find.(cli_binary()), target)
   end
 
   @impl true
@@ -496,6 +500,7 @@ defmodule Tightbeam.Harness.Claude do
         "id" => "claude",
         "wire_name" => "claude",
         "install_package" => "@agentclientprotocol/claude-agent-acp",
+        "cli_binary" => "claude",
         "process_markers" => ["claude-agent-acp"]
       }
     })

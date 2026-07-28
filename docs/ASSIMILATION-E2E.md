@@ -25,10 +25,11 @@ of:
    `codex` — on that same non-login PATH. These are an operator prerequisite,
    not something assimilation provides: Tight Beam installs its own plumbing on
    a satellite, never the vendors' software. Onboarding and turns invoke these
-   binaries directly; the ACP adapters wrap them and cannot substitute. A host
-   missing one assimilates cleanly and then fails at the ceremony with a bare
-   `command not found` (#76, #78). **Check this yourself before starting** —
-   assimilate does not, and `--dry-run` will not tell you (see §2).
+   binaries directly; the ACP adapters wrap them and cannot substitute.
+   Assimilation probes for them and refuses a host that is missing one, naming
+   the binary and the host (#76) — but it will never install them, so a refusal
+   is yours to fix on the target. `--dry-run` (§2) asks the same question
+   without writing anything.
 3. **Reaches the gateway's advertised URL.** `TIGHTBEAM_ADVERTISED_URL` must be
    resolvable *from the satellite*, never `127.0.0.1`.
 4. **Is approved for this use**, and is either unassimilated or has been returned
@@ -78,12 +79,9 @@ that have nothing to do with creation.
 tightbeam assimilate <ssh-dest> --name <host-name> --dry-run --as-user <admin>
 ```
 
-> **This step cannot currently be trusted (#73).** `--dry-run` prints the probe
-> command and then reports `ok` unconditionally — the ssh never runs. So it cannot
-> fail, cannot name a missing prerequisite, and reports the base dir and bin paths
-> from configuration rather than observation. **Verify §Host-selection by hand**
-> until #73 lands. The PASS condition below is what the step must become, not what
-> it does.
+The probe is the one step a dry run performs rather than prints: it runs over the
+same non-interactive ssh the real run uses, and writes nothing. Every step that
+writes stays a `DRY` line.
 
 PASS: reports the probe results — ssh reachable, `node`/`npm`/`rsync` present, the
 harness CLI of every harness being enabled present (§Host-selection 2b), and the
@@ -93,7 +91,7 @@ resolved base dir and bin paths — all **observed**, and **writes nothing**. Re
 FAIL: any missing prerequisite is named, with the host and the fact that it is the
 operator's to install. Fix it on the host and re-probe. A `--dry-run` that reports
 success and then a real run that fails on the same prerequisite is a FINDING, not a
-retry — and today that is guaranteed rather than possible.
+retry.
 
 ## 3. Assimilate
 
@@ -116,13 +114,13 @@ PASS, all of:
   does not carry credentials. Verify the gateway's own `auth/` files are unchanged
   by hash, and that the satellite has no credential it did not already have.
 
-> **OPEN QUESTION (Q4), flagged rather than invented.** Host configuration has two
-> sources: `TIGHTBEAM_HOSTS` (read at `config/runtime.exs:67`) and
-> `Placement.register_host/3` as written by `assimilate`/`register-host`. This
-> runbook assumes `assimilate` is the golden path and the env var is the older
-> manual route. Whether they merge, which wins on conflict, and whether a host
-> registered one way is visible to the other is **not yet ruled**. Until it is, do
-> not declare the same host both ways in one run, and record which route you used.
+There is exactly one host registry: `<base_dir>/hosts.json`, written only by
+`Placement.register_host/3` — which is what `assimilate`'s last step records
+through — and read by `Placement.hosts/1`, which adds the gateway's own machine.
+A `TIGHTBEAM_HOSTS` env var used to layer a second store on top and win on
+collision, so a stale entry silently overrode what assimilate had just written and
+the gateway then dialled a different destination than the one it reported
+installing. It was removed in `8c0dfa0`; assimilate is the only route.
 
 ## 4. Credentials — onboarded ON the satellite, never transported
 

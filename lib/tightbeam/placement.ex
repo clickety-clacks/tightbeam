@@ -255,6 +255,82 @@ defmodule Tightbeam.Placement do
     {:ok, entry}
   end
 
+  @doc """
+  Write the OPERATOR endpoint file on a satellite: `gateway.json` in the host's
+  remote base_dir, mode 0600, naming the gateway's advertised url, the org
+  token, and this host's registered name.
+
+  Every agent the gateway launches on a satellite is handed a per-SESSION token
+  in its workdir's `.tightbeam-session`. An operator shell has no session and no
+  workdir, so `tightbeam onboard` — a three-phase conversation with the gateway,
+  which must run ON the host whose credentials it banks — had no url and no
+  token at all and died reading a file assimilation never wrote. This is that
+  file. It names the ADVERTISED url: the gateway host's own gateway.json carries
+  a port, and 127.0.0.1 is correct there and nowhere else.
+
+  Content is staged locally at 0600 and rsynced, never interpolated into an ssh
+  command line, so the org token never appears in a remote process table. The
+  local host is skipped — `hosts/1` shadows its registry entry, and the gateway
+  writes its own gateway.json at boot.
+  """
+  @spec provision_endpoint(String.t(), String.t(), host_config(), keyword()) ::
+          :ok | {:error, :advertised_url_missing | :cli_token_missing}
+  def provision_endpoint(base_dir, name, host, opts \\ [])
+
+  def provision_endpoint(_base_dir, _name, %{ssh: nil}, _opts), do: :ok
+
+  def provision_endpoint(base_dir, name, %{ssh: dest} = host, opts) do
+    url = Keyword.get(opts, :url) || Application.get_env(:tightbeam, :advertised_url)
+    token = Keyword.get(opts, :token) || org_cli_token(base_dir)
+
+    cond do
+      name == local_host_name() -> :ok
+      url in [nil, ""] -> {:error, :advertised_url_missing}
+      token in [nil, ""] -> {:error, :cli_token_missing}
+      true -> write_endpoint(base_dir, name, dest, host.base_dir, url, token, opts)
+    end
+  end
+
+  defp org_cli_token(base_dir) do
+    with {:ok, encoded} <- File.read(Path.join(base_dir, "gateway.json")),
+         {:ok, %{"cliToken" => token}} <- JSON.decode(encoded),
+         true <- is_binary(token) do
+      token
+    else
+      _ -> nil
+    end
+  end
+
+  defp write_endpoint(base_dir, name, dest, remote_base_dir, url, token, opts) do
+    sh = Keyword.get(opts, :sh, &system_cmd/1)
+    stage = Path.join([base_dir, "staging", "gateway-files", name])
+    stage_file = Path.join(stage, "gateway.json")
+    File.mkdir_p!(stage)
+
+    try do
+      # `machine` is this host's REGISTERED name. An operator ceremony run here
+      # acts on this machine, and the gateway defaults an unnamed one to its own
+      # hostname — so onboarding a satellite without it stages credentials into
+      # the gateway's directories while the provider CLI writes them here.
+      File.write!(stage_file, JSON.encode!(%{url: url, cliToken: token, machine: name}))
+      File.chmod!(stage_file, 0o600)
+      run!(sh, ["ssh" | @ssh_opts] ++ [dest, "mkdir", "-p", remote_base_dir])
+
+      run!(sh, [
+        "rsync",
+        "-a",
+        "-e",
+        Enum.join(["ssh" | @ssh_opts], " "),
+        stage_file,
+        "#{dest}:#{remote_base_dir}/"
+      ])
+    after
+      File.rm_rf!(stage)
+    end
+
+    :ok
+  end
+
   defp registry_path(base_dir), do: Path.join(base_dir, "hosts.json")
 
   defp effort_manifest_command(root, baseline) do

@@ -4,6 +4,7 @@ mod ceremonies;
 mod contain;
 mod dispatch;
 mod harnesses;
+mod preflight;
 mod probe;
 
 fn main() {
@@ -42,6 +43,15 @@ fn main() {
     match args::parse(args) {
         Ok(args::Command::Help) => {
             println!("{}", args::render_help(harnesses::load_optional().as_ref()))
+        }
+        Ok(args::Command::CommandHelp(command)) => {
+            match args::render_command_help(harnesses::load_optional().as_ref(), &command) {
+                Some(entry) => println!("{entry}"),
+                None => {
+                    eprintln!("no such command: {command} — run 'tightbeam help' for usage");
+                    std::process::exit(1);
+                }
+            }
         }
         Ok(command) => {
             if let Err(error) = dispatch::run(command) {

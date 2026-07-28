@@ -9,6 +9,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use crate::args::{AssimilateArgs, Identity};
 use crate::dispatch::{self, RequestSpec};
 use crate::harnesses::HarnessCatalog;
+use crate::preflight;
 
 /// Read the staging path out of a `begin` phase response.
 ///
@@ -286,13 +287,32 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
         .unwrap_or_else(|| default_assimilate_name(&args.ssh_dest));
     let dry_run = args.dry_run;
 
-    let probe_output = step(io, "PROBE", probe_failure, |io| {
-        ssh(
-            io,
-            dry_run,
-            &args.ssh_dest,
-            "uname -sm && command -v node && command -v rsync",
-        )
+    // The probe runs for real even under --dry-run. It writes nothing, and a dry run
+    // that cannot observe is worse than no dry run at all: it converted "I checked"
+    // into false confidence and passed a host with no node (#73).
+    let requirements = preflight::requirements(catalog, &args.harnesses);
+    let observation = step(io, "PROBE", probe_failure, |io| {
+        let probe = io.exec(
+            "ssh",
+            &[
+                "-o".to_owned(),
+                "BatchMode=yes".to_owned(),
+                args.ssh_dest.clone(),
+                preflight::script(&requirements, &remote_path(&args.base_dir)),
+            ],
+        )?;
+        let observation = preflight::parse(&probe);
+        for line in preflight::report(&observation) {
+            io.log(&line);
+        }
+        preflight::verdict(&requirements, &observation, &args.ssh_dest).map_err(|message| {
+            ExecFailure {
+                message,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        })?;
+        Ok(observation)
     })?;
 
     let resolved_base = step(io, "DIRS", command_failure, |io| {
@@ -307,17 +327,22 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
             &args.ssh_dest,
             &format!("mkdir -p {}", auth_dirs.join(" ")),
         )?;
+        if dry_run {
+            // The probe already resolved this read-only. On a host that has never been
+            // assimilated there is nothing to resolve, and saying so beats reporting a
+            // configured path as though it had been observed.
+            return Ok(observation
+                .base_dir
+                .clone()
+                .unwrap_or_else(|| args.base_dir.clone()));
+        }
         let resolved = ssh(
             io,
             dry_run,
             &args.ssh_dest,
             &format!("cd {} && pwd", remote_path(&args.base_dir)),
         )?;
-        Ok(if dry_run {
-            args.base_dir.clone()
-        } else {
-            resolved.trim().to_owned()
-        })
+        Ok(resolved.trim().to_owned())
     })?;
 
     step(io, "ADAPTERS", command_failure, |io| {
@@ -348,8 +373,8 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
 
     let cli_bin = format!("{resolved_base}/bin");
     let adapter_bin_dir = format!("{resolved_base}/adapters/node_modules/.bin");
-    let remote_target = target_from_probe(&probe_output);
-    let cli_compatible = dry_run || remote_target.as_deref() == Some(local_target_triple());
+    let remote_target = target_from_probe(&observation.platform);
+    let cli_compatible = remote_target.as_deref() == Some(local_target_triple());
     if cli_compatible {
         step(io, "CLI", command_failure, |io| {
             ssh(
@@ -413,6 +438,8 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
     io.log("Assimilation summary:");
     io.log(&format!("  host: {host_name}"));
     io.log(&format!("  base dir: {resolved_base}"));
+    io.log(&format!("  cli bin: {cli_bin}"));
+    io.log(&format!("  adapter bin: {adapter_bin_dir}"));
     io.log("  credentials: not transported; onboard independently on this host");
     io.log(&format!(
         "  next: add \"{host_name}\" to an archetype's `where`"
@@ -484,6 +511,9 @@ fn command_failure(error: &ExecFailure) -> String {
     error.message.clone()
 }
 
+/// Reachability is the only thing left to classify here: the probe script exits 0 and
+/// labels its findings, so a missing binary arrives as a verdict from `preflight`
+/// rather than as an exit status this has to guess at by counting stdout lines.
 fn probe_failure(error: &ExecFailure) -> String {
     let reason = command_failure(error);
     let lower = reason.to_ascii_lowercase();
@@ -493,19 +523,7 @@ fn probe_failure(error: &ExecFailure) -> String {
     {
         return "ssh authentication failed; set up ssh keys for non-interactive access".to_owned();
     }
-    let lines = error
-        .stdout
-        .trim()
-        .lines()
-        .filter(|line| !line.is_empty())
-        .count();
-    if lines < 2 {
-        "node is missing on the satellite; install node and retry".to_owned()
-    } else if lines < 3 {
-        "rsync is missing on the satellite; install rsync and retry".to_owned()
-    } else {
-        reason
-    }
+    reason
 }
 
 pub fn default_assimilate_name(ssh_dest: &str) -> String {
@@ -620,6 +638,34 @@ mod tests {
         }
     }
 
+    fn local_platform() -> &'static str {
+        match local_target_triple() {
+            "aarch64-apple-darwin" => "Darwin arm64",
+            "x86_64-apple-darwin" => "Darwin x86_64",
+            "aarch64-unknown-linux-gnu" => "Linux aarch64",
+            _ => "Linux x86_64",
+        }
+    }
+
+    /// What a satisfied host answers the probe with. Named binaries are found; every
+    /// other requirement of the run is reported MISSING, so a test that wants a green
+    /// probe has to say which prerequisites it is claiming.
+    fn probe_response(platform: &str, found: &[&str]) -> String {
+        let mut lines = vec![platform.to_owned()];
+        for binary in found {
+            lines.push(format!("{binary} /usr/bin/{binary}"));
+        }
+        lines.push("base-dir ABSENT".to_owned());
+        lines.join("\n") + "\n"
+    }
+
+    fn healthy_probe() -> String {
+        probe_response(
+            local_platform(),
+            &["node", "npm", "rsync", "claude", "codex"],
+        )
+    }
+
     fn args() -> AssimilateArgs {
         AssimilateArgs {
             ssh_dest: "flynn@work-1.local".to_owned(),
@@ -647,7 +693,13 @@ mod tests {
 
     #[test]
     fn fixture_only_projection_drives_assimilation_provisioning() {
-        let mut io = FakeIo::default();
+        let mut io = FakeIo {
+            responses: vec![Ok(probe_response(
+                local_platform(),
+                &["node", "npm", "rsync", "fixture"],
+            ))],
+            ..FakeIo::default()
+        };
         let mut fixture_args = args();
         fixture_args.dry_run = true;
         fixture_args.harnesses = vec!["fixture".to_owned()];
@@ -656,6 +708,7 @@ mod tests {
                 id: "fixture".to_owned(),
                 wire_name: "fixture".to_owned(),
                 install_package: "fixture-package".to_owned(),
+                cli_binary: "fixture".to_owned(),
                 process_markers: vec!["fixture-acp".to_owned()],
             }],
         };
@@ -697,15 +750,7 @@ mod tests {
     fn assimilate_runs_ts_step_order_and_ships_current_binary() {
         let mut io = FakeIo {
             responses: vec![
-                Ok(format!(
-                    "{}\n/node\n/rsync\n",
-                    match local_target_triple() {
-                        "aarch64-apple-darwin" => "Darwin arm64",
-                        "x86_64-apple-darwin" => "Darwin x86_64",
-                        "aarch64-unknown-linux-gnu" => "Linux aarch64",
-                        _ => "Linux x86_64",
-                    }
-                )),
+                Ok(healthy_probe()),
                 Ok(String::new()),
                 Ok("/Users/remote/.tightbeam\n".to_owned()),
                 Ok("harvested\n".to_owned()),
@@ -725,15 +770,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ssh", "ssh", "ssh", "ssh", "ssh", "scp", "ssh"]
         );
+        let probe = io.commands[0].1.last().unwrap();
         assert_eq!(
-            io.commands[0].1,
-            vec![
-                "-o",
-                "BatchMode=yes",
-                "flynn@work-1.local",
-                "uname -sm && command -v node && command -v rsync"
-            ]
+            io.commands[0].1[..3],
+            ["-o", "BatchMode=yes", "flynn@work-1.local"]
         );
+        for expected in [
+            "uname -sm",
+            "'node'",
+            "'npm'",
+            "'rsync'",
+            "'claude'",
+            "'codex'",
+        ] {
+            assert!(probe.contains(expected), "probe must observe {expected}");
+        }
         assert!(
             io.commands[5]
                 .1
@@ -758,7 +809,10 @@ mod tests {
 
     #[test]
     fn dry_run_prints_commands_and_skips_register() {
-        let mut io = FakeIo::default();
+        let mut io = FakeIo {
+            responses: vec![Ok(healthy_probe())],
+            ..FakeIo::default()
+        };
         let mut dry_args = args();
         dry_args.dry_run = true;
         assimilate_with(&mut io, dry_args).unwrap();
@@ -767,13 +821,102 @@ mod tests {
                 .iter()
                 .filter(|line| line.starts_with("DRY "))
                 .count(),
-            7
+            5
         );
         assert!(
             io.logs
                 .contains(&"[assimilate] REGISTER... skipped (--dry-run)".to_owned())
         );
         assert!(io.dispatched.is_empty());
+    }
+
+    /// #73: the probe is the one step a dry run performs rather than prints, and it
+    /// is the only command it runs at all. Everything that writes stays a DRY line.
+    #[test]
+    fn dry_run_executes_the_probe_and_nothing_else() {
+        let mut io = FakeIo {
+            responses: vec![Ok(healthy_probe())],
+            ..FakeIo::default()
+        };
+        let mut dry_args = args();
+        dry_args.dry_run = true;
+        assimilate_with(&mut io, dry_args).unwrap();
+
+        assert_eq!(io.commands.len(), 1, "a dry run executes only the probe");
+        assert_eq!(io.commands[0].0, "ssh");
+        assert!(
+            !io.logs
+                .iter()
+                .any(|line| line.starts_with("DRY ") && line.contains("uname")),
+            "the probe must run, not be printed as a plan"
+        );
+        for written in ["mkdir", "npm install", "chmod"] {
+            assert!(
+                io.logs
+                    .iter()
+                    .any(|line| line.starts_with("DRY ") && line.contains(written)),
+                "{written} must stay dry"
+            );
+        }
+        assert!(
+            io.logs
+                .iter()
+                .any(|line| line.contains("node: /usr/bin/node")),
+            "a dry run reports what it observed"
+        );
+    }
+
+    /// The fail-before/pass-after for #73 + #76 together: a host missing a harness CLI
+    /// is rejected BY THE DRY RUN. Before the fix a dry run could not fail at all, and
+    /// the probe never looked for a harness CLI in either mode -- which is how a
+    /// satellite assimilated cleanly and then died on `claude: command not found`.
+    #[test]
+    fn dry_run_fails_on_a_host_missing_a_harness_cli() {
+        let mut io = FakeIo {
+            responses: vec![Ok(probe_response(
+                local_platform(),
+                &["node", "npm", "rsync", "codex"],
+            ))],
+            ..FakeIo::default()
+        };
+        let mut dry_args = args();
+        dry_args.dry_run = true;
+
+        let reason = assimilate_with(&mut io, dry_args).unwrap_err();
+
+        assert!(reason.contains("claude"), "{reason}");
+        assert!(reason.contains("flynn@work-1.local"), "{reason}");
+        assert!(reason.contains("never the vendors' software"), "{reason}");
+        assert!(
+            io.logs
+                .iter()
+                .any(|line| line.starts_with("[assimilate] PROBE... FAILED")),
+            "the probe step itself must fail"
+        );
+        assert!(
+            !io.logs
+                .iter()
+                .any(|line| line.starts_with("DRY ") && line.contains("npm install")),
+            "a rejected host must not proceed to the install plan"
+        );
+    }
+
+    /// npm was never probed though the next step runs `npm install` (#76).
+    #[test]
+    fn a_host_without_npm_is_rejected_before_the_adapter_install() {
+        let mut io = FakeIo {
+            responses: vec![Ok(probe_response(
+                local_platform(),
+                &["node", "rsync", "claude", "codex"],
+            ))],
+            ..FakeIo::default()
+        };
+
+        let reason = assimilate_with(&mut io, args()).unwrap_err();
+
+        assert!(reason.contains("\n  npm "), "{reason}");
+        assert!(reason.contains("missing 1 prerequisite"), "{reason}");
+        assert_eq!(io.commands.len(), 1, "nothing runs after a failed probe");
     }
 
     #[test]
@@ -789,13 +932,17 @@ mod tests {
                     id: name.to_owned(),
                     wire_name: name.to_owned(),
                     install_package: install_package.to_owned(),
+                    cli_binary: name.to_owned(),
                     process_markers: Vec::new(),
                 },
             )
             .collect(),
         };
 
-        let mut codex_io = FakeIo::default();
+        let mut codex_io = FakeIo {
+            responses: vec![Ok(healthy_probe())],
+            ..FakeIo::default()
+        };
         let mut codex_args = args();
         codex_args.dry_run = true;
         codex_args.harnesses = vec!["codex".to_owned()];
@@ -805,7 +952,10 @@ mod tests {
         assert!(codex_plan.contains("codex-acp"));
         assert!(!codex_plan.contains("claude-agent-acp"));
 
-        let mut all_io = FakeIo::default();
+        let mut all_io = FakeIo {
+            responses: vec![Ok(healthy_probe())],
+            ..FakeIo::default()
+        };
         let mut all_args = args();
         all_args.dry_run = true;
         all_args.harnesses = catalog.names();
@@ -825,7 +975,10 @@ mod tests {
         };
         let mut io = FakeIo {
             responses: vec![
-                Ok(format!("{remote}\n/node\n/rsync\n")),
+                Ok(probe_response(
+                    remote,
+                    &["node", "npm", "rsync", "claude", "codex"],
+                )),
                 Ok(String::new()),
                 Ok("/remote\n".to_owned()),
                 Ok("present\n".to_owned()),
@@ -843,14 +996,17 @@ mod tests {
 
     #[test]
     fn probe_failures_name_missing_runtime_and_batch_auth() {
-        let missing = ExecFailure {
-            message: "probe failed".to_owned(),
-            stdout: "Linux x86_64\n".to_owned(),
+        // A prerequisite verdict arrives already worded, and is passed through rather
+        // than re-guessed. It used to be inferred from how many lines the probe had
+        // printed, which is why it could name only node or rsync and never npm.
+        let verdict = ExecFailure {
+            message: "npm is missing on satellite work-1.local".to_owned(),
+            stdout: String::new(),
             stderr: String::new(),
         };
         assert_eq!(
-            probe_failure(&missing),
-            "node is missing on the satellite; install node and retry"
+            probe_failure(&verdict),
+            "npm is missing on satellite work-1.local"
         );
         let auth = ExecFailure {
             message: "probe failed".to_owned(),

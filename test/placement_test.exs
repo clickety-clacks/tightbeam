@@ -292,6 +292,61 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join([base_dir, "staging", "session-files", "failure"]))
   end
 
+  test "provision_endpoint writes only to satellites and always cleans its staging", %{
+    base_dir: base_dir
+  } do
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:11373")
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:sh, command})
+      {"", 0}
+    end
+
+    # The gateway's own machine is not a satellite: hosts/1 shadows its registry
+    # entry with the synthetic local one, and its gateway.json is boot-owned.
+    assert :ok =
+             Placement.provision_endpoint(
+               base_dir,
+               Placement.local_host_name(),
+               %{ssh: "clu@#{Placement.local_host_name()}", base_dir: "/remote/tb"},
+               sh: fn command -> flunk("unexpected command: #{inspect(command)}") end
+             )
+
+    assert :ok =
+             Placement.provision_endpoint(base_dir, "gateway-host", %{
+               ssh: nil,
+               base_dir: base_dir
+             })
+
+    assert :ok =
+             Placement.provision_endpoint(
+               base_dir,
+               "worker",
+               %{ssh: "clu@worker", base_dir: "~/.tightbeam"},
+               sh: sh
+             )
+
+    assert_receive {:sh, mkdir}
+    assert mkdir == ["ssh"] ++ ssh_opts() ++ ["clu@worker", "mkdir", "-p", "~/.tightbeam"]
+    assert_receive {:sh, rsync}
+    assert List.last(rsync) == "clu@worker:~/.tightbeam/"
+    refute File.exists?(Path.join([base_dir, "staging", "gateway-files", "worker"]))
+
+    assert_raise RuntimeError, ~r/command failed/, fn ->
+      Placement.provision_endpoint(
+        base_dir,
+        "worker",
+        %{ssh: "clu@worker", base_dir: "/remote/tb"},
+        sh: fn _ -> {"", 255} end
+      )
+    end
+
+    refute File.exists?(Path.join([base_dir, "staging", "gateway-files", "worker"]))
+  end
+
+  defp ssh_opts, do: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+
   test "move_workdir fails on a real local token removal error", %{base_dir: base_dir} do
     old_base = Path.join(base_dir, "old-remove-error")
     new_base = Path.join(base_dir, "new-remove-error")

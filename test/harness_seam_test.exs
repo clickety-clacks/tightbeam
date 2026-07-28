@@ -119,7 +119,7 @@ defmodule Tightbeam.HarnessSeamTest do
                "grep",
                [
                  "-RnE",
-                 "\"(wire_name|install_package|process_markers)\"",
+                 "\"(wire_name|install_package|cli_binary|process_markers)\"",
                  "lib",
                  "--exclude-dir=harness"
                ],

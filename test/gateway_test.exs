@@ -733,6 +733,50 @@ defmodule Tightbeam.GatewayTest do
     assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
   end
 
+  # Hosts assimilated before the endpoint file existed, and hosts whose org token
+  # has since been rotated, must not need a second ceremony: boot re-provisions
+  # every registered satellite, so the operator shell heals on restart.
+  test "children re-provisions the endpoint of an already-registered satellite", ctx do
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_endpoint_boot_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(base_dir)
+
+    register_hosts(base_dir, %{
+      "already-assimilated" => %{
+        ssh: "clu@already-assimilated",
+        base_dir: "/remote/tb",
+        cli_bin: nil
+      }
+    })
+
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:11373")
+    on_exit(fn -> Application.delete_env(:tightbeam, :advertised_url) end)
+    parent = self()
+
+    sh = fn command ->
+      if hd(command) == "rsync", do: send(parent, {:staged, File.read!(Enum.at(command, -2))})
+      {"", 0}
+    end
+
+    Gateway.children(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
+
+    token =
+      base_dir
+      |> Path.join("gateway.json")
+      |> File.read!()
+      |> JSON.decode!()
+      |> Map.fetch!("cliToken")
+
+    assert_receive {:staged, content}
+
+    assert JSON.decode!(content) == %{
+             "url" => "http://gateway.example:11373",
+             "cliToken" => token,
+             "machine" => "already-assimilated"
+           }
+  end
+
   test "Proof 5: the boot audit logs conflicts without mutating and terminates on a synthetic cycle",
        ctx do
     first_item = create_work_item(ctx.db, "Audit reviewed")
@@ -1870,11 +1914,27 @@ defmodule Tightbeam.GatewayTest do
   test "register-host supervises credentials and refuses spawn until onboarding", ctx do
     machine = "credential-worker-registration"
     base_dir = move_test_base("credential-server-registration", machine)
+
+    File.write!(
+      Path.join(base_dir, "gateway.json"),
+      JSON.encode!(%{port: 11_373, cliToken: "tbc_org"})
+    )
+
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:11373")
+    on_exit(fn -> Application.delete_env(:tightbeam, :advertised_url) end)
     parent = self()
 
-    sh = fn command ->
-      send(parent, {:credential_command, command})
-      {"", 1}
+    # Registration provisions the satellite's operator endpoint through the same
+    # runner; only the credential probe is being failed here.
+    sh = fn
+      ["ssh" | _] = command ->
+        if "mkdir" in command, do: {"", 0}, else: credential_probe(parent, command)
+
+      ["rsync" | _] ->
+        {"", 0}
+
+      command ->
+        credential_probe(parent, command)
     end
 
     config =
@@ -2068,6 +2128,99 @@ defmodule Tightbeam.GatewayTest do
              id == {Credentials, local}
            end),
            "re-registering the local hostname minted a dynamic credential child"
+  end
+
+  # A satellite's OPERATOR shell has no session and therefore no endpoint: the
+  # gateway injects a per-session token into every agent it launches there, and
+  # an operator running `tightbeam onboard` is not one of those. Assimilation
+  # left that shell with no url and no token at all, so onboarding — a three-
+  # phase conversation with the gateway — died on ENOENT reading gateway.json,
+  # and the documented install could not be completed on any assimilated host.
+  # Registration is where the gateway learns the host exists, and it is the only
+  # party that knows both its advertised url and the org token.
+  test "register-host provisions the satellite's operator endpoint file", ctx do
+    machine = "endpoint-worker"
+    base_dir = move_test_base("endpoint-provisioning", machine)
+
+    File.write!(
+      Path.join(base_dir, "gateway.json"),
+      JSON.encode!(%{port: 11_373, cliToken: "tbc_org_secret"})
+    )
+
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:11373")
+    on_exit(fn -> Application.delete_env(:tightbeam, :advertised_url) end)
+    parent = self()
+
+    sh = fn command ->
+      if hd(command) == "rsync" do
+        stage_file = Enum.at(command, -2)
+
+        send(
+          parent,
+          {:staged, File.read!(stage_file), Bitwise.band(File.stat!(stage_file).mode, 0o777)}
+        )
+      end
+
+      send(parent, {:command, command})
+      {"", 0}
+    end
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
+
+    assert %{host: ^machine} =
+             handlers["register-host"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{name: machine, ssh: machine, base_dir: "/remote/tb"}
+             })
+
+    assert_receive {:staged, content, 0o600}
+
+    assert JSON.decode!(content) == %{
+             "url" => "http://gateway.example:11373",
+             "cliToken" => "tbc_org_secret",
+             "machine" => machine
+           }
+
+    assert_receive {:command, ["rsync" | _] = rsync}
+    assert List.last(rsync) == "#{machine}:/remote/tb/"
+
+    # Staged and rsynced, never interpolated into a command line: the org token
+    # must not appear in the satellite's process table.
+    refute Enum.any?(rsync, &String.contains?(&1, "tbc_org_secret"))
+    refute File.exists?(Path.join([base_dir, "staging", "gateway-files", machine]))
+  end
+
+  test "register-host refuses a satellite when the gateway has no advertised url", ctx do
+    machine = "unreachable-gateway-worker"
+    base_dir = move_test_base("endpoint-no-advertised-url", machine)
+
+    File.write!(
+      Path.join(base_dir, "gateway.json"),
+      JSON.encode!(%{port: 11_373, cliToken: "tbc_org_secret"})
+    )
+
+    Application.delete_env(:tightbeam, :advertised_url)
+
+    handlers =
+      Gateway.handlers(
+        gateway_config(base_dir, ctx.db, 11_373)
+        |> Map.put(:sh, fn command -> flunk("unexpected command: #{inspect(command)}") end)
+      )
+
+    # Fail at registration rather than at the operator's first `onboard`: a host
+    # with an ssh destination is a satellite, and a satellite whose gateway has no
+    # advertised url cannot be reached by its own adapters either.
+    assert %{code: "advertised_url_missing", message: message} =
+             handlers["register-host"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{name: machine, ssh: machine, base_dir: "/remote/tb"}
+             })
+
+    assert message =~ "TIGHTBEAM_ADVERTISED_URL"
+    assert {:ok, hosts} = base_dir |> Path.join("hosts.json") |> File.read!() |> JSON.decode()
+    assert hosts[machine]["base_dir"] == "/remote/tb"
   end
 
   test "register-host raises a host-named error when credential child startup fails", ctx do
@@ -4462,6 +4615,11 @@ defmodule Tightbeam.GatewayTest do
       {:ok, _pid} -> :ok
       {:error, {:already_started, _pid}} -> :ok
     end
+  end
+
+  defp credential_probe(parent, command) do
+    send(parent, {:credential_command, command})
+    {"", 1}
   end
 
   defp move_test_base(suffix, remote_host \\ "worker") do

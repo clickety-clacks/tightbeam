@@ -189,7 +189,7 @@ defmodule Tightbeam.Harness.Support do
 
   def observe_vector(module, "wire_projection", %{input: %{}}) do
     {:ok, decoded} = module.wire_projection() |> JSON.decode()
-    Map.take(decoded, ~w(id wire_name install_package process_markers))
+    Map.take(decoded, ~w(id wire_name install_package cli_binary process_markers))
   end
 
   defp prepare_launch_vectors(_module, profile) do

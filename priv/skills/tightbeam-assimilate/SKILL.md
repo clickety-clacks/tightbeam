@@ -10,8 +10,12 @@ section is the complete procedure.
 1. `tightbeam assimilate <ssh-dest> --as-user <operatorId>` (admin act —
    run it AS the operator who asked). <ssh-dest> is anything ssh resolves
    (tailnet names work). Preconditions the probe checks for you: key-based
-   ssh access and node on the target. Useful flags: --name <hostname>
-   (defaults from the destination), --harness claude,codex, --dry-run.
+   ssh access, node, npm and rsync on the target, and the CLI of every
+   harness being enabled (`claude`, `codex`) — those are the operator's to
+   install, never assimilation's, and the probe sees only what a
+   non-interactive ssh session sees. Useful flags: --name <hostname>
+   (defaults from the destination), --harness claude,codex, --dry-run
+   (runs the probe for real and writes nothing, so it can and does fail).
 1b. Cross-architecture satellites. The ceremony installs the CLI by
    shipping its own running binary, gated on identical target triples: a
    satellite whose OS/CPU differs from the control node SKIPS the CLI

@@ -30,6 +30,15 @@ defmodule Tightbeam.Harness do
   @callback wire_name() :: String.t()
   @callback credential_provider() :: atom()
   @callback install_package() :: binary()
+  @doc """
+  The vendor CLI this harness invokes directly.
+
+  An operator prerequisite, never something Tight Beam installs: assimilation puts
+  Tight Beam's own plumbing on a satellite -- adapters, CLI, base dir -- and enabling
+  a harness there presupposes this binary is already on that machine's PATH. It is
+  projected on the wire so the satellite probe can check for it by name.
+  """
+  @callback cli_binary() :: binary()
   @callback wire_projection() :: binary()
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan()
   @callback ensure_adapter(target()) :: {:ok, String.t()} | {:error, map()}

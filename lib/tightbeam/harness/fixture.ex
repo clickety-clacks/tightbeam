@@ -21,6 +21,9 @@ defmodule Tightbeam.Harness.Fixture do
   @impl true
   def install_package, do: "@tightbeam/fixture-acp"
 
+  @impl true
+  def cli_binary, do: "fixture"
+
   @doc false
   def adapter_version, do: @adapter_version
 
@@ -30,6 +33,7 @@ defmodule Tightbeam.Harness.Fixture do
       "id" => "fixture",
       "wire_name" => wire_name(),
       "install_package" => install_package(),
+      "cli_binary" => cli_binary(),
       "process_markers" => ["fixture-acp"]
     })
   end
@@ -123,7 +127,7 @@ defmodule Tightbeam.Harness.Fixture do
   @impl true
   def probe_cli(target) do
     find = Map.get(target, :find_executable, &System.find_executable/1)
-    Support.bounded_probe(find.("fixture"), target)
+    Support.bounded_probe(find.(cli_binary()), target)
   end
 
   @impl true
@@ -247,6 +251,7 @@ defmodule Tightbeam.Harness.Fixture do
         "id" => "fixture",
         "wire_name" => "fixture",
         "install_package" => "@tightbeam/fixture-acp",
+        "cli_binary" => "fixture",
         "process_markers" => ["fixture-acp"]
       }
     })

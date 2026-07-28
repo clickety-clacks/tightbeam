@@ -53,6 +53,7 @@
     "wire_name",
     "credential_provider",
     "install_package",
+    "cli_binary",
     "conformance_vectors"
   ],
   "vector_contract": {
@@ -172,6 +173,7 @@
     "id",
     "wire_name",
     "install_package",
+    "cli_binary",
     "process_markers"
   ]
 }

@@ -230,6 +230,7 @@ defmodule Tightbeam.Gateway do
 
     File.write!(gateway_path, JSON.encode!(%{port: config.port, cliToken: cli_token}))
     File.chmod!(gateway_path, 0o600)
+    provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config, db)
     on_terminal = fn session_key, seq -> Supervision.notify_terminal(session_key, seq) end
@@ -485,6 +486,43 @@ defmodule Tightbeam.Gateway do
   defp maybe_put_credential_runner(opts, %{sh: sh}), do: Keyword.put(opts, :sh, sh)
   defp maybe_put_credential_runner(opts, _config), do: opts
 
+  defp provision_opts(config), do: if(config[:sh], do: [sh: config.sh], else: [])
+
+  defp endpoint_failure_message(:advertised_url_missing, machine) do
+    "#{machine} is registered, but this gateway has no advertised url, so nothing on #{machine} " <>
+      "can reach it: set TIGHTBEAM_ADVERTISED_URL to an address #{machine} can dial, restart the " <>
+      "gateway, and re-run assimilate"
+  end
+
+  defp endpoint_failure_message(:cli_token_missing, machine) do
+    "#{machine} is registered, but this gateway's own gateway.json carries no cliToken, so no " <>
+      "endpoint could be written for it"
+  end
+
+  # Satellites registered before this boot — including every host assimilated
+  # before the endpoint file existed, and every host whose org token has since
+  # been rotated — are re-provisioned here, so the operator shell heals without a
+  # ceremony. Best effort by construction: an unreachable satellite is a logged
+  # fact, never a failed boot.
+  defp provision_host_endpoints(db, config, cli_token) do
+    config.base_dir
+    |> Placement.hosts()
+    |> Enum.each(fn {name, host} ->
+      opts = [token: cli_token] ++ provision_opts(config)
+
+      result =
+        try do
+          Placement.provision_endpoint(config.base_dir, name, host, opts)
+        rescue
+          error -> {:error, Exception.message(error)}
+        end
+
+      with {:error, reason} <- result do
+        EventLog.lifecycle(db, "endpoint_not_provisioned", name, to_string(reason))
+      end
+    end)
+  end
+
   defp assert_harness_binary_ready!(cli_bin) do
     results =
       Enum.map(Harness.all(), fn module ->
@@ -659,7 +697,22 @@ defmodule Tightbeam.Gateway do
             })
 
           :ok = start_credential_child(config, db, p.name, previous_entry, entry)
-          %{host: p.name, config: entry}
+
+          # The operator who just assimilated this machine will run `onboard` ON
+          # it, and that shell has no session token. Provisioning is the gateway's
+          # because only the gateway knows its advertised url and the org token.
+          case Placement.provision_endpoint(
+                 config.base_dir,
+                 p.name,
+                 entry,
+                 provision_opts(config)
+               ) do
+            :ok ->
+              %{host: p.name, config: entry}
+
+            {:error, reason} ->
+              %{code: to_string(reason), message: endpoint_failure_message(reason, p.name)}
+          end
         end),
       "identity-edit" =>
         admin_call_handler(db, fn call -> identity_edit_result(config, call) end),

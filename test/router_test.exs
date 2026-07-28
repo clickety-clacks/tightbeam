@@ -1102,16 +1102,34 @@ defmodule Tightbeam.Wire.RouterTest do
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "flynn"}).status == 200
     assert_receive {:call, %{origin: "user:flynn", principal: {:session, "holder-token"}}}
 
+    # Registering a satellite also provisions its operator endpoint over ssh; this
+    # test is about the identity ladder, so the reach is stubbed and the gateway
+    # is given the advertised url a real satellite registration requires.
+    old_url = Application.get_env(:tightbeam, :advertised_url)
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:11373")
+
+    on_exit(fn ->
+      if old_url,
+        do: Application.put_env(:tightbeam, :advertised_url, old_url),
+        else: Application.delete_env(:tightbeam, :advertised_url)
+    end)
+
     register_host =
       Gateway.handlers(%{
         db: ctx.db,
         base_dir: ctx.base_dir,
         default_harness: :claude,
         default_model: "fable",
-        max_live_sessions_per_user: 50
+        max_live_sessions_per_user: 50,
+        sh: fn _command -> {"", 0} end
       })["register-host"]
 
     File.mkdir_p!(ctx.base_dir)
+
+    File.write!(
+      Path.join(ctx.base_dir, "gateway.json"),
+      JSON.encode!(%{port: 11_373, cliToken: "tbc_router_org"})
+    )
 
     admin_ctx = %{
       ctx

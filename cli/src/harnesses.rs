@@ -10,6 +10,8 @@ pub struct HarnessProjection {
     pub id: String,
     pub wire_name: String,
     pub install_package: String,
+    /// The vendor CLI this harness invokes directly, which the operator installs.
+    pub cli_binary: String,
     pub process_markers: Vec<String>,
 }
 
@@ -66,6 +68,7 @@ fn parse(encoded: &str) -> Result<HarnessCatalog, String> {
                 id: string("id")?,
                 wire_name: string("wire_name")?,
                 install_package: string("install_package")?,
+                cli_binary: string("cli_binary")?,
                 process_markers,
             })
         })
@@ -142,6 +145,7 @@ pub fn catalog() -> Result<HarnessCatalog, String> {
             id: name.to_owned(),
             wire_name: name.to_owned(),
             install_package: format!("{name}-package"),
+            cli_binary: name.to_owned(),
             process_markers: vec![marker.to_owned()],
         })
         .collect(),
@@ -160,13 +164,29 @@ mod tests {
     #[test]
     fn round_trips_every_consumed_field() {
         let catalog = parse(
-            r#"[{"id":"third","wire_name":"third","install_package":"pkg","process_markers":["marker"]}]"#,
+            r#"[{"id":"third","wire_name":"third","install_package":"pkg","cli_binary":"third-cli","process_markers":["marker"]}]"#,
         )
         .unwrap();
         assert_eq!(catalog.names(), vec!["third"]);
         assert_eq!(catalog.harnesses[0].id, "third");
         assert_eq!(catalog.harnesses[0].install_package, "pkg");
+        assert_eq!(catalog.harnesses[0].cli_binary, "third-cli");
         assert_eq!(catalog.harnesses[0].process_markers, vec!["marker"]);
+    }
+
+    /// A projection with no `cli_binary` is rejected rather than treated as a harness
+    /// with no CLI prerequisite. Skipping the check for a harness whose projection is
+    /// old is precisely the fail-open that let a satellite assimilate cleanly and then
+    /// die on `claude: command not found` (#76).
+    #[test]
+    fn a_projection_without_a_cli_binary_is_rejected_rather_than_probed_loosely() {
+        assert!(
+            parse(
+                r#"[{"id":"third","wire_name":"third","install_package":"pkg","process_markers":[]}]"#
+            )
+            .unwrap_err()
+            .contains("missing cli_binary")
+        );
     }
 
     #[test]
@@ -181,7 +201,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("harnesses.json"),
-            r#"[{"id":"third","wire_name":"third","install_package":"pkg","process_markers":["third-marker"]}]"#,
+            r#"[{"id":"third","wire_name":"third","install_package":"pkg","cli_binary":"third-cli","process_markers":["third-marker"]}]"#,
         )
         .unwrap();
         let catalog = load_from(&root).unwrap();
@@ -191,7 +211,7 @@ mod tests {
 
     #[test]
     fn missing_file_uses_the_route_loader_contract() {
-        let encoded = r#"[{"id":"route","wire_name":"route","install_package":"route-pkg","process_markers":["route-marker"]}]"#;
+        let encoded = r#"[{"id":"route","wire_name":"route","install_package":"route-pkg","cli_binary":"route-cli","process_markers":["route-marker"]}]"#;
         let root = std::env::temp_dir().join("tightbeam-missing-harness-projection");
         let catalog = load_from_with(&root, || parse(encoded)).unwrap();
         assert_eq!(catalog.names(), vec!["route"]);
@@ -210,7 +230,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("harnesses.json"), r#"[{"id":"truncated""#).unwrap();
 
-        let encoded = r#"[{"id":"route","wire_name":"route","install_package":"route-pkg","process_markers":["route-marker"]}]"#;
+        let encoded = r#"[{"id":"route","wire_name":"route","install_package":"route-pkg","cli_binary":"route-cli","process_markers":["route-marker"]}]"#;
         let catalog = load_from_with(&root, || parse(encoded)).unwrap();
 
         assert_eq!(catalog.names(), vec!["route"]);

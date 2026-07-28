@@ -89,7 +89,10 @@ fn request(
 /// Build the dispatch request without performing discovery or network I/O.
 pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
-        Command::Help | Command::Doctor { .. } | Command::Assimilate(_) => {
+        Command::Help
+        | Command::CommandHelp(_)
+        | Command::Doctor { .. }
+        | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
         Command::Wake {
@@ -739,17 +742,27 @@ fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
         }
     })?;
     let config: Value = serde_json::from_str(&encoded).map_err(|error| error.to_string())?;
-    let port = config
-        .get("port")
-        .map(Value::to_string)
-        .unwrap_or_else(|| "undefined".to_owned());
     let token = config
         .get("cliToken")
         .and_then(Value::as_str)
         .unwrap_or("undefined")
         .to_owned();
+    // A SATELLITE's file names the gateway's advertised url, because the gateway
+    // is somewhere else; the gateway host's own file carries a port, and 127.0.0.1
+    // is correct there and nowhere else. The gateway writes both (Placement) and
+    // only ever writes one of the two shapes per machine.
+    let base = match config.get("url").and_then(Value::as_str) {
+        Some(url) if !url.is_empty() => url.to_owned(),
+        _ => {
+            let port = config
+                .get("port")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "undefined".to_owned());
+            format!("http://127.0.0.1:{port}")
+        }
+    };
     Ok(Endpoint {
-        base: format!("http://127.0.0.1:{port}"),
+        base,
         token,
         session_file: None,
     })
@@ -820,7 +833,9 @@ where
     S: FnOnce(&Endpoint, &RequestSpec) -> Result<Option<Value>, String>,
 {
     match command {
-        Command::Help => unreachable!("help is handled before dispatch"),
+        Command::Help | Command::CommandHelp(_) => {
+            unreachable!("help is handled before dispatch")
+        }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::Onboard { identity, provider } => {
@@ -897,7 +912,10 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Onboard { identity, .. }
         | Command::ConfigGet { identity, .. }
         | Command::ConfigSet { identity, .. } => Some(identity),
-        Command::Help | Command::Doctor { .. } | Command::Assimilate(_) => None,
+        Command::Help
+        | Command::CommandHelp(_)
+        | Command::Doctor { .. }
+        | Command::Assimilate(_) => None,
     }
 }
 
@@ -1455,6 +1473,53 @@ mod tests {
         assert_eq!(
             gateway_config_path(&|name| env.get(name).cloned(), &root),
             PathBuf::from("gateway.json")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A satellite's gateway.json names a URL, because the gateway is not on that
+    // machine. The gateway host's own file carries a port and nothing else, and
+    // 127.0.0.1 is right there and only there. A freshly assimilated satellite had
+    // no endpoint at all: `tightbeam onboard` on it died with ENOENT on
+    // gateway.json, and copying the gateway's file over would have pointed the
+    // satellite's operator at the satellite's own localhost.
+    #[test]
+    fn a_satellite_gateway_file_names_its_url_and_the_gateway_host_keeps_the_port_form() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_satellite_{unique}"));
+        let satellite = root.join("satellite");
+        let gateway = root.join("gateway");
+        fs::create_dir_all(&satellite).unwrap();
+        fs::create_dir_all(&gateway).unwrap();
+        fs::write(
+            satellite.join("gateway.json"),
+            r#"{"url":"http://gateway.example:11373","cliToken":"tbc_org"}"#,
+        )
+        .unwrap();
+        fs::write(
+            gateway.join("gateway.json"),
+            r#"{"port":11373,"cliToken":"tbc_org"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_from(&satellite),
+            Ok(Endpoint {
+                base: "http://gateway.example:11373".to_owned(),
+                token: "tbc_org".to_owned(),
+                session_file: None,
+            })
+        );
+        assert_eq!(
+            discover_from(&gateway),
+            Ok(Endpoint {
+                base: "http://127.0.0.1:11373".to_owned(),
+                token: "tbc_org".to_owned(),
+                session_file: None,
+            })
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -50,11 +50,15 @@ defmodule Tightbeam.Harness.Codex do
   def install_package, do: "@agentclientprotocol/codex-acp"
 
   @impl true
+  def cli_binary, do: "codex"
+
+  @impl true
   def wire_projection do
     JSON.encode!(%{
       "id" => "codex",
       "wire_name" => wire_name(),
       "install_package" => install_package(),
+      "cli_binary" => cli_binary(),
       "process_markers" => ["codex-acp"]
     })
   end
@@ -239,8 +243,8 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def install_cli_projection(cli_bin) do
-    shim = Path.join(cli_bin, "codex")
-    discovered = System.find_executable("codex")
+    shim = Path.join(cli_bin, cli_binary())
+    discovered = System.find_executable(cli_binary())
 
     if not File.exists?(shim) and is_binary(discovered) and
          Path.dirname(discovered) != Path.dirname(shim) do
@@ -258,8 +262,8 @@ defmodule Tightbeam.Harness.Codex do
   @impl true
   def probe_cli(target) do
     find = Map.get(target, :find_executable, &System.find_executable/1)
-    shim = Path.join(Map.get(target, :cli_bin, ""), "codex")
-    binary = if File.exists?(shim), do: shim, else: find.("codex")
+    shim = Path.join(Map.get(target, :cli_bin, ""), cli_binary())
+    binary = if File.exists?(shim), do: shim, else: find.(cli_binary())
     Support.bounded_probe(binary, target)
   end
 
@@ -467,6 +471,7 @@ defmodule Tightbeam.Harness.Codex do
         "id" => "codex",
         "wire_name" => "codex",
         "install_package" => "@agentclientprotocol/codex-acp",
+        "cli_binary" => "codex",
         "process_markers" => ["codex-acp"]
       }
     })

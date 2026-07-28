@@ -28,6 +28,10 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
+    /// Help for one named command: `tightbeam assimilate --help`, `tightbeam help
+    /// assimilate`. Printing the whole manual in answer to a question about one
+    /// command buries the answer it was asked for.
+    CommandHelp(String),
     Doctor {
         json: bool,
         base_dir: Option<String>,
@@ -427,8 +431,16 @@ COMMANDS:
   assimilate <ssh-dest> [--name n] [--base-dir p] [--harness {{HARNESSES_CSV}}]
              [--dry-run]
       Prepare a machine to run agent harnesses and register it as a host
-      (admin). Probes ssh/node/rsync, creates the base dir, installs the
-      ACP adapters and this CLI, and records the host. Credentials never
+      (admin). Probes ssh, node, npm, rsync and the CLI of every harness
+      being enabled, creates the base dir, installs the ACP adapters and
+      this CLI, and records the host. --dry-run runs that probe for real
+      and writes nothing else.
+      HARNESS CLIs ARE YOURS TO INSTALL. Tight Beam installs its own
+      plumbing on a satellite — adapters, CLI, base dir — never the
+      vendors' software, and --harness <h> means "enable h here", which
+      presupposes h's CLI is already there. The probe sees only what a
+      non-interactive ssh session sees, so a binary reachable through a
+      login shell profile alone does not count. Credentials never
       transit between machines; run `tightbeam onboard` independently on
       the assimilated host.
       After: add the host to an archetype's `where`.
@@ -462,6 +474,33 @@ pub fn render_help(catalog: Option<&HarnessCatalog>) -> String {
             "{{EXAMPLE_HARNESS}}",
             names.first().map(String::as_str).unwrap_or(pointer),
         )
+}
+
+/// One command's own entry, lifted out of the single help text rather than written
+/// twice. An entry is its syntax line (two-space indent) plus every line indented
+/// under it, which is exactly how COMMANDS is laid out.
+pub fn render_command_help(catalog: Option<&HarnessCatalog>, command: &str) -> Option<String> {
+    let help = render_help(catalog);
+    let mut lines = help.lines().skip_while(|line| !opens_entry(line, command));
+    let first = lines.next()?.to_owned();
+    let rest = lines
+        .take_while(|line| line.starts_with("   "))
+        .collect::<Vec<_>>();
+    Some(
+        std::iter::once(first.as_str())
+            .chain(rest)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn opens_entry(line: &str, command: &str) -> bool {
+    line.strip_prefix("  ").is_some_and(|rest| {
+        !rest.starts_with(' ')
+            && rest
+                .strip_prefix(command)
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with(' '))
+    })
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
@@ -711,12 +750,22 @@ fn parse_with_optional_catalog(
 ) -> Result<Command, String> {
     let parsed = split_args(args);
     let command = parsed.positional.first().map(String::as_str);
-    if command.is_none()
-        || matches!(command, Some("help" | "-h"))
-        || parsed.flags.contains_key("help")
-        || parsed.flags.contains_key("h")
-    {
-        return Ok(Command::Help);
+    // `-h` never becomes a flag: split_args only recognizes `--`-prefixed names, so it
+    // arrives as a positional and the old `flags["h"]` test could never fire.
+    let asked_for_help = parsed.flags.contains_key("help")
+        || parsed.positional.iter().any(|value| value == "-h")
+        || command.is_none();
+    match command {
+        None => return Ok(Command::Help),
+        // `help <command>` and `<command> --help` are the same question.
+        Some("help" | "-h") => {
+            return Ok(match parsed.positional.get(1) {
+                Some(topic) => Command::CommandHelp(topic.clone()),
+                None => Command::Help,
+            });
+        }
+        Some(named) if asked_for_help => return Ok(Command::CommandHelp(named.to_owned())),
+        Some(_) => {}
     }
 
     let flags = &parsed.flags;
@@ -1376,6 +1425,49 @@ mod tests {
         }
     }
 
+    /// `--help` was consumed before the command was ever looked at, so every
+    /// subcommand answered with the whole manual — the operator asking about one
+    /// command got 150 lines and had to find the answer themselves.
+    #[test]
+    fn a_named_command_gets_its_own_help_not_the_manual() {
+        for args in [
+            strings(&["assimilate", "--help"]),
+            strings(&["assimilate", "-h"]),
+            strings(&["help", "assimilate"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Ok(Command::CommandHelp("assimilate".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn command_help_is_that_command_and_its_indented_lines_only() {
+        let entry =
+            render_command_help(Some(&crate::harnesses::catalog().unwrap()), "assimilate").unwrap();
+
+        assert!(entry.starts_with("  assimilate <ssh-dest>"));
+        assert!(entry.contains("[--dry-run]"), "{entry}");
+        assert!(entry.contains("node, npm, rsync"), "{entry}");
+        assert!(
+            entry.contains("HARNESS CLIs ARE YOURS TO INSTALL"),
+            "{entry}"
+        );
+        assert!(
+            !entry.contains("DISCOVERY:") && !entry.contains("  doctor "),
+            "the entry must stop at its own last line: {entry}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_command_has_no_entry_to_print() {
+        assert_eq!(
+            render_command_help(Some(&crate::harnesses::catalog().unwrap()), "frobnicate"),
+            None
+        );
+    }
+
     #[test]
     fn fixture_provider_is_additive_inside_the_test_provider_bundle() {
         assert_eq!(
@@ -1478,6 +1570,7 @@ mod tests {
                 id: "third".to_owned(),
                 wire_name: "third".to_owned(),
                 install_package: "third-package".to_owned(),
+                cli_binary: "third-cli".to_owned(),
                 process_markers: vec!["third-marker".to_owned()],
             }],
         };
@@ -1494,6 +1587,7 @@ mod tests {
                 id: "fixture".to_owned(),
                 wire_name: "fixture".to_owned(),
                 install_package: "fixture-package".to_owned(),
+                cli_binary: "fixture".to_owned(),
                 process_markers: vec!["fixture-acp".to_owned()],
             }],
         };
