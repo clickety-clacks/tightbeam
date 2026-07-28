@@ -72,6 +72,9 @@ defmodule Tightbeam.Acp.AdapterTest do
   const capturePath = process.argv[2];
   const failMode = process.argv[3] || "none";
   const gateMode = process.argv[4] || "none";
+  // When this harness came up. A deadline the adapter enforces AFTER the spawn can only
+  // be timed from here; timing it from before the spawn bills `node` startup to it.
+  fs.writeFileSync(capturePath + ".boot", String(Date.now()));
   let modeCalls = 0;
   let newCalls = 0;
   const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, mcpServers: m.params.mcpServers, modeId: m.params.modeId, cwd: m.params.cwd, sessionId: m.params.sessionId, prompt: m.params.prompt, meta: m.params._meta }) + "\n");
@@ -246,6 +249,46 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, capture_path}
   end
 
+  # Booting an adapter spawns `node` and round-trips `initialize`, so how long it takes
+  # belongs to the machine, not to us: every fixed assert_receive budget over a boot in
+  # this file was a bet on the runner's load, and the 4-core CI runner collected (#83).
+  # These wait on the two things that can actually happen — the adapter reports, or it
+  # dies and says why — with no clock of their own. The reported reason is still matched
+  # exactly by the caller, and a death now names itself instead of arriving as a bare
+  # "no message after N ms". A genuine hang is ExUnit's per-test timeout to catch.
+  defp assert_ready(adapter, message) do
+    ref = Process.monitor(adapter)
+
+    receive do
+      ^message ->
+        Process.demonitor(ref, [:flush])
+        :ok
+
+      {:DOWN, ^ref, :process, ^adapter, reason} ->
+        flunk("adapter died before reporting ready: #{inspect(reason)}")
+    end
+  end
+
+  defp assert_down(adapter, monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^adapter, reason} -> reason
+    end
+  end
+
+  # Wall-clock stamp the fake harness writes for itself as it starts, so a test can time
+  # something the adapter does after the spawn without the spawn in the measurement.
+  defp harness_started_at(capture_path) do
+    path = capture_path <> ".boot"
+
+    case File.read(path) do
+      {:ok, stamp} ->
+        String.to_integer(String.trim(stamp))
+
+      {:error, reason} ->
+        flunk("the fake harness never recorded its start at #{path}: #{inspect(reason)}")
+    end
+  end
+
   defp captured_requests(path) do
     if File.exists?(path) do
       path
@@ -393,8 +436,14 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, _capture_path} =
       start_adapter(
         harness: :codex,
-        on_auth_event: &send(owner, {:auth, &1, &2})
+        on_auth_event: &send(owner, {:auth, &1, &2}),
+        on_ready: fn -> send(owner, :booted) end
       )
+
+    # The notification below queues behind the boot's handle_continue, so without this
+    # barrier the assert_receive budget covers a `node` spawn as well as the dispatch
+    # it is actually about.
+    assert_ready(adapter, :booted)
 
     send(
       adapter,
@@ -630,7 +679,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           on_ready: fn -> send(parent, {:gate_ready, gate_mode}) end
         )
 
-      assert_receive {:gate_ready, ^gate_mode}
+      assert_ready(adapter, {:gate_ready, gate_mode})
       refute Adapter.knows_session?(adapter, "probe-sess")
 
       assert [probe_new] =
@@ -669,7 +718,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, capture_path} = start_adapter(harness: :codex, gate_mode: "drift")
     monitor = Process.monitor(adapter)
 
-    assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, :no_marker}}
+    assert assert_down(adapter, monitor) == {:gate_attestation_failed, :no_marker}
 
     log = capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!()
     assert log =~ "[gate-drift] raw_updates="
@@ -688,7 +737,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         on_ready: fn -> send(parent, :sentinel_gate_ready) end
       )
 
-    assert_receive :sentinel_gate_ready
+    assert_ready(adapter, :sentinel_gate_ready)
     assert Process.alive?(adapter)
 
     explicit_path =
@@ -699,7 +748,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     on_exit(fn -> File.rm(explicit_path) end)
 
-    {_adapter, _capture_path} =
+    {explicit_adapter, _capture_path} =
       start_adapter(
         harness: :codex,
         gate_mode: "pass-message",
@@ -708,7 +757,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         on_ready: fn -> send(parent, :explicit_gate_ready) end
       )
 
-    assert_receive :explicit_gate_ready
+    assert_ready(explicit_adapter, :explicit_gate_ready)
     assert File.read!(explicit_path) =~ "gate wiring-check PASS [gate: tightbeam-probe]"
   end
 
@@ -720,11 +769,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       queued =
         Task.async(fn -> Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance") end)
 
-      # A real `node` spawn + gate attestation + death does not reliably fit the
-      # default 100ms budget on a loaded box (pre-existing flake, ~1 run in 6).
-      # Its siblings in this file already use explicit seconds-scale budgets; the
-      # assertion itself is unchanged and still demands the exact reason.
-      assert_receive {:DOWN, ^monitor, :process, ^adapter, reason}, 2_000
+      reason = assert_down(adapter, monitor)
 
       expected_reason =
         case gate_mode do
@@ -770,13 +815,12 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, capture_path} = start_adapter(harness: :codex, gate_mode: "pass-then-die")
     monitor = Process.monitor(adapter)
 
-    assert_receive {:DOWN, ^monitor, :process, ^adapter,
-                    {:adapter_fault,
-                     %{
-                       reason: {:acp_exit, 137},
-                       stderr: "adapter exploded: credential socket closed"
-                     }}},
-                   2_000
+    assert assert_down(adapter, monitor) ==
+             {:adapter_fault,
+              %{
+                reason: {:acp_exit, 137},
+                stderr: "adapter exploded: credential socket closed"
+              }}
 
     stderr_path = Path.join(Path.dirname(capture_path), "stderr.log")
     gate_path = stderr_path <> ".gate.log"
@@ -813,9 +857,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   end
 
   test "gate wiring-check enforces one absolute deadline and serves no queued session" do
-    started = System.monotonic_time(:millisecond)
-
-    {adapter, _capture_path} =
+    {adapter, capture_path} =
       start_adapter(
         harness: :codex,
         gate_mode: "stall",
@@ -827,10 +869,14 @@ defmodule Tightbeam.Acp.AdapterTest do
     queued =
       Task.async(fn -> Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance") end)
 
-    assert_receive {:DOWN, ^monitor, :process, ^adapter, {:gate_attestation_failed, :deadline}},
-                   1_000
+    assert assert_down(adapter, monitor) == {:gate_attestation_failed, :deadline}
+    died_at = System.system_time(:millisecond)
 
-    assert System.monotonic_time(:millisecond) - started < 1_000
+    # The claim is that the 75ms attestation deadline is ABSOLUTE — so the clock starts
+    # where that deadline does, once the harness is up. Timing from before start_adapter/1
+    # billed a `node` spawn to the deadline, and a spawn's duration is the runner's load,
+    # not the adapter's behavior (#83).
+    assert died_at - harness_started_at(capture_path) < 1_000
 
     assert {:error, {:adapter_unavailable, reason}} = Task.await(queued)
 
@@ -844,7 +890,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "boot without probe opts sends no probe request" do
     parent = self()
 
-    {_adapter, capture_path} =
+    {adapter, capture_path} =
       start_adapter(
         harness: :codex,
         gate_mode: "stall",
@@ -852,7 +898,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         on_ready: fn -> send(parent, :plain_ready) end
       )
 
-    assert_receive :plain_ready
+    assert_ready(adapter, :plain_ready)
     assert captured_requests(capture_path) == []
   end
 end

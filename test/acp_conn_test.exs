@@ -51,6 +51,12 @@ defmodule Tightbeam.Acp.ConnTest do
 
   test "notifications reach the subscriber" do
     conn = start_conn("notif")
+    # `notify` is fire-and-forget, so with nothing waited on first the budget below covers
+    # a `node` spawn as well as the round trip it is about — which is how this went red on
+    # the 4-core runner (#59). `initialize` returns on the harness's own reply, so it ends
+    # when the boot ends rather than on a clock of ours, and the budget then measures the
+    # notification alone.
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
     Conn.notify(conn, "ping.me", %{})
     assert_receive {:acp_notification, "session/update", %{"note" => "hi"}}, 2_000
   end
@@ -71,6 +77,9 @@ defmodule Tightbeam.Acp.ConnTest do
 
   test "requester death sends session/cancel; adapter's eventual answer is the quiescence signal" do
     conn = start_conn("orphan")
+    # Same boot barrier as the notification test: everything below is sub-millisecond once
+    # the harness is up, and a `node` spawn does not fit anyone's budget under load.
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
 
     task =
       Task.async(fn ->
