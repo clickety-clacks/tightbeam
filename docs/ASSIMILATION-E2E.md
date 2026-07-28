@@ -21,6 +21,14 @@ of:
 2. **Has `node`, `npm`, and `rsync`** on a PATH the ssh session sees. A
    non-login shell is what assimilation gets — a tool installed only by `.bashrc`
    is not installed.
+2b. **Has the harness CLI of every harness you intend to enable** — `claude`,
+   `codex` — on that same non-login PATH. These are an operator prerequisite,
+   not something assimilation provides: Tight Beam installs its own plumbing on
+   a satellite, never the vendors' software. Onboarding and turns invoke these
+   binaries directly; the ACP adapters wrap them and cannot substitute. A host
+   missing one assimilates cleanly and then fails at the ceremony with a bare
+   `command not found` (#76, #78). **Check this yourself before starting** —
+   assimilate does not, and `--dry-run` will not tell you (see §2).
 3. **Reaches the gateway's advertised URL.** `TIGHTBEAM_ADVERTISED_URL` must be
    resolvable *from the satellite*, never `127.0.0.1`.
 4. **Is approved for this use**, and is either unassimilated or has been returned
@@ -70,13 +78,22 @@ that have nothing to do with creation.
 tightbeam assimilate <ssh-dest> --name <host-name> --dry-run --as-user <admin>
 ```
 
-PASS: reports the probe results — ssh reachable, node/npm/rsync present, the
-resolved base dir and bin paths — and **writes nothing**. Re-run §1 and confirm the
-satellite is byte-for-byte as it was.
+> **This step cannot currently be trusted (#73).** `--dry-run` prints the probe
+> command and then reports `ok` unconditionally — the ssh never runs. So it cannot
+> fail, cannot name a missing prerequisite, and reports the base dir and bin paths
+> from configuration rather than observation. **Verify §Host-selection by hand**
+> until #73 lands. The PASS condition below is what the step must become, not what
+> it does.
 
-FAIL: any missing prerequisite is named. Fix it on the host and re-probe. A
-`--dry-run` that reports success and then a real run that fails on the same
-prerequisite is a FINDING, not a retry.
+PASS: reports the probe results — ssh reachable, `node`/`npm`/`rsync` present, the
+harness CLI of every harness being enabled present (§Host-selection 2b), and the
+resolved base dir and bin paths — all **observed**, and **writes nothing**. Re-run
+§1 and confirm the satellite is byte-for-byte as it was.
+
+FAIL: any missing prerequisite is named, with the host and the fact that it is the
+operator's to install. Fix it on the host and re-probe. A `--dry-run` that reports
+success and then a real run that fails on the same prerequisite is a FINDING, not a
+retry — and today that is guaranteed rather than possible.
 
 ## 3. Assimilate
 

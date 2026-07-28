@@ -30,6 +30,14 @@ catalog on its own host, and a spawn is refused when the catalog is missing (see
 3. **Runtime + adapters** — install node and the ACP adapter packages
    (`@agentclientprotocol/claude-agent-acp`, `codex-acp`) at a path of your
    choosing. Also install `rsync` (standard on macOS/Linux).
+4. **The harness CLIs themselves** — `claude` and/or `codex`, on a PATH a
+   **non-login ssh shell** can see. These are a prerequisite, like node and
+   rsync: Tight Beam installs Tight Beam's plumbing on a satellite, not the
+   vendors' software. Onboarding and turns invoke these binaries **directly**
+   (`claude setup-token`, `codex login --device-auth`) — the ACP adapters wrap
+   them and cannot stand in for them. A host without them assimilates fine and
+   then cannot run anything, failing at the onboarding ceremony with a bare
+   `command not found`. Assimilate does not yet check for them (#76).
 4. **Agent CLI** — put a `tightbeam` executable on a path of your choosing
    (the reference CLI is `node <checkout>/dist/cli/main.js`; a shim script
    suffices). Agents on this host reach the gateway via the TIGHTBEAM_URL /
