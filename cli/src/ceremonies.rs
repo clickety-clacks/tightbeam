@@ -30,7 +30,12 @@ fn staging_path(ready: &serde_json::Value) -> Result<&str, String> {
 }
 
 pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
-    let machine = std::env::var("TIGHTBEAM_MACHINE").ok();
+    let machine = onboard_machine(
+        std::env::var("TIGHTBEAM_MACHINE")
+            .ok()
+            .filter(|name| !name.is_empty()),
+        dispatch::provisioned(),
+    )?;
     let begin = dispatch::build_onboard_phase_request(
         identity,
         provider,
@@ -91,6 +96,54 @@ pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Which machine this ceremony acts on.
+///
+/// The gateway defaults an unnamed onboarding machine to its OWN hostname
+/// (`gateway.ex`, `params[:machine] || Placement.local_host_name()`). On the gateway host
+/// that is right. On a satellite it is a trap: the gateway stages the credential into its
+/// own directories while the provider CLI writes into the satellite's, and `finish` then
+/// reads an absent file and reports a TOKEN failure -- blaming the credential for what is
+/// really a wrong-host error.
+///
+/// So an unnamed machine is only allowed where it is correct. Everywhere else this
+/// REFUSES rather than deriving a name, because the value must match the name
+/// `assimilate` registered (`default_assimilate_name`, i.e. the ssh destination minus any
+/// user) and that is not necessarily this host's `uname -n`. A guess that misses produces
+/// `unknown_host` from the gateway, which tells the operator less than naming the
+/// variable does.
+fn onboard_machine(
+    from_env: Option<String>,
+    provisioned: dispatch::Provisioned,
+) -> Result<Option<String>, String> {
+    if let Some(name) = from_env {
+        return Ok(Some(name));
+    }
+    match provisioned {
+        dispatch::Provisioned::GatewayHost => Ok(None),
+        dispatch::Provisioned::Satellite {
+            machine: Some(name),
+        } => Ok(Some(name)),
+        dispatch::Provisioned::Satellite { machine: None } => Err(unnamed_machine(
+            "this satellite's gateway.json does not name it, which means the gateway that \
+             wrote the file predates that field; restarting the gateway rewrites it for \
+             every registered host",
+        )),
+        dispatch::Provisioned::Absent => Err(unnamed_machine(
+            "there is no gateway.json here, so this machine cannot say what it is \
+             registered as",
+        )),
+    }
+}
+
+fn unnamed_machine(because: &str) -> String {
+    format!(
+        "cannot tell which machine to onboard: {because}. Set TIGHTBEAM_MACHINE to this \
+         host's REGISTERED name -- the name given to `tightbeam assimilate`, which \
+         defaults to the ssh destination without any user@ prefix -- and re-run. Without \
+         it the gateway would onboard ITSELF instead of this machine."
+    )
 }
 
 fn run_provider_onboarding(provider: &str, staging: &str) -> Result<(), String> {
@@ -1136,5 +1189,42 @@ mod tests {
             default_assimilate_name("flynn@worker.local"),
             "worker.local"
         );
+    }
+
+    /// The gateway substitutes its own hostname for an unnamed machine, so an unnamed
+    /// machine is safe in exactly one place. Everywhere else must refuse rather than
+    /// guess -- a derived name that is not the registered one comes back `unknown_host`.
+    #[test]
+    fn an_unnamed_machine_is_allowed_only_where_the_gateway_default_is_correct() {
+        assert_eq!(
+            onboard_machine(Some("work-1".to_owned()), dispatch::Provisioned::Absent),
+            Ok(Some("work-1".to_owned())),
+            "the environment wins outright, including for agent shells"
+        );
+        assert_eq!(
+            onboard_machine(None, dispatch::Provisioned::GatewayHost),
+            Ok(None),
+            "on the gateway host its own hostname IS this machine"
+        );
+        assert_eq!(
+            onboard_machine(
+                None,
+                dispatch::Provisioned::Satellite {
+                    machine: Some("work-1".to_owned())
+                }
+            ),
+            Ok(Some("work-1".to_owned())),
+            "a provisioned satellite needs no operator env"
+        );
+
+        for stale in [
+            dispatch::Provisioned::Satellite { machine: None },
+            dispatch::Provisioned::Absent,
+        ] {
+            let reason = onboard_machine(None, stale.clone()).unwrap_err();
+            assert!(reason.contains("TIGHTBEAM_MACHINE"), "{reason}");
+            assert!(reason.contains("REGISTERED"), "{reason}");
+            assert!(reason.contains("onboard ITSELF"), "{reason}");
+        }
     }
 }

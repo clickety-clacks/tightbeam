@@ -768,6 +768,54 @@ fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
     })
 }
 
+/// What a machine's provisioned `gateway.json` says about the MACHINE ITSELF.
+///
+/// Deliberately separate from `Endpoint`, which answers a different question: where to
+/// send a request. An operator ceremony acts on the machine it is running on, and on a
+/// satellite the two answers differ -- the endpoint points at the gateway, while the
+/// ceremony must name the satellite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provisioned {
+    /// A satellite's file. It names the gateway's advertised url, and carries this
+    /// host's REGISTERED name unless an older gateway wrote it (`Placement.write_endpoint`
+    /// has included `machine` since 4dd0d39; a gateway restart rewrites every host's).
+    Satellite { machine: Option<String> },
+    /// The gateway host's own file: a port, and no machine. The gateway defaults an
+    /// unnamed onboarding machine to its own hostname, which is correct exactly here.
+    GatewayHost,
+    /// No provisioned file, so this machine cannot say what it is registered as.
+    Absent,
+}
+
+/// Read the provisioning of the machine this process is running on.
+pub fn provisioned() -> Provisioned {
+    provisioned_in(&crate::base_dir::resolve())
+}
+
+fn provisioned_in(base_dir: &Path) -> Provisioned {
+    let Ok(encoded) = fs::read_to_string(base_dir.join("gateway.json")) else {
+        return Provisioned::Absent;
+    };
+    let Ok(config) = serde_json::from_str::<Value>(&encoded) else {
+        return Provisioned::Absent;
+    };
+    let text = |key: &str| {
+        config
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    // The url/port split is the same one `endpoint_from_gateway_file` reads, and for the
+    // same reason: only a satellite's file names a url.
+    match text("url") {
+        Some(_) => Provisioned::Satellite {
+            machine: text("machine"),
+        },
+        None => Provisioned::GatewayHost,
+    }
+}
+
 pub fn send(request: &RequestSpec) -> Result<Option<Value>, String> {
     let endpoint = discover()?;
     send_to(&endpoint, request)
@@ -1643,5 +1691,47 @@ mod tests {
             parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
             Err("denied: no".to_owned())
         );
+    }
+
+    #[test]
+    fn provisioning_distinguishes_a_satellite_from_the_gateway_host_and_from_staleness() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_provisioned_{unique}"));
+        let cases = [
+            (
+                "satellite",
+                r#"{"url":"http://gw:11373","cliToken":"t","machine":"work-1"}"#,
+                Provisioned::Satellite {
+                    machine: Some("work-1".to_owned()),
+                },
+            ),
+            // Written by a gateway from before `machine` was included. The name is not
+            // derivable here -- it is whatever `assimilate` registered -- so this must
+            // stay distinguishable from the gateway host, which legitimately has none.
+            (
+                "stale_satellite",
+                r#"{"url":"http://gw:11373","cliToken":"t"}"#,
+                Provisioned::Satellite { machine: None },
+            ),
+            (
+                "gateway_host",
+                r#"{"port":11373,"cliToken":"t"}"#,
+                Provisioned::GatewayHost,
+            ),
+        ];
+        for (name, body, expected) in cases {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("gateway.json"), body).unwrap();
+            assert_eq!(provisioned_in(&dir), expected, "{name}");
+        }
+        assert_eq!(
+            provisioned_in(&root.join("nothing-here")),
+            Provisioned::Absent
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

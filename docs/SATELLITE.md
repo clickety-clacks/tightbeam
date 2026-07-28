@@ -23,13 +23,11 @@ catalog on its own host, and a spawn is refused when the catalog is missing (see
 2. **Credentials** — run Tight Beam onboarding independently on this
    machine: `tightbeam onboard openai` for Codex device-code, and
    `tightbeam onboard anthropic` for Claude setup-token. Never copy,
-   harvest, scp, or rsync credentials between machines. Gateway discovery
-   needs no operator env — step 4's file supplies it. An operator shell must
-   still export `TIGHTBEAM_MACHINE=<this host's registered name>`: the gateway
-   defaults an unnamed onboarding machine to its OWN hostname, so without it
-   the ceremony stages credentials on the gateway while the provider CLI writes
-   them here. That name is in the provisioned file, and the CLI will read it
-   from there (#84); agent shells receive it automatically today.
+   harvest, scp, or rsync credentials between machines. No operator env is
+   needed: step 5's provisioned file supplies both the gateway endpoint and
+   this host's registered name. `TIGHTBEAM_MACHINE` still overrides the name
+   if you need it to, and a satellite provisioned by a gateway too old to have
+   written the name says so and tells you to set it.
 3. **Runtime + adapters** — install node and the ACP adapter packages
    (`@agentclientprotocol/claude-agent-acp`, `codex-acp`) at a path of your
    choosing. Also install `rsync` (standard on macOS/Linux).
