@@ -777,14 +777,27 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  # INVARIANT: a non-ok control response always carries a code.
+  #
+  # `ok: false` on its own tells a client that something did not happen and nothing
+  # about whether to retry, re-authorize, or report a bug — a rejection and a fault
+  # are the same two bytes. Handlers are expected to supply their own code, and all
+  # of them do; the fallback exists so that a path which forgets one, or a future
+  # handler that returns a bare false, still cannot reach a client as an unexplained
+  # negative. Enforced HERE because this is the one seam every session-control
+  # response passes through, which is what makes it an invariant rather than a
+  # convention.
   defp control_json(conn, result, session_key, action) do
+    ok = Map.get(result, :ok, not Map.has_key?(result, :code))
+    code = result[:code] || if(ok, do: nil, else: "control_failed")
+
     %{
-      "ok" => Map.get(result, :ok, not Map.has_key?(result, :code)),
+      "ok" => ok,
       "sessionKey" => session_key,
       "action" => action,
       "status" => session_status(conn).(session_key)
     }
-    |> put_optional("code", result[:code])
+    |> put_optional("code", code)
     |> put_optional("message", result[:message])
     |> then(&json(conn, 200, &1))
   end

@@ -3125,7 +3125,16 @@ defmodule Tightbeam.Gateway do
           %{ok: true}
 
         {:error, reason} ->
-          %{ok: false, reason: reason}
+          # `reason:` is not a key the wire carries. `control_json` emits only `code`
+          # and `message`, so this returned `ok: false` with NEITHER -- and dropped
+          # the reason on the floor on the way out. A client saw a bare false and
+          # could not tell a refusal from a fault, which is the one thing a control
+          # response exists to say.
+          %{
+            ok: false,
+            code: "model_apply_failed",
+            message: "the live session did not accept #{new_ref}: #{inspect(reason)}"
+          }
       end
     else
       {:error, denial} -> denial

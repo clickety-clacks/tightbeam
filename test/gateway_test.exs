@@ -2614,12 +2614,16 @@ defmodule Tightbeam.GatewayTest do
 
     start_supervised!({CoordinatorStub, adapter})
 
-    assert %{ok: false, reason: :model_unavailable} =
+    # The reason rides the MESSAGE now. It used to ride a `reason:` key the wire
+    # does not emit, so this refusal reached clients as a bare `ok: false` (#68).
+    assert %{ok: false, code: "model_apply_failed", message: message} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
+
+    assert message =~ "model_unavailable"
 
     assert_receive {:tune_model_applied, "resident-session", "claude-sonnet-4-6"}
     assert Org.get(ctx.db, "k1").model == before
@@ -3031,12 +3035,14 @@ defmodule Tightbeam.GatewayTest do
     adapter = start_supervised!({ContainmentAdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
 
-    assert %{ok: false, reason: :contained_sandbox_disable_failed} =
+    assert %{ok: false, code: "model_apply_failed", message: message} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
+
+    assert message =~ "contained_sandbox_disable_failed"
 
     assert_receive {:contained_load_session, "existing-session"}
     refute Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"

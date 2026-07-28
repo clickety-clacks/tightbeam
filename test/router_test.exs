@@ -1392,6 +1392,41 @@ defmodule Tightbeam.Wire.RouterTest do
     |> Router.call(Router.init(ctx.opts))
   end
 
+  # INVARIANT: a non-ok session-control response always carries a code.
+  #
+  # `ok: false` alone was observed in production and could not be reproduced,
+  # because it is not a bug in any one handler -- it is what the wire renders for
+  # ANY handler result that forgets a code, and `reason:` (which one path did set)
+  # is not a key this seam emits, so it was dropped silently. A client receiving it
+  # cannot tell a refusal it should surface from a fault it should retry.
+  #
+  # Asserted through the router rather than against a handler, because the seam is
+  # what makes it total: it holds for handlers that do not exist yet.
+  test "POST /api/session-control never returns a bare ok:false", ctx do
+    key = "control-invariant"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    for result <- [%{ok: false}, %{ok: false, reason: :adapter_said_no}] do
+      opts = with_handler(ctx.opts, "tune", fn _call -> result end)
+
+      response =
+        conn(
+          :post,
+          "/api/session-control",
+          JSON.encode!(%{"sessionKey" => key, "action" => "set_model", "model" => "fable"})
+        )
+        |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+        |> Router.call(Router.init(opts))
+
+      body = JSON.decode!(response.resp_body)
+
+      assert body["ok"] == false, "#{inspect(result)} -> #{inspect(body)}"
+
+      assert is_binary(body["code"]) and body["code"] != "",
+             "a non-ok control response must name a code: #{inspect(result)} -> #{inspect(body)}"
+    end
+  end
+
   defp with_handler(opts, verb, handler) do
     Keyword.update!(opts, :handlers, &Map.put(&1, verb, handler))
   end
