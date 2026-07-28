@@ -101,8 +101,8 @@ defmodule Tightbeam.JobTraceTest do
          terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
       VALUES
         ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', 'eezo', '/tmp',
-         '{"status":"available","manifest":{"repos":[],"untracked":[]}}',
-         'w_condition', '{"outcome":"zero_edits"}');
+         '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
+         'w_condition', '{"outcome":"zero_effect"}');
 
       INSERT INTO decision_requests
         (id, kind, raiserId, ownerUserId, assignmentId, raisedAt, deadlineAt,

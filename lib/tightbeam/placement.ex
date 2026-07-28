@@ -73,6 +73,10 @@ defmodule Tightbeam.Placement do
   # timeouts or an invisible password prompt.
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
+  # Effort stamps sit in the session's own workdir, so they are reaped with the
+  # workspace and never outlive it.
+  @effort_stamp_dir ".tightbeam-effort"
+
   @typedoc "A configured host. ssh: nil marks the reserved local host."
   @type host_config :: %{
           required(:ssh) => String.t() | nil,
@@ -192,21 +196,30 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
-  Read the observable git state for an assignment root without creating it.
+  Observe writes under an assignment root without creating it: what was written
+  since the prior stamp, plus the current listing.
 
-  Local and satellite holders use the same bounded shell probe. The returned
-  manifest is repository-scoped and retains the sorted untracked name list.
+  No git anywhere. Arming lays an empty stamp file; a later observation asks
+  `find -newer` what has been written since, diffs the listing for created and
+  deleted paths, then lays the NEXT stamp and removes the one it consumed — so a
+  stamp lives exactly as long as the generation that owns it, and dies with the
+  workspace it sits in. The stamp directory is pruned from the walk, so a stamp
+  can never perturb its own probe.
+
+  Local and satellite holders use the same bounded shell probe.
   """
-  @spec effort_manifest(map(), map(), String.t(), term()) ::
+  @spec effort_observation(map(), map(), String.t(), term()) ::
           {:ok, map()} | {:error, String.t()}
-  def effort_manifest(config, session, root, baseline \\ nil) do
+  def effort_observation(config, session, root, baseline \\ nil) do
     case Map.get(config, :effort_probe) do
-      fun when is_function(fun, 3) ->
-        fun.(session, root, config)
+      fun when is_function(fun, 4) ->
+        fun.(session, root, baseline, config)
 
       _ ->
         host = Map.fetch!(hosts(config.base_dir), session.host)
-        command = effort_manifest_command(root, baseline)
+        stamp_dir = Path.join(workdir_path(config, session), @effort_stamp_dir)
+        stamp = Path.join(stamp_dir, "#{Tightbeam.Id.uuid4()}.stamp")
+        command = effort_observation_command(root, stamp_dir, stamp, prior_stamp(baseline))
         runner = Map.get(config, :sh, &system_cmd/1)
 
         invocation =
@@ -228,11 +241,15 @@ defmodule Tightbeam.Placement do
           end
 
         case result do
-          {:ok, output} -> parse_effort_manifest(output)
+          {:ok, output} -> parse_effort_observation(output, stamp)
           {:error, reason} -> {:error, reason}
         end
     end
   end
+
+  defp prior_stamp({:ok, observation}), do: prior_stamp(observation)
+  defp prior_stamp(%{stamp: stamp}) when is_binary(stamp), do: stamp
+  defp prior_stamp(_baseline), do: nil
 
   @doc """
   Record (or update) a host in the instance registry — the DUMB half of
@@ -333,103 +350,61 @@ defmodule Tightbeam.Placement do
 
   defp registry_path(base_dir), do: Path.join(base_dir, "hosts.json")
 
-  defp effort_manifest_command(root, baseline) do
-    quoted_root = shell_quote(root)
-
-    baseline_cases =
-      case baseline do
-        {:ok, %{repos: repos}} ->
-          Enum.map_join(repos, "\n", fn repo ->
-            "        #{shell_quote(repo.path)}) baseline=#{shell_quote(repo.head)} ;;"
-          end)
-
-        _ ->
-          ""
-      end
-
+  # Portable shell: no git, no mktemp, no GNU-only find predicates. A vanished
+  # file mid-walk is not a probe failure, so the walk's own stderr is dropped and
+  # only the explicit preconditions (a readable root, a writable stamp) fail.
+  defp effort_observation_command(root, stamp_dir, stamp, prior) do
     """
-    set -eu
-    root=#{quoted_root}
-    test -d "$root"
-    dotgits=$(find "$root" -name .git -print -prune)
-    test -n "$dotgits"
-    printf '%s\\n' "$dotgits" | while IFS= read -r dotgit; do
-      repo=${dotgit%/.git}
-      rel=${repo#"$root"}
-      rel=${rel#/}
-      test -n "$rel" || rel=.
-      head=$(git -C "$repo" rev-parse HEAD)
-      effort_index=$(mktemp)
-      trap 'rm -f "$effort_index"' EXIT HUP INT TERM
-      source_index=$(git -C "$repo" rev-parse --git-path index)
-      case "$source_index" in
-        /*) ;;
-        *) source_index="$repo/$source_index" ;;
-      esac
-      cp "$source_index" "$effort_index"
-      GIT_INDEX_FILE="$effort_index" git -C "$repo" add -u -- .
-      tracked=$(GIT_INDEX_FILE="$effort_index" git -C "$repo" write-tree)
-      rm -f "$effort_index"
-      baseline=
-      case "$rel" in
-    #{baseline_cases}
-        *) ;;
-      esac
-      new_commit=0
-      if test -n "$baseline" && test "$head" != "$baseline"; then
-        if ! git -C "$repo" merge-base --is-ancestor "$head" "$baseline"; then
-          new_commit=1
-        fi
+    set -u
+    root=#{shell_quote(root)}
+    stampdir=#{shell_quote(stamp_dir)}
+    stamp=#{shell_quote(stamp)}
+    prior=#{shell_quote(prior || "")}
+    test -d "$root" || { echo "workdir root is unavailable" >&2; exit 1; }
+    mkdir -p "$stampdir" || exit 1
+    priorState=none
+    writes=0
+    if test -n "$prior"; then
+      if test -e "$prior"; then
+        priorState=observed
+        writes=$(find "$root" -path "$stampdir" -prune -o -newer "$prior" -print 2>/dev/null | wc -l)
+      else
+        priorState=missing
       fi
-      printf 'R\\t%s\\t%s\\t%s\\t%s\\n' "$rel" "$head" "$tracked" "$new_commit"
-      untracked=$(git -C "$repo" ls-files --others)
-      test -z "$untracked" || printf '%s\\n' "$untracked" | while IFS= read -r name; do
-        if test "$rel" = .; then full="$name"; else full="$rel/$name"; fi
-        printf 'U\\t%s\\n' "$full"
-      done
-    done
+    fi
+    : > "$stamp" || exit 1
+    test -z "$prior" || rm -f "$prior"
+    printf 'B\\t%s\\t%s\\n' "$priorState" "$writes"
+    find "$root" -path "$stampdir" -prune -o -print 2>/dev/null
     """
   end
 
-  defp parse_effort_manifest(output) do
-    {repos, untracked} =
+  defp parse_effort_observation(output, stamp) do
+    {header, paths} =
       output
       |> String.split("\n", trim: true)
-      |> Enum.reduce({[], []}, fn line, {repos, untracked} ->
+      |> Enum.reduce({nil, []}, fn line, {header, paths} ->
         case String.split(line, "\t") do
-          ["R", path, head, tracked, new_commit] ->
-            {[
-               %{
-                 path: path,
-                 head: head,
-                 tracked: tracked,
-                 new_commit: new_commit == "1"
-               }
-               | repos
-             ], untracked}
-
-          ["R", path, head, tracked] ->
-            {[
-               %{path: path, head: head, tracked: tracked, new_commit: false}
-               | repos
-             ], untracked}
-
-          ["U", name] ->
-            {repos, [name | untracked]}
-
-          _ ->
-            {repos, untracked}
+          ["B", prior_state, writes] -> {{prior_state, writes}, paths}
+          _ -> {header, [line | paths]}
         end
       end)
 
-    if repos == [] do
-      {:error, "no git repository under effort root"}
-    else
-      {:ok,
-       %{
-         repos: Enum.sort_by(repos, & &1.path),
-         untracked: Enum.sort(Enum.uniq(untracked))
-       }}
+    case header do
+      nil ->
+        {:error, "effort observation was unreadable"}
+
+      {prior_state, writes} ->
+        sorted = paths |> Enum.uniq() |> Enum.sort()
+
+        {:ok,
+         %{
+           stamp: stamp,
+           prior: prior_state,
+           writes: writes |> String.trim() |> String.to_integer(),
+           entries: length(sorted),
+           digest: :crypto.hash(:sha256, Enum.join(sorted, "\n")) |> Base.encode16(case: :lower)
+         }}
     end
   end
 

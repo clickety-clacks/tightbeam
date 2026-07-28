@@ -1344,8 +1344,15 @@ defmodule Tightbeam.GatewayTest do
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.put(:effort_checkin_horizon_ms, 1)
-      |> Map.put(:effort_probe, fn _session, _root, _config ->
-        {:ok, %{repos: [%{path: ".", head: "same", tracked: "same"}], untracked: []}}
+      |> Map.put(:effort_probe, fn _session, _root, _baseline, _config ->
+        {:ok,
+         %{
+           stamp: "/tmp/effort.stamp",
+           prior: "observed",
+           writes: 0,
+           entries: 1,
+           digest: "same"
+         }}
       end)
 
     {Wakes, wake_opts} =
@@ -1393,6 +1400,17 @@ defmodule Tightbeam.GatewayTest do
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
 
+    # Rung one prods the HOLDER and re-arms; the owner's request is rung two.
+    assert :ok = Wakes.fire_due(scheduler)
+
+    {:ok, [[rearmed_wake_id]]} =
+      DB.query(
+        ctx.db,
+        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+        [assignment.id]
+      )
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [rearmed_wake_id])
     assert :ok = Wakes.fire_due(scheduler)
 
     assert {:ok, [[request_id]]} =
@@ -3392,8 +3410,15 @@ defmodule Tightbeam.GatewayTest do
 
     config =
       gateway_config(base_dir, ctx.db, 0)
-      |> Map.put(:effort_probe, fn _session, _root, _config ->
-        {:ok, %{repos: [%{path: ".", head: "same", tracked: "same"}], untracked: []}}
+      |> Map.put(:effort_probe, fn _session, _root, _baseline, _config ->
+        {:ok,
+         %{
+           stamp: "/tmp/effort.stamp",
+           prior: "observed",
+           writes: 0,
+           entries: 1,
+           digest: "same"
+         }}
       end)
 
     item =
@@ -3415,7 +3440,17 @@ defmodule Tightbeam.GatewayTest do
         [item.id]
       )
 
+    # Rung one prods the holder; the owner's request is rung two.
     :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, probe_wake_id))
+
+    {:ok, [[second_probe_wake_id]]} =
+      DB.query(
+        ctx.db,
+        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+        [item.id]
+      )
+
+    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, second_probe_wake_id))
 
     {:ok, [[request_id]]} =
       DB.query(
@@ -3481,7 +3516,18 @@ defmodule Tightbeam.GatewayTest do
                [item.id]
              )
 
+    # A dismissal re-arms a FRESH bracket, so the agent is prodded once more
+    # before its owner is asked anything again.
     :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, ruleable_probe_wake))
+
+    assert {:ok, [[reprodded_probe_wake]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [item.id]
+             )
+
+    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, reprodded_probe_wake))
 
     assert {:ok, [[motion_request_id]]} =
              DB.query(
@@ -3525,7 +3571,17 @@ defmodule Tightbeam.GatewayTest do
                [item.id]
              )
 
+    # Respawn re-armed on the NEW holder, so that holder gets the prod rung too.
     :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, fresh_wake_id))
+
+    assert {:ok, [[fresh_second_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [item.id]
+             )
+
+    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, fresh_second_wake_id))
 
     assert {:ok, [[fresh_request_id]]} =
              DB.query(

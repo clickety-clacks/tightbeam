@@ -2,9 +2,22 @@ defmodule Tightbeam.EffortCheckin do
   @moduledoc """
   Event-driven effort-without-effect brackets for dispatched assignments.
 
+  EFFECT is any of, since the bracket armed: writes in the workdir, an artifact
+  the holder recorded, an attest on the assignment, or an update to the
+  assignment's work item. Turns are effort, never effect — a spinning session
+  has turns. Git is a change-management system an org may or may not use; it is
+  never a requirement for observation, and work done elsewhere (another machine,
+  a service, a person) is surfaced by RECORDING AN ARTIFACT, not by probing for
+  it.
+
+  Zero effect on every channel prods the AGENT first — one wake naming the four
+  channels. Only continued silence at the next bracket escalates to the owner's
+  decision request. Owners get decisions, not status.
+
   Filesystem observation is performed before the callback transaction. The
-  transaction then CASes the exact generation/wake pair and either re-arms or
-  opens one parent-routed decision request with its durable deadline wake.
+  transaction then CASes the exact generation/wake pair and either re-arms,
+  prods, or opens one parent-routed decision request with its durable deadline
+  wake.
   """
 
   alias Tightbeam.{CausalEvents, DB, Org, Placement, Wakes}
@@ -29,6 +42,10 @@ defmodule Tightbeam.EffortCheckin do
     baseline TEXT NOT NULL,
     wakeId TEXT NOT NULL,
     evidence TEXT,
+    agentProdded INTEGER NOT NULL DEFAULT 0,
+    artifactWatermark INTEGER NOT NULL DEFAULT 0,
+    attestWatermark INTEGER NOT NULL DEFAULT 0,
+    workItemWatermark INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (assignmentId, generation)
   );
   CREATE INDEX IF NOT EXISTS effort_checkin_wake
@@ -36,7 +53,21 @@ defmodule Tightbeam.EffortCheckin do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    result = DB.execute(db, @ddl)
+
+    for column <- ~w(agentProdded artifactWatermark attestWatermark workItemWatermark) do
+      case DB.query(
+             db,
+             "ALTER TABLE effort_checkin_generations ADD COLUMN #{column} INTEGER NOT NULL DEFAULT 0"
+           ) do
+        {:ok, _} -> :ok
+        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
+      end
+    end
+
+    result
+  end
 
   @spec valid_workdir_root(term()) :: :ok | {:error, map()}
   def valid_workdir_root(nil), do: :ok
@@ -93,7 +124,7 @@ defmodule Tightbeam.EffortCheckin do
         [assignment.id]
       )
 
-    insert_generation(txn, config, assignment.id, session, root, baseline, generation, 1)
+    insert_generation(txn, config, assignment.id, session, root, baseline, generation, 1, 0)
   end
 
   @doc "Capture monitored assignments on a holder against a destination placement."
@@ -243,18 +274,21 @@ defmodule Tightbeam.EffortCheckin do
   def probe(db, config, wake) do
     snapshot = generation_for_wake(db, wake.wake_id)
 
+    # Only an ARMED generation is observed: an observation consumes the stamp it
+    # probed and lays the next one, so replaying a probe against an already
+    # probed generation would destroy the stamp its row still points at.
     inspection =
       case snapshot do
-        nil ->
-          {:error, "generation unavailable"}
-
-        generation ->
+        %{state: "armed"} = generation ->
           observe(
             config,
             %{session_key: generation.holder_key, host: generation.host},
             generation.root,
             generation.baseline
           )
+
+        _ ->
+          {:error, "generation unavailable"}
       end
 
     case DB.transaction(db, fn txn -> probe_in_txn(txn, config, wake, inspection) end) do
@@ -385,11 +419,10 @@ defmodule Tightbeam.EffortCheckin do
 
           if Txn.changes(txn) == 1 do
             mark_wake_fired(txn, wake.wake_id)
-            outcome = compare(generation.baseline, inspection)
+            channels = channels(txn, generation, inspection)
+            session = session_in_txn(txn, generation.holder_key)
 
-            if outcome == :effect do
-              session = session_in_txn(txn, generation.holder_key)
-
+            if effect?(channels) do
               insert_generation(
                 txn,
                 config,
@@ -398,20 +431,47 @@ defmodule Tightbeam.EffortCheckin do
                 generation.root,
                 inspection,
                 generation.generation + 1,
-                1
+                1,
+                0
               )
 
               nil
             else
-              evidence = evidence(txn, generation, outcome)
+              evidence = evidence(generation, channels)
 
+              # The observation consumed this generation's stamp and laid the
+              # next one, so the row advances to it even when nothing moved:
+              # a later `continue` re-arms against a stamp that still exists.
               Txn.q(
                 txn,
-                "UPDATE effort_checkin_generations SET evidence = ?3 WHERE assignmentId = ?1 AND generation = ?2",
-                [generation.assignment_id, generation.generation, JSON.encode!(evidence)]
+                "UPDATE effort_checkin_generations SET evidence = ?3, baseline = ?4 WHERE assignmentId = ?1 AND generation = ?2",
+                [
+                  generation.assignment_id,
+                  generation.generation,
+                  JSON.encode!(evidence),
+                  encode_observation(advanced_baseline(generation.baseline, inspection))
+                ]
               )
 
-              open_request_in_txn(txn, config, generation, evidence)
+              if generation.agent_prodded == 0 do
+                prod_holder_in_txn(txn, generation, evidence)
+
+                insert_generation(
+                  txn,
+                  config,
+                  generation.assignment_id,
+                  session,
+                  generation.root,
+                  advanced_baseline(generation.baseline, inspection),
+                  generation.generation + 1,
+                  generation.multiplier,
+                  1
+                )
+
+                nil
+              else
+                open_request_in_txn(txn, config, generation, evidence)
+              end
             end
           end
         end
@@ -540,7 +600,8 @@ defmodule Tightbeam.EffortCheckin do
                 generation.root,
                 generation.baseline,
                 generation.generation + 1,
-                min(generation.multiplier * 2, 4)
+                min(generation.multiplier * 2, 4),
+                generation.agent_prodded
               )
 
             "dismiss" ->
@@ -605,6 +666,11 @@ defmodule Tightbeam.EffortCheckin do
         now(),
         deadline_at,
         "Assignment #{generation.assignment_id} effort check-in outcome: #{evidence.outcome}. " <>
+          "The holder was prodded and stayed silent. Channels checked since arm — " <>
+          "workspace writes: #{evidence.channels.writes} (#{evidence.workspace}); " <>
+          "artifacts recorded: #{evidence.channels.artifacts}; " <>
+          "attests: #{evidence.channels.attests}; " <>
+          "work-item updates: #{evidence.channels.workItems}. " <>
           "Terminal turns since arm: #{evidence.turnsSinceArmed}; minutes since arm: #{evidence.minutesSinceArmed}. " <>
           "Choose continue or dismiss, or use an available ordinary power.",
         JSON.encode!(menu),
@@ -638,7 +704,8 @@ defmodule Tightbeam.EffortCheckin do
          root,
          baseline,
          generation,
-         multiplier
+         multiplier,
+         agent_prodded
        ) do
     armed_at = now()
     horizon = horizon_ms(config)
@@ -647,6 +714,12 @@ defmodule Tightbeam.EffortCheckin do
       Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE sessionKey = ?1", [
         session.session_key
       ])
+
+    # One cursor per channel, captured with the arm — the same shape the turns
+    # watermark has always had. A timestamp would tie with its own bracket.
+    artifacts = cursor(txn, "artifacts", "rowid")
+    attests = cursor(txn, "attests", "rowid")
+    work_items = cursor(txn, "work_item_events", "id")
 
     wake =
       Wakes.schedule_in_txn(txn, %{
@@ -662,8 +735,9 @@ defmodule Tightbeam.EffortCheckin do
       """
       INSERT INTO effort_checkin_generations
         (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
-         terminalSeqWatermark, holderKey, host, root, baseline, wakeId)
-      VALUES (?1, ?2, 'armed', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         terminalSeqWatermark, holderKey, host, root, baseline, wakeId,
+         agentProdded, artifactWatermark, attestWatermark, workItemWatermark)
+      VALUES (?1, ?2, 'armed', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
       """,
       [
         assignment_id,
@@ -676,7 +750,11 @@ defmodule Tightbeam.EffortCheckin do
         session.host,
         root,
         encode_observation(baseline),
-        wake.wake_id
+        wake.wake_id,
+        agent_prodded,
+        artifacts,
+        attests,
+        work_items
       ]
     )
 
@@ -808,27 +886,65 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp compare({:error, _}, _inspection), do: :unobservable
-  defp compare(_baseline, {:error, _}), do: :unobservable
-
-  defp compare({:ok, baseline}, {:ok, current}) do
-    baseline_repos = Map.new(baseline.repos, &{&1.path, &1})
-    current_paths = MapSet.new(current.repos, & &1.path)
-
-    repo_effect =
-      Enum.any?(baseline.repos, &(!MapSet.member?(current_paths, &1.path))) or
-        Enum.any?(current.repos, fn repo ->
-          case Map.get(baseline_repos, repo.path) do
-            nil -> true
-            prior -> repo[:new_commit] == true or prior.tracked != repo.tracked
-          end
-        end)
-
-    untracked_effect = current.untracked -- baseline.untracked != []
-    if repo_effect or untracked_effect, do: :effect, else: :zero_edits
+  # The four channels, all read in the verdict's own transaction. Turns ride
+  # along as EFFORT — they are reported, never counted as effect.
+  defp channels(txn, generation, inspection) do
+    %{
+      workspace: workspace_channel(generation.baseline, inspection),
+      artifacts:
+        count_since(
+          txn,
+          "artifacts",
+          "SELECT COUNT(*) FROM artifacts WHERE createdBySession = ?1 AND rowid > ?2",
+          [generation.holder_key, generation.artifact_watermark]
+        ),
+      attests:
+        count_since(
+          txn,
+          "attests",
+          "SELECT COUNT(*) FROM attests WHERE assignmentId = ?1 AND rowid > ?2",
+          [generation.assignment_id, generation.attest_watermark]
+        ),
+      workItems: work_item_updates(txn, generation),
+      turns: terminal_turns(txn, generation)
+    }
   end
 
-  defp evidence(txn, generation, outcome) do
+  defp effect?(channels) do
+    channels.workspace == :writes or channels.artifacts > 0 or channels.attests > 0 or
+      channels.workItems > 0
+  end
+
+  defp workspace_channel({:error, _}, _inspection), do: :unobservable
+  defp workspace_channel(_baseline, {:error, _}), do: :unobservable
+
+  defp workspace_channel({:ok, baseline}, {:ok, current}) do
+    cond do
+      current.prior != "observed" -> :unobservable
+      current.writes > 0 -> :writes
+      current.digest != baseline.digest -> :writes
+      true -> :none
+    end
+  end
+
+  defp work_item_updates(txn, generation) do
+    case Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [
+           generation.assignment_id
+         ]) do
+      [[item]] when is_binary(item) ->
+        count_since(
+          txn,
+          "work_item_events",
+          "SELECT COUNT(*) FROM work_item_events WHERE workItemId = ?1 AND id > ?2",
+          [item, generation.work_item_watermark]
+        )
+
+      _ ->
+        0
+    end
+  end
+
+  defp terminal_turns(txn, generation) do
     [[turns]] =
       Txn.q(
         txn,
@@ -840,40 +956,100 @@ defmodule Tightbeam.EffortCheckin do
         [generation.holder_key, generation.terminal_seq_watermark]
       )
 
+    turns
+  end
+
+  defp count_since(txn, table, sql, params) do
+    if table?(txn, table) do
+      [[count]] = Txn.q(txn, sql, params)
+      count
+    else
+      0
+    end
+  end
+
+  defp cursor(txn, table, column) do
+    if table?(txn, table) do
+      [[cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(#{column}), 0) FROM #{table}")
+      cursor
+    else
+      0
+    end
+  end
+
+  defp table?(txn, table) do
+    Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [table]) == [[1]]
+  end
+
+  defp evidence(generation, channels) do
     %{
       assignmentId: generation.assignment_id,
       effortGeneration: generation.generation,
-      outcome: Atom.to_string(outcome),
-      turnsSinceArmed: turns,
+      outcome: "zero_effect",
+      channels: %{
+        writes: Atom.to_string(channels.workspace),
+        artifacts: channels.artifacts,
+        attests: channels.attests,
+        workItems: channels.workItems
+      },
+      workspace: generation.root,
+      agentProdded: generation.agent_prodded == 1,
+      turnsSinceArmed: channels.turns,
       minutesSinceArmed: div(max(now() - generation.armed_at, 0), 60_000)
     }
   end
 
+  # The agent prod: one wake to the HOLDER naming every channel that was checked.
+  # It rides the ordinary active-session gate — a holder that is not there to
+  # answer is the owner's decision at the next bracket, not a second prod.
+  defp prod_holder_in_txn(txn, generation, evidence) do
+    Wakes.schedule_in_txn(txn, %{
+      session_key: generation.holder_key,
+      origin: @origin,
+      prompt:
+        "[effort check-in] Assignment #{generation.assignment_id}: " <>
+          channel_sentence(evidence) <>
+          " Record your work — `artifact-record` for anything produced outside this workdir " <>
+          "(another machine, a service, a conversation), `attest` for progress — or say what is happening.",
+      due_at: now(),
+      assignment_id: generation.assignment_id
+    })
+  end
+
+  defp channel_sentence(evidence) do
+    "no writes, artifacts, attests, or work-item updates observed since " <>
+      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken; " <>
+      "workspace #{evidence.workspace}: #{evidence.channels.writes})."
+  end
+
+  defp advanced_baseline(_baseline, {:ok, _observation} = inspection), do: inspection
+  defp advanced_baseline(baseline, _inspection), do: baseline
+
   defp observe(config, session, root, baseline \\ nil) do
-    case Placement.effort_manifest(config, session, root, baseline) do
-      {:ok, manifest} -> {:ok, manifest}
+    case Placement.effort_observation(config, session, root, baseline) do
+      {:ok, observation} -> {:ok, observation}
       {:error, reason} -> {:error, reason}
     end
   rescue
     error -> {:error, Exception.message(error)}
   end
 
-  defp encode_observation({:ok, manifest}),
-    do: JSON.encode!(%{status: "available", manifest: manifest})
+  defp encode_observation({:ok, observation}),
+    do: JSON.encode!(%{status: "available", observation: observation})
 
   defp encode_observation({:error, reason}),
     do: JSON.encode!(%{status: "unavailable", reason: reason})
 
   defp decode_observation(encoded) do
     case JSON.decode!(encoded) do
-      %{"status" => "available", "manifest" => manifest} ->
+      %{"status" => "available", "observation" => observation} ->
         {:ok,
          %{
-           repos:
-             Enum.map(manifest["repos"], fn repo ->
-               %{path: repo["path"], head: repo["head"], tracked: repo["tracked"]}
-             end),
-           untracked: manifest["untracked"]
+           stamp: observation["stamp"],
+           prior: observation["prior"],
+           writes: observation["writes"],
+           entries: observation["entries"],
+           digest: observation["digest"]
          }}
 
       %{"reason" => reason} ->
@@ -1059,7 +1235,7 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp generation_select do
-    "SELECT assignmentId, generation, state, baseHorizonMs, multiplier, armedAt, terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence FROM effort_checkin_generations"
+    "SELECT assignmentId, generation, state, baseHorizonMs, multiplier, armedAt, terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence, agentProdded, artifactWatermark, attestWatermark, workItemWatermark FROM effort_checkin_generations"
   end
 
   defp generation([
@@ -1075,7 +1251,11 @@ defmodule Tightbeam.EffortCheckin do
          root,
          baseline,
          wake_id,
-         evidence
+         evidence,
+         agent_prodded,
+         artifact_watermark,
+         attest_watermark,
+         work_item_watermark
        ]) do
     %{
       assignment_id: assignment_id,
@@ -1090,7 +1270,11 @@ defmodule Tightbeam.EffortCheckin do
       root: root,
       baseline: decode_observation(baseline),
       wake_id: wake_id,
-      evidence: evidence && JSON.decode!(evidence)
+      evidence: evidence && JSON.decode!(evidence),
+      agent_prodded: agent_prodded,
+      artifact_watermark: artifact_watermark,
+      attest_watermark: attest_watermark,
+      work_item_watermark: work_item_watermark
     }
   end
 

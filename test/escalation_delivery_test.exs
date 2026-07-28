@@ -152,6 +152,12 @@ defmodule Tightbeam.EscalationDeliveryTest do
   test "proof 2: an effort request, its deadline wake, and its notification are one commit",
        ctx do
     assignment = dispatch!(ctx)
+
+    # Rung one is the agent prod (no request, no owner notification); the OWNER
+    # request is the next bracket, and that is the commit under test here.
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
+    assert notification_wakes(ctx.db) == []
+
     probe_wake = bracket_wake(ctx.db, assignment.id)
     generations_before = count(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations")
 
@@ -200,7 +206,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   test "proof 3: a deadline advance and its new-rung notification are one commit", ctx do
     assignment = dispatch!(ctx)
-    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
+    :ok = escalate!(ctx, assignment.id)
     before = effort_request(ctx.db)
     [notification] = notification_wakes(ctx.db)
 
@@ -400,7 +406,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     # And a stale effort-deadline replay is silent too.
     assignment = dispatch!(ctx)
-    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
+    :ok = escalate!(ctx, assignment.id)
     opened = effort_request(ctx.db)
     :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, opened.deadline_wake_id))
     after_advance = Enum.map(notification_wakes(ctx.db), & &1.wake_id)
@@ -413,7 +419,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   test "proof 8: every rung expiry re-arms one deadline wake and one prompt wake", ctx do
     assignment = dispatch!(ctx)
-    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
+    :ok = escalate!(ctx, assignment.id)
 
     opened = effort_request(ctx.db)
     assert opened.expecter_session_key == "mid"
@@ -460,7 +466,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
       |> Map.put(:lane_manager, lanes)
 
     assignment = dispatch!(ctx)
-    :ok = EffortCheckin.probe(ctx.db, config, bracket_wake(ctx.db, assignment.id))
+    :ok = escalate!(%{ctx | config: config}, assignment.id)
 
     assert {:decision_pending, _id} =
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
@@ -586,7 +592,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   test "proof 11: targetGate 0 delivers to a retired target; the default gate still gates", ctx do
     assignment = dispatch!(ctx)
-    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
+    :ok = escalate!(ctx, assignment.id)
 
     assert {:decision_pending, _id} =
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
@@ -697,8 +703,15 @@ defmodule Tightbeam.EscalationDeliveryTest do
       credential_status: fn _provider -> :onboarded end,
       credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end,
-      effort_probe: fn _session, _root, _config ->
-        {:ok, %{repos: [%{path: ".", head: "same", tracked: "same"}], untracked: []}}
+      effort_probe: fn _session, _root, _baseline, _config ->
+        {:ok,
+         %{
+           stamp: "/tmp/effort.stamp",
+           prior: "observed",
+           writes: 0,
+           entries: 1,
+           digest: "same"
+         }}
       end
     }
   end
@@ -770,6 +783,12 @@ defmodule Tightbeam.EscalationDeliveryTest do
   defp job_ref(db, assignment_id) do
     [[job_ref]] = rows(db, "SELECT workItemId FROM assignments WHERE id = ?1", [assignment_id])
     job_ref
+  end
+
+  # Zero effect prods the HOLDER first; the owner's request is the next bracket.
+  defp escalate!(ctx, assignment_id) do
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment_id))
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment_id))
   end
 
   defp bracket_wake(db, assignment_id) do
