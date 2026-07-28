@@ -308,6 +308,11 @@ the tool call, with the statute text delivered only as the denial reason.
     (matcher "Bash"). The codex home's `hooks.json` decodes with one entry
     per statute plus `tightbeam-probe` LAST; the codex home still has NO
     `settings.json`. Existing sessions are not refreshed automatically.
+    **Count every statute the org has, not just the ones you copied.**
+    `mix tightbeam.init` seeds `identity/rails/engineering.toml` (5 statutes),
+    so a real org shows those plus the example's — the assertion is a 1:1
+    correspondence with the total, and reading it as "one per copied statute"
+    manufactures a discrepancy that isn't there.
 18. [manual] The invariant: assert neither shared home contains `CLAUDE.md`,
     `AGENTS.md`, nor archetype skill directories. Run `tightbeam identity
     status <archetype>` and inspect both composed instruction channels.
