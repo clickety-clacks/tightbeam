@@ -784,6 +784,18 @@ defmodule Tightbeam.ClientE2ETest do
       File.mkdir_p!(home)
       File.write!(Path.join(store, "auth.json"), "{}")
 
+      # A store row is the credential file AND its metadata. The preflight reads
+      # the KIND from here to choose which route to probe, so a file with no
+      # metadata beside it is not a seeded credential — it is the half-assembled
+      # store the "records no credential kind" row exists to catch.
+      metadata = Path.join([store, ".tightbeam", "credential.json"])
+      File.mkdir_p!(Path.dirname(metadata))
+
+      File.write!(
+        metadata,
+        JSON.encode!(%{"provider" => "openai", "kind" => "subscription", "onboarded" => true})
+      )
+
       on_exit(fn -> File.rm_rf!(base_dir) end)
       %{base_dir: base_dir}
     end

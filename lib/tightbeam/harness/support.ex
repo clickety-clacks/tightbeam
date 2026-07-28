@@ -225,7 +225,7 @@ defmodule Tightbeam.Harness.Support do
 
   @doc false
   def observe_vector(module, "prepare_launch", %{input: input}),
-    do: observe_launch(module, input.profile, input.locality, input.rails)
+    do: observe_launch(module, input.profile, input.locality, input.rails, input.kind)
 
   def observe_vector(module, "ensure_adapter", %{input: input}),
     do: observe_adapter(module, input.profile, input.locality, input.presence)
@@ -276,20 +276,26 @@ defmodule Tightbeam.Harness.Support do
     Map.take(decoded, ~w(id wire_name install_package cli_binary process_markers))
   end
 
+  # Eight cases, not four: a harness's launch plan is a function of locality,
+  # rails AND the host's credential kind. For claude the kind decides which
+  # environment variable carries the credential; for codex it decides nothing,
+  # because codex reads its own auth.json — and running codex under both kinds
+  # PINS that invariance instead of assuming it.
   defp prepare_launch_vectors(_module, profile) do
     for locality <- [:local, :remote],
-        rails <- [:railed, :lawless] do
-      case_name = "#{locality}_#{rails}"
+        rails <- [:railed, :lawless],
+        kind <- [:subscription, :api_key] do
+      case_name = "#{locality}_#{rails}_#{kind}"
 
       vector(
         case_name,
-        expected_launch(profile, locality, rails),
-        %{profile: profile, locality: locality, rails: rails}
+        expected_launch(profile, locality, rails, kind),
+        %{profile: profile, locality: locality, rails: rails, kind: kind}
       )
     end
   end
 
-  defp observe_launch(module, profile, locality, rails) do
+  defp observe_launch(module, profile, locality, rails, kind) do
     with_tmp("launch", fn base ->
       home = Path.join(base, "home")
       local? = locality == :local
@@ -311,6 +317,7 @@ defmodule Tightbeam.Harness.Support do
         remote_env: ["REMOTE=1"],
         lineage: "tb-vector",
         rails: if(rails == :railed, do: %{"hooks" => %{"PreToolUse" => []}}, else: nil),
+        credential_kind: kind,
         ensure_workdir: fn _host, _cwd, _content, _opts -> :ok end,
         sh_out: nil
       ]
@@ -321,7 +328,7 @@ defmodule Tightbeam.Harness.Support do
     end)
   end
 
-  defp expected_launch(profile, locality, rails) do
+  defp expected_launch(profile, locality, rails, kind) do
     base = "<BASE>"
     home = "<HOME>"
     adapter = adapter_path(base, profile.adapter_bin, locality)
@@ -331,7 +338,7 @@ defmodule Tightbeam.Harness.Support do
     plan =
       if local? do
         extra =
-          profile.local_extra_env ++
+          Map.fetch!(profile.local_extra_env, kind) ++
             if(railed? and profile.rails_env, do: [profile.rails_env], else: [])
 
         [
@@ -340,7 +347,7 @@ defmodule Tightbeam.Harness.Support do
         ]
       else
         remote_env =
-          profile.remote_prefix.(base, home) ++
+          profile.remote_prefix.(base, home, kind) ++
             ["REMOTE=1"] ++
             if(railed? and profile.remote_rails_env,
               do: [profile.remote_rails_env],
@@ -724,7 +731,12 @@ defmodule Tightbeam.Harness.Support do
         %{host_config: %{ssh: nil}, sh: &system_cmd/1},
         "/vector/home",
         transport: transport,
-        timeout_ms: timeout_ms
+        timeout_ms: timeout_ms,
+        # The five liveness cases are about the RESULT MAPPING (live/dead/
+        # unknown/bounded/cleaned-up), which is kind-independent, so they run on
+        # one kind. The api-key routes are exercised where their oracle is a
+        # recorded vendor response, in credential_kinds_test.exs.
+        credential_kind: :subscription
       )
 
     elapsed = System.monotonic_time(:millisecond) - started
@@ -902,7 +914,7 @@ defmodule Tightbeam.Harness.Support do
   end
 
   defp catalog_vectors(_module, profile) do
-    for case_name <- ["valid", "malformed", "unavailable"] do
+    for case_name <- ["valid", "valid_api_key", "malformed", "unavailable"] do
       vector(
         case_name,
         Map.fetch!(profile.catalog_expected, case_name),

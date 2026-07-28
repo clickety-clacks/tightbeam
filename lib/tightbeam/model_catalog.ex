@@ -3,7 +3,10 @@ defmodule Tightbeam.ModelCatalog do
   Asynchronously derived model inventory, keyed by `{host, harness}`.
 
   Credentials are host-local by design, so entitlements are host-local, so a
-  catalog is a fact about ONE host's account. It used to be derived once, on the
+  catalog is a fact about ONE host's account — and about the KIND of credential
+  that host holds, since the two kinds read different routes with different
+  entitlements. A satellite on an API key and a gateway on a subscription derive
+  genuinely different catalogs, and neither is a stale copy of the other. It used to be derived once, on the
   gateway, from the gateway's credential, and then applied to every host — which
   validated a spawn against the gateway account while the turn ran under the
   target host's (#88). Facts about a host are established on that host.
@@ -94,6 +97,7 @@ defmodule Tightbeam.ModelCatalog do
       now: Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end),
       options: Map.new(opts),
       credential_status: Keyword.get(opts, :credential_status, &default_credential_status/2),
+      credential_kind: Keyword.get(opts, :credential_kind, &default_credential_kind/2),
       entries: %{}
     }
 
@@ -214,11 +218,24 @@ defmodule Tightbeam.ModelCatalog do
   defp safely_derive({host, harness}, probe, state) do
     try do
       module = Harness.parse!(harness)
+      provider = module.credential_provider()
 
-      with :onboarded <- credential_status(state, module.credential_provider(), host) do
-        module.fetch_catalog(probe)
+      with :onboarded <- credential_status(state, provider, host),
+           kind when kind in [:api_key, :subscription] <-
+             credential_kind(state, provider, host) do
+        module.fetch_catalog(Map.put(probe, :credential_kind, kind))
       else
-        {:needs_onboarding, reason} -> {:error, {:needs_onboarding, reason}}
+        {:needs_onboarding, reason} ->
+          {:error, {:needs_onboarding, reason}}
+
+        # Onboarded, but the store records no kind. Refused rather than
+        # defaulted: the two kinds read different routes, so a catalog derived
+        # against a guessed kind would be a confident answer about the wrong
+        # account. Production cannot reach this — `:onboarded` and a readable
+        # kind have the same preconditions — but a half-migrated or
+        # hand-assembled store can, and it deserves a refusal, not a guess.
+        :none ->
+          {:error, {:needs_onboarding, :missing}}
       end
     rescue
       error -> {:error, {:exception, Exception.message(error)}}
@@ -241,6 +258,35 @@ defmodule Tightbeam.ModelCatalog do
     case GenServer.whereis(server) do
       nil -> {:needs_onboarding, :credential_server_unavailable}
       _pid -> Tightbeam.Credentials.status(provider, server)
+    end
+  end
+
+  defp credential_kind(%{credential_kind: kind}, _provider, _host)
+       when is_atom(kind),
+       do: kind
+
+  defp credential_kind(%{credential_kind: kind}, provider, _host)
+       when is_function(kind, 1),
+       do: kind.(provider)
+
+  defp credential_kind(%{credential_kind: kind}, provider, host)
+       when is_function(kind, 2),
+       do: kind.(provider, host)
+
+  # `:subscription` when the lifecycle owner is unreachable, NOT `:none` — and
+  # this is NOT #21's fail-open returning by another door. The credential GATE is
+  # `credential_status/3`, checked one line above this in `safely_derive/3`, and
+  # it already refuses `{:needs_onboarding, :credential_server_unavailable}` for
+  # exactly this case; nothing derives a catalog past it. This value only decides
+  # WHICH ROUTE an already-authorized derivation reads, and the pre-invariant
+  # answer — the only kind that existed — is the right one when nobody can say
+  # otherwise.
+  defp default_credential_kind(provider, host) do
+    server = Tightbeam.Credentials.server(host)
+
+    case GenServer.whereis(server) do
+      nil -> :subscription
+      _pid -> Tightbeam.Credentials.kind(provider, server)
     end
   end
 

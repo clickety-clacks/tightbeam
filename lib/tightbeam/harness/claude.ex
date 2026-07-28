@@ -126,21 +126,21 @@ defmodule Tightbeam.Harness.Claude do
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
     common = Keyword.fetch!(opts, :common_env)
+    variable = credential_env_var(Keyword.fetch!(opts, :credential_kind))
+    credential_path = credential_path(target.host_config.base_dir)
 
     if Support.local?(target) do
-      token_env =
-        case File.read(Path.join([target.host_config.base_dir, "auth", "claude", "oauth-token"])) do
-          {:ok, token} -> [{"CLAUDE_CODE_OAUTH_TOKEN", String.trim(token)}]
+      credential_env =
+        case File.read(credential_path) do
+          {:ok, credential} -> [{variable, String.trim(credential)}]
           _ -> []
         end
 
-      [cmd: [binary], env: [{"CLAUDE_CONFIG_DIR", home} | common ++ token_env]]
+      [cmd: [binary], env: [{"CLAUDE_CONFIG_DIR", home} | common ++ credential_env]]
     else
-      token_path = Path.join([target.host_config.base_dir, "auth", "claude", "oauth-token"])
-
       remote_env =
         [
-          "CLAUDE_CODE_OAUTH_TOKEN=$(cat #{token_path} 2>/dev/null)",
+          "#{variable}=$(cat #{credential_path} 2>/dev/null)",
           "CLAUDE_CONFIG_DIR=#{home}"
           | Keyword.fetch!(opts, :remote_env)
         ]
@@ -153,6 +153,23 @@ defmodule Tightbeam.Harness.Claude do
       ]
     end
   end
+
+  # Claude takes its credential from the environment, and the VARIABLE NAMES THE
+  # KIND: a setup-token in ANTHROPIC_API_KEY is rejected, and an API key in
+  # CLAUDE_CODE_OAUTH_TOKEN is rejected. Exactly one is ever set -- never both,
+  # never an empty one -- so a wrong kind fails as an authentication error naming
+  # the credential rather than as a precedence puzzle between two variables.
+  #
+  # `fetch!` and no default: a launch that cannot say which kind it is launching
+  # is a programming error, and defaulting it would quietly run part of the fleet
+  # on the wrong variable.
+  defp credential_env_var(:subscription), do: "CLAUDE_CODE_OAUTH_TOKEN"
+  defp credential_env_var(:api_key), do: "ANTHROPIC_API_KEY"
+
+  # ONE file per provider, holding whichever kind is active. The name is
+  # historical -- it predates API-key support -- and is deliberately NOT read as
+  # evidence of the kind by anything: `credential.json` is the authority.
+  defp credential_path(base_dir), do: Path.join([base_dir, "auth", "claude", "oauth-token"])
 
   @impl true
   def ensure_adapter(target) do
@@ -232,12 +249,14 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def credential_live?(target, home, opts) do
+    {header, scheme} = credential_header(Keyword.fetch!(opts, :credential_kind))
+
     script = """
     const fs = require("node:fs");
-    const token = fs.readFileSync(process.argv[1], "utf8").trim();
+    const credential = fs.readFileSync(process.argv[1], "utf8").trim();
     fetch("https://api.anthropic.com/v1/models?limit=1", {
       headers: {
-        "Authorization": `Bearer ${token}`,
+        [process.argv[2]]: process.argv[3] + credential,
         "anthropic-version": "2023-06-01",
         "User-Agent": "claude-cli/2.1.220"
       }
@@ -253,12 +272,25 @@ defmodule Tightbeam.Harness.Claude do
     });
     """
 
+    # The header NAME and its scheme ride in argv; the credential never does --
+    # it is read from disk inside the script, on the host that owns it.
     request = %{
-      command: ["node", "--no-warnings", "-e", script, Path.join(home, "oauth-token")]
+      command: [
+        "node",
+        "--no-warnings",
+        "-e",
+        script,
+        Path.join(home, "oauth-token"),
+        header,
+        scheme
+      ]
     }
 
     Support.credential_live_result(target, request, opts)
   end
+
+  defp credential_header(:subscription), do: {"Authorization", "Bearer "}
+  defp credential_header(:api_key), do: {"x-api-key", ""}
 
   @impl true
   def install_cli_projection(_cli_bin), do: :ok
@@ -327,33 +359,50 @@ defmodule Tightbeam.Harness.Claude do
   # command line, so none appears in a process table on either machine, and no
   # credential moves between them — only the model list comes back.
   defp catalog_getter(state) do
-    token_path = Path.join([state.base_dir, "auth", "claude", "oauth-token"])
+    kind = Map.fetch!(state, :credential_kind)
+    credential_path = credential_path(state.base_dir)
 
     case Map.get(state, :host_config, %{ssh: nil}).ssh do
-      nil -> local_getter(state, token_path)
-      dest -> {:ok, remote_getter(state, dest, token_path)}
+      nil -> local_getter(state, credential_path, kind)
+      dest -> {:ok, remote_getter(state, dest, credential_path, kind)}
     end
   end
 
-  defp local_getter(state, token_path) do
+  defp local_getter(state, credential_path, kind) do
     fetch = Map.get(state.options, :claude_fetch, &http_get/2)
 
-    with {:ok, raw} <- read_token(token_path),
-         token = String.trim(raw),
-         true <- token != "" do
-      headers = [
-        {~c"authorization", String.to_charlist("Bearer " <> token)},
-        {~c"anthropic-version", ~c"2023-06-01"}
-      ]
-
-      {:ok, fn path -> fetch.(path, headers) end}
+    with {:ok, raw} <- read_token(credential_path),
+         credential = String.trim(raw),
+         true <- credential != "" do
+      {:ok, fn path -> fetch.(path, catalog_headers(kind, credential)) end}
     else
       {:error, reason} -> {:error, reason}
       false -> {:error, :missing_token}
     end
   end
 
-  defp remote_getter(state, dest, token_path) do
+  # Both kinds read the SAME route; only the header differs. Recorded live
+  # 2026-07-28 with deliberately invalid credentials, which is what pins the two
+  # names apart: `x-api-key` answers 401 "API key is invalid." while
+  # `Authorization: Bearer` answers 401 "Invalid bearer token" -- two distinct
+  # code paths on one route, so the header is not interchangeable.
+  #
+  # Charlists because this is httpc's header shape, not ours.
+  defp catalog_headers(:subscription, credential) do
+    [
+      {~c"authorization", String.to_charlist("Bearer " <> credential)},
+      {~c"anthropic-version", ~c"2023-06-01"}
+    ]
+  end
+
+  defp catalog_headers(:api_key, credential) do
+    [
+      {~c"x-api-key", String.to_charlist(credential)},
+      {~c"anthropic-version", ~c"2023-06-01"}
+    ]
+  end
+
+  defp remote_getter(state, dest, credential_path, kind) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
 
     fn path ->
@@ -363,8 +412,8 @@ defmodule Tightbeam.Harness.Claude do
       script = """
       exec 2>&1
       set -eu
-      token=$(cat #{token_path})
-      exec #{Support.catalog_curl("#{@api_base}#{path}", ["authorization: Bearer $token", "anthropic-version: 2023-06-01"])}
+      credential=$(cat #{credential_path})
+      exec #{Support.catalog_curl("#{@api_base}#{path}", curl_headers(kind))}
       """
 
       case Support.catalog_probe(sh, Support.catalog_probe_argv(dest, script)) do
@@ -373,6 +422,16 @@ defmodule Tightbeam.Harness.Claude do
       end
     end
   end
+
+  # `$credential` is expanded by the REMOTE shell, so no credential byte is
+  # interpolated into a command line on either machine -- the property the
+  # subscription probe already had, kept for the API key, which is equally a
+  # secret.
+  defp curl_headers(:subscription),
+    do: ["authorization: Bearer $credential", "anthropic-version: 2023-06-01"]
+
+  defp curl_headers(:api_key),
+    do: ["x-api-key: $credential", "anthropic-version: 2023-06-01"]
 
   # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
   # the already-derived entries — no probe, no extra fetch, nothing at boot; the
@@ -447,11 +506,14 @@ defmodule Tightbeam.Harness.Claude do
       rails_file: "settings.json",
       rails: %{"hooks" => %{"PreToolUse" => []}},
       skills_path: Path.join([".claude", "skills"]),
-      local_extra_env: [{"CLAUDE_CODE_OAUTH_TOKEN", "vector-token"}],
+      local_extra_env: %{
+        subscription: [{"CLAUDE_CODE_OAUTH_TOKEN", "vector-token"}],
+        api_key: [{"ANTHROPIC_API_KEY", "vector-token"}]
+      },
       rails_env: nil,
-      remote_prefix: fn base, home ->
+      remote_prefix: fn base, home, kind ->
         [
-          "CLAUDE_CODE_OAUTH_TOKEN=$(cat #{Path.join([base, "auth", "claude", "oauth-token"])} 2>/dev/null)",
+          "#{credential_env_var(kind)}=$(cat #{Path.join([base, "auth", "claude", "oauth-token"])} 2>/dev/null)",
           "CLAUDE_CONFIG_DIR=#{home}"
         ]
       end,
@@ -511,6 +573,10 @@ defmodule Tightbeam.Harness.Claude do
       ],
       catalog_expected: %{
         "valid" => {:ok, [valid_entry]},
+        # Same route and same response shape for both kinds, so the api-key case
+        # derives the same entry. What it exists to pin is the HEADER, which the
+        # fetch stand-in below asserts.
+        "valid_api_key" => {:ok, [valid_entry]},
         "malformed" => {:error, :malformed_catalog},
         "unavailable" => {:error, :unavailable}
       },
@@ -533,9 +599,19 @@ defmodule Tightbeam.Harness.Claude do
             ]
           })
 
-        fetch = fn _path, _headers ->
+        # The stand-in asserts the header it was called with, so a case cannot
+        # pass while sending the other kind's.
+        fetch = fn _path, headers ->
+          names = Enum.map(headers, fn {name, _value} -> to_string(name) end)
+          expected = if case_name == "valid_api_key", do: "x-api-key", else: "authorization"
+
+          if expected not in names do
+            raise "claude catalog probe sent #{inspect(names)}, expected #{expected}"
+          end
+
           case case_name do
             "valid" -> {:ok, body}
+            "valid_api_key" -> {:ok, body}
             "malformed" -> {:ok, "{}"}
             "unavailable" -> {:error, :unavailable}
           end
@@ -546,7 +622,11 @@ defmodule Tightbeam.Harness.Claude do
         # separate concern with its own tests, so it is disabled here; leaving it on
         # would filter `claude-vector` away and turn a derivation vector into a test
         # of the table.
-        %{base_dir: base, options: %{claude_fetch: fetch, claude_selectable_models: :all}}
+        %{
+          base_dir: base,
+          credential_kind: if(case_name == "valid_api_key", do: :api_key, else: :subscription),
+          options: %{claude_fetch: fetch, claude_selectable_models: :all}
+        }
       end,
       wire_projection: %{
         "id" => "claude",
@@ -568,6 +648,8 @@ defmodule Tightbeam.Harness.Claude do
 
   defp decode_catalog(_body), do: {:error, :malformed_catalog}
 
+  # Reads the active credential of EITHER kind. The name and its two reasons are
+  # load-bearing -- doctor and the catalog tests match on them -- so they stay.
   defp read_token(path) do
     case File.read(path) do
       {:ok, token} -> {:ok, token}

@@ -190,9 +190,12 @@ defmodule Tightbeam.Harness.Fixture do
       rails_file: "fixture.rails",
       rails: %{"fixture" => true},
       skills_path: Path.join([".fixture", "skills"]),
-      local_extra_env: [],
+      # Kind-invariant by construction: the fixture harness has no vendor and no
+      # credential to carry, so both kinds render the same plan. Stated rather
+      # than exempted, so the contract stays uniform across the registry.
+      local_extra_env: %{subscription: [], api_key: []},
       rails_env: nil,
-      remote_prefix: fn _base, home -> ["FIXTURE_HOME=#{home}"] end,
+      remote_prefix: fn _base, home, _kind -> ["FIXTURE_HOME=#{home}"] end,
       remote_rails_env: nil,
       railed_probe: false,
       adapter_bin: "fixture-acp",
@@ -233,6 +236,8 @@ defmodule Tightbeam.Harness.Fixture do
       ],
       catalog_expected: %{
         "valid" => {:ok, [valid_entry]},
+        # No vendor, so no per-kind route: the fixture answers identically.
+        "valid_api_key" => {:ok, [valid_entry]},
         "malformed" => {:error, :malformed_catalog},
         "unavailable" => {:error, :fixture_unavailable}
       },
@@ -240,12 +245,13 @@ defmodule Tightbeam.Harness.Fixture do
         fetch = fn ->
           case case_name do
             "valid" -> {:ok, :valid}
+            "valid_api_key" -> {:ok, :valid}
             "malformed" -> {:ok, :malformed}
             "unavailable" -> {:error, :fixture_unavailable}
           end
         end
 
-        %{options: %{fixture_fetch: fetch}}
+        %{credential_kind: :subscription, options: %{fixture_fetch: fetch}}
       end,
       wire_projection: %{
         "id" => "fixture",

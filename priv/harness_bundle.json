@@ -59,12 +59,16 @@
   "vector_contract": {
     "prepare_launch": {
       "required_cases": [
-        "local_railed",
-        "local_lawless",
-        "remote_railed",
-        "remote_lawless"
+        "local_railed_subscription",
+        "local_railed_api_key",
+        "local_lawless_subscription",
+        "local_lawless_api_key",
+        "remote_railed_subscription",
+        "remote_railed_api_key",
+        "remote_lawless_subscription",
+        "remote_lawless_api_key"
       ],
-      "oracle": "rendered plan env, argv, and serialized command equal the vector's expected form"
+      "oracle": "rendered plan env, argv, and serialized command equal the vector's expected form for the host's credential kind"
     },
     "ensure_adapter": {
       "required_cases": [
@@ -157,6 +161,7 @@
     "fetch_catalog": {
       "required_cases": [
         "valid",
+        "valid_api_key",
         "malformed",
         "unavailable"
       ],

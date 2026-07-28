@@ -369,6 +369,34 @@ defmodule Tightbeam.ModelCatalogTest do
     end)
   end
 
+  # The kind resolver falls back to `:subscription` when the lifecycle owner is
+  # unreachable (`default_credential_kind/2`), and that fallback must never
+  # become load-bearing: the GATE is `credential_status`, which refuses the same
+  # condition one line earlier. This is the test that keeps the two apart — if
+  # someone ever loosens the status default the way #21 did, this goes red rather
+  # than a catalog quietly deriving against a guessed kind.
+  test "an unreachable lifecycle owner is refused by the gate, not routed by the kind fallback",
+       ctx do
+    gated = unique_name(:gated_catalog)
+
+    start_supervised!(
+      {ModelCatalog,
+       name: gated,
+       base_dir: ctx.base_dir,
+       sh: fn _command -> raise "no probe may run: the credential gate must refuse first" end,
+       claude_fetch: fn _path, _headers ->
+         raise "no probe may run: the credential gate must refuse first"
+       end}
+    )
+
+    for harness <- ["claude", "codex"] do
+      await(fn ->
+        ModelCatalog.member?(@host, harness, "anything", gated).health ==
+          {:unavailable, {:needs_onboarding, :credential_server_unavailable}}
+      end)
+    end
+  end
+
   test "failed fetch, malformed JSON, and a refused grant degrade without crashing readers",
        ctx do
     for {label, opts, harness, reason} <- [
@@ -548,16 +576,18 @@ defmodule Tightbeam.ModelCatalogTest do
       {local, :fresh} = ModelCatalog.get(@host, "claude", catalog)
       refute Enum.any?(local, &(&1.ref == "satellite-only"))
 
-      # The eurisko method: the token is read by the shell ON the owning host, so
-      # no byte of it is in the argv, and each script says so literally.
+      # The eurisko method: the credential is read by the shell ON the owning
+      # host, so no byte of it is in the argv, and each script says so literally.
+      # The shell variable is `credential`, not `token`: this file holds whichever
+      # KIND the host was onboarded on.
       claude = probe_command!(:claude)
       claude_line = Enum.join(claude, " ")
       refute claude_line =~ @claude_secret
 
       assert claude_line =~
-               "token=$(cat #{Path.join([ctx.satellite_base, "auth", "claude", "oauth-token"])})"
+               "credential=$(cat #{Path.join([ctx.satellite_base, "auth", "claude", "oauth-token"])})"
 
-      assert claude_line =~ ~s(-H "authorization: Bearer $token")
+      assert claude_line =~ ~s(-H "authorization: Bearer $credential")
       assert ["ssh" | claude_rest] = claude
       assert "sat.example" in claude_rest
 

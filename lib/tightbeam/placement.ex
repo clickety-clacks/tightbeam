@@ -819,6 +819,7 @@ defmodule Tightbeam.Placement do
         remote_env: remote_env,
         lineage: lineage,
         rails: Rails.hook_settings(),
+        credential_kind: credential_kind(config, module.credential_provider(), host),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)
       )
@@ -1076,6 +1077,44 @@ defmodule Tightbeam.Placement do
   end
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
+
+  defp credential_kind(%{credential_kind: kind}, _provider, _host)
+       when is_atom(kind),
+       do: kind
+
+  defp credential_kind(%{credential_kind: kind}, provider, _host)
+       when is_function(kind, 1),
+       do: kind.(provider)
+
+  defp credential_kind(%{credential_kind: kind}, provider, host)
+       when is_function(kind, 2),
+       do: kind.(provider, host)
+
+  # Same seam shape as the gateway's and the catalog's credential reads: an
+  # injected value or fun wins, otherwise the machine's own lifecycle owner is
+  # asked.
+  #
+  # An unresolvable kind falls back to `:subscription` — the ONLY kind that
+  # existed before this invariant — so the fallback reproduces today's behaviour
+  # rather than inventing a new failure. It is not a credential gate: spawn
+  # already refused a host whose credential needs onboarding
+  # (`Gateway.validate_credential/3`), so by the time a launch runs there is a
+  # credential and it has a recorded kind. Reaching the fallback means a race or
+  # a test harness, and in both the old behaviour is the right one.
+  defp credential_kind(_config, provider, host) do
+    server = Tightbeam.Credentials.server(host)
+
+    case GenServer.whereis(server) do
+      nil ->
+        :subscription
+
+      _pid ->
+        case Tightbeam.Credentials.kind(provider, server) do
+          :none -> :subscription
+          kind -> kind
+        end
+    end
+  end
 
   defp system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
   defp system_cmd_out([command | args]), do: System.cmd(command, args)

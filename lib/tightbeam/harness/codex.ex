@@ -6,10 +6,25 @@ defmodule Tightbeam.Harness.Codex do
 
   @adapter_version "1.1.4"
   @adapter_package "codex-acp"
-  # Recorded live 2026-07-28 against codex-cli 0.145.0. The platform route
-  # (api.openai.com/v1/models) is CLOSED to this token — 403, missing scope
-  # `api.model.read` — so do not "fix" this to the obvious URL.
+  # Two routes, one per credential kind, because they are two different accounts'
+  # worth of entitlement expressed two different ways.
+  #
+  # SUBSCRIPTION — recorded live 2026-07-28 against codex-cli 0.145.0. The
+  # platform route is CLOSED to a ChatGPT token: 403, missing scope
+  # `api.model.read`. Do not "fix" this to the obvious URL.
   @models_url "https://chatgpt.com/backend-api/codex/models"
+
+  # API KEY — the platform route, which the subscription token was refused for by
+  # name. Recorded 2026-07-28 with a deliberately invalid key: 401
+  # `invalid_api_key`, an AUTHENTICATION failure, not the subscription token's
+  # 403 authorization failure. That contrast is the evidence the route treats API
+  # keys as first-class.
+  #
+  # UNVERIFIED WITH A VALID KEY as of 2026-07-28. Two things below rest on
+  # documentation rather than observation: `derive_platform_entries/1`'s response
+  # shape, and whether codex-acp runs a turn on api-key auth at all. If this
+  # branch misbehaves, PROBE IT before editing it.
+  @api_models_url "https://api.openai.com/v1/models"
   @adapter_bundle "index.js"
   @adapter_replacements [
     {
@@ -220,7 +235,18 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def credential_live?(target, home, opts) do
-    script = """
+    script = liveness_script(Keyword.fetch!(opts, :credential_kind))
+    request = %{command: ["node", "--no-warnings", "-e", script, Path.join(home, "auth.json")]}
+    Support.credential_live_result(target, request, opts)
+  end
+
+  # The cheapest authenticated call each kind CAN make. A subscription cannot
+  # reach the platform route (403, missing `api.model.read`) and an API key
+  # cannot reach the ChatGPT account route, so there is no single probe that
+  # serves both — liveness is kind-shaped all the way down. This is what
+  # docs/SMOKE.md P2 promises; the two must move together.
+  defp liveness_script(:subscription) do
+    """
     const fs = require("node:fs");
     const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     fetch("https://chatgpt.com/backend-api/wham/accounts/check", {
@@ -229,7 +255,26 @@ defmodule Tightbeam.Harness.Codex do
         "ChatGPT-Account-ID": auth.tokens.account_id,
         "User-Agent": "codex_cli_rs/0.145.0"
       }
-    }).then(async response => {
+    })#{liveness_tail()}
+    """
+  end
+
+  defp liveness_script(:api_key) do
+    """
+    const fs = require("node:fs");
+    const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    fetch("#{@api_models_url}", {
+      headers: {
+        "Authorization": `Bearer ${auth.OPENAI_API_KEY}`,
+        "User-Agent": "codex_cli_rs/0.145.0"
+      }
+    })#{liveness_tail()}
+    """
+  end
+
+  defp liveness_tail do
+    """
+    .then(async response => {
       process.stdout.write(JSON.stringify({
         status: response.status,
         headers: {"content-type": response.headers.get("content-type")},
@@ -240,9 +285,6 @@ defmodule Tightbeam.Harness.Codex do
       process.exitCode = 70;
     });
     """
-
-    request = %{command: ["node", "--no-warnings", "-e", script, Path.join(home, "auth.json")]}
-    Support.credential_live_result(target, request, opts)
   end
 
   @impl true
@@ -335,15 +377,18 @@ defmodule Tightbeam.Harness.Codex do
   # expands both — so no credential transits and none appears in a process table.
   @impl true
   def fetch_catalog(state) do
-    case probe(state) do
+    kind = Map.fetch!(state, :credential_kind)
+
+    case probe(state, kind) do
       {:ok, body, trailer} ->
-        with {:ok, models} <- decode_catalog(body),
-             {:ok, entries} <- derive_catalog_entries(models),
+        with {:ok, models} <- decode_catalog(kind, body),
+             {:ok, entries} <- derive_catalog_entries(kind, models),
+             entries <- keep_selectable(entries, selectable_models(state)),
              entries when entries != [] <- entries do
           {:ok, entries}
         else
           {:error, reason} -> {:error, reason}
-          [] -> {:error, {:empty_catalog_for_client_version, client_version(trailer)}}
+          [] -> {:error, empty_catalog_reason(kind, trailer)}
           _ -> {:error, :malformed_catalog}
         end
 
@@ -352,7 +397,16 @@ defmodule Tightbeam.Harness.Codex do
     end
   end
 
-  defp probe(state) do
+  # An empty answer means two different things on the two routes, and saying the
+  # wrong one sends the operator after the wrong fix. Only the account route
+  # filters by client version (see `probe_script/2`); the platform route has no
+  # such filter, so blaming a version there would be a fabricated diagnosis.
+  defp empty_catalog_reason(:subscription, trailer),
+    do: {:empty_catalog_for_client_version, client_version(trailer)}
+
+  defp empty_catalog_reason(:api_key, _trailer), do: :empty_inventory
+
+  defp probe(state, kind) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
     auth = Path.join([state.base_dir, "auth", "codex", "auth.json"])
 
@@ -360,10 +414,10 @@ defmodule Tightbeam.Harness.Codex do
     |> Support.catalog_probe(
       Support.catalog_probe_argv(
         Map.get(state, :host_config, %{ssh: nil}).ssh,
-        probe_script(auth)
+        probe_script(kind, auth)
       )
     )
-    |> classify_extraction(auth)
+    |> classify_extraction(kind, auth)
   end
 
   # Codex owns `auth.json` and rewrites it IN PLACE as it rotates (established
@@ -375,25 +429,38 @@ defmodule Tightbeam.Harness.Codex do
   # repair it would imply (re-onboard) is both wrong and destructive of a working
   # login. The extraction step exits on a distinct code per state so the three
   # cannot collapse into one opaque failure.
-  defp classify_extraction({:error, {:probe_failed, 66, _output}}, auth),
+  defp classify_extraction({:error, {:probe_failed, 66, _output}}, _kind, auth),
     do: {:error, {:missing_credential, auth}}
 
-  defp classify_extraction({:error, {:probe_failed, 75, _output}}, _auth),
+  # 75 is structurally near-impossible on an api-key host, and the branch stays
+  # anyway. A torn read needs a concurrent in-place REWRITER, and an API key has
+  # none: it is static, with no refresh and no single-writer constraint — the
+  # same fact that removes codex's shared-runtime anchor on such a host. A
+  # hand-run `codex login` is still a writer, so the state stays reachable and
+  # stays retryable.
+  defp classify_extraction({:error, {:probe_failed, 75, _output}}, _kind, _auth),
     do: {:error, {:credential_read_torn, :retry_next_refresh}}
 
-  defp classify_extraction({:error, {:probe_failed, 67, _output}}, auth),
+  # The 67 reason names the field the host was supposed to hold. An api-key host
+  # has no `access_token` to be missing, and saying it did would send the
+  # operator hunting the wrong key in the right file.
+  defp classify_extraction({:error, {:probe_failed, 67, _output}}, :subscription, auth),
     do: {:error, {:credential_missing_access_token, auth}}
 
-  defp classify_extraction(result, _auth), do: result
+  defp classify_extraction({:error, {:probe_failed, 67, _output}}, :api_key, auth),
+    do: {:error, {:credential_missing_api_key, auth}}
 
-  # `client_version` is a SILENT filter: every model carries a
-  # `minimal_client_version` and the server drops the ones the caller is too old
-  # for — returning 200 with an EMPTY list, not an error. So the version must be
-  # the one the `codex` binary on THAT host reports (it is an operator
+  defp classify_extraction(result, _kind, _auth), do: result
+
+  # `client_version` is a SILENT filter ON THIS BRANCH ONLY: every model carries
+  # a `minimal_client_version` and the account route drops the ones the caller is
+  # too old for — returning 200 with an EMPTY list, not an error. So the version
+  # must be the one the `codex` binary on THAT host reports (it is an operator
   # prerequisite there, #76). A constant in our source would filter the catalog
   # to nothing and blame the account. It rides back on the status line so the
-  # refusal can name the version that produced an empty answer.
-  defp probe_script(auth_path) do
+  # refusal can name the version that produced an empty answer. The platform
+  # route has no such filter — see the api-key clause below.
+  defp probe_script(:subscription, auth_path) do
     # Exit codes are sysexits: 66 EX_NOINPUT (no readable auth.json — a real
     # "this host holds no grant"), 75 EX_TEMPFAIL (present but unparseable — a
     # torn read, transient), 67 EX_NOUSER (parsed, but carries no access token —
@@ -418,6 +485,36 @@ defmodule Tightbeam.Harness.Codex do
     set -eu
     token=$(node -e '#{node_program}')
     raw=$(codex --version)
+    exec #{curl}
+    """
+  end
+
+  # No `codex --version` here, and no trailer: `client_version` is the ACCOUNT
+  # route's silent filter and the platform route does not have it. Asking the
+  # host for a version it will not use would turn "codex is not on this PATH"
+  # into a catalog failure.
+  #
+  # The key comes from `auth.json`'s own `OPENAI_API_KEY` — the native field
+  # codex writes and reads in api-key mode, null under a subscription. Same
+  # sysexits contract as the subscription branch (66 no readable file, 75 torn,
+  # 67 parsed but no usable key), so the three states stay apart here too; an
+  # api-key host must not be the one place a torn read reports as a bad
+  # credential. As on the other branch the credential is expanded by the REMOTE
+  # shell and never appears in a command line on either machine.
+  defp probe_script(:api_key, auth_path) do
+    node_program =
+      ~s|const fs=require("fs");let raw;| <>
+        ~s|try{raw=fs.readFileSync("#{auth_path}","utf8")}catch(e){process.exit(66)}| <>
+        ~s|let d;try{d=JSON.parse(raw)}catch(e){process.exit(75)}| <>
+        ~s|const k=d?d.OPENAI_API_KEY:undefined;| <>
+        ~s|if(!(typeof k==="string"&&k.length)){process.exit(67)}process.stdout.write(k)|
+
+    curl = Support.catalog_curl(@api_models_url, [~s|authorization: Bearer $token|])
+
+    """
+    exec 2>&1
+    set -eu
+    token=$(node -e '#{node_program}')
     exec #{curl}
     """
   end
@@ -453,9 +550,12 @@ defmodule Tightbeam.Harness.Codex do
       rails_file: "hooks.json",
       rails: %{"hooks" => %{"PreToolUse" => []}},
       skills_path: Path.join([".codex", "skills"]),
-      local_extra_env: [],
+      # Identical under both kinds on purpose: codex reads its credential out of
+      # auth.json itself, so its launch plan does not vary by kind. The vector
+      # exists to keep that true.
+      local_extra_env: %{subscription: [], api_key: []},
       rails_env: {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})},
-      remote_prefix: fn _base, home -> ["CODEX_HOME=#{home}"] end,
+      remote_prefix: fn _base, home, _kind -> ["CODEX_HOME=#{home}"] end,
       remote_rails_env: "CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'",
       railed_probe: true,
       adapter_bin: "codex-acp",
@@ -518,6 +618,22 @@ defmodule Tightbeam.Harness.Codex do
       ],
       catalog_expected: %{
         "valid" => {:ok, [valid_entry]},
+        # A DIFFERENT route answering in a DIFFERENT shape, so a different
+        # derivation: bare id, no effort tiers, no context window — everything
+        # the platform route does not tell us. See `derive_platform_entries/1`.
+        "valid_api_key" =>
+          {:ok,
+           [
+             %{
+               ref: "codex-vector",
+               display_name: "codex-vector",
+               name: "codex-vector",
+               efforts: [],
+               max_input_tokens: nil,
+               capabilities: %{},
+               provider: :openai
+             }
+           ]},
         "malformed" => {:error, :malformed_catalog},
         # The vendor's own sentence for a grant that needs signing in again — the
         # probe carries the 401 BODY, not just the code, because that is what the
@@ -543,10 +659,30 @@ defmodule Tightbeam.Harness.Codex do
         # One HTTPS call made BY the owning host, so the seam is the runner and
         # the vector is a RESPONSE: body, then curl's status on a trailing line,
         # then the `codex --version` that decided what the server would list.
-        sh = fn _command ->
+        sh = fn command ->
+          script = Enum.join(command, " ")
+
           case case_name do
             "valid" ->
               {body <> "\n200 0.145.0", 0}
+
+            # Asserting the SCRIPT, not just the parse: this case exists to pin
+            # the route and the credential field, and a stand-in that answered
+            # regardless would pass while the probe called the wrong endpoint.
+            "valid_api_key" ->
+              unless String.contains?(script, "api.openai.com/v1/models") do
+                raise "codex api-key probe did not call the platform route: #{script}"
+              end
+
+              unless String.contains?(script, "OPENAI_API_KEY") do
+                raise "codex api-key probe did not read the native api-key field: #{script}"
+              end
+
+              if String.contains?(script, "codex --version") do
+                raise "codex api-key probe asked for a client_version the route ignores"
+              end
+
+              {~s({"data":[{"id":"codex-vector","object":"model"}]}) <> "\n200", 0}
 
             "malformed" ->
               {"{}\n200 0.145.0", 0}
@@ -557,7 +693,11 @@ defmodule Tightbeam.Harness.Codex do
           end
         end
 
-        %{base_dir: base, options: %{sh: sh}}
+        %{
+          base_dir: base,
+          credential_kind: if(case_name == "valid_api_key", do: :api_key, else: :subscription),
+          options: %{sh: sh}
+        }
       end,
       wire_projection: %{
         "id" => "codex",
@@ -569,17 +709,25 @@ defmodule Tightbeam.Harness.Codex do
     })
   end
 
-  defp decode_catalog(body) when is_binary(body) do
+  defp decode_catalog(kind, body) when is_binary(body) do
+    envelope = catalog_envelope(kind)
+
     case JSON.decode(body) do
-      {:ok, %{"models" => models}} when is_list(models) -> {:ok, models}
+      {:ok, %{^envelope => models}} when is_list(models) -> {:ok, models}
       {:ok, _} -> {:error, :malformed_catalog}
       {:error, _} -> {:error, :malformed_json}
     end
   end
 
-  defp decode_catalog(_body), do: {:error, :malformed_catalog}
+  defp decode_catalog(_kind, _body), do: {:error, :malformed_catalog}
 
-  defp derive_catalog_entries(models) do
+  defp catalog_envelope(:subscription), do: "models"
+  defp catalog_envelope(:api_key), do: "data"
+
+  defp derive_catalog_entries(:subscription, models), do: derive_account_entries(models)
+  defp derive_catalog_entries(:api_key, models), do: derive_platform_entries(models)
+
+  defp derive_account_entries(models) do
     Enum.reduce_while(models, {:ok, []}, fn
       %{
         "slug" => slug,
@@ -623,6 +771,60 @@ defmodule Tightbeam.Harness.Codex do
       }
     end)
   end
+
+  # The platform route answers in the PLATFORM's shape, not the codex account
+  # route's: `{"data": [{"id": …, "object": "model", …}]}`. No display name, no
+  # `supported_reasoning_levels`, no context window. So this is a SECOND
+  # derivation, not a second decoder feeding one, and the catalog it produces is
+  # honestly thinner: bare ids, no effort tiers, no token ceiling. A session on
+  # such a catalog reports `canChangeReasoning: false`, which is correct —
+  # nothing here knows what efforts the model offers, and inventing tiers would
+  # advertise a control that does not work.
+  #
+  # UNVERIFIED (2026-07-28): this shape is documented, not observed. If an
+  # api-key host reports `:malformed_catalog`, capture the actual body BEFORE
+  # editing this.
+  defp derive_platform_entries(models) do
+    Enum.reduce_while(models, {:ok, []}, fn
+      %{"id" => id}, {:ok, entries} when is_binary(id) and id != "" ->
+        {:cont,
+         {:ok,
+          entries ++
+            [
+              %{
+                ref: id,
+                display_name: id,
+                name: id,
+                efforts: [],
+                max_input_tokens: nil,
+                capabilities: %{},
+                provider: :openai
+              }
+            ]}}
+
+      _model, _entries ->
+        {:halt, {:error, :malformed_catalog}}
+    end)
+  end
+
+  # The platform route returns the whole account's model universe — embeddings,
+  # audio, image models — and nothing here knows which of them codex will accept
+  # at `session/set_config_option`. The account route never had this problem: it
+  # only ever returned codex models.
+  #
+  # Injectable through the same `state.options` seam claude's pin uses, and
+  # `:all` by default: the honest answer is "everything the key can see", and
+  # narrowing it is an ORG's statement about its own account, not a guess this
+  # module can make from how a model id is SPELLED. A spelling heuristic that
+  # dropped a usable model would be the same silent substitution
+  # `harness/claude.ex` refuses.
+  defp selectable_models(state),
+    do: Map.get(state.options, :codex_selectable_models, :all)
+
+  defp keep_selectable(entries, :all), do: entries
+
+  defp keep_selectable(entries, selectable),
+    do: Enum.filter(entries, fn entry -> entry.ref in selectable end)
 
   defp adapter_binary(target) do
     # One path for both localities, as fixture.ex already does: the adapter lives

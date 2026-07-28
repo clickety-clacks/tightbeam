@@ -169,7 +169,10 @@ defmodule Tightbeam.ClientE2E do
   `scripts/check_harness_seam.sh` enforces.
 
   The harness's `credential_live?/3` callback performs the bounded authenticated
-  probe. Its result mapping is closed: `:live` passes after catalog readiness is
+  probe, against the route and header its host's credential KIND can actually
+  reach — the kind is read from the credential store here and handed to the
+  callback, because no single call authenticates both kinds.
+  Its result mapping is closed: `:live` passes after catalog readiness is
   confirmed, `{:dead, reason}` fails, and `{:unknown, reason}` is INCOMPLETE —
   never a pass.
   """
@@ -187,7 +190,14 @@ defmodule Tightbeam.ClientE2E do
   defp probe_credential(module, step, label, base_dir, opts) do
     home = Tightbeam.Homes.home_path(base_dir, Tightbeam.Placement.local_host_name(), module.id())
     target = target(base_dir, opts)
-    opts = Keyword.put_new(opts, :transport, &Tightbeam.Harness.Support.credential_transport/2)
+
+    opts =
+      opts
+      |> Keyword.put_new(:transport, &Tightbeam.Harness.Support.credential_transport/2)
+      |> Keyword.put_new(
+        :credential_kind,
+        Tightbeam.Credentials.kind_at(base_dir, module.credential_provider())
+      )
 
     cond do
       not module.credential_ready?(target, home) ->
@@ -195,6 +205,17 @@ defmodule Tightbeam.ClientE2E do
           step,
           label,
           "the harness reports its credential store is not ready in #{base_dir}"
+        )
+
+      # A credential with no recorded kind cannot be probed: the two kinds take
+      # different routes and different headers, so there is no neutral call to
+      # make. A real preflight failure with a real remedy, not a reason to guess.
+      Keyword.fetch!(opts, :credential_kind) == :none ->
+        Scorecard.fail(
+          step,
+          label,
+          "the credential store in #{base_dir} records no credential kind for " <>
+            "#{module.credential_provider()}; re-run onboarding so the metadata records it"
         )
 
       true ->
@@ -212,7 +233,14 @@ defmodule Tightbeam.ClientE2E do
   end
 
   defp grade_live(module, step, label, base_dir, opts) do
-    case module.fetch_catalog(target(base_dir, opts)) do
+    catalog_target =
+      Map.put(
+        target(base_dir, opts),
+        :credential_kind,
+        Keyword.fetch!(opts, :credential_kind)
+      )
+
+    case module.fetch_catalog(catalog_target) do
       {:ok, [_ | _]} ->
         Scorecard.pass(step, label,
           note: "credential store ready; authenticated liveness probe returned :live"
