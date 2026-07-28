@@ -17,16 +17,23 @@
 //! character an earlier frame put there. Rejoining full-width rows undoes (2).
 //!
 //! The width is taken from the transcript rather than from any terminal: it is the
-//! longest row the replay produced. That is exact in the only case where it matters,
-//! and the argument is self-supporting. Nothing can be wider than the terminal, so the
-//! longest row is never an over-estimate; and IF the token wrapped, then its own first
-//! row is exactly the terminal width, so the token pins the width itself. The OAuth URL
-//! (~250 characters, always displayed) usually pins it too, but nothing relies on that
-//! — if a future claude stopped displaying the URL, this inference would not weaken.
+//! longest row the replay produced. Nothing can be wider than the terminal, so it is
+//! never an over-estimate, and it rejoins ordinary wrapped prose correctly.
 //!
-//! An under-estimate is the only dangerous direction, and it cannot happen while the
-//! token wraps. If the token does NOT wrap, no rejoining occurs and the width is not
-//! consulted for anything that matters.
+//! It does NOT pin the token. A screen has more than one wrapping width: the OAuth URL
+//! is unboxed and wraps at the terminal, while the token panel wraps at its own content
+//! width, which is narrower. So the token's first row can be SHORTER than the widest row
+//! on screen — at which point the width-based rejoin does not fire, the token's rows stay
+//! separate, and the first of them is by itself a well-formed `sk-ant-oat…` string of
+//! plausible length. That is the dangerous shape: not a malformed token that fails a
+//! check, but a truncated one that passes every check there is and 401s a month later.
+//! Measured headlessly (`stty size` = 0 0, TERM unset) it banked 79 characters of a
+//! 108-character token and reported success.
+//!
+//! So the token is reassembled from its OWN rows: consecutive rows made only of token
+//! characters, terminated by the blank row that claude's `gap:1` panel always leaves
+//! after it. The single inferred width still does the prose, and no longer decides the
+//! credential.
 //!
 //! Taking the width from `ioctl(TIOCGWINSZ)` was the obvious alternative and is worse:
 //! it assumes how `script(1)` sizes the child pty, which differs between BSD and
@@ -185,6 +192,18 @@ pub fn displayed_lines(transcript: &[u8]) -> Vec<String> {
     let mut lines = Vec::new();
     let mut wrapped = String::new();
     for row in rows {
+        // A BLANK row is a gap, never a continuation, so it ends the run it follows and
+        // survives as a line of its own. Absorbing it as a run's terminator — which is
+        // what happens to any row that is not full width — loses it exactly when the run
+        // ended flush at the width, and the gap after the token is load-bearing.
+        if row.is_empty() {
+            if !wrapped.is_empty() {
+                lines.push(std::mem::take(&mut wrapped));
+            }
+            lines.push(String::new());
+            continue;
+        }
+
         let continues = width > 0 && row.chars().count() == width;
         wrapped.push_str(&row);
         if !continues {
@@ -219,12 +238,36 @@ pub fn displayed_lines(transcript: &[u8]) -> Vec<String> {
 /// with `refusal_reason` saying exactly that, rather than welding the next line onto the
 /// token.
 pub fn capture_setup_token(transcript: &[u8]) -> Option<String> {
-    displayed_lines(transcript)
-        .iter()
-        .rev()
-        .map(|line| line.trim())
-        .find(|line| is_bare_token(line))
-        .map(str::to_owned)
+    let lines = displayed_lines(transcript);
+    let start = lines.iter().rposition(|line| is_bare_token(line.trim()))?;
+
+    // The token's own rows, not the screen's. `displayed_lines` rejoins on ONE width --
+    // the widest row anywhere -- so it only reunites the token when the token wrapped at
+    // that same width. When the panel wraps narrower than the widest row on screen, the
+    // token's first row is short of that width, no rejoin happens, and the orphaned first
+    // row is ITSELF a well-formed bare token. Nothing downstream can tell it from a whole
+    // one. Continuing across adjacent token-character rows is what closes that: they are
+    // the remainder, and gap:1 means nothing else is ever adjacent.
+    let mut end = start;
+    while lines
+        .get(end + 1)
+        .is_some_and(|line| is_token_run(line.trim()))
+    {
+        end += 1;
+    }
+
+    // gap:1 again, now as a COMPLETENESS check rather than a decidability one: a whole
+    // token is always followed by a blank row, or by the end of the screen. Anything else
+    // sharing the token's neighbourhood means the reconstruction is not what was
+    // displayed, and a token wrong by one character banks fine and fails later as an auth
+    // error nobody traces back here.
+    match lines.get(end + 1) {
+        None => {}
+        Some(next) if next.trim().is_empty() => {}
+        Some(_) => return None,
+    }
+
+    Some(lines[start..=end].iter().map(|line| line.trim()).collect())
 }
 
 /// Why capture refused, for the operator who has to act on it.
@@ -263,6 +306,12 @@ pub fn refusal_reason(transcript: &[u8]) -> String {
 
 fn is_bare_token(line: &str) -> bool {
     line.starts_with("sk-ant-oat") && line.chars().all(is_token_character)
+}
+
+/// A row that could be the tail of a token split across rows: token characters and
+/// nothing else. Blank is excluded — a blank row is the gap that ENDS the token.
+fn is_token_run(line: &str) -> bool {
+    !line.is_empty() && line.chars().all(is_token_character)
 }
 
 fn is_token_character(character: char) -> bool {
@@ -760,5 +809,63 @@ mod tests {
         assert!(welded.contains("carried more than the token"), "{welded}");
         assert!(welded.contains("wrapped across rows"), "{welded}");
         assert!(welded.contains("different width"), "{welded}");
+    }
+
+    /// A screen that wraps at TWO widths, which is what a real headless ceremony renders.
+    ///
+    /// Measured on the failing run: the pty reported `stty size` = `0 0` with TERM unset,
+    /// the TUI fell back to 80 columns, and the OAuth URL hard-wrapped at exactly 80. The
+    /// token panel does not wrap at 80 — it wraps at its own narrower content width, so
+    /// the token's first row is short of the widest row on screen and the width-based
+    /// rejoin never fires.
+    ///
+    /// The assertion is the EXACT token, not a well-formed one. That distinction is the
+    /// whole defect: what shipped banked a 79-character prefix that starts with
+    /// `sk-ant-oat`, is made entirely of token characters, and is wrong. Every weaker
+    /// assertion — starts_with, is_bare_token, "looks like a token" — passes on it.
+    #[test]
+    fn a_token_panel_narrower_than_the_widest_row_is_reassembled_whole() {
+        // One column of difference is enough, and is the margin that actually bit.
+        for content in [79usize, 76, 60, 40] {
+            let mut screen = String::new();
+            for chunk in URL.chars().collect::<Vec<_>>().chunks(80) {
+                screen.push_str(&chunk.iter().collect::<String>());
+                screen.push_str("\r\r\n");
+            }
+            screen.push_str("\r\r\n");
+            for chunk in TOKEN.chars().collect::<Vec<_>>().chunks(content) {
+                screen.push_str(&chunk.iter().collect::<String>());
+                screen.push_str("\r\r\n");
+            }
+            // gap:1 — the blank row that says the token ended here.
+            screen.push_str("\r\r\n");
+            screen.push_str("Store this token securely.\r\r\n");
+
+            let captured = capture_setup_token(screen.as_bytes());
+            assert_eq!(captured.as_deref(), Some(TOKEN), "content width {content}");
+            assert_eq!(
+                captured.map(|token| token.chars().count()),
+                Some(108),
+                "content width {content}: a truncated token is well-formed, so the LENGTH \
+                 is what has to be asserted"
+            );
+        }
+    }
+
+    /// The refusal has to fire on a screen that is genuinely undecidable. Tonight proved
+    /// it can silently not fire: capture returned a truncated token, so nothing refused,
+    /// no failure log was written, and a dead credential was banked as onboarded.
+    #[test]
+    fn an_ambiguous_screen_refuses_rather_than_banking_something_token_shaped() {
+        // Token characters continue past the token with no gap row: the reconstruction
+        // cannot say where the credential ended, so it must not guess.
+        let welded = format!("{TOKEN}\r\n0123456789abcdef\r\nStore this token securely.\r\n");
+        assert_eq!(capture_setup_token(welded.as_bytes()), None);
+
+        // And the operator is told which situation it was, and that it is recoverable.
+        let reason = refusal_reason(welded.as_bytes());
+        assert!(reason.contains("sk-ant-oat"), "{reason}");
+        assert!(reason.contains("carried more than the token"), "{reason}");
+        assert!(reason.contains("different width"), "{reason}");
     }
 }
