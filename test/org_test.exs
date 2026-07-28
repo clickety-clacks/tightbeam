@@ -188,6 +188,7 @@ defmodule Tightbeam.OrgTest do
                default_model: "claude-fable-5",
                max_live_sessions_per_user: 50,
                wake_tick_ms: 1_000,
+               onboarding_lease_ms: 1_800_000,
                db: db,
                harness_binary_probe: fn harness, _cli_bin ->
                  {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}

@@ -158,6 +158,7 @@ defmodule Tightbeam.AttentionTierTest do
       default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
+      onboarding_lease_ms: 1_800_000,
       db: db,
       credential_status: fn _ -> :onboarded end,
       patch_adapter: fn _harness, _path -> :ok end

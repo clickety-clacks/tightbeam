@@ -1121,6 +1121,7 @@ defmodule Tightbeam.Wire.RouterTest do
         default_harness: :claude,
         default_model: "fable",
         max_live_sessions_per_user: 50,
+        onboarding_lease_ms: 1_800_000,
         sh: fn _command -> {"", 0} end
       })["register-host"]
 

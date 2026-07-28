@@ -691,6 +691,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
       default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
+      onboarding_lease_ms: 1_800_000,
       db: db,
       effort_checkin_horizon_ms: 1,
       credential_status: fn _provider -> :onboarded end,

@@ -2556,6 +2556,7 @@ defmodule Tightbeam.ConformanceSupport do
         default_model: "test",
         max_live_sessions_per_user: 50,
         wake_tick_ms: 1_000,
+        onboarding_lease_ms: 1_800_000,
         # Adapter patching has its own tests; this contract is about remedy
         # dispatch, and the staged adapter is a stub with no real bundle.
         patch_adapter: fn _harness, _path -> :ok end,

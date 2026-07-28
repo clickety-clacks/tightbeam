@@ -130,7 +130,8 @@ defmodule Tightbeam.Gateway do
           adjudication_claim_window_ms: pos_integer(),
           adjudication_response_window_ms: pos_integer(),
           adjudication_park_fallback_ms: pos_integer(),
-          critical_lease_hard_cap_ms: pos_integer()
+          critical_lease_hard_cap_ms: pos_integer(),
+          onboarding_lease_ms: pos_integer()
         }
 
   @doc """
@@ -422,6 +423,10 @@ defmodule Tightbeam.Gateway do
         end,
         publish_sessions: fn captured, transition ->
           publish_credential_sessions(db, captured, transition)
+        end,
+        onboarding_lease_ms: config.onboarding_lease_ms,
+        log_event: fn kind, subject, detail ->
+          Tightbeam.EventLog.lifecycle(db, kind, subject, detail)
         end
       ]
       |> maybe_put_credential_runner(config)
@@ -2109,7 +2114,7 @@ defmodule Tightbeam.Gateway do
     machine = params[:machine] || Placement.local_host_name()
 
     case Map.has_key?(Placement.hosts(config.base_dir), machine) do
-      true -> onboard_phase(provider_atom(provider), phase, machine, params[:reason])
+      true -> onboard_phase(config, provider_atom(provider), phase, machine, params[:reason])
       false -> %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
     end
   end
@@ -2121,21 +2126,33 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp onboard_phase(provider, "begin", machine, _reason) do
+  defp onboard_phase(config, provider, "begin", machine, _reason) do
     case Tightbeam.Credentials.begin_onboard(provider, Tightbeam.Credentials.server(machine)) do
-      {:ok, path} -> %{provider: provider, status: "ready", staging_path: path}
-      {:error, reason} -> %{code: "needs_onboarding", message: inspect(reason)}
+      {:ok, path} ->
+        # The lease TTL rides the reply so the CLI's ceremony watchdog and the
+        # server's lease are one fact with one home. A matching constant in the
+        # Rust CLI would drift from `production_config` the first time either is
+        # tuned, and the CLI cannot read `production_config` itself.
+        %{
+          provider: provider,
+          status: "ready",
+          staging_path: path,
+          lease_ttl_ms: config.onboarding_lease_ms
+        }
+
+      {:error, reason} ->
+        %{code: "needs_onboarding", message: inspect(reason)}
     end
   end
 
-  defp onboard_phase(provider, "finish", machine, _reason) do
+  defp onboard_phase(_config, provider, "finish", machine, _reason) do
     case Tightbeam.Credentials.finish_onboard(provider, Tightbeam.Credentials.server(machine)) do
       :ok -> %{provider: provider, status: "onboarded"}
       {:error, reason} -> %{code: "needs_onboarding", message: inspect(reason)}
     end
   end
 
-  defp onboard_phase(provider, "cancel", machine, reason) do
+  defp onboard_phase(_config, provider, "cancel", machine, reason) do
     :ok =
       Tightbeam.Credentials.cancel_onboard(
         provider,

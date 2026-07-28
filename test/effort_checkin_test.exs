@@ -88,7 +88,8 @@ defmodule Tightbeam.EffortCheckinTest do
       default_harness: :claude,
       default_model: "claude-fable-5",
       max_live_sessions_per_user: 50,
-      wake_tick_ms: 60_000
+      wake_tick_ms: 60_000,
+      onboarding_lease_ms: 1_800_000
     }
 
     root = Placement.workdir_path(config, holder)
