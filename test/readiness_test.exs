@@ -24,8 +24,14 @@ defmodule Tightbeam.ReadinessTest do
     def start(answers), do: GenServer.start(__MODULE__, answers)
     def init(answers), do: {:ok, answers}
 
-    def handle_call({:get, harness}, _from, answers) do
-      {:reply, Map.get(answers, harness, {[], {:unavailable, :not_derived}}), answers}
+    # Keyed by {host, harness}, like the real server. Tests that care about one
+    # host key their answers by harness alone and let this default the host.
+    def handle_call({:get, {host, harness}}, _from, answers) do
+      answer =
+        Map.get(answers, {host, harness}) || Map.get(answers, harness) ||
+          {[], {:unavailable, :not_derived}}
+
+      {:reply, answer, answers}
     end
 
     def handle_call(:get, _from, answers), do: {:reply, answers, answers}
@@ -71,7 +77,7 @@ defmodule Tightbeam.ReadinessTest do
 
     [first | _] = lines = Readiness.render(summary, ctx.config)
     assert first =~ "NOT READY"
-    assert first =~ "no harness on this instance can run a turn"
+    assert first =~ "no harness on any host can run a turn"
 
     # Serving is still correct — the summary must say so rather than implying
     # the gateway is down.
@@ -84,7 +90,7 @@ defmodule Tightbeam.ReadinessTest do
 
     summary = Readiness.summary(ctx.config, catalog)
     assert summary.runnable?
-    names = Enum.map_join(Harness.all(), ", ", & &1.wire_name())
+    names = Enum.map_join(Harness.all(), ", ", &"#{&1.wire_name()} on testhost")
 
     # EXACT output, not "does not contain". A working install states it and stops.
     # "Does not nag" is guarded twice — the ready harness is rejected before
@@ -192,10 +198,11 @@ defmodule Tightbeam.ReadinessTest do
     # through summary/2 today, but the invariant lives in two functions that do
     # not know about each other.
     rows =
-      for adapter <- [:present, {:missing, "/p"}],
+      for adapter <- [:present, {:missing, "/p"}, {:unknown, :not_probed_on_satellite}],
           credential <- [:live, {:absent, :missing}, {:unknown, :x}, {:degraded, :y}],
           model <- [:selectable, {:absent, "m"}, :unknown] do
         %{
+          host: "somehost",
           harness: "h",
           # Rows here are built directly rather than through harness_row/3, so a
           # new key must be mirrored or every row crashes instead of rendering —
@@ -204,7 +211,8 @@ defmodule Tightbeam.ReadinessTest do
           adapter: adapter,
           credential: credential,
           model: model,
-          runnable?: adapter == :present and credential == :live and model == :selectable
+          runnable?:
+            not match?({:missing, _}, adapter) and credential == :live and model == :selectable
         }
       end
 
@@ -213,7 +221,9 @@ defmodule Tightbeam.ReadinessTest do
         %{runnable?: false, harnesses: [row]}
         |> Readiness.render(ctx.config)
         |> Enum.drop(3)
-        |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "Diagnose") or &1 =~ ~r/^  h:$/))
+        |> Enum.reject(
+          &(&1 == "" or String.starts_with?(&1, "Diagnose") or &1 =~ ~r/^  h on somehost:$/)
+        )
 
       refute explanation == [],
              "blocked row renders no explanation: #{inspect(Map.drop(row, [:harness]))}"
@@ -223,7 +233,7 @@ defmodule Tightbeam.ReadinessTest do
   ## The derivation this module rests on
 
   test "every registered harness's adapter bin is its package basename", _ctx do
-    # `adapter_state/2` derives the adapter's bin name from `install_package/0`
+    # `adapter_state/3` derives the adapter's bin name from `install_package/0`
     # because no callback exposes it. If a harness ever breaks that convention,
     # its adapter would be reported permanently missing and the summary would
     # send operators to reinstall something already installed — so the
@@ -239,7 +249,7 @@ defmodule Tightbeam.ReadinessTest do
 
       assert String.contains?(published, expected),
              "#{module.wire_name()}: Support builds no adapter path ending #{expected}, " <>
-               "so Readiness.adapter_state/2 — which derives the bin name from " <>
+               "so Readiness.adapter_state/3 — which derives the bin name from " <>
                "install_package/0 — would report this adapter permanently missing"
     end
   end

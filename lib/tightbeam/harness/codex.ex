@@ -320,17 +320,26 @@ defmodule Tightbeam.Harness.Codex do
 
   def classify_subagent_event(_update), do: :skip
 
+  # `models_cache.json` is written by codex itself, in codex's home, on the host
+  # where codex runs. The gateway's copy describes the gateway's account, so a
+  # satellite's catalog is read on the satellite — one bounded ssh `cat`, no
+  # credential in either direction. `cat` exits 1 on a missing file and ssh exits
+  # 255 when it cannot reach the host, which is what separates "codex never ran
+  # here" from "this host is unreachable".
   @impl true
   def fetch_catalog(state) do
-    home =
-      Map.get(state.options, :codex_home) ||
-        Tightbeam.Homes.home_path(
-          state.base_dir,
-          Tightbeam.Placement.local_host_name(),
-          id()
-        )
+    {home, read} =
+      case Map.get(state, :host_config, %{ssh: nil}).ssh do
+        # Both test seams describe the LOCAL codex — a `codex_home` override that
+        # also redirected satellites would read the gateway's cache and call it
+        # the satellite's, which is the whole defect.
+        nil ->
+          {Map.get(state.options, :codex_home) || home_path(state),
+           Map.get(state.options, :codex_read, &File.read/1)}
 
-    read = Map.get(state.options, :codex_read, &File.read/1)
+        dest ->
+          {home_path(state), remote_read(state, dest)}
+      end
 
     with {:ok, body} <- read.(Path.join(home, "models_cache.json")),
          {:ok, models} <- decode_catalog(body),
@@ -342,6 +351,26 @@ defmodule Tightbeam.Harness.Codex do
       {:error, reason} -> {:error, reason}
       [] -> {:error, :empty_inventory}
       _ -> {:error, :malformed_catalog}
+    end
+  end
+
+  defp home_path(state) do
+    Tightbeam.Homes.home_path(
+      state.base_dir,
+      Map.get(state, :host_name) || Tightbeam.Placement.local_host_name(),
+      id()
+    )
+  end
+
+  defp remote_read(state, dest) do
+    sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
+
+    fn path ->
+      case sh.(["ssh" | Support.ssh_opts()] ++ [dest, "cat", path]) do
+        {body, 0} -> {:ok, body}
+        {_output, 1} -> {:error, :enoent}
+        {_output, status} -> {:error, {:remote_cache_read_failed, status}}
+      end
     end
   end
 

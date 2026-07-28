@@ -1042,7 +1042,7 @@ defmodule Tightbeam.RailRemedyTest do
   defp await_catalog(tries \\ 100)
 
   defp await_catalog(tries) when tries > 0 do
-    case ModelCatalog.get("codex", ModelCatalog) do
+    case ModelCatalog.get(Tightbeam.Placement.local_host_name(), "codex", ModelCatalog) do
       {_, :fresh} -> :ok
       _ -> Process.sleep(5) && await_catalog(tries - 1)
     end

@@ -1060,9 +1060,13 @@ defmodule Tightbeam.Gateway do
 
   @doc """
   Org options for client creation/tuning pickers (device-authed via
-  GET /api/org-options): harnesses, per-harness model catalog, assimilated
-  hosts, archetypes with their WHERE. Same data inspect gives agents —
-  discovery beats documentation, for humans too.
+  GET /api/org-options): harnesses, the model catalog per host per harness,
+  assimilated hosts, archetypes with their WHERE. Same data inspect gives
+  agents — discovery beats documentation, for humans too.
+
+  `models` is keyed by HOST first because entitlements are host-local: the
+  picker must offer what the host the session will land on can actually run,
+  not what the gateway's own account happens to hold.
   """
   @spec org_options() :: map()
   def org_options do
@@ -1071,16 +1075,7 @@ defmodule Tightbeam.Gateway do
 
     %{
       harnesses: Enum.map(Harness.all(), & &1.wire_name()),
-      models:
-        Map.new(ModelCatalog.get(), fn {harness, models} ->
-          {harness,
-           Enum.map(models, fn model ->
-             model
-             |> Map.put(:id, model.ref)
-             |> Map.put(:name, model.display_name)
-             |> Map.put(:provider, model.provider)
-           end)}
-        end),
+      models: picker_models(base_dir),
       hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
       archetypes:
         Enum.map(Archetypes.names(), fn name ->
@@ -1088,6 +1083,33 @@ defmodule Tightbeam.Gateway do
           %{name: a.name, where: a.where, defaults: a.defaults}
         end)
     }
+  end
+
+  # %{host => %{harness => [model]}} — the shape both pickers (org-options) and
+  # inspect publish. Hosts come from the registry, so a host whose catalog is
+  # still degraded appears with an empty list rather than vanishing.
+  defp picker_models(base_dir) do
+    catalog = ModelCatalog.get()
+
+    base_dir
+    |> Placement.hosts()
+    |> Map.keys()
+    |> Map.new(fn host ->
+      {host,
+       Map.new(Harness.all(), fn module ->
+         wire = module.wire_name()
+
+         {wire,
+          catalog
+          |> Map.get({host, wire}, [])
+          |> Enum.map(fn model ->
+            model
+            |> Map.put(:id, model.ref)
+            |> Map.put(:name, model.display_name)
+            |> Map.put(:provider, model.provider)
+          end)}
+       end)}
+    end)
   end
 
   @doc """
@@ -1119,7 +1141,7 @@ defmodule Tightbeam.Gateway do
           end
 
         {base_model, effort} = Adapter.parse_model_ref(session.model)
-        {catalog, _health} = ModelCatalog.get(session.harness, ModelCatalog)
+        {catalog, _health} = ModelCatalog.get(session.host, session.harness, ModelCatalog)
         unsupported = fn reason -> %{supported: false, reason: reason} end
 
         models_once = Enum.uniq_by(catalog, &base_ref(&1.ref))
@@ -1484,9 +1506,11 @@ defmodule Tightbeam.Gateway do
   defp adjudication_brief(session, condition, cause) do
     archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
+    # The affected session's OWN host: an adjudicator choosing a replacement model
+    # needs what that host can run, not what the gateway can.
     inventories =
       Map.new(Harness.all(), fn module ->
-        {models, health} = ModelCatalog.get(module.wire_name(), ModelCatalog)
+        {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
         {module.wire_name(), %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
       end)
 
@@ -1498,6 +1522,7 @@ defmodule Tightbeam.Gateway do
     current_model=#{session.model}
     current_harness=#{session.harness}
     model_preferences=#{JSON.encode!(archetype.model_preferences)}
+    live_catalog_host=#{session.host}
     live_catalog=#{JSON.encode!(inventories)}
 
     Reply with: tightbeam adjudicate --episode <correlationKey> --action park|swap|respawn|stop [--model <ref>] [--reason <text>]
@@ -2371,7 +2396,7 @@ defmodule Tightbeam.Gateway do
               }
             end),
           hosts: config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
-          models: ModelCatalog.get()
+          models: picker_models(config.base_dir)
         }
 
         result = %{
@@ -2667,8 +2692,10 @@ defmodule Tightbeam.Gateway do
 
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
 
+    # Placement resolved the host FIRST, so the ref is judged against the account
+    # that will actually run the turn (#88) — not the gateway's.
     with :ok <- validate_credential(config, harness_string, host),
-         :ok <- validate_catalog_model(harness_string, model, is_nil(p[:model])),
+         :ok <- validate_catalog_model(host, harness_string, model, is_nil(p[:model])),
          :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
       input = %{
         display_name: p.display_name,
@@ -2683,7 +2710,7 @@ defmodule Tightbeam.Gateway do
         identity_name: identity_name,
         host: host,
         harness: harness_string,
-        provider: catalog_provider!(harness_string, model),
+        provider: catalog_provider!(host, harness_string, model),
         model: model
       }
 
@@ -2787,7 +2814,8 @@ defmodule Tightbeam.Gateway do
             model = p[:model] || config.default_model
 
             with :ok <- validate_credential(config, harness, session.host),
-                 :ok <- validate_catalog_model(harness, model, is_nil(p[:model])),
+                 :ok <-
+                   validate_catalog_model(session.host, harness, model, is_nil(p[:model])),
                  :ok <-
                    Spinup.ensure_ready(
                      config,
@@ -2807,7 +2835,7 @@ defmodule Tightbeam.Gateway do
                 db,
                 call.session_key,
                 harness,
-                catalog_provider!(harness, model),
+                catalog_provider!(session.host, harness, model),
                 model
               )
 
@@ -2932,7 +2960,9 @@ defmodule Tightbeam.Gateway do
             %{ok: false, code: "not_found"}
 
           session ->
-            new_ref = compose_model_selection(session.harness, session.model, p.model)
+            new_ref =
+              compose_model_selection(session.host, session.harness, session.model, p.model)
+
             apply_model_change(config, db, call, session, new_ref)
         end
 
@@ -2956,13 +2986,13 @@ defmodule Tightbeam.Gateway do
   # the first available tier when the current effort doesn't apply to the
   # newly selected model. A ref already carrying "[effort]" is passed through
   # unchanged (back-compat with callers that send a full ref directly).
-  defp compose_model_selection(harness, current_ref, selected) do
+  defp compose_model_selection(host, harness, current_ref, selected) do
     if String.contains?(selected, "[") do
       selected
     else
       {_current_base, current_effort} = Adapter.parse_model_ref(current_ref)
 
-      case efforts_for(harness, selected) do
+      case efforts_for(host, harness, selected) do
         [] ->
           selected
 
@@ -2980,8 +3010,8 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp efforts_for(harness, base_model) do
-    {catalog, _health} = ModelCatalog.get(harness, ModelCatalog)
+  defp efforts_for(host, harness, base_model) do
+    {catalog, _health} = ModelCatalog.get(host, harness, ModelCatalog)
 
     case Enum.find(catalog, &(base_ref(&1.ref) == base_model)) do
       nil -> []
@@ -2990,9 +3020,9 @@ defmodule Tightbeam.Gateway do
   end
 
   defp apply_model_change(config, db, call, session, new_ref) do
-    with :ok <- validate_catalog_model(session.harness, new_ref, false),
+    with :ok <- validate_catalog_model(session.host, session.harness, new_ref, false),
          {%{provider: provider}, _health} <-
-           ModelCatalog.entry(session.harness, new_ref, ModelCatalog) do
+           ModelCatalog.entry(session.host, session.harness, new_ref, ModelCatalog) do
       case apply_tuned_model(config, db, session, new_ref) do
         :ok ->
           Org.set_model(db, call.session_key, new_ref, Atom.to_string(provider))
@@ -3051,49 +3081,54 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp validate_catalog_model(harness, model, configured_default?) do
-    case is_binary(model) && ModelCatalog.member?(harness, model) do
+  # Every refusal names the harness, the HOST that owns the catalog, and the
+  # repair ON THAT HOST. The catalog belongs to the account that will run the
+  # turn, so sending an operator to the gateway to fix a satellite's grant — as
+  # this did before per-host catalogs — sent them to the wrong machine.
+  defp validate_catalog_model(host, harness, model, configured_default?) do
+    case is_binary(model) && ModelCatalog.member?(host, harness, model) do
       %{present?: true, health: :fresh} ->
         :ok
 
       %{health: :fresh} ->
-        warn_dead_default(harness, model, configured_default?)
+        warn_dead_default(host, harness, model, configured_default?)
 
         {:error,
          %{
            code: "model_unavailable",
            message:
-             "model #{inspect(model)} is not offered by #{harness}" <>
-               offered_models_hint(harness)
+             "model #{inspect(model)} is not offered by #{harness} on host #{host}" <>
+               offered_models_hint(host, harness)
          }}
 
       %{health: {:unavailable, {:needs_onboarding, reason}}} ->
-        warn_dead_default(harness, model, configured_default?)
+        warn_dead_default(host, harness, model, configured_default?)
         provider = Harness.parse!(harness).credential_provider()
-        gateway = Placement.local_host_name()
 
         {:error,
          %{
            code: "catalog_unavailable",
            message:
-             "cannot validate model #{inspect(model)} for #{harness}: no #{harness} model " <>
-               "catalog, because #{provider} has no usable credential on GATEWAY host " <>
-               "#{gateway} (#{inspect(reason)}). The gateway derives every harness's catalog " <>
-               "on its own host, so it needs its own #{provider} grant regardless of where " <>
-               "sessions are placed; run tightbeam onboard #{provider} on #{gateway}"
+             "cannot validate model #{inspect(model)} for #{harness} on host #{host}: no " <>
+               "#{harness} model catalog there, because #{provider} has no usable credential " <>
+               "on #{host} (#{inspect(reason)}). A catalog is derived on the host that runs " <>
+               "the turn, so this is #{host}'s grant to fix; run tightbeam onboard " <>
+               "#{provider} on #{host}"
          }}
 
       %{health: health} ->
-        warn_dead_default(harness, model, configured_default?)
+        warn_dead_default(host, harness, model, configured_default?)
 
         {:error,
          %{
            code: "catalog_unavailable",
-           message: "cannot validate model #{inspect(model)} for #{harness}: #{inspect(health)}"
+           message:
+             "cannot validate model #{inspect(model)} for #{harness} on host #{host}: " <>
+               "#{inspect(health)}"
          }}
 
       false ->
-        warn_dead_default(harness, model, configured_default?)
+        warn_dead_default(host, harness, model, configured_default?)
         {:error, %{code: "model_unavailable", message: "model must be specified"}}
     end
   end
@@ -3101,8 +3136,8 @@ defmodule Tightbeam.Gateway do
   # A refusal that names only the rejected value makes the operator guess. The
   # catalog is already in hand, so say what IS offered — harness-agnostic, and for
   # claude it reflects the selectable filter rather than the raw API list.
-  defp offered_models_hint(harness) do
-    case ModelCatalog.get(harness, ModelCatalog) do
+  defp offered_models_hint(host, harness) do
+    case ModelCatalog.get(host, harness, ModelCatalog) do
       {[_ | _] = entries, _health} ->
         "; offered: " <> (entries |> Enum.map(& &1.ref) |> Enum.sort() |> Enum.join(", "))
 
@@ -3233,11 +3268,12 @@ defmodule Tightbeam.Gateway do
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
 
-  defp warn_dead_default(_harness, _model, false), do: :ok
+  defp warn_dead_default(_host, _harness, _model, false), do: :ok
 
-  defp warn_dead_default(harness, model, true) do
+  defp warn_dead_default(host, harness, model, true) do
     Logger.warning(
-      "configured default model #{inspect(model)} is not currently offered by #{harness}"
+      "configured default model #{inspect(model)} is not currently offered by " <>
+        "#{harness} on host #{host}"
     )
   end
 
@@ -3825,9 +3861,9 @@ defmodule Tightbeam.Gateway do
   end
 
   defp adjudicate_swap(_config, db, call, episode) do
-    with {:ok, harness, provider} <- harness_for_ref(call.params.model) do
-      session = Org.get(db, episode.session_key)
+    session = Org.get(db, episode.session_key)
 
+    with {:ok, harness, provider} <- harness_for_ref(session.host, call.params.model) do
       if harness != session.harness do
         %{
           code: "cross_harness_requires_respawn",
@@ -3918,8 +3954,9 @@ defmodule Tightbeam.Gateway do
     do: %{code: "workspace_move_race", message: "assignments kept changing during respawn"}
 
   defp adjudicate_respawn(config, db, call, episode, attempts) do
-    with {:ok, harness, provider} <- harness_for_ref(call.params.model) do
-      old = Org.get(db, episode.session_key)
+    old = Org.get(db, episode.session_key)
+
+    with {:ok, harness, provider} <- harness_for_ref(old.host, call.params.model) do
       new_session_key = "agent:" <> Tightbeam.Id.uuid4()
 
       {:ok, transferred_rows} =
@@ -4348,10 +4385,10 @@ defmodule Tightbeam.Gateway do
     count > 0
   end
 
-  defp harness_for_ref(ref) do
+  defp harness_for_ref(host, ref) do
     matches =
       Enum.flat_map(Harness.all(), fn module ->
-        case ModelCatalog.entry(module.wire_name(), ref) do
+        case ModelCatalog.entry(host, module.wire_name(), ref) do
           {%{} = entry, :fresh} -> [{module, entry}]
           _ -> []
         end
@@ -4393,10 +4430,13 @@ defmodule Tightbeam.Gateway do
   defp describe_engine(harness, nil), do: "#{harness}"
   defp describe_engine(harness, model), do: "#{harness} (#{model})"
 
-  defp catalog_provider!(harness, ref) do
-    case ModelCatalog.entry(harness, ref) do
-      {%{provider: provider}, _health} -> Atom.to_string(provider)
-      {nil, _health} -> raise "catalog entry missing after validation: #{harness}/#{ref}"
+  defp catalog_provider!(host, harness, ref) do
+    case ModelCatalog.entry(host, harness, ref) do
+      {%{provider: provider}, _health} ->
+        Atom.to_string(provider)
+
+      {nil, _health} ->
+        raise "catalog entry missing after validation: #{harness}/#{ref} on #{host}"
     end
   end
 
@@ -4455,8 +4495,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # The built-in Main stream is seeded on the gateway's own host (see
+  # `Wire.Socket.seed_main_stream/2`), so that is the catalog to read.
   defp default_seed_provider(module, ref) do
-    case ModelCatalog.entry(module.wire_name(), ref) do
+    case ModelCatalog.entry(Placement.local_host_name(), module.wire_name(), ref) do
       {%{provider: provider}, _health} -> Atom.to_string(provider)
       {nil, _health} -> Atom.to_string(module.credential_provider())
     end

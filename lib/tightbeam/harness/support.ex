@@ -19,6 +19,10 @@ defmodule Tightbeam.Harness.Support do
 
   def system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
 
+  # For probes whose STDOUT is the answer: ssh chatters on stderr even when it
+  # succeeds, and a warning spliced into a JSON body is a malformed catalog.
+  def system_cmd_out([command | args]), do: System.cmd(command, args)
+
   @doc false
   def owned_home_entries(credential_file, rails_file) do
     [

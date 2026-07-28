@@ -1,9 +1,11 @@
 defmodule Tightbeam.ModelCatalogTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Archetypes, Gateway, ModelCatalog}
+  alias Tightbeam.{Archetypes, Gateway, ModelCatalog, Placement}
 
   @fixtures Path.join(__DIR__, "fixtures/model_catalog")
+  @host "testhost"
+  @secret "sk-ant-oat01-NEVER-ON-A-COMMAND-LINE"
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "model-catalog-#{System.unique_integer([:positive])}")
@@ -45,8 +47,8 @@ defmodule Tightbeam.ModelCatalogTest do
     await_fresh(catalog, "claude")
     await_fresh(catalog, "codex")
 
-    {claude, :fresh} = ModelCatalog.get("claude", catalog)
-    {codex, :fresh} = ModelCatalog.get("codex", catalog)
+    {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
+    {codex, :fresh} = ModelCatalog.get(@host, "codex", catalog)
 
     opus = Enum.find(claude, &(&1.ref == "claude-opus-5[low]"))
     assert opus.display_name == "Claude Opus 5"
@@ -96,7 +98,7 @@ defmodule Tightbeam.ModelCatalogTest do
     await_fresh(catalog, "claude")
 
     assert {[%{ref: "claude-haiku-4-5-20251001"} = entry], :fresh} =
-             ModelCatalog.get("claude", catalog)
+             ModelCatalog.get(@host, "claude", catalog)
 
     assert entry.display_name == "Claude Haiku 4.5"
     assert entry.max_input_tokens == 200_000
@@ -130,7 +132,7 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx, claude_fetch: claude_fetch)
     await_fresh(catalog, "claude")
 
-    {claude, :fresh} = ModelCatalog.get("claude", catalog)
+    {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
 
     assert Enum.map(claude, & &1.ref) == [
              "claude-sort-test[high]",
@@ -170,7 +172,7 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx, claude_fetch: claude_fetch)
     await_fresh(catalog, "claude")
 
-    {claude, :fresh} = ModelCatalog.get("claude", catalog)
+    {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
 
     assert Enum.map(claude, & &1.ref) == [
              "claude-live-shape[low]",
@@ -203,7 +205,7 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx, codex_read: codex_read)
     await_fresh(catalog, "codex")
 
-    {codex, :fresh} = ModelCatalog.get("codex", catalog)
+    {codex, :fresh} = ModelCatalog.get(@host, "codex", catalog)
 
     assert Enum.map(codex, & &1.ref) == [
              "gpt-sort-test[mega]",
@@ -300,10 +302,10 @@ defmodule Tightbeam.ModelCatalogTest do
       catalog = start_catalog(ctx, Keyword.put(overrides, :name, unique_name(label)))
 
       await(fn ->
-        ModelCatalog.get(harness, catalog) == {[], {:unavailable, :malformed_catalog}}
+        ModelCatalog.get(@host, harness, catalog) == {[], {:unavailable, :malformed_catalog}}
       end)
 
-      assert ModelCatalog.get(harness, catalog) ==
+      assert ModelCatalog.get(@host, harness, catalog) ==
                {[], {:unavailable, :malformed_catalog}}
     end
   end
@@ -333,12 +335,12 @@ defmodule Tightbeam.ModelCatalogTest do
 
     await_fresh(catalog, "claude")
 
-    assert ModelCatalog.member?("claude", "claude-opus-5[high]", catalog) == %{
+    assert ModelCatalog.member?(@host, "claude", "claude-opus-5[high]", catalog) == %{
              present?: true,
              health: :fresh
            }
 
-    assert ModelCatalog.member?("claude", "absent", catalog) == %{
+    assert ModelCatalog.member?(@host, "claude", "absent", catalog) == %{
              present?: false,
              health: :fresh
            }
@@ -346,12 +348,12 @@ defmodule Tightbeam.ModelCatalogTest do
     Agent.update(clock, fn _ -> 11 end)
     Agent.update(failures, fn _ -> true end)
 
-    assert ModelCatalog.member?("claude", "claude-opus-5[high]", catalog) == %{
+    assert ModelCatalog.member?(@host, "claude", "claude-opus-5[high]", catalog) == %{
              present?: true,
              health: :stale
            }
 
-    await(fn -> ModelCatalog.get("claude", catalog) |> elem(1) == :stale end)
+    await(fn -> ModelCatalog.get(@host, "claude", catalog) |> elem(1) == :stale end)
 
     missing = unique_name(:missing_catalog)
 
@@ -364,7 +366,7 @@ defmodule Tightbeam.ModelCatalogTest do
     )
 
     await(fn ->
-      ModelCatalog.member?("claude", "anything", missing).health ==
+      ModelCatalog.member?(@host, "claude", "anything", missing).health ==
         {:unavailable, :missing_token}
     end)
   end
@@ -379,8 +381,8 @@ defmodule Tightbeam.ModelCatalogTest do
       name = unique_name(label)
       catalog = start_catalog(ctx, Keyword.put(opts, :name, name))
 
-      await(fn -> ModelCatalog.get(harness, catalog) == {[], {:unavailable, reason}} end)
-      assert is_map(ModelCatalog.member?(harness, "absent", catalog))
+      await(fn -> ModelCatalog.get(@host, harness, catalog) == {[], {:unavailable, reason}} end)
+      assert is_map(ModelCatalog.member?(@host, harness, "absent", catalog))
     end
 
     Archetypes.load!(ctx.base_dir)
@@ -411,8 +413,8 @@ defmodule Tightbeam.ModelCatalogTest do
     unavailable = {:unavailable, {:needs_onboarding, :credential_server_unavailable}}
 
     await(fn ->
-      ModelCatalog.get("claude", name) == {[], unavailable} and
-        ModelCatalog.get("codex", name) == {[], unavailable}
+      ModelCatalog.get(@host, "claude", name) == {[], unavailable} and
+        ModelCatalog.get(@host, "codex", name) == {[], unavailable}
     end)
 
     refute_receive :provider_io
@@ -434,13 +436,13 @@ defmodule Tightbeam.ModelCatalogTest do
     Archetypes.load!(ctx.base_dir)
 
     {reader_us, {[], {:unavailable, :not_derived}}} =
-      :timer.tc(fn -> ModelCatalog.get("claude", catalog) end)
+      :timer.tc(fn -> ModelCatalog.get(@host, "claude", catalog) end)
 
     {list_us, options} = :timer.tc(&Gateway.org_options/0)
 
     assert reader_us < 100_000
     assert list_us < 100_000
-    assert options.models["claude"] == []
+    assert options.models[@host]["claude"] == []
     send(fetch_pid, :release)
   end
 
@@ -449,14 +451,15 @@ defmodule Tightbeam.ModelCatalogTest do
     await_fresh(catalog, "claude")
     await_fresh(catalog, "codex")
 
-    for harness <- ["claude", "codex"], entry <- ModelCatalog.get(catalog)[harness] do
-      assert ModelCatalog.member?(harness, entry.ref, catalog) == %{
+    for harness <- ["claude", "codex"],
+        entry <- ModelCatalog.get(catalog)[{@host, harness}] do
+      assert ModelCatalog.member?(@host, harness, entry.ref, catalog) == %{
                present?: true,
                health: :fresh
              }
     end
 
-    assert ModelCatalog.member?("claude", "opus[1m]", catalog) == %{
+    assert ModelCatalog.member?(@host, "claude", "opus[1m]", catalog) == %{
              present?: false,
              health: :fresh
            }
@@ -469,6 +472,152 @@ defmodule Tightbeam.ModelCatalogTest do
 
     refute source =~ "@" <> "model_catalog"
     refute source =~ "model_" <> "pins"
+  end
+
+  # per-host-catalogs-v1. Credentials are host-local, so entitlements are, so a
+  # catalog is a fact about ONE host's account and is established on that host.
+  describe "per-host catalogs" do
+    setup ctx do
+      # The satellite's base_dir is a REAL directory holding a REAL token, so the
+      # no-token-bytes assertion below has something to catch. If the probe ever
+      # read this file locally and interpolated it, the secret would appear in
+      # the command line the test captures.
+      satellite_base = Path.join(ctx.base_dir, "satellite-root")
+      File.mkdir_p!(Path.join([satellite_base, "auth", "claude"]))
+      File.write!(Path.join([satellite_base, "auth", "claude", "oauth-token"]), @secret)
+
+      {:ok, _entry} =
+        Placement.register_host(ctx.base_dir, "satellite", %{
+          ssh: "sat.example",
+          base_dir: satellite_base,
+          cli_bin: nil
+        })
+
+      %{satellite_base: satellite_base}
+    end
+
+    test "the claude probe runs on the owning host and its token never reaches a command line",
+         ctx do
+      parent = self()
+
+      satellite_body =
+        JSON.encode!(%{
+          data: [
+            %{
+              id: "satellite-only",
+              display_name: "Satellite Only",
+              max_input_tokens: 1_000,
+              capabilities: %{effort: %{}}
+            }
+          ]
+        })
+
+      sh = fn command ->
+        send(parent, {:probe, command})
+        if claude_probe?(command), do: {satellite_body, 0}, else: {"", 1}
+      end
+
+      catalog = start_catalog(ctx, sh: sh)
+      await_fresh(catalog, "claude", "satellite")
+      await_fresh(catalog, "claude")
+
+      # The satellite's account, not the gateway's — and the gateway's entry is
+      # untouched by the satellite's answer.
+      assert {[%{ref: "satellite-only"}], :fresh} =
+               ModelCatalog.get("satellite", "claude", catalog)
+
+      {local, :fresh} = ModelCatalog.get(@host, "claude", catalog)
+      refute Enum.any?(local, &(&1.ref == "satellite-only"))
+
+      command = claude_command!()
+
+      # The eurisko method: the token is read by the REMOTE shell, so no byte of
+      # it is in the argv, and the script says so literally.
+      joined = Enum.join(command, " ")
+      refute joined =~ @secret
+      refute joined =~ "Bearer #{@secret}"
+
+      assert joined =~
+               "token=$(cat #{Path.join([ctx.satellite_base, "auth", "claude", "oauth-token"])})"
+
+      assert joined =~ ~s(-H "authorization: Bearer $token")
+      assert ["ssh" | rest] = command
+      assert "sat.example" in rest
+    end
+
+    test "codex reads the owning host's home, and a host where codex never ran names itself",
+         ctx do
+      parent = self()
+
+      sh = fn command ->
+        send(parent, {:probe, command})
+        # `cat` exits 1 on a missing file: codex has never run on this host.
+        {"cat: no such file", 1}
+      end
+
+      catalog = start_catalog(ctx, sh: sh)
+
+      await(fn ->
+        ModelCatalog.get("satellite", "codex", catalog) == {[], {:unavailable, :missing_cache}}
+      end)
+
+      # ...while the gateway's own codex catalog, read from its own home, is fine.
+      await_fresh(catalog, "codex")
+
+      command = codex_command!()
+
+      assert command ==
+               ["ssh" | Tightbeam.Harness.Support.ssh_opts()] ++
+                 [
+                   "sat.example",
+                   "cat",
+                   Path.join([
+                     ctx.satellite_base,
+                     "homes",
+                     "satellite",
+                     "codex",
+                     "models_cache.json"
+                   ])
+                 ]
+    end
+
+    test "an unreachable host degrades only its own entries", ctx do
+      # 255 is ssh's own "could not connect", distinct from cat's 1.
+      sh = fn _command -> {"", 255} end
+      catalog = start_catalog(ctx, sh: sh)
+
+      await(fn ->
+        match?({[], {:unavailable, _}}, ModelCatalog.get("satellite", "claude", catalog))
+      end)
+
+      assert {[], {:unavailable, {:remote_catalog_probe_failed, 255, ""}}} =
+               ModelCatalog.get("satellite", "claude", catalog)
+
+      assert {[], {:unavailable, {:remote_cache_read_failed, 255}}} =
+               ModelCatalog.get("satellite", "codex", catalog)
+
+      # The gateway's entries are established from local disk and stay fresh.
+      await_fresh(catalog, "claude")
+      await_fresh(catalog, "codex")
+    end
+  end
+
+  defp claude_probe?(command), do: Enum.any?(command, &String.contains?(&1, "api.anthropic.com"))
+
+  defp claude_command! do
+    receive do
+      {:probe, command} -> if claude_probe?(command), do: command, else: claude_command!()
+    after
+      1_000 -> flunk("no claude probe command was constructed")
+    end
+  end
+
+  defp codex_command! do
+    receive do
+      {:probe, command} -> if claude_probe?(command), do: codex_command!(), else: command
+    after
+      1_000 -> flunk("no codex probe command was constructed")
+    end
   end
 
   defp start_catalog(ctx, overrides \\ []) do
@@ -495,8 +644,8 @@ defmodule Tightbeam.ModelCatalogTest do
     name
   end
 
-  defp await_fresh(catalog, harness) do
-    await(fn -> ModelCatalog.get(harness, catalog) |> elem(1) == :fresh end)
+  defp await_fresh(catalog, harness, host \\ @host) do
+    await(fn -> ModelCatalog.get(host, harness, catalog) |> elem(1) == :fresh end)
   end
 
   defp await(fun, attempts \\ 100)
@@ -520,7 +669,7 @@ defmodule Tightbeam.ModelCatalogTest do
         )
 
       await_fresh(catalog, "claude")
-      {claude, :fresh} = ModelCatalog.get("claude", catalog)
+      {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
       refs = Enum.map(claude, & &1.ref)
       bases = refs |> Enum.map(&String.replace(&1, ~r/\[.*\]$/, "")) |> Enum.uniq()
 

@@ -10,6 +10,10 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
 
+  # Same ceiling the local httpc call carries, so a wedged vendor endpoint costs
+  # the same either side of the ssh seam and never strands a refresh in flight.
+  @catalog_timeout_s 10
+
   # NOTE FOR FUTURE AGENTS — the claude model vocabulary is NARROWER than the catalog.
   #
   # The derived catalog for claude comes from the Anthropic API (`fetch_catalog/1` hits
@@ -298,27 +302,77 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def fetch_catalog(state) do
-    fetch = Map.get(state.options, :claude_fetch, &http_get/2)
-
-    with {:ok, token} <- read_token(Path.join([state.base_dir, "auth", "claude", "oauth-token"])),
-         token <- String.trim(token),
-         true <- token != "",
-         headers = [
-           {~c"authorization", String.to_charlist("Bearer " <> token)},
-           {~c"anthropic-version", ~c"2023-06-01"}
-         ],
-         {:ok, body} <- fetch.("/v1/models?limit=100", headers),
+    with {:ok, get} <- catalog_getter(state),
+         {:ok, body} <- get.("/v1/models?limit=100"),
          {:ok, models} <- decode_catalog(body),
-         {:ok, models} <- fill_capabilities(models, headers, fetch),
+         {:ok, models} <- fill_capabilities(models, get),
          {:ok, entries} <- derive_catalog_entries(models),
          entries <- keep_selectable(entries, selectable_models(state)),
          entries when entries != [] <- entries do
       {:ok, entries}
     else
       {:error, reason} -> {:error, reason}
-      false -> {:error, :missing_token}
       [] -> {:error, :empty_inventory}
       _ -> {:error, :malformed_catalog}
+    end
+  end
+
+  # A catalog is an account's entitlements, so it is derived on the host whose
+  # account it describes. This is a plain vendor HTTPS GET with a bearer token
+  # read off local disk — NOT an ACP or harness surface — which is exactly why
+  # it can run remotely at all.
+  #
+  # Local: read the token, call the API from here. Remote: one bounded ssh whose
+  # script reads the token with `$(cat …)` in the REMOTE shell, the same pattern
+  # turn launch uses (`prepare_launch/3`). No token byte is interpolated into any
+  # command line, so none appears in a process table on either machine, and no
+  # credential moves between them — only the model list comes back.
+  defp catalog_getter(state) do
+    token_path = Path.join([state.base_dir, "auth", "claude", "oauth-token"])
+
+    case Map.get(state, :host_config, %{ssh: nil}).ssh do
+      nil -> local_getter(state, token_path)
+      dest -> {:ok, remote_getter(state, dest, token_path)}
+    end
+  end
+
+  defp local_getter(state, token_path) do
+    fetch = Map.get(state.options, :claude_fetch, &http_get/2)
+
+    with {:ok, raw} <- read_token(token_path),
+         token = String.trim(raw),
+         true <- token != "" do
+      headers = [
+        {~c"authorization", String.to_charlist("Bearer " <> token)},
+        {~c"anthropic-version", ~c"2023-06-01"}
+      ]
+
+      {:ok, fn path -> fetch.(path, headers) end}
+    else
+      {:error, reason} -> {:error, reason}
+      false -> {:error, :missing_token}
+    end
+  end
+
+  defp remote_getter(state, dest, token_path) do
+    sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
+
+    fn path ->
+      # curl's own stderr is folded into stdout so a failure carries a reason
+      # (401, DNS, TLS); ssh's is NOT, because an ssh warning on a SUCCESSFUL
+      # connection would land in the middle of the JSON body.
+      script =
+        "set -eu\n" <>
+          "token=$(cat #{token_path})\n" <>
+          "exec curl -sS -f --max-time #{@catalog_timeout_s} " <>
+          ~s(-H "authorization: Bearer $token" ) <>
+          ~s(-H "anthropic-version: 2023-06-01" ) <>
+          "'https://api.anthropic.com#{path}' 2>&1\n"
+
+      case sh.(["ssh" | Support.ssh_opts()] ++ [dest, "sh", "-c", Support.shell_quote(script)]) do
+        {body, 0} -> {:ok, body}
+        {output, status} -> {:error, {:remote_catalog_probe_failed, status, String.trim(output)}}
+      end
     end
   end
 
@@ -524,7 +578,7 @@ defmodule Tightbeam.Harness.Claude do
     end
   end
 
-  defp fill_capabilities(models, headers, fetch) do
+  defp fill_capabilities(models, get) do
     Enum.reduce_while(models, {:ok, []}, fn model, {:ok, acc} ->
       if is_map(get_in(model, ["capabilities", "effort"])) do
         {:cont, {:ok, [model | acc]}}
@@ -533,7 +587,7 @@ defmodule Tightbeam.Harness.Claude do
           id when is_binary(id) ->
             path = "/v1/models/" <> URI.encode(id, &URI.char_unreserved?/1)
 
-            with {:ok, body} <- fetch.(path, headers),
+            with {:ok, body} <- get.(path),
                  {:ok, detail} <- JSON.decode(body),
                  true <- is_map(detail) do
               {:cont, {:ok, [Map.merge(model, detail) | acc]}}

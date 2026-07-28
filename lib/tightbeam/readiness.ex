@@ -30,11 +30,12 @@ defmodule Tightbeam.Readiness do
   thing it names.
   """
 
-  alias Tightbeam.{Harness, ModelCatalog}
+  alias Tightbeam.{Harness, ModelCatalog, Placement}
 
   @type harness_row :: %{
+          host: String.t(),
           harness: String.t(),
-          adapter: :present | {:missing, String.t()},
+          adapter: :present | {:missing, String.t()} | {:unknown, atom()},
           credential: :live | {:absent, atom()} | {:unknown, term()} | {:degraded, term()},
           model: :selectable | {:absent, String.t()} | :unknown,
           runnable?: boolean()
@@ -58,13 +59,16 @@ defmodule Tightbeam.Readiness do
   end
 
   defp poll_settled(catalog, deadline, step_ms) do
+    keys = catalog |> ModelCatalog.get() |> Map.keys()
+
     unsettled? =
-      Enum.any?(Harness.all(), fn module ->
-        match?(
-          {[], {:unavailable, reason}} when reason in [:not_derived, :catalog_not_started],
-          ModelCatalog.get(module.wire_name(), catalog)
-        )
-      end)
+      keys == [] or
+        Enum.any?(keys, fn {host, harness} ->
+          match?(
+            {[], {:unavailable, reason}} when reason in [:not_derived, :catalog_not_started],
+            ModelCatalog.get(host, harness, catalog)
+          )
+        end)
 
     cond do
       not unsettled? ->
@@ -85,19 +89,27 @@ defmodule Tightbeam.Readiness do
   """
   @spec summary(map(), GenServer.server()) :: %{harnesses: [harness_row()], runnable?: boolean()}
   def summary(config, catalog \\ ModelCatalog) do
-    rows = Enum.map(Harness.all(), &harness_row(&1, config, catalog))
+    local = Placement.local_host_name()
+    hosts = config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort()
+
+    rows =
+      for host <- hosts, module <- Harness.all() do
+        harness_row(module, host, host == local, config, catalog)
+      end
+
     %{harnesses: rows, runnable?: Enum.any?(rows, & &1.runnable?)}
   end
 
-  defp harness_row(module, config, catalog) do
+  defp harness_row(module, host, local?, config, catalog) do
     wire = module.wire_name()
-    {entries, health} = ModelCatalog.get(wire, catalog)
+    {entries, health} = ModelCatalog.get(host, wire, catalog)
 
-    adapter = adapter_state(module, config)
+    adapter = adapter_state(module, local?, config)
     credential = credential_state(entries, health)
     model = model_state(entries, credential, config)
 
     %{
+      host: host,
       harness: wire,
       # `onboard` takes the CREDENTIAL PROVIDER, not the harness: a credential
       # belongs to anthropic or openai, and claude/codex are the harnesses that
@@ -108,7 +120,13 @@ defmodule Tightbeam.Readiness do
       adapter: adapter,
       credential: credential,
       model: model,
-      runnable?: adapter == :present and credential == :live and model == :selectable
+      # An UNKNOWN adapter does not veto. Boot establishes adapter presence with
+      # one local File.exists?, which cannot see a satellite, and this module's
+      # rule is that a fact it cannot establish is never reported as a failure of
+      # the thing it names — vetoing on it would print that failure on every
+      # healthy satellite, on every boot.
+      runnable?:
+        not match?({:missing, _}, adapter) and credential == :live and model == :selectable
     }
   end
 
@@ -116,7 +134,9 @@ defmodule Tightbeam.Readiness do
   # so one path serves both. The bin name is the package's basename — pinned by
   # a test over every registered harness, so a harness that breaks the
   # convention fails loudly instead of being reported permanently missing.
-  defp adapter_state(module, config) do
+  defp adapter_state(_module, false, _config), do: {:unknown, :not_probed_on_satellite}
+
+  defp adapter_state(module, true, config) do
     path =
       Path.join([
         config.base_dir,
@@ -172,7 +192,11 @@ defmodule Tightbeam.Readiness do
   """
   @spec render(%{harnesses: [harness_row()], runnable?: boolean()}, map()) :: [String.t()]
   def render(%{runnable?: true, harnesses: rows}, _config) do
-    ready = rows |> Enum.filter(& &1.runnable?) |> Enum.map_join(", ", & &1.harness)
+    ready =
+      rows
+      |> Enum.filter(& &1.runnable?)
+      |> Enum.map_join(", ", &"#{&1.harness} on #{&1.host}")
+
     blocked = Enum.reject(rows, & &1.runnable?)
 
     ["READY: #{ready} can run turns."] ++
@@ -181,7 +205,7 @@ defmodule Tightbeam.Readiness do
 
   def render(%{runnable?: false, harnesses: rows}, config) do
     [
-      "NOT READY: no harness on this instance can run a turn. The gateway is",
+      "NOT READY: no harness on any host can run a turn. The gateway is",
       "serving, so clients can connect, but every turn will fail until the",
       "gaps below are closed."
     ] ++
@@ -203,7 +227,7 @@ defmodule Tightbeam.Readiness do
       [] when not row.runnable? ->
         [
           "",
-          "  #{row.harness}:",
+          "  #{row.harness} on #{row.host}:",
           "    cannot run turns, and boot could not say why " <>
             "(adapter=#{inspect(row.adapter)} credential=#{inspect(row.credential)} " <>
             "model=#{inspect(row.model)}) — please report this, it is a gap in the summary itself"
@@ -213,11 +237,12 @@ defmodule Tightbeam.Readiness do
         []
 
       lines ->
-        ["", "  #{row.harness}:"] ++ Enum.map(lines, &("    " <> &1))
+        ["", "  #{row.harness} on #{row.host}:"] ++ Enum.map(lines, &("    " <> &1))
     end
   end
 
   defp adapter_line(%{adapter: :present}), do: nil
+  defp adapter_line(%{adapter: {:unknown, _reason}}), do: nil
 
   defp adapter_line(%{harness: wire, adapter: {:missing, path}}) do
     "ACP adapter missing at #{path} — no turn can start. " <>
@@ -228,20 +253,21 @@ defmodule Tightbeam.Readiness do
 
   defp credential_line(%{credential: :live}), do: nil
 
-  defp credential_line(%{provider: provider, credential: {:absent, reason}}) do
-    "no credential (#{inspect(reason)}) — the model catalog is empty, so no " <>
-      "model can be selected. Onboard it with: tightbeam onboard #{provider} --as-user <userId>"
+  defp credential_line(%{provider: provider, host: host, credential: {:absent, reason}}) do
+    "no credential on #{host} (#{inspect(reason)}) — this host's model catalog is " <>
+      "empty, so no model can be selected here. Onboard it with: " <>
+      "tightbeam onboard #{provider} --as-user <userId> on #{host}"
   end
 
-  defp credential_line(%{harness: wire, credential: {:unknown, reason}}) do
+  defp credential_line(%{harness: wire, host: host, credential: {:unknown, reason}}) do
     "credential state UNKNOWN (#{inspect(reason)}) — boot has not established " <>
-      "this, so it is NOT a claim that #{wire}'s credential is bad. " <>
+      "this, so it is NOT a claim that #{wire}'s credential on #{host} is bad. " <>
       "Check with: mix tightbeam.doctor, or watch the first turn."
   end
 
-  defp credential_line(%{harness: wire, credential: {:degraded, reason}}) do
-    "catalog degraded (#{inspect(reason)}) — #{wire} fetched no models. " <>
-      "Turns will fail model selection until it recovers."
+  defp credential_line(%{harness: wire, host: host, credential: {:degraded, reason}}) do
+    "catalog degraded (#{inspect(reason)}) — #{wire} fetched no models on #{host}. " <>
+      "Turns placed there will fail model selection until it recovers."
   end
 
   defp model_line(%{model: :selectable}), do: nil
@@ -252,9 +278,9 @@ defmodule Tightbeam.Readiness do
       "(see mix tightbeam.catalog.diff)"
   end
 
-  defp model_line(%{harness: wire, model: {:absent, model}}) do
-    "default model #{model} is not in #{wire}'s live catalog — set " <>
-      "TIGHTBEAM_DEFAULT_MODEL to a listed ref (see mix tightbeam.catalog.diff)"
+  defp model_line(%{harness: wire, host: host, model: {:absent, model}}) do
+    "default model #{model} is not in #{wire}'s live catalog on #{host} — set " <>
+      "TIGHTBEAM_DEFAULT_MODEL to a ref that host offers (see mix tightbeam.catalog.diff)"
   end
 
   defp package_for(wire) do

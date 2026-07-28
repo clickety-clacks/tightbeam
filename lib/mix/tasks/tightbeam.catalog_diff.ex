@@ -104,14 +104,19 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     poll_fresh(server, deadline)
   end
 
+  # Scoped to the host this task runs on. Catalogs are per `{host, harness}`, but
+  # a bare mix task is a diagnostic of THIS machine — the org-wide per-host view
+  # belongs to the running gateway (readiness, and the refusals themselves).
   defp poll_fresh(server, deadline) do
+    host = Tightbeam.Placement.local_host_name()
+
     health =
       Map.new(Tightbeam.Harness.all(), fn module ->
-        {module.wire_name(), ModelCatalog.get(module.wire_name(), server)}
+        {module.wire_name(), ModelCatalog.get(host, module.wire_name(), server)}
       end)
 
     if Enum.all?(health, fn {_harness, {_entries, state}} -> settled?(state) end) do
-      inventories = ModelCatalog.get(server)
+      inventories = ModelCatalog.host_inventories(host, server)
 
       degraded =
         health

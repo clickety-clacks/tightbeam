@@ -283,47 +283,21 @@ defmodule Tightbeam.GatewayTest do
       # This suite's subject is the gateway, not the claude selectable-model pin
       # (tested in model_catalog_test). Leaving the pin on would filter this
       # fixture to nothing and starve the catalog.
+      # The REMOTE probes for any registered satellite, through the one runner
+      # seam both harnesses use. Tests that register a host get a catalog for it
+      # without an ssh ever leaving this machine.
       base_dir: catalog_base,
       codex_home: Path.join(catalog_base, "codex"),
       credential_status: fn _provider -> :onboarded end,
       claude_selectable_models: :all,
       claude_fetch: fn _, _ -> {:ok, claude_models} end,
+      sh: fn command ->
+        if Enum.any?(command, &String.contains?(&1, "api.anthropic.com")),
+          do: {claude_models, 0},
+          else: {codex_models(), 0}
+      end,
       codex_read: fn _ ->
-        {:ok,
-         JSON.encode!(%{
-           models: [
-             %{
-               slug: "gpt-5.6-sol",
-               display_name: "GPT-5.6 Sol",
-               supported_reasoning_levels: [
-                 %{effort: "low"},
-                 %{effort: "medium"},
-                 %{effort: "high"},
-                 %{effort: "xhigh"},
-                 %{effort: "max"},
-                 %{effort: "ultra"}
-               ]
-             },
-             %{
-               slug: "gpt-5.6-terra",
-               display_name: "GPT-5.6 Terra",
-               supported_reasoning_levels: [
-                 %{effort: "low"},
-                 %{effort: "high"}
-               ]
-             },
-             %{
-               slug: "gpt-5.6-nano",
-               display_name: "GPT-5.6 Nano",
-               supported_reasoning_levels: [%{effort: "turbo"}]
-             },
-             %{
-               slug: "gpt-5.6-classic",
-               display_name: "GPT-5.6 Classic",
-               supported_reasoning_levels: []
-             }
-           ]
-         })}
+        {:ok, codex_models()}
       end
     })
 
@@ -385,7 +359,7 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    %{db: db, registry: registry, lane: lane}
+    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base}
   end
 
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
@@ -859,22 +833,7 @@ defmodule Tightbeam.GatewayTest do
     {Tightbeam.Wire.Router, socket_deps} = Keyword.fetch!(bandit_opts, :plug)
     socket_deps = %{socket_deps | conn_registry: ctx.registry}
 
-    :sys.replace_state(ModelCatalog, fn state ->
-      harnesses =
-        Map.new(state.harnesses, fn {name, cache} ->
-          {name,
-           %{
-             cache
-             | entries: [],
-               derived_at: nil,
-               attempted_at: state.now.(),
-               reason: :not_derived,
-               refreshing: true
-           }}
-        end)
-
-      %{state | harnesses: harnesses}
-    end)
+    empty_catalog(:not_derived)
 
     {:pending, pending} =
       Devices.pair(ctx.db, %{
@@ -911,7 +870,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-opus-5"}
              })
 
-    assert message =~ ~s(model "claude-opus-5" is not offered by claude)
+    assert message =~ ~s(model "claude-opus-5" is not offered by claude on host testhost)
 
     # The hint is the point: naming only the rejection makes the operator guess.
     assert message =~ "offered:"
@@ -926,24 +885,9 @@ defmodule Tightbeam.GatewayTest do
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
 
-    # The gateway derives catalogs against its OWN host; force that derivation to
-    # have failed for a missing credential while the target host stays onboarded.
-    :sys.replace_state(ModelCatalog, fn state ->
-      harnesses =
-        Map.new(state.harnesses, fn {name, cache} ->
-          {name,
-           %{
-             cache
-             | entries: [],
-               derived_at: nil,
-               attempted_at: state.now.(),
-               reason: {:needs_onboarding, :no_credential},
-               refreshing: true
-           }}
-        end)
-
-      %{state | harnesses: harnesses}
-    end)
+    # Force the session host's OWN derivation to have failed for a missing
+    # credential — the catalog belongs to the host that will run the turn.
+    empty_catalog({:needs_onboarding, :no_credential})
 
     assert %{code: "catalog_unavailable", message: message} =
              Gateway.handlers(config)["tune"].(%{
@@ -952,16 +896,17 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    gateway = Placement.local_host_name()
-
-    # Names what is missing, on which host, for which provider, and the repair.
-    assert message =~ "anthropic has no usable credential on GATEWAY host #{gateway}"
+    # Names what is missing, on WHICH HOST, for which provider, and the repair —
+    # and the host is the SESSION's, not the gateway's. Before per-host catalogs
+    # this line sent the operator to the gateway to fix a satellite's grant.
+    assert message =~ "anthropic has no usable credential on testhost"
     assert message =~ ":no_credential"
-    assert message =~ "run tightbeam onboard anthropic on #{gateway}"
+    assert message =~ "run tightbeam onboard anthropic on testhost"
+    refute message =~ "GATEWAY host"
 
     # ...and never regresses to the bare inspected health term, which named
     # neither the provider, the host, nor the fix (sat-e2e mac-0726a S2).
-    refute message =~ "for claude: {:unavailable,"
+    refute message =~ "for claude on host testhost: {:unavailable,"
   end
 
   test "children refuses a broken harness on PATH without creating any org artifact", ctx do
@@ -2252,6 +2197,14 @@ defmodule Tightbeam.GatewayTest do
     base_dir = move_test_base("spawn-ready")
     parent = self()
 
+    # The catalog derives per {host, harness}, so the target host must be in the
+    # registry the catalog server reads before it can hold a catalog for it.
+    register_hosts(ctx.catalog_base, %{
+      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
+    })
+
+    await_host_catalog("worker", "claude")
+
     sh = fn command ->
       send(parent, {:spinup_command, command})
       {"", 0}
@@ -2278,6 +2231,131 @@ defmodule Tightbeam.GatewayTest do
 
     assert Org.get(ctx.db, session_key).host == "worker"
     assert_receive {:spinup_command, ["ssh" | _]}
+  end
+
+  # Task #88 / per-host-catalogs-v1 acceptance 1. Both failure directions of one
+  # defect: the catalog used to be the GATEWAY account's, applied to every host,
+  # so a ref was validated against entitlements that had nothing to do with the
+  # account the turn would run under. On the old tree this test is red twice —
+  # the gateway-only ref spawns onto the satellite, and the satellite-only ref is
+  # refused there.
+  test "spawn validates the model against the TARGET host's catalog, not the gateway's", ctx do
+    base_dir = move_test_base("per-host-validate", "worker")
+    parent = self()
+    sh = fn command -> send(parent, {:spinup_command, command}) && {"", 0} end
+
+    start_supervised!(%{
+      id: :per_host_validate_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    register_hosts(ctx.catalog_base, %{
+      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
+    })
+
+    await_host_catalog("worker", "claude")
+
+    # Two accounts, two entitlements. Neither ref is offered by the other host.
+    put_host_catalog("testhost", "claude", ["gateway-only-model"])
+    put_host_catalog("worker", "claude", ["worker-only-model"])
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+
+    place = fn host, model, key ->
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{display_name: "S", host: host, model: model, idempotency_key: key}
+      })
+    end
+
+    # Refused-though-runnable: worker CAN run this, and now says so.
+    assert %{session_key: on_worker} = place.("worker", "worker-only-model", "k-worker-ok")
+    assert Org.get(ctx.db, on_worker).host == "worker"
+
+    # Masquerading (#81): the gateway's grant covers this ref, worker's does not.
+    assert %{code: "model_unavailable", message: message} =
+             place.("worker", "gateway-only-model", "k-worker-bad")
+
+    assert message =~ ~s(model "gateway-only-model" is not offered by claude on host worker)
+    assert message =~ "worker-only-model"
+
+    # Symmetrically, on the gateway's own host (session k1) the gateway's ref is
+    # good and the satellite's is not — tune, because it judges the ref against
+    # the session's host without going through spinup.
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
+
+    retune = fn model ->
+      tune.(%{
+        origin: "user:flynn",
+        session_key: "k1",
+        params: %{setting: "set_model", model: model}
+      })
+    end
+
+    assert %{ok: true} = retune.("gateway-only-model")
+
+    assert %{code: "model_unavailable", message: gateway_message} =
+             retune.("worker-only-model")
+
+    assert gateway_message =~ "on host testhost"
+  end
+
+  # Acceptance 2: the gateway no longer needs a credential for a harness it does
+  # not itself run. SATELLITE.md carried the opposite rule until this change.
+  test "a harness with no GATEWAY credential still spawns on a satellite that has one", ctx do
+    base_dir = move_test_base("satellite-only-harness", "worker")
+    parent = self()
+    sh = fn command -> send(parent, {:spinup_command, command}) && {"", 0} end
+
+    start_supervised!(%{
+      id: :satellite_only_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    register_hosts(ctx.catalog_base, %{
+      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
+    })
+
+    await_host_catalog("worker", "claude")
+
+    put_host_catalog("worker", "claude", ["worker-only-model"])
+    degrade_host_catalog("testhost", "claude", {:needs_onboarding, :no_credential})
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+
+    assert %{session_key: session_key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "SatOnly",
+                 host: "worker",
+                 model: "worker-only-model",
+                 idempotency_key: "k-sat-only"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "worker"
+
+    # The gateway's own host still refuses, and blames ITSELF rather than
+    # demanding a grant for a machine that already has one.
+    assert %{code: "catalog_unavailable", message: message} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "OnGateway",
+                 host: "testhost",
+                 model: "worker-only-model",
+                 idempotency_key: "k-sat-only-gw"
+               }
+             })
+
+    assert message =~ "anthropic has no usable credential on testhost"
+    assert message =~ "run tightbeam onboard anthropic on testhost"
+    refute message =~ "GATEWAY host"
+    refute message =~ "onboard anthropic on worker"
   end
 
   test "kungfu-scaffold is admin-tier and commits a real starter that composes cleanly", ctx do
@@ -3632,20 +3710,122 @@ defmodule Tightbeam.GatewayTest do
            ]
   end
 
-  defp await_catalog(harness, attempts \\ 100)
+  # Install a fresh catalog for one {host, harness}, so a test can give two hosts
+  # genuinely different entitlements without a provider on either end.
+  defp put_host_catalog(host, harness, refs) do
+    entries =
+      Enum.map(refs, fn ref ->
+        %{
+          ref: ref,
+          display_name: ref,
+          name: ref,
+          efforts: [],
+          max_input_tokens: 200_000,
+          capabilities: %{},
+          provider: :anthropic
+        }
+      end)
 
-  defp await_catalog(harness, attempts) when attempts > 0 do
-    case ModelCatalog.get(harness, ModelCatalog) do
+    :sys.replace_state(ModelCatalog, fn state ->
+      now = state.now.()
+
+      put_in(state.entries[{host, harness}], %{
+        entries: entries,
+        derived_at: now,
+        attempted_at: now,
+        reason: nil,
+        refreshing: false
+      })
+    end)
+  end
+
+  defp degrade_host_catalog(host, harness, reason) do
+    :sys.replace_state(ModelCatalog, fn state ->
+      put_in(state.entries[{host, harness}], %{
+        entries: [],
+        derived_at: nil,
+        attempted_at: state.now.(),
+        reason: reason,
+        refreshing: true
+      })
+    end)
+  end
+
+  defp codex_models do
+    JSON.encode!(%{
+      models: [
+        %{
+          slug: "gpt-5.6-sol",
+          display_name: "GPT-5.6 Sol",
+          supported_reasoning_levels: [
+            %{effort: "low"},
+            %{effort: "medium"},
+            %{effort: "high"},
+            %{effort: "xhigh"},
+            %{effort: "max"},
+            %{effort: "ultra"}
+          ]
+        },
+        %{
+          slug: "gpt-5.6-terra",
+          display_name: "GPT-5.6 Terra",
+          supported_reasoning_levels: [
+            %{effort: "low"},
+            %{effort: "high"}
+          ]
+        },
+        %{
+          slug: "gpt-5.6-nano",
+          display_name: "GPT-5.6 Nano",
+          supported_reasoning_levels: [%{effort: "turbo"}]
+        },
+        %{
+          slug: "gpt-5.6-classic",
+          display_name: "GPT-5.6 Classic",
+          supported_reasoning_levels: []
+        }
+      ]
+    })
+  end
+
+  # Force every cached entry empty with a given degraded reason, keeping the
+  # server's own key set (one per {host, harness}) intact.
+  defp empty_catalog(reason) do
+    :sys.replace_state(ModelCatalog, fn state ->
+      entries =
+        Map.new(state.entries, fn {key, cache} ->
+          {key,
+           %{
+             cache
+             | entries: [],
+               derived_at: nil,
+               attempted_at: state.now.(),
+               reason: reason,
+               refreshing: true
+           }}
+        end)
+
+      %{state | entries: entries}
+    end)
+  end
+
+  defp await_catalog(harness), do: await_host_catalog(Placement.local_host_name(), harness)
+
+  defp await_host_catalog(host, harness, attempts \\ 100)
+
+  defp await_host_catalog(host, harness, attempts) when attempts > 0 do
+    case ModelCatalog.get(host, harness, ModelCatalog) do
       {_entries, :fresh} ->
         :ok
 
       _ ->
         Process.sleep(5)
-        await_catalog(harness, attempts - 1)
+        await_host_catalog(host, harness, attempts - 1)
     end
   end
 
-  defp await_catalog(harness, 0), do: flunk("catalog did not become fresh: #{harness}")
+  defp await_host_catalog(host, harness, 0),
+    do: flunk("catalog did not become fresh: #{harness} on #{host}")
 
   test "next turn after set_host delivers the advertised remote URL", ctx do
     exact_registry =
