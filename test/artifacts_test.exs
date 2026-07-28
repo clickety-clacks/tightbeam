@@ -400,7 +400,8 @@ defmodule Tightbeam.ArtifactsTest do
     refute File.exists?(archive_root)
   end
 
-  test "an origin outside the workspace is not mislabeled as archived", ctx do
+  test "acceptance 7: an origin outside the workspace is external — released, and nothing raises",
+       ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
 
@@ -426,14 +427,16 @@ defmodule Tightbeam.ArtifactsTest do
         origin_path: outside
       })
 
-    assert_raise ArgumentError, "artifact origin is outside its session workspace", fn ->
-      Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
-    end
+    # The work happened somewhere Tightbeam does not hold. The ROW is the
+    # record; there is nothing to take into custody, and nothing raises.
+    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
 
-    unchanged = Artifacts.get(ctx.db, row.artifact_id)
-    assert unchanged.state == "in-workspace"
-    assert unchanged.home == nil
-    assert File.dir?(workspace)
+    external = Artifacts.get(ctx.db, row.artifact_id)
+    assert external.state == "released"
+    assert external.home == nil
+    assert external.origin_path == outside
+    assert File.read!(outside) == "not in workspace"
+    refute File.exists?(workspace)
     refute File.exists?(archive_root)
   end
 
@@ -477,7 +480,7 @@ defmodule Tightbeam.ArtifactsTest do
     refute File.exists?(workspace)
   end
 
-  test "canonical custody rejects a symlink to bytes outside the workspace", ctx do
+  test "a symlink to bytes outside the workspace is external, not custody", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
 
@@ -504,18 +507,19 @@ defmodule Tightbeam.ArtifactsTest do
         origin_path: "outside-link.md"
       })
 
-    assert_raise ArgumentError, "artifact origin is outside its session workspace", fn ->
-      Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
-    end
+    # The bytes live outside the workspace, so the link is a pointer at external
+    # work — released, never claimed as custody Tightbeam does not have.
+    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
 
-    unchanged = Artifacts.get(ctx.db, row.artifact_id)
-    assert unchanged.state == "in-workspace"
-    assert unchanged.home == nil
-    assert File.dir?(workspace)
+    external = Artifacts.get(ctx.db, row.artifact_id)
+    assert external.state == "released"
+    assert external.home == nil
+    assert File.read!(outside) == "outside"
+    refute File.exists?(workspace)
     refute File.exists?(archive_root)
   end
 
-  test "valid artifacts archive despite each invalid mixed-row class", ctx do
+  test "valid artifacts archive beside each external and unreadable mixed-row class", ctx do
     for invalid_kind <- [:outside, :missing, :external_symlink] do
       suffix = "#{invalid_kind}-#{System.unique_integer([:positive])}"
       session_key = "mixed-#{suffix}"
@@ -566,7 +570,7 @@ defmodule Tightbeam.ArtifactsTest do
 
       [archive_dir_name] = File.ls!(archive_root)
       archived = Artifacts.get(ctx.db, valid.artifact_id)
-      unchanged = Artifacts.get(ctx.db, invalid.artifact_id)
+      other = Artifacts.get(ctx.db, invalid.artifact_id)
 
       assert archived.state == "archived"
 
@@ -574,8 +578,20 @@ defmodule Tightbeam.ArtifactsTest do
                Path.join([archive_root, archive_dir_name, "reports/valid.md"])
 
       assert File.read!(archived.home) == "valid #{invalid_kind}"
-      assert unchanged.state == "in-workspace"
-      assert unchanged.home == nil
+
+      # An origin OUTSIDE the workspace (directly or through a link) is external
+      # work, released. An origin inside the workspace that is not there at all
+      # is neither: nothing was released, so the row stays as recorded.
+      case invalid_kind do
+        :missing ->
+          assert other.state == "in-workspace"
+          assert other.home == nil
+
+        _external ->
+          assert other.state == "released"
+          assert other.home == nil
+      end
+
       refute File.exists?(workspace)
 
       File.rm_rf!(archive_root)

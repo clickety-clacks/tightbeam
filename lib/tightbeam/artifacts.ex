@@ -4,6 +4,8 @@ defmodule Tightbeam.Artifacts do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
+  @outside_workspace "artifact origin is outside its session workspace"
+
   @table_definition """
     artifactId        TEXT PRIMARY KEY,
     kind              TEXT NOT NULL CHECK (kind IN ('spec','report','doc','data','other')),
@@ -139,7 +141,14 @@ defmodule Tightbeam.Artifacts do
     Enum.map(rows, &artifact/1)
   end
 
-  @doc "Archive in-workspace rows after a session workspace has been reaped."
+  @doc """
+  Archive in-workspace rows after a session workspace has been reaped.
+
+  An origin that does not resolve inside the session workspace is an EXTERNAL
+  artifact — work that legitimately happened somewhere else (another machine, a
+  service) and was declared by recording it. There is nothing to take into
+  custody, so the row is RELEASED rather than archived: the row is the record.
+  """
   @spec archive_session(DB.server(), String.t(), String.t() | nil, String.t()) :: :ok
   def archive_session(db \\ Tightbeam.DB, session_key, workspace_path, archive_root) do
     rows = list(db, %{session_key: session_key})
@@ -150,13 +159,23 @@ defmodule Tightbeam.Artifacts do
     else
       ensure_workspace_available!(workspace_path)
 
-      {relative_paths, errors} = archive_candidates(live, workspace_path)
+      {relative_paths, external, errors} = archive_candidates(live, workspace_path)
 
-      if map_size(relative_paths) == 0 do
+      # An origin that is inside the workspace and unreadable is not external —
+      # nothing was released, the bytes are simply gone. That still refuses to
+      # invent custody.
+      if map_size(relative_paths) == 0 and errors != [] do
         raise hd(errors)
       end
 
-      archived_path = archive_workspace!(workspace_path, archive_root, session_key)
+      archived_path =
+        if map_size(relative_paths) == 0 do
+          remove_workspace(workspace_path)
+          nil
+        else
+          archive_workspace!(workspace_path, archive_root, session_key)
+        end
+
       updated_at = now()
 
       {:ok, :ok} =
@@ -177,6 +196,18 @@ defmodule Tightbeam.Artifacts do
             )
           end)
 
+          Enum.each(external, fn artifact_id ->
+            DB.Txn.q(
+              txn,
+              """
+              UPDATE artifacts
+              SET state = 'released', home = NULL, updatedAt = ?2
+              WHERE artifactId = ?1 AND state = 'in-workspace'
+              """,
+              [artifact_id, updated_at]
+            )
+          end)
+
           :ok
         end)
     end
@@ -185,12 +216,17 @@ defmodule Tightbeam.Artifacts do
   end
 
   defp archive_candidates(live, workspace_path) do
-    Enum.reduce(live, {%{}, []}, fn row, {paths, errors} ->
+    Enum.reduce(live, {%{}, [], []}, fn row, {paths, external, errors} ->
       try do
         relative_path = archived_relative_path!(row.origin_path, workspace_path)
-        {Map.put(paths, row.artifact_id, relative_path), errors}
+        {Map.put(paths, row.artifact_id, relative_path), external, errors}
       rescue
-        error in ArgumentError -> {paths, errors ++ [error]}
+        error in ArgumentError ->
+          if error.message == @outside_workspace do
+            {paths, external ++ [row.artifact_id], errors}
+          else
+            {paths, external, errors ++ [error]}
+          end
       end
     end)
   end
@@ -370,7 +406,7 @@ defmodule Tightbeam.Artifacts do
 
     if Path.type(relative) == :absolute or relative == ".." or
          String.starts_with?(relative, "../") do
-      raise ArgumentError, "artifact origin is outside its session workspace"
+      raise ArgumentError, @outside_workspace
     end
 
     relative
