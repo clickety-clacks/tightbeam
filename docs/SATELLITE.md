@@ -28,6 +28,12 @@ it and demands nothing.
    this host's registered name. `TIGHTBEAM_MACHINE` still overrides the name
    if you need it to, and a satellite provisioned by a gateway too old to have
    written the name says so and tells you to set it.
+
+   When driving the Anthropic ceremony non-interactively, the pasted code needs a
+   bare carriage return (`\r`) as a separate write to submit. A trailing newline
+   fills the input box but does not submit: the ceremony sits at the prompt, looking
+   identical to a hang, while the 30-minute onboarding lease runs down and the auth
+   URL silently expires.
 3. **Runtime + adapters** — install node and the ACP adapter packages
    (`@agentclientprotocol/claude-agent-acp`, `codex-acp`) at a path of your
    choosing. Also install `rsync` (standard on macOS/Linux).

@@ -1657,9 +1657,13 @@ mod tests {
         for (name, written, expected) in cases {
             let dir = root.join(name);
             fs::create_dir_all(&dir).unwrap();
+            // The WHOLE shape a live gateway writes, `machine` included -- confirmed
+            // reproduced on every provisioning pass, including a fresh re-assimilate.
+            // A fixture that drops a field production always writes is a fixture that
+            // can stop matching without anything failing.
             fs::write(
                 dir.join("gateway.json"),
-                format!(r#"{{"url":"{written}","cliToken":"tbc_org"}}"#),
+                format!(r#"{{"url":"{written}","cliToken":"tbc_org","machine":"work-1"}}"#),
             )
             .unwrap();
 
