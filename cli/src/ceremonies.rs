@@ -45,7 +45,8 @@ fn lease_timeout(ready: &serde_json::Value) -> Duration {
         .map_or(CEREMONY_FALLBACK_TIMEOUT, Duration::from_millis)
 }
 
-pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
+pub fn onboard(identity: &Identity, provider: &str, api_key: bool) -> Result<(), String> {
+    let kind = if api_key { "apiKey" } else { "subscription" };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
             .ok()
@@ -56,6 +57,7 @@ pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
         identity,
         provider,
         "begin",
+        kind,
         machine.as_deref(),
         None,
     );
@@ -64,9 +66,13 @@ pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
     let staging = staging_path(&ready)?;
     let timeout = lease_timeout(&ready);
 
-    let interactive = run_provider_onboarding(provider, staging, timeout);
+    let staged = if api_key {
+        run_api_key_onboarding(provider, staging, machine.as_deref(), timeout)
+    } else {
+        run_provider_onboarding(provider, staging, timeout)
+    };
 
-    if let Err(reason) = interactive {
+    if let Err(reason) = staged {
         let _ = fs::remove_dir_all(staging);
         let classified = if reason.contains("unsupported (no subscription)") {
             Some("unsupported_no_subscription")
@@ -77,6 +83,7 @@ pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
             identity,
             provider,
             "cancel",
+            kind,
             machine.as_deref(),
             classified,
         );
@@ -88,6 +95,7 @@ pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
         identity,
         provider,
         "finish",
+        kind,
         machine.as_deref(),
         None,
     );
@@ -105,6 +113,7 @@ pub fn onboard(identity: &Identity, provider: &str) -> Result<(), String> {
                 identity,
                 provider,
                 "cancel",
+                kind,
                 machine.as_deref(),
                 None,
             );
@@ -231,10 +240,16 @@ fn set_terminal_group(fd: libc::c_int, pgid: libc::pid_t) -> bool {
 /// codex self-limits its device-auth at 15 minutes. `claude setup-token` does not, and an
 /// abandoned one was found alive after two days against a deleted binary -- that asymmetry
 /// is why this wrapper exists rather than trusting the vendor CLIs.
+/// `stdin` is written to the child and the pipe closed immediately: a ceremony
+/// that consumes a secret must read it from a pipe, never from argv, and a child
+/// that reads to EOF deadlocks against a pipe left open. `None` leaves stdin
+/// exactly as the caller configured it -- the interactive ceremonies inherit the
+/// terminal and must keep doing so.
 fn run_bounded(
     mut command: ProcessCommand,
     what: &str,
     timeout: Duration,
+    stdin: Option<&[u8]>,
 ) -> Result<ExitStatus, String> {
     unsafe {
         command.pre_exec(|| {
@@ -247,6 +262,15 @@ fn run_bounded(
 
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let pgid = child.id() as libc::pid_t;
+
+    if let Some(bytes) = stdin {
+        let mut pipe = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("{what} did not accept stdin"))?;
+        pipe.write_all(bytes).map_err(|error| error.to_string())?;
+        // Dropped here on purpose -- see the doc comment.
+    }
 
     // Set it on this side too: the child may not have reached its own setpgid yet, and the
     // terminal handoff below needs the group to exist. Both sides racing to set the same
@@ -312,6 +336,171 @@ fn run_provider_onboarding(provider: &str, staging: &str, timeout: Duration) -> 
         .map_err(|error| error.to_string()),
         _ => Err(format!("unsupported provider: {provider}")),
     }
+}
+
+/// The non-interactive credential ceremony: a key on stdin, one live validation
+/// call, then the same staged install the subscription flows use.
+///
+/// The ORDER is the requirement, not an implementation detail -- validate, then
+/// bank. Banking first would leave a host holding a credential nothing has shown
+/// to work, and the next thing to discover it would be a turn failing as a model
+/// error, which is exactly the masquerade the preflight exists to end.
+fn run_api_key_onboarding(
+    provider: &str,
+    staging: &str,
+    machine: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let key = read_api_key()?;
+    validate_api_key(provider, &key, machine, timeout)?;
+    match provider {
+        "openai" => bank_openai_api_key(staging, &key, timeout),
+        "anthropic" => bank_anthropic_api_key(staging, &key),
+        #[cfg(test)]
+        "fixture-provider" => fs::write(std::path::Path::new(staging).join("fixture.json"), &key)
+            .map_err(|error| error.to_string()),
+        _ => Err(format!("unsupported provider: {provider}")),
+    }
+}
+
+/// Read the key from stdin, and REFUSE a terminal.
+///
+/// Not a usability choice. A secret typed at a terminal is echoed into that
+/// terminal's scrollback and, on most setups, into a scrollback file on disk --
+/// a leak this ceremony would be CREATING, not merely permitting. Suppressing
+/// the echo is possible but is a second, subtler thing to get right, and this
+/// path is non-interactive by design anyway. So the terminal case is refused
+/// with the exact command that works, which is also the form codex's own
+/// `login --with-api-key` documents.
+fn read_api_key() -> Result<String, String> {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        return Err(api_key_needs_a_pipe());
+    }
+    let mut raw = String::new();
+    io::Read::read_to_string(&mut io::stdin(), &mut raw)
+        .map_err(|error| format!("could not read the API key from stdin: {error}"))?;
+    let key = raw.trim().to_owned();
+    if key.is_empty() {
+        return Err("no API key arrived on stdin".to_owned());
+    }
+    Ok(key)
+}
+
+/// Split out so the sentence can be pinned by a test: `read_api_key` calls
+/// `isatty` directly and a unit test cannot stub that, but the remedy it prints
+/// is the whole value of the refusal. Same shape, and same reason, as
+/// `unnamed_machine`.
+fn api_key_needs_a_pipe() -> String {
+    "--api-key reads the key from stdin and will not read from a terminal, because a key \
+     typed at a prompt ends up in your shell scrollback. Pipe it in instead, e.g.\n  \
+     printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key"
+        .to_owned()
+}
+
+/// One authenticated models call, made from THIS host, before anything is banked.
+///
+/// Made in-process with the HTTP client the CLI already carries, so the key never
+/// reaches a command line -- not even a `curl` invocation this process would
+/// spawn, which would put a billing credential in the process table.
+///
+/// Recorded 2026-07-28 against both routes with deliberately invalid keys:
+/// anthropic answers `x-api-key` with 401 "API key is invalid.", and openai
+/// answers a bearer key with 401 `invalid_api_key`. The openai result is the
+/// load-bearing one: a ChatGPT subscription token is refused from that same route
+/// with 403 naming the missing scope `api.model.read`, so the route does
+/// distinguish the two kinds. A VALID key has not been exercised against either
+/// route from this fleet -- see credential-kinds-v1.
+fn validate_api_key(
+    provider: &str,
+    key: &str,
+    machine: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let host = machine.map(str::to_owned).unwrap_or_else(this_host);
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let request = match provider {
+        "anthropic" => agent
+            .get("https://api.anthropic.com/v1/models?limit=1")
+            .set("x-api-key", key)
+            .set("anthropic-version", "2023-06-01"),
+        "openai" => agent
+            .get("https://api.openai.com/v1/models")
+            .set("authorization", &format!("Bearer {key}")),
+        #[cfg(test)]
+        "fixture-provider" => return Ok(()),
+        _ => return Err(format!("unsupported provider: {provider}")),
+    };
+
+    match request.call() {
+        Ok(_response) => Ok(()),
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            Err(format!(
+                "the {provider} API key was rejected on {host}: HTTP {status} {}. Nothing was \
+                 banked -- the {provider} credential on {host} is unchanged.",
+                body.trim()
+            ))
+        }
+        Err(ureq::Error::Transport(error)) => Err(format!(
+            "could not reach {provider} from {host} to validate the API key: {error}. Nothing \
+             was banked -- the {provider} credential on {host} is unchanged."
+        )),
+    }
+}
+
+/// Let codex write its own `auth.json`.
+///
+/// `codex login --with-api-key` reads the key from stdin (verified present in
+/// codex-cli 0.145.0) and banks it in `CODEX_HOME` in whatever shape that version
+/// of codex reads back. Writing that file ourselves would mean guessing at
+/// `auth_mode`'s api-key spelling and at which fields codex requires -- a guess
+/// that would rot the next time codex ships. The subscription leg already defers
+/// to `codex login --device-auth` for exactly this reason.
+///
+/// Bounded by the same watchdog as every other ceremony child: a new path that
+/// spawned an unbounded child would reopen the orphan leak the watchdog closed.
+fn bank_openai_api_key(staging: &str, key: &str, timeout: Duration) -> Result<(), String> {
+    let codex = harness_cli("openai")?;
+    let mut command = ProcessCommand::new(&codex);
+    command
+        .args(["login", "--with-api-key"])
+        .env("CODEX_HOME", staging)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = run_bounded(
+        command,
+        "codex login --with-api-key",
+        timeout,
+        Some(key.as_bytes()),
+    )?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`codex login --with-api-key` failed: {status}"))
+    }
+}
+
+/// Claude has no equivalent CLI affordance -- it takes its credential from the
+/// environment -- so the key is staged directly, under the same filename the
+/// subscription ceremony stages, at the same 0600. Everything downstream (the
+/// install, the metadata, the home reconcile) is then identical between the two
+/// kinds; only the recorded kind differs.
+fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
+    let path = std::path::Path::new(staging).join("oauth-token");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))?;
+    file.write_all(key.as_bytes())
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))
 }
 
 /// The vendor binary a provider's ceremony invokes, checked to be reachable first.
@@ -392,7 +581,7 @@ fn run_openai_onboarding(staging: &str, timeout: Duration) -> Result<(), String>
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = run_bounded(command, "codex device-code login", timeout)?;
+    let status = run_bounded(command, "codex device-code login", timeout, None)?;
 
     if status.success() {
         Ok(())
@@ -476,7 +665,12 @@ fn run_anthropic_onboarding(staging: &str, timeout: Duration) -> Result<(), Stri
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = run_bounded(command, "claude setup-token (under script(1))", timeout)?;
+    let status = run_bounded(
+        command,
+        "claude setup-token (under script(1))",
+        timeout,
+        None,
+    )?;
 
     // Bytes, not `read_to_string`: one invalid UTF-8 byte anywhere in a pty transcript
     // made that call fail, and `unwrap_or_default` turned the failure into an empty
@@ -940,6 +1134,45 @@ fn target_from_probe(output: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The refusal is the whole value of not reading a key from a terminal, so
+    /// the sentence is pinned rather than the `isatty` branch that produces it
+    /// (which a unit test cannot stub). It must name the pipe form, because that
+    /// is the remedy the operator needs -- a bare "refused" would leave them
+    /// guessing at an invocation that does not exist anywhere else.
+    #[test]
+    fn refusing_a_terminal_names_the_pipe_form() {
+        let message = api_key_needs_a_pipe();
+
+        assert!(message.contains("printenv"));
+        assert!(message.contains("--api-key"));
+        assert!(message.contains("scrollback"));
+    }
+
+    /// An API key is staged under the SAME filename the subscription ceremony
+    /// stages, at the same 0600, so everything downstream is identical between
+    /// the two kinds and only the recorded kind differs.
+    #[test]
+    fn an_anthropic_api_key_stages_like_a_setup_token() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-api-key-stage-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+
+        bank_anthropic_api_key(staging.to_str().unwrap(), "sk-ant-api03-test").unwrap();
+
+        let staged = staging.join("oauth-token");
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "sk-ant-api03-test");
+        let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = fs::remove_dir_all(&staging);
+    }
+
     #[test]
     fn fixture_provider_materializes_its_staged_credential() {
         let staging =
@@ -989,7 +1222,8 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let error = run_bounded(command, "a stub ceremony", Duration::from_secs(1)).unwrap_err();
+        let error =
+            run_bounded(command, "a stub ceremony", Duration::from_secs(1), None).unwrap_err();
 
         // Named, not merely "timed out": an operator has to know what was killed on their
         // terminal.

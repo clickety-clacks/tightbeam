@@ -583,7 +583,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "identity-apply", vec![], params))
         }
-        Command::Onboard { identity, provider } => Ok(request(
+        Command::Onboard {
+            identity, provider, ..
+        } => Ok(request(
             identity,
             "onboard",
             vec![],
@@ -619,12 +621,16 @@ pub fn build_onboard_phase_request(
     identity: &Identity,
     provider: &str,
     phase: &str,
+    kind: &str,
     machine: Option<&str>,
     reason: Option<&str>,
 ) -> RequestSpec {
+    // `kind` rides on EVERY phase, not just finish, so the conversation is
+    // self-describing in a gateway log. Only finish acts on it.
     let mut params = vec![
         string_field("provider", provider),
         string_field("phase", phase),
+        string_field("kind", kind),
     ];
     if let Some(machine) = machine {
         params.push(string_field("machine", machine));
@@ -886,10 +892,14 @@ where
         }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
-        Command::Onboard { identity, provider } => {
+        Command::Onboard {
+            identity,
+            provider,
+            api_key,
+        } => {
             let endpoint = discover_endpoint()?;
             require_session_endpoint(&identity, &endpoint)?;
-            crate::ceremonies::onboard(&identity, &provider)
+            crate::ceremonies::onboard(&identity, &provider, api_key)
         }
         command => {
             let endpoint = discover_endpoint()?;
@@ -1352,16 +1362,35 @@ mod tests {
             &Identity::User("flynn".to_owned()),
             "openai",
             "begin",
+            "subscription",
             Some("work-1"),
             None,
         );
 
         assert_eq!(
             request.body_json,
-            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"openai","phase":"begin","machine":"work-1"}}"#
+            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"openai","phase":"begin","kind":"subscription","machine":"work-1"}}"#
         );
         assert!(!request.body_json.contains("auth.json"));
         assert!(!request.body_json.contains("token"));
+
+        // The api-key ceremony's conversation carries the KIND and nothing else
+        // new. The key itself is staged on the host being onboarded and never
+        // crosses the wire, exactly as the subscription credential never does.
+        let keyed = build_onboard_phase_request(
+            &Identity::User("flynn".to_owned()),
+            "anthropic",
+            "finish",
+            "apiKey",
+            Some("work-1"),
+            None,
+        );
+
+        assert_eq!(
+            keyed.body_json,
+            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1"}}"#
+        );
+        assert!(!keyed.body_json.contains("sk-"));
     }
 
     #[test]

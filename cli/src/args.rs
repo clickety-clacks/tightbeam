@@ -212,6 +212,7 @@ pub enum Command {
     Onboard {
         identity: Identity,
         provider: String,
+        api_key: bool,
     },
     ConfigGet {
         identity: Identity,
@@ -420,8 +421,14 @@ COMMANDS:
       Report the live revision, session revisions, staleness, and conflicts.
   identity apply (<session> | --all)
       Refresh selected sessions from the current live identity revision.
-  onboard openai|anthropic
-      Run this machine's guided credential onboarding flow.
+  onboard openai|anthropic [--api-key]
+      Run this machine's credential onboarding flow. Without --api-key this is
+      the interactive subscription ceremony. With it the flow is
+      non-interactive and the KEY is read from stdin -- never as an argument,
+      which would put a secret in this machine's process table:
+        printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
+      The key is validated against the provider before it is banked, and it
+      never leaves this machine.
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
 
@@ -504,7 +511,7 @@ fn opens_entry(line: &str, command: &str) -> bool {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
-    "abort", "all", "dry-run", "help", "json", "manifest", "resolve", "rm", "tree",
+    "abort", "all", "api-key", "dry-run", "help", "json", "manifest", "resolve", "rm", "tree",
 ];
 
 #[derive(Debug)]
@@ -1392,7 +1399,7 @@ fn parse_identity_command(
 
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
-        return Err("usage: tightbeam onboard <provider>".to_owned());
+        return Err("usage: tightbeam onboard <provider> [--api-key]".to_owned());
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
@@ -1402,6 +1409,10 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     Ok(Command::Onboard {
         identity: identity(flags)?,
         provider,
+        // A BOOLEAN flag, deliberately. `--api-key <value>` would put the key in
+        // this process's argv, where anyone on the box can read it out of the
+        // process table. The key arrives on stdin instead.
+        api_key: flags.contains_key("api-key"),
     })
 }
 
@@ -1480,6 +1491,7 @@ mod tests {
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
+                api_key: false,
             })
         );
     }
@@ -1555,7 +1567,7 @@ mod tests {
             "identity relearn [--abort | --resolve]",
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
-            "onboard openai|anthropic",
+            "onboard openai|anthropic [--api-key]",
             "config get default-archetype",
             "config set default-archetype <name>",
         ] {
@@ -2119,6 +2131,7 @@ mod tests {
                 Command::Onboard {
                     identity: Identity::User("flynn".to_owned()),
                     provider: "openai".to_owned(),
+                    api_key: false,
                 },
             ),
             (
