@@ -1401,10 +1401,7 @@ mod tests {
         let check = script(
             &dir,
             "hangs",
-            &format!(
-                "(sleep 1; echo survived > '{}') &\nsleep 5",
-                marker.display()
-            ),
+            &format!("{}\nsleep 5", escaped_writer(&marker)),
         );
         let status = run_with_input(
             RailExecArgs {
@@ -1415,8 +1412,7 @@ mod tests {
             b"{}\n".to_vec(),
         );
         assert_eq!(status, SCRIPT_TIMEOUT);
-        thread::sleep(Duration::from_millis(1_100));
-        assert!(!marker.exists());
+        assert_never_written(&marker);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1427,10 +1423,7 @@ mod tests {
         let check = script(
             &dir,
             "leader-exits",
-            &format!(
-                "(sleep 1; echo survived > '{}') &\nexit 0",
-                marker.display()
-            ),
+            &format!("{}\nexit 0", escaped_writer(&marker)),
         );
         let status = run_with_input(
             RailExecArgs {
@@ -1441,14 +1434,13 @@ mod tests {
             b"{}\n".to_vec(),
         );
         assert_eq!(status, SCRIPT_TIMEOUT);
-        thread::sleep(Duration::from_millis(1_100));
-        // The marker carries BOTH claims, which is why no stopwatch appears here. The
-        // descendant writes it as the last thing before exiting, so a wrapper that waited
-        // for the descendant instead of timing out could only have returned after that
-        // write — its absence is the proof that the timeout stayed armed. Timing the
-        // return against a fixed 500ms budget proved the same thing by racing a fork and
-        // an exec on a loaded runner, and lost (#51).
-        assert!(!marker.exists());
+        // The marker carries BOTH claims, which is why no stopwatch appears here. A
+        // wrapper that waited for the descendant instead of timing out could only have
+        // returned after the descendant began writing — so the absence of any write, right
+        // through the window, is the proof that the timeout stayed armed. Timing the return
+        // against a fixed 500ms budget proved the same thing by racing a fork and an exec
+        // on a loaded runner, and lost (#51).
+        assert_never_written(&marker);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1497,6 +1489,44 @@ mod tests {
 
         unsafe { libc::kill(escaped, libc::SIGKILL) };
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A descendant that outlives the wrapper and then writes CONTINUOUSLY.
+    ///
+    /// The initial sleep is what makes the test about anything: the wrapper's budget is
+    /// 40ms, so a group kill that works lands during the sleep and the loop never runs.
+    /// It is not lengthened here — a longer sleep makes a false pass MORE likely, not
+    /// less, because it pushes the first write further past whatever window is watching.
+    ///
+    /// Bounded rather than infinite: a survivor is a bug, and a bug should not leave a
+    /// shell looping on a shared box forever (#87). Ten seconds outlasts the poll window
+    /// with room and then exits on its own.
+    fn escaped_writer(marker: &Path) -> String {
+        format!(
+            "(sleep 1; for _ in $(seq 1 200); do echo survived > '{}'; sleep 0.05; done) &",
+            marker.display()
+        )
+    }
+
+    /// Assert a write NEVER appears, across a bounded window, rather than looking once
+    /// after a fixed nap.
+    ///
+    /// The nap this replaces slept 1.1s and looked once. Its failure mode was a FALSE
+    /// PASS: under parallel `cargo test` the descendant's own `sleep 1` lands late, so the
+    /// single look happened before the write, the marker was absent, and a containment
+    /// failure was recorded green. Polling inverts that — a survivor writes every 50ms, so
+    /// any survivor is caught within one interval, and the window is 3s to leave the
+    /// descendant's sleep three times its nominal length before this can miss it.
+    fn assert_never_written(marker: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            assert!(
+                !marker.exists(),
+                "a descendant survived the group kill and wrote {}",
+                marker.display()
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 
     // The escaped descendant is beyond the group kill, so its pid file is an event that
