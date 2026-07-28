@@ -28,7 +28,9 @@ defmodule Tightbeam.MixProject do
     [
       {:exqlite, "~> 0.27"},
       # Wire front: Bandit serves Plug (HTTP control plane) + WebSock (Clawline WS).
-      {:bandit, "~> 1.5"},
+      # The floor is the advisory boundary, stated as the advisory states it:
+      # EEF-CVE-2026-65623 / GHSA-vg8x-66vg-5pxh affects >= 1.11.0 and < 1.12.1.
+      {:bandit, ">= 1.12.1 and < 2.0.0"},
       {:websock_adapter, "~> 0.5"},
       # Archetype manifests are TOML (spec §Agent identity; rails will share the format).
       {:toml, "~> 0.7"},
