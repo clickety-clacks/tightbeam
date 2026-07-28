@@ -651,6 +651,13 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_commit_refs(call.params[:kind], call.params[:commit_refs]) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
+
+      # The referent cursor is read BEFORE the claim is filed: what a claim points
+      # at is what had been recorded when it was made, never an artifact that
+      # appeared while the check was running. Reading it outside the attest's
+      # transaction is deliberate — a registry this cannot read is reported as
+      # such, and a failed CHECK never rejects the claim (§Design 5).
+      artifact_cursor = artifact_cursor(db)
       result = transaction(db, fn txn -> attest_in_txn(txn, call) end)
 
       if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
@@ -662,8 +669,11 @@ defmodule Tightbeam.Assignments do
       # AFTER the transaction and never changes it: a referent that cannot be
       # checked is a fact about the check, not a verdict on the attest.
       case result do
-        %{assignment: assignment} -> Map.put(result, :referents, referents(db, call, assignment))
-        _ -> result
+        %{assignment: assignment} ->
+          Map.put(result, :referents, referents(db, call, assignment, artifact_cursor))
+
+        _ ->
+          result
       end
     end
   rescue
@@ -672,37 +682,75 @@ defmodule Tightbeam.Assignments do
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
   # "Artifacts are the referents" — an attest's referents are the artifacts the
-  # HOLDER recorded, not a separate list it declares. Each is verified by
-  # write-detection of its originPath on the host that holds it. Released and
-  # archived rows are out of custody, so their originPath means nothing and they
-  # are not checked.
-  defp referents(db, call, assignment) do
+  # HOLDER recorded, not a separate list it declares, and not a subset chosen
+  # here. Every one of them is verified by write-detection of its originPath on
+  # the host that holds it.
+  #
+  # The one row this cannot check is an ARCHIVED one: archival moved those bytes
+  # into `home` itself, so originPath is knowingly stale and stat-ing it would
+  # manufacture an "absent" the substrate caused. A released row is still checked
+  # — external work lives exactly where it says it does.
+  defp referents(_db, _call, _assignment, {:error, reason}), do: [unreadable_registry(reason)]
+
+  defp referents(db, call, assignment, {:ok, artifact_cursor}) do
     config = effort_config(call)
     holder = Org.get(db, assignment.holderKey)
 
-    {sql, params} =
-      case assignment.workItemId do
-        nil ->
-          {"createdBySession = ?1", [assignment.holderKey]}
-
-        item ->
-          {"createdBySession = ?1 AND workItemId = ?2", [assignment.holderKey, item]}
-      end
-
     case DB.query(
            db,
-           "SELECT artifactId, originPath FROM artifacts WHERE #{sql} AND state = 'in-workspace' ORDER BY createdAt, artifactId",
-           params
+           """
+           SELECT artifactId, originPath FROM artifacts
+           WHERE createdBySession = ?1 AND rowid <= ?2 AND state <> 'archived'
+           ORDER BY createdAt, artifactId
+           """,
+           [assignment.holderKey, artifact_cursor]
          ) do
       {:ok, rows} -> verified_referents(config, holder, rows)
-      {:error, _reason} -> []
+      {:error, reason} -> [unreadable_registry(reason)]
     end
   rescue
-    _ -> []
+    error -> [unreadable_registry(error)]
   end
 
-  defp verified_referents(_config, nil, _rows), do: []
+  defp artifact_cursor(db) do
+    case DB.query(db, "SELECT COALESCE(MAX(rowid), 0) FROM artifacts") do
+      {:ok, [[cursor]]} -> {:ok, cursor}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  defp unreadable_registry(reason) do
+    %{
+      artifactId: nil,
+      originPath: nil,
+      host: nil,
+      path: nil,
+      mtime: nil,
+      status: "unverifiable",
+      reason: "the artifact registry could not be read: #{inspect(reason)}"
+    }
+  end
+
   defp verified_referents(_config, _holder, []), do: []
+
+  # No holder session means no host to resolve a path against. That is reported
+  # per artifact, not swallowed into an empty list that reads like "checked, all
+  # fine".
+  defp verified_referents(_config, nil, rows) do
+    Enum.map(rows, fn [id, origin] ->
+      %{
+        artifactId: id,
+        originPath: origin,
+        host: nil,
+        path: nil,
+        mtime: nil,
+        status: "unverifiable",
+        reason: "the holder session is unavailable, so its host could not be resolved"
+      }
+    end)
+  end
 
   defp verified_referents(config, holder, rows) do
     resolved = Enum.map(rows, fn [id, origin] -> resolve_origin(config, holder, id, origin) end)
@@ -718,16 +766,16 @@ defmodule Tightbeam.Assignments do
 
     Enum.map(resolved, fn referent ->
       status =
-        cond do
-          referent.reason -> {:error, referent.reason}
-          true -> checks[referent.host][referent.path]
-        end
+        if referent.reason,
+          do: {:error, referent.reason},
+          else: checks[referent.host][referent.path]
 
       %{
         artifactId: referent.artifact_id,
         originPath: referent.origin,
         host: referent.host,
         path: referent.path,
+        mtime: referent_mtime(status),
         status: referent_status(status),
         reason: referent_reason(status)
       }
@@ -764,9 +812,12 @@ defmodule Tightbeam.Assignments do
       else: Path.join(Placement.workdir_path(config, holder), origin)
   end
 
-  defp referent_status(:present), do: "present"
+  defp referent_status({:present, _mtime}), do: "present"
   defp referent_status(:absent), do: "absent"
   defp referent_status(_), do: "unverifiable"
+
+  defp referent_mtime({:present, mtime}), do: mtime
+  defp referent_mtime(_), do: nil
 
   defp referent_reason({:error, reason}), do: reason
   defp referent_reason(nil), do: "the check returned no answer for this path"
