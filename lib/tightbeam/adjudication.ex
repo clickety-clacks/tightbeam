@@ -339,6 +339,24 @@ defmodule Tightbeam.Adjudication do
         # whose turn never reached a terminal must RE-HOLD, not clear — clearing
         # would free the session onto the same unhealed adapter. Every other
         # narrowed hold clears exactly as before.
+        reheld =
+          Txn.q(
+            txn,
+            """
+            SELECT e.sessionKey, e.condition
+            FROM sessions AS s
+            JOIN adjudication_episodes AS e
+              ON e.sessionKey=s.sessionKey AND e.recoveryWakeId=s.adjudicationHold
+            WHERE s.adjudicationHold IS NOT NULL AND s.adjudicationHold != '*'
+              AND NOT EXISTS (
+                SELECT 1 FROM turns AS t
+                WHERE t.sessionKey=s.sessionKey AND t.wakeId=s.adjudicationHold
+                  AND t.status IN ('queued','running')
+              )
+              AND e.healToken IS NOT NULL AND e.cause LIKE '#{@adapter_fault_prefix}%'
+            """
+          )
+
         Txn.q(
           txn,
           """
@@ -357,6 +375,12 @@ defmodule Tightbeam.Adjudication do
           """,
           [now()]
         )
+
+        # The vanished probe re-holds like any other non-delivered probe
+        # terminal, so it arms the same retry (idempotent per failed probe).
+        for [session_key, condition] <- reheld,
+            episode = get_in_txn(txn, session_key, condition),
+            do: schedule_probe_retry_in_txn(txn, episode)
 
         Txn.q(
           txn,
@@ -486,9 +510,15 @@ defmodule Tightbeam.Adjudication do
   probed it — so replaying a token produces nothing and a post-restart ready
   (new epoch) always qualifies. Returns `{session_key, condition}` pairs.
   """
-  @spec heal_candidates(DB.server(), String.t(), AdapterCoordinator.heal_token()) ::
+  @spec heal_candidates(DB.server(), String.t(), AdapterCoordinator.heal_token(), keyword()) ::
           [{String.t(), String.t()}]
-  def heal_candidates(db \\ DB, cause, token) do
+  def heal_candidates(db \\ DB, cause, token, opts \\ []) do
+    # `include_equal` is reserved for the probe RETRY (spec §2): a re-hold is a
+    # new hold and its one probe may re-use the token that already probed the
+    # previous hold. The ready-event sweeps never pass it — an equal token there
+    # is a replayed event and stays a no-op.
+    include_equal = Keyword.get(opts, :include_equal, false)
+
     {:ok, rows} =
       DB.query(
         db,
@@ -503,22 +533,34 @@ defmodule Tightbeam.Adjudication do
       )
 
     for [session_key, condition, heal_token] <- rows,
-        AdapterCoordinator.newer_token?(token, AdapterCoordinator.decode_token(heal_token)),
+        probe_worthy?(token, AdapterCoordinator.decode_token(heal_token), include_equal),
         do: {session_key, condition}
   end
+
+  defp probe_worthy?(token, prior, include_equal),
+    do: AdapterCoordinator.newer_token?(token, prior) or (include_equal and token == prior)
 
   @doc """
   The probe wake for one (episode, token) — deterministic, so an at-least-once
   sweep enqueues EXACTLY ONE probe turn per token even if it runs twice. The
-  token is part of the idempotency key: the next probe of a re-held session is a
-  different wake, which the ledger's UNIQUE wakeId then admits.
+  token is part of the idempotency key, and so is the PREDECESSOR probe when one
+  exists (`recoveryWakeId` at probe time — the probe whose failure re-held the
+  session): a retry probing the SAME token on an un-reopened episode is a new
+  attempt, not a replay, and must mint a new wake the ledger's UNIQUE wakeId
+  admits.
   """
   @spec probe_wake_in_txn(Txn.t(), map(), String.t()) :: String.t()
   def probe_wake_in_txn(%Txn{} = txn, episode, encoded_token) do
+    attempt =
+      case episode.recovery_wake_id do
+        prior when is_binary(prior) -> ":after:" <> prior
+        _ -> ""
+      end
+
     idempotent_wake_in_txn(
       txn,
       episode,
-      "probe:" <> encoded_token,
+      "probe:" <> encoded_token <> attempt,
       episode.session_key,
       @probe_prompt,
       nil
@@ -528,6 +570,62 @@ defmodule Tightbeam.Adjudication do
   @doc "The prompt a probe turn carries (also the text the session sees in history)."
   @spec probe_prompt() :: String.t()
   def probe_prompt, do: @probe_prompt
+
+  @probe_retry_consumer "adjudication_heal_retry"
+
+  @doc "The wake consumer name the composition root registers for probe retries."
+  @spec probe_retry_consumer() :: String.t()
+  def probe_retry_consumer, do: @probe_retry_consumer
+
+  @doc """
+  Arm a re-held session's probe retry (spec s4-operability-v1 §2): a re-hold is
+  a NEW hold, and this wake delivers its one probe. Time, not a ready edge,
+  carries the wake-up — the failed probe's adapter may already be ready and will
+  then never emit another edge (the task #103 wedge). Idempotent per failed
+  probe (`recoveryWakeId` at re-hold time), so the terminal writer and boot
+  reconciliation arm at most one retry for the same failure.
+  """
+  @spec schedule_probe_retry_in_txn(Txn.t(), map()) :: :ok
+  def schedule_probe_retry_in_txn(%Txn{} = txn, episode) do
+    wakes_exist? =
+      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wakes'") == [[1]]
+
+    if wakes_exist? and is_binary(episode.recovery_wake_id) do
+      key =
+        Enum.join(
+          [
+            "adjudication",
+            episode.session_key,
+            episode.condition,
+            "heal_retry",
+            episode.recovery_wake_id
+          ],
+          ":"
+        )
+
+      unless Idempotency.get_in_txn(txn, episode.session_key, "wake", key) do
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: episode.session_key,
+            origin: "process:tightbeam",
+            consumer: @probe_retry_consumer,
+            due_at: now() + probe_retry_ms()
+          })
+
+        Idempotency.put_in_txn(txn, %{
+          owner_user_id: episode.session_key,
+          operation: "wake",
+          idempotency_key: key,
+          session_key: wake.wake_id
+        })
+      end
+    end
+
+    :ok
+  end
+
+  defp probe_retry_ms,
+    do: Application.get_env(:tightbeam, :adjudication_probe_retry_ms, 30_000)
 
   @doc """
   Whether an episode is in a state a heal may take. This is the episode-state

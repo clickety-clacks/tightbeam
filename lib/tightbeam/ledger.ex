@@ -308,8 +308,11 @@ defmodule Tightbeam.Ledger do
   end
 
   @doc """
-  Re-hold the session of a probe turn identified by `seq`, wide (`'*'`).
-  Shared by the terminal writers; idempotent.
+  Re-hold the session of a probe turn identified by `seq`, wide (`'*'`), and arm
+  the re-hold's probe retry (spec s4-operability-v1 §2: a re-hold is a NEW hold
+  and owes its own probe — the failed probe's adapter may already be ready and
+  will then never emit another heal edge). Shared by the terminal writers;
+  idempotent, including the retry (one per failed probe wake).
   """
   @spec rehold_probe(Txn.t(), integer(), integer()) :: :ok
   def rehold_probe(%Txn{} = txn, seq, now) do
@@ -322,6 +325,16 @@ defmodule Tightbeam.Ledger do
       """,
       [seq, now]
     )
+
+    if Txn.changes(txn) == 1 do
+      with [[wake_id]] when is_binary(wake_id) <-
+             Txn.q(txn, "SELECT wakeId FROM turns WHERE seq = ?1", [seq]),
+           %{} = episode <- Tightbeam.Adjudication.probe_episode_for_wake_in_txn(txn, wake_id) do
+        Tightbeam.Adjudication.schedule_probe_retry_in_txn(txn, episode)
+      else
+        _ -> :ok
+      end
+    end
 
     :ok
   end

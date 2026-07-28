@@ -363,7 +363,8 @@ defmodule Tightbeam.Gateway do
          deliver: deliver,
          internal_consumers: %{
            "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
+           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+           Adjudication.probe_retry_consumer() => &adapter_heal_retry(heal_config, db, &1)
          },
          tick_ms: config.wake_tick_ms,
          name: Tightbeam.WakeScheduler},
@@ -4312,7 +4313,10 @@ defmodule Tightbeam.Gateway do
   replayed ready event does nothing.
 
   The EDGE trigger (a ready event) calls this for all held sessions; the LEVEL
-  trigger (a hold committing while the adapter is already ready) calls it for one.
+  trigger (a hold committing while the adapter is already ready) calls it for
+  one; the probe RETRY calls it for one with `include_equal: true` — a re-hold
+  is a new hold, and its one probe may re-use the token that probed its
+  predecessor (spec §2, ruled 2026-07-28).
   """
   @spec adapter_healed(map(), DB.server(), String.t(), AdapterCoordinator.heal_token(), keyword()) ::
           :ok
@@ -4320,7 +4324,7 @@ defmodule Tightbeam.Gateway do
     encoded = AdapterCoordinator.encode_token(token)
     only = Keyword.get(opts, :session_key)
 
-    Adjudication.heal_candidates(db, cause, token)
+    Adjudication.heal_candidates(db, cause, token, Keyword.take(opts, [:include_equal]))
     |> Enum.filter(fn {session_key, _condition} -> is_nil(only) or session_key == only end)
     |> Enum.each(fn {session_key, condition} ->
       release_hold(config, db, session_key, condition, cause, encoded)
@@ -4428,6 +4432,64 @@ defmodule Tightbeam.Gateway do
   catch
     :exit, _ -> :ok
   end
+
+  # Probe RETRY (spec s4-operability-v1 §2, ruled 2026-07-28): the wake a
+  # non-delivered probe terminal armed, fired after its backoff. Readiness is
+  # re-read NOW — an equal token is permitted because this is a new hold's one
+  # probe, not a replayed ready event. A not-ready adapter probes nothing: the
+  # next genuine ready edge owns the wake-up. The wake is consumed either way;
+  # a raise leaves it pending for the scheduler's next tick (transient failure).
+  defp adapter_heal_retry(config, db, wake) do
+    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT DISTINCT cause FROM adjudication_episodes WHERE sessionKey = ?1 AND cause LIKE 'adapter_fault:%'",
+        [wake.session_key]
+      )
+
+    Enum.each(rows, fn [cause] ->
+      with {:ok, adapter_key} <- parse_adapter_fault_key(cause),
+           {:ok, token} <- AdapterCoordinator.ready_token(coordinator, adapter_key) do
+        adapter_healed(config, db, cause, token,
+          session_key: wake.session_key,
+          include_equal: true
+        )
+      else
+        _ -> :ok
+      end
+    end)
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+          [wake.wake_id, System.system_time(:millisecond)]
+        )
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  # Inverse of AdapterCoordinator.key_name/1, from the cause encoding: the
+  # episode names the adapter it is waiting on, and the retry asks about THAT
+  # adapter — not whatever the session points at today.
+  defp parse_adapter_fault_key("adapter_fault:" <> key_name) do
+    with [harness, rest] <- String.split(key_name, ":", parts: 2),
+         [archetype, host] <- String.split(rest, "@", parts: 2) do
+      {:ok, {Harness.parse!(harness).id(), archetype, host}}
+    else
+      _ -> :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp parse_adapter_fault_key(_cause), do: :error
 
   defp arm_hold_in_txn(txn, session_key, wake_id) do
     Txn.q(txn, "UPDATE sessions SET adjudicationHold=?2, updatedAt=?3 WHERE sessionKey=?1", [

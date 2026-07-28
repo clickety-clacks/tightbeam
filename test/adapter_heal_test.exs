@@ -423,6 +423,7 @@ defmodule Tightbeam.AdapterHealTest do
       start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
       run_failing_turn(ctx, "fault")
 
+      before_rehold = System.system_time(:millisecond)
       epoch = 7
       heal(ctx, {epoch, 2})
       probe_wake = hold(ctx.db)
@@ -444,12 +445,17 @@ defmodule Tightbeam.AdapterHealTest do
       assert episode.cause == @cause
       assert AdapterCoordinator.decode_token(episode.heal_token) == {epoch, 2}
 
-      # No further probe on the SAME token...
+      # TOTALITY: every non-delivered probe terminal arms exactly one retry
+      # wake, deferred by the backoff — never due at the instant of the re-hold.
+      assert [%{state: "pending", due_at: due_at}] = retry_wakes(ctx.db)
+      assert due_at - before_rehold >= 5_000, "the retry must wait out a real backoff"
+
+      # A replayed ready event on the SAME token still probes nothing...
       heal(ctx, {epoch, 2})
       assert probe_count(ctx.db) == 1
       assert hold(ctx.db) == "*"
 
-      # ...and exactly one on a strictly larger one.
+      # ...and a strictly larger one probes exactly once, as before.
       heal(ctx, {epoch, 3})
       assert probe_count(ctx.db) == 2
       next_probe = hold(ctx.db)
@@ -457,12 +463,15 @@ defmodule Tightbeam.AdapterHealTest do
     end
   end
 
-  test "proof 3: a probe that fails through the REAL failure path does not re-probe its own token",
+  test "proof 3: a re-held probe re-probes its own token exactly once, AFTER backoff — never immediately",
        ctx do
-    # The storm this defends against: the failed probe reopens its episode, and
-    # the reopen must NOT clear healToken — otherwise the post-commit level check
-    # (the coordinator has not yet observed the death, so it still reports ready
-    # at the SAME token) immediately probes again, and again.
+    # The storm guard survives verbatim: the failed probe reopens its episode
+    # keeping healToken, so the post-commit level check (the coordinator still
+    # reports ready at the SAME token) must NOT immediately probe again. What
+    # died with the old clause (task #103): the re-held session then waited for
+    # a strictly newer token that a HEALTHY adapter never mints. A re-hold is a
+    # NEW hold; its one probe arrives via the armed retry wake instead.
+    retry_immediately()
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
 
@@ -476,7 +485,7 @@ defmodule Tightbeam.AdapterHealTest do
     # adjudication closure, post-commit — with the adapter still reported ready.
     fail_claimed_turn(ctx, probe)
 
-    assert probe_count(ctx.db) == 1, "a re-held probe must not re-probe its own token"
+    assert probe_count(ctx.db) == 1, "the level check must still refuse the equal token"
     assert hold(ctx.db) == "*"
 
     episode = episode(ctx.db)
@@ -485,9 +494,152 @@ defmodule Tightbeam.AdapterHealTest do
     assert AdapterCoordinator.decode_token(episode.heal_token) == {epoch, 2},
            "the token that already probed must survive the re-hold"
 
-    # A strictly larger token probes exactly once more.
-    heal(ctx, {epoch, 3})
+    # The scheduler's own tick delivers the retry: ONE probe, SAME token.
+    fire_due_retries(ctx)
     assert probe_count(ctx.db) == 2
+    next_probe = hold(ctx.db)
+    assert is_binary(next_probe) and next_probe != "*"
+    assert AdapterCoordinator.decode_token(episode(ctx.db).heal_token) == {epoch, 2}
+
+    # The consumed retry replays as nothing: the probe is in flight.
+    fire_due_retries(ctx)
+    assert probe_count(ctx.db) == 2
+
+    # A strictly larger token later still behaves as before.
+    assert {:ok, probe2} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert :ok = Ledger.finish(ctx.db, probe2.seq, "failed")
+    heal(ctx, {epoch, 3})
+    assert probe_count(ctx.db) == 3
+  end
+
+  test "task #103 production shape: a healed adapter's queued backlog drains after a transient probe failure, with NO further heal edge",
+       ctx do
+    retry_immediately()
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+
+    # FIVE real turns queue behind the hold — the wedged run's exact shape.
+    for i <- 1..5 do
+      assert :appended =
+               Gateway.deliver_prompt("k1", "user:flynn", "work #{i}",
+                 db: ctx.db,
+                 client_message_id: "c_w#{i}"
+               )
+    end
+
+    assert :none = Ledger.claim_next(ctx.db, "k1", "held")
+
+    # The adapter heals: its ONE ready edge fires, and it stays level-ready.
+    epoch = 7
+    :ok = CoordinatorStub.set_ready({:ok, {epoch, 2}})
+    heal(ctx, {epoch, 2})
+
+    # The probe claims first — and fails transiently (the #20 boot-boundary
+    # shape: the adapter reports ready, the probe's own call still failed).
+    assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert probe.prompt =~ "adapter recovered"
+    fail_claimed_turn(ctx, probe)
+    assert hold(ctx.db) == "*"
+
+    # From here the adapter is HEALTHY — circuit closed, zero failures, no
+    # death — so no further ready edge will EVER fire. Only the substrate's own
+    # time machinery may act.
+    fire_due_retries(ctx)
+
+    # The retry probed; this probe succeeds — and the backlog drains IN ORDER.
+    assert {:ok, probe2} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert probe2.prompt =~ "adapter recovered"
+    assert :ok = Ledger.finish(ctx.db, probe2.seq, "delivered")
+    assert is_nil(hold(ctx.db))
+
+    for i <- 1..5 do
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "lane")
+      assert turn.prompt == "work #{i}"
+      assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    end
+
+    assert Ledger.pending_count(ctx.db, "k1") == 0
+  end
+
+  test "a task-crash probe terminal (episode left RESOLVED, no reopen) still feeds the retry and drains",
+       ctx do
+    # The silent half of the wedge: a crashed probe re-holds without reopening
+    # its episode, so neither the escalation ladder nor any future edge would
+    # ever act. The retry must feed off the resolved-with-token episode too.
+    retry_immediately()
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "queued work",
+               db: ctx.db,
+               client_message_id: "c_q"
+             )
+
+    :ok = CoordinatorStub.set_ready({:ok, {7, 2}})
+    heal(ctx, {7, 2})
+    assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
+
+    # SessionLane's :DOWN path: no adjudication closure runs.
+    assert :ok = Ledger.finish(ctx.db, probe.seq, "failed", inspect(:task_crash))
+    assert hold(ctx.db) == "*"
+    assert episode(ctx.db).status == "resolved"
+
+    fire_due_retries(ctx)
+
+    assert {:ok, probe2} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert probe2.prompt =~ "adapter recovered"
+    assert :ok = Ledger.finish(ctx.db, probe2.seq, "delivered")
+    assert is_nil(hold(ctx.db))
+
+    assert {:ok, work} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert work.prompt == "queued work"
+  end
+
+  test "a due retry against a NOT-ready adapter probes nothing and leaves the hold heal-eligible",
+       ctx do
+    retry_immediately()
+    # ready defaults to :not_ready — the adapter went down again before the
+    # retry fired.
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+    heal(ctx, {7, 2})
+    assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert :ok = Ledger.finish(ctx.db, probe.seq, "failed")
+    assert hold(ctx.db) == "*"
+
+    fire_due_retries(ctx)
+
+    assert probe_count(ctx.db) == 1, "no readiness, no probe"
+    assert hold(ctx.db) == "*"
+    assert [%{state: "fired"}] = retry_wakes(ctx.db), "the retry is consumed, not left spinning"
+
+    # The next genuine heal edge (necessarily strictly newer) still sweeps.
+    heal(ctx, {7, 3})
+    assert probe_count(ctx.db) == 2
+  end
+
+  test "boot reconciliation of a VANISHED probe turn re-holds and arms the same retry exactly once",
+       ctx do
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+    heal(ctx, {7, 2})
+    probe_wake = hold(ctx.db)
+
+    # The probe turn never reached a terminal and its row is gone — the shape
+    # boot reconciliation re-holds rather than clears.
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        DB.Txn.q(txn, "DELETE FROM turns WHERE wakeId = ?1", [probe_wake])
+      end)
+
+    :ok = Adjudication.reconcile(ctx.db)
+    assert hold(ctx.db) == "*"
+    assert [%{state: "pending"}] = retry_wakes(ctx.db)
+
+    # Reconciling again arms nothing further (idempotent per failed probe).
+    :ok = Adjudication.reconcile(ctx.db)
+    assert [_only_one] = retry_wakes(ctx.db)
   end
 
   test "proof 3: a task-crash probe terminal re-holds (no adjudication closure runs)", ctx do
@@ -1024,6 +1176,52 @@ defmodule Tightbeam.AdapterHealTest do
   end
 
   defp heal(ctx, token), do: Gateway.adapter_healed(ctx.config, ctx.db, @cause, token)
+
+  # Collapse the retry backoff so the next scheduler fire delivers it; the app
+  # env is global, so it is restored when the test exits.
+  defp retry_immediately do
+    Application.put_env(:tightbeam, :adjudication_probe_retry_ms, 0)
+    on_exit(fn -> Application.delete_env(:tightbeam, :adjudication_probe_retry_ms) end)
+  end
+
+  defp retry_wakes(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT wakeId, sessionKey, dueAt, state FROM wakes WHERE consumer = ?1 ORDER BY createdAt, wakeId",
+        [Adjudication.probe_retry_consumer()]
+      )
+
+    Enum.map(rows, fn [wake_id, session_key, due_at, state] ->
+      %{wake_id: wake_id, session_key: session_key, due_at: due_at, state: state}
+    end)
+  end
+
+  # A REAL scheduler wired exactly as the composition root wires it (the same
+  # internal_consumers map), fired once — the substrate's own time machinery,
+  # no external stimulus. Prompt-wake delivery is stubbed out: this seam
+  # exercises the internal retry consumer.
+  defp fire_due_retries(ctx) do
+    {Tightbeam.Wakes, wake_opts} =
+      ctx.config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.Wakes, _}, &1))
+
+    name = :"retry_scheduler_#{System.unique_integer([:positive])}"
+
+    pid =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         deliver: fn _wake -> :ok end,
+         internal_consumers: Keyword.fetch!(wake_opts, :internal_consumers),
+         tick_ms: 3_600_000,
+         name: name},
+        id: name
+      )
+
+    Wakes.fire_due(pid)
+  end
 
   defp hold(db) do
     {:ok, [[hold]]} =
