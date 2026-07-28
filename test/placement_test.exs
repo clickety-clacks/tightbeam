@@ -11,6 +11,7 @@ defmodule Tightbeam.PlacementTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Org.ensure_schema(db)
     :ok = EventLog.ensure_schema(db)
+    :ok = Placement.ensure_schema(db)
     Archetypes.load!(base_dir)
     Rails.load!(base_dir)
 
@@ -73,14 +74,15 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "hosts registers the gateway machine under its real name; nothing redefines it", %{
-    base_dir: base_dir
+    base_dir: base_dir,
+    db: db
   } do
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       "remote" => %{ssh: "worker", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"},
       "testhost" => %{ssh: "forbidden", base_dir: "/wrong", cli_bin: "/wrong/bin"}
     })
 
-    hosts = Placement.hosts(base_dir)
+    hosts = Placement.hosts(base_dir, db)
     assert Placement.local_host_name() == "testhost"
     assert hosts["testhost"] == %{ssh: nil, base_dir: base_dir, cli_bin: nil}
     refute Map.has_key?(hosts, "local")
@@ -106,11 +108,11 @@ defmodule Tightbeam.PlacementTest do
     assert unknown =~ "work-2"
   end
 
-  test "move_workdir copies local to local", %{base_dir: base_dir} do
+  test "move_workdir copies local to local", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-local")
     new_base = Path.join(base_dir, "new-local")
 
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       "old-local" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
       "new-local" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
     })
@@ -121,7 +123,12 @@ defmodule Tightbeam.PlacementTest do
     File.write!(Path.join(source, ".tightbeam-session"), "secret")
 
     assert :ok =
-             Placement.move_workdir(%{base_dir: base_dir}, "session-1", "old-local", "new-local")
+             Placement.move_workdir(
+               %{base_dir: base_dir, db: db},
+               "session-1",
+               "old-local",
+               "new-local"
+             )
 
     assert File.read!(Path.join(test_workdir(new_base, "session-1"), "memory.md")) == "remember"
     refute File.exists?(Path.join(source, ".tightbeam-session"))
@@ -304,11 +311,11 @@ defmodule Tightbeam.PlacementTest do
 
   defp ssh_opts, do: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
-  test "move_workdir fails on a real local token removal error", %{base_dir: base_dir} do
+  test "move_workdir fails on a real local token removal error", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-remove-error")
     new_base = Path.join(base_dir, "new-remove-error")
 
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       "old-remove-error" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
       "new-remove-error" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
     })
@@ -318,7 +325,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert {:error, message} =
              Placement.move_workdir(
-               %{base_dir: base_dir},
+               %{base_dir: base_dir, db: db},
                "remove-error",
                "old-remove-error",
                "new-remove-error"
@@ -327,10 +334,10 @@ defmodule Tightbeam.PlacementTest do
     assert message =~ "source session token removal failed"
   end
 
-  test "move_workdir rsyncs local to remote", %{base_dir: base_dir} do
+  test "move_workdir rsyncs local to remote", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-local")
 
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       "old-local" => %{ssh: nil, base_dir: old_base, cli_bin: nil},
       "remote" => %{ssh: "remote", base_dir: "/remote/tb", cli_bin: nil}
     })
@@ -347,7 +354,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert :ok =
              Placement.move_workdir(
-               %{base_dir: base_dir, sh: sh},
+               %{base_dir: base_dir, db: db, sh: sh},
                "session-2",
                "old-local",
                "remote"
@@ -377,10 +384,10 @@ defmodule Tightbeam.PlacementTest do
            ]
   end
 
-  test "move_workdir rsyncs remote to local", %{base_dir: base_dir} do
+  test "move_workdir rsyncs remote to local", %{base_dir: base_dir, db: db} do
     new_base = Path.join(base_dir, "new-local")
 
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       "remote" => %{ssh: "remote", base_dir: "/remote/tb", cli_bin: nil},
       "new-local" => %{ssh: nil, base_dir: new_base, cli_bin: nil}
     })
@@ -396,7 +403,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert :ok =
              Placement.move_workdir(
-               %{base_dir: base_dir, sh: sh},
+               %{base_dir: base_dir, db: db, sh: sh},
                "session-3",
                "remote",
                "new-local"
@@ -438,8 +445,8 @@ defmodule Tightbeam.PlacementTest do
            ]
   end
 
-  test "move_workdir stages remote to remote through the gateway", %{base_dir: base_dir} do
-    register_hosts(base_dir, %{
+  test "move_workdir stages remote to remote through the gateway", %{base_dir: base_dir, db: db} do
+    register_hosts(db, %{
       "old-remote" => %{ssh: "old-remote", base_dir: "/old/tb", cli_bin: nil},
       "new-remote" => %{ssh: "new-remote", base_dir: "/new/tb", cli_bin: nil}
     })
@@ -456,7 +463,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert :ok =
              Placement.move_workdir(
-               %{base_dir: base_dir, sh: sh},
+               %{base_dir: base_dir, db: db, sh: sh},
                "session-4",
                "old-remote",
                "new-remote"
@@ -503,8 +510,8 @@ defmodule Tightbeam.PlacementTest do
   # harness. This existed only for codex, so restoring claude's sibling-checkout
   # path passed the whole suite — the exact regression the ticket is about.
   test "every harness resolves its local adapter under base_dir, never a sibling checkout",
-       %{base_dir: base_dir} do
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: Path.join(base_dir, "bin")}
+       %{base_dir: base_dir, db: db} do
+    config = %{base_dir: base_dir, db: db, cwd: "/work", cli_bin: Path.join(base_dir, "bin")}
 
     for module <- Tightbeam.Harness.all() do
       opts = Placement.adapter_opts(config, {module.id(), "shared", "testhost"})
@@ -526,11 +533,12 @@ defmodule Tightbeam.PlacementTest do
     end
   end
 
-  test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir} do
+  test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir, db: db} do
     parent = self()
 
     config = %{
       base_dir: base_dir,
+      db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: "fable",
@@ -563,7 +571,8 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "adapter_opts prepares a local codex gate probe with the trust-bypass CODEX_CONFIG", %{
-    base_dir: base_dir
+    base_dir: base_dir,
+    db: db
   } do
     install_statute(base_dir)
     Rails.load!(base_dir)
@@ -575,7 +584,7 @@ defmodule Tightbeam.PlacementTest do
     cli_bin = Path.join(base_dir, "bin")
     File.mkdir_p!(cli_bin)
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: cli_bin, default_model: "fable"}
+    config = %{base_dir: base_dir, db: db, cwd: "/work", cli_bin: cli_bin, default_model: "fable"}
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
@@ -593,13 +602,20 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "adapter_opts injects the org's claude token env when the store holds one", %{
-    base_dir: base_dir
+    base_dir: base_dir,
+    db: db
   } do
     token_dir = Path.join([base_dir, "auth", "claude"])
     File.mkdir_p!(token_dir)
     File.write!(Path.join(token_dir, "oauth-token"), "sk-ant-oat01-test\n")
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "fable"
+    }
 
     claude_env = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
     assert {"CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test"} in claude_env
@@ -609,10 +625,13 @@ defmodule Tightbeam.PlacementTest do
     refute Enum.any?(codex_env, fn {k, _} -> k == "CLAUDE_CODE_OAUTH_TOKEN" end)
   end
 
-  test "adapter_opts embeds every remote agent env in the ssh command", %{base_dir: base_dir} do
+  test "adapter_opts embeds every remote agent env in the ssh command", %{
+    base_dir: base_dir,
+    db: db
+  } do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       "worker" => %{
         ssh: "codex@worker",
         base_dir: "/srv/tb",
@@ -625,6 +644,7 @@ defmodule Tightbeam.PlacementTest do
 
     config = %{
       base_dir: base_dir,
+      db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: "fable",
@@ -671,11 +691,12 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "adapter_opts prepares the remote codex probe with the trust-bypass CODEX_CONFIG", %{
-    base_dir: base_dir
+    base_dir: base_dir,
+    db: db
   } do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       "worker" => %{ssh: "codex@worker", base_dir: "/srv/tb", cli_bin: "/srv/tb/bin"}
     })
 
@@ -690,6 +711,7 @@ defmodule Tightbeam.PlacementTest do
 
     config = %{
       base_dir: base_dir,
+      db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: "fable",
@@ -718,14 +740,21 @@ defmodule Tightbeam.PlacementTest do
     refute Keyword.has_key?(lawless_opts, :probe_model)
   end
 
-  test "adapter lineage identifies the shared harness runtime", %{base_dir: base_dir} do
+  test "adapter lineage identifies the shared harness runtime", %{base_dir: base_dir, db: db} do
     archetypes_dir = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(archetypes_dir)
     identity_name = "name with space:/@$('<é"
     File.write!(Path.join(archetypes_dir, "spaced.toml"), ~s(name = "#{identity_name}"\n))
     Archetypes.load!(base_dir)
 
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "fable"
+    }
+
     opts = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
 
     {"TIGHTBEAM_LINEAGE", "tb1-" <> encoded} =
@@ -735,9 +764,17 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "deliver_home preserves the manifest and nested state with zero statutes", %{
-    base_dir: base_dir
+    base_dir: base_dir,
+    db: db
   } do
-    config = %{base_dir: base_dir, cwd: "/work", cli_bin: "/local/bin", default_model: "fable"}
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: "fable"
+    }
+
     home = Placement.deliver_home(config, {:codex, "default", "testhost"})
     stamp_path = Path.join([home, ".tightbeam", "manifest"])
     stamp_before = File.read!(stamp_path)
@@ -777,27 +814,125 @@ defmodule Tightbeam.PlacementTest do
     Path.join([base_dir, "work", digest])
   end
 
-  test "hosts.json is the one registry; register_host records and updates in place", %{} do
-    base = Path.join(System.tmp_dir!(), "tb-reg-#{System.unique_integer([:positive])}")
-    File.mkdir_p!(base)
-    on_exit(fn -> File.rm_rf!(base) end)
-
+  test "the hosts table is the one registry; register_host records and updates in place", %{
+    base_dir: base_dir,
+    db: db
+  } do
     assert {:ok, entry} =
-             Placement.register_host(base, "work-1", %{
+             Placement.register_host(db, "work-1", %{
                ssh: "work-1.example",
                base_dir: "/home/u/.tightbeam"
              })
 
     assert entry.ssh == "work-1.example"
 
-    hosts = Placement.hosts(base)
+    hosts = Placement.hosts(base_dir, db)
     assert hosts["work-1"].base_dir == "/home/u/.tightbeam"
     assert hosts["testhost"].ssh == nil
 
     # re-register updates in place
-    assert {:ok, _} = Placement.register_host(base, "work-1", %{ssh: "w2", base_dir: "/z"})
-    assert Placement.hosts(base)["work-1"].ssh == "w2"
-    assert Placement.hosts(base)["work-1"].base_dir == "/z"
+    assert {:ok, _} = Placement.register_host(db, "work-1", %{ssh: "w2", base_dir: "/z"})
+    assert Placement.hosts(base_dir, db)["work-1"].ssh == "w2"
+    assert Placement.hosts(base_dir, db)["work-1"].base_dir == "/z"
+  end
+
+  # host-registry-v1 acceptance 3, plus the migration's authority rule: the
+  # table is the authority and a legacy file only fills gaps — a stale file
+  # spelling for a host that is already a row must not win a re-run.
+  test "migrate_registry! imports a legacy hosts.json once and table rows win", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    {:ok, _} = Placement.register_host(db, "kept", %{ssh: "kept.live", base_dir: "/live"})
+
+    path = Path.join(base_dir, "hosts.json")
+
+    File.write!(
+      path,
+      JSON.encode!(%{
+        "kept" => %{ssh: "kept.stale", base_dir: "/stale", cli_bin: nil},
+        "imported" => %{ssh: "imported.example", base_dir: "/srv/tb", cli_bin: "/srv/bin"}
+      })
+    )
+
+    assert :ok = Placement.migrate_registry!(db, base_dir)
+
+    hosts = Placement.hosts(base_dir, db)
+    assert hosts["kept"].ssh == "kept.live"
+    assert hosts["kept"].base_dir == "/live"
+    assert hosts["imported"].ssh == "imported.example"
+    assert hosts["imported"].cli_bin == "/srv/bin"
+    assert hosts[Placement.local_host_name()].ssh == nil
+
+    # The rename is what retires the file and makes the old bytes recoverable.
+    refute File.exists?(path)
+    assert File.exists?(path <> ".migrated")
+
+    # Second boot: nothing to migrate, nothing changes.
+    assert :ok = Placement.migrate_registry!(db, base_dir)
+    assert Placement.hosts(base_dir, db) == hosts
+  end
+
+  # host-registry-v1 acceptance 4: no hosts.json boots clean, and the gateway's
+  # own entry is synthesized either way.
+  test "an org with no hosts.json boots clean with the gateway's own entry", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    assert :ok = Placement.migrate_registry!(db, base_dir)
+
+    assert Placement.hosts(base_dir, db) == %{
+             Placement.local_host_name() => %{ssh: nil, base_dir: base_dir, cli_bin: nil}
+           }
+
+    refute File.exists?(Path.join(base_dir, "hosts.json.migrated"))
+  end
+
+  # Fail-before evidence, measured 2026-07-28 against the hosts.json registry
+  # this table replaced (40 concurrent registrations of distinct hosts, 10
+  # trials, through the same public API): 371 of 400 calls returned {:ok, entry}
+  # to their caller and the host was then ABSENT from the registry — roughly 3
+  # of 40 survived a trial — and one reader crashed on a torn read
+  # (JSON.DecodeError at position 0; File.write! truncates before it writes).
+  # The DB owner serializes the row upserts, so the same shape must now leave
+  # every acknowledged host present, with a concurrent reader never observing a
+  # torn or partial registry (host-registry-v1 acceptance 1 and 2).
+  test "concurrent registrations all land and a concurrent reader never tears", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    hosts = for index <- 1..40, do: "race-host-#{index}"
+
+    # Every task blocks on a release message, so all 40 writers and the reader
+    # are alive BEFORE any of them runs — without the barrier the reader could
+    # drain its reads against an empty table before the first write existed.
+    reader =
+      Task.async(fn ->
+        receive do: (:go -> :ok)
+        # hosts/2 raises on a registry it cannot read whole, so surviving the
+        # write burst IS the torn-read assertion.
+        Enum.each(1..200, fn _ -> _ = Placement.hosts(base_dir, db) end)
+        :ok
+      end)
+
+    writers =
+      Enum.map(hosts, fn name ->
+        Task.async(fn ->
+          receive do: (:go -> :ok)
+          Placement.register_host(db, name, %{ssh: "#{name}.example", base_dir: "/srv/tb"})
+        end)
+      end)
+
+    Enum.each([reader | writers], &send(&1.pid, :go))
+
+    results = Task.await_many(writers)
+    assert Task.await(reader) == :ok
+    assert Enum.all?(results, &match?({:ok, _}, &1))
+
+    # Every caller that was told {:ok, _} finds its host present — the defect
+    # was exactly an acknowledgement for a registration that then vanished.
+    registered = Placement.hosts(base_dir, db)
+    for name <- hosts, do: assert(registered[name].ssh == "#{name}.example")
   end
 
   test "where [\"*\"] grants any configured host; empty stays an error upstream" do

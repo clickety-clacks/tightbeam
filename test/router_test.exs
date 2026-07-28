@@ -24,7 +24,7 @@ defmodule Tightbeam.Wire.RouterTest do
     db = :"router_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Assets, Devices, EventLog, Org, Roles, Wakes],
+    for module <- [Assets, Devices, EventLog, Org, Roles, Wakes, Tightbeam.Placement],
         do: :ok = module.ensure_schema(db)
 
     base_dir =

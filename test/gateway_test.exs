@@ -225,6 +225,7 @@ defmodule Tightbeam.GatewayTest do
     db = :"gateway_db_#{System.unique_integer([:positive])}"
     registry = :"gateway_registry_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Placement.ensure_schema(db)
     start_supervised!({ConnRegistry, name: registry})
     lane = start_supervised!({LaneDoorbell, self()})
 
@@ -261,6 +262,7 @@ defmodule Tightbeam.GatewayTest do
       # on satellites. Tests that register a host get a catalog for it without an
       # ssh ever leaving this machine.
       base_dir: catalog_base,
+      db: db,
       credential_status: fn _provider -> :onboarded end,
       credential_kind: fn _provider -> :subscription end,
       claude_selectable_models: :all,
@@ -486,7 +488,7 @@ defmodule Tightbeam.GatewayTest do
       ])
 
     session = Org.get(ctx.db, session.session_key)
-    workspace = Placement.workdir_path(%{base_dir: base_dir}, session)
+    workspace = Placement.workdir_path(%{base_dir: base_dir, db: ctx.db}, session)
     artifact_path = Path.join(workspace, "specs/banana.md")
     File.mkdir_p!(Path.dirname(artifact_path))
     File.write!(artifact_path, "banana")
@@ -688,7 +690,7 @@ defmodule Tightbeam.GatewayTest do
 
     File.mkdir_p!(base_dir)
 
-    register_hosts(base_dir, %{
+    register_hosts(ctx.db, %{
       "already-assimilated" => %{
         ssh: "clu@already-assimilated",
         base_dir: "/remote/tb",
@@ -1806,10 +1808,10 @@ defmodule Tightbeam.GatewayTest do
 
   test "spawn fails closed when a registered host has no credential server", ctx do
     machine = "credential-worker-missing"
-    base_dir = move_test_base("credential-server-missing", machine)
+    base_dir = move_test_base(ctx.db, "credential-server-missing", machine)
 
     {:ok, _entry} =
-      Placement.register_host(base_dir, machine, %{
+      Placement.register_host(ctx.db, machine, %{
         ssh: machine,
         base_dir: "/remote/tb"
       })
@@ -1841,7 +1843,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "register-host supervises credentials and refuses spawn until onboarding", ctx do
     machine = "credential-worker-registration"
-    base_dir = move_test_base("credential-server-registration", machine)
+    base_dir = move_test_base(ctx.db, "credential-server-registration", machine)
 
     File.write!(
       Path.join(base_dir, "gateway.json"),
@@ -2027,7 +2029,7 @@ defmodule Tightbeam.GatewayTest do
   test "register-host with the LOCAL hostname never touches the boot-owned credential server",
        ctx do
     local = Tightbeam.Placement.local_host_name()
-    base_dir = move_test_base("local-host-reregistration", local)
+    base_dir = move_test_base(ctx.db, "local-host-reregistration", local)
     config = gateway_config(base_dir, ctx.db, 0)
     handlers = Gateway.handlers(config)
 
@@ -2068,7 +2070,7 @@ defmodule Tightbeam.GatewayTest do
   # party that knows both its advertised url and the org token.
   test "register-host provisions the satellite's operator endpoint file", ctx do
     machine = "endpoint-worker"
-    base_dir = move_test_base("endpoint-provisioning", machine)
+    base_dir = move_test_base(ctx.db, "endpoint-provisioning", machine)
 
     File.write!(
       Path.join(base_dir, "gateway.json"),
@@ -2121,7 +2123,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "register-host refuses a satellite when the gateway has no advertised url", ctx do
     machine = "unreachable-gateway-worker"
-    base_dir = move_test_base("endpoint-no-advertised-url", machine)
+    base_dir = move_test_base(ctx.db, "endpoint-no-advertised-url", machine)
 
     File.write!(
       Path.join(base_dir, "gateway.json"),
@@ -2147,13 +2149,12 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "TIGHTBEAM_ADVERTISED_URL"
-    assert {:ok, hosts} = base_dir |> Path.join("hosts.json") |> File.read!() |> JSON.decode()
-    assert hosts[machine]["base_dir"] == "/remote/tb"
+    assert Placement.hosts(base_dir, ctx.db)[machine].base_dir == "/remote/tb"
   end
 
   test "register-host raises a host-named error when credential child startup fails", ctx do
     machine = "credential-worker-start-failure"
-    base_dir = move_test_base("credential-server-start-failure", machine)
+    base_dir = move_test_base(ctx.db, "credential-server-start-failure", machine)
     {:ok, rejecting_supervisor} = RejectingCredentialSupervisor.start_link()
 
     handler =
@@ -2172,17 +2173,16 @@ defmodule Tightbeam.GatewayTest do
                    })
                  end
 
-    assert {:ok, hosts} = base_dir |> Path.join("hosts.json") |> File.read!() |> JSON.decode()
-    assert hosts[machine]["base_dir"] == "/remote/failed"
+    assert Placement.hosts(base_dir, ctx.db)[machine].base_dir == "/remote/failed"
   end
 
   test "spawn proceeds after a live remote readiness probe", ctx do
-    base_dir = move_test_base("spawn-ready")
+    base_dir = move_test_base(ctx.db, "spawn-ready")
     parent = self()
 
     # The catalog derives per {host, harness}, so the target host must be in the
     # registry the catalog server reads before it can hold a catalog for it.
-    register_hosts(ctx.catalog_base, %{
+    register_hosts(ctx.db, %{
       "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
     })
 
@@ -2223,7 +2223,7 @@ defmodule Tightbeam.GatewayTest do
   # the gateway-only ref spawns onto the satellite, and the satellite-only ref is
   # refused there.
   test "spawn validates the model against the TARGET host's catalog, not the gateway's", ctx do
-    base_dir = move_test_base("per-host-validate", "worker")
+    base_dir = move_test_base(ctx.db, "per-host-validate", "worker")
     parent = self()
     sh = fn command -> send(parent, {:spinup_command, command}) && {"", 0} end
 
@@ -2232,7 +2232,7 @@ defmodule Tightbeam.GatewayTest do
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
     })
 
-    register_hosts(ctx.catalog_base, %{
+    register_hosts(ctx.db, %{
       "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
     })
 
@@ -2314,7 +2314,7 @@ defmodule Tightbeam.GatewayTest do
   # Acceptance 2: the gateway no longer needs a credential for a harness it does
   # not itself run. SATELLITE.md carried the opposite rule until this change.
   test "a harness with no GATEWAY credential still spawns on a satellite that has one", ctx do
-    base_dir = move_test_base("satellite-only-harness", "worker")
+    base_dir = move_test_base(ctx.db, "satellite-only-harness", "worker")
     parent = self()
     sh = fn command -> send(parent, {:spinup_command, command}) && {"", 0} end
 
@@ -2323,7 +2323,7 @@ defmodule Tightbeam.GatewayTest do
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
     })
 
-    register_hosts(ctx.catalog_base, %{
+    register_hosts(ctx.db, %{
       "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
     })
 
@@ -3271,7 +3271,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "set_host denies on workdir sync failure and leaves Org unchanged", ctx do
-    base_dir = move_test_base("failure")
+    base_dir = move_test_base(ctx.db, "failure")
     source = test_workdir(base_dir, "k1")
     File.mkdir_p!(source)
     File.write!(Path.join(source, "memory.md"), "keep")
@@ -3296,7 +3296,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "set_host proceeds when the source workdir is missing", ctx do
-    base_dir = move_test_base("missing")
+    base_dir = move_test_base(ctx.db, "missing")
     parent = self()
 
     sh = fn command ->
@@ -3318,7 +3318,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "set_host readiness denial leaves Org unchanged", ctx do
-    base_dir = move_test_base("readiness-denial")
+    base_dir = move_test_base(ctx.db, "readiness-denial")
 
     sh = fn command ->
       if String.contains?(List.last(command), "test -f"), do: {"", 1}, else: {"", 0}
@@ -4062,7 +4062,7 @@ defmodule Tightbeam.GatewayTest do
 
     Application.put_env(:tightbeam, :advertised_url, "https://new-gateway.example")
 
-    register_hosts(base, %{
+    register_hosts(ctx.db, %{
       "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
     })
 
@@ -4899,7 +4899,7 @@ defmodule Tightbeam.GatewayTest do
     {"", 1}
   end
 
-  defp move_test_base(suffix, remote_host \\ "worker") do
+  defp move_test_base(db, suffix, remote_host \\ "worker") do
     base_dir =
       Path.join(System.tmp_dir!(), "gateway_move_#{suffix}_#{System.unique_integer([:positive])}")
 
@@ -4915,7 +4915,7 @@ defmodule Tightbeam.GatewayTest do
     Archetypes.load!(base_dir)
     on_exit(fn -> :persistent_term.erase(Archetypes) end)
 
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       remote_host => %{ssh: remote_host, base_dir: "/remote/tb", cli_bin: nil}
     })
 

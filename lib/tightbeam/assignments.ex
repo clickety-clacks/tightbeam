@@ -533,7 +533,7 @@ defmodule Tightbeam.Assignments do
         nil ->
           case Org.get(db, call.session_key) do
             %{state: "active"} = holder ->
-              config = effort_config(call)
+              config = effort_config(db, call)
               prepared = EffortCheckin.prepare_arm(config, holder, call.params[:workdir_root])
 
               open_assignment_result(
@@ -648,7 +648,7 @@ defmodule Tightbeam.Assignments do
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
          :ok <- commit_ref_filing_allowed(db, call),
-         :ok <- valid_commit_refs(call.params[:kind], call.params[:commit_refs]) do
+         :ok <- valid_commit_refs(db, call.params[:kind], call.params[:commit_refs]) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
 
@@ -693,7 +693,7 @@ defmodule Tightbeam.Assignments do
   defp referents(_db, _call, _assignment, {:error, reason}), do: [unreadable_registry(reason)]
 
   defp referents(db, call, assignment, {:ok, artifact_cursor}) do
-    config = effort_config(call)
+    config = effort_config(db, call)
     holder = Org.get(db, assignment.holderKey)
 
     case DB.query(
@@ -794,7 +794,7 @@ defmodule Tightbeam.Assignments do
           Path.type(path) != :absolute ->
             %{base | host: holder.host, path: local_origin_path(config, holder, origin)}
 
-          Map.has_key?(Placement.hosts(config.base_dir), name) ->
+          Map.has_key?(Placement.hosts(config.base_dir, config.db), name) ->
             %{base | host: name, path: path}
 
           true ->
@@ -1368,9 +1368,10 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp effort_config(call) do
+  defp effort_config(db, call) do
     defaults = %{
       base_dir: Application.get_env(:tightbeam, :base_dir, System.tmp_dir!()),
+      db: db,
       port: Application.get_env(:tightbeam, :port, 4_321),
       effort_checkin_horizon_ms:
         Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000)
@@ -1389,21 +1390,21 @@ defmodule Tightbeam.Assignments do
 
   defp valid_note(_), do: error("invalid_note", "note must be text")
 
-  defp valid_commit_refs(_kind, nil), do: :ok
+  defp valid_commit_refs(_db, _kind, nil), do: :ok
 
-  defp valid_commit_refs("completion", refs) when is_list(refs) do
+  defp valid_commit_refs(db, "completion", refs) when is_list(refs) do
     Enum.reduce_while(refs, :ok, fn ref, :ok ->
-      case validate_commit_ref(ref) do
+      case validate_commit_ref(db, ref) do
         :ok -> {:cont, :ok}
         error -> {:halt, error}
       end
     end)
   end
 
-  defp valid_commit_refs("completion", _refs),
+  defp valid_commit_refs(_db, "completion", _refs),
     do: error("invalid_commit_refs", "commitRefs must be an array")
 
-  defp valid_commit_refs(_kind, _refs),
+  defp valid_commit_refs(_db, _kind, _refs),
     do: error("invalid_commit_refs", "commitRefs are only valid on completion attests")
 
   defp commit_ref_filing_allowed(db, call) do
@@ -1430,7 +1431,7 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp validate_commit_ref(ref) when is_map(ref) do
+  defp validate_commit_ref(db, ref) when is_map(ref) do
     normalized = Map.new(ref, fn {key, value} -> {to_string(key), value} end)
 
     with ["commit", "repo"] <- normalized |> Map.keys() |> Enum.sort(),
@@ -1438,17 +1439,17 @@ defmodule Tightbeam.Assignments do
          commit when is_binary(commit) <- normalized["commit"],
          [host, path] <- String.split(repo, ":", parts: 2),
          true <- host != "" and Path.type(path) == :absolute,
-         {_output, 0} <- run_git_cat_file(host, path, commit) do
+         {_output, 0} <- run_git_cat_file(db, host, path, commit) do
       :ok
     else
       _ -> error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
     end
   end
 
-  defp validate_commit_ref(_ref),
+  defp validate_commit_ref(_db, _ref),
     do: error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
 
-  defp run_git_cat_file(host, path, commit) do
+  defp run_git_cat_file(db, host, path, commit) do
     base_dir =
       Application.get_env(
         :tightbeam,
@@ -1456,7 +1457,7 @@ defmodule Tightbeam.Assignments do
         Path.join(System.user_home!(), ".tightbeam")
       )
 
-    case Placement.hosts(base_dir)[host] do
+    case Placement.hosts(base_dir, db)[host] do
       %{ssh: nil} ->
         run_commit_ref_command(
           "git",

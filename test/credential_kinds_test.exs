@@ -24,8 +24,11 @@ defmodule Tightbeam.CredentialKindsTest do
 
   setup do
     base = Path.join(System.tmp_dir!(), "tb-cred-kinds-#{System.unique_integer([:positive])}")
+    db = :"cred_kinds_db_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Placement.ensure_schema(db)
     on_exit(fn -> File.rm_rf!(base) end)
-    %{base: base}
+    %{base: base, db: db}
   end
 
   defp stage!(base, provider, filename, bytes) do
@@ -337,7 +340,7 @@ defmodule Tightbeam.CredentialKindsTest do
       satellite_dir = Path.join(ctx.base, "satellite")
       File.mkdir_p!(gateway_dir)
 
-      register_hosts(gateway_dir, %{
+      register_hosts(ctx.db, %{
         "satellite" => %{ssh: "tb@satellite", base_dir: satellite_dir}
       })
 
@@ -359,6 +362,7 @@ defmodule Tightbeam.CredentialKindsTest do
         ModelCatalog.start_link(
           name: nil,
           base_dir: gateway_dir,
+          db: ctx.db,
           sh: sh,
           credential_status: fn _provider, _host -> :onboarded end,
           credential_kind: fn _provider, host ->

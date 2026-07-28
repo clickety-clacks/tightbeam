@@ -119,7 +119,8 @@ defmodule Tightbeam.AttentionTierTest do
           Tightbeam.Assignments,
           EventLog,
           Ledger,
-          WorkState
+          WorkState,
+          Tightbeam.Placement
         ],
         do: :ok = module.ensure_schema(db)
 
@@ -145,6 +146,7 @@ defmodule Tightbeam.AttentionTierTest do
     start_supervised!(
       {ModelCatalog,
        base_dir: base_dir,
+       db: db,
        codex_home: Path.join(base_dir, "codex"),
        claude_fetch: fn _, _ -> {:error, :offline} end,
        codex_read: fn _ -> {:error, :offline} end}

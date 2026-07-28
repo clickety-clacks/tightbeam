@@ -165,6 +165,7 @@ defmodule Tightbeam.AdapterHealTest do
   setup do
     db = :"heal_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Placement.ensure_schema(db)
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
     scheduler = start_supervised!({WakeSchedulerStub, self()})
@@ -179,6 +180,7 @@ defmodule Tightbeam.AdapterHealTest do
     start_supervised!(
       {ModelCatalog,
        base_dir: catalog_base,
+       db: db,
        codex_home: Path.join(catalog_base, "codex"),
        claude_fetch: fn _, _ -> {:error, :offline} end,
        codex_read: fn _ -> {:error, :offline} end}

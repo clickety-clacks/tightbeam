@@ -66,7 +66,8 @@ defmodule Tightbeam.CliIntegrationTest do
           WorkState,
           EventLog,
           Escalation,
-          Producers
+          Producers,
+          Tightbeam.Placement
         ],
         do: :ok = module.ensure_schema(db)
 

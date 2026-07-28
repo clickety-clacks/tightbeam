@@ -163,7 +163,7 @@ defmodule Tightbeam.Producers do
     result =
       with %{holder_key: holder_key} <- assignment_holder(db, job.assignment_id),
            %{} = holder <- Org.get(db, holder_key),
-           :ok <- local_holder(config, holder),
+           :ok <- local_holder(db, config, holder),
            workdir <- Placement.holder_workdir(config, holder) do
         run_local(db, job, workdir, runner)
       else
@@ -624,8 +624,8 @@ defmodule Tightbeam.Producers do
     outcome
   end
 
-  defp local_holder(config, holder) do
-    case Placement.hosts(config.base_dir)[holder.host] do
+  defp local_holder(db, config, holder) do
+    case Placement.hosts(config.base_dir, db)[holder.host] do
       nil ->
         {:error,
          "host-fail: no host named #{holder.host} is registered: assimilate it or correct the placement"}

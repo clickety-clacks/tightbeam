@@ -49,7 +49,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
           Assignments,
           Artifacts,
           WorkState,
-          RailRemedy
+          RailRemedy,
+          Tightbeam.Placement
         ] do
       :ok = module.ensure_schema(db)
     end

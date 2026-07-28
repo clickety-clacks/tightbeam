@@ -41,7 +41,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
           Assignments,
           WorkState,
           EventLog,
-          RailRemedy
+          RailRemedy,
+          Tightbeam.Placement
         ] do
       :ok = module.ensure_schema(db)
     end

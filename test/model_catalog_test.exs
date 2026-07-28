@@ -11,6 +11,9 @@ defmodule Tightbeam.ModelCatalogTest do
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "model-catalog-#{System.unique_integer([:positive])}")
+    db = :"model_catalog_db_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Placement.ensure_schema(db)
     token_dir = Path.join([base_dir, "auth", "claude"])
     File.mkdir_p!(token_dir)
     File.write!(Path.join(token_dir, "oauth-token"), "fixture-token")
@@ -38,6 +41,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
     %{
       base_dir: base_dir,
+      db: db,
       claude_fetch: claude_fetch,
       codex_json: codex_json,
       codex_sh: codex_sh
@@ -359,6 +363,7 @@ defmodule Tightbeam.ModelCatalogTest do
       {ModelCatalog,
        name: missing,
        base_dir: Path.join(ctx.base_dir, "missing"),
+       db: ctx.db,
        sh: ctx.codex_sh,
        credential_status: fn _provider -> :onboarded end}
     )
@@ -383,6 +388,7 @@ defmodule Tightbeam.ModelCatalogTest do
       {ModelCatalog,
        name: gated,
        base_dir: ctx.base_dir,
+       db: ctx.db,
        sh: fn _command -> raise "no probe may run: the credential gate must refuse first" end,
        claude_fetch: fn _path, _headers ->
          raise "no probe may run: the credential gate must refuse first"
@@ -421,6 +427,9 @@ defmodule Tightbeam.ModelCatalogTest do
     end
 
     Archetypes.load!(ctx.base_dir)
+    # org_options is the globals-facing form: it reads the default-named DB.
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: Tightbeam.DB}, id: :global_db)
+    :ok = Placement.ensure_schema(Tightbeam.DB)
     assert is_map(Gateway.org_options())
   end
 
@@ -434,6 +443,7 @@ defmodule Tightbeam.ModelCatalogTest do
       {ModelCatalog,
        name: name,
        base_dir: ctx.base_dir,
+       db: ctx.db,
        claude_fetch: fn path, headers ->
          send(parent, :provider_io)
          ctx.claude_fetch.(path, headers)
@@ -468,6 +478,9 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx, name: ModelCatalog, claude_fetch: hung_fetch)
     assert_receive {:fetch_started, fetch_pid}
     Archetypes.load!(ctx.base_dir)
+    # org_options is the globals-facing form: it reads the default-named DB.
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: Tightbeam.DB}, id: :global_db)
+    :ok = Placement.ensure_schema(Tightbeam.DB)
 
     {reader_us, {[], {:unavailable, :not_derived}}} =
       :timer.tc(fn -> ModelCatalog.get(@host, "claude", catalog) end)
@@ -531,7 +544,7 @@ defmodule Tightbeam.ModelCatalogTest do
       )
 
       {:ok, _entry} =
-        Placement.register_host(ctx.base_dir, "satellite", %{
+        Placement.register_host(ctx.db, "satellite", %{
           ssh: "sat.example",
           base_dir: satellite_base,
           cli_bin: nil
@@ -754,6 +767,7 @@ defmodule Tightbeam.ModelCatalogTest do
       [
         name: name,
         base_dir: ctx.base_dir,
+        db: ctx.db,
         claude_fetch: ctx.claude_fetch,
         sh: ctx.codex_sh,
         credential_status: fn _provider -> :onboarded end,

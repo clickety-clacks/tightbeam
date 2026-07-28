@@ -30,7 +30,8 @@ defmodule Tightbeam.ProducersTest do
           WorkItems,
           Assignments,
           EventLog,
-          Producers
+          Producers,
+          Tightbeam.Placement
         ] do
       :ok = module.ensure_schema(db)
     end
@@ -326,7 +327,7 @@ defmodule Tightbeam.ProducersTest do
     remote = session(ctx.db, "remote", "flynn", "claude", "anthropic", "remote-host")
     remote_assignment = assignment(ctx.db, remote.session_key, "remote")
 
-    register_hosts(ctx.base_dir, %{
+    register_hosts(ctx.db, %{
       "remote-host" => %{ssh: "remote", base_dir: "/remote"}
     })
 
@@ -351,7 +352,7 @@ defmodule Tightbeam.ProducersTest do
     # detail is what `local_holder/2` reports for an unregistered host too, so the
     # premise has to be pinned separately or the registration above is decoration
     # and the case passes with no host registered at all (#79).
-    assert %{ssh: "remote"} = Placement.hosts(ctx.base_dir)["remote-host"]
+    assert %{ssh: "remote"} = Placement.hosts(ctx.base_dir, ctx.db)["remote-host"]
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.subject == remote_assignment.id and
@@ -363,7 +364,7 @@ defmodule Tightbeam.ProducersTest do
     # ssh/placement when the actual repair is assimilate (#97).
     ghost = session(ctx.db, "ghost", "flynn", "claude", "anthropic", "ghost-host")
     ghost_assignment = assignment(ctx.db, ghost.session_key, "ghost")
-    assert Placement.hosts(ctx.base_dir)["ghost-host"] == nil
+    assert Placement.hosts(ctx.base_dir, ctx.db)["ghost-host"] == nil
 
     %{queued: ghost_id} =
       Producers.__handle__(
@@ -554,7 +555,7 @@ defmodule Tightbeam.ProducersTest do
     start_supervised!(
       {Tightbeam.ProducerRunner,
        db: ctx.db,
-       config: %{base_dir: ctx.base_dir, port: 1},
+       config: %{base_dir: ctx.base_dir, db: ctx.db, port: 1},
        supervisor: supervisor,
        name: runner},
       id: runner

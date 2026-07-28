@@ -38,7 +38,8 @@ defmodule Tightbeam.RailRemedyTest do
           Assignments,
           WorkState,
           EventLog,
-          RailRemedy
+          RailRemedy,
+          Tightbeam.Placement
         ] do
       :ok = module.ensure_schema(db)
     end
@@ -1019,6 +1020,7 @@ defmodule Tightbeam.RailRemedyTest do
         start_supervised!(
           {ModelCatalog,
            base_dir: ctx.base_dir,
+           db: ctx.db,
            credential_status: fn _provider -> :onboarded end,
            credential_kind: fn _provider -> :subscription end,
            credential_kind: fn _provider -> :subscription end,

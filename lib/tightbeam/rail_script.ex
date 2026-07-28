@@ -101,6 +101,7 @@ defmodule Tightbeam.RailScript do
       holder ->
         config = %{
           base_dir: base_dir,
+          db: db,
           port: Application.get_env(:tightbeam, :port, 0)
         }
 

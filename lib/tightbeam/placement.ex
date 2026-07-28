@@ -4,9 +4,11 @@ defmodule Tightbeam.Placement do
   exist. Everything else addresses identity; this module turns a host NAME
   into an adapter command, a delivered shared home, and an allow/deny answer.
 
-  Hosts are INSTANCE CONFIG, never DB rows: `<base_dir>/hosts.json` maps
-  name => %{ssh: destination-or-nil, base_dir: path, cli_bin:
-  path-or-nil}, written by `assimilate`. The gateway's own machine is under its
+  Hosts are DB ROWS behind the org's DB owner — the serialization seam — written
+  by `assimilate` through `register_host/3` and read back as name =>
+  %{ssh: destination-or-nil, base_dir: path, cli_bin: path-or-nil}
+  (host-registry-v1). `gateway.json` stays a FILE — the CLI reads it
+  before any DB exists. The gateway's own machine is under its
   REAL hostname (`local_host_name/0`; ssh: nil) — never under an indexical
   like "local", because the org's vocabulary must match the operator's
   ("spawn on eezo" has to resolve on eezo, including on eezo itself). Which
@@ -65,7 +67,7 @@ defmodule Tightbeam.Placement do
   an unreachable host degrades exactly like a dead adapter, per spec.
   """
 
-  alias Tightbeam.{Archetypes, Harness, Homes, Identity, Org, Rails}
+  alias Tightbeam.{Archetypes, DB, Harness, Homes, Identity, Org, Rails}
   import Bitwise
 
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
@@ -87,13 +89,59 @@ defmodule Tightbeam.Placement do
   @typedoc "Adapter key. The reserved identity `shared` is the one runtime per harness+host."
   @type adapter_key :: {harness :: atom(), archetype :: String.t(), host :: String.t()}
 
+  @hosts_ddl """
+  CREATE TABLE IF NOT EXISTS hosts (
+    name          TEXT PRIMARY KEY,
+    ssh           TEXT,
+    baseDir       TEXT NOT NULL,
+    cliBin        TEXT,
+    adapterBinDir TEXT
+  )
+  """
+
+  @doc "Create the host registry schema."
+  @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
+  def ensure_schema(db \\ DB), do: DB.execute(db, @hosts_ddl)
+
+  @doc """
+  Migrate a pre-DB `hosts.json` into the table, once, and rename it aside.
+
+  Idempotent by construction: the rename is what retires the file, so a second
+  boot finds nothing to migrate. Rows already in the table win — a re-run can
+  only add hosts the registry knew and the table did not.
+  """
+  @spec migrate_registry!(DB.server(), String.t()) :: :ok
+  def migrate_registry!(db \\ DB, base_dir) do
+    path = registry_path(base_dir)
+
+    case read_registry(path) do
+      registry when map_size(registry) > 0 ->
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            Enum.each(registry, fn {name, entry} ->
+              insert_host_if_absent_in_txn(txn, name, entry)
+            end)
+
+            :ok
+          end)
+
+        File.rename!(path, path <> ".migrated")
+        :ok
+
+      _empty ->
+        if File.exists?(path), do: File.rename!(path, path <> ".migrated")
+        :ok
+    end
+  end
+
   @doc """
   The known hosts map with the gateway's own machine always present under
   `local_host_name/0` (ssh: nil, base_dir = the gateway's base_dir).
 
-  ONE source: the instance registry `<base_dir>/hosts.json`, written only by
-  `register_host/3` — what `assimilate` records through. Then the gateway's own
-  entry, which nothing may redefine.
+  ONE source: the `hosts` table, written only by `register_host/3` — what
+  `assimilate` records through. Then the gateway's own entry, which nothing may
+  redefine. `base_dir` is still an argument because that own entry IS the
+  gateway's base_dir; it no longer says where the registry lives.
 
   There was a second source until 2026-07-28: a `TIGHTBEAM_HOSTS` env var merged
   in ON TOP of the registry, so a stale env entry silently won over what
@@ -101,12 +149,16 @@ defmodule Tightbeam.Placement do
   different ssh destination than the one it had reported installing. Removed —
   two stores for one fact is the same defect as the four base_dir resolvers.
   """
-  @spec hosts(String.t()) :: %{optional(String.t()) => host_config()}
-  def hosts(base_dir) do
-    base_dir
-    |> registry_hosts()
+  @spec hosts(String.t(), DB.server()) :: %{optional(String.t()) => host_config()}
+  def hosts(base_dir, db \\ DB) do
+    db
+    |> registered_hosts()
     |> Map.put(local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
   end
+
+  # Placement's own callers hand it the gateway config, which carries both the
+  # DB owner and the base_dir the local entry is built from.
+  defp hosts_for(config), do: hosts(config.base_dir, Map.get(config, :db, DB))
 
   @doc """
   The gateway machine's registered name — its real hostname (override:
@@ -132,7 +184,7 @@ defmodule Tightbeam.Placement do
   """
   @spec holder_workdir(map(), map()) :: String.t()
   def holder_workdir(config, holder_session) do
-    host = hosts(config.base_dir)[holder_session.host] || %{ssh: nil, base_dir: config.base_dir}
+    host = hosts_for(config)[holder_session.host] || %{ssh: nil, base_dir: config.base_dir}
     path = workdir_path(config, holder_session)
 
     url =
@@ -160,7 +212,7 @@ defmodule Tightbeam.Placement do
   @doc "Materialize one already-resolved identity snapshot at the session's exact cwd."
   @spec materialize_identity(map(), map(), Identity.snapshot(), keyword()) :: Identity.snapshot()
   def materialize_identity(config, session, snapshot, opts \\ []) do
-    host = Map.fetch!(hosts(config.base_dir), session.host)
+    host = Map.fetch!(hosts_for(config), session.host)
     cwd = holder_workdir(config, session)
     materialize_identity(config, host, session, snapshot, cwd, opts)
   end
@@ -185,7 +237,7 @@ defmodule Tightbeam.Placement do
   @doc "Derive a session's durable workspace path without creating it."
   @spec workdir_path(map(), map()) :: String.t()
   def workdir_path(config, session) do
-    host = hosts(config.base_dir)[session.host] || %{base_dir: config.base_dir}
+    host = hosts_for(config)[session.host] || %{base_dir: config.base_dir}
 
     digest =
       :crypto.hash(:sha256, session.session_key)
@@ -214,7 +266,7 @@ defmodule Tightbeam.Placement do
   @spec effort_observation(map(), map(), String.t(), term()) ::
           {:ok, map()} | {:error, String.t()}
   def effort_observation(config, session, root, baseline \\ nil) do
-    host = Map.fetch!(hosts(config.base_dir), session.host)
+    host = Map.fetch!(hosts_for(config), session.host)
     stamp_dir = Path.join(workdir_path(config, session), @effort_stamp_dir)
     stamp = Path.join(stamp_dir, "#{Tightbeam.Id.uuid4()}.stamp")
     command = effort_observation_command(root, stamp_dir, stamp, prior_stamp(baseline))
@@ -263,7 +315,7 @@ defmodule Tightbeam.Placement do
   def check_origins(_config, _host_name, []), do: %{}
 
   def check_origins(config, host_name, paths) do
-    case hosts(config.base_dir)[host_name] do
+    case hosts_for(config)[host_name] do
       nil ->
         Map.new(paths, &{&1, {:error, "no host named #{host_name} is registered"}})
 
@@ -331,8 +383,8 @@ defmodule Tightbeam.Placement do
   Admin gating happens in the verb handler, not here. Returns the stored
   config.
   """
-  @spec register_host(String.t(), String.t(), host_config()) :: {:ok, host_config()}
-  def register_host(base_dir, name, config) do
+  @spec register_host(DB.server(), String.t(), host_config()) :: {:ok, host_config()}
+  def register_host(db \\ DB, name, config) do
     entry = %{
       ssh: Map.fetch!(config, :ssh),
       base_dir: Map.fetch!(config, :base_dir),
@@ -340,9 +392,14 @@ defmodule Tightbeam.Placement do
       adapter_bin_dir: Map.get(config, :adapter_bin_dir)
     }
 
-    path = registry_path(base_dir)
-    updated = Map.put(read_registry(path), name, entry)
-    File.write!(path, JSON.encode!(updated))
+    # One row upsert, inside the DB owner's transaction. There is nothing to read
+    # first, so there is no window to lose a concurrent registration in.
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        upsert_host_in_txn(txn, name, entry)
+        :ok
+      end)
+
     {:ok, entry}
   end
 
@@ -542,8 +599,56 @@ defmodule Tightbeam.Placement do
     end
   end
 
-  defp registry_hosts(base_dir) do
-    base_dir |> registry_path() |> read_registry()
+  defp upsert_host_in_txn(txn, name, entry) do
+    DB.Txn.q(
+      txn,
+      """
+      INSERT INTO hosts (name, ssh, baseDir, cliBin, adapterBinDir)
+      VALUES (?1, ?2, ?3, ?4, ?5)
+      ON CONFLICT(name) DO UPDATE SET
+        ssh = excluded.ssh, baseDir = excluded.baseDir, cliBin = excluded.cliBin,
+        adapterBinDir = excluded.adapterBinDir
+      """,
+      [
+        name,
+        entry.ssh,
+        entry.base_dir,
+        Map.get(entry, :cli_bin),
+        Map.get(entry, :adapter_bin_dir)
+      ]
+    )
+  end
+
+  # Migration's insert, NOT the live upsert: the table is the authority, and a
+  # legacy file may only fill gaps. DO NOTHING is what keeps stale file bytes
+  # from overwriting a row that is already a table row.
+  defp insert_host_if_absent_in_txn(txn, name, entry) do
+    DB.Txn.q(
+      txn,
+      """
+      INSERT INTO hosts (name, ssh, baseDir, cliBin, adapterBinDir)
+      VALUES (?1, ?2, ?3, ?4, ?5)
+      ON CONFLICT(name) DO NOTHING
+      """,
+      [
+        name,
+        entry.ssh,
+        entry.base_dir,
+        Map.get(entry, :cli_bin),
+        Map.get(entry, :adapter_bin_dir)
+      ]
+    )
+  end
+
+  # No missing-table fallback. A registry table that is not there is a broken
+  # substrate, and reading it as "no hosts registered" would deny every spawn
+  # while looking like an empty fleet.
+  defp registered_hosts(db) do
+    {:ok, rows} = DB.query(db, "SELECT name, ssh, baseDir, cliBin, adapterBinDir FROM hosts")
+
+    Map.new(rows, fn [name, ssh, base_dir, cli_bin, adapter_bin_dir] ->
+      {name, %{ssh: ssh, base_dir: base_dir, cli_bin: cli_bin, adapter_bin_dir: adapter_bin_dir}}
+    end)
   end
 
   defp read_registry(path) do
@@ -650,7 +755,7 @@ defmodule Tightbeam.Placement do
           :ok | {:error, String.t()}
   def move_workdir(config, session_key, old_host_name, new_host_name) do
     try do
-      configured_hosts = hosts(config.base_dir)
+      configured_hosts = hosts_for(config)
       old_host = Map.fetch!(configured_hosts, old_host_name)
       new_host = Map.fetch!(configured_hosts, new_host_name)
       source = host_workdir_path(old_host, session_key)
@@ -826,7 +931,7 @@ defmodule Tightbeam.Placement do
     lineage =
       "tb1-" <> Base.url_encode64("#{harness}@#{host}", padding: false)
 
-    host_config = Map.fetch!(hosts(config.base_dir), host)
+    host_config = Map.fetch!(hosts_for(config), host)
     sh = Map.get(config, :sh, &system_cmd/1)
 
     target = %{
@@ -1004,7 +1109,7 @@ defmodule Tightbeam.Placement do
   """
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
   def deliver_home(config, {harness, _identity_name, host}, opts \\ []) do
-    host_config = Map.fetch!(hosts(config.base_dir), host)
+    host_config = Map.fetch!(hosts_for(config), host)
     module = Harness.module!(harness)
     home = Homes.home_path(host_config.base_dir, host, harness)
     sh = Keyword.get(opts, :sh, &system_cmd/1)

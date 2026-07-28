@@ -8,13 +8,15 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
       Path.join(System.tmp_dir!(), "tb-served-placement-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(base)
+    db = :"served_placement_db_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     old_local = Application.get_env(:tightbeam, :local_host_name)
     old_url = Application.get_env(:tightbeam, :advertised_url)
 
     Application.put_env(:tightbeam, :local_host_name, "eezo")
     Application.put_env(:tightbeam, :advertised_url, "http://eezo:4321")
 
-    register_hosts(base, %{
+    register_hosts(db, %{
       "worker" => %{ssh: "agent@worker", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"}
     })
 
@@ -33,7 +35,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
         else: Application.delete_env(:tightbeam, :advertised_url)
     end)
 
-    %{base: base}
+    %{base: base, db: db}
   end
 
   test "remote home regeneration harvests before owned removal and never removes the home", ctx do
@@ -51,7 +53,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
       end
     end
 
-    config = %{base_dir: ctx.base, sh: sh}
+    config = %{base_dir: ctx.base, db: ctx.db, sh: sh}
     home = Placement.deliver_home(config, {:codex, "shared", "worker"}, sh: sh)
     commands = collect_commands([])
     assert home == "/srv/tightbeam/homes/worker/codex"
@@ -88,7 +90,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     File.write!(Path.join(home, "hooks.json"), "old")
     File.write!(Path.join(home, ".tightbeam/manifest"), "stale")
 
-    register_hosts(ctx.base, %{
+    register_hosts(ctx.db, %{
       "worker" => %{ssh: "agent@worker", base_dir: remote, cli_bin: "/srv/bin"}
     })
 
@@ -130,7 +132,9 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
       end
     end
 
-    assert Placement.deliver_home(%{base_dir: ctx.base, sh: sh}, {:codex, "shared", "worker"},
+    assert Placement.deliver_home(
+             %{base_dir: ctx.base, db: ctx.db, sh: sh},
+             {:codex, "shared", "worker"},
              sh: sh
            ) == home
 
@@ -164,7 +168,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
       cli_token: "tbs_test"
     }
 
-    config = %{base_dir: ctx.base, port: 4321, sh: sh, sh_out: sh}
+    config = %{base_dir: ctx.base, db: ctx.db, port: 4321, sh: sh, sh_out: sh}
 
     assert Placement.materialize_identity(config, session, snapshot, sh: sh) == snapshot
 
@@ -182,7 +186,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     File.mkdir_p!(Path.dirname(token))
     File.write!(token, "sk-ant-oat01-shared")
 
-    config = %{base_dir: ctx.base, cwd: "/work", cli_bin: "/bin"}
+    config = %{base_dir: ctx.base, db: ctx.db, cwd: "/work", cli_bin: "/bin"}
 
     for _index <- 1..20 do
       opts = Placement.adapter_opts(config, {:claude, "shared", "eezo"})

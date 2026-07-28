@@ -40,7 +40,8 @@ defmodule Tightbeam.AssignmentsTest do
           WorkItems,
           Assignments,
           WorkState,
-          EventLog
+          EventLog,
+          Tightbeam.Placement
         ] do
       :ok = module.ensure_schema(db)
     end

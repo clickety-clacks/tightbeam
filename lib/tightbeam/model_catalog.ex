@@ -93,6 +93,8 @@ defmodule Tightbeam.ModelCatalog do
   def init(opts) do
     state = %{
       base_dir: Keyword.fetch!(opts, :base_dir),
+      db: Keyword.get(opts, :db, Tightbeam.DB),
+      hosts: Keyword.get(opts, :hosts),
       ttl_ms: Keyword.get(opts, :ttl_ms, @default_ttl_ms),
       now: Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end),
       options: Map.new(opts),
@@ -155,9 +157,11 @@ defmodule Tightbeam.ModelCatalog do
 
   # Hosts are re-read every pass rather than captured at init: `assimilate`
   # writes the registry while the gateway runs, and a satellite registered at
-  # 10am must not need a restart to acquire a catalog.
+  # 10am must not need a restart to acquire a catalog. A bare mix task has no
+  # DB owner to read the registry from (and must not create one), so it hands
+  # in its own hosts source via the `:hosts` option instead.
   defp refresh_due(state) do
-    hosts = Placement.hosts(state.base_dir)
+    hosts = enumerate_hosts(state)
 
     state =
       Enum.reduce(hosts, state, fn {host, host_config}, acc ->
@@ -168,6 +172,9 @@ defmodule Tightbeam.ModelCatalog do
 
     drop_unconfigured(state, hosts)
   end
+
+  defp enumerate_hosts(%{hosts: fun}) when is_function(fun, 0), do: fun.()
+  defp enumerate_hosts(state), do: Placement.hosts(state.base_dir, state.db)
 
   defp refresh_key(state, key, host_config) do
     now = now_ms(state)

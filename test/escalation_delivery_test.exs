@@ -89,7 +89,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
     EffortCheckin,
     EventLog,
     Ledger,
-    WorkState
+    WorkState,
+    Tightbeam.Placement
   ]
 
   setup do

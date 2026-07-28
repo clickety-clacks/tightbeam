@@ -39,6 +39,7 @@ defmodule Tightbeam.RailScriptTest do
     :ok = Escalation.ensure_schema(db)
     # Opening a request arms its owner notification wake in the same transaction.
     :ok = Wakes.ensure_schema(db)
+    :ok = Placement.ensure_schema(db)
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
 
@@ -359,7 +360,7 @@ defmodule Tightbeam.RailScriptTest do
   end
 
   test "runs at the holder workdir with scratch as its only rail write root", ctx do
-    workdir = Placement.holder_workdir(%{base_dir: ctx.base_dir, port: 0}, ctx.holder)
+    workdir = Placement.holder_workdir(%{base_dir: ctx.base_dir, db: ctx.db, port: 0}, ctx.holder)
     File.write!(Path.join(workdir, ".rail-cwd-marker"), "cwd")
     assignment = %{holder_key: ctx.holder.session_key}
 
@@ -387,7 +388,9 @@ defmodule Tightbeam.RailScriptTest do
       File.cp!(@release_binary, wrapper)
       File.chmod!(wrapper, 0o755)
 
-      workdir = Placement.holder_workdir(%{base_dir: ctx.base_dir, port: 0}, ctx.holder)
+      workdir =
+        Placement.holder_workdir(%{base_dir: ctx.base_dir, db: ctx.db, port: 0}, ctx.holder)
+
       File.write!(Path.join(workdir, ".rail-cwd-marker"), "cwd")
       assignment = %{holder_key: ctx.holder.session_key}
 
@@ -422,7 +425,7 @@ defmodule Tightbeam.RailScriptTest do
   test "remote holder fails closed before ensuring its workdir", ctx do
     remote_base = Path.join(ctx.base_dir, "remote-host")
 
-    register_hosts(ctx.base_dir, %{
+    register_hosts(ctx.db, %{
       "remote-testhost" => %{ssh: nil, base_dir: remote_base, cli_bin: nil}
     })
 
@@ -442,7 +445,7 @@ defmodule Tightbeam.RailScriptTest do
       })
 
     expected_workdir =
-      Placement.workdir_path(%{base_dir: ctx.base_dir, port: 0}, remote_holder)
+      Placement.workdir_path(%{base_dir: ctx.base_dir, db: ctx.db, port: 0}, remote_holder)
 
     # The workdir must resolve under the REGISTERED host's base, which is what makes
     # this a remote-holder case at all. Without this the test passed identically with

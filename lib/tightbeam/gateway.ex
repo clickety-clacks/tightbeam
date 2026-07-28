@@ -176,6 +176,7 @@ defmodule Tightbeam.Gateway do
           WorkItems,
           Assignments,
           EffortCheckin,
+          Placement,
           RailRemedy,
           Producers,
           Supervision,
@@ -183,6 +184,10 @@ defmodule Tightbeam.Gateway do
         ] do
       :ok = module.ensure_schema(db)
     end
+
+    # One-time: a pre-DB hosts.json becomes rows and the file is renamed aside
+    # (host-registry-v1). Idempotent — the rename is what retires it.
+    :ok = Placement.migrate_registry!(db, config.base_dir)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
@@ -351,7 +356,7 @@ defmodule Tightbeam.Gateway do
 
     credential_children(config, db) ++
       [
-        {ModelCatalog, base_dir: config.base_dir},
+        {ModelCatalog, base_dir: config.base_dir, db: db},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
         {Tightbeam.Wakes,
          db: db,
@@ -400,7 +405,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp credential_children(config, db) do
-    Enum.map(Placement.hosts(config.base_dir), fn {machine, host} ->
+    Enum.map(Placement.hosts(config.base_dir, db), fn {machine, host} ->
       credential_child(config, db, machine, host)
     end)
   end
@@ -509,9 +514,14 @@ defmodule Tightbeam.Gateway do
   # been rotated — are re-provisioned here, so the operator shell heals without a
   # ceremony. Best effort by construction: an unreachable satellite is a logged
   # fact, never a failed boot.
+  # The gateway resolves its DB owner once at boot (`Map.get(config, :db, ...)`);
+  # handler-scoped functions that were only ever handed `config` resolve it the
+  # same way rather than reaching for the global name directly.
+  defp gateway_db(config), do: Map.get(config, :db, Tightbeam.DB)
+
   defp provision_host_endpoints(db, config, cli_token) do
     config.base_dir
-    |> Placement.hosts()
+    |> Placement.hosts(db)
     |> Enum.each(fn {name, host} ->
       opts = [token: cli_token] ++ provision_opts(config)
 
@@ -691,10 +701,10 @@ defmodule Tightbeam.Gateway do
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
           # prepared the machine; this records the fact. The topology is the
           # operator's to declare.
-          previous_entry = Placement.hosts(config.base_dir)[p.name]
+          previous_entry = Placement.hosts(config.base_dir, db)[p.name]
 
           {:ok, entry} =
-            Placement.register_host(config.base_dir, p.name, %{
+            Placement.register_host(db, p.name, %{
               ssh: p[:ssh] || p.name,
               base_dir: Map.fetch!(p, :base_dir),
               cli_bin: p[:cli_bin],
@@ -1084,7 +1094,7 @@ defmodule Tightbeam.Gateway do
 
     %{
       harnesses: Enum.map(Harness.all(), & &1.wire_name()),
-      models: picker_models(base_dir),
+      models: picker_models(base_dir, Tightbeam.DB),
       hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
       archetypes:
         Enum.map(Archetypes.names(), fn name ->
@@ -1097,11 +1107,11 @@ defmodule Tightbeam.Gateway do
   # %{host => %{harness => [model]}} — the shape both pickers (org-options) and
   # inspect publish. Hosts come from the registry, so a host whose catalog is
   # still degraded appears with an empty list rather than vanishing.
-  defp picker_models(base_dir) do
+  defp picker_models(base_dir, db) do
     catalog = ModelCatalog.get()
 
     base_dir
-    |> Placement.hosts()
+    |> Placement.hosts(db)
     |> Map.keys()
     |> Map.new(fn host ->
       {host,
@@ -1716,7 +1726,7 @@ defmodule Tightbeam.Gateway do
 
   def warn_cli_target_mismatches(db, base_dir, local) do
     base_dir
-    |> Placement.hosts()
+    |> Placement.hosts(db)
     |> Enum.each(fn
       {_name, %{ssh: nil}} ->
         :ok
@@ -2144,7 +2154,7 @@ defmodule Tightbeam.Gateway do
        when provider in @onboarding_providers and phase in ["begin", "finish", "cancel"] do
     machine = params[:machine] || Placement.local_host_name()
 
-    with true <- Map.has_key?(Placement.hosts(config.base_dir), machine),
+    with true <- Map.has_key?(Placement.hosts(config.base_dir, gateway_db(config)), machine),
          {:ok, kind} <- onboarding_kind(params[:kind]) do
       onboard_phase(config, provider_atom(provider), phase, machine, kind, params[:reason])
     else
@@ -2482,8 +2492,9 @@ defmodule Tightbeam.Gateway do
                 modelPreferences: a.model_preferences
               }
             end),
-          hosts: config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
-          models: picker_models(config.base_dir)
+          hosts:
+            config.base_dir |> Placement.hosts(gateway_db(config)) |> Map.keys() |> Enum.sort(),
+          models: picker_models(config.base_dir, gateway_db(config))
         }
 
         result = %{
@@ -2756,7 +2767,7 @@ defmodule Tightbeam.Gateway do
 
         with {:ok, overrides} <- override_result,
              {:ok, host} <-
-               Placement.resolve(archetype, p[:host], Placement.hosts(config.base_dir)) do
+               Placement.resolve(archetype, p[:host], Placement.hosts(config.base_dir, db)) do
           create_spawn(config, db, call, caller, archetype, host, overrides)
         else
           {:error, denial} -> classified_spawn_denial(denial, "config_denied", "placement_denied")
@@ -3032,7 +3043,7 @@ defmodule Tightbeam.Gateway do
           session ->
             archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
-            case Placement.resolve(archetype, p.host, Placement.hosts(config.base_dir)) do
+            case Placement.resolve(archetype, p.host, Placement.hosts(config.base_dir, db)) do
               {:error, denial} ->
                 Map.put(denial, :ok, false)
 
@@ -4462,7 +4473,7 @@ defmodule Tightbeam.Gateway do
 
   defp archive_retired_workspace(config, db, session_key) do
     with session when not is_nil(session) <- Org.get(db, session_key) do
-      host = Placement.hosts(config.base_dir)[session.host]
+      host = Placement.hosts(config.base_dir, db)[session.host]
 
       # Remote workspaces are derivable but not locally accessible. Reap has
       # no remote workspace-removal mechanism, so v1 flips their rows only.

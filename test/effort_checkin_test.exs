@@ -67,7 +67,8 @@ defmodule Tightbeam.EffortCheckinTest do
           WorkItems,
           WorkState,
           Assignments,
-          Artifacts
+          Artifacts,
+          Placement
         ] do
       :ok = module.ensure_schema(db)
     end
@@ -654,7 +655,7 @@ defmodule Tightbeam.EffortCheckinTest do
   test "proof 7: placement satellite probe is bounded and SSH failure is unobservable", ctx do
     satellite = %{ctx.holder | host: "satellite"}
 
-    register_hosts(ctx.base_dir, %{
+    register_hosts(ctx.db, %{
       "satellite" => %{ssh: "satellite.example", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 
@@ -907,7 +908,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
   test "acceptance 6: an attest verifies the artifacts the holder recorded, and never rejects",
        ctx do
-    register_hosts(ctx.base_dir, %{
+    register_hosts(ctx.db, %{
       "satellite" => %{ssh: "satellite.example", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 
@@ -1210,7 +1211,7 @@ defmodule Tightbeam.EffortCheckinTest do
     Archetypes.load!(ctx.base_dir)
     on_exit(fn -> :persistent_term.erase(Archetypes) end)
 
-    register_hosts(ctx.base_dir, %{
+    register_hosts(ctx.db, %{
       "satellite" => %{ssh: "satellite.example", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 

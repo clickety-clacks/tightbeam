@@ -34,7 +34,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       advertised_url:
         System.get_env("TIGHTBEAM_ADVERTISED_URL") ||
           Application.get_env(:tightbeam, :advertised_url),
-      hosts: Placement.hosts(base_dir),
+      hosts: org_hosts(base_dir),
       local_host_name: Placement.local_host_name(),
       cli_bin: Path.join(base_dir, "bin")
     ]
@@ -303,6 +303,45 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       false,
       "advertised URL is not set",
       "Set TIGHTBEAM_ADVERTISED_URL."
+    )
+  end
+
+  # RULED: doctor never creates org state. The registry lives in the org DB now
+  # (host-registry-v1), so it is opened READ-ONLY, and only when the file already
+  # exists — an org that has not booted yet has no DB, which is a fact for the
+  # table, not a failure of anything this task checks.
+  @doc false
+  def org_hosts(base_dir) do
+    db_path = Path.join(base_dir, "state.db")
+
+    if File.exists?(db_path) do
+      {:ok, conn} = Exqlite.Sqlite3.open(db_path, mode: :readonly)
+
+      try do
+        {:ok, stmt} =
+          Exqlite.Sqlite3.prepare(conn, "SELECT name, ssh, baseDir, cliBin FROM hosts")
+
+        {:ok, rows} = Exqlite.Sqlite3.fetch_all(conn, stmt)
+        :ok = Exqlite.Sqlite3.release(conn, stmt)
+
+        rows
+        |> Map.new(fn [name, ssh, host_base, cli_bin] ->
+          {name, %{ssh: ssh, base_dir: host_base, cli_bin: cli_bin}}
+        end)
+        |> Map.put(Placement.local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+      after
+        Exqlite.Sqlite3.close(conn)
+      end
+    else
+      :absent
+    end
+  end
+
+  defp hosts_check(:absent, _local_host_name) do
+    unverifiable(
+      "hosts_registered",
+      "org database absent — there is no host registry to read yet",
+      "Not a registration verdict — the org DB is created when the gateway boots."
     )
   end
 

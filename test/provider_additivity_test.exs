@@ -27,6 +27,7 @@ defmodule Tightbeam.ProviderAdditivityTest do
     db = :"provider_additivity_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Devices.ensure_schema(db)
+    :ok = Tightbeam.Placement.ensure_schema(db)
 
     {:ok, _rows} =
       DB.query(

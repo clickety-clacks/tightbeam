@@ -28,20 +28,23 @@ defmodule Tightbeam.TestCase do
   @doc """
   Register satellite hosts the way the product does.
 
-  `assimilate` records a host through `Placement.register_host/3`, which writes
-  `<base_dir>/hosts.json` — the one host store. Tests used to inject
+  `assimilate` records a host through `Placement.register_host/3`, a row in the
+  org DB's `hosts` table — the one host store. Tests used to inject
   `Application.put_env(:tightbeam, :hosts, …)`, a SECOND store that existed only
   because `TIGHTBEAM_HOSTS` did; both are gone. Beyond removing the duplication,
-  this scopes host config to the test's own base_dir instead of global app env,
-  so two tests can no longer see each other's hosts.
+  this scopes host config to the test's own DB instead of global app env, so
+  two tests can no longer see each other's hosts.
 
   This is assimilate's recording step, not the whole verb: the rest of it probes
   ssh and installs adapters on a real machine, which a test naming a fictional
   host cannot do.
   """
-  def register_hosts(base_dir, hosts) do
+  def register_hosts(db, hosts) do
+    # The registry is a table; a suite that registers hosts declares it.
+    :ok = Tightbeam.Placement.ensure_schema(db)
+
     Enum.each(hosts, fn {name, config} ->
-      {:ok, _entry} = Tightbeam.Placement.register_host(base_dir, name, config)
+      {:ok, _entry} = Tightbeam.Placement.register_host(db, name, config)
     end)
   end
 

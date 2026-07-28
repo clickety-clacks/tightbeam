@@ -226,6 +226,47 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert check.fix == "Register a host."
   end
 
+  # RULED: doctor never creates org state. An org that has not booted has no DB,
+  # so the registry is unreadable — a fact for the table, not a failed check and
+  # never a reason to conjure the DB into existence.
+  test "an absent org database is a fact row, not a failure", ctx do
+    {status, report} = Doctor.evaluate(ctx.catalog, put(ctx.inputs, :hosts, :absent))
+    check = find(report, "hosts_registered")
+
+    assert status == 0
+    assert check.unverifiable
+    assert check.level == :info
+    assert check.detail =~ "org database absent"
+  end
+
+  test "org_hosts leaves an absent org database absent", ctx do
+    db_path = Path.join(ctx.base_dir, "state.db")
+    refute File.exists?(db_path)
+
+    assert Doctor.org_hosts(ctx.base_dir) == :absent
+
+    # The never-creates-state half of the ruling: looking did not create it.
+    refute File.exists?(db_path)
+  end
+
+  test "org_hosts reads a present hosts table through the read-only open", ctx do
+    db = :"doctor_org_hosts_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.DB, path: Path.join(ctx.base_dir, "state.db"), name: db})
+    :ok = Tightbeam.Placement.ensure_schema(db)
+
+    {:ok, _entry} =
+      Tightbeam.Placement.register_host(db, "worker", %{
+        ssh: "tb@worker",
+        base_dir: "/srv/tb",
+        cli_bin: "/srv/tb/bin"
+      })
+
+    hosts = Doctor.org_hosts(ctx.base_dir)
+
+    assert hosts["worker"] == %{ssh: "tb@worker", base_dir: "/srv/tb", cli_bin: "/srv/tb/bin"}
+    assert hosts[Tightbeam.Placement.local_host_name()].ssh == nil
+  end
+
   test "human and JSON formats expose status, detail, fixes, and readiness", ctx do
     {0, report} = Doctor.evaluate(ctx.catalog, ctx.inputs)
     human = Doctor.format(report, :human)

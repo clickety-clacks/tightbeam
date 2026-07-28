@@ -95,7 +95,11 @@ defmodule Tightbeam.Readiness do
         }
   def summary(config, catalog \\ ModelCatalog, archetypes \\ %{}) do
     local = Placement.local_host_name()
-    hosts = config.base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort()
+
+    hosts =
+      Placement.hosts(config.base_dir, Map.get(config, :db, Tightbeam.DB))
+      |> Map.keys()
+      |> Enum.sort()
 
     rows =
       for host <- hosts, module <- Harness.all() do

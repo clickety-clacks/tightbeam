@@ -11,14 +11,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 
 const LINEAGE_KEY: &[u8] = b"TIGHTBEAM_LINEAGE=";
-const CANONICAL_ENTRIES: [&str; 11] = [
+const CANONICAL_ENTRIES: [&str; 10] = [
     "adapters",
     "assets",
     "auth",
     "bin",
     "gateway.json",
     "homes",
-    "hosts.json",
     "identity",
     "staging",
     "state.db",
@@ -179,7 +178,6 @@ struct Entries {
     bin: &'static str,
     gateway_json: &'static str,
     homes: &'static str,
-    hosts_json: &'static str,
     identity: &'static str,
     staging: &'static str,
     state_db: &'static str,
@@ -784,7 +782,6 @@ fn entries_with(status: &'static str) -> Entries {
         bin: status,
         gateway_json: status,
         homes: status,
-        hosts_json: status,
         identity: status,
         staging: status,
         state_db: status,
@@ -823,11 +820,10 @@ fn inspect_base_dir(io: &impl ProbeIo, path: &Path, notes: &mut Vec<String>) -> 
         bin: value(CANONICAL_ENTRIES[3]),
         gateway_json: value(CANONICAL_ENTRIES[4]),
         homes: value(CANONICAL_ENTRIES[5]),
-        hosts_json: value(CANONICAL_ENTRIES[6]),
-        identity: value(CANONICAL_ENTRIES[7]),
-        staging: value(CANONICAL_ENTRIES[8]),
-        state_db: value(CANONICAL_ENTRIES[9]),
-        work: value(CANONICAL_ENTRIES[10]),
+        identity: value(CANONICAL_ENTRIES[6]),
+        staging: value(CANONICAL_ENTRIES[7]),
+        state_db: value(CANONICAL_ENTRIES[8]),
+        work: value(CANONICAL_ENTRIES[9]),
     };
     let count = names
         .iter()
@@ -1090,7 +1086,6 @@ fn entries_value(entries: &Entries) -> Value {
         ("bin", Value::from(entries.bin)),
         ("gateway.json", Value::from(entries.gateway_json)),
         ("homes", Value::from(entries.homes)),
-        ("hosts.json", Value::from(entries.hosts_json)),
         ("identity", Value::from(entries.identity)),
         ("staging", Value::from(entries.staging)),
         ("state.db", Value::from(entries.state_db)),
@@ -1790,7 +1785,7 @@ mod tests {
         assert_eq!(base.status, "present");
         assert_eq!(base.adapter_stderr_log_count, Some(1));
         assert_eq!(base.entries.state_db, "absent");
-        assert_eq!(entries_value(&base.entries).as_object().unwrap().len(), 11);
+        assert_eq!(entries_value(&base.entries).as_object().unwrap().len(), 10);
         fs::remove_dir_all(root).unwrap();
 
         let unreadable = FakeIo {
@@ -1869,7 +1864,6 @@ mod tests {
       "bin": "absent",
       "gateway.json": "absent",
       "homes": "absent",
-      "hosts.json": "absent",
       "identity": "absent",
       "staging": "absent",
       "state.db": "absent",
@@ -1964,7 +1958,6 @@ mod tests {
       "bin": "present",
       "gateway.json": "present",
       "homes": "present",
-      "hosts.json": "present",
       "identity": "present",
       "staging": "present",
       "state.db": "present",

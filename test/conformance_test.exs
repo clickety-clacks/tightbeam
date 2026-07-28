@@ -909,7 +909,7 @@ defmodule Tightbeam.ConformanceSupport do
       {db, pid} = memory_db!()
       base = temp_dir!("conformance-producer")
       {:ok, runner} = Tightbeam.ConformanceProducerRegistry.start_link()
-      config = %{base_dir: base, port: 0}
+      config = %{base_dir: base, db: db, port: 0}
 
       try do
         ids = materialize_world(db, kase["world"])
@@ -2527,6 +2527,7 @@ defmodule Tightbeam.ConformanceSupport do
         start_named_service(ModelCatalog, fn ->
           ModelCatalog.start_link(
             base_dir: base,
+            db: db,
             credential_status: fn _provider -> :onboarded end,
             credential_kind: fn _provider -> :subscription end,
             claude_fetch: fn _, _ -> {:error, :unused} end,
@@ -2879,7 +2880,8 @@ defmodule Tightbeam.ConformanceSupport do
           Supervision,
           Adjudication,
           Escalation,
-          RailRemedy
+          RailRemedy,
+          Placement
         ] do
       :ok = module.ensure_schema(name)
     end
@@ -3199,7 +3201,7 @@ defmodule Tightbeam.ConformanceSupport do
     {:ok, runner} = Tightbeam.ConformanceProducerRegistry.start_link()
 
     try do
-      Producers.execute(db, %{base_dir: base, port: 0}, job, runner)
+      Producers.execute(db, %{base_dir: base, db: db, port: 0}, job, runner)
     after
       GenServer.stop(runner)
       File.rm_rf!(base)
@@ -3300,7 +3302,7 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp seed_checked_rule_checkout!(base, fixture, kase, db) do
     holder = Org.get(db, "holder")
-    workdir = Placement.holder_workdir(%{base_dir: base, port: 0}, holder)
+    workdir = Placement.holder_workdir(%{base_dir: base, db: db, port: 0}, holder)
 
     File.rm_rf!(workdir)
     File.mkdir_p!(workdir)

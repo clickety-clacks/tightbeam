@@ -42,7 +42,22 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   @doc false
   def fetch_live(base_dir, timeout_ms \\ @fetch_timeout_ms, options \\ []) do
     name = Keyword.get(options, :name, :tightbeam_catalog_diff)
-    options = Keyword.merge(options, base_dir: base_dir, name: name)
+
+    # A bare mix task is a diagnostic of THIS machine and owns no DB to read
+    # the host registry from (and must not create one), so the catalog gets the
+    # local host as its whole world instead of the registry table.
+    hosts =
+      Keyword.get(options, :hosts, fn ->
+        %{
+          Tightbeam.Placement.local_host_name() => %{
+            ssh: nil,
+            base_dir: base_dir,
+            cli_bin: nil
+          }
+        }
+      end)
+
+    options = Keyword.merge(options, base_dir: base_dir, name: name, hosts: hosts)
 
     case ModelCatalog.start_link(options) do
       {:ok, pid} ->

@@ -20,7 +20,7 @@ defmodule Tightbeam.Spinup do
     module = Harness.module!(harness)
 
     {result, detail} =
-      case Map.fetch(Placement.hosts(config.base_dir), host_name) do
+      case Map.fetch(Placement.hosts(config.base_dir, db), host_name) do
         :error ->
           denial = %{code: "unknown_host", message: "host #{host_name} is not configured"}
           {{:error, denial}, "DENIED: #{denial.message}"}

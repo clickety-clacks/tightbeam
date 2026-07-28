@@ -34,7 +34,8 @@ defmodule Tightbeam.JobTraceTest do
           Org,
           Roles,
           WorkItems,
-          Assignments
+          Assignments,
+          Tightbeam.Placement
         ] do
       :ok = module.ensure_schema(db)
     end
@@ -229,14 +230,14 @@ defmodule Tightbeam.JobTraceTest do
       restore_env(:commit_ref_command, old_runner)
     end)
 
-    # Hosts live in <base_dir>/hosts.json now, so the test has to name the base_dir
-    # the code under test will read — Assignments resolves it from :base_dir.
+    # Hosts are rows in the handler's DB now; :base_dir still names the dir the
+    # gateway's own registry entry is built from, so the test pins it.
     base_dir = Path.join(System.tmp_dir!(), "tb-job-trace-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base_dir)
     Application.put_env(:tightbeam, :base_dir, base_dir)
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
-    register_hosts(base_dir, %{
+    register_hosts(db, %{
       "remote-test" => %{ssh: "git@remote-test", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 

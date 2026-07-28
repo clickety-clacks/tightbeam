@@ -54,7 +54,8 @@ defmodule Tightbeam.RetireOwnershipTest do
           Tightbeam.CriticalLeases,
           Tightbeam.Adjudication,
           Tightbeam.Artifacts,
-          WorkState
+          WorkState,
+          Tightbeam.Placement
         ],
         do: :ok = module.ensure_schema(db)
 

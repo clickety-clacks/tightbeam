@@ -9,6 +9,7 @@ defmodule Tightbeam.SpinupTest do
     File.mkdir_p!(base_dir)
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = EventLog.ensure_schema(db)
+    :ok = Tightbeam.Placement.ensure_schema(db)
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     %{base_dir: base_dir, db: db}
@@ -152,7 +153,7 @@ defmodule Tightbeam.SpinupTest do
   test "remote readiness uses quoted commands and records allow", ctx do
     remote_base = "/srv/tight beam/o'hare"
 
-    register_hosts(ctx.base_dir, %{
+    register_hosts(ctx.db, %{
       "worker" => %{ssh: "worker.example", base_dir: remote_base, cli_bin: nil}
     })
 
@@ -188,7 +189,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "remote missing adapter deploys both packages and rechecks", ctx do
-    configure_remote(ctx.base_dir)
+    configure_remote(ctx)
     {:ok, checks} = Agent.start_link(fn -> 0 end)
     parent = self()
 
@@ -238,7 +239,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "remote npm failure denies with command output", ctx do
-    configure_remote(ctx.base_dir)
+    configure_remote(ctx)
 
     sh = fn command ->
       script = List.last(command)
@@ -263,7 +264,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "remote adapter still missing after deployment names the verification remedy", ctx do
-    configure_remote(ctx.base_dir)
+    configure_remote(ctx)
 
     sh = fn command ->
       if String.contains?(List.last(command), "test -x"), do: {"not found", 1}, else: {"", 0}
@@ -280,7 +281,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "remote directory setup failure names the permissions remedy", ctx do
-    configure_remote(ctx.base_dir)
+    configure_remote(ctx)
 
     sh = fn command ->
       if String.contains?(List.last(command), "mkdir -p"),
@@ -299,7 +300,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "unreachable host denies with ssh output and records history", ctx do
-    configure_remote(ctx.base_dir)
+    configure_remote(ctx)
     parent = self()
 
     sh = fn command ->
@@ -320,12 +321,10 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "DENIED"
   end
 
-  defp configure_remote(local_base) do
-    register_hosts(local_base, %{
+  defp configure_remote(ctx) do
+    register_hosts(ctx.db, %{
       "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
     })
-
-    local_base
   end
 
   defp receive_commands(count), do: receive_commands(count, [])

@@ -40,8 +40,11 @@ defmodule Tightbeam.ReadinessTest do
   setup do
     base = Path.join(System.tmp_dir!(), "readiness_#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
+    db = :"readiness_db_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Placement.ensure_schema(db)
     on_exit(fn -> File.rm_rf!(base) end)
-    %{base: base, config: %{base_dir: base, default_model: "m[medium]"}}
+    %{base: base, config: %{base_dir: base, db: db, default_model: "m[medium]"}}
   end
 
   defp install_adapter!(base, module) do
