@@ -510,6 +510,13 @@ defmodule Tightbeam.Producers do
   # within the same second as its predecessor would collide — vanishingly unlikely,
   # and strictly better than signalling something unverified.
   #
+  # The `tightbeam-producer` argv marker is what lets an operator census ATTRIBUTE a
+  # leaked shell before signalling it. Every shape spawned here and by the test fixture
+  # carries it except one: the `sleep` the fixture's park watchdog execs, whose argv is a
+  # bare `sleep <n>`. It is inert and dies with its process group, so a census that finds
+  # one at ppid 1 loses nothing by reaping it — but it is the single shape the marker
+  # cannot reach, so do not read "no marker" as "not ours".
+  #
   # Three outcomes, and the distinction is the point:
   #   :signalled      — the signal was delivered and the kernel accepted it.
   #   {:noop, why}    — the target is already gone (pid absent, or recycled and so

@@ -721,6 +721,10 @@ defmodule Tightbeam.ProducersTest do
     end
   end
 
+  # How long a parked fixture shell may stay parked before it reaps itself. An order of
+  # magnitude above the longest fixture payload (`sleep 5`) and far below forever.
+  @park_bound_s 120
+
   defp spawn_leader(command) do
     shell = System.find_executable("sh")
 
@@ -731,12 +735,22 @@ defmodule Tightbeam.ProducersTest do
         :stderr_to_stdout,
         :hide,
         {:args,
-         ["-c", "kill -STOP $$; exec \"$1\" -lc \"$2\"", "tightbeam-producer", shell, command]},
+         [
+           "-c",
+           park_watchdog() <> "kill -STOP $$; exec \"$1\" -lc \"$2\"",
+           "tightbeam-producer",
+           shell,
+           command
+         ]},
         {:cd, System.tmp_dir!()}
       ])
 
     os_pid = port |> Port.info(:os_pid) |> elem(1)
     started = process_started!(os_pid)
+    # Belt and braces with the shell's own watchdog below: on_exit covers the ordinary
+    # abort (ExUnit tears the case down and the BEAM lives), the watchdog covers the case
+    # on_exit cannot reach — a SIGKILLed BEAM, which is how 40 of these accumulated.
+    on_exit(fn -> reap_leader(os_pid, started) end)
     # Wait for state T before CONT, exactly as Producers.verify_process_group/2
     # does in production. A SIGCONT that arrives before the shell has run its own
     # `kill -STOP $$` is simply lost, and the leader then stays STOPped forever —
@@ -750,6 +764,51 @@ defmodule Tightbeam.ProducersTest do
     # linux the leader never resumes and never forks the children these tests read.
     System.cmd("kill", ["-CONT", "--", "-#{os_pid}"], stderr_to_stdout: true)
     %{port: port, os_pid: os_pid, started: started}
+  end
+
+  # A self-limiting park. The shell stops ITSELF below and nothing outside guarantees a
+  # SIGCONT — if the BEAM that spawned it dies first, it stays STOPped forever at ppid 1
+  # (40 of them, oldest 2d11h, were cleaned off eezo by hand).
+  #
+  # TERM BEFORE CONT, and the order is load-bearing. This shell is stopped before its
+  # `exec`, so a bare SIGCONT resumes it INTO the fixture payload and only then takes the
+  # TERM. Sending TERM first leaves it pending — the kernel delivers it the moment SIGCONT
+  # resumes the process, so the payload never runs at all. Do not "fix" this to the
+  # intuitive CONT-then-TERM.
+  #
+  # `$$` inside the backgrounded subshell is still THIS shell's pid (a subshell does not
+  # get its own), which is what lets a shell carry its own reaper.
+  #
+  # It POLLS the parked state rather than sleeping out the whole bound and signalling
+  # blind. A blind `sleep N; kill $$` outlives the test on the happy path — the leader
+  # execs, finishes, and the subshell is left holding a pid that has already exited and
+  # may have been RECYCLED, so the delayed TERM lands on a stranger. That is the exact
+  # unverified-pid kill this fixture exists to stop doing. Leaving state T (resumed,
+  # exec'd, or gone) means the fixture is proceeding normally and the reaper's job is
+  # over, so it exits.
+  defp park_watchdog do
+    "{ n=0; while [ $n -lt #{@park_bound_s} ]; do sleep 1; " <>
+      "case $(ps -o state= -p $$ 2>/dev/null) in T*) ;; *) exit 0 ;; esac; " <>
+      "n=$((n+1)); done; kill -TERM $$ 2>/dev/null; kill -CONT $$ 2>/dev/null; } & "
+  end
+
+  # Identity-verified group reap, the same discipline production uses: signal_group/3 takes
+  # the start time because a bare pid is not an identity, and a suite that reaps by pid
+  # alone on a shared box will eventually signal something it did not spawn.
+  defp reap_leader(os_pid, started) do
+    case System.cmd("ps", ["-o", "lstart=", "-p", Integer.to_string(os_pid)],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        if String.trim(output) == started do
+          # `--` before the negative target for the reason deliver_signal/2 documents.
+          System.cmd("kill", ["-TERM", "--", "-#{os_pid}"], stderr_to_stdout: true)
+          System.cmd("kill", ["-CONT", "--", "-#{os_pid}"], stderr_to_stdout: true)
+        end
+
+      _ ->
+        :ok
+    end
   end
 
   defp wait_until_stopped(os_pid) do
