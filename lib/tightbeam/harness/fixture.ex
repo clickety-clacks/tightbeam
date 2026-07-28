@@ -131,9 +131,6 @@ defmodule Tightbeam.Harness.Fixture do
   end
 
   @impl true
-  def containment_additions, do: []
-
-  @impl true
   def classify_auth_event(_event), do: :unknown
 
   @impl true
@@ -206,7 +203,6 @@ defmodule Tightbeam.Harness.Fixture do
       patched: patch_adapter_source(source),
       remote_patch_detail: "; fixture adapter patched",
       session_meta: %{instructions: "vector guidance"},
-      containment: [],
       cli_name: "fixture",
       cli_version: "fixture vector 1.0",
       probe_path: :discovered,

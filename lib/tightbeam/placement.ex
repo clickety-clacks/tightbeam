@@ -65,7 +65,7 @@ defmodule Tightbeam.Placement do
   an unreachable host degrades exactly like a dead adapter, per spec.
   """
 
-  alias Tightbeam.{Archetypes, Containment, Harness, Homes, Identity, Org, Rails}
+  alias Tightbeam.{Archetypes, Harness, Homes, Identity, Org, Rails}
   import Bitwise
 
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
@@ -837,12 +837,6 @@ defmodule Tightbeam.Placement do
       cli_bin: config.cli_bin
     }
 
-    contained? = contained_runtime?(config, identity_name)
-
-    if contained? and host_config.ssh != nil do
-      containment_refused!(config, key, "contained_remote_unsupported")
-    end
-
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
     home = deliver_home(config, key, deliver_opts)
 
@@ -880,80 +874,16 @@ defmodule Tightbeam.Placement do
         sh_out: Map.get(config, :sh_out)
       )
 
-    opts =
-      [
-        harness: harness,
-        home: home,
-        cwd: config.cwd,
-        stderr_path: stderr_path,
-        on_auth_event: auth_event_handler(host, module),
-        on_subagent_event: subagent_event_handler(config, host, module),
-        env: []
-      ]
-      |> Keyword.merge(plan)
-
-    if contained? do
-      write_roots = [
-        Path.join(host_config.base_dir, "work"),
-        home,
-        Tightbeam.Credentials.store_dir(
-          host_config.base_dir,
-          module.credential_provider()
-        )
-      ]
-
-      probe_result =
-        try do
-          # macOS-only, like the argv below. Unreachable while every adapter key is
-          # "shared" (#36); whoever enables adapter containment owns making both sites
-          # per-OS under shared specs tightbeam-containment.md. The PROFILE is already
-          # correct on both platforms — only the applier here is not.
-          sh.(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"])
-        rescue
-          error -> {:raised, error}
-        end
-
-      case probe_result do
-        {:raised, error} ->
-          containment_refused!(
-            config,
-            key,
-            "sandbox-exec probe failed: #{Exception.message(error)}"
-          )
-
-        {_output, 0} ->
-          :ok
-
-        {_output, exit} ->
-          containment_refused!(config, key, "sandbox-exec probe failed with exit #{exit}")
-      end
-
-      profile =
-        try do
-          Containment.adapter_profile(write_roots)
-        rescue
-          error in [ArgumentError] ->
-            containment_refused!(config, key, Exception.message(error))
-        end
-
-      [binary] = Keyword.fetch!(opts, :cmd)
-
-      Tightbeam.EventLog.lifecycle(
-        config.db,
-        "containment",
-        adapter_key_name(key),
-        "assembled; fs=workdir network=open; write-roots=#{Enum.join(write_roots, ",")}"
-      )
-
-      # macOS-only applier; see the probe above and #36. `adapter_profile/1` renders for
-      # the host's OS, so on linux this argv would hand a Landlock envelope to a binary
-      # that does not exist — the site to fix is here, not the profile.
-      opts
-      |> Keyword.put(:cmd, ["/usr/bin/sandbox-exec", "-p", profile, binary])
-      |> Keyword.put(:contained, true)
-    else
-      opts
-    end
+    [
+      harness: harness,
+      home: home,
+      cwd: config.cwd,
+      stderr_path: stderr_path,
+      on_auth_event: auth_event_handler(host, module),
+      on_subagent_event: subagent_event_handler(config, host, module),
+      env: []
+    ]
+    |> Keyword.merge(plan)
   end
 
   @doc "Derive the stored name for a normalized overridden identity."
@@ -1101,35 +1031,11 @@ defmodule Tightbeam.Placement do
     |> Map.fetch!(:home_path)
   end
 
-  defp containment_refused!(config, key, reason) do
-    Tightbeam.EventLog.lifecycle(
-      config.db,
-      "containment",
-      adapter_key_name(key),
-      "DENIED: #{reason}"
-    )
-
-    raise ArgumentError,
-          "containment refused for host #{elem(key, 2)} adapter #{adapter_key_name(key)}: #{reason}"
-  end
-
-  defp adapter_key_name({harness, identity_name, host}),
-    do: "#{harness}:#{identity_name}@#{host}"
-
   defp effective_identity_fingerprint(effective) do
     skill_names = effective.skills |> Enum.sort() |> Enum.intersperse(<<0>>)
 
     :crypto.hash(:sha256, [Archetypes.guidance(effective), <<0>>, skill_names])
     |> Base.encode16(case: :lower)
-  end
-
-  defp contained_runtime?(_config, "shared"), do: false
-
-  defp contained_runtime?(config, identity_name) do
-    config
-    |> resolve_identity!(identity_name)
-    |> elem(0)
-    |> then(&(&1.containment.fs == :workdir))
   end
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"

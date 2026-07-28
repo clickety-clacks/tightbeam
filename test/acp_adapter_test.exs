@@ -75,7 +75,6 @@ defmodule Tightbeam.Acp.AdapterTest do
   // When this harness came up. A deadline the adapter enforces AFTER the spawn can only
   // be timed from here; timing it from before the spawn bills `node` startup to it.
   fs.writeFileSync(capturePath + ".boot", String(Date.now()));
-  let modeCalls = 0;
   let newCalls = 0;
   const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, mcpServers: m.params.mcpServers, modeId: m.params.modeId, cwd: m.params.cwd, sessionId: m.params.sessionId, prompt: m.params.prompt, meta: m.params._meta }) + "\n");
   let pendingPrompt = null;
@@ -109,8 +108,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       }
       case "session/set_mode": {
         capture(m);
-        modeCalls += 1;
-        if (failMode === "fail" || (failMode === "fail-second" && modeCalls === 2)) {
+        if (failMode === "fail") {
           return send({ id: m.id, error: { code: -32000, message: "mode refused" } });
         }
         return send({ id: m.id, result: {} });
@@ -178,7 +176,6 @@ defmodule Tightbeam.Acp.AdapterTest do
     File.write!(path, @fake)
 
     harness = Keyword.get(opts, :harness, :claude)
-    contained = Keyword.get(opts, :contained, false)
     fail_mode = Keyword.get(opts, :fail_mode, "none")
     gate_mode = Keyword.get(opts, :gate_mode, "none")
     probe? = Keyword.get(opts, :probe, gate_mode != "none")
@@ -203,9 +200,6 @@ defmodule Tightbeam.Acp.AdapterTest do
           {:ok, path} -> Keyword.put(adapter_opts, :gate_log_path, path)
           :error -> adapter_opts
         end
-      end)
-      |> then(fn adapter_opts ->
-        if contained, do: Keyword.put(adapter_opts, :contained, true), else: adapter_opts
       end)
       |> then(fn adapter_opts ->
         if probe? do
@@ -621,50 +615,15 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
-  test "load asserts mode only when contained" do
+  test "load does not assert mode" do
     {plain, plain_capture} = start_adapter()
     assert :ok = Adapter.load_session(plain, "sess-1", "haiku", "/tmp", [], "guidance")
     refute Enum.any?(captured_requests(plain_capture), &(&1["method"] == "session/set_mode"))
-
-    {contained, contained_capture} = start_adapter(contained: true)
-    assert :ok = Adapter.load_session(contained, "sess-1", "haiku", "/tmp", [], "guidance")
-    assert Adapter.knows_session?(contained, "sess-1")
-
-    assert [%{"method" => "session/set_mode", "modeId" => "bypassPermissions"}] =
-             Enum.filter(
-               captured_requests(contained_capture),
-               &(&1["method"] == "session/set_mode")
-             )
   end
 
-  test "contained mode failures are structured while uncontained new remains best effort" do
+  test "new session mode set stays best effort" do
     {plain, _capture} = start_adapter(fail_mode: "fail")
     assert {:ok, "sess-1"} = Adapter.new_session(plain, "haiku", "/tmp", [], "guidance")
-
-    {contained_new, _capture} = start_adapter(contained: true, fail_mode: "fail")
-
-    assert {:error, :contained_sandbox_disable_failed} =
-             Adapter.new_session(contained_new, "haiku", "/tmp", [], "guidance")
-
-    refute Adapter.knows_session?(contained_new, "sess-1")
-
-    {contained_load, _capture} = start_adapter(contained: true, fail_mode: "fail")
-
-    assert {:error, :contained_sandbox_disable_failed} =
-             Adapter.load_session(contained_load, "sess-1", "haiku", "/tmp", [], "guidance")
-
-    refute Adapter.knows_session?(contained_load, "sess-1")
-  end
-
-  test "contained load mode failure evicts prior known residency" do
-    {adapter, _capture} = start_adapter(contained: true, fail_mode: "fail-second")
-    assert :ok = Adapter.load_session(adapter, "sess-1", "haiku", "/tmp", [], "guidance")
-    assert Adapter.knows_session?(adapter, "sess-1")
-
-    assert {:error, :contained_sandbox_disable_failed} =
-             Adapter.load_session(adapter, "sess-1", "haiku", "/tmp", [], "guidance")
-
-    refute Adapter.knows_session?(adapter, "sess-1")
   end
 
   test "gate wiring-check passes on message or tool content and discards the probe session" do

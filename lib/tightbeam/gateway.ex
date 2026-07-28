@@ -1828,9 +1828,6 @@ defmodule Tightbeam.Gateway do
                     Org.set_identity_revision(db, session.session_key, snapshot.revision)
                     {:ok, pointer.harness_session_id}
 
-                  {:error, :contained_sandbox_disable_failed} = error ->
-                    error
-
                   {:error, {:model_apply_failed, _reason}} = error ->
                     error
 

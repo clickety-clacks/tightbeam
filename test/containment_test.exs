@@ -41,13 +41,6 @@ defmodule Tightbeam.ContainmentTest do
       assert Containment.rail_profile(roots) == expected
       assert Containment.rail_profile(roots) == Containment.rail_profile(roots)
     end
-
-    test "adapter profile still carries the harness additions" do
-      profile = Containment.adapter_profile(["/org/work"])
-
-      assert profile =~ ~s|(subpath "/private/tmp")|
-      assert profile =~ ~s|(subpath "/dev")|
-    end
   else
     test "rail profile renders exact deterministic Landlock bytes" do
       roots = ["/org/work", "/org/home"]
@@ -59,28 +52,22 @@ defmodule Tightbeam.ContainmentTest do
       assert Containment.rail_profile(roots) == expected
       assert Containment.rail_profile(roots) == Containment.rail_profile(roots)
     end
-
-    test "adapter profile still carries the harness additions" do
-      profile = Containment.adapter_profile(["/org/work"])
-
-      assert profile =~ ~s|"/private/tmp"|
-      assert profile =~ ~s|"/dev"|
-    end
   end
 
-  # The regression guard for the hole this split closed. A rail check script is not a
-  # harness turn, so a grant added for a harness must never widen the rail wall again —
-  # and on linux `/dev` in a rail profile means `/dev/shm`, a world-writable tmpfs, which
-  # is a durable write channel outside the scratch root that survives its rm_rf. Proven
-  # reachable on shrdlu before the split: the script wrote /dev/shm and returned PASS.
+  # The regression guard for the hole the rail/adapter seam split closed. A rail check
+  # script is not a harness turn, so a grant added for a harness must never widen the
+  # rail wall again — and on linux `/dev` in a rail profile means `/dev/shm`, a
+  # world-writable tmpfs, which is a durable write channel outside the scratch root that
+  # survives its rm_rf. Proven reachable on shrdlu before the split: the script wrote
+  # /dev/shm and returned PASS. The harness-addition seam itself is deleted (#36); the
+  # paths it once granted (`/private/tmp`, `/dev`) stay pinned here as the guard.
   test "a rail profile grants no harness addition, and no writable /dev tree" do
     profile = Containment.rail_profile(["/org/work"])
-    additions = Enum.flat_map(Tightbeam.Harness.all(), & &1.containment_additions())
 
     # Compared in the platform's GRANT FORM, not as a substring: `/dev` is a substring of
     # the `/dev/null` grant below, and the whole point is that the tree is not granted
     # while the single sink is.
-    for {path, _comment} <- additions do
+    for path <- ["/private/tmp", "/dev"] do
       refute_grants(profile, path)
     end
 

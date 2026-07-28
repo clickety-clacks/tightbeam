@@ -59,32 +59,6 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert failures >= 5
   end
 
-  test "containment refusal in adapter_opts takes the uniform degraded path", ctx do
-    coordinator =
-      start_supervised!(
-        {AdapterCoordinator,
-         adapter_sup: ctx.sup,
-         backoff_base_ms: 1,
-         adapter_opts: fn _ -> raise ArgumentError, "contained_remote_unsupported" end,
-         db: ctx.db,
-         name: :"containment_coord_#{System.unique_integer([:positive])}"}
-      )
-
-    key = {:codex, "contained", "worker"}
-    assert {:ok, _pid, _generation} = AdapterCoordinator.adapter_for(coordinator, key)
-
-    assert wait_until(fn ->
-             match?(
-               %{"codex:contained@worker" => %{circuit: :open}},
-               AdapterCoordinator.health(coordinator)
-             )
-           end)
-
-    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
-
-    assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "adapter_down")) >= 5
-  end
-
   test "failure circuit threshold uses application config", ctx do
     old_value = Application.get_env(:tightbeam, :adapter_failure_circuit)
 

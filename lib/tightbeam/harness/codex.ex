@@ -314,9 +314,6 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   @impl true
-  def containment_additions, do: []
-
-  @impl true
   def classify_auth_event(%{
         "_meta" => %{
           "codex" => %{"accountUpdated" => %{"authMode" => nil, "planType" => nil}}
@@ -566,7 +563,6 @@ defmodule Tightbeam.Harness.Codex do
       patched: patch_adapter_source(source),
       remote_patch_detail: "; codex adapter patched",
       session_meta: %{developerInstructions: "vector guidance"},
-      containment: [],
       cli_name: "codex",
       cli_version: "codex vector 1.0",
       probe_path: :discovered,

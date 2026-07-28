@@ -137,12 +137,6 @@
       ],
       "oracle": "pinned CLI version and path decision equal the vector's expected values"
     },
-    "containment_additions": {
-      "required_cases": [
-        "exact_grants"
-      ],
-      "oracle": "exact grant list equals the vector's expected list"
-    },
     "classify_auth_event": {
       "required_cases": [
         "positive",

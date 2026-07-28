@@ -214,16 +214,18 @@ defmodule Tightbeam.ArchetypesTest do
     File.write!(path, """
     name = "contained"
     [containment]
-    fs = "workdir"
+    fs = "off"
     network = "open"
     """)
 
     assert Archetypes.load!(ctx.base_dir)["contained"].containment ==
-             %{fs: :workdir, network: :open}
+             %{fs: :off, network: :open}
 
+    # "workdir" was the adapter-containment posture; deleted by ruling (#36).
     for body <- [
           "[containment]\nunknown = true\n",
           "[containment]\nfs = \"offf\"\n",
+          "[containment]\nfs = \"workdir\"\n",
           "[containment]\nnetwork = \"loopback\"\n"
         ] do
       File.write!(path, "name = \"contained\"\n" <> body)

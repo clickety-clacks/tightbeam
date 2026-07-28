@@ -212,9 +212,6 @@ defmodule Tightbeam.Harness.Support do
       "credential_live?" => credential_live_vectors(module, profile),
       "install_cli_projection" => install_cli_projection_vectors(module),
       "probe_cli" => probe_cli_vectors(module, profile),
-      "containment_additions" => [
-        vector("exact_grants", profile.containment, %{})
-      ],
       "classify_auth_event" => classification_vectors(module, profile.auth_events, :auth),
       "classify_subagent_event" =>
         classification_vectors(module, profile.subagent_events, :subagent),
@@ -258,9 +255,6 @@ defmodule Tightbeam.Harness.Support do
 
   def observe_vector(module, "probe_cli", %{input: input}),
     do: observe_probe_cli(module, input.profile)
-
-  def observe_vector(module, "containment_additions", %{input: %{}}),
-    do: module.containment_additions()
 
   def observe_vector(module, "classify_auth_event", %{input: input}),
     do: module.classify_auth_event(input.envelope)

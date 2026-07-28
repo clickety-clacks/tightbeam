@@ -54,7 +54,6 @@ defmodule Tightbeam.Harness do
   @callback probe_cli(target()) ::
               {:ok, %{bin: String.t(), version: String.t()}}
               | {:error, :not_found | {:exec_failed, String.t()}}
-  @callback containment_additions() :: [{String.t(), String.t() | nil}]
   @callback classify_auth_event(map()) :: :terminal | :transient | :unknown
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip

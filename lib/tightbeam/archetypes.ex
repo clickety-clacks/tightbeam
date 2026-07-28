@@ -20,7 +20,7 @@ defmodule Tightbeam.Archetypes do
           defaults: %{optional(:harness) => atom(), optional(:model) => String.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [String.t()],
-          containment: %{fs: :off | :workdir, network: :open},
+          containment: %{fs: :off, network: :open},
           mcp: [
             %{
               name: String.t(),
@@ -758,8 +758,8 @@ defmodule Tightbeam.Archetypes do
     fs = Map.get(raw, "fs", "off")
     network = Map.get(raw, "network", "open")
 
-    unless fs in ["off", "workdir"] do
-      raise ArgumentError, "archetype containment.fs must be off or workdir: #{path}"
+    unless fs == "off" do
+      raise ArgumentError, "archetype containment.fs must be off: #{path}"
     end
 
     unless network == "open" do

@@ -21,11 +21,12 @@ defmodule Tightbeam.Containment do
   product knowledge the wrapper does not have. The wrapper dispatches on its own
   target OS to apply what it is handed.
 
-  There are two seams and they get DIFFERENT grants, named per seam rather than
-  sharing one renderer's list: `rail_profile/1` for a rail check script, and
-  `adapter_profile/1` for a contained harness adapter. Sharing the list is what
-  let a harness-driven grant widen the rail wall by accident, so a caller now has
-  to say which seam it is.
+  `rail_profile/1` for a rail check script is the ONLY seam. Adapter-level
+  containment (a second seam that sandboxed the harness adapter process) was
+  ruled out and deleted (#36): containment is a rails mechanism, and no rail
+  routes through the adapter. When the seams coexisted they got DIFFERENT
+  grants, because sharing one renderer's list let a harness-driven grant widen
+  the rail wall by accident.
 
   A platform-specific mechanism carries a parity obligation and a per-OS proof
   obligation at the moment it is chosen. Both mechanisms and both obligations
@@ -39,9 +40,10 @@ defmodule Tightbeam.Containment do
   """
 
   # A rail check script is not a harness turn, so it gets NO harness additions. It used
-  # to: `containment_additions/0` arrived with the adapter-seam refactor (63fc9e7, two
-  # days after rails were contained in 0be38de) and was appended to the one renderer both
-  # seams happened to share. On macOS that silently widened rail profiles by
+  # to: the harness-additions hook (deleted with adapter containment, #36) arrived with
+  # the adapter-seam refactor (63fc9e7, two days after rails were contained in 0be38de)
+  # and was appended to the one renderer both seams happened to share. On macOS that
+  # silently widened rail profiles by
   # `/private/tmp`; on linux it granted `/dev`, and `/dev/shm` is world-writable tmpfs —
   # a DURABLE write channel outside the scratch root, surviving the scratch rm_rf. Proven
   # on shrdlu: a rail script under a real rail profile wrote /dev/shm and returned PASS.
@@ -56,16 +58,6 @@ defmodule Tightbeam.Containment do
   @spec rail_profile([String.t()]) :: String.t()
   def rail_profile(write_roots) do
     render(write_roots, @rail_grants)
-  end
-
-  @spec adapter_profile([String.t()]) :: String.t()
-  def adapter_profile(write_roots) do
-    additions =
-      Tightbeam.Harness.all()
-      |> Enum.flat_map(& &1.containment_additions())
-      |> Enum.uniq()
-
-    render(write_roots, additions)
   end
 
   defp render(write_roots, extra_grants) do

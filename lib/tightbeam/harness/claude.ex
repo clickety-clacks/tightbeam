@@ -302,14 +302,6 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   @impl true
-  def containment_additions do
-    [
-      {"/private/tmp", "claude Terminal per-command workdir"},
-      {"/dev", "claude session-new PTY allocation"}
-    ]
-  end
-
-  @impl true
   def classify_auth_event(_event), do: :unknown
 
   @impl true
@@ -533,10 +525,6 @@ defmodule Tightbeam.Harness.Claude do
           append: "vector guidance"
         }
       },
-      containment: [
-        {"/private/tmp", "claude Terminal per-command workdir"},
-        {"/dev", "claude session-new PTY allocation"}
-      ],
       cli_name: "claude",
       cli_version: "claude vector 1.0",
       probe_path: :discovered,

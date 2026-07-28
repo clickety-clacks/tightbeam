@@ -3,8 +3,6 @@ defmodule Tightbeam.PlacementTest do
 
   alias Tightbeam.{Archetypes, DB, EventLog, Homes, Identity, Org, Placement, Rails}
 
-  @darwin? :os.type() == {:unix, :darwin}
-
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base_dir)
@@ -72,47 +70,6 @@ defmodule Tightbeam.PlacementTest do
                run: fn _ -> Process.sleep(100) end,
                timeout: 10
              )
-  end
-
-  test "reconstruction refuses retired sessions with colliding effective content", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    base = Archetypes.load!(base_dir)["default"]
-    first = %{"guidance_extra" => "First"}
-    second = %{"guidance_extra" => "Second"}
-
-    config = %{
-      base_dir: base_dir,
-      cwd: "/work",
-      cli_bin: "/local/bin",
-      default_model: "fable",
-      db: db
-    }
-
-    identity_name = Placement.identity_name(config, base, first, :codex)
-
-    for {session_key, overrides} <- [{"first", first}, {"second", second}] do
-      Org.create(db, %{
-        session_key: session_key,
-        display_name: session_key,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        overrides: overrides,
-        identity_name: identity_name,
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: "gpt-5.6-sol[medium]"
-      })
-    end
-
-    Org.retire(db, "second")
-
-    assert_raise ArgumentError, ~r/identity name collision/, fn ->
-      Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
-    end
   end
 
   test "hosts registers the gateway machine under its real name; nothing redefines it", %{
@@ -598,7 +555,6 @@ defmodule Tightbeam.PlacementTest do
     assert is_function(opts[:on_auth_event], 2)
     assert {"TIGHTBEAM_LINEAGE", "tb1-Y29kZXhAdGVzdGhvc3Q"} in opts[:env]
 
-    refute Keyword.has_key?(opts, :contained)
     refute Keyword.has_key?(opts, :probe_cwd)
     refute Keyword.has_key?(opts, :probe_model)
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
@@ -762,250 +718,6 @@ defmodule Tightbeam.PlacementTest do
     refute Keyword.has_key?(lawless_opts, :probe_model)
   end
 
-  test "contained local adapter validates, probes once, wraps argv, and records exact grants", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    canonical_base = canonical(base_dir)
-    write_containment_manifest(canonical_base, "default", "workdir")
-    Archetypes.load!(canonical_base)
-    auth_dir = Path.join([canonical_base, "auth", "codex"])
-    File.mkdir_p!(auth_dir)
-    File.write!(Path.join(auth_dir, "auth.json"), "credential")
-    parent = self()
-
-    sh = fn command ->
-      send(parent, {:probe, command})
-      {"", 0}
-    end
-
-    config = %{
-      base_dir: canonical_base,
-      cwd: "/work",
-      cli_bin: "/local/bin",
-      default_model: "fable",
-      db: db,
-      sh: sh
-    }
-
-    opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
-    assert opts[:contained] == true
-
-    assert ["/usr/bin/sandbox-exec", "-p", profile, binary] = opts[:cmd]
-
-    # Under the host's OWN base_dir, not a sibling checkout (#46). Compared by
-    # suffix plus a realpath'd prefix because macOS resolves /var via /private.
-    assert String.ends_with?(binary, "adapters/node_modules/.bin/codex-acp")
-    assert String.starts_with?(binary, File.cd!(base_dir, &File.cwd!/0))
-
-    work_root = Path.join(canonical_base, "work")
-    home = Path.join([canonical_base, "homes", "testhost", "codex"])
-
-    # The grant FORM is per-OS — SBPL subpaths on macOS, a Landlock envelope on linux —
-    # but that these three roots are granted, in this order, is not. The argv below is
-    # still macOS-only: adapter containment is unreachable while every adapter key is
-    # "shared", and making its applier per-OS belongs with task #36 (see the shared
-    # containment spec). The profile it would pass is already correct on both.
-    assert profile =~ ordered_grants([work_root, home, auth_dir])
-
-    assert_receive {:probe,
-                    [
-                      "/usr/bin/sandbox-exec",
-                      "-p",
-                      "(version 1)(allow default)",
-                      "/usr/bin/true"
-                    ]}
-
-    refute_receive {:probe, _}
-
-    assert File.read_link!(Path.join(home, "auth.json")) == Path.join(auth_dir, "auth.json")
-
-    assert [%{kind: "containment", subject: "codex:default@testhost", detail: detail}] =
-             EventLog.lifecycle_events(db)
-
-    assert detail ==
-             "assembled; fs=workdir network=open; write-roots=#{work_root},#{home},#{auth_dir}"
-  end
-
-  test "contained local probe failures refuse and record DENIED", %{base_dir: base_dir, db: db} do
-    canonical_base = canonical(base_dir)
-    write_containment_manifest(canonical_base, "default", "workdir")
-    Archetypes.load!(canonical_base)
-
-    config = %{
-      base_dir: canonical_base,
-      cwd: "/work",
-      cli_bin: "/local/bin",
-      default_model: "fable",
-      db: db,
-      sh: fn _ -> {"no", 1} end
-    }
-
-    assert_raise ArgumentError, ~r/testhost.*sandbox-exec probe failed with exit 1/, fn ->
-      Placement.adapter_opts(config, {:claude, "default", "testhost"})
-    end
-
-    assert [%{detail: "DENIED: sandbox-exec probe failed with exit 1"}] =
-             EventLog.lifecycle_events(db)
-  end
-
-  test "contained local runner exceptions refuse like probe failures", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    canonical_base = canonical(base_dir)
-    write_containment_manifest(canonical_base, "default", "workdir")
-    Archetypes.load!(canonical_base)
-
-    config = %{
-      base_dir: canonical_base,
-      cwd: "/work",
-      cli_bin: "/local/bin",
-      default_model: "fable",
-      db: db,
-      sh: fn _ -> raise ErlangError, original: :enoent end
-    }
-
-    assert_raise ArgumentError, ~r/sandbox-exec probe failed/, fn ->
-      Placement.adapter_opts(config, {:codex, "default", "testhost"})
-    end
-
-    assert [%{detail: "DENIED: sandbox-exec probe failed:" <> _}] =
-             EventLog.lifecycle_events(db)
-  end
-
-  test "contained local aliases introduce no extra refusal", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    canonical_base = canonical(base_dir)
-    write_containment_manifest(canonical_base, "default", "workdir")
-    Archetypes.load!(canonical_base)
-
-    register_hosts(base_dir, %{
-      "alias" => %{ssh: nil, base_dir: canonical_base, cli_bin: nil}
-    })
-
-    parent = self()
-
-    config = %{
-      base_dir: canonical_base,
-      cwd: "/work",
-      cli_bin: "/local/bin",
-      default_model: "fable",
-      db: db,
-      sh: fn command ->
-        send(parent, {:command, command})
-        {"", 0}
-      end
-    }
-
-    opts = Placement.adapter_opts(config, {:codex, "default", "alias"})
-    assert opts[:contained]
-
-    assert_receive {:command,
-                    [
-                      "/usr/bin/sandbox-exec",
-                      "-p",
-                      "(version 1)(allow default)",
-                      "/usr/bin/true"
-                    ]}
-
-    assert [%{detail: "assembled; fs=workdir network=open;" <> _}] =
-             EventLog.lifecycle_events(db)
-
-    write_containment_manifest(canonical_base, "default", "off")
-    Archetypes.load!(canonical_base)
-    opts = Placement.adapter_opts(config, {:codex, "default", "alias"})
-    refute Keyword.has_key?(opts, :contained)
-    refute_receive {:command, _}
-  end
-
-  test "adapter_opts refuses contained remote placement before public home delivery behavior", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    write_containment_manifest(base_dir, "default", "workdir")
-    Archetypes.load!(base_dir)
-
-    register_hosts(base_dir, %{
-      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
-    })
-
-    parent = self()
-
-    sh = fn command ->
-      send(parent, {:command, command})
-      {"", 0}
-    end
-
-    config = %{
-      base_dir: base_dir,
-      cwd: "/work",
-      cli_bin: "/bin",
-      default_model: "fable",
-      db: db,
-      sh: sh
-    }
-
-    assert_raise ArgumentError, ~r/contained_remote_unsupported/, fn ->
-      Placement.adapter_opts(config, {:codex, "default", "worker"})
-    end
-
-    refute_receive {:command, _}
-
-    assert Placement.deliver_home(config, {:codex, "default", "worker"}, sh: sh) ==
-             "/remote/tb/homes/worker/codex"
-
-    assert_receive {:command, _}
-
-    assert Enum.map(EventLog.lifecycle_events(db), & &1.detail) == [
-             "DENIED: contained_remote_unsupported"
-           ]
-  end
-
-  test "adapter_opts resolves an overridden identity exactly once with posture off and on", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    canonical_base = canonical(base_dir)
-    base = Archetypes.load!(canonical_base)["default"]
-    overrides = %{"skills_add" => ["missing-override-dependency"]}
-
-    config = %{
-      base_dir: canonical_base,
-      cwd: "/work",
-      cli_bin: "/local/bin",
-      default_model: "fable",
-      db: db,
-      sh: fn _ -> {"", 0} end
-    }
-
-    identity_name = Placement.identity_name(config, base, overrides, :codex)
-
-    Org.create(db, %{
-      session_key: "resolution-count",
-      display_name: "Resolution count",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      overrides: overrides,
-      identity_name: identity_name,
-      host: "testhost",
-      harness: "codex",
-      provider: "openai",
-      model: "gpt-5.6-sol[medium]"
-    })
-
-    Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
-    assert discrepancy_count(db) == 1
-
-    write_containment_manifest(canonical_base, "default", "workdir")
-    Archetypes.load!(canonical_base)
-    Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
-    assert discrepancy_count(db) == 2
-  end
-
   test "adapter lineage identifies the shared harness runtime", %{base_dir: base_dir} do
     archetypes_dir = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(archetypes_dir)
@@ -1121,40 +833,10 @@ defmodule Tightbeam.PlacementTest do
     |> JSON.encode!()
   end
 
-  defp write_containment_manifest(base_dir, name, fs) do
-    dir = Path.join([base_dir, "identity", "archetypes"])
-    File.mkdir_p!(dir)
-
-    File.write!(Path.join(dir, "#{name}.toml"), """
-    name = "#{name}"
-
-    [containment]
-    fs = "#{fs}"
-    network = "open"
-    """)
-  end
-
-  defp discrepancy_count(db) do
-    db
-    |> EventLog.lifecycle_events()
-    |> Enum.count(&(&1.kind == "override_discrepancy"))
-  end
-
   defp put_skill!(base_dir, name, body) do
     Identity.init!(base_dir)
     Identity.edit!(base_dir, "default", {:skill, name, false}, body, "test")
     Archetypes.load!(base_dir)
     Path.join([base_dir, "identity", "skills", name, "SKILL.md"])
-  end
-
-  defp canonical(path) do
-    {resolved, 0} = System.cmd("/bin/realpath", [path])
-    String.trim(resolved)
-  end
-
-  defp ordered_grants(roots) do
-    if @darwin?,
-      do: Enum.map_join(roots, "\n  ", &~s|(subpath "#{&1}")|),
-      else: Enum.map_join(roots, ",", &JSON.encode!/1)
   end
 end

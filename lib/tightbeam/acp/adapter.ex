@@ -37,7 +37,6 @@ defmodule Tightbeam.Acp.Adapter do
     :stderr_path,
     :on_auth_event,
     :on_subagent_event,
-    contained: false,
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
@@ -261,8 +260,7 @@ defmodule Tightbeam.Acp.Adapter do
       stderr_path: stderr_path,
       stderr_offset: offset,
       on_auth_event: Keyword.get(opts, :on_auth_event),
-      on_subagent_event: Keyword.get(opts, :on_subagent_event),
-      contained: Keyword.get(opts, :contained, false)
+      on_subagent_event: Keyword.get(opts, :on_subagent_event)
     }
 
     # A binary that cannot execute still opens the port (the spawn is `sh -c`),
@@ -354,15 +352,8 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, _result} ->
         case apply_model_to_session(state, sid, model) do
           :ok ->
-            case set_mode_after_load(state, sid) do
-              :ok ->
-                state = %{state | known: MapSet.put(state.known, sid)}
-                {:reply, :ok, put_in(state.chunks[sid], [])}
-
-              {:error, _reason} = error ->
-                state = %{state | known: MapSet.delete(state.known, sid)}
-                {:reply, error, state}
-            end
+            state = %{state | known: MapSet.put(state.known, sid)}
+            {:reply, :ok, put_in(state.chunks[sid], [])}
 
           {:error, reason} ->
             state = %{state | known: MapSet.delete(state.known, sid)}
@@ -643,7 +634,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp read_back?(_, _id, _expected), do: false
 
-  defp set_mode(%{contained: false} = state, sid) do
+  defp set_mode(state, sid) do
     _ =
       Conn.request(state.conn, "session/set_mode", %{
         sessionId: sid,
@@ -652,19 +643,6 @@ defmodule Tightbeam.Acp.Adapter do
 
     :ok
   end
-
-  defp set_mode(%{contained: true} = state, sid) do
-    case Conn.request(state.conn, "session/set_mode", %{
-           sessionId: sid,
-           modeId: state.preset.permission_mode
-         }) do
-      {:ok, _} -> :ok
-      {:error, _} -> {:error, :contained_sandbox_disable_failed}
-    end
-  end
-
-  defp set_mode_after_load(%{contained: false}, _sid), do: :ok
-  defp set_mode_after_load(state, sid), do: set_mode(state, sid)
 
   defp adapter_ready(opts) do
     # Boot completed — the only trustworthy health signal under lazy boot
