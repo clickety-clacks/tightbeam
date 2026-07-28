@@ -46,7 +46,7 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["update-ref", "-d", "refs/heads/tightbeam/live"])
 
     assert_raise ArgumentError,
-                 "identity repository is missing required refs: tightbeam/live. Repair with: git -C #{dir} branch tightbeam/live main",
+                 "identity repository is missing required refs: tightbeam/live. Repair with: git -C #{dir} branch tightbeam/live main; then tightbeam identity relearn",
                  fn ->
                    Identity.init!(ctx.base)
                  end
@@ -84,7 +84,7 @@ defmodule Tightbeam.IdentityTest do
     File.write!(packed_path, packed)
 
     assert_raise ArgumentError,
-                 "identity repository is missing required refs: tightbeam/live. Repair with: git -C #{dir} branch tightbeam/live main",
+                 "identity repository is missing required refs: tightbeam/live. Repair with: git -C #{dir} branch tightbeam/live main; then tightbeam identity relearn",
                  fn ->
                    Identity.init!(ctx.base)
                  end
@@ -315,6 +315,46 @@ defmodule Tightbeam.IdentityTest do
              "relearn operator <relearn-operator@tightbeam.local>"
 
     assert File.read!(Path.join(dir, "guidance/coder.md")) == "no-identity-edit"
+  end
+
+  # The second gate a pre-upgrade org hits, and the one its own repair walks into.
+  #
+  # An org seeded before `operating-model.md` shipped has main only, so boot raises
+  # the missing-refs error first. That error says to create the refs from main — and
+  # doing exactly that gets you here, where the tree is still too old to serve. Both
+  # halves are the same upgrade, so the first error now names relearn too.
+  test "an org whose tree predates a required fragment says so, and says relearn", ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+
+    File.rm!(Path.join(dir, "guidance/operating-model.md"))
+    git!(dir, ["add", "-A"], "tightbeam")
+    git!(dir, ["commit", "-m", "pre-upgrade tree"], "tightbeam")
+    git!(dir, ["branch", "-f", "tightbeam/live", "main"])
+
+    error = assert_raise(ArgumentError, fn -> Identity.snapshot!(ctx.base, "coder", :claude) end)
+    message = error.message
+
+    assert message =~ "has no guidance/operating-model.md"
+    assert message =~ "tightbeam identity relearn"
+    assert message =~ "seeded before"
+
+    # The fragment map is NOT in the message. It is every guidance file in the org,
+    # and dumping it buries the one filename and one verb that matter.
+    refute message =~ "wisdom"
+    assert String.length(message) < 400
+  end
+
+  test "the missing-refs repair names relearn, not just the branch commands", ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    git!(dir, ["branch", "-D", "tightbeam/live"])
+
+    error = assert_raise(ArgumentError, fn -> Identity.live_revision!(ctx.base) end)
+
+    assert error.message =~ "missing required refs: tightbeam/live"
+    assert error.message =~ "branch tightbeam/live main"
+    assert error.message =~ "then tightbeam identity relearn"
   end
 
   test "dirty and conflicted relearns never move live", ctx do

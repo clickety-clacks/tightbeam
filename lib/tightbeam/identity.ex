@@ -52,10 +52,15 @@ defmodule Tightbeam.Identity do
     if missing != [] do
       repair =
         if any_ref_exists?(identity_dir) do
+          # Refs exist, so this is a repository that PREDATES something rather than a
+          # broken one, and missing refs are only its first symptom: its tree can also
+          # be too old to serve (see `required_fragment!`). Creating the refs alone
+          # fixes the half that raised here and leaves the other half to fail at the
+          # next session provisioning, so the repair names both steps.
           Enum.map_join(missing, "; ", fn
             "main" -> "restore main from a known-good identity backup"
             ref -> "git -C #{identity_dir} branch #{ref} main"
-          end)
+          end) <> "; then tightbeam identity relearn"
         else
           "remove #{identity_dir} and re-boot to re-learn"
         end
@@ -119,12 +124,34 @@ defmodule Tightbeam.Identity do
     guidance =
       [
         Archetypes.guidance(archetype, fragments),
-        Map.fetch!(fragments, "operating-model.md")
+        required_fragment!(fragments, "operating-model.md", revision)
       ]
       |> Enum.join("\n\n")
       |> then(&Harness.module!(harness).session_config(%{identity: true}, &1).guidance)
 
     %{revision: revision, archetype: archetype, guidance: guidance, skills: skills}
+  end
+
+  # A fragment the SUBSTRATE requires, which an org's tree may predate.
+  #
+  # `operating-model.md` is composed into every archetype's guidance by name, from
+  # here rather than from the org's manifests, so an org seeded before it shipped
+  # has a tree that cannot serve a session — and `init!` is a no-op once the repo
+  # exists, so nothing brings it in on its own. `Map.fetch!` raised a KeyError that
+  # named the key and then printed the entire fragment map: tens of kilobytes of
+  # guidance prose in a message whose actionable content is one filename and one
+  # verb.
+  defp required_fragment!(fragments, name, revision) do
+    case Map.fetch(fragments, name) do
+      {:ok, body} ->
+        body
+
+      :error ->
+        raise ArgumentError,
+              "identity revision #{revision} has no guidance/#{name}, which every " <>
+                "archetype's guidance is composed with. This org was seeded before that " <>
+                "fragment shipped. Repair with: tightbeam identity relearn"
+    end
   end
 
   @doc """
