@@ -736,6 +736,20 @@ fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
     Ok(None)
 }
 
+/// The advertised url names the WEBSOCKET wire; this base roots an HTTP path.
+///
+/// A gateway writes what it advertises to clients (`ws://host:port`), which is the
+/// right answer for the wire and the wrong scheme for `/agent/dispatch` -- the http
+/// client refuses it outright rather than treating it as http. Same host, same port,
+/// same server; only the scheme differs, so the scheme is all this changes.
+fn http_scheme(url: &str) -> String {
+    match url.split_once("://") {
+        Some(("ws", rest)) => format!("http://{rest}"),
+        Some(("wss", rest)) => format!("https://{rest}"),
+        _ => url.to_owned(),
+    }
+}
+
 fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
     let encoded = fs::read_to_string(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -758,7 +772,7 @@ fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
     // is correct there and nowhere else. The gateway writes both (Placement) and
     // only ever writes one of the two shapes per machine.
     let base = match config.get("url").and_then(Value::as_str) {
-        Some(url) if !url.is_empty() => url.to_owned(),
+        Some(url) if !url.is_empty() => http_scheme(url),
         _ => {
             let port = config
                 .get("port")
@@ -1598,6 +1612,67 @@ mod tests {
                 session_file: None,
             })
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // RECORDED REALITY, not a chosen fixture: `Placement.provision_endpoint` writes
+    // TIGHTBEAM_ADVERTISED_URL verbatim, and that value is the WEBSOCKET url -- in
+    // production, `ws://shrdlu:11373`. This base is the root of an HTTP path
+    // (`/agent/dispatch`), and the http client rejects the scheme outright with
+    // "Unknown Scheme: unknown scheme 'ws'", so every satellite ceremony died on the
+    // one url a real gateway ever writes. The sibling fixtures above hardcode
+    // `http://` and can never catch it: they encode an assumption production
+    // violates. One host, one wire, two schemes -- the transport is the websocket's,
+    // the dispatch path is HTTP's.
+    #[test]
+    fn a_satellite_url_written_as_a_websocket_scheme_dispatches_over_http() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_ws_scheme_{unique}"));
+        let cases = [
+            (
+                "ws",
+                "ws://gateway.example:11373",
+                "http://gateway.example:11373",
+            ),
+            (
+                "wss",
+                "wss://gateway.example:11373",
+                "https://gateway.example:11373",
+            ),
+            // http and https are already the dispatch scheme and pass through whole.
+            (
+                "http",
+                "http://gateway.example:11373",
+                "http://gateway.example:11373",
+            ),
+            (
+                "https",
+                "https://gateway.example:11373",
+                "https://gateway.example:11373",
+            ),
+        ];
+        for (name, written, expected) in cases {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("gateway.json"),
+                format!(r#"{{"url":"{written}","cliToken":"tbc_org"}}"#),
+            )
+            .unwrap();
+
+            assert_eq!(
+                discover_from(&dir),
+                Ok(Endpoint {
+                    base: expected.to_owned(),
+                    token: "tbc_org".to_owned(),
+                    session_file: None,
+                }),
+                "{name}"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
