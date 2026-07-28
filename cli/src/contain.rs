@@ -1432,7 +1432,6 @@ mod tests {
                 marker.display()
             ),
         );
-        let started = Instant::now();
         let status = run_with_input(
             RailExecArgs {
                 profile: permissive_profile(),
@@ -1442,8 +1441,13 @@ mod tests {
             b"{}\n".to_vec(),
         );
         assert_eq!(status, SCRIPT_TIMEOUT);
-        assert!(started.elapsed() < Duration::from_millis(500));
         thread::sleep(Duration::from_millis(1_100));
+        // The marker carries BOTH claims, which is why no stopwatch appears here. The
+        // descendant writes it as the last thing before exiting, so a wrapper that waited
+        // for the descendant instead of timing out could only have returned after that
+        // write — its absence is the proof that the timeout stayed armed. Timing the
+        // return against a fixed 500ms budget proved the same thing by racing a fork and
+        // an exec on a loaded runner, and lost (#51).
         assert!(!marker.exists());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1451,23 +1455,69 @@ mod tests {
     #[test]
     fn timeout_does_not_join_a_reader_held_open_by_an_escaped_descendant() {
         let dir = temp_dir();
+        let escaped_pid_path = dir.join("escaped.pid");
+        // setsid() takes the child out of the process group, so the wrapper's group kill
+        // cannot reach it and it holds the inherited stdout open for far longer than a
+        // loaded runner needs to fork, exec and time out. It records its own pid, which is
+        // what makes its survival checkable instead of inferred from a stopwatch.
         let check = script(
             &dir,
             "daemonizes",
-            "/usr/bin/perl -MPOSIX=setsid -e 'if (fork) { sleep 30 } else { setsid(); sleep 1 }'",
+            &format!(
+                "/usr/bin/perl -MPOSIX=setsid -e 'if (fork) {{ sleep 30 }} else {{ setsid(); open(F, \">\", \"{}\") or die; print F POSIX::getpid(); close F; sleep 30 }}'",
+                escaped_pid_path.display()
+            ),
         );
-        let started = Instant::now();
+        // 2s, where the siblings above use 40ms, because the escape has to have HAPPENED
+        // for this test to be about anything: at 40ms the group kill can land on the child
+        // before it reaches setsid(), leaving nothing holding the reader open and a test
+        // that passes without exercising the seam. perl forks and detaches in tens of
+        // milliseconds, so this is a ceiling on the escape, and the check below is what
+        // proves the escape occurred rather than assuming it.
         let status = run_with_input(
             RailExecArgs {
                 profile: permissive_profile(),
-                timeout: Duration::from_millis(40),
+                timeout: Duration::from_secs(2),
                 script: check,
             },
             b"{}\n".to_vec(),
         );
         assert_eq!(status, SCRIPT_TIMEOUT);
-        assert!(started.elapsed() < Duration::from_millis(500));
-        thread::sleep(Duration::from_millis(1_100));
+
+        // A wrapper that JOINED the reader thread could only return once the descendant
+        // holding it released the pipe — that is, after it exited. The descendant outlives
+        // the wrapper's whole budget by 28s, so finding it still alive is that proof, as a
+        // state rather than as a deadline: the 500ms budget this replaced was timing a fork
+        // and an exec, and lost the race under parallel `cargo test` (#51).
+        let escaped = escaped_descendant_pid(&escaped_pid_path);
+        assert!(
+            alive(escaped),
+            "the wrapper waited for the escaped descendant instead of returning"
+        );
+
+        unsafe { libc::kill(escaped, libc::SIGKILL) };
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // The escaped descendant is beyond the group kill, so its pid file is an event that
+    // WILL arrive; wait for the event, and say so plainly if it never does.
+    fn escaped_descendant_pid(path: &Path) -> libc::pid_t {
+        for _ in 0..2_000 {
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<libc::pid_t>() {
+                    return pid;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        panic!(
+            "the escaped descendant never recorded its pid at {}",
+            path.display()
+        );
+    }
+
+    fn alive(pid: libc::pid_t) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
     }
 }
