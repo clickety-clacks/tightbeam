@@ -237,7 +237,7 @@ product's own path was not visible from where it was standing.
 > - The reply spelling **is** written down in `priv/guidance/operating-manual.md:31-32`
 >   — but that fragment reaches an agent only if its archetype `#include`s
 >   `operating-manual.md`, and **no shipped archetype does**
->   (`priv/archetypes/default.toml`, `priv/kungfu/agentic-engineering/archetypes/*.toml`).
+>   (`priv/kungfu/agentic-engineering/archetypes/*.toml`).
 >   `Identity.snapshot_at!` (`lib/tightbeam/identity.ex:119-125`) composes the
 >   archetype's own guidance plus `operating-model.md` — a *different* document, about
 >   the served-identity seam, which never mentions wake.
