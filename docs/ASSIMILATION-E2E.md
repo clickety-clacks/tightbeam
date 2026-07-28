@@ -40,24 +40,27 @@ of:
 
 Actual host assignments belong in `docs/TEST-HOSTS.md`, not here.
 
-## Prerequisites on the GATEWAY, checked first
+## Prerequisites, checked first
 
 Assimilation will appear to succeed and then fail at first spawn if these are
 missing, so check them before you start.
 
-- **The gateway holds a credential for every harness the satellite will run**, even
-  though those sessions execute remotely. Catalogs are derived gateway-side and a
-  spawn is refused when the catalog is missing. A satellite grant does not cover
-  the gateway. See `SATELLITE.md` §What failure looks like.
-- **Each such catalog is actually live**, not merely credentialled — `mix
-  tightbeam.catalog.diff` returns without `catalog_unavailable`. On a fresh org the
-  codex catalog additionally requires `models_cache.json` in the gateway's codex
-  home; see finding **#67**, which blocks this prerequisite until resolved.
+- **The SATELLITE holds a credential for every harness it will run.** Catalogs are
+  per `{host, harness}` and derived on the host that owns the credential, so this
+  is the satellite's grant, not the gateway's — the gateway needs a credential only
+  for the harnesses it runs itself. See `SATELLITE.md` §What failure looks like.
+- **Each such catalog is actually live**, not merely credentialled. The gateway's
+  boot summary reads READY for `<harness> on <satellite>`; a spawn refused
+  `catalog_unavailable` names the host to repair. On a fresh org the codex catalog
+  additionally requires `models_cache.json` in that host's codex home, written by
+  codex itself — finding **#67**, still open: the refusal now names the owning host
+  rather than the gateway, but nothing generates the cache.
 - **`TIGHTBEAM_ADVERTISED_URL` is set** to an address the satellite can reach.
-- The gateway is `active` and its boot summary reads READY for those harnesses.
+- The gateway is `active` and its boot summary reads READY for those `{host,
+  harness}` pairs.
 
-Record all four. A run that skips them will misattribute a gateway fault to the
-satellite, which is the single most common way this procedure is misread.
+Record all four. A run that skips them will misattribute a fault to the wrong
+machine, which is the single most common way this procedure is misread.
 
 ## 1. Baseline the satellite BEFORE anything
 
@@ -197,10 +200,10 @@ forever. Restore reachability. PASS: the circuit closes on the next successful
 start with no operator action.
 
 **6d. Failure diagnostics name the right machine.** A spawn refused
-`catalog_unavailable` naming the **gateway** is the §Prerequisites failure, not a
-satellite fault, and onboarding the satellite again will not fix it. Confirm the
-message names the provider, the host, and the repair. A diagnostic that sends the
-operator to the wrong machine is a FINDING.
+`catalog_unavailable` names the host whose catalog is missing — the host the
+session would have run on, which for a satellite spawn is the satellite. Confirm
+the message names the harness, that host, the provider, and the repair on it. A
+diagnostic that sends the operator to the wrong machine is a FINDING.
 
 ## 7. End of run — retain or return, deliberately
 
