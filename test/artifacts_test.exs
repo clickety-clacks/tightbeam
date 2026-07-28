@@ -599,6 +599,47 @@ defmodule Tightbeam.ArtifactsTest do
     end
   end
 
+  test "an origin that names a machine is external without ever touching the workspace", ctx do
+    workspace =
+      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
+
+    archive_root =
+      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    # The exact form the operating manual teaches for remote work. Resolving it
+    # against the workspace would make "shrdlu:" a missing directory and raise.
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Remote vhost",
+        origin_path: "shrdlu:/etc/nginx/sites-enabled/app"
+      })
+
+    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+
+    external = Artifacts.get(ctx.db, row.artifact_id)
+    assert external.state == "released"
+    assert external.home == nil
+    refute File.exists?(archive_root)
+  end
+
+  test "a remote session with only declared work archives with no reachable workspace", ctx do
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Remote only",
+        origin_path: "eurisko:/srv/app/report.md"
+      })
+
+    # Reap passes nil for a workspace it cannot see (gateway archive_retired_workspace).
+    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, nil, "/unused")
+
+    assert Artifacts.get(ctx.db, row.artifact_id).state == "released"
+  end
+
   test "removes an artifact-free workspace", ctx do
     workspace =
       Path.join(

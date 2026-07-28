@@ -148,6 +148,15 @@ defmodule Tightbeam.Artifacts do
   artifact — work that legitimately happened somewhere else (another machine, a
   service) and was declared by recording it. There is nothing to take into
   custody, so the row is RELEASED rather than archived: the row is the record.
+
+  Classification comes FIRST, before the workspace is touched at all. An origin
+  that names a machine (`host:/absolute/path`, the form the operating manual
+  teaches for remote work) is external by inspection — resolving it against a
+  workspace would turn the machine name into a missing directory, and a session
+  whose only artifact is remote could then never be archived. It also means a
+  session whose workspace is not reachable from here — every remote holder — can
+  still release what it declared: the workspace is required only when some row
+  actually needs custody.
   """
   @spec archive_session(DB.server(), String.t(), String.t() | nil, String.t()) :: :ok
   def archive_session(db \\ Tightbeam.DB, session_key, workspace_path, archive_root) do
@@ -157,8 +166,6 @@ defmodule Tightbeam.Artifacts do
     if live == [] do
       remove_workspace(workspace_path)
     else
-      ensure_workspace_available!(workspace_path)
-
       {relative_paths, external, errors} = archive_candidates(live, workspace_path)
 
       # An origin that is inside the workspace and unreadable is not external —
@@ -173,6 +180,7 @@ defmodule Tightbeam.Artifacts do
           remove_workspace(workspace_path)
           nil
         else
+          ensure_workspace_available!(workspace_path)
           archive_workspace!(workspace_path, archive_root, session_key)
         end
 
@@ -216,19 +224,37 @@ defmodule Tightbeam.Artifacts do
   end
 
   defp archive_candidates(live, workspace_path) do
-    Enum.reduce(live, {%{}, [], []}, fn row, {paths, external, errors} ->
-      try do
-        relative_path = archived_relative_path!(row.origin_path, workspace_path)
-        {Map.put(paths, row.artifact_id, relative_path), external, errors}
-      rescue
-        error in ArgumentError ->
-          if error.message == @outside_workspace do
-            {paths, external ++ [row.artifact_id], errors}
-          else
-            {paths, external, errors ++ [error]}
-          end
-      end
+    Enum.reduce(live, {%{}, [], []}, fn row, acc ->
+      if names_a_machine?(row.origin_path),
+        do: external(acc, row),
+        else: resolved_candidate(row, workspace_path, acc)
     end)
+  end
+
+  # `host:/absolute/path` — the origin names a machine, so it is external by
+  # inspection. Which machines exist is Placement's knowledge, and this module
+  # does not need it: whatever that host is, the bytes are not in this workspace.
+  defp names_a_machine?(origin_path) when is_binary(origin_path),
+    do: Regex.match?(~r{^[^/:]+:/}, origin_path)
+
+  defp names_a_machine?(_origin_path), do: false
+
+  defp external({paths, external, errors}, row),
+    do: {paths, external ++ [row.artifact_id], errors}
+
+  defp resolved_candidate(row, workspace_path, {paths, external, errors} = acc) do
+    # Only a row that might need custody needs the workspace, and a workspace
+    # that is not there says THAT rather than blaming the origin for it.
+    ensure_workspace_available!(workspace_path)
+    relative_path = archived_relative_path!(row.origin_path, workspace_path)
+    {Map.put(paths, row.artifact_id, relative_path), external, errors}
+  rescue
+    error in ArgumentError ->
+      if error.message == @outside_workspace do
+        external(acc, row)
+      else
+        {paths, external, errors ++ [error]}
+      end
   end
 
   @doc "Mark an archived artifact as released from Tightbeam custody."
