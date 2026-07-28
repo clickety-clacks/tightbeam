@@ -703,16 +703,9 @@ defmodule Tightbeam.EscalationDeliveryTest do
       credential_status: fn _provider -> :onboarded end,
       credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end,
-      effort_probe: fn _session, _root, _baseline, _config ->
-        {:ok,
-         %{
-           stamp: "/tmp/effort.stamp",
-           prior: "observed",
-           writes: 0,
-           entries: 1,
-           digest: "same"
-         }}
-      end
+      # The real probe command, answered by a canned shell: these proofs are
+      # about transaction atomicity, not about what a filesystem contains.
+      sh: fn _invocation -> {"B\tobserved\t0\n/w\n", 0} end
     }
   end
 

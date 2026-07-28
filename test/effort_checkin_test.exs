@@ -341,10 +341,15 @@ defmodule Tightbeam.EffortCheckinTest do
   test "dispatch replay precedes current holder placement and performs no new probe", ctx do
     calls = :counters.new(1, [])
 
+    # The REAL mechanism runs; only the counting is injected. A fake that
+    # replaced the probe would prove the replay path calls something once, not
+    # that it observes once.
     config =
-      Map.put(ctx.config, :effort_probe, fn _session, _root, _baseline, _config ->
-        :counters.add(calls, 1, 1)
-        {:ok, observation()}
+      Map.put(ctx.config, :sh, fn invocation ->
+        if String.contains?(Enum.join(invocation, " "), "priorState="),
+          do: :counters.add(calls, 1, 1)
+
+        System.cmd(hd(invocation), tl(invocation), stderr_to_stdout: true)
       end)
 
     params = %{
@@ -772,6 +777,82 @@ defmodule Tightbeam.EffortCheckinTest do
     assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == recorded.id)) == []
   end
 
+  test "acceptance 1 on the PRODUCTION path: the dispatch's own doorbell is not the holder's work",
+       ctx do
+    item = work_item!(ctx.db, "production path")
+    handlers = Gateway.handlers(ctx.config)
+
+    params = %{subject: "turns only", brief: "turns only", work_item_id: item.id}
+
+    call = %{
+      verb: "dispatch",
+      origin: "agent:parent",
+      principal: {:session, "parent"},
+      session_key: "holder",
+      target_role: nil,
+      role_fallback: false,
+      params: params
+    }
+
+    assert %{rumination_required: true} = handlers["dispatch"].(call)
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET state='fired' WHERE rumination=1 AND work_item_id='#{item.id}'"
+      )
+
+    assignment = handlers["dispatch"].(call)
+
+    # The gateway's composition doorbell fired for THIS dispatch — the row the
+    # bracket would have read as the holder's work.
+    assert [["composition"]] =
+             rows(ctx.db, "SELECT kind FROM work_item_events WHERE workItemId=?1", [item.id])
+
+    for _ <- 1..2, do: terminal_turn(ctx.db, "holder", "delivered")
+
+    assert nil == fire_probe(ctx, assignment.id)
+
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assignment.id))
+    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+
+    # And a real work-item UPDATE by the holder still counts, on the same path.
+    silent = dispatch_for_item(ctx, {:session, "parent"}, "holder", "second bracket", item.id)
+
+    handlers["work-item-update"].(%{
+      verb: "work-item-update",
+      origin: "agent:holder",
+      principal: {:session, "holder"},
+      session_key: "holder",
+      params: %{work_item_id: item.id, title: "production path, sharpened"}
+    })
+
+    assert nil == fire_probe(ctx, silent.id)
+    assert silent_rearm(ctx.db, silent.id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == silent.id)) == []
+  end
+
+  test "an observation never removes the stamp it read", ctx do
+    item = dispatch(ctx, {:session, "parent"}, "holder", "stamp relay")
+    armed = generation_stamp(ctx.db, item.id, 1)
+    assert File.exists?(armed)
+
+    # Two observers can hold the same armed snapshot — observation runs before
+    # the CAS that picks a winner — so a loser removing the stamp the winner's
+    # row points at would silently blind the next bracket.
+    assert nil == fire_probe(ctx, item.id)
+    assert File.exists?(armed)
+    assert generation_stamp(ctx.db, item.id, 2) != armed
+  end
+
+  test "a broken channel is not a channel that saw nothing", ctx do
+    item = dispatch(ctx, {:session, "parent"}, "holder", "broken substrate")
+    :ok = DB.execute(ctx.db, "DROP TABLE artifacts")
+
+    # Reading a missing table as zero would fire a prod off the breakage.
+    assert_raise MatchError, fn -> fire_probe(ctx, item.id) end
+  end
+
   test "acceptance 2: an agent working only on another machine is never prodded", ctx do
     item = work_item!(ctx.db, "stand up the web server")
 
@@ -849,7 +930,7 @@ defmodule Tightbeam.EffortCheckinTest do
       Map.put(ctx.config, :sh, fn invocation ->
         if Enum.any?(invocation, &(&1 == "satellite.example")) do
           send(test_pid, {:origin_check, invocation})
-          {"P\t/srv/www/index.html\n", 0}
+          {"P\t1700000042\t/srv/www/index.html\n", 0}
         else
           System.cmd(hd(invocation), tl(invocation), stderr_to_stdout: true)
         end
@@ -864,13 +945,19 @@ defmodule Tightbeam.EffortCheckinTest do
 
     by_origin = Map.new(referents, &{&1.originPath, &1})
 
+    # A stat, not an existence check: the present ones carry the mtime the host
+    # reported, which is the write-detection evidence.
     assert by_origin["report.md"].status == "present"
     assert by_origin["report.md"].host == Placement.local_host_name()
+    {:ok, %File.Stat{mtime: mtime}} = File.stat(src(ctx, "report.md"), time: :posix)
+    assert by_origin["report.md"].mtime == mtime
     assert by_origin["vanished.md"].status == "absent"
+    assert by_origin["vanished.md"].mtime == nil
 
     # The remote one was checked over ssh, on its own host, in one bounded call.
     assert by_origin["satellite:/srv/www/index.html"].status == "present"
     assert by_origin["satellite:/srv/www/index.html"].host == "satellite"
+    assert by_origin["satellite:/srv/www/index.html"].mtime == 1_700_000_042
 
     assert_receive {:origin_check,
                     [
@@ -919,6 +1006,55 @@ defmodule Tightbeam.EffortCheckinTest do
     assert remote.reason =~ "Host is down"
     refute remote.reason =~ "credential"
     refute remote.reason =~ "claim"
+  end
+
+  test "referents are every artifact the holder recorded, as of the moment the claim was filed",
+       ctx do
+    other_item = work_item!(ctx.db, "some other thread")
+    item = work_item!(ctx.db, "this thread")
+    assignment = dispatch_for_item(ctx, {:session, "parent"}, "holder", "build it", item.id)
+
+    # Recorded against a DIFFERENT work item: still this holder's work, still a
+    # referent. Narrowing by work item would have hidden it.
+    File.write!(Path.join(ctx.root, "elsewhere.md"), "recorded under another item")
+    artifact!(ctx.db, "holder", other_item.id, "elsewhere.md")
+
+    # Released — external work, out of custody but exactly where it says it is.
+    File.write!(Path.join(ctx.root, "released.md"), "released")
+    released = artifact!(ctx.db, "holder", item.id, "released.md")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE artifacts SET state='released' WHERE artifactId=?1", [
+        released.artifact_id
+      ])
+
+    # Archived — archival moved these bytes into `home` itself, so originPath is
+    # knowingly stale and stat-ing it would manufacture an absence we caused.
+    archived = artifact!(ctx.db, "holder", item.id, "archived.md")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE artifacts SET state='archived', home='/archive/archived.md' WHERE artifactId=?1",
+        [archived.artifact_id]
+      )
+
+    %{referents: referents} =
+      assignment(ctx, "attest", {:session, "holder"}, nil, %{
+        assignment_id: assignment.id,
+        kind: "progress",
+        note: "checkpoint"
+      })
+
+    origins = Enum.map(referents, & &1.originPath)
+    assert "elsewhere.md" in origins
+    assert "released.md" in origins
+    refute "archived.md" in origins
+
+    # An artifact recorded AFTER the claim was filed is not something the claim
+    # pointed at.
+    artifact!(ctx.db, "holder", item.id, "later.md")
+    assert Enum.map(referents, & &1.originPath) == origins
   end
 
   test "an attest, and a work-item update, are each effect on their own", ctx do
@@ -1397,19 +1533,15 @@ defmodule Tightbeam.EffortCheckinTest do
 
   defp src(ctx, relative), do: Path.join(ctx.root, relative)
 
-  # The shape `Placement.effort_observation/4` returns: a stamp to compare
-  # against next time, and what this walk saw.
-  defp observation(overrides \\ %{}) do
-    Map.merge(
-      %{
-        stamp: "/tmp/effort/stamp",
-        prior: "observed",
-        writes: 0,
-        entries: 1,
-        digest: "same"
-      },
-      overrides
-    )
+  defp generation_stamp(db, assignment_id, generation) do
+    [[baseline]] =
+      rows(
+        db,
+        "SELECT baseline FROM effort_checkin_generations WHERE assignmentId=?1 AND generation=?2",
+        [assignment_id, generation]
+      )
+
+    JSON.decode!(baseline)["observation"]["stamp"]
   end
 
   defp init_repo(path) do
