@@ -108,6 +108,17 @@ These facts are the state of the work. The state is computed from the facts; the
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.
 
+- Record what you produced OUTSIDE your workdir as an artifact:
+
+    tightbeam artifact-record --kind report --title "nginx config on shrdlu" \
+      --path "shrdlu:/etc/nginx/sites-enabled/app" --work-item <workItemId>
+
+Tightbeam sees the files you write in your own workdir. Work on another machine, in a
+service, or in a conversation is invisible until you point at it — an artifact row is how
+you declare it. An assignment whose holder takes turns while writing, attesting and
+recording nothing is checked in on: you get asked what is happening. Recording the work is
+the answer, and it is cheaper given than asked for.
+
 ## Recover after losing context
 You can lose context to compaction or a restart. On waking, re-derive the state from the
 facts — read the work-item and its attests. Read the facts; do not rely on prior scrollback.
