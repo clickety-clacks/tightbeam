@@ -69,7 +69,7 @@ pub fn onboard(identity: &Identity, provider: &str, api_key: bool) -> Result<(),
     let staged = if api_key {
         run_api_key_onboarding(provider, staging, machine.as_deref(), timeout)
     } else {
-        run_provider_onboarding(provider, staging, timeout)
+        run_provider_onboarding(provider, staging, machine.as_deref(), timeout)
     };
 
     if let Err(reason) = staged {
@@ -324,10 +324,15 @@ fn run_bounded(
     }
 }
 
-fn run_provider_onboarding(provider: &str, staging: &str, timeout: Duration) -> Result<(), String> {
+fn run_provider_onboarding(
+    provider: &str,
+    staging: &str,
+    machine: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
     match provider {
         "openai" => run_openai_onboarding(staging, timeout),
-        "anthropic" => run_anthropic_onboarding(staging, timeout),
+        "anthropic" => run_anthropic_onboarding(staging, machine, timeout),
         #[cfg(test)]
         "fixture-provider" => std::fs::write(
             std::path::Path::new(staging).join("fixture.json"),
@@ -627,7 +632,21 @@ fn script_args(transcript: &str, claude: &str) -> Vec<String> {
     ]
 }
 
-fn run_anthropic_onboarding(staging: &str, timeout: Duration) -> Result<(), String> {
+/// The subscription ceremony: `claude setup-token` under a pty, the token read off the
+/// replayed screen, one live validation call, then the staged install.
+///
+/// The ORDER is the requirement, not an implementation detail -- validate, then bank.
+/// This path banked first for as long as it existed, and the capture it banks is the
+/// one that can silently lose characters (#80): a truncated token has the right prefix
+/// and the right alphabet, so it stages, reports `onboarded: true` with a year's expiry,
+/// and is discovered a month later as a turn failing with an auth error nobody traces
+/// back to onboarding. One authenticated call with the captured bytes is the only thing
+/// that can tell a captured token from a captured fragment.
+fn run_anthropic_onboarding(
+    staging: &str,
+    machine: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
     let claude = harness_cli("anthropic")?;
     require_on_path(
         "script",
@@ -692,6 +711,9 @@ fn run_anthropic_onboarding(staging: &str, timeout: Duration) -> Result<(), Stri
         Some(token) => token,
         None => return Err(capture_failed(&raw)),
     };
+
+    validate_setup_token(&token, machine, timeout)?;
+
     let path = PathBuf::from(staging).join("oauth-token");
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -705,6 +727,89 @@ fn run_anthropic_onboarding(staging: &str, timeout: Duration) -> Result<(), Stri
     // The preserved evidence is only worth keeping while a failure is unexplained.
     let _ = fs::remove_file(preserved_transcript());
     Ok(())
+}
+
+/// The route and headers a SUBSCRIPTION credential is authenticated with.
+///
+/// Not the api-key path's header. `validate_api_key` sends anthropic `x-api-key`, which
+/// a setup-token is not: sending one as the other refuses a perfectly good credential
+/// and blames the operator's capture for it. The pairing here is the live one --
+/// `Tightbeam.Harness.Claude` routes a subscription credential as `Authorization: Bearer`
+/// and an api key as `x-api-key`, against this same models route, on every catalog
+/// derivation in production. Recorded rather than reasoned: the two kinds answer with
+/// distinguishable 401 bodies, "Invalid bearer token" against a bearer and "API key is
+/// invalid." against an x-api-key.
+fn subscription_probe(token: &str) -> (&'static str, [(&'static str, String); 2]) {
+    (
+        "https://api.anthropic.com/v1/models?limit=1",
+        [
+            ("authorization", format!("Bearer {token}")),
+            ("anthropic-version", "2023-06-01".to_owned()),
+        ],
+    )
+}
+
+/// One authenticated call with the CAPTURED bytes, before anything is staged.
+///
+/// Made in-process, and made exactly once: a 401 on this route is deterministic, so a
+/// retry would only spend the operator's time, and a network failure is a different
+/// refusal that must not be reported as either a bad capture or a missing subscription.
+fn validate_setup_token(
+    token: &str,
+    machine: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let host = machine.map(str::to_owned).unwrap_or_else(this_host);
+    let (url, headers) = subscription_probe(token);
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let mut request = agent.get(url);
+    for (name, value) in &headers {
+        request = request.set(name, value);
+    }
+
+    match request.call() {
+        Ok(_response) => Ok(()),
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            Err(rejected_setup_token(status, body.trim(), &host))
+        }
+        Err(ureq::Error::Transport(error)) => {
+            Err(unvalidated_setup_token(&error.to_string(), &host))
+        }
+    }
+}
+
+/// The captured token does not work, and CAPTURE is the suspect.
+///
+/// Deliberately not phrased as a subscription problem: `claude setup-token` only
+/// prints a token to an account that has one, so a token that reached this point and
+/// was refused is far more likely to be the wrong bytes than the wrong account. It
+/// must also not read as `unsupported (no subscription)` -- `onboard` classifies the
+/// cancel phase off that exact phrase, and this is not that.
+fn rejected_setup_token(status: u16, body: &str, host: &str) -> String {
+    format!(
+        "the captured Anthropic setup token was rejected on {host}: HTTP {status} {body}. \
+         claude prints a token only to an account that has a subscription, so the likely \
+         fault is the CAPTURE rather than the account: the token is read off a replayed \
+         terminal screen and a truncated read is well-formed. Nothing was banked -- the \
+         anthropic credential on {host} is unchanged. Re-run the ceremony; the transcript \
+         from a failed capture is preserved at {}.",
+        preserved_transcript().display()
+    )
+}
+
+/// Unreachable is not invalid. Neither the capture nor the subscription is implicated,
+/// and saying so is the difference between an operator re-running a ceremony and an
+/// operator re-authorizing an account that was never the problem.
+fn unvalidated_setup_token(error: &str, host: &str) -> String {
+    format!(
+        "could not reach anthropic from {host} to validate the captured setup token: \
+         {error}. The token was NOT validated. Nothing was banked -- the anthropic \
+         credential on {host} is unchanged. This is a network failure on {host}, not a \
+         verdict on the token or the subscription."
+    )
 }
 
 /// Where a transcript is kept when the token could not be read out of it.
@@ -1148,6 +1253,78 @@ mod tests {
         assert!(message.contains("scrollback"));
     }
 
+    /// A subscription credential is a BEARER token, and sending it as `x-api-key` would
+    /// refuse a perfectly good one -- a fail-closed regression that would then be
+    /// reported as a bad capture, sending the operator to re-run a ceremony that was
+    /// never wrong. The pairing is asserted directly because it is the one thing here
+    /// no unit test can learn from the network.
+    #[test]
+    fn a_setup_token_is_validated_as_a_bearer_not_an_api_key() {
+        let (url, headers) = subscription_probe("sk-ant-oat01-EXAMPLE");
+        let names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
+
+        assert_eq!(url, "https://api.anthropic.com/v1/models?limit=1");
+        assert_eq!(names, vec!["authorization", "anthropic-version"]);
+        assert_eq!(headers[0].1, "Bearer sk-ant-oat01-EXAMPLE");
+        assert_eq!(headers[1].1, "2023-06-01");
+        assert!(
+            !names.contains(&"x-api-key"),
+            "x-api-key is the OTHER kind's header"
+        );
+    }
+
+    /// The refusal a truncated capture earns. Recorded signature: a bearer route answers
+    /// an invalid token with 401 "Invalid bearer token" (the x-api-key route says "API key
+    /// is invalid.", which is how the two are told apart).
+    ///
+    /// It has to point at CAPTURE, because that is what is actually broken when a token
+    /// gets this far and fails -- claude prints one only to an account that has a
+    /// subscription. And it must not collide with the `unsupported (no subscription)`
+    /// phrase, which `onboard` matches to classify the cancel phase.
+    #[test]
+    fn a_rejected_capture_blames_capture_and_banks_nothing() {
+        let message = rejected_setup_token(
+            401,
+            "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\
+             \"message\":\"Invalid bearer token\"}}",
+            "shrdlu",
+        );
+
+        assert!(message.contains("Invalid bearer token"), "{message}");
+        assert!(message.contains("401"), "{message}");
+        assert!(message.contains("CAPTURE"), "{message}");
+        assert!(message.contains("shrdlu"), "{message}");
+        assert!(
+            message.contains("Nothing was banked"),
+            "the api-key path's promise, verbatim: {message}"
+        );
+        assert!(
+            message.contains("setup-token-failure.log"),
+            "the preserved transcript is the operator's next step: {message}"
+        );
+        assert!(
+            !message.contains("unsupported (no subscription)"),
+            "must not be classified as a missing subscription: {message}"
+        );
+    }
+
+    /// Unreachable is not invalid. A network failure during validation must implicate
+    /// neither the capture nor the account, or the operator burns a single-use
+    /// authorization re-authorizing something that was never broken.
+    #[test]
+    fn an_unreachable_provider_is_not_a_verdict_on_the_token() {
+        let message = unvalidated_setup_token("dns error: failed to lookup address", "shrdlu");
+
+        assert!(message.contains("could not reach anthropic"), "{message}");
+        assert!(message.contains("NOT validated"), "{message}");
+        assert!(message.contains("Nothing was banked"), "{message}");
+        assert!(message.contains("not a verdict"), "{message}");
+        assert!(
+            !message.contains("CAPTURE"),
+            "a network failure does not implicate the capture: {message}"
+        );
+    }
+
     /// An API key is staged under the SAME filename the subscription ceremony
     /// stages, at the same 0600, so everything downstream is identical between
     /// the two kinds and only the recorded kind differs.
@@ -1184,6 +1361,7 @@ mod tests {
             run_provider_onboarding(
                 "fixture-provider",
                 staging.to_str().unwrap(),
+                None,
                 CEREMONY_FALLBACK_TIMEOUT
             ),
             Ok(())
