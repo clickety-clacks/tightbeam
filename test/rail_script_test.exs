@@ -444,6 +444,13 @@ defmodule Tightbeam.RailScriptTest do
     expected_workdir =
       Placement.workdir_path(%{base_dir: ctx.base_dir, port: 0}, remote_holder)
 
+    # The workdir must resolve under the REGISTERED host's base, which is what makes
+    # this a remote-holder case at all. Without this the test passed identically with
+    # `remote-testhost` never registered — an unregistered host also refuses, so every
+    # assertion below held for the wrong reason and the registration above proved
+    # nothing (#79).
+    assert String.starts_with?(expected_workdir, remote_base)
+
     refute File.exists?(expected_workdir)
 
     # The class used to be `error:1` — a child exit for a child that was never spawned,

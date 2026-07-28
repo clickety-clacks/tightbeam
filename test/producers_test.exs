@@ -10,6 +10,7 @@ defmodule Tightbeam.ProducersTest do
     Gateway,
     Idempotency,
     Org,
+    Placement,
     Producers,
     Roles,
     Rules,
@@ -344,6 +345,18 @@ defmodule Tightbeam.ProducersTest do
     assert_wait(fn -> Producers.get(ctx.db, remote_id).state == "failed" end)
     refute File.exists?(remote_marker)
     assert Assignments.list_attests(ctx.db, remote_assignment.id) == []
+
+    # WHY it failed, and that it was a REMOTE holder that made it fail. Neither
+    # assertion alone is enough: "failed" happens for any reason, and the deferral
+    # detail is what `local_holder/2` reports for an unregistered host too, so the
+    # premise has to be pinned separately or the registration above is decoration
+    # and the case passes with no host registered at all (#79).
+    assert %{ssh: "remote"} = Placement.hosts(ctx.base_dir)["remote-host"]
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.subject == remote_assignment.id and
+               event.detail =~ "remote holder deferred"
+           end)
   end
 
   test "run-smoke is symmetric and retiring a holder cancels its queued jobs", ctx do
