@@ -1,5 +1,11 @@
 # Installing a satellite (work) host
 
+> **This page explains what a satellite is and what its operator must do by hand.
+> To bring one up and prove it, run `docs/ASSIMILATION-E2E.md`** — that is the
+> golden path and the scored one. The manual host declaration below predates the
+> `assimilate` verb; see that runbook's Q4 for the open question about which host
+> registration route wins when both are used.
+
 A satellite is a machine where agent *harnesses* run while the substrate,
 ledger, and stores stay on the gateway host (spec §Placement). There is no
 satellite daemon: sshd is the transport, rsync materializes non-secret

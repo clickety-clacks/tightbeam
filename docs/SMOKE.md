@@ -360,13 +360,14 @@ the tool call, with the statute text delivered only as the denial reason.
     forbidden command.
     PASS: no refusal (the gate is gone, not lingering in the shared home);
     step 18 still passes and durable harness state survives.
-24. [manual] ⌥ Satellite propagation (needs an assimilated host with credentials for
-    the harness leg): after step 17, deliver a home to the satellite (adapter
-    boot there) and repeat steps 18–20 on the satellite's projected home.
-    PASS [divergent]: identical enforcement behavior; the generic shared
-    home received `settings.json`/`hooks.json`, while elected archetype skills
-    were materialized separately at the exact remote session cwd. No
-    credential bytes appear in captured ssh/rsync commands.
+24. [manual] ⌥ Satellite propagation — **run `docs/ASSIMILATION-E2E.md` §5**, which
+    supersedes the single line this step used to be. It carries the commands,
+    the expected rows, and the same PASS conditions: identical enforcement on
+    the satellite's projected home, `settings.json`/`hooks.json` in the shared
+    home with elected archetype skills materialized separately at the exact
+    remote session cwd, and no credential bytes in any captured ssh/rsync
+    command. Agent-to-agent delivery across hosts is `docs/INTER-NODE-COMMS.md`.
+    Score this step from that run: PASS / BLOCKED(no assimilated satellite).
 
 ## 10. Roles (offices: typed targets, binding, fallback, late binding)
 
