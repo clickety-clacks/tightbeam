@@ -2113,9 +2113,19 @@ defmodule Tightbeam.Gateway do
        when provider in @onboarding_providers and phase in ["begin", "finish", "cancel"] do
     machine = params[:machine] || Placement.local_host_name()
 
-    case Map.has_key?(Placement.hosts(config.base_dir), machine) do
-      true -> onboard_phase(config, provider_atom(provider), phase, machine, params[:reason])
-      false -> %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
+    with true <- Map.has_key?(Placement.hosts(config.base_dir), machine),
+         {:ok, kind} <- onboarding_kind(params[:kind]) do
+      onboard_phase(config, provider_atom(provider), phase, machine, kind, params[:reason])
+    else
+      false ->
+        %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
+
+      :error ->
+        %{
+          code: "invalid_message",
+          message:
+            "unknown credential kind #{inspect(params[:kind])}; expected apiKey or subscription"
+        }
     end
   end
 
@@ -2126,15 +2136,20 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp onboard_phase(config, provider, "begin", machine, _reason) do
+  defp onboard_phase(config, provider, "begin", machine, kind, _reason) do
     case Tightbeam.Credentials.begin_onboard(provider, Tightbeam.Credentials.server(machine)) do
       {:ok, path} ->
         # The lease TTL rides the reply so the CLI's ceremony watchdog and the
         # server's lease are one fact with one home. A matching constant in the
         # Rust CLI would drift from `production_config` the first time either is
         # tuned, and the CLI cannot read `production_config` itself.
+        #
+        # `kind` is echoed, not consumed: a LEASE carries no opinion about what
+        # will be banked into it (`Credentials.finish_onboard/3`). It is here so
+        # a gateway log shows which ceremony an operator started.
         %{
           provider: provider,
+          kind: kind,
           status: "ready",
           staging_path: path,
           lease_ttl_ms: config.onboarding_lease_ms
@@ -2145,14 +2160,27 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "finish", machine, _reason) do
-    case Tightbeam.Credentials.finish_onboard(provider, Tightbeam.Credentials.server(machine)) do
-      :ok -> %{provider: provider, status: "onboarded"}
-      {:error, reason} -> %{code: "needs_onboarding", message: inspect(reason)}
+  defp onboard_phase(_config, provider, "finish", machine, kind, _reason) do
+    case Tightbeam.Credentials.finish_onboard(
+           provider,
+           kind,
+           Tightbeam.Credentials.server(machine)
+         ) do
+      :ok ->
+        # The result the CLI prints. It names the kind that was banked, so a
+        # successful ceremony says which of the two it installed rather than
+        # leaving the operator to go read the store.
+        %{provider: provider, credential_kind: kind, status: "onboarded"}
+
+      {:error, reason} ->
+        %{
+          code: "needs_onboarding",
+          message: "#{provider} #{kind} credential on #{machine}: #{inspect(reason)}"
+        }
     end
   end
 
-  defp onboard_phase(_config, provider, "cancel", machine, reason) do
+  defp onboard_phase(_config, provider, "cancel", machine, _kind, reason) do
     :ok =
       Tightbeam.Credentials.cancel_onboard(
         provider,
@@ -2165,6 +2193,17 @@ defmodule Tightbeam.Gateway do
 
   defp onboarding_failure("unsupported_no_subscription"), do: :unsupported_no_subscription
   defp onboarding_failure(_reason), do: nil
+
+  # The wire says `apiKey`; the store says `api_key`. This is the one place the
+  # translation happens on the way in, mirroring `wire_credential_kind/1` on the
+  # way out.
+  #
+  # An absent kind is a subscription: every ceremony that predates the API-key
+  # path is one, and a client that does not send the field is such a ceremony.
+  defp onboarding_kind(nil), do: {:ok, :subscription}
+  defp onboarding_kind("subscription"), do: {:ok, :subscription}
+  defp onboarding_kind("apiKey"), do: {:ok, :api_key}
+  defp onboarding_kind(_unknown), do: :error
 
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic

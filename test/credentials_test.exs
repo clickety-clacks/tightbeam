@@ -335,7 +335,7 @@ defmodule Tightbeam.CredentialsTest do
     assert {:messages, []} = Process.info(server, :messages)
     File.write!(Path.join(staging, "auth.json"), "device-code-result")
 
-    assert :ok = Credentials.finish_onboard(:openai, server)
+    assert :ok = Credentials.finish_onboard(:openai, :subscription, server)
     assert_receive :start
     assert_receive :resume
     refute File.exists?(staging)
@@ -373,7 +373,7 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == {:needs_onboarding, :in_progress}
 
     File.write!(Path.join(staging, "auth.json"), "satellite-only-secret")
-    assert :ok = Credentials.finish_onboard(:openai, server)
+    assert :ok = Credentials.finish_onboard(:openai, :subscription, server)
     assert Credentials.status(:openai, server) == :onboarded
 
     store = Path.join([ctx.base, "auth", "codex", "auth.json"])
@@ -470,6 +470,76 @@ defmodule Tightbeam.CredentialsTest do
       machine: name,
       onboarders: %{openai: fn _ -> {:ok, %{bytes: bytes, expires_at: nil}} end}
     )
+  end
+
+  describe "credential kind" do
+    test "an API key banks with its kind recorded and no expiry", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      File.write!(Path.join(staging, "oauth-token"), "sk-ant-api03-staged")
+      assert :ok = Credentials.finish_onboard(:anthropic, :api_key, server)
+
+      metadata = credential_metadata(ctx.base, "claude")
+
+      assert metadata["kind"] == "api_key"
+      assert metadata["onboarded"] == true
+
+      # API keys are static: no rotation, no refresh. A synthetic expiry would
+      # eventually have `credential_status` demand a re-onboard for a credential
+      # that still works.
+      assert metadata["expires_at"] == nil
+      assert metadata["subscription_status"] == nil
+
+      assert Credentials.status(:anthropic, server) == :onboarded
+      assert Credentials.kind(:anthropic, server) == :api_key
+      assert Credentials.kind_at(ctx.base, :anthropic) == :api_key
+    end
+
+    test "a subscription banks with its kind and keeps its expiry", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      File.write!(Path.join(staging, "oauth-token"), "sk-ant-oat01-staged")
+      assert :ok = Credentials.finish_onboard(:anthropic, :subscription, server)
+
+      metadata = credential_metadata(ctx.base, "claude")
+
+      assert metadata["kind"] == "subscription"
+      assert is_integer(metadata["expires_at"])
+      assert metadata["subscription_status"] == "supported"
+      assert Credentials.kind(:anthropic, server) == :subscription
+    end
+
+    test "no credential is its own state, not a kind", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      assert Credentials.kind(:anthropic, server) == :none
+      assert Credentials.kind(:openai, server) == :none
+      assert Credentials.kind_at(ctx.base, :openai) == :none
+    end
+
+    test "one host holds a different kind per provider", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, claude_staging} = Credentials.begin_onboard(:anthropic, server)
+      File.write!(Path.join(claude_staging, "oauth-token"), "sk-ant-api03-staged")
+      :ok = Credentials.finish_onboard(:anthropic, :api_key, server)
+
+      {:ok, codex_staging} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(codex_staging, "auth.json"), ~s({"tokens":{"access_token":"t"}}))
+      :ok = Credentials.finish_onboard(:openai, :subscription, server)
+
+      assert Credentials.kind(:anthropic, server) == :api_key
+      assert Credentials.kind(:openai, server) == :subscription
+    end
+  end
+
+  defp credential_metadata(base, harness) do
+    [base, "auth", harness, ".tightbeam", "credential.json"]
+    |> Path.join()
+    |> File.read!()
+    |> JSON.decode!()
   end
 
   defp fixture(name) do

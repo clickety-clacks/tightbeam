@@ -6,6 +6,18 @@ defmodule Tightbeam.Credentials do
   live home `auth.json` while its runtime is running; Claude uses one
   non-rotating setup-token through `CLAUDE_CODE_OAUTH_TOKEN`. Expiry is
   compared only at read seams—there is no timer or sweep.
+
+  A host holds ONE active credential per provider, of either KIND: an API key or
+  a subscription token. The kind is recorded in that provider's
+  `credential.json` and is the single authority on how the credential is used—
+  which environment variable carries it, which header a probe sends, whether
+  rotation is even a concept. Nothing anywhere infers the kind from the
+  credential file's name or shape.
+
+  Rotation posture is a property of the kind, not of the provider: API keys are
+  static, so they have no refresh and no single-writer constraint. Subscription
+  is claude-static (a year-long setup-token) and codex-self-rotating (in place,
+  single writer).
   """
 
   use GenServer
@@ -16,6 +28,7 @@ defmodule Tightbeam.Credentials do
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
   @type provider :: :openai | :anthropic | :fixture_provider
+  @type kind :: :api_key | :subscription
   @type status :: :onboarded | {:needs_onboarding, term()}
 
   @doc "Start one lifecycle owner for this machine."
@@ -45,6 +58,38 @@ defmodule Tightbeam.Credentials do
   def status(provider, server \\ __MODULE__),
     do: GenServer.call(server, {:status, provider})
 
+  @doc """
+  The KIND of credential this machine holds for a provider, or `:none`.
+
+  `:none` is the ABSENCE of a credential, not a verdict on one: a revoked or
+  expired credential still has a kind, and reporting it is what lets an operator
+  tell "the API key stopped working" from "nothing is installed here".
+  """
+  @spec kind(provider(), GenServer.server()) :: kind() | :none
+  def kind(provider, server \\ __MODULE__),
+    do: GenServer.call(server, {:kind, provider})
+
+  @doc """
+  The recorded kind under a LOCAL base dir, without the lifecycle owner.
+
+  For callers that already hold a base dir on this machine and run outside the
+  supervision tree—the e2e preflight, mix tasks. Remote hosts must go through
+  `kind/2`, whose owner holds the ssh destination.
+  """
+  @spec kind_at(String.t(), provider()) :: kind() | :none
+  def kind_at(base_dir, provider) do
+    case File.read(metadata_path(base_dir, provider)) do
+      {:ok, bytes} ->
+        case JSON.decode(bytes) do
+          {:ok, %{"onboarded" => true} = metadata} -> decode_kind(metadata["kind"])
+          _ -> :none
+        end
+
+      {:error, _reason} ->
+        :none
+    end
+  end
+
   @doc "Run the provider flow through the serialized gate/stop/write/start/resume lifecycle."
   @spec onboard(provider(), GenServer.server()) :: :ok | {:error, term()}
   def onboard(provider, server \\ __MODULE__),
@@ -55,10 +100,17 @@ defmodule Tightbeam.Credentials do
   def begin_onboard(provider, server \\ __MODULE__),
     do: GenServer.call(server, {:begin_onboard, provider})
 
-  @doc "Install the credential produced in the active onboarding lease."
-  @spec finish_onboard(provider(), GenServer.server()) :: :ok | {:error, term()}
-  def finish_onboard(provider, server \\ __MODULE__),
-    do: GenServer.call(server, {:finish_onboard, provider}, :infinity)
+  @doc """
+  Install the credential produced in the active onboarding lease, as `kind`.
+
+  The kind is stated by the ceremony that produced the credential rather than
+  stashed at `begin_onboard/2`, so a lease carries no opinion about what will be
+  banked into it. No default arity, deliberately: an omitted kind must fail to
+  COMPILE, not silently bank an API key as a subscription.
+  """
+  @spec finish_onboard(provider(), kind(), GenServer.server()) :: :ok | {:error, term()}
+  def finish_onboard(provider, kind, server) when kind in [:api_key, :subscription],
+    do: GenServer.call(server, {:finish_onboard, provider, kind}, :infinity)
 
   @doc "Cancel the active onboarding lease without restarting the old credential."
   @spec cancel_onboard(provider(), GenServer.server()) :: :ok
@@ -131,6 +183,11 @@ defmodule Tightbeam.Credentials do
     {:reply, credential_status(state, provider), state}
   end
 
+  def handle_call({:kind, provider}, _from, state) do
+    state = expire_lease(state, provider)
+    {:reply, credential_kind(state, provider), state}
+  end
+
   def handle_call({:mark_terminal, provider, evidence}, _from, state) do
     if terminal_evidence?(provider, evidence) do
       metadata = read_metadata(state, provider)
@@ -189,15 +246,15 @@ defmodule Tightbeam.Credentials do
     end
   end
 
-  def handle_call({:finish_onboard, provider}, _from, state) do
+  def handle_call({:finish_onboard, provider, kind}, _from, state) do
     state = expire_lease(state, provider)
 
     case Map.fetch(state.pending, provider) do
       {:ok, %{path: path}} ->
         result =
-          with {:ok, credential} <- install_staged!(state, provider, path),
+          with {:ok, credential} <- install_staged!(state, provider, kind, path),
                :ok <- state.start.(provider),
-               :ok <- mark_onboarded!(state, provider, credential),
+               :ok <- mark_onboarded!(state, provider, kind, credential),
                captured <- capture_sessions(state, provider),
                :ok <- state.resume.(provider) do
             publish_sessions(state, captured, :onboarded)
@@ -252,7 +309,7 @@ defmodule Tightbeam.Credentials do
            {:ok, credential} <- Map.fetch!(state.onboarders, provider).(state),
            :ok <- write_credential!(state, provider, credential),
            :ok <- state.start.(provider),
-           :ok <- mark_onboarded!(state, provider, credential),
+           :ok <- mark_onboarded!(state, provider, :subscription, credential),
            captured <- capture_sessions(state, provider),
            :ok <- state.resume.(provider) do
         publish_sessions(state, captured, :onboarded)
@@ -333,6 +390,23 @@ defmodule Tightbeam.Credentials do
         {:needs_onboarding, :missing}
     end
   end
+
+  defp credential_kind(state, provider) do
+    metadata = read_metadata(state, provider)
+
+    if metadata["onboarded"] == true and credential_present?(state, provider) do
+      decode_kind(metadata["kind"])
+    else
+      :none
+    end
+  end
+
+  # Every credential banked before this invariant existed is a subscription BY
+  # CONSTRUCTION—there was no other onboarding path—so metadata without a "kind"
+  # reads as one. That is a migration default over OUR OWN recorded metadata, not
+  # an inference from the credential file, which nothing here does.
+  defp decode_kind("api_key"), do: :api_key
+  defp decode_kind(_recorded), do: :subscription
 
   defp expired?(nil, _now), do: false
   defp expired?(expires_at, now) when is_integer(expires_at), do: expires_at <= now
@@ -416,9 +490,10 @@ defmodule Tightbeam.Credentials do
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
 
-  defp mark_onboarded!(state, provider, credential) do
+  defp mark_onboarded!(state, provider, kind, credential) do
     write_metadata!(state, provider, %{
       "provider" => Atom.to_string(provider),
+      "kind" => Atom.to_string(kind),
       "onboarded" => true,
       "terminal" => false,
       "last_health" => "onboarded",
@@ -429,9 +504,12 @@ defmodule Tightbeam.Credentials do
     :ok
   end
 
-  defp metadata_path(state, provider) do
+  defp metadata_path(state, provider) when is_map(state),
+    do: metadata_path(state.base_dir, provider)
+
+  defp metadata_path(base_dir, provider) when is_binary(base_dir) do
     Path.join([
-      state.base_dir,
+      base_dir,
       "auth",
       harness_name(provider),
       ".tightbeam",
@@ -581,43 +659,40 @@ defmodule Tightbeam.Credentials do
     end
   end
 
-  defp staged_credential(:openai, path) do
+  # The staged FILENAME is per provider, not per kind: a host holds one active
+  # credential per provider and the ceremony stages it under that provider's one
+  # name. What differs by kind is the metadata written beside it—expiry above
+  # all. An API key is static (no rotation, no refresh), so it has no expiry to
+  # compare and no subscription entitlement to report.
+  defp staged_credential(:openai, kind, path) do
     case File.read(Path.join(path, "auth.json")) do
-      {:ok, bytes} -> {:ok, %{bytes: bytes, expires_at: nil}}
+      {:ok, bytes} -> {:ok, Map.put(installed_metadata(:openai, kind), :bytes, bytes)}
       {:error, reason} -> {:error, {:device_auth_failed, reason}}
     end
   end
 
-  defp staged_credential(:anthropic, path) do
+  defp staged_credential(:anthropic, kind, path) do
     case File.read(Path.join(path, "oauth-token")) do
-      {:ok, bytes} ->
-        {:ok,
-         %{
-           bytes: bytes,
-           expires_at: System.system_time(:second) + 365 * 24 * 60 * 60,
-           subscription_status: "supported"
-         }}
-
-      {:error, reason} ->
-        {:error, {:setup_token_failed, reason}}
+      {:ok, bytes} -> {:ok, Map.put(installed_metadata(:anthropic, kind), :bytes, bytes)}
+      {:error, reason} -> {:error, {:setup_token_failed, reason}}
     end
   end
 
-  defp staged_credential(:fixture_provider, path) do
+  defp staged_credential(:fixture_provider, kind, path) do
     case File.read(Path.join(path, "fixture.json")) do
-      {:ok, bytes} -> {:ok, %{bytes: bytes, expires_at: nil}}
+      {:ok, bytes} -> {:ok, Map.put(installed_metadata(:fixture_provider, kind), :bytes, bytes)}
       {:error, reason} -> {:error, {:fixture_provider_failed, reason}}
     end
   end
 
-  defp install_staged!(%{ssh: nil} = state, provider, path) do
-    with {:ok, credential} <- staged_credential(provider, path),
+  defp install_staged!(%{ssh: nil} = state, provider, kind, path) do
+    with {:ok, credential} <- staged_credential(provider, kind, path),
          :ok <- write_credential!(state, provider, credential) do
       {:ok, credential}
     end
   end
 
-  defp install_staged!(state, provider, path) do
+  defp install_staged!(state, provider, kind, path) do
     source = staged_path(provider, path)
     store = credential_store_path(state, provider)
 
@@ -631,22 +706,26 @@ defmodule Tightbeam.Credentials do
     case remote_command(state, ["sh", "-c", shell_quote(script)]) do
       {_output, 0} ->
         reconcile_provider_homes(state, provider)
-        {:ok, installed_metadata(provider)}
+        {:ok, installed_metadata(provider, kind)}
 
       {output, status} ->
         {:error, {:credential_install_failed, status, String.trim(output)}}
     end
   end
 
-  defp installed_metadata(:openai), do: %{expires_at: nil}
-  defp installed_metadata(:fixture_provider), do: %{expires_at: nil}
+  # An API key does not expire and carries no subscription entitlement, so it
+  # reports neither. Giving one a synthetic expiry would make `credential_status`
+  # eventually demand a re-onboard for a credential that is still perfectly good.
+  defp installed_metadata(_provider, :api_key), do: %{expires_at: nil}
 
-  defp installed_metadata(:anthropic) do
+  defp installed_metadata(:anthropic, :subscription) do
     %{
       expires_at: System.system_time(:second) + 365 * 24 * 60 * 60,
       subscription_status: "supported"
     }
   end
+
+  defp installed_metadata(_provider, :subscription), do: %{expires_at: nil}
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, "oauth-token")
