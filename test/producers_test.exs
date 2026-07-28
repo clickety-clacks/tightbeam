@@ -699,8 +699,8 @@ defmodule Tightbeam.ProducersTest do
       # A non-leader child: `kill -TERM -<pid>` finds no process GROUP with that id,
       # so the kernel refuses with a nonzero exit. Identity still verifies, which is
       # what isolates the exit-status check from the identity check.
-      %{os_pid: leader} = spawn_leader("sleep 30 & sleep 30")
-      child = non_leader_child(leader)
+      %{os_pid: leader, port: port} = spawn_leader(announcing_child("sleep 30"))
+      child = announced_child(port)
       started = process_started!(child)
 
       assert {:failed, why} = Producers.kill_process_group(ctx.db, "job-exit", child, started)
@@ -772,12 +772,13 @@ defmodule Tightbeam.ProducersTest do
   # Poll, don't one-shot. Production reads the LEADER pid it holds through the port and
   # only AFTER verify_process_group/2 has polled it into state T (producers.ex), and its
   # process_started/1 returns nil rather than crashing — so production never races a
-  # not-yet-visible process. This helper reads a CHILD discovered by a `ps -g` scan, and
-  # on a loaded macOS runner `ps -p <child>` can return {"", 1} in the window before that
-  # child is resolvable, which the one-shot `{output, 0} = ...` turned into a MatchError
-  # that read as a producer defect. Wait for the pid to become observable, matching
-  # wait_until_stopped/2 and verify_process_group/2; flunk clearly if it never does —
-  # that WOULD be a real fault, and it still surfaces.
+  # not-yet-visible process. Callers here can hand over a pid the kernel has only just
+  # forked, where a one-shot `{output, 0} = ...` turned a momentary {"", 1} into a
+  # MatchError that read as a producer defect. Wait for the pid to become observable,
+  # matching wait_until_stopped/2 and verify_process_group/2; flunk clearly if it never
+  # does — that WOULD be a real fault, and it still surfaces. Every pid reaching here is
+  # one a process announced for itself, so exhausting the window means a live pid went
+  # unobservable, not that the test guessed wrong.
   defp process_started!(os_pid) do
     Enum.reduce_while(1..1_000, nil, fn _, _ ->
       case System.cmd("ps", ["-o", "lstart=", "-p", Integer.to_string(os_pid)],
@@ -796,20 +797,34 @@ defmodule Tightbeam.ProducersTest do
       flunk("pid #{os_pid} never became observable to `ps -o lstart` within the poll window")
   end
 
-  defp non_leader_child(leader) do
-    Enum.reduce_while(1..200, nil, fn _, _ ->
-      {out, _} =
-        System.cmd("ps", ["-o", "pid=", "-g", Integer.to_string(leader)], stderr_to_stdout: true)
+  # The child names ITSELF, down the port's own stdout. What this replaced scanned the
+  # leader's process group for any non-leader pid — and `spawn_leader` runs `sh -lc`, a
+  # LOGIN shell, whose profile forks a subshell and /usr/libexec/path_helper into that
+  # same group before the command's children exist (a non-sleep transient was present
+  # in 23 of 25 observed groups). Pids list ascending and those transients fork first,
+  # so a scan landing in their window picked one, and the pid handed to
+  # process_started!/1 was ALREADY DEAD — which is why "poll for the process, wait
+  # longer" (3dae945) could not fix it and no larger number ever will.
+  #
+  # `$!` is a process the shell has already forked, so it is alive by construction, and
+  # it is not a process-group leader — the one property the exit-status assertion needs.
+  defp announcing_child(command), do: "#{command} & printf 'child=%s\\n' \"$!\"; wait"
 
-      out
-      |> String.split()
-      |> Enum.map(&String.to_integer/1)
-      |> Enum.reject(&(&1 == leader))
-      |> case do
-        [child | _] -> {:halt, child}
-        [] -> Process.sleep(10) && {:cont, nil}
-      end
-    end) || flunk("no non-leader child appeared in the producer group")
+  # Waits on the two things that can happen, not on a clock: the announcement arrives,
+  # or the shell dies and says so. A genuine hang is ExUnit's per-test timeout to catch.
+  defp announced_child(port, buffer \\ "") do
+    receive do
+      {^port, {:data, data}} ->
+        buffer = buffer <> data
+
+        case Regex.run(~r/child=(\d+)\n/, buffer) do
+          [_, pid] -> String.to_integer(pid)
+          nil -> announced_child(port, buffer)
+        end
+
+      {^port, {:exit_status, status}} ->
+        flunk("the producer shell exited #{status} before naming its background child")
+    end
   end
 
   # Says so when it gives up. Silently returning nil made the caller assert the
