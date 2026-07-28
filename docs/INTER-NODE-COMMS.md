@@ -22,6 +22,13 @@ below is therefore marked:
 - **[S] substrate** — an observable row or frame. Gates the verdict.
 - **[E] effectiveness** — whether a model chose to do the apt thing. Recorded,
   **never gates**. This is evals' domain (#11), not this runbook's.
+- **[A] affordance** — whether the **product** makes its own path findable. Observed
+  through model behaviour, but the subject is what we shipped, not what the model
+  knows: the agent fails an [A] criterion by not finding something we published.
+  Produces **FINDINGS**, and **never gates** — one model's behaviour is too noisy to
+  fail a run on. Filing these under [E] would bury them as model mood and make them
+  unactionable; that is the exact mistake this marker exists to prevent. An [A]
+  finding is a bug against guidance, skills, or CLI help, and is filed there.
 
 Conflating these is how a runbook starts failing on model mood.
 
@@ -84,7 +91,7 @@ on the relevant hosts.
 | M1 | local | local | baseline; isolates substrate faults from transport faults |
 | M2 | local | satellite | gateway-resident sender |
 | M3 | satellite | local | the return path — an agent on a satellite must reach the gateway |
-| M4 | satellite A | satellite B | neither endpoint is the gateway |
+| M4 | satellite A | satellite B | neither endpoint is the gateway; also carries the affordance probe (E) |
 
 M1 first, always. A failure that reproduces on M1 is not an inter-node problem.
 
@@ -119,10 +126,10 @@ checks decisive.
    — a wake is not echoed to its sender.
 
 **[E] recorded, non-gating**: whether Bravo's reply is responsive, and whether Bravo
-autonomously replies *back* to Alpha with `wake --role alpha` per its dispatching
-skill. Record it. A model that declines is not a substrate failure — see SMOKE.md
-step 29, and note the reply spelling lives in the `tightbeam-dispatching` skill, not
-in composed guidance.
+autonomously replies *back* to Alpha with `wake --role alpha`. Record it. A model that
+declines is not a substrate failure — see SMOKE.md step 29. Whether Bravo could
+*find* the reply spelling at all is a different question and belongs to §E, which
+asks it deliberately; do not conflate a decline with a failure to discover.
 
 ### B. Scheduled wake
 
@@ -157,22 +164,113 @@ never hangs and never silently disappears. Backoff and circuit state are visible
 `/version`. Restore reachability: the circuit closes on the next successful start,
 and any durable wake still due fires.
 
-### E. M4 only — proof it routes through the substrate
+### E. M4 only — is the built-in path the obvious one?
 
-Satellite A wakes Satellite B. Two checks:
+M4 is where an agent is most tempted to improvise: two satellites, each plainly
+reachable from the other by ssh, and the built-in path runs through a third machine.
+So this row carries one substrate check and an **affordance probe** — can an agent
+*find* what we shipped, without being told.
 
-1. **Positive**: every durable row for the exchange exists **in the gateway's
-   `state.db`** — the wake, the turn on B, the message. There is no satellite-side
-   ledger; agents on a satellite reach the gateway through the injected
-   `TIGHTBEAM_URL` / `TIGHTBEAM_TOKEN`.
-2. **Negative**: stop the gateway. Attempt the same A→B wake. **PASS: it cannot be
-   delivered** — the CLI fails to reach a gateway and no state changes anywhere.
-   Restart the gateway; a wake issued after recovery delivers normally.
+> **RESOLVED (was Q2).** Isolation between two satellites is deliberately **not** the
+> property under test. Flynn's ruling: it does not matter whether an agent could find
+> some other way to reach a peer — what matters is that our way is easy and
+> conspicuous enough that it never burns tokens inventing one. The gateway-down
+> negative check that used to sit here is **withdrawn**; proving absence of a direct
+> path would need traffic capture, and malicious circumvention is out of scope by
+> standing ruling.
 
-> **OPEN QUESTION (Q2).** The negative check proves routing goes *through* the
-> substrate. It does not prove two satellites *could not* communicate by some other
-> means; only traffic capture would, and per standing ruling malicious circumvention
-> is out of scope. Confirm this is the intended bar.
+**1. [S] The exchange is durable on the gateway.** Satellite A wakes Satellite B.
+Every durable row for the exchange exists **in the gateway's `state.db`** — the wake,
+the turn on B, the message. There is no satellite-side ledger; agents on a satellite
+reach the gateway through the injected `TIGHTBEAM_URL` / `TIGHTBEAM_TOKEN`.
+
+**2. [A] Discoverability — the cold ask.** From Satellite A's agent, give a task that
+plainly requires reaching another agent and **do not name the command, the CLI, or
+the verb**:
+
+```
+"Bravo, on <B's host>, has the <thing>. Get it from Bravo and report back."
+```
+
+Record, **verbatim, not paraphrased**:
+
+- the agent's **first action** after the prompt — the exact command line or tool call.
+  A paraphrase destroys the signal; this line is the finding.
+- what it consulted before acting: `tightbeam help`? `--help` on a subcommand? a
+  skill it went and read? guidance already in its context? nothing at all?
+- whether it arrived at `tightbeam wake --role bravo --prompt "…"`, and how many
+  actions it took to get there.
+
+Reaching the built-in path within the first two actions is the shape we want.
+Anything else is a FINDING, recorded with the first attempt quoted.
+
+**3. [A] The reply affordance.** Bravo receives the prompt with a first line
+`[from agent:alpha]` (stamped at `gateway.ex:826`; `wire/payloads.ex:20-26` states the
+stamp's job normatively — it is "the model's return address"). Ask Bravo to answer
+and, again, **do not spell the command**.
+
+The question is whether the stamp alone yields the reply spelling. It is not a pure
+substitution: the stamp carries the origin class and handle, `agent:alpha`, while the
+reply is `wake --role alpha` — the agent must drop the class prefix and pick the
+matching target flag. Record whether Bravo makes that translation, and record any
+wrong surface it reaches for instead (writing a file, answering into its own
+transcript and expecting delivery, guessing a `--session` key).
+
+**4. [A] Cost.** Roughly how much work happened before the built-in path was found:
+actions taken, files or help pages read, turns consumed. "Reached for it directly"
+and "found it after eleven actions" are different products, and the scorecard should
+be able to tell them apart.
+
+**5. Improvisation is the finding, not the fault.** If the agent invents its own
+channel — ssh into the other host, a shared file, polling a directory, writing into a
+repo — that is a **FINDING about conspicuousness**, not agent misbehaviour, and it is
+never scored as an [E] failure. Do not correct the agent mid-run; let it finish and
+record the whole path it took. An agent that reaches for ssh on M4 has told us the
+product's own path was not visible from where it was standing.
+
+> **Known gap — the live hypothesis this probe exists to check.** The shrdlu run
+> (`docs/smoke-runs/2026-07-28-91901ff-shrdlu-prod-service.md`, step 29) found
+> **zero** occurrences of `wake --user`, `wake --role` or `[from …]` in the probe
+> session's composed guidance. Reading the source, that is the shape of composition,
+> not a packaging accident:
+>
+> - The reply spelling **is** written down in `priv/guidance/operating-manual.md:31-32`
+>   — but that fragment reaches an agent only if its archetype `#include`s
+>   `operating-manual.md`, and **no shipped archetype does**
+>   (`priv/archetypes/default.toml`, `priv/kungfu/agentic-engineering/archetypes/*.toml`).
+>   `Identity.snapshot_at!` (`lib/tightbeam/identity.ex:119-125`) composes the
+>   archetype's own guidance plus `operating-model.md` — a *different* document, about
+>   the served-identity seam, which never mentions wake.
+> - The `default` archetype elects **no skills at all**
+>   (`priv/kungfu/agentic-engineering/archetypes/default.toml`), so a default-archetype
+>   agent carries neither `tightbeam-dispatching` nor any bundle skill.
+> - `tightbeam-dispatching` (`priv/skills/tightbeam-dispatching/SKILL.md:11`) teaches
+>   the **dispatch** wake, `tightbeam wake --role <name> --prompt "…"`. It never
+>   mentions `--user` and never mentions the `[from …]` stamp — it is not where an
+>   agent learns to *reply*.
+> - `wake --user <id>` appears only in bundle skills (`feature-cycle` SKILL.md:26,68;
+>   `spec-handoff`:17,47; `unblocking`:36), elected by the orchestrator and spec-writer
+>   archetypes and no others.
+>
+> But the affordance is **not** absent from the product: `tightbeam help` carries it
+> prominently, under IDENTITY, before any command
+> (`cli/src/args.rs:265-300`) — *"To reply to [from user:mike], use wake --user mike;
+> to reply to [from agent:notetaker], use wake --role notetaker. [from process:x]
+> cannot be woken."* — and a malformed wake answers `usage: tightbeam wake exactly one
+> of --session <key>, --role <name>, --user <id> --prompt ...` (`cli/src/args.rs:749`).
+>
+> So the sharp question this probe asks is: **does the agent think to run `tightbeam
+> help`?** One command away is either conspicuous or invisible, and only the cold ask
+> settles it. **Record the archetype every probe session carries** — discoverability is
+> archetype-dependent, and a result without the archetype is unreadable.
+>
+> **OPEN — inconsistent origin spelling.** `operating-manual.md:32` instructs
+> "tagged `[from role:notetaker]`, run `wake --role notetaker`", but `role:` is not an
+> origin class: `wire/payloads.ex:13-14` fixes the closed set as `user:<id>`,
+> `agent:<handle>`, `process:<name>`, and the live stamp is `[from agent:…]`
+> (shrdlu step 29 observed `[from agent:probe-office]`). An agent following the manual
+> literally would be looking for a tag that never appears. Whether the manual or the
+> wire contract is wrong is not this runbook's call — file it.
 
 ## Cross-harness
 
@@ -189,6 +287,9 @@ VERIFIED(reason) / BLOCKED(blocker).
 
 - Any **[S]** criterion failing is a FAIL.
 - Any **[E]** observation is recorded and **never** produces a FAIL.
+- Any **[A]** observation that misses is a **FINDING** against guidance, skills, or CLI
+  help — named, with the agent's first attempt quoted. It **never** produces a FAIL: a
+  single model's behaviour cannot gate a run. A run can pass carrying [A] findings.
 - An out-of-scope cell is WAIVED by name with its blocker. The run is INCOMPLETE —
   not passed — while any cell is waived.
 
@@ -204,7 +305,8 @@ participating host.
 
 `docs/smoke-runs/<date>-<short-sha>-inter-node-comms.md`. One row per {placement ×
 harness-pair × path}, columns for A–E. Header carries gateway commit, every
-participating host and its role, and which cells were waived.
+participating host and its role, the **archetype and model each probe session
+carried** (§E is unreadable without them), and which cells were waived.
 
 **Record turns consumed per row.** Turn count per step is otherwise unrecoverable
 after the fact, and a step that silently stops exercising anything is invisible
