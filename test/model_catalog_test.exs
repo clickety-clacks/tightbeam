@@ -2,6 +2,7 @@ defmodule Tightbeam.ModelCatalogTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Archetypes, Gateway, ModelCatalog, Placement}
+  alias Tightbeam.Harness.Support
 
   @fixtures Path.join(__DIR__, "fixtures/model_catalog")
   @host "testhost"
@@ -610,6 +611,61 @@ defmodule Tightbeam.ModelCatalogTest do
       await(fn ->
         ModelCatalog.get(@host, "codex", catalog) ==
           {[], {:unavailable, {:empty_catalog_for_client_version, "0.145.0"}}}
+      end)
+    end
+
+    # Codex OWNS auth.json and rewrites it in place as it rotates; this probe is a
+    # read-only second reader, so a read can land mid-rewrite. That is an accident
+    # of timing, not a verdict on the grant — and reporting it as a bad credential
+    # would send the operator to re-onboard a login that is working.
+    #
+    # Run against the GATEWAY's own host, because that is where the extraction
+    # script actually executes here: on a satellite it runs inside the remote
+    # shell, which a unit test has no business reaching. The script is the real
+    # one; only the hosts we cannot run on are stubbed away.
+    test "a torn read of auth.json is transient, and never a credential verdict", ctx do
+      auth = Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+      File.mkdir_p!(Path.dirname(auth))
+
+      whole =
+        JSON.encode!(%{
+          tokens: %{access_token: "tok", refresh_token: "r", account_id: "a"},
+          auth_mode: "chatgpt"
+        })
+
+      # Local probes are ["sh", "-c", script] and run for real; anything bound for
+      # another machine fails fast without touching the network.
+      sh = fn command ->
+        if hd(command) == "sh", do: Support.system_cmd_out(command), else: {"", 255}
+      end
+
+      states = [
+        # A genuine prefix of a genuine file — what a reader sees mid-rewrite.
+        {:torn, binary_part(whole, 0, div(byte_size(whole), 2)),
+         {:credential_read_torn, :retry_next_refresh}},
+        {:no_tokens_object, JSON.encode!(%{auth_mode: "chatgpt"}),
+         {:credential_missing_access_token, auth}},
+        {:empty_token, JSON.encode!(%{tokens: %{access_token: ""}}),
+         {:credential_missing_access_token, auth}}
+      ]
+
+      for {label, contents, expected} <- states do
+        File.write!(auth, contents)
+        catalog = start_catalog(ctx, name: unique_name(label), sh: sh)
+
+        await(fn ->
+          ModelCatalog.get(@host, "codex", catalog) == {[], {:unavailable, expected}}
+        end)
+      end
+
+      # ...and a file that simply is not there is a REAL "no grant on this host",
+      # which must stay distinct from a torn read of one that is.
+      File.rm!(auth)
+      catalog = start_catalog(ctx, name: unique_name(:absent), sh: sh)
+
+      await(fn ->
+        ModelCatalog.get(@host, "codex", catalog) ==
+          {[], {:unavailable, {:missing_credential, auth}}}
       end)
     end
 

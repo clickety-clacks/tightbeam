@@ -356,14 +356,35 @@ defmodule Tightbeam.Harness.Codex do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
     auth = Path.join([state.base_dir, "auth", "codex", "auth.json"])
 
-    Support.catalog_probe(
-      sh,
+    sh
+    |> Support.catalog_probe(
       Support.catalog_probe_argv(
         Map.get(state, :host_config, %{ssh: nil}).ssh,
         probe_script(auth)
       )
     )
+    |> classify_extraction(auth)
   end
+
+  # Codex owns `auth.json` and rewrites it IN PLACE as it rotates (established
+  # empirically 2026-07-28: the inode survives a forced rotation, so the store's
+  # symlink stays coherent). This probe is a second, read-only reader of that
+  # file, so a read can land mid-rewrite and see torn JSON. That is a RETRYABLE
+  # accident of timing, not a verdict on the grant — the next refresh reads a
+  # whole file — and it must never be reported as a bad credential, because the
+  # repair it would imply (re-onboard) is both wrong and destructive of a working
+  # login. The extraction step exits on a distinct code per state so the three
+  # cannot collapse into one opaque failure.
+  defp classify_extraction({:error, {:probe_failed, 66, _output}}, auth),
+    do: {:error, {:missing_credential, auth}}
+
+  defp classify_extraction({:error, {:probe_failed, 75, _output}}, _auth),
+    do: {:error, {:credential_read_torn, :retry_next_refresh}}
+
+  defp classify_extraction({:error, {:probe_failed, 67, _output}}, auth),
+    do: {:error, {:credential_missing_access_token, auth}}
+
+  defp classify_extraction(result, _auth), do: result
 
   # `client_version` is a SILENT filter: every model carries a
   # `minimal_client_version` and the server drops the ones the caller is too old
@@ -373,9 +394,17 @@ defmodule Tightbeam.Harness.Codex do
   # to nothing and blame the account. It rides back on the status line so the
   # refusal can name the version that produced an empty answer.
   defp probe_script(auth_path) do
+    # Exit codes are sysexits: 66 EX_NOINPUT (no readable auth.json — a real
+    # "this host holds no grant"), 75 EX_TEMPFAIL (present but unparseable — a
+    # torn read, transient), 67 EX_NOUSER (parsed, but carries no access token —
+    # a real credential-shape problem). `set -e` propagates the substitution's
+    # status, so the script exits with whichever one node chose.
     node_program =
-      ~s|const fs=require("fs");| <>
-        ~s|process.stdout.write(JSON.parse(fs.readFileSync("#{auth_path}","utf8")).tokens.access_token)|
+      ~s|const fs=require("fs");let raw;| <>
+        ~s|try{raw=fs.readFileSync("#{auth_path}","utf8")}catch(e){process.exit(66)}| <>
+        ~s|let d;try{d=JSON.parse(raw)}catch(e){process.exit(75)}| <>
+        ~s|const t=d&&d.tokens?d.tokens.access_token:undefined;| <>
+        ~s|if(!(typeof t==="string"&&t.length)){process.exit(67)}process.stdout.write(t)|
 
     curl =
       Support.catalog_curl(
