@@ -635,10 +635,18 @@ defmodule Tightbeam.AdapterHealTest do
     heal(ctx, {7, 2})
     assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
     assert :ok = Ledger.finish(ctx.db, probe.seq, "failed")
-    assert [%{state: "pending"}] = retry_wakes(ctx.db)
+    assert [%{state: "pending", due_at: due_at}] = retry_wakes(ctx.db)
 
     # BEFORE the backoff elapses, the scheduler's fire delivers nothing — even
     # with the adapter ready and the hold eligible.
+    #
+    # The dueAt check states the precondition this negative rests on: the few
+    # statements above have to fit inside the 400ms backoff. Load makes that RED
+    # rather than a false pass — an overrun DELIVERS the probe — and this way the
+    # failure names the overrun instead of blaming the probe count for it.
+    assert due_at > System.system_time(:millisecond),
+           "the backoff elapsed before the pre-deadline fire; this run proves nothing"
+
     Wakes.fire_due(scheduler)
     assert probe_count(ctx.db) == 1
     assert [%{state: "pending"}] = retry_wakes(ctx.db)

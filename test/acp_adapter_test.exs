@@ -38,9 +38,12 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "residency waits behind slow adapter boot and dead adapters fail promptly" do
     adapter = start_supervised!({SlowBootAdapter, self()})
     assert_receive {:adapter_booting, ^adapter}
+    parent = self()
 
     queued =
       Task.async(fn ->
+        send(parent, :calling)
+
         try do
           Adapter.knows_session?(adapter, "resident")
         catch
@@ -48,7 +51,18 @@ defmodule Tightbeam.Acp.AdapterTest do
         end
       end)
 
-    Process.sleep(5_100)
+    # The boot-boundary proof (task #20): a residency call legally queues behind a
+    # slow codex boot, and the 5s DEFAULT GenServer.call budget it replaced would
+    # have given up. There is no way to observe "did not give up at 5s" in under
+    # 5s, so the wait below is the price of the assertion, not slack.
+    #
+    # :calling is what makes it honest. Anchored to Task.async instead, the window
+    # measured task STARTUP too, and only 100ms separated 5_100 from the 5_000 it
+    # had to outlast — so a reverted 5s budget stayed invisible whenever the task
+    # took >100ms to reach the call. The marker lands microseconds before the call
+    # arms its timer, so the 500ms band now covers only that gap.
+    assert_receive :calling
+    Process.sleep(5_500)
     assert Task.yield(queued, 0) == nil
 
     send(adapter, :finish_boot)
@@ -565,7 +579,18 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
 
     {adapter, _capture_path} =
-      start_adapter(harness: :codex, on_auth_event: on_auth_event)
+      start_adapter(
+        harness: :codex,
+        on_auth_event: on_auth_event,
+        on_ready: fn -> send(owner, :booted) end
+      )
+
+    # The refute below needs this barrier more than any assert_receive does. Both
+    # notifications queue behind the boot's handle_continue, and a boot outlasting
+    # the 100ms refute window meant the transient event had not been PROCESSED
+    # when the window closed — so the test passed whether or not a transient
+    # account update wrongly parked the credential.
+    assert_ready(adapter, :booted)
 
     send(
       adapter,
@@ -586,7 +611,14 @@ defmodule Tightbeam.Acp.AdapterTest do
     owner = self()
 
     {adapter, _capture_path} =
-      start_adapter(on_subagent_event: &send(owner, {:subagent, &1, &2}))
+      start_adapter(
+        on_subagent_event: &send(owner, {:subagent, &1, &2}),
+        on_ready: fn -> send(owner, :booted) end
+      )
+
+    # Without this the 1s budget below covers a `node` spawn as well as the
+    # dispatch it is about — the shape #83 collected on the 4-core runner.
+    assert_ready(adapter, :booted)
 
     update = %{
       "sessionUpdate" => "tool_call",
@@ -855,6 +887,12 @@ defmodule Tightbeam.Acp.AdapterTest do
     # where that deadline does, once the harness is up. Timing from before start_adapter/1
     # billed a `node` spawn to the deadline, and a spawn's duration is the runner's load,
     # not the adapter's behavior (#83).
+    #
+    # MEASURED 2026-07-29 under a four-file load on an idle 16-core mac: 83, 85,
+    # 95, 101, 140 ms — the 75ms deadline plus 10-65ms of harness startup and two
+    # round trips. ~7x headroom, so this budget stays; the `.boot` stamp is what
+    # keeps it that tight, and widening it would only hide a regression in the
+    # deadline itself.
     assert died_at - harness_started_at(capture_path) < 1_000
 
     assert {:error, {:adapter_unavailable, reason}} = Task.await(queued)

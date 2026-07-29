@@ -1,6 +1,28 @@
 defmodule Tightbeam.TestCase do
   @moduledoc false
 
+  # WAITING ON THINGS — read this before adding a sleep or a refute.
+  #
+  # `start_supervised!` is NOT a boot barrier for an adapter. `Acp.Adapter.init/1`
+  # returns `{:ok, nil, {:continue, {:boot, opts}}}`, so it returns before `node`
+  # is spawned and before the `initialize` round trip; anything sent to a fresh
+  # adapter queues behind that boot.
+  #
+  # The sanctioned barriers, in order of preference. `assert_ready/2` (an
+  # unbounded receive plus a death monitor, acp_adapter_test.exs) for adapter
+  # boot. A `GenServer.call` into the target — including `:sys.get_state/1` —
+  # when the thing you are waiting on is a `cast`: both are answered in mailbox
+  # order, so the cast has RUN when the call returns.
+  #
+  # A fixed sleep before a `refute_receive`/`refute_received` is a false-pass
+  # generator, not a budget: if the work has not started yet, the absence you
+  # assert is the absence of a beginning. Make the racing side signal before it
+  # acts, `assert_receive` that signal, then refute.
+  #
+  # A predicate-poll helper that returns `false` on exhaustion must be called
+  # under `assert` — in statement position its timeout is silent, and the test
+  # passes having proven nothing.
+
   use ExUnit.CaseTemplate
 
   @persistent_keys [

@@ -755,11 +755,23 @@ defmodule Tightbeam.SupervisionTest do
     )
 
     Supervision.request_sweep(name)
-    eventually(fn -> Supervision.prod_state(ctx.db, "asg_1") != nil end)
+
+    # BOTH sweeps are casts, and :sys.get_state is answered in mailbox order, so
+    # each has RUN when its barrier returns. The FIRST barrier is the one that
+    # made this test flaky: polling prod_state instead let first_count be read
+    # before the sweep had written its wake, and the test then compared a
+    # post-sweep count against a pre-sweep one — measured red in 2 of 3 combined
+    # runs on an idle 16-core mac, both as `1 == 0`. The second sleep(20) was a
+    # false pass in the other direction: a still-queued cast read as "did not
+    # reclaim twice", the one thing this test exists to prove.
+    :sys.get_state(name)
+
+    assert Supervision.prod_state(ctx.db, "asg_1") != nil,
+           "the first sweep never reclaimed the suppressed terminal"
 
     first_count = length(Wakes.list_pending(ctx.db))
     Supervision.request_sweep(name)
-    Process.sleep(20)
+    :sys.get_state(name)
     assert length(Wakes.list_pending(ctx.db)) == first_count
     assert first_count == 1
   end
@@ -775,9 +787,13 @@ defmodule Tightbeam.SupervisionTest do
 
     Supervision.notify_terminal(name, "holder", seq)
 
-    eventually(fn ->
-      Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "supervision_evaluate_failed"))
-    end)
+    assert eventually(fn ->
+             Enum.any?(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "supervision_evaluate_failed")
+             )
+           end),
+           "the contained exit was never recorded as an evaluation failure"
 
     assert Process.alive?(pid)
     assert %{attemptCount: 1, prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
@@ -795,15 +811,19 @@ defmodule Tightbeam.SupervisionTest do
     :ok = DB.execute(ctx.db, "DROP TABLE decision_requests")
     Supervision.notify_retired(name, "holder")
 
-    eventually(fn ->
-      Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-        event.kind == "supervision_evaluate_failed" and event.subject == "holder"
-      end)
-    end)
+    assert eventually(fn ->
+             Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+               event.kind == "supervision_evaluate_failed" and event.subject == "holder"
+             end)
+           end),
+           "the caught retirement failure was never recorded for holder"
 
     assert Process.alive?(pid)
     Supervision.request_sweep(name)
-    Process.sleep(20)
+
+    # Same cast barrier: alive? proves nothing about a sweep still sitting in the
+    # mailbox, and alive? was this test's only other assertion.
+    :sys.get_state(name)
     assert Process.alive?(pid)
   end
 
