@@ -439,6 +439,50 @@ defmodule Tightbeam.CredentialKindsTest do
       # own (invariant: one authority per vocabulary).
       assert Credentials.kind(:anthropic, Credentials) == :api_key
     end
+
+    # FAIL-BEFORE (#106): the begin reply echoed the STORE spelling
+    # (`kind: :api_key`), so the ceremony's opening line said "api_key" on a
+    # wire whose contract — and every other surface, via
+    # `wire_credential_kind/1` — says "apiKey". Same camelizer gap as the
+    # finish reply: it rewrites keys, not atom values.
+    test "the begin reply names the leased kind as apiKey, not api_key", ctx do
+      :ok = Tightbeam.Devices.ensure_schema(ctx.db)
+
+      {:ok, _rows} =
+        Tightbeam.DB.query(
+          ctx.db,
+          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          ["kind-admin", System.system_time(:second)]
+        )
+
+      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+
+      onboard =
+        Tightbeam.Gateway.handlers(%{
+          base_dir: ctx.base,
+          db: ctx.db,
+          onboarding_lease_ms: 1_800_000
+        })["onboard"]
+
+      call = %{
+        origin: "user:kind-admin",
+        params: %{provider: "anthropic", phase: "begin"}
+      }
+
+      assert %{provider: :anthropic, kind: "apiKey", status: "ready"} =
+               onboard.(put_in(call.params[:kind], "apiKey"))
+
+      # Release the lease so the subscription spelling gets its own ceremony.
+      onboard.(%{call | params: Map.put(call.params, :phase, "cancel")})
+
+      assert %{provider: :anthropic, kind: "subscription", status: "ready"} =
+               onboard.(put_in(call.params[:kind], "subscription"))
+
+      # A lease banks nothing, and the wire translation did not leak into the
+      # store, whose spelling is its own (invariant: one authority per
+      # vocabulary).
+      assert Credentials.kind(:anthropic, Credentials) == :none
+    end
   end
 
   # ------------------------------------------------------------------

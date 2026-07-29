@@ -2188,10 +2188,13 @@ defmodule Tightbeam.Gateway do
         #
         # `kind` is echoed, not consumed: a LEASE carries no opinion about what
         # will be banked into it (`Credentials.finish_onboard/3`). It is here so
-        # a gateway log shows which ceremony an operator started.
+        # a gateway log shows which ceremony an operator started — in the WIRE
+        # spelling (`wire_credential_kind/1`), like every other surface: the
+        # camelizer rewrites keys, not atom values, so a bare `kind` put the
+        # store's "api_key" on a wire whose contract says "apiKey".
         %{
           provider: provider,
-          kind: kind,
+          kind: wire_credential_kind(kind),
           status: "ready",
           staging_path: path,
           lease_ttl_ms: config.onboarding_lease_ms
