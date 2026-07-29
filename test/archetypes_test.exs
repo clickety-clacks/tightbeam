@@ -111,6 +111,51 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "every archetype's served snapshot carries the operating manual", ctx do
+    Identity.init!(ctx.base_dir)
+    loaded = Archetypes.load!(ctx.base_dir)
+    revision = Identity.live_revision!(ctx.base_dir)
+
+    for name <- Map.keys(loaded), harness <- [:codex, :claude] do
+      guidance = Identity.snapshot_at!(ctx.base_dir, revision, name, harness).guidance
+
+      assert guidance =~ "# Operating tightbeam"
+      assert guidance =~ "shell tool"
+      assert guidance =~ "PATH"
+    end
+  end
+
+  test "an org's own operating-manual fragment wins and is served exactly once", ctx do
+    Identity.init!(ctx.base_dir)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    File.write!(Path.join(identity_dir, "guidance/operating-manual.md"), "ORG MANUAL v2")
+    publish!(identity_dir, "org manual")
+
+    revision = Identity.live_revision!(ctx.base_dir)
+    guidance = Identity.snapshot_at!(ctx.base_dir, revision, "default", :codex).guidance
+
+    assert length(String.split(guidance, "ORG MANUAL v2")) == 2
+    refute guidance =~ "# Operating tightbeam"
+  end
+
+  test "an explicit operating-manual include resolves and is not double-appended", ctx do
+    Identity.init!(ctx.base_dir)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+
+    File.write!(Path.join([identity_dir, "archetypes", "manualist.toml"]), """
+    name = "manualist"
+    [guidance]
+    text = '#include "operating-manual.md"'
+    """)
+
+    publish!(identity_dir, "manualist")
+
+    revision = Identity.live_revision!(ctx.base_dir)
+    guidance = Identity.snapshot_at!(ctx.base_dir, revision, "manualist", :codex).guidance
+
+    assert length(String.split(guidance, "# Operating tightbeam")) == 2
+  end
+
   test "manifest parsing is boot-equivalent and unknown elections fail", ctx do
     Identity.init!(ctx.base_dir)
     manifest = Path.join([ctx.base_dir, "identity", "archetypes", "default.toml"])
@@ -401,5 +446,25 @@ defmodule Tightbeam.ArchetypesTest do
       {output, 0} -> String.trim_trailing(output)
       {output, status} -> raise "git failed #{status}: #{output}"
     end
+  end
+
+  defp publish!(identity_dir, message) do
+    git!(identity_dir, ["add", "-A"])
+
+    git!(identity_dir, [
+      "-c",
+      "user.name=test",
+      "-c",
+      "user.email=test@test",
+      "commit",
+      "-m",
+      message
+    ])
+
+    git!(identity_dir, [
+      "update-ref",
+      "refs/heads/tightbeam/live",
+      git!(identity_dir, ["rev-parse", "main"])
+    ])
   end
 end

@@ -108,7 +108,18 @@ defmodule Tightbeam.Identity do
   @spec snapshot_at!(String.t(), String.t(), String.t(), harness()) :: snapshot()
   def snapshot_at!(base_dir, revision, archetype_name, harness) do
     identity_dir = identity_dir(base_dir)
-    fragments = revision_fragments!(identity_dir, revision)
+
+    # The operating manual is substrate-shipped (priv/guidance/operating-manual.md)
+    # and served to every session, like operating-model.md below. An org tree that
+    # carries its own operating-manual.md wins; otherwise the built-in fills the
+    # name, so an explicit `#include "operating-manual.md"` resolves either way.
+    # Absence of the shipped file is a broken install: File.read! raises.
+    fragments =
+      identity_dir
+      |> revision_fragments!(revision)
+      |> Map.put_new_lazy("operating-manual.md", fn ->
+        String.trim_trailing(Archetypes.builtin_fragments()["operating-manual.md"])
+      end)
     manifest_path = "archetypes/#{archetype_name}.toml"
     manifest = git_show!(identity_dir, revision, manifest_path)
     archetype = Archetypes.parse_manifest!(manifest, manifest_path)
@@ -121,11 +132,21 @@ defmodule Tightbeam.Identity do
         {name, git_show!(identity_dir, revision, "skills/#{name}/SKILL.md")}
       end)
 
+    archetype_guidance = Archetypes.guidance(archetype, fragments)
+    operating_manual = Map.fetch!(fragments, "operating-manual.md")
+
+    # Appended once: an archetype whose guidance already includes the manual
+    # (via `#include`) is not served it twice.
+    manual_part =
+      if String.contains?(archetype_guidance, operating_manual),
+        do: [],
+        else: [operating_manual]
+
     guidance =
-      [
-        Archetypes.guidance(archetype, fragments),
-        required_fragment!(fragments, "operating-model.md", revision)
-      ]
+      ([
+         archetype_guidance,
+         required_fragment!(fragments, "operating-model.md", revision)
+       ] ++ manual_part)
       |> Enum.join("\n\n")
       |> then(&Harness.module!(harness).session_config(%{identity: true}, &1).guidance)
 
