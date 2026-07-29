@@ -762,7 +762,7 @@ defmodule Tightbeam.ConformanceSupport do
       assert_rule_result(
         kase["case"],
         kase["expect"],
-        kase["reason"],
+        expected_denial(kase),
         Rules.evaluate(db, call),
         timeout_ctx(db, fixture)
       )
@@ -802,7 +802,7 @@ defmodule Tightbeam.ConformanceSupport do
         assert_rule_result(
           "#{kase["case"]} phase2",
           phase2["expect"] || kase["expect"],
-          kase["reason"],
+          expected_denial(kase),
           Rules.evaluate(db, phase2_call),
           timeout_ctx(db, fixture)
         )
@@ -812,16 +812,39 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  defp assert_rule_result(_case, "deny", reason, {:deny, %{rule: actual}}, _ctx),
-    do: assert(actual == reason)
+  defp assert_rule_result(case_id, "deny", {rule, reason}, {:deny, actual}, ctx) do
+    assert actual.rule == rule
 
-  defp assert_rule_result(_case, "pass", _reason, :ok, _ctx), do: :ok
+    assert actual.reason == reason,
+           "#{case_id}: denied under #{rule}, but for #{actual.reason} rather than " <>
+             "#{reason} — this case proves nothing about the mechanism it names" <>
+             Tightbeam.RailTimeoutEvidence.render({:deny, actual}, ctx)
+  end
 
-  defp assert_rule_result(case_id, expect, _reason, actual, ctx),
+  defp assert_rule_result(_case, "pass", _denial, :ok, _ctx), do: :ok
+
+  defp assert_rule_result(case_id, expect, _denial, actual, ctx),
     do:
       flunk(
         "#{case_id}: expected #{expect}, got #{inspect(actual)}#{Tightbeam.RailTimeoutEvidence.render(actual, ctx)}"
       )
+
+  # The rule NAME cannot tell a genuine denial from a load-induced one: a rail script that
+  # blows its budget denies under the SAME rule with reason `script_timeout`, so a case
+  # asserting only the name went green while proving nothing about the mechanism it names
+  # (task #38's residual class). The `script_return` a fixture already declares determines
+  # the reason its mechanism must produce, so both are pinned and a timeout reads RED.
+  defp expected_denial(kase), do: {kase["reason"], deny_reason(kase["script_return"])}
+
+  # No script: the denial can only come from the rule's own effect. With one, the wrapper's
+  # exit band decides — see RailScript.classify/4 for the bands these mirror.
+  defp deny_reason(nil), do: "rule_denied"
+  defp deny_reason("out-of-set"), do: "script_out_of_set"
+  defp deny_reason("timeout"), do: "script_timeout"
+  defp deny_reason("contained"), do: "script_contained_refused"
+  defp deny_reason("error:" <> _code), do: "script_error"
+  # An in-set token the script returned normally; the effect table denies on it.
+  defp deny_reason(_token), do: "rule_denied"
 
   defp timeout_ctx(db, fixture) do
     %{db: db, timeout_ms: Enum.find_value(fixture["rule"], &get_in(&1, ["check", "timeout_ms"]))}
@@ -3775,6 +3798,14 @@ defmodule Tightbeam.ConformanceTest do
     Corpus.run_producer_cas_races(fixture!("C4", "producer-cas-verdict-txn"))
   end
 
+  # ExUnit's per-test default is 60s and nobody chose it for a test that seeds fifteen real
+  # git repos and drives the release rail-exec through the containment layer for every case
+  # — roughly forty process creations, none of them BEAM-side. Measured end to end on a
+  # loaded dev box: 40.8s once and 88.2s an hour later, straddling the default, so the test
+  # was a coin flip against a number that describes in-memory unit tests. The budget being
+  # declared is what makes the timeout mean "the rail layer wedged" instead of "the box was
+  # busy"; the reason assertions, not this, are what keep a slow run from passing falsely.
+  @tag timeout: 300_000
   test "C5 real rail-exec drives git state, observed files, exit bands, CWD, and laziness" do
     for name <- [
           "reconcile-with-main",

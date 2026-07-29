@@ -248,8 +248,12 @@ defmodule Tightbeam.ProducersTest do
              )
 
     assert_wait(fn -> Producers.get(ctx.db, job_id).state == "cancelled" end)
+    # `finished` is written by the CHILD shell after its `wait` returns, and the line below
+    # proves every pid in the tree is gone — so no process survives that could ever write
+    # it. Sleeping out the grandchild's window on top of that proved nothing and cost the
+    # suite the wall clock. A grandchild that exited on its OWN still fails here, because
+    # the child would then have written the file before dying.
     assert_wait(fn -> Enum.all?(pids, &(not process_exists?(&1))) end)
-    Process.sleep(2_200)
     refute File.exists?(tree.finished)
     assert Assignments.list_attests(ctx.db, ctx.assignment.id) == []
   end
@@ -276,8 +280,10 @@ defmodule Tightbeam.ProducersTest do
     pids = descendant_pids(tree)
     assert Enum.all?(pids, &process_exists?/1)
     assert_wait(fn -> Producers.get(ctx.db, job_id).state == "failed" end)
+    # No wait for the grandchild's window to elapse: the line below proves the whole tree is
+    # gone, and only the child shell writes `finished`, so the delayed effect has no process
+    # left to run it.
     assert_wait(fn -> Enum.all?(pids, &(not process_exists?(&1))) end)
-    Process.sleep(1_200)
     refute File.exists?(tree.finished)
     assert Assignments.list_attests(ctx.db, assignment.id) == []
 
@@ -677,10 +683,17 @@ defmodule Tightbeam.ProducersTest do
     }
   end
 
+  # The grandchild's sleep is the WINDOW the kill has to land inside, so it has to outlast
+  # the setup that precedes the kill — not merely be "long". At `sleep 2` it did not: on a
+  # box at load 97 the job reaching `running` plus the cancel round-trip took longer than
+  # the window, so the tree ran to completion on its own and the test failed for having
+  # observed `finished` from a fixture nobody killed. Widening costs nothing on the happy
+  # path, because every one of these tests kills the tree and none of them waits the window
+  # out; it only stops the clock from deciding what the kill was supposed to decide.
   defp descendant_command(tree) do
     child =
       "printf '%s' \"$$\" > #{shell_quote(tree.child)}; " <>
-        "sleep 2 & printf '%s' \"$!\" > #{shell_quote(tree.grandchild)}; " <>
+        "sleep 30 & printf '%s' \"$!\" > #{shell_quote(tree.grandchild)}; " <>
         "wait; printf finished > #{shell_quote(tree.finished)}"
 
     "printf '%s' \"$$\" > #{shell_quote(tree.root)}; sh -c #{shell_quote(child)} & wait"

@@ -16,7 +16,7 @@ deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
 [fixture.rule.check]
 script = "reconcile-with-main"
 returns = ["reconciled", "behind"]
-timeout_ms = 2000
+timeout_ms = 8000
 [fixture.rule.check.effects]
 reconciled = "allow"
 behind = "deny"
