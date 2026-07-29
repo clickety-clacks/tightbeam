@@ -723,6 +723,9 @@ defmodule Tightbeam.Wire.Router do
 
   defp control_call(%{"action" => "cancel_current_run"}), do: {:ok, "cancel", %{}}
 
+  defp control_call(%{"action" => action}) when action in ~w(adopt unadopt),
+    do: {:ok, "tune", %{setting: "adopt", adopted: action == "adopt"}}
+
   defp control_call(%{"action" => "set_model", "model" => model}),
     do: {:ok, "tune", %{setting: "set_model", model: model}}
 

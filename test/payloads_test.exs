@@ -155,7 +155,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
       "isBuiltIn" => true,
       "createdAt" => 1,
       "updatedAt" => 2,
-      "adopted" => true
+      "adopted" => true,
+      "startedBy" => "user"
     }
 
     stream = Payloads.stream_session(session)
@@ -166,13 +167,15 @@ defmodule Tightbeam.Wire.PayloadsTest do
                "spawnedBy" => "agent:main:clawline:flynn:main"
              })
 
+    # `origin` and `spawnedBy` drop out when absent; `startedBy` never does —
+    # a client that has to handle a missing value has to invent a policy for it.
     stream_without_provenance =
       session
       |> Map.put(:origin, nil)
       |> Map.put(:spawned_by, nil)
       |> Payloads.stream_session()
 
-    assert stream_without_provenance == existing_keys
+    assert stream_without_provenance == %{existing_keys | "startedBy" => "substrate"}
     refute Map.has_key?(stream_without_provenance, "origin")
     refute Map.has_key?(stream_without_provenance, "spawnedBy")
 

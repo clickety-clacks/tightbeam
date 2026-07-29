@@ -4832,6 +4832,102 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:runtime_start, {:fixture, "shared", "testhost"}}
   end
 
+  # Driven through real spawns rather than hand-built session maps: the point of
+  # the assertion is that the classes the CREATION paths actually stamp are the
+  # ones the wire can name, and a fabricated origin proves nothing about that.
+  test "startedBy names who started each session the spawn path can create", ctx do
+    base_dir = role_test_base("started-by")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    typed =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{display_name: "Typed", handle: "typed", idempotency_key: "sb-user"}
+      })
+
+    hired =
+      spawn.(%{
+        origin: "agent:typed",
+        session_key: nil,
+        params: %{display_name: "Hired", idempotency_key: "sb-agent"}
+      })
+
+    # The remedy class never comes off a transport — the rail remedy executor is
+    # its only constructor — so it is admitted here by principal, as it is live.
+    remedied =
+      spawn.(%{
+        origin: "remedy:review-before-merge",
+        principal: {:remedy, %{action: "spawn", owner: "flynn"}},
+        session_key: nil,
+        params: %{display_name: "Remedied", idempotency_key: "sb-remedy"}
+      })
+
+    for {result, origin, started_by} <- [
+          {typed, "user:flynn", "user"},
+          {hired, "agent:typed", "agent"},
+          {remedied, "remedy:review-before-merge", "substrate"}
+        ] do
+      stream = ctx.db |> Org.get(result.session_key) |> Payloads.stream_session()
+
+      assert stream["startedBy"] == started_by, inspect(stream)
+      assert stream["origin"] == origin, "origin stays as the detailed provenance"
+    end
+  end
+
+  test "tune adopt writes the flag, unadopt clears it, and each pushes stream_updated", ctx do
+    base_dir = role_test_base("adopt")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "adopt-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
+    key = "k1"
+
+    refute Org.get(ctx.db, key).adopted
+
+    assert %{ok: true} =
+             tune.(%{
+               origin: "user:flynn",
+               session_key: key,
+               params: %{setting: "adopt", adopted: true}
+             })
+
+    assert Org.get(ctx.db, key).adopted
+
+    assert_receive {:push,
+                    %{
+                      "type" => "stream_updated",
+                      "stream" => %{"sessionKey" => ^key, "adopted" => true}
+                    }}
+
+    assert %{ok: true} =
+             tune.(%{
+               origin: "user:flynn",
+               session_key: key,
+               params: %{setting: "adopt", adopted: false}
+             })
+
+    refute Org.get(ctx.db, key).adopted
+
+    assert_receive {:push,
+                    %{
+                      "type" => "stream_updated",
+                      "stream" => %{"sessionKey" => ^key, "adopted" => false}
+                    }}
+  end
+
   defp gateway_config(base_dir, db, port) do
     %{
       base_dir: base_dir,
