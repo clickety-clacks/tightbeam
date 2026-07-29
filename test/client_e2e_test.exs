@@ -1406,8 +1406,8 @@ defmodule Tightbeam.ClientE2ETest do
     })
 
     handlers = Gateway.handlers(%{db: db, base_dir: base_dir, port: 0})
-    Rules.load!(Path.join(base_dir, "no-rules"), Map.keys(handlers), %{})
-    on_exit(fn -> Rules.load!(Path.join(System.tmp_dir!(), "client-e2e-reset"), [], %{}) end)
+    Rules.load!(Path.join(base_dir, "no-rules"), Map.keys(handlers))
+    on_exit(fn -> Rules.load!(Path.join(System.tmp_dir!(), "client-e2e-reset"), []) end)
 
     router_opts =
       Router.init(

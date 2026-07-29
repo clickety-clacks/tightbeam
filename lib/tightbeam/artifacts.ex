@@ -114,6 +114,24 @@ defmodule Tightbeam.Artifacts do
     end
   end
 
+  @doc """
+  Distinct artifact kinds a session recorded on a work item.
+
+  State-blind by design: in-workspace, archived, and released rows all count —
+  a record counts in every state.
+  """
+  @spec recorded_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
+  def recorded_kinds(db \\ Tightbeam.DB, work_item_id, created_by_session) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT DISTINCT kind FROM artifacts WHERE workItemId = ?1 AND createdBySession = ?2 ORDER BY kind",
+        [work_item_id, created_by_session]
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
   @doc "List artifacts matching exact optional provenance filters, newest first."
   @spec list(DB.server(), map()) :: [map()]
   def list(db \\ Tightbeam.DB, filters \\ %{}) do

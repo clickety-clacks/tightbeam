@@ -85,12 +85,15 @@ Compile clean and pass the tests the change touches before you report — a comm
 does not build is never pushed. But green is not working: passing on the inputs you chose
 does not prove the behavior, and a parity or hand-written fixture proves equivalence, not
 correctness. Capture fixtures from real responses, and for anything touching live inputs,
-run it against real inputs before you call it done. Where the org has a committed test
-command, `tightbeam run-tests <yourAssignmentId>` stamps a `tests-passed` verdict no
-self-report can substitute for; where it has a committed smoke command,
-`tightbeam run-smoke <yourAssignmentId>` stamps `real-run-passed` — the substrate ran
-it against reality, and that verdict is the one that proves live-input work, not your
-word that it works.
+run it against real inputs before you call it done. Your completion must carry a
+verification papertrail, and you produce it: verify the work the way the repository
+defines verification — its AGENTS.md or equivalent prose says what verification means
+there — then record the results (output, logs, evidence) with `tightbeam artifact-record`
+as a report artifact on the work item, and file
+`tightbeam attest <yourAssignmentId> --kind verdict --verdict verified` with a note
+saying what you ran and what you observed. If the repository never defines verification,
+say so and escalate — being hounded to verify against a repo that defines no verification
+is a process gap for a human, not something to guess around.
 
 Before declaring ready for review, re-read your own diff cold and write the walkthrough
 into your progress attest — what changed, why, where the risk lives. Authors who annotate
@@ -99,11 +102,11 @@ is where the author catches them. That ready-for-review attest, like your comple
 names the repo as `host:absolute-path` and the commit id — "it shipped" without an
 address sends your verifier hunting the wrong repo.
 
-File completion ONLY after the review verdict is in and integration is proven.
-Completion closes your assignment, and the substrate accepts verdicts only on open
-ones — complete early and the `tests-passed`/`real-run-passed` stamps and the user's
-`verified` verdict have nowhere to land: your row closes as a claim that can never be
-upgraded to verified. And a completion filed before `reviewed-clean` is a claim the
+File completion ONLY after the review verdict is in, the verification papertrail is
+recorded, and integration is proven. Completion closes your assignment, and the
+substrate accepts verdicts only on open ones — complete early and your `verified`
+verdict and the user's have nowhere to land: your row closes as a claim that can never
+be upgraded to verified. And a completion filed before `reviewed-clean` is a claim the
 record contradicts.
 
 Work only in your own worktree (`worktree-session`), reconcile with main before building

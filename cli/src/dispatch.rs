@@ -288,24 +288,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("assignmentId", assignment_id)],
         )),
-        Command::RunTests {
-            identity,
-            assignment_id,
-        } => Ok(request(
-            identity,
-            "run-tests",
-            vec![],
-            vec![string_field("assignmentId", assignment_id)],
-        )),
-        Command::RunSmoke {
-            identity,
-            assignment_id,
-        } => Ok(request(
-            identity,
-            "run-smoke",
-            vec![],
-            vec![string_field("assignmentId", assignment_id)],
-        )),
         Command::WorkItemCreate {
             identity,
             title,
@@ -960,8 +942,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::EffortRule { identity, .. }
         | Command::DecisionRequests { identity, .. }
         | Command::RevokeAssignment { identity, .. }
-        | Command::RunTests { identity, .. }
-        | Command::RunSmoke { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
@@ -1250,11 +1230,11 @@ mod tests {
                 "--kind",
                 "verdict",
                 "--verdict",
-                "tests-passed",
+                "verified",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"tests-passed"}}"#
+            r#"{"asUser":"flynn","verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"verified"}}"#
         );
         assert_eq!(
             body(&["attests", "asg_1", "--as", "reviewer"]),
@@ -1336,18 +1316,6 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"work-item-fail","params":{"workItemId":"wi_1","reason":"cannot repro"}}"#
-        );
-    }
-
-    #[test]
-    fn builds_byte_exact_producer_bodies() {
-        assert_eq!(
-            body(&["run-tests", "asg_1", "--as", "builder"]),
-            r#"{"as":"builder","verb":"run-tests","params":{"assignmentId":"asg_1"}}"#
-        );
-        assert_eq!(
-            body(&["run-smoke", "asg_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"run-smoke","params":{"assignmentId":"asg_1"}}"#
         );
     }
 

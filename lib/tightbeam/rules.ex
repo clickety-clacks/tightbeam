@@ -12,13 +12,15 @@ defmodule Tightbeam.Rules do
   A nil fact never satisfies any operator, including `ne` and `not_in`.
   An empty list is present, however: `caller.roles not_in ["admin"]` fires
   for a caller holding no roles, and `assignment.verdicts not_in
-  ["tests-passed"]` fires for an assignment with no verdicts. List facts are
+  ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
   `assignment.cross_harness_verdict_kinds`,
   `assignment.cross_provider_verdict_kinds`, and
-  `assignment.produced_verdict_kinds`. Assignment caller identity comes from
-  the optional dispatch principal rather than the origin string.
+  `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
+  holder recorded on its work item, in every artifact state). Assignment
+  caller identity comes from the optional dispatch principal rather than the
+  origin string.
 
   Check-tier facts are `attest.kind` (raw string on attest calls),
   `assignment.verdicts` (distinct filed verdict kinds),
@@ -39,6 +41,7 @@ defmodule Tightbeam.Rules do
   """
 
   alias Tightbeam.{
+    Artifacts,
     Assignments,
     DB,
     Devices,
@@ -87,7 +90,6 @@ defmodule Tightbeam.Rules do
     assignment.independent_verdict_kinds
     assignment.cross_harness_verdict_kinds
     assignment.cross_provider_verdict_kinds
-    assignment.produced_verdict_kinds
   )
   @independence_facts ~w(
     assignment.independent_verdict_kinds
@@ -112,7 +114,7 @@ defmodule Tightbeam.Rules do
     "assignment.independent_verdict_kinds" => {:list, :string},
     "assignment.cross_harness_verdict_kinds" => {:list, :string},
     "assignment.cross_provider_verdict_kinds" => {:list, :string},
-    "assignment.produced_verdict_kinds" => {:list, :string},
+    "assignment.artifact_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
     "work_item.is_bug" => :bool,
@@ -135,8 +137,8 @@ defmodule Tightbeam.Rules do
         }
 
   @doc "Load and validate all rule files, replacing the currently active set."
-  @spec load!(String.t(), Enumerable.t(), map()) :: [rule()]
-  def load!(base_dir, valid_verbs, producers) do
+  @spec load!(String.t(), Enumerable.t()) :: [rule()]
+  def load!(base_dir, valid_verbs) do
     verbs = MapSet.new(valid_verbs)
 
     identity_manifest_sha = identity_manifest_sha(base_dir)
@@ -156,7 +158,7 @@ defmodule Tightbeam.Rules do
         :ok
     end
 
-    validate_satisfiability!(rules, verbs, producers)
+    validate_satisfiability!(rules, verbs)
     :persistent_term.put(@persist_key, rules)
     rules
   end
@@ -436,13 +438,17 @@ defmodule Tightbeam.Rules do
       check && not is_nil(produces) ->
         fail.("script-effect remedy must omit produces")
 
-      is_nil(check) and requirements == [] ->
-        fail.("predicate remedy requires a verdict-fact gate")
+      is_nil(check) and requirements == [] and artifact_requirements(conditions) == [] ->
+        fail.("predicate remedy requires a verdict-fact or artifact-fact gate")
 
-      is_nil(check) and not valid_verdict_kind?(produces) ->
+      is_nil(check) and requirements == [] and not is_nil(produces) ->
+        fail.("remedy produces is valid only on a verdict-fact gate")
+
+      is_nil(check) and requirements != [] and not valid_verdict_kind?(produces) ->
         fail.("remedy produces must be a verdictKind required by the gate")
 
-      is_nil(check) and not Enum.any?(requirements, fn {_fact, kinds} -> produces in kinds end) ->
+      is_nil(check) and requirements != [] and
+          not Enum.any?(requirements, fn {_fact, kinds} -> produces in kinds end) ->
         fail.("remedy produces #{inspect(produces)} but the gate does not require it")
 
       true ->
@@ -595,24 +601,17 @@ defmodule Tightbeam.Rules do
     |> Enum.sort()
   end
 
-  defp validate_satisfiability!(rules, valid_verbs, producers) when is_map(producers) do
-    Enum.each(rules, &validate_producer_existence!(&1, producers))
+  defp validate_satisfiability!(rules, valid_verbs) do
+    Enum.each(rules, &validate_producer_existence!/1)
     Enum.each(rules, &validate_remedy_reachability!(&1, rules, valid_verbs))
-    validate_producer_cycles!(rules, producers)
+    validate_producer_cycles!(rules)
   end
 
-  defp validate_satisfiability!(_rules, _valid_verbs, producers) do
-    raise ArgumentError, "producer registry must be a map, got: #{inspect(producers)}"
-  end
+  defp validate_producer_existence!(%{check: check}) when not is_nil(check), do: :ok
 
-  defp validate_producer_existence!(%{check: check}, _producers) when not is_nil(check), do: :ok
-
-  defp validate_producer_existence!(rule, producers) do
+  defp validate_producer_existence!(rule) do
     Enum.each(verdict_requirements(rule.conditions), fn {fact, kinds} ->
-      covered? =
-        (rule.external_producer and fact != "assignment.produced_verdict_kinds") or
-          remedy_covers?(rule.remedy, fact, kinds) or
-          producer_registry_covers?(producers, fact, kinds)
+      covered? = rule.external_producer or remedy_covers?(rule.remedy, fact, kinds)
 
       unless covered? do
         raise ArgumentError,
@@ -622,26 +621,10 @@ defmodule Tightbeam.Rules do
   end
 
   defp remedy_covers?(nil, _fact, _kinds), do: false
-  defp remedy_covers?(_remedy, "assignment.produced_verdict_kinds", _kinds), do: false
 
   defp remedy_covers?(remedy, fact, kinds) do
     remedy.produces in kinds and
       (fact not in @independence_facts or remedy.params[:reviews] == "{assignment_id}")
-  end
-
-  defp producer_registry_covers?(producers, "assignment.produced_verdict_kinds", kinds) do
-    available =
-      []
-      |> maybe_add_producer_kind(producers, :tests, "tests-passed")
-      |> maybe_add_producer_kind(producers, :smoke, "real-run-passed")
-
-    Enum.any?(kinds, &(&1 in available))
-  end
-
-  defp producer_registry_covers?(_producers, _fact, _kinds), do: false
-
-  defp maybe_add_producer_kind(kinds, producers, key, verdict_kind) do
-    if is_binary(producers[key]) and producers[key] != "", do: [verdict_kind | kinds], else: kinds
   end
 
   defp validate_remedy_reachability!(%{remedy: nil}, _rules, _valid_verbs), do: :ok
@@ -682,11 +665,11 @@ defmodule Tightbeam.Rules do
 
   defp fixed_condition_true?(_condition, _remedy), do: false
 
-  defp validate_producer_cycles!(rules, producers) do
+  defp validate_producer_cycles!(rules) do
     remedy_rules =
       Enum.filter(
         rules,
-        &(not is_nil(&1.remedy) and not escaping_static_producer?(&1, producers))
+        &(not is_nil(&1.remedy) and not escaping_static_producer?(&1))
       )
 
     Enum.each(remedy_rules, fn rule ->
@@ -694,15 +677,14 @@ defmodule Tightbeam.Rules do
     end)
   end
 
-  defp escaping_static_producer?(%{external_producer: true}, _producers), do: true
+  defp escaping_static_producer?(%{external_producer: true}), do: true
 
-  defp escaping_static_producer?(rule, producers) do
-    requirements = verdict_requirements(rule.conditions)
-
-    requirements != [] and
-      Enum.all?(requirements, fn {fact, kinds} ->
-        producer_registry_covers?(producers, fact, kinds)
-      end)
+  # A statute whose gate requirements are all artifact requirements escapes the
+  # chain walk: `artifact-record` is a constitutional verb available to every
+  # session, so the requirement is statically satisfiable without any producer.
+  defp escaping_static_producer?(rule) do
+    verdict_requirements(rule.conditions) == [] and
+      artifact_requirements(rule.conditions) != []
   end
 
   defp walk_producer_chain!(root, current, rules, path) do
@@ -722,6 +704,16 @@ defmodule Tightbeam.Rules do
     Enum.flat_map(conditions, fn
       %{fact: fact, op: "not_in", value: kinds} when fact in @verdict_facts ->
         [{fact, kinds}]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp artifact_requirements(conditions) do
+    Enum.flat_map(conditions, fn
+      %{fact: "assignment.artifact_kinds", op: "not_in", value: kinds} ->
+        [{"assignment.artifact_kinds", kinds}]
 
       _ ->
         []
@@ -1056,10 +1048,13 @@ defmodule Tightbeam.Rules do
     end)
   end
 
-  defp compute_fact("assignment.produced_verdict_kinds", db, call, cache) do
+  defp compute_fact("assignment.artifact_kinds", db, call, cache) do
     with_dependency("$assignment", db, call, cache, fn
-      nil, cache -> {nil, cache}
-      assignment, cache -> {Assignments.produced_verdict_kinds(db, assignment.id), cache}
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Artifacts.recorded_kinds(db, assignment.work_item_id, assignment.holder_key), cache}
     end)
   end
 

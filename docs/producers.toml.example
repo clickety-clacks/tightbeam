@@ -1,4 +1,0 @@
-# Copy to <base_dir>/identity/producers.toml and restart the gateway to apply.
-tests = "mix test --warnings-as-errors"
-smoke = "bin/smoke --against staging"
-timeout_ms = 600000

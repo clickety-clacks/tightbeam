@@ -1,25 +1,3 @@
-defmodule Tightbeam.ConformanceProducerRegistry do
-  use GenServer
-
-  def start_link do
-    GenServer.start_link(__MODULE__, %{})
-  end
-
-  @impl true
-  def init(state), do: {:ok, state}
-
-  @impl true
-  # Tracks ProducerRunner's real arity: registration carries the captured process
-  # start time, which every later signal is verified against (task #45).
-  def handle_call({:register_process, job_id, port, os_pid, started}, _from, state) do
-    {:reply, :ok, Map.put(state, job_id, %{port: port, os_pid: os_pid, started: started})}
-  end
-
-  @impl true
-  def handle_cast({:unregister_process, job_id}, state),
-    do: {:noreply, Map.delete(state, job_id)}
-end
-
 defmodule Tightbeam.ConformanceLaneManager do
   use GenServer
 
@@ -51,7 +29,6 @@ defmodule Tightbeam.ConformanceSupport do
     ModelCatalog,
     Org,
     Placement,
-    Producers,
     Projection,
     RailRemedy,
     Rails,
@@ -83,14 +60,13 @@ defmodule Tightbeam.ConformanceSupport do
   }
   @load_twins [
     ~w(remedy-target-missing remedy-target-present),
-    ~w(missing-producer-unsatisfiable producer-present-satisfiable),
     ~w(static-blocker-unsatisfiable runtime-conditional-blocker-loads),
     ~w(dead-remedy live-remedy),
-    ~w(dead-gate producer-backed-gate),
+    ~w(dead-gate artifact-backed-gate),
     ~w(grammar-root-table-rejected grammar-nested-accepted)
   ]
   @world_keys MapSet.new(
-                ~w(users sessions roles work_items assignments attests producer_verdict retune producer_job adjudicate adjudication_episode ledger wakes turn)
+                ~w(users sessions roles work_items assignments attests retune adjudicate adjudication_episode ledger wakes turn)
               )
   @world_shapes %{
     "users" => ~w(id admin),
@@ -99,9 +75,7 @@ defmodule Tightbeam.ConformanceSupport do
     "work_items" => ~w(id title),
     "assignments" => ~w(id holder creator reviews files),
     "attests" => ~w(assignment kind by verdict_kind),
-    "producer_verdict" => ~w(assignment verdict_kind producer producerCommand),
     "retune" => ~w(session harness provider),
-    "producer_job" => ~w(verb assignment state),
     "adjudicate" => ~w(session hold),
     "adjudication_episode" => ~w(session status),
     "ledger" => ~w(session pending),
@@ -542,9 +516,6 @@ defmodule Tightbeam.ConformanceSupport do
       {"C4", _, "declared-files-overlap"} ->
         run_handler_refusal_fixture(fixture)
 
-      {"C4", _, "producer-cas-verdict-txn"} ->
-        run_producer_cas_races(fixture)
-
       {"C4", _, _} ->
         run_rules_fixture(fixture)
 
@@ -723,7 +694,7 @@ defmodule Tightbeam.ConformanceSupport do
     base = temp_dir!("conformance-rules")
     prepare_rule_base!(base, fixture)
     handlers = Gateway.handlers(%{})
-    Rules.load!(base, Map.keys(handlers), %{tests: "fixture", smoke: "fixture"})
+    Rules.load!(base, Map.keys(handlers))
 
     try do
       Enum.each(fixture["cases"], &run_rule_case(fixture, &1, handlers, base))
@@ -738,7 +709,7 @@ defmodule Tightbeam.ConformanceSupport do
     base = temp_dir!("conformance-real-rail")
     prepare_rule_base!(base, fixture, real_rail_exec: true)
     handlers = Gateway.handlers(%{})
-    Rules.load!(base, Map.keys(handlers), %{})
+    Rules.load!(base, Map.keys(handlers))
 
     try do
       fixture["cases"]
@@ -881,88 +852,7 @@ defmodule Tightbeam.ConformanceSupport do
     end)
   end
 
-  defp assert_fixture_world(%{"name" => "orphaned-running-failed"}, kase, db, ids) do
-    :ok = Producers.recover(db)
-
-    Enum.each(ids.producer_jobs, fn {_key, job_id} ->
-      job = Producers.get(db, job_id)
-
-      if kase["expect"] == "deny" do
-        assert job.state == "failed"
-        assert Assignments.list_attests(db, job.assignment_id) == []
-
-        assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
-                 event.kind == "producer_failed" and event.subject == job.assignment_id and
-                   event.detail =~ "orphaned"
-               end)
-      else
-        assert job.state == "done"
-        assert length(Assignments.list_attests(db, job.assignment_id)) == 1
-      end
-    end)
-  end
-
   defp assert_fixture_world(_fixture, _kase, _db, _ids), do: :ok
-
-  def run_producer_cas_races(fixture) do
-    Enum.each(fixture["cases"], fn kase ->
-      {db, pid} = memory_db!()
-      base = temp_dir!("conformance-producer")
-      {:ok, runner} = Tightbeam.ConformanceProducerRegistry.start_link()
-      config = %{base_dir: base, db: db, port: 0}
-
-      try do
-        ids = materialize_world(db, kase["world"])
-        [{_key, job_id}] = Map.to_list(ids.producer_jobs)
-        job = Producers.get(db, job_id)
-
-        case kase["case"] do
-          "done-vs-failure-race-one-cas-wins" ->
-            [done_result, failed_result] =
-              [
-                Task.async(fn -> Producers.execute(db, config, job, runner) end),
-                Task.async(fn -> Producers.fail_running(db, job.id, "racing failure") end)
-              ]
-              |> Task.await_many()
-
-            assert Enum.count([done_result, failed_result], &(&1 in [:done, :failed])) == 1
-            assert Enum.count([done_result, failed_result], &(&1 == :noop)) == 1
-
-            case Producers.get(db, job.id).state do
-              "done" ->
-                assert [_verdict] = Assignments.list_attests(db, job.assignment_id)
-
-              "failed" ->
-                assert Assignments.list_attests(db, job.assignment_id) == []
-            end
-
-          "two-workers-race-done-one-verdict" ->
-            results =
-              [
-                Task.async(fn -> Producers.execute(db, config, job, runner) end),
-                Task.async(fn -> Producers.execute(db, config, job, runner) end)
-              ]
-              |> Task.await_many()
-
-            assert Enum.sort(results) == [:done, :noop]
-            assert Producers.get(db, job.id).state == "done"
-            assert [_verdict] = Assignments.list_attests(db, job.assignment_id)
-
-          "cancel-before-claim-commits-no-verdict" ->
-            assert job.state == "cancelled"
-            assert Assignments.list_attests(db, job.assignment_id) == []
-
-          "failed-job-denial-is-legible" ->
-            assert job.state == "failed"
-            assert Assignments.list_attests(db, job.assignment_id) == []
-        end
-      after
-        GenServer.stop(runner)
-        File.rm_rf!(base)
-        GenServer.stop(pid)
-      end
-    end)
-  end
 
   def run_handler_refusal_fixture(fixture) do
     Enum.each(fixture["cases"], fn kase ->
@@ -1013,7 +903,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_overlap_observation(%{"rule" => [_ | _]} = fixture, db, call, overlap?) do
     base = temp_dir!("conformance-overlap-observation")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       if overlap?,
@@ -1043,7 +933,6 @@ defmodule Tightbeam.ConformanceSupport do
     loadset["loadset_dir"]
     |> Path.join("*.toml")
     |> Path.wildcard()
-    |> Enum.reject(&(Path.basename(&1) == "producers.toml"))
     |> Enum.each(&File.cp!(&1, Path.join(rules_dir, Path.basename(&1))))
 
     loadset["loadset_dir"]
@@ -1054,26 +943,7 @@ defmodule Tightbeam.ConformanceSupport do
     try do
       outcome =
         try do
-          producers =
-            case File.read(Path.join(loadset["loadset_dir"], "producers.toml")) do
-              {:ok, encoded} ->
-                producer_base = temp_dir!("conformance-producers")
-                identity = Path.join(producer_base, "identity")
-                File.mkdir_p!(identity)
-                File.write!(Path.join(identity, "producers.toml"), encoded)
-                init_committed_identity!(identity)
-
-                try do
-                  Producers.load!(producer_base)
-                after
-                  File.rm_rf!(producer_base)
-                end
-
-              {:error, :enoent} ->
-                %{}
-            end
-
-          Rules.load!(base, Map.keys(Gateway.handlers(%{})), producers)
+          Rules.load!(base, Map.keys(Gateway.handlers(%{})))
           :clean
         rescue
           error in ArgumentError -> {:raise, Exception.message(error)}
@@ -1096,34 +966,11 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  defp init_committed_identity!(identity) do
-    {"", 0} = System.cmd("git", ["init", "--quiet"], cd: identity)
-    {"", 0} = System.cmd("git", ["add", "producers.toml"], cd: identity)
-
-    {_output, 0} =
-      System.cmd(
-        "git",
-        [
-          "-c",
-          "user.name=Conformance",
-          "-c",
-          "user.email=conformance@tightbeam.invalid",
-          "commit",
-          "--quiet",
-          "-m",
-          "fixture"
-        ],
-        cd: identity
-      )
-
-    :ok
-  end
-
   def run_rules_decide(fixture) do
     base = temp_dir!("conformance-decide")
     prepare_rule_base!(base, fixture)
     handlers = Gateway.handlers(%{})
-    Rules.load!(base, Map.keys(handlers), %{})
+    Rules.load!(base, Map.keys(handlers))
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -1171,7 +1018,7 @@ defmodule Tightbeam.ConformanceSupport do
   def run_remedy_episode_contract(%{"name" => "remedy-episode-idempotent"} = fixture) do
     base = temp_dir!("conformance-remedy-episode-matrix")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -1334,7 +1181,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp run_aggregate_remedy_episode_contract(fixture) do
     base = temp_dir!("conformance-remedy-episode")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
     {db, pid} = memory_db!()
 
     try do
@@ -1480,7 +1327,7 @@ defmodule Tightbeam.ConformanceSupport do
   def run_escalation_return_dispatch_contract(fixture) do
     base = temp_dir!("conformance-escalation-dispatch-matrix")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -1609,7 +1456,7 @@ defmodule Tightbeam.ConformanceSupport do
   def run_escalation_return_sweep_contract(fixture) do
     base = temp_dir!("conformance-escalation-sweep-matrix")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
     service_pids = start_wake_delivery_services()
 
     try do
@@ -1807,7 +1654,7 @@ defmodule Tightbeam.ConformanceSupport do
   def run_park_wake_reuse_contract(fixture) do
     base = temp_dir!("conformance-park-wake-reuse")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -1873,7 +1720,7 @@ defmodule Tightbeam.ConformanceSupport do
 
     base = temp_dir!("conformance-r21-pending-wake")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -1966,7 +1813,7 @@ defmodule Tightbeam.ConformanceSupport do
   def run_schedule_then_check_contract(fixture) do
     base = temp_dir!("conformance-schedule-then-check")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
     service_pids = start_wake_delivery_services()
 
     try do
@@ -2076,7 +1923,7 @@ defmodule Tightbeam.ConformanceSupport do
   def run_sweep_ruling_contract(fixture) do
     base = temp_dir!("conformance-sweep-ruling")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
     {db, pid} = memory_db!()
 
     try do
@@ -2149,7 +1996,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp run_judge_capstone(fixture, verdict_kind, iterate?) do
     base = temp_dir!("conformance-capstone-judge")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       missing =
@@ -2261,13 +2108,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp run_produced_capstone(fixture, release_case) do
     base = temp_dir!("conformance-capstone-produced")
     prepare_rule_base!(base, fixture)
-
-    producers =
-      if release_case == "produced-tests-release",
-        do: %{tests: "true"},
-        else: %{smoke: "true"}
-
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), producers)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       missing =
@@ -2318,7 +2159,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp run_retired_holder_contract(fixture) do
     base = temp_dir!("conformance-retired-holder")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       sample =
@@ -2377,7 +2218,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp run_watermark_contract(fixture) do
     base = temp_dir!("conformance-watermark")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       nil_case = Enum.find(fixture["cases"], &(&1["case"] == "nil-fallthrough-no-null-write"))
@@ -2419,7 +2260,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp run_sweep_escalation_contract(fixture) do
     base = temp_dir!("conformance-sweep-escalation")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
     {db, pid} = memory_db!()
 
     try do
@@ -2462,7 +2303,7 @@ defmodule Tightbeam.ConformanceSupport do
   def run_remedy_action_contract(fixture) do
     base = temp_dir!("conformance-remedy-actions")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
     {db, pid} = memory_db!()
 
     try do
@@ -2599,7 +2440,7 @@ defmodule Tightbeam.ConformanceSupport do
     base = temp_dir!("conformance-escalation-fold")
     prepare_rule_base!(base, fixture)
     handlers = Gateway.handlers(%{})
-    Rules.load!(base, Map.keys(handlers), %{})
+    Rules.load!(base, Map.keys(handlers))
 
     try do
       {db, pid} = memory_db!()
@@ -2681,7 +2522,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp run_dispatch_actor(fixture) do
     base = temp_dir!("conformance-dispatch-actor")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -2771,7 +2612,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp run_supervision_actor(fixture) do
     base = temp_dir!("conformance-supervision-actor")
     prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})), %{})
+    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
 
     try do
       Enum.each(fixture["cases"], fn kase ->
@@ -2873,7 +2714,6 @@ defmodule Tightbeam.ConformanceSupport do
           Assignments,
           WorkState,
           EventLog,
-          Producers,
           Ledger,
           ConditionFacts,
           Wakes,
@@ -2892,7 +2732,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp materialize_world(
          db,
          world,
-         ids \\ %{assignments: %{}, work_items: %{}, producer_jobs: %{}, turns: %{}}
+         ids \\ %{assignments: %{}, work_items: %{}, turns: %{}}
        ) do
     Enum.each(Map.get(world, "users", []), fn user ->
       {:ok, _} =
@@ -2987,8 +2827,6 @@ defmodule Tightbeam.ConformanceSupport do
       refute Map.has_key?(result, :code), "failed to materialize attest: #{inspect(result)}"
     end)
 
-    producer_verdicts = Map.get(world, "producer_verdict", [])
-
     Enum.each(Map.get(world, "retune", []), fn retune ->
       fields =
         Enum.filter(
@@ -3023,69 +2861,6 @@ defmodule Tightbeam.ConformanceSupport do
           """,
           [episode["session"], episode["status"], "fixture-#{episode["session"]}"]
         )
-    end)
-
-    producer_jobs =
-      Enum.reduce(Map.get(world, "producer_job", []), ids.producer_jobs, fn producer_job,
-                                                                            job_ids ->
-        assignment_id = assignments[producer_job["assignment"]]
-        key = {producer_job["verb"], producer_job["assignment"]}
-
-        {:ok, [[holder]]} =
-          DB.query(db, "SELECT holderKey FROM assignments WHERE id = ?1", [assignment_id])
-
-        job_id =
-          case Map.fetch(job_ids, key) do
-            {:ok, existing} ->
-              existing
-
-            :error ->
-              assert %{queued: queued} =
-                       Producers.__handle__(
-                         db,
-                         producer_job["verb"],
-                         %{
-                           principal: {:session, holder},
-                           params: %{assignment_id: assignment_id}
-                         },
-                         config: %{tests: "true", smoke: "true", timeout_ms: 5_000}
-                       )
-
-              queued
-          end
-
-        transition_producer_job(db, job_id, producer_job["state"], holder)
-        Map.put(job_ids, key, job_id)
-      end)
-
-    Enum.each(producer_verdicts, fn verdict ->
-      assignment_id = assignments[verdict["assignment"]]
-      kind = Map.fetch!(%{"build" => "tests", "smoke" => "smoke"}, verdict["producer"])
-
-      assert {:ok, [[by_session, by_user, by_harness, by_provider]]} =
-               DB.query(
-                 db,
-                 """
-                 SELECT bySession, byUser, byHarness, byProvider
-                 FROM producer_jobs
-                 WHERE assignmentId=?1 AND kind=?2 AND command=?3
-                 """,
-                 [assignment_id, kind, verdict["producerCommand"]]
-               )
-
-      {:ok, {:ok, _}} =
-        DB.transaction(db, fn txn ->
-          Assignments.insert_producer_verdict_in_txn(txn, %{
-            assignment_id: assignment_id,
-            verdict_kind: verdict["verdict_kind"],
-            producer: verdict["producer"],
-            producer_command: verdict["producerCommand"],
-            by_session: by_session,
-            by_user: by_user,
-            by_harness: by_harness,
-            by_provider: by_provider
-          })
-        end)
     end)
 
     Enum.each(Map.get(world, "wakes", []), fn wake ->
@@ -3149,63 +2924,8 @@ defmodule Tightbeam.ConformanceSupport do
     %{
       assignments: assignments,
       work_items: work_items,
-      producer_jobs: producer_jobs,
       turns: turns
     }
-  end
-
-  defp transition_producer_job(_db, _job_id, "queued", _holder), do: :ok
-
-  defp transition_producer_job(db, job_id, "cancelled", holder) do
-    assert %{cancelled: ^job_id} =
-             Producers.__handle__(db, "cancel-producer-job", %{
-               principal: {:session, holder},
-               params: %{job_id: job_id}
-             })
-
-    assert Producers.get(db, job_id).state == "cancelled"
-  end
-
-  defp transition_producer_job(db, job_id, state, _holder)
-       when state in ~w(running done failed) do
-    job = Producers.get(db, job_id)
-    job = if job.state == "queued", do: Producers.claim_next(db), else: job
-    assert job.id == job_id
-
-    case state do
-      "running" ->
-        assert Producers.get(db, job_id).state == "running"
-
-      "failed" ->
-        assert Producers.fail_running(db, job_id, "conformance fixture") == :failed
-        assert Assignments.list_attests(db, job.assignment_id) == []
-
-      "done" ->
-        result = production_finish_producer_job(db, job)
-
-        assert result == :done,
-               "producer completion failed: #{inspect(Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "producer_failed")))}"
-
-        assert production_finish_producer_job(db, job) == :noop
-        assert Producers.fail_running(db, job_id, "losing failure") == :noop
-        assert [verdict] = Assignments.list_attests(db, job.assignment_id)
-        assert verdict.byHarness == job.by_harness
-        assert verdict.byProvider == job.by_provider
-        assert verdict.producer == job.producer
-        assert verdict.producerCommand == job.command
-    end
-  end
-
-  defp production_finish_producer_job(db, job) do
-    base = temp_dir!("conformance-producer-finish")
-    {:ok, runner} = Tightbeam.ConformanceProducerRegistry.start_link()
-
-    try do
-      Producers.execute(db, %{base_dir: base, db: db, port: 0}, job, runner)
-    after
-      GenServer.stop(runner)
-      File.rm_rf!(base)
-    end
   end
 
   defp first_user(world), do: world |> Map.get("users", []) |> List.first() |> Map.fetch!("id")
@@ -3685,15 +3405,18 @@ defmodule Tightbeam.ConformanceTest do
         "#{structured} structured-legibility assertion sets active"
     )
 
-    # The corpus SIZE is unchanged: nothing was deleted. What changed is the
-    # honesty of the split — seven C6 fixtures moved out of "active" (where a
-    # catch-all ran a foreign contract on their behalf) and into named skips.
-    assert length(@fixtures) == 72
-    assert active_fixtures == 62
+    # verification-papertrail-v1 removed the producer subsystem and with it
+    # seven fixtures: five C4 producer fixtures (producer-cas-verdict-txn,
+    # frozen-job-provenance, produced-tests-only, produced-real-run-only,
+    # orphaned-running-failed) and the missing-producer/producer-present F1
+    # loadset twin; producer-backed-gate was replaced 1:1 by
+    # artifact-backed-gate. The ten exact-mechanism skips are untouched.
+    assert length(@fixtures) == 65
+    assert active_fixtures == 55
     assert exact_skips == 10
-    assert activated_fixture_tests == 49
+    assert activated_fixture_tests == 42
     assert activated_class_tests == 5
-    assert activated_tests == 54
+    assert activated_tests == 47
   end
 
   # The structural guard for the defect this file used to carry: a catch-all clause
@@ -3740,7 +3463,7 @@ defmodule Tightbeam.ConformanceTest do
       )
     end)
 
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 59
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 52
 
     assert %{
              scope: "case",
@@ -3769,10 +3492,6 @@ defmodule Tightbeam.ConformanceTest do
     fixture = fixture!("C7", "adjudication-hold-order")
     Corpus.run_rules_decide(fixture)
     Corpus.run_acting_layer(fixture)
-  end
-
-  test "C4 producer completion races commit at most one frozen verdict" do
-    Corpus.run_producer_cas_races(fixture!("C4", "producer-cas-verdict-txn"))
   end
 
   test "C5 real rail-exec drives git state, observed files, exit bands, CWD, and laziness" do

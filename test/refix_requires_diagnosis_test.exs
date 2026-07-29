@@ -73,7 +73,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     handlers = Gateway.handlers(%{db: db})
 
-    rules = Rules.load!(base_dir, Map.keys(handlers), %{})
+    rules = Rules.load!(base_dir, Map.keys(handlers))
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -95,7 +95,9 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   test "shipped statute loads through satisfiability and first-attempt bugs proceed", ctx do
     assert Enum.map(ctx.rules, & &1.name) == [
              "completion-requires-review",
-             "refix-requires-diagnosis"
+             "refix-requires-diagnosis",
+             "completion-requires-verification",
+             "completion-requires-results-artifact"
            ]
 
     item = work_item(ctx, true)
