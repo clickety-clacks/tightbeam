@@ -7,6 +7,8 @@ defmodule Tightbeam.Spinup do
   changing them, and records the result as lifecycle history.
   """
 
+  require Logger
+
   alias Tightbeam.{EventLog, Harness, Homes, Placement}
   alias Tightbeam.Harness.Support
 
@@ -83,11 +85,23 @@ defmodule Tightbeam.Spinup do
     install_dir = Path.join(target.host_config.base_dir, "adapters")
     command = install_command(target, install_dir, locality)
 
+    # A start line AND a closing line, deliberately: a cold-cache npm install is
+    # minutes of silence, and a gateway that says nothing while it runs reads
+    # exactly like a broken one (#102). The client-e2e driver's readiness wait
+    # also names an open install by these lines.
+    Logger.info(
+      "installing ACP adapters into #{install_dir} on #{target.host_name} — " <>
+        "npm can take minutes on a cold cache"
+    )
+
     case target.sh.(command) do
       {_output, 0} ->
+        Logger.info("ACP adapter install into #{install_dir} on #{target.host_name} complete")
         confirm_adapter(target, module, path, locality)
 
       {output, _exit} ->
+        Logger.warning("ACP adapter install into #{install_dir} on #{target.host_name} failed")
+
         {:error,
          host_unready(
            "host #{target.host_name} is not ready for #{module.wire_name()}: adapter deployment failed: #{String.trim(output)}" <>

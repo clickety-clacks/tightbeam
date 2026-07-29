@@ -92,6 +92,56 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "deployed adapters"
   end
 
+  # An install is minutes of npm silence on a cold cache, indistinguishable from
+  # a broken gateway unless it says so (#102). Every start line gets a closer —
+  # complete or failed — and the client-e2e driver's readiness wait names an
+  # open install by these exact phrases (LegGateway.await_runnable's hint), so
+  # a rewording here must carry that hint with it.
+  test "adapter provisioning logs a start line and a complete line", ctx do
+    adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
+    credential = Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+    File.mkdir_p!(Path.dirname(credential))
+    File.write!(credential, "test-token")
+
+    sh = fn _command ->
+      File.mkdir_p!(Path.dirname(adapter))
+      File.write!(adapter, "#!/bin/sh\n")
+      File.chmod!(adapter, 0o755)
+      {"", 0}
+    end
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok =
+                 Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "testhost",
+                   db: ctx.db,
+                   sh: sh,
+                   patch_adapter: no_patch()
+                 )
+      end)
+
+    install_dir = Path.join(ctx.base_dir, "adapters")
+    assert log =~ "installing ACP adapters into #{install_dir} on testhost"
+    assert log =~ "ACP adapter install into #{install_dir} on testhost complete"
+  end
+
+  test "a failed install closes its start line with a failed line", ctx do
+    sh = fn _command -> {"npm error code E404\nnot found", 1} end
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, %{code: "host_unready"}} =
+                 Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :codex, "testhost",
+                   db: ctx.db,
+                   sh: sh
+                 )
+      end)
+
+    install_dir = Path.join(ctx.base_dir, "adapters")
+    assert log =~ "installing ACP adapters into #{install_dir} on testhost"
+    assert log =~ "ACP adapter install into #{install_dir} on testhost failed"
+  end
+
   test "local adapter install failure names the npm remedy for this host", ctx do
     sh = fn _command -> {"npm error code E404\nnot found", 1} end
 

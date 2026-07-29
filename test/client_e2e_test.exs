@@ -475,6 +475,195 @@ defmodule Tightbeam.ClientE2ETest do
     end
   end
 
+  describe "leg provisioning carries the template's adapters (#102)" do
+    alias Tightbeam.ClientE2E.LegGateway
+
+    # A leg provisioned WITHOUT adapters/ boots with zero ACP adapters: its own
+    # boot summary says NOT READY, every spawn faults while npm spends minutes
+    # installing, and the run is poisoned before turn 1. The copy is same-host
+    # by construction, so the template's node_modules (native deps included)
+    # and its relative .bin symlinks are valid as-is.
+    test "provision! copies adapters/ alongside auth/, homes/ and identity/ — never state.db" do
+      template =
+        Path.join(
+          System.tmp_dir!(),
+          "tightbeam-client-e2e-template-#{System.unique_integer([:positive])}"
+        )
+
+      base_dir = template <> "-leg-client-e2e"
+      on_exit(fn -> File.rm_rf!(template) end)
+      on_exit(fn -> File.rm_rf!(base_dir) end)
+
+      adapter = Path.join(["adapters", "node_modules", ".bin", "claude-agent-acp"])
+
+      for rel <- [adapter, "auth/claude/token", "homes/marker", "identity/marker"] do
+        path = Path.join(template, rel)
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, rel)
+      end
+
+      # History must NOT ride along: a fresh leg with the template's state.db is
+      # not a fresh leg.
+      File.write!(Path.join(template, "state.db"), "history")
+
+      LegGateway.provision!(template, base_dir)
+
+      assert File.exists?(Path.join(base_dir, adapter)),
+             "the template's installed adapters must ride into the leg"
+
+      for rel <- ["auth/claude/token", "homes/marker", "identity/marker"] do
+        assert File.exists?(Path.join(base_dir, rel))
+      end
+
+      refute File.exists?(Path.join(base_dir, "state.db"))
+    end
+  end
+
+  describe "the driver's readiness gate (#102)" do
+    alias Tightbeam.ClientE2E.LegGateway
+    alias Tightbeam.Readiness
+
+    # The defect this gate exists for: the leg gateway's own boot summary said
+    # NOT READY, with the exact remedy, and the driver walked journeys anyway.
+    # These tests fake only the READ — the log content is produced by the REAL
+    # renderer (Tightbeam.Readiness.render/2), so the parser is pinned to the
+    # renderer's actual shapes rather than to a hand-written imitation.
+
+    test "a READY verdict naming the leg admits it" do
+      dir = gate_dir!()
+
+      lines =
+        Readiness.render(
+          %{runnable?: true, harnesses: [readiness_row("claude", %{})]},
+          %{base_dir: dir}
+        )
+
+      gateway = gate_gateway!(dir, ["boot noise" | lines])
+
+      assert LegGateway.await_runnable(gateway, "claude", "testhost",
+               timeout_ms: 2_000,
+               poll_ms: 50,
+               progress: quiet()
+             ) == :ok
+    end
+
+    test "a NOT READY verdict refuses the leg, quoting the gateway's own remedy" do
+      dir = gate_dir!()
+      missing = Path.join([dir, "adapters", "node_modules", ".bin", "claude-agent-acp"])
+
+      lines =
+        Readiness.render(
+          %{
+            runnable?: false,
+            harnesses: [
+              readiness_row("claude", %{adapter: {:missing, missing}, runnable?: false})
+            ]
+          },
+          %{base_dir: dir}
+        )
+
+      gateway = gate_gateway!(dir, lines)
+
+      assert {:error, {:not_ready, quoted}} =
+               LegGateway.await_runnable(gateway, "claude", "testhost",
+                 timeout_ms: 2_000,
+                 poll_ms: 50,
+                 progress: quiet()
+               )
+
+      # The refusal must carry the gateway's OWN words: the verdict, the leg's
+      # gap, and the remedy the operator is told to run.
+      assert quoted =~ "NOT READY"
+      assert quoted =~ "claude on testhost:"
+      assert quoted =~ "ACP adapter missing at #{missing}"
+      assert quoted =~ "tightbeam assimilate --harness claude"
+      assert quoted =~ "Diagnose further with: mix tightbeam.doctor"
+    end
+
+    test "READY for another harness still refuses a leg the summary reports blocked" do
+      dir = gate_dir!()
+      missing = Path.join([dir, "adapters", "node_modules", ".bin", "claude-agent-acp"])
+
+      lines =
+        Readiness.render(
+          %{
+            runnable?: true,
+            harnesses: [
+              readiness_row("codex", %{provider: :openai}),
+              readiness_row("claude", %{adapter: {:missing, missing}, runnable?: false})
+            ]
+          },
+          %{base_dir: dir}
+        )
+
+      gateway = gate_gateway!(dir, lines)
+
+      assert LegGateway.await_runnable(gateway, "codex", "testhost",
+               timeout_ms: 2_000,
+               poll_ms: 50,
+               progress: quiet()
+             ) == :ok
+
+      assert {:error, {:not_ready, quoted}} =
+               LegGateway.await_runnable(gateway, "claude", "testhost",
+                 timeout_ms: 2_000,
+                 poll_ms: 50,
+                 progress: quiet()
+               )
+
+      assert quoted =~ "claude on testhost:"
+      assert quoted =~ "ACP adapter missing at #{missing}"
+    end
+
+    test "no verdict waits, names what it is waiting on, then fails legibly" do
+      dir = gate_dir!()
+
+      # An open Spinup start line (no complete/failed closer) is the known slow
+      # case, and the wait must NAME it — installing and broken are otherwise
+      # indistinguishable silence.
+      gateway =
+        gate_gateway!(dir, [
+          "Running Tightbeam.Wire.Router with Bandit 1.0 at 127.0.0.1:0 (http)",
+          "installing ACP adapters into #{dir}/adapters on testhost — npm can take minutes on a cold cache"
+        ])
+
+      parent = self()
+
+      assert {:error, {:no_verdict, detail}} =
+               LegGateway.await_runnable(gateway, "claude", "testhost",
+                 timeout_ms: 300,
+                 poll_ms: 50,
+                 progress: &send(parent, {:progress, &1})
+               )
+
+      assert detail =~ "never published its boot readiness verdict"
+      assert detail =~ "ACP adapters installing"
+
+      assert_received {:progress, progress_line}
+      assert progress_line =~ "waiting on the gateway's boot readiness verdict"
+      assert progress_line =~ "ACP adapters installing"
+    end
+
+    test "a closed install no longer reads as installing" do
+      dir = gate_dir!()
+
+      gateway =
+        gate_gateway!(dir, [
+          "installing ACP adapters into #{dir}/adapters on testhost — npm can take minutes on a cold cache",
+          "ACP adapter install into #{dir}/adapters on testhost complete"
+        ])
+
+      assert {:error, {:no_verdict, detail}} =
+               LegGateway.await_runnable(gateway, "claude", "testhost",
+                 timeout_ms: 150,
+                 poll_ms: 50,
+                 progress: quiet()
+               )
+
+      refute detail =~ "ACP adapters installing"
+    end
+  end
+
   describe "leg teardown reports what actually happened" do
     alias Tightbeam.ClientE2E.LegGateway
 
@@ -1066,6 +1255,50 @@ defmodule Tightbeam.ClientE2ETest do
       assert Enum.all?(rows, &(&1.note =~ "gateway"))
     end
   end
+
+  ## Readiness-gate helpers (#102)
+
+  defp gate_dir! do
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-client-e2e-gate-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    dir
+  end
+
+  defp gate_gateway!(dir, lines) do
+    log_path = Path.join(dir, "gateway.log")
+
+    # As Logger writes them: console prefix first, message (indentation
+    # intact) after.
+    File.write!(
+      log_path,
+      Enum.map_join(lines, "", &("12:00:00.000 [info] " <> &1 <> "\n"))
+    )
+
+    %Tightbeam.ClientE2E.LegGateway{base_dir: dir, port: 0, log_path: log_path}
+  end
+
+  defp readiness_row(harness, overrides) do
+    Map.merge(
+      %{
+        host: "testhost",
+        harness: harness,
+        provider: :anthropic,
+        adapter: :present,
+        credential: :live,
+        model: :selectable,
+        runnable?: true
+      },
+      overrides
+    )
+  end
+
+  defp quiet, do: fn _line -> :ok end
 
   defp wait_for_file(path, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms

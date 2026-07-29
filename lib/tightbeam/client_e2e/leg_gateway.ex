@@ -15,6 +15,13 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   What is copied from the template org and why (SMOKE.md §Fresh-org
   provisioning — every one of these was rediscovered the hard way):
 
+  - `adapters/` — the pinned ACP adapter install (`node_modules/` and its
+    `.bin/` links). A leg without it boots with ZERO adapters: its own boot
+    summary says NOT READY, every adapter spawn faults while npm spends
+    minutes installing, and the run is poisoned before turn 1 (#102). The
+    copy is same-host by construction — the leg gateway runs on the machine
+    the template lives on — so native deps and the relative `.bin` symlinks
+    are valid as-is.
   - `auth/` — credentials are STORE ROWS, not loose files: the backing file,
     the home symlink, and the `.tightbeam/credential.json` metadata row all
     have to arrive together.
@@ -43,7 +50,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
   defstruct [:base_dir, :port, :os_pid, :os_command, :port_ref, :log_path]
 
-  @copied ~w(auth homes identity)
+  @copied ~w(adapters auth homes identity)
 
   @doc """
   Copies a provisioned template org into `base_dir` (which must not exist).
@@ -152,6 +159,172 @@ defmodule Tightbeam.ClientE2E.LegGateway do
       {:error, reason, gateway} ->
         teardown(gateway, remove: false)
         raise "gateway did not come up on port #{port} (#{reason}); log: #{gateway.log_path}"
+    end
+  end
+
+  @doc """
+  The readiness GATE the driver runs between boot and the first journey step.
+
+  `/version` answering proves the wire is up; it does not prove a turn can
+  run. Boot's own closing statement (`Tightbeam.Readiness`) already says
+  whether this leg's {host, harness} can run a turn and, when it cannot,
+  names the gap and the remedy — and the driver used to ignore it, walking
+  journeys into a run whose turn 1 had already failed (#102). This reads that
+  verdict back out of the gateway's own log:
+
+  - verdict READY naming "harness on host" → `:ok`;
+  - verdict present but the leg is not runnable → `{:error, {:not_ready,
+    text}}`, where `text` QUOTES the gateway's own gap and remedy lines. The
+    summary is emitted once per boot, so a not-ready verdict cannot flip;
+    waiting on it would only bury the remedy under a timeout — and a wait
+    that outlasts a genuine boot failure is worse than the failure;
+  - no verdict within the bound → `{:error, {:no_verdict, text}}`.
+
+  The wait is therefore only for the verdict to APPEAR: it lands
+  asynchronously, after the catalog refresh settles. While waiting, progress
+  output names what is being waited on — an ACP adapter install in flight
+  (`Tightbeam.Spinup`'s start/done log lines) is the known case an operator
+  needs to tell apart from a hang.
+  """
+  @spec await_runnable(t(), String.t(), String.t(), keyword()) ::
+          :ok | {:error, {:not_ready | :no_verdict, String.t()}}
+  def await_runnable(%__MODULE__{} = gateway, harness, host_name, opts \\ []) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, 60_000)
+    poll_ms = Keyword.get(opts, :poll_ms, 500)
+    progress = Keyword.get(opts, :progress, &IO.puts/1)
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    poll_verdict(gateway, "#{harness} on #{host_name}", deadline, poll_ms, progress, nil)
+  end
+
+  defp poll_verdict(gateway, leg_name, deadline, poll_ms, progress, last_progress_at) do
+    lines = log_lines(gateway.log_path)
+
+    case verdict(lines, leg_name) do
+      :runnable ->
+        :ok
+
+      {:not_runnable, quoted} ->
+        {:error, {:not_ready, quoted}}
+
+      :no_verdict ->
+        now = System.monotonic_time(:millisecond)
+
+        if now >= deadline do
+          {:error,
+           {:no_verdict,
+            "the gateway never published its boot readiness verdict (READY/NOT READY) " <>
+              "in #{gateway.log_path}" <> waiting_hint(lines)}}
+        else
+          last_progress_at =
+            if is_nil(last_progress_at) or now - last_progress_at >= 5_000 do
+              progress.("  waiting on the gateway's boot readiness verdict#{waiting_hint(lines)}")
+              now
+            else
+              last_progress_at
+            end
+
+          Process.sleep(poll_ms)
+          poll_verdict(gateway, leg_name, deadline, poll_ms, progress, last_progress_at)
+        end
+    end
+  end
+
+  # The known slow case, named while it is happening: Spinup logs a start line
+  # before `npm install` and a complete/failed line after, so an open start line
+  # means the silence is an install, not a hang. Drift here only degrades a
+  # progress hint — the verdict itself never depends on these lines.
+  defp waiting_hint(lines) do
+    starts = Enum.count(lines, &String.contains?(&1, "installing ACP adapters into"))
+    closers = Enum.count(lines, &String.contains?(&1, "ACP adapter install into"))
+
+    if starts > closers, do: " (ACP adapters installing — npm can take minutes)", else: ""
+  end
+
+  # Strip the Logger console prefix ("12:34:56.789 [info] ") so the summary
+  # lines compare against what Tightbeam.Readiness.render/2 actually produced,
+  # indentation intact.
+  defp log_lines(path) do
+    case File.read(path) do
+      {:ok, content} ->
+        content
+        |> String.split("\n")
+        |> Enum.map(&String.replace(&1, ~r/^\d{2}:\d{2}:\d{2}\.\d+ (?:[^\[]*)?\[[a-z]+\] /, ""))
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  defp verdict(lines, leg_name) do
+    case last_verdict_index(lines) do
+      nil ->
+        :no_verdict
+
+      index ->
+        if leg_name in ready_names(Enum.at(lines, index)) do
+          :runnable
+        else
+          {:not_runnable, quoted_block(lines, index, leg_name)}
+        end
+    end
+  end
+
+  defp last_verdict_index(lines) do
+    lines
+    |> Enum.with_index()
+    |> Enum.reduce(nil, fn {line, index}, acc ->
+      if String.starts_with?(line, "READY: ") or String.starts_with?(line, "NOT READY: "),
+        do: index,
+        else: acc
+    end)
+  end
+
+  # The names in "READY: claude on host1, codex on host2 can run turns." —
+  # the renderer's one READY shape, pinned exactly by the readiness suite.
+  defp ready_names(line) do
+    case Regex.run(~r/^READY: (.+) can run turns\.$/, line) do
+      [_, names] -> String.split(names, ", ")
+      nil -> []
+    end
+  end
+
+  # Quote the gateway's own words: the verdict line, this leg's gap/remedy row
+  # when the summary rendered one, and the doctor pointer. When the leg's row
+  # is not found (the summary explains the whole org, not this leg), quote the
+  # summary block wholesale — legibility beats brevity in a refusal.
+  defp quoted_block(lines, verdict_index, leg_name) do
+    rest = Enum.drop(lines, verdict_index)
+
+    row =
+      case Enum.find_index(rest, &(String.trim_trailing(&1) == "  " <> leg_name <> ":")) do
+        nil ->
+          []
+
+        row_index ->
+          [header | tail] = Enum.drop(rest, row_index)
+          [header | Enum.take_while(tail, &String.starts_with?(&1, "    "))]
+      end
+
+    quoted =
+      case row do
+        [] -> summary_block(rest)
+        row -> [hd(rest) | row] ++ diagnose_line(rest)
+      end
+
+    Enum.join(quoted, "\n")
+  end
+
+  defp diagnose_line(rest) do
+    rest |> Enum.filter(&String.starts_with?(&1, "Diagnose further with:")) |> Enum.take(1)
+  end
+
+  defp summary_block(rest) do
+    case Enum.find_index(rest, &String.starts_with?(&1, "Diagnose further with:")) do
+      # No terminator to cut at; a bounded raw quote keeps the refusal legible
+      # without replaying the whole log.
+      nil -> Enum.take(rest, 20)
+      index -> Enum.take(rest, index + 1)
     end
   end
 

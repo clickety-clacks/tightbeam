@@ -122,30 +122,62 @@ defmodule ClientE2ERunner do
 
         {:ok, gateway} ->
           Process.put(:leg_gateway, gateway)
-
-          # run_leg hands back the CURRENT gateway: J7 restarts it, and tearing
-          # down the pre-restart handle would signal a dead pid and delete the
-          # base_dir from under the live one.
-          {leg, current_gateway} =
-            ClientE2E.run_leg(
-              host: "127.0.0.1",
-              port: port,
-              base_dir: base_dir,
-              harness: harness,
-              model: model_for(harness),
-              gateway: gateway,
-              journeys: journeys,
-              preflight_row: preflight_row
-            )
-
-          Process.put(:leg_gateway, current_gateway || gateway)
-          IO.puts("leg #{harness}: #{Scorecard.verdict_text(Scorecard.leg_verdict(leg))}")
-          leg
+          run_ready_leg(gateway, harness, base_dir, port, journeys, preflight_row)
       end
     after
       teardown(Process.get(:leg_gateway), base_dir)
       Process.delete(:leg_gateway)
     end
+  end
+
+  defp run_ready_leg(gateway, harness, base_dir, port, journeys, preflight_row) do
+    host_name = Tightbeam.Placement.local_host_name()
+
+    # The gate between boot and the first journey step (#102): /version
+    # answering only proves the wire is up. The gateway's own boot summary says
+    # whether this {host, harness} can run a turn, and a driver that ignores a
+    # NOT READY verdict walks journeys into a run whose turn 1 already failed.
+    case LegGateway.await_runnable(gateway, harness, host_name) do
+      :ok ->
+        run_journeys(gateway, harness, base_dir, port, journeys, preflight_row)
+
+      {:error, {_kind, detail}} ->
+        IO.puts("  gateway readiness gate REFUSED this leg — journeys not started:")
+        detail |> String.split("\n") |> Enum.each(&IO.puts("    " <> &1))
+
+        %Scorecard.Leg{harness: harness, host: host_name}
+        |> Scorecard.add(preflight_row)
+        |> Scorecard.add(
+          Scorecard.fail(
+            "1",
+            "boot",
+            "gateway booted but reports it cannot run this leg's turns: #{detail}; " <>
+              "log: #{gateway.log_path}",
+            journey: "J0"
+          )
+        )
+    end
+  end
+
+  defp run_journeys(gateway, harness, base_dir, port, journeys, preflight_row) do
+    # run_leg hands back the CURRENT gateway: J7 restarts it, and tearing
+    # down the pre-restart handle would signal a dead pid and delete the
+    # base_dir from under the live one.
+    {leg, current_gateway} =
+      ClientE2E.run_leg(
+        host: "127.0.0.1",
+        port: port,
+        base_dir: base_dir,
+        harness: harness,
+        model: model_for(harness),
+        gateway: gateway,
+        journeys: journeys,
+        preflight_row: preflight_row
+      )
+
+    Process.put(:leg_gateway, current_gateway || gateway)
+    IO.puts("leg #{harness}: #{Scorecard.verdict_text(Scorecard.leg_verdict(leg))}")
+    leg
   end
 
   # A gateway that outlived SIGTERM keeps its directory, and gets said out loud:
