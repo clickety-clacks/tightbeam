@@ -97,12 +97,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
     %{db: db, base_dir: base_dir, handlers: handlers, holder: holder, reviewer: reviewer}
   end
 
+  # The statutes are NOT copied in: the setup's `init_identity!` is a real learn
+  # from the shipped bundle, so loading the org's own identity tree is what
+  # arrives on learn (§7). Copying them here would pass even if learn stopped
+  # delivering `rules/`.
   defp learn_engineering_rules!(ctx) do
     for file <- ["engineering.toml", "verification.toml"] do
-      File.cp!(
-        "priv/kungfu/agentic-engineering/rules/#{file}",
-        Path.join([ctx.base_dir, "identity", "rules", file])
-      )
+      assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
+             "learn did not deliver rules/#{file} into the org's identity tree"
     end
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -333,6 +335,30 @@ defmodule Tightbeam.VerificationPapertrailTest do
              EventLog.lifecycle_events(ctx.db),
              &(&1.detail =~ "verification" or &1.kind =~ "verification")
            )
+  end
+
+  test "learn delivers the verification statutes and they load beside engineering's (§7)", ctx do
+    shipped = File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
+    delivered = Path.join([ctx.base_dir, "identity", "rules", "verification.toml"])
+
+    # The setup's init_identity! is the real bundle import, not a fixture copy.
+    assert File.read!(delivered) == shipped
+
+    loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert Enum.map(loaded, & &1.name) == [
+             "completion-requires-review",
+             "refix-requires-diagnosis",
+             @verification_rule,
+             @artifact_rule
+           ]
+
+    # F1/F2 accept the shipped pair: the verdict gate is remedy-covered, and the
+    # artifact gate loads with no `produces` at all (D2).
+    verification = Enum.find(loaded, &(&1.name == @verification_rule))
+    artifact = Enum.find(loaded, &(&1.name == @artifact_rule))
+    assert verification.remedy.produces == "verified"
+    assert artifact.remedy.produces == nil
   end
 
   defp assign(ctx, holder_key, work_item_id, subject, opts \\ []) do
