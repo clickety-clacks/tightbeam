@@ -395,6 +395,53 @@ defmodule Tightbeam.CredentialKindsTest do
   end
 
   # ------------------------------------------------------------------
+  # The ceremony speaks the wire vocabulary end to end (invariant 2)
+  # ------------------------------------------------------------------
+
+  describe "the onboarding ceremony replies in wire spellings" do
+    # FAIL-BEFORE (#100): the finish reply returned the STORE spelling
+    # (`credential_kind: :api_key`), so the CLI printed "api_key" on a wire
+    # whose contract — and every other surface, via `wire_credential_kind/1` —
+    # says "apiKey". The camelizer rewrites keys, not atom values.
+    test "the finish reply names the banked kind as apiKey, not api_key", ctx do
+      :ok = Tightbeam.Devices.ensure_schema(ctx.db)
+
+      {:ok, _rows} =
+        Tightbeam.DB.query(
+          ctx.db,
+          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          ["kind-admin", System.system_time(:second)]
+        )
+
+      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+
+      onboard =
+        Tightbeam.Gateway.handlers(%{
+          base_dir: ctx.base,
+          db: ctx.db,
+          onboarding_lease_ms: 1_800_000
+        })["onboard"]
+
+      call = %{
+        origin: "user:kind-admin",
+        params: %{provider: "anthropic", kind: "apiKey"}
+      }
+
+      assert %{status: "ready", staging_path: staging} =
+               onboard.(put_in(call.params[:phase], "begin"))
+
+      File.write!(Path.join(staging, "oauth-token"), "sk-ant-api03-ceremony")
+
+      assert %{provider: :anthropic, credential_kind: "apiKey", status: "onboarded"} =
+               onboard.(put_in(call.params[:phase], "finish"))
+
+      # The wire translation did not leak into the store, whose spelling is its
+      # own (invariant: one authority per vocabulary).
+      assert Credentials.kind(:anthropic, Credentials) == :api_key
+    end
+  end
+
+  # ------------------------------------------------------------------
   # Acceptance 2: mixed fleet
   # ------------------------------------------------------------------
 

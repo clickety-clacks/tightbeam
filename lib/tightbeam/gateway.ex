@@ -2210,8 +2210,11 @@ defmodule Tightbeam.Gateway do
       :ok ->
         # The result the CLI prints. It names the kind that was banked, so a
         # successful ceremony says which of the two it installed rather than
-        # leaving the operator to go read the store.
-        %{provider: provider, credential_kind: kind, status: "onboarded"}
+        # leaving the operator to go read the store — in the WIRE spelling
+        # (`wire_credential_kind/1`), like every other surface: the camelizer
+        # rewrites keys, not atom values, so a bare `kind` here put the store's
+        # "api_key" on a wire whose contract says "apiKey".
+        %{provider: provider, credential_kind: wire_credential_kind(kind), status: "onboarded"}
 
       {:error, reason} ->
         %{
