@@ -456,9 +456,17 @@ defmodule Tightbeam.ModelCatalogTest do
 
     unavailable = {:unavailable, {:needs_onboarding, :credential_server_unavailable}}
 
+    # Every REGISTERED harness, not just the two with a stub: a refresh Task is the
+    # only thing that could do provider IO, and the refute below means nothing
+    # while one is still in flight. Waiting for all of them to report closes that
+    # set — and it stays closed because `@default_ttl_ms` is 15 minutes, so the
+    # polling `get` calls here cannot dispatch a second round. That TTL is
+    # load-bearing for the refute: hand this test a short `ttl_ms:`, or a second
+    # host, and it goes back to racing a live Task with nothing going red.
     await(fn ->
-      ModelCatalog.get(@host, "claude", name) == {[], unavailable} and
-        ModelCatalog.get(@host, "codex", name) == {[], unavailable}
+      Enum.all?(Tightbeam.Harness.all(), fn harness ->
+        ModelCatalog.get(@host, harness.wire_name(), name) == {[], unavailable}
+      end)
     end)
 
     refute_receive :provider_io
@@ -487,8 +495,17 @@ defmodule Tightbeam.ModelCatalogTest do
 
     {list_us, options} = :timer.tc(&Gateway.org_options/0)
 
-    assert reader_us < 100_000
-    assert list_us < 100_000
+    # The defect is a reader QUEUED BEHIND the hung refresh, and that has a floor,
+    # not a slope: it waits out `GenServer.call`'s 5s and then comes back in the
+    # shape the match above already refuses. So the number only has to separate
+    # "served while the fetch hangs" from that floor. Three ordered quantities,
+    # measured on a 4-core linux box 2026-07-29: served costs 44-122us idle and
+    # 12ms (read) / 74ms (list) with the four cores 3x oversubscribed; the bound
+    # below is 1s; the blocked floor is 5s. The old 100_000 sat inside the loaded
+    # range, so a busy runner failed it with nothing wrong — and a wall-clock
+    # budget that a healthy machine can miss reports load as a defect.
+    assert reader_us < 1_000_000
+    assert list_us < 1_000_000
     assert options.models[@host]["claude"] == []
     send(fetch_pid, :release)
   end
@@ -678,8 +695,28 @@ defmodule Tightbeam.ModelCatalogTest do
 
       # Local probes are ["sh", "-c", script] and run for real; anything bound for
       # another machine fails fast without touching the network.
+      #
+      # The real one is the ONLY external process the catalog suite spawns, and a
+      # spawn on a shared runner has an unbounded tail, so the test says when it
+      # returned instead of guessing how long it takes. Three ordered quantities,
+      # measured 2026-07-29: the spawn itself is 24-38ms on the linux runner and
+      # 128-168ms on the macOS one; the poll below then covers only the
+      # Task -> GenServer hop that follows it (<1ms) inside its 100 x 5ms = 500ms
+      # budget; the spawn gets the 10s bound of an external wait. Before this, the
+      # 500ms poll covered the spawn as well — 13x the linux cost but only 3x the
+      # macOS one — and one linux excursion past 500ms (run 30430140506) reported
+      # it as "condition did not become true", the shape of a broken verdict
+      # rather than of a slow runner.
+      parent = self()
+
       sh = fn command ->
-        if hd(command) == "sh", do: Support.system_cmd_out(command), else: {"", 255}
+        if hd(command) == "sh" do
+          result = Support.system_cmd_out(command)
+          send(parent, {:probe_returned, elem(result, 1)})
+          result
+        else
+          {"", 255}
+        end
       end
 
       states = [
@@ -695,6 +732,7 @@ defmodule Tightbeam.ModelCatalogTest do
       for {label, contents, expected} <- states do
         File.write!(auth, contents)
         catalog = start_catalog(ctx, name: unique_name(label), sh: sh)
+        assert_receive {:probe_returned, _exit_status}, 10_000
 
         await(fn ->
           ModelCatalog.get(@host, "codex", catalog) == {[], {:unavailable, expected}}
@@ -705,6 +743,7 @@ defmodule Tightbeam.ModelCatalogTest do
       # which must stay distinct from a torn read of one that is.
       File.rm!(auth)
       catalog = start_catalog(ctx, name: unique_name(:absent), sh: sh)
+      assert_receive {:probe_returned, _exit_status}, 10_000
 
       await(fn ->
         ModelCatalog.get(@host, "codex", catalog) ==
@@ -721,16 +760,17 @@ defmodule Tightbeam.ModelCatalogTest do
       end
 
       catalog = start_catalog(ctx, sh: sh)
+      unreachable = {[], {:unavailable, {:probe_failed, 255, ""}}}
 
-      await(fn ->
-        match?({[], {:unavailable, _}}, ModelCatalog.get("satellite", "claude", catalog))
-      end)
+      # Wait for the VERDICT, not for the shape of one. `:not_derived` is itself an
+      # `{:unavailable, _}`, so the old wait was satisfied before the first probe
+      # had run and waited for nothing at all — leaving the assertions below racing
+      # the probe the wait was there to cover.
+      await(fn -> ModelCatalog.get("satellite", "claude", catalog) == unreachable end)
+      await(fn -> ModelCatalog.get("satellite", "codex", catalog) == unreachable end)
 
-      assert {[], {:unavailable, {:probe_failed, 255, ""}}} =
-               ModelCatalog.get("satellite", "claude", catalog)
-
-      assert {[], {:unavailable, {:probe_failed, 255, ""}}} =
-               ModelCatalog.get("satellite", "codex", catalog)
+      assert ModelCatalog.get("satellite", "claude", catalog) == unreachable
+      assert ModelCatalog.get("satellite", "codex", catalog) == unreachable
 
       # The gateway's own entries are established here and stay fresh.
       await_fresh(catalog, "claude")
@@ -740,9 +780,16 @@ defmodule Tightbeam.ModelCatalogTest do
 
   defp claude_probe?(command), do: Enum.any?(command, &String.contains?(&1, "api.anthropic.com"))
 
-  defp probe_command!(harness, dest \\ nil) do
+  # Four probes race into one mailbox and each caller wants a different one, so a
+  # record this call skipped goes BACK — it is the next call's evidence. Dropping
+  # it made every assertion below depend on the order the four refresh Tasks
+  # happened to finish in: whichever probe reported first was eaten by whichever
+  # call came first, and the one that actually wanted it then waited out its
+  # second for a message that no longer existed ("no codex probe command was
+  # constructed"). Stable on an idle box, ordinary on a loaded one.
+  defp probe_command!(harness, dest \\ nil, skipped \\ []) do
     receive do
-      {:probe, command} ->
+      {:probe, command} = record ->
         matches_harness? = claude_probe?(command) == (harness == :claude)
 
         matches_dest? =
@@ -752,13 +799,20 @@ defmodule Tightbeam.ModelCatalogTest do
             name -> Enum.member?(command, name)
           end
 
-        if matches_harness? and matches_dest?,
-          do: command,
-          else: probe_command!(harness, dest)
+        if matches_harness? and matches_dest? do
+          requeue(skipped)
+          command
+        else
+          probe_command!(harness, dest, [record | skipped])
+        end
     after
-      1_000 -> flunk("no #{harness} probe command was constructed")
+      1_000 ->
+        requeue(skipped)
+        flunk("no #{harness} probe command was constructed")
     end
   end
+
+  defp requeue(skipped), do: skipped |> Enum.reverse() |> Enum.each(&send(self(), &1))
 
   defp start_catalog(ctx, overrides \\ []) do
     name = Keyword.get(overrides, :name, unique_name(:catalog))
