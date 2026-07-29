@@ -2,6 +2,8 @@ defmodule Tightbeam.Harness.Codex do
   @moduledoc false
   @behaviour Tightbeam.Harness
 
+  require Logger
+
   alias Tightbeam.Harness.Support
 
   @adapter_version "1.1.4"
@@ -20,11 +22,42 @@ defmodule Tightbeam.Harness.Codex do
   # 403 authorization failure. That contrast is the evidence the route treats API
   # keys as first-class.
   #
-  # UNVERIFIED WITH A VALID KEY as of 2026-07-28. Two things below rest on
-  # documentation rather than observation: `derive_platform_entries/1`'s response
-  # shape, and whether codex-acp runs a turn on api-key auth at all. If this
-  # branch misbehaves, PROBE IT before editing it.
+  # VERIFIED WITH A VALID KEY 2026-07-28 (the #89 api-key exercise, throwaway
+  # org): the route answered 200 with 125 bare ids in the platform shape
+  # `derive_platform_entries/1` decodes, and codex-acp ran a real turn on
+  # api-key auth (gpt-5.6-sol[medium]). What the exercise DISPROVED is that the
+  # adapter accepts everything this route lists — see
+  # `@adapter_selectable_models` below.
   @api_models_url "https://api.openai.com/v1/models"
+
+  # Model values codex-acp @adapter_version accepts at `session/set_config_option
+  # {configId: "model"}` — the API-KEY catalog is filtered to this set, because
+  # the platform route lists the account's whole model universe and the adapter
+  # accepts almost none of it.
+  #
+  # RECORDED LIVE 2026-07-28 (the #89 api-key exercise, throwaway org,
+  # codex-acp 1.1.4): GET /v1/models answered 125 bare ids; the adapter REFUSED
+  # the platform id `gpt-5.1-codex` with -32602 Invalid params, and ACCEPTED
+  # `gpt-5.6-sol`, which ran a real turn (effort medium) on the same adapter and
+  # auth. `gpt-5.1-codex` is spelled exactly like a codex slug and was refused
+  # anyway, so a platform id is NOT translatable into the adapter's vocabulary
+  # by any mapping this repo can compute from spelling — substituting a
+  # near-miss would be the silent-downgrade `harness/claude.ex` refuses. Hence a
+  # FILTER to the demonstrably-selectable set, claude's `@adapter_selectable_models`
+  # precedent exactly.
+  #
+  # Injectable (`codex_selectable_models` in the catalog's options, `:all` to
+  # disable): the accepted set is the ADAPTER VERSION's, and an operator on a
+  # newer adapter — or with acceptance evidence for more slugs — must be able to
+  # widen it without editing code.
+  #
+  # WHEN THIS ROTS (a new codex model ships, or an accepted slug stops being
+  # accepted): re-probe codex-acp rather than editing from a changelog — boot
+  # the adapter, `initialize`, `session/new`, then confirm each candidate with
+  # `session/set_config_option {configId: "model"}`. Update this table and
+  # `@adapter_version` together.
+  @adapter_selectable_models ~w(gpt-5.6-sol)
+
   @adapter_bundle "index.js"
   @adapter_replacements [
     {
@@ -55,6 +88,15 @@ defmodule Tightbeam.Harness.Codex do
 
   @doc false
   def adapter_version, do: @adapter_version
+
+  @doc """
+  Model values this adapter version accepts at `session/set_config_option`.
+
+  Narrower than the platform-derived api-key catalog — see the note above the
+  attribute. Anything outside this list is refused by the adapter; it is never
+  silently substituted.
+  """
+  def adapter_selectable_models, do: @adapter_selectable_models
 
   @impl true
   def id, do: :codex
@@ -380,7 +422,7 @@ defmodule Tightbeam.Harness.Codex do
       {:ok, body, trailer} ->
         with {:ok, models} <- decode_catalog(kind, body),
              {:ok, entries} <- derive_catalog_entries(kind, models),
-             entries <- keep_selectable(entries, selectable_models(state)),
+             entries <- keep_selectable(entries, selectable_models(state, kind)),
              entries when entries != [] <- entries do
           {:ok, entries}
         else
@@ -689,10 +731,15 @@ defmodule Tightbeam.Harness.Codex do
           end
         end
 
+        # The vector's subject is catalog DERIVATION — route, credential field,
+        # shape — using a synthetic model id. The selectable pin is a separate
+        # concern with its own tests, so it is disabled here; leaving it on
+        # would filter the synthetic id out and fail the case for the wrong
+        # reason.
         %{
           base_dir: base,
           credential_kind: if(case_name == "valid_api_key", do: :api_key, else: :subscription),
-          options: %{sh: sh}
+          options: %{sh: sh, codex_selectable_models: :all}
         }
       end,
       wire_projection: %{
@@ -777,9 +824,8 @@ defmodule Tightbeam.Harness.Codex do
   # nothing here knows what efforts the model offers, and inventing tiers would
   # advertise a control that does not work.
   #
-  # UNVERIFIED (2026-07-28): this shape is documented, not observed. If an
-  # api-key host reports `:malformed_catalog`, capture the actual body BEFORE
-  # editing this.
+  # OBSERVED LIVE 2026-07-28 (the #89 api-key exercise): 125 entries in exactly
+  # this shape, bare ids under "data".
   defp derive_platform_entries(models) do
     Enum.reduce_while(models, {:ok, []}, fn
       %{"id" => id}, {:ok, entries} when is_binary(id) and id != "" ->
@@ -803,24 +849,57 @@ defmodule Tightbeam.Harness.Codex do
     end)
   end
 
-  # The platform route returns the whole account's model universe — embeddings,
-  # audio, image models — and nothing here knows which of them codex will accept
-  # at `session/set_config_option`. The account route never had this problem: it
-  # only ever returned codex models.
+  # The catalog must not advertise what the adapter will refuse (#99, the #41
+  # problem's codex/api-key edition). The platform route returns the whole
+  # account's model universe — 125 ids observed live 2026-07-28 — and codex-acp
+  # refuses almost all of it at `session/set_config_option` (-32602 for
+  # `gpt-5.1-codex`, recorded on the same adapter+auth that accepted and ran
+  # `gpt-5.6-sol`). So the api-key kind defaults to the pinned
+  # `@adapter_selectable_models` set — a PURE FILTER over the already-derived
+  # entries, claude's precedent exactly: no probe, no extra fetch, nothing at
+  # boot, and never a substitution.
   #
-  # Injectable through the same `state.options` seam claude's pin uses, and
-  # `:all` by default: the honest answer is "everything the key can see", and
-  # narrowing it is an ORG's statement about its own account, not a guess this
-  # module can make from how a model id is SPELLED. A spelling heuristic that
-  # dropped a usable model would be the same silent substitution
-  # `harness/claude.ex` refuses.
-  defp selectable_models(state),
+  # The SUBSCRIPTION kind stays unfiltered: its catalog comes from the account
+  # route the CLI itself consults, so the two vocabularies share one source
+  # there. That claim is now kind-scoped — it was once believed to cover codex
+  # wholesale (see the note on claude's `@adapter_selectable_models`), and the
+  # api-key exercise disproved it for the platform route.
+  #
+  # Injectable through the same `state.options` seam claude's pin uses
+  # (`:all` disables): the accepted set is the adapter version's, and a test
+  # must be able to exercise derivation without coupling to the table.
+  defp selectable_models(state, :subscription),
     do: Map.get(state.options, :codex_selectable_models, :all)
+
+  defp selectable_models(state, :api_key),
+    do: Map.get(state.options, :codex_selectable_models, @adapter_selectable_models)
 
   defp keep_selectable(entries, :all), do: entries
 
-  defp keep_selectable(entries, selectable),
-    do: Enum.filter(entries, fn entry -> entry.ref in selectable end)
+  defp keep_selectable(entries, selectable) do
+    {kept, dropped} =
+      Enum.split_with(entries, fn entry ->
+        entry.ref |> base_ref() |> Kernel.in(selectable)
+      end)
+
+    if dropped != [] do
+      Logger.info(
+        "codex catalog: #{length(dropped)} model(s) the platform lists are not selectable by " <>
+          "codex-acp #{@adapter_version} and were withheld: " <>
+          Enum.map_join(dropped, ", ", & &1.ref) <>
+          " — re-probe @adapter_selectable_models in harness/codex.ex if this looks wrong"
+      )
+    end
+
+    kept
+  end
+
+  defp base_ref(ref) do
+    case Regex.run(~r/^(.*?)\[(.*?)\]$/, ref) do
+      [_, base, _effort] -> base
+      _ -> ref
+    end
+  end
 
   defp adapter_binary(target) do
     # One path for both localities, as fixture.ex already does: the adapter lives

@@ -64,13 +64,14 @@ defmodule Tightbeam.Harness.Claude do
   # That is why the set is injectable (`claude_selectable_models` in the catalog's
   # options, `:all` to disable) rather than only editable here.
   #
-  # ON CODEX, qualified: codex's catalog comes from the same account endpoint the
-  # CLI itself consults, filtered by that CLI's own version (codex.ex), so its two
-  # vocabularies share one source and divergence is structurally unlikely. But
-  # acceptance still happens in the external
-  # ACP/CLI process (`acp/adapter.ex` set_config_option), which this repo does not
-  # observe, so "cannot diverge" is NOT proven here — it is unprobed analysis. Nobody
-  # has run the equivalent probe against codex-acp.
+  # ON CODEX, kind-scoped: the shared-source argument holds only for the
+  # SUBSCRIPTION kind, whose catalog comes from the same account endpoint the
+  # CLI itself consults (codex.ex). The API-KEY kind derives from the platform
+  # route — the account's whole model universe — and the 2026-07-28 api-key
+  # exercise (#99) proved live that codex-acp refuses platform ids at
+  # set_config_option (-32602 for `gpt-5.1-codex`) while accepting codex-native
+  # slugs (`gpt-5.6-sol` ran a real turn). Codex's api-key catalog now carries
+  # its own `@adapter_selectable_models` guard on this precedent.
   @adapter_selectable_models ~w(default sonnet opus haiku claude-sonnet-5 claude-opus-4-8
                                 claude-haiku-4-5-20251001)
 

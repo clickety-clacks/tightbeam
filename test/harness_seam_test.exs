@@ -159,9 +159,14 @@ defmodule Tightbeam.HarnessSeamTest do
     assert source =~ "claude-agent-acp 0.59.0"
     assert source =~ "silent downgrade"
 
-    # The codex half is unprobed analysis and must stay labelled as such, so nobody
-    # reads it as a proven property of this repo (review finding 3).
-    assert source =~ "unprobed analysis"
+    # The codex half is PROBED now, and kind-scoped: the 2026-07-28 api-key
+    # exercise (#99) recorded the codex adapter refusing a platform id at
+    # set_config_option (-32602), so the note must carry that evidence — and it
+    # must never grow back into a wholesale "cannot diverge" claim, which the
+    # exercise disproved for the platform route.
+    assert source =~ "kind-scoped"
+    assert source =~ "-32602"
     refute source =~ "come from one artifact and cannot diverge"
+    refute source =~ "divergence is structurally unlikely"
   end
 end

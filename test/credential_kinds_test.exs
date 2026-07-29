@@ -38,6 +38,15 @@ defmodule Tightbeam.CredentialKindsTest do
     path
   end
 
+  defp platform_fixture_body do
+    [__DIR__, "fixtures", "model_catalog", "openai_platform_models.jsonc"]
+    |> Path.join()
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.drop_while(&String.starts_with?(&1, "//"))
+    |> Enum.join("\n")
+  end
+
   # ------------------------------------------------------------------
   # The store: one authority, and it is the metadata
   # ------------------------------------------------------------------
@@ -303,6 +312,61 @@ defmodule Tightbeam.CredentialKindsTest do
       assert entry.efforts == []
       assert entry.max_input_tokens == nil
       assert entry.provider == :openai
+    end
+
+    # Recorded reality, the #89/#99 api-key exercise (2026-07-28): the platform
+    # route listed 125 bare ids; codex-acp REFUSED the platform id
+    # `gpt-5.1-codex` at session/set_config_option (-32602 Invalid params) and
+    # ACCEPTED `gpt-5.6-sol`, which ran a real turn on the same adapter+auth.
+    # The fixture is that payload's shape trimmed to those two adjudicated ids.
+    test "an api-key codex catalog withholds platform ids the adapter refuses", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-selectable"}))
+      sh = fn _command -> {platform_fixture_body() <> "\n200", 0} end
+
+      assert {:ok, entries} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :api_key,
+                 options: %{sh: sh}
+               })
+
+      # The catalog must not advertise what the adapter will refuse: spawns
+      # validated against `gpt-5.1-codex` and then -32602'd at model apply.
+      assert Enum.map(entries, & &1.ref) == ["gpt-5.6-sol"]
+    end
+
+    test "the injectable seam lifts the api-key selectable pin", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-unpinned"}))
+      sh = fn _command -> {platform_fixture_body() <> "\n200", 0} end
+
+      assert {:ok, entries} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :api_key,
+                 options: %{sh: sh, codex_selectable_models: :all}
+               })
+
+      assert Enum.map(entries, & &1.ref) == ["gpt-5.1-codex", "gpt-5.6-sol"]
+    end
+
+    test "the subscription catalog is not filtered by the api-key pin", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"tokens":{"access_token":"t"}}))
+
+      # The account route lists only what the CLI accepts (one shared source),
+      # so a slug outside the api-key pin must survive on the subscription kind.
+      sh = fn _command ->
+        {~s({"models":[{"slug":"gpt-x-future","display_name":"Future",) <>
+           ~s("supported_reasoning_levels":[{"effort":"medium"}]}]}) <> "\n200 0.145.0", 0}
+      end
+
+      assert {:ok, [entry]} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :subscription,
+                 options: %{sh: sh}
+               })
+
+      assert entry.ref == "gpt-x-future[medium]"
     end
 
     test "an empty api-key catalog is not blamed on a client version", ctx do

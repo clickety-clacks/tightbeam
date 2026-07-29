@@ -563,11 +563,13 @@ defmodule Tightbeam.Acp.Adapter do
     {model, effort} = parse_model_ref(model_ref)
 
     with {:ok, _} <-
-           request.("session/set_config_option", %{
-             sessionId: sid,
-             configId: "model",
-             value: model
-           }),
+           map_model_refusal(
+             request.("session/set_config_option", %{
+               sessionId: sid,
+               configId: "model",
+               value: model
+             })
+           ),
          {:ok, _} <-
            (if effort do
               request.("session/set_config_option", %{
@@ -581,6 +583,17 @@ defmodule Tightbeam.Acp.Adapter do
       :ok
     end
   end
+
+  # The adapter's own refusal of a model value — JSON-RPC -32602 Invalid params,
+  # recorded live 2026-07-28: the harness ACP adapter refused the platform id
+  # `gpt-5.1-codex` at `session/set_config_option {configId: "model"}` — is a
+  # model decision, not an adapter fault, and it must say so in the house
+  # vocabulary (`:model_unavailable`, the word `strict_apply/4` already uses)
+  # instead of passing the raw envelope through to be recorded as an
+  # unclassifiable harness error. Every other shape keeps the fail-loud raw
+  # passthrough.
+  defp map_model_refusal({:error, %{"code" => -32602}}), do: {:error, :model_unavailable}
+  defp map_model_refusal(result), do: result
 
   defp strict_apply_with_retry(state, sid, model_ref, prior_model, attempts) do
     case strict_apply(state, sid, model_ref, prior_model) do

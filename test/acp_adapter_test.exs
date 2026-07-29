@@ -104,6 +104,11 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "model-refusal") {
           return send({ id: m.id, error: { code: -32000, message: "Invalid value for config option model" } });
         }
+        if (failMode === "model-invalid-params" && m.params.configId === "model") {
+          // Recorded live 2026-07-28: codex-acp's refusal of a model value the
+          // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
+          return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
+        }
         return send({ id: m.id, result: { configOptions: [ { id: m.params.configId, currentValue: m.params.value } ] } });
       }
       case "session/set_mode": {
@@ -461,6 +466,21 @@ defmodule Tightbeam.Acp.AdapterTest do
                         }
                       }
                     }}
+  end
+
+  # FAIL-BEFORE: against the tree preceding #99 both calls returned the raw
+  # JSON-RPC envelope, which the gateway could only record as an unclassifiable
+  # harness error.
+  test "the adapter's -32602 model refusal surfaces as :model_unavailable" do
+    {adapter, _capture} = start_adapter(harness: :codex, fail_mode: "model-invalid-params")
+
+    assert {:error, :model_unavailable} =
+             Adapter.new_session(adapter, "gpt-5.1-codex", "/tmp", [], "guidance")
+
+    assert {:error, {:model_apply_failed, :model_unavailable}} =
+             Adapter.load_session(adapter, "sess-1", "gpt-5.1-codex", "/tmp", [], "guidance")
+
+    refute Adapter.knows_session?(adapter, "sess-1")
   end
 
   test "new and load surface model apply failures without claiming residency" do
