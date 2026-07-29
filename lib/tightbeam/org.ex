@@ -358,6 +358,17 @@ defmodule Tightbeam.Org do
   end
 
   @doc """
+  Set a session's adoption — the client-side view-membership flag (the `tune`
+  adopt write). Agent- and substrate-started sessions exist and are addressable
+  whether or not they are adopted; adoption only decides whether the chat client
+  lists the session by default. Returns the updated session.
+  """
+  @spec set_adopted(db(), String.t(), boolean()) :: session()
+  def set_adopted(db \\ Tightbeam.DB, session_key, adopted) do
+    update(db, session_key, "adopted = ?2", [if(adopted, do: 1, else: 0)])
+  end
+
+  @doc """
   Retune a session's engine wholesale — harness+provider+model (the `tune`
   set_harness write). Same identity, different engine: the next turn's
   adapter checkout targets the new harness; the old harness session can't
