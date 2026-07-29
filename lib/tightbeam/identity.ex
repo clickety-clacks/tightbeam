@@ -120,6 +120,7 @@ defmodule Tightbeam.Identity do
       |> Map.put_new_lazy("operating-manual.md", fn ->
         String.trim_trailing(Archetypes.builtin_fragments()["operating-manual.md"])
       end)
+
     manifest_path = "archetypes/#{archetype_name}.toml"
     manifest = git_show!(identity_dir, revision, manifest_path)
     archetype = Archetypes.parse_manifest!(manifest, manifest_path)
