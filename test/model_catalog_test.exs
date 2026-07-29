@@ -679,7 +679,15 @@ defmodule Tightbeam.ModelCatalogTest do
       # Local probes are ["sh", "-c", script] and run for real; anything bound for
       # another machine fails fast without touching the network.
       sh = fn command ->
-        if hd(command) == "sh", do: Support.system_cmd_out(command), else: {"", 255}
+        if hd(command) == "sh" do
+          t0 = System.monotonic_time(:microsecond)
+          result = Support.system_cmd_out(command)
+          dt = (System.monotonic_time(:microsecond) - t0) / 1000
+          IO.puts(:stderr, "DIAG sh_ms=#{dt} exit=#{inspect(elem(result, 1))}")
+          result
+        else
+          {"", 255}
+        end
       end
 
       states = [
@@ -694,11 +702,23 @@ defmodule Tightbeam.ModelCatalogTest do
 
       for {label, contents, expected} <- states do
         File.write!(auth, contents)
+        t0 = System.monotonic_time(:microsecond)
         catalog = start_catalog(ctx, name: unique_name(label), sh: sh)
+        t1 = System.monotonic_time(:microsecond)
 
-        await(fn ->
-          ModelCatalog.get(@host, "codex", catalog) == {[], {:unavailable, expected}}
-        end)
+        await(
+          fn ->
+            ModelCatalog.get(@host, "codex", catalog) == {[], {:unavailable, expected}}
+          end,
+          4000
+        )
+
+        t2 = System.monotonic_time(:microsecond)
+
+        IO.puts(
+          :stderr,
+          "DIAG state=#{label} start_ms=#{(t1 - t0) / 1000} await_ms=#{(t2 - t1) / 1000}"
+        )
       end
 
       # ...and a file that simply is not there is a REAL "no grant on this host",
