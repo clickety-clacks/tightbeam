@@ -40,6 +40,12 @@ defmodule Tightbeam.ArchetypesTest do
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
   end
 
+  test "the operating manual names the shell as the path to every substrate verb" do
+    manual = Archetypes.builtin_fragments()["operating-manual.md"]
+    assert manual =~ "shell tool"
+    assert manual =~ "PATH"
+  end
+
   test "the shipped bundle loads role guidance and elected shared skills", ctx do
     Identity.init!(ctx.base_dir)
     loaded = Archetypes.load!(ctx.base_dir)

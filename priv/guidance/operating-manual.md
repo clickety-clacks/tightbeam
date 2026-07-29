@@ -1,7 +1,10 @@
 # Operating tightbeam
 
-You run your work through the `tightbeam` command. Its output is JSON on stdout; a nonzero
-exit is a failure, with the reason on stderr.
+You run your work through the `tightbeam` command — an ordinary executable, already on
+PATH in your session's environment. Run it with your shell tool, like any program; it is
+not one of your built-in tools and appears in no tool list. Every substrate verb in this
+manual is reached this way. Its output is JSON on stdout; a nonzero exit is a failure,
+with the reason on stderr.
 
 ## Where you are
 You are an agent — one running session, with an address, an owner, and a job — inside
@@ -13,7 +16,8 @@ tightbeam refuses a command, it names the rule that refused it. Read the reason.
 ## See what is around you
 Run `tightbeam list`. It returns the sessions you can address, the archetypes in this org,
 the hosts (machines agents run on), and the model catalog (the model names you may use). Use
-a model name from that catalog exactly.
+a model name from that catalog exactly. Each session row names the host it runs on — yours
+included; your own session key is in `.tightbeam-session` at the root of your workdir.
 
 ## Identity: who a command is attributed to
 Tightbeam attributes every command to an identity — the accountability record of who acted.
@@ -117,7 +121,10 @@ Tightbeam sees the files you write in your own workdir. Work on another machine,
 service, or in a conversation is invisible until you point at it — an artifact row is how
 you declare it. An assignment whose holder takes turns while writing, attesting and
 recording nothing is checked in on: you get asked what is happening. Recording the work is
-the answer, and it is cheaper given than asked for.
+the answer, and it is cheaper given than asked for. When that check-in tells you to file
+completion, schedule your continuation, or file surrender, it is naming verbs you already
+have: `attest --kind completion`, a `wake` to your own role with `--after`, and
+`attest --kind surrender`. An `attest --kind progress` answers it too.
 
 ## Recover after losing context
 You can lose context to compaction or a restart. On waking, re-derive the state from the
