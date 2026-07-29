@@ -266,12 +266,37 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     key = {:claude, "default", "testhost"}
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(
+             fn -> match?({:ok, {_, 1}}, AdapterCoordinator.ready_token(coordinator, key)) end,
+             500
+           )
+
+    {:ok, closed_token} = AdapterCoordinator.ready_token(coordinator, key)
     ref = Process.monitor(adapter)
 
     assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
     assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
-    assert AdapterCoordinator.generation(coordinator, key) == 1
+
+    # A planned teardown IS a death in the token algebra: the successor must be
+    # a NEW generation, or a credential stop/start landing inside a probe-retry
+    # window would re-mint the SAME ready token and the strict heal sweep would
+    # never feed the re-held session (task #103 review). Still no crash
+    # bookkeeping: no lifecycle row, no failure count.
+    assert AdapterCoordinator.generation(coordinator, key) == 2
     assert EventLog.lifecycle_events(ctx.db) == []
+
+    # The successor boots as generation 2, and its ready token strictly
+    # outranks every token stamped against the closed process.
+    assert {:ok, _successor, 2} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(
+             fn -> match?({:ok, {_, 2}}, AdapterCoordinator.ready_token(coordinator, key)) end,
+             500
+           )
+
+    {:ok, reborn_token} = AdapterCoordinator.ready_token(coordinator, key)
+    assert AdapterCoordinator.newer_token?(reborn_token, closed_token)
   end
 
   test "load-slot queue caps concurrency at three and releases on borrower exit", ctx do

@@ -596,11 +596,11 @@ defmodule Tightbeam.AdapterHealTest do
     assert work.prompt == "queued work"
   end
 
-  test "a due retry against a NOT-ready adapter probes nothing and leaves the hold heal-eligible",
-       ctx do
+  test "credential stop/start inside the retry window still ends with the hold fed", ctx do
     retry_immediately()
-    # ready defaults to :not_ready — the adapter went down again before the
-    # retry fired.
+    # The STOP half: a credential stop calls close_adapter, so by the time the
+    # retry fires the adapter is torn down — ready defaults to :not_ready. The
+    # retry probes nothing and consumes itself; the next edge owns the wake-up.
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
     heal(ctx, {7, 2})
@@ -614,9 +614,102 @@ defmodule Tightbeam.AdapterHealTest do
     assert hold(ctx.db) == "*"
     assert [%{state: "fired"}] = retry_wakes(ctx.db), "the retry is consumed, not left spinning"
 
-    # The next genuine heal edge (necessarily strictly newer) still sweeps.
+    # The START half: close_adapter BUMPED the generation (the coordinator's
+    # planned-close proof), so the restarted adapter's ready is STRICTLY newer
+    # than the stamped {7, 2} — the ordinary edge sweep feeds the hold.
     heal(ctx, {7, 3})
     assert probe_count(ctx.db) == 2
+    assert hold(ctx.db) != "*"
+  end
+
+  test "the retry honors a REAL backoff: a scheduler fire before dueAt delivers nothing", ctx do
+    Application.put_env(:tightbeam, :adjudication_probe_retry_ms, 400)
+    on_exit(fn -> Application.delete_env(:tightbeam, :adjudication_probe_retry_ms) end)
+
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    # Built BEFORE the clock starts: the timed window below must measure the
+    # backoff, not scheduler assembly.
+    scheduler = retry_scheduler(ctx)
+    run_failing_turn(ctx, "fault")
+    :ok = CoordinatorStub.set_ready({:ok, {7, 2}})
+    heal(ctx, {7, 2})
+    assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert :ok = Ledger.finish(ctx.db, probe.seq, "failed")
+    assert [%{state: "pending"}] = retry_wakes(ctx.db)
+
+    # BEFORE the backoff elapses, the scheduler's fire delivers nothing — even
+    # with the adapter ready and the hold eligible.
+    Wakes.fire_due(scheduler)
+    assert probe_count(ctx.db) == 1
+    assert [%{state: "pending"}] = retry_wakes(ctx.db)
+
+    # After it elapses: exactly one probe, and firing again adds nothing.
+    Process.sleep(500)
+    Wakes.fire_due(scheduler)
+    assert probe_count(ctx.db) == 2
+    Wakes.fire_due(scheduler)
+    assert probe_count(ctx.db) == 2
+  end
+
+  test "a probe task crash through SessionLane's REAL monitored-task :DOWN branch re-holds and arms the retry",
+       ctx do
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+    :ok = CoordinatorStub.set_ready({:ok, {7, 2}})
+    heal(ctx, {7, 2})
+    probe_wake = hold(ctx.db)
+
+    # A real lane, a real monitored TurnTask, a real crash — the exact :DOWN
+    # branch production takes, not a hand-written terminal.
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+
+    task_sup =
+      start_supervised!(
+        {Task.Supervisor, name: :"heal_tsup_#{System.unique_integer([:positive])}"}
+      )
+
+    start_supervised!(
+      {Tightbeam.SessionLane,
+       session_key: "k1", db: ctx.db, task_sup: task_sup, runner: fn _turn -> exit(:boom) end}
+    )
+
+    assert eventually(fn -> hold(ctx.db) == "*" end),
+           "the crashed probe's :DOWN must re-hold the session"
+
+    {:ok, [[error]]} = DB.query(ctx.db, "SELECT error FROM turns WHERE wakeId = ?1", [probe_wake])
+
+    assert error =~ "task_crash"
+    assert episode(ctx.db).status == "resolved", "no adjudication closure ran"
+
+    assert [%{state: "pending"}] = retry_wakes(ctx.db),
+           "the :DOWN terminal writer armed the retry"
+  end
+
+  test "a newer failure SUPERSEDES the pending retry: one pending wake, the newest, honoring its own full backoff",
+       ctx do
+    # Default (real) backoff throughout — dueAt comparisons are meaningful.
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+    run_failing_turn(ctx, "fault")
+    epoch = 7
+    heal(ctx, {epoch, 2})
+    assert {:ok, p1} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert :ok = Ledger.finish(ctx.db, p1.seq, "failed")
+    assert [%{state: "pending", wake_id: r1}] = retry_wakes(ctx.db)
+
+    # A genuinely newer edge probes immediately (the strict path, unchanged)...
+    heal(ctx, {epoch, 3})
+    assert probe_count(ctx.db) == 2
+    assert {:ok, p2} = Ledger.claim_next(ctx.db, "k1", "lane")
+
+    # ...and ITS failure arms the newest retry, superseding the stale one — a
+    # stale retry firing early would hand the newer hold a probe before its
+    # backoff elapsed.
+    armed_at = System.system_time(:millisecond)
+    assert :ok = Ledger.finish(ctx.db, p2.seq, "failed")
+
+    assert %{state: "canceled"} = Enum.find(retry_wakes(ctx.db), &(&1.wake_id == r1))
+    assert [%{due_at: due_at}] = Enum.filter(retry_wakes(ctx.db), &(&1.state == "pending"))
+    assert due_at - armed_at >= 25_000, "the newest retry honors its own FULL backoff"
   end
 
   test "boot reconciliation of a VANISHED probe turn re-holds and arms the same retry exactly once",
@@ -1198,10 +1291,10 @@ defmodule Tightbeam.AdapterHealTest do
   end
 
   # A REAL scheduler wired exactly as the composition root wires it (the same
-  # internal_consumers map), fired once — the substrate's own time machinery,
-  # no external stimulus. Prompt-wake delivery is stubbed out: this seam
-  # exercises the internal retry consumer.
-  defp fire_due_retries(ctx) do
+  # internal_consumers map) — the substrate's own time machinery, no external
+  # stimulus. Prompt-wake delivery is stubbed out: this seam exercises the
+  # internal retry consumer.
+  defp retry_scheduler(ctx) do
     {Tightbeam.Wakes, wake_opts} =
       ctx.config
       |> Gateway.children()
@@ -1209,19 +1302,18 @@ defmodule Tightbeam.AdapterHealTest do
 
     name = :"retry_scheduler_#{System.unique_integer([:positive])}"
 
-    pid =
-      start_supervised!(
-        {Wakes,
-         db: ctx.db,
-         deliver: fn _wake -> :ok end,
-         internal_consumers: Keyword.fetch!(wake_opts, :internal_consumers),
-         tick_ms: 3_600_000,
-         name: name},
-        id: name
-      )
-
-    Wakes.fire_due(pid)
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       deliver: fn _wake -> :ok end,
+       internal_consumers: Keyword.fetch!(wake_opts, :internal_consumers),
+       tick_ms: 3_600_000,
+       name: name},
+      id: name
+    )
   end
+
+  defp fire_due_retries(ctx), do: Wakes.fire_due(retry_scheduler(ctx))
 
   defp hold(db) do
     {:ok, [[hold]]} =

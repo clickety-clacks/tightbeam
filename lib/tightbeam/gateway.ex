@@ -4319,18 +4319,20 @@ defmodule Tightbeam.Gateway do
   predecessor (spec §2, ruled 2026-07-28).
   """
   @spec adapter_healed(map(), DB.server(), String.t(), AdapterCoordinator.heal_token(), keyword()) ::
-          :ok
+          [{String.t(), String.t(), :released | :lost | {:error, term()}}]
   def adapter_healed(config, db, cause, token, opts \\ []) do
     encoded = AdapterCoordinator.encode_token(token)
     only = Keyword.get(opts, :session_key)
+    only_condition = Keyword.get(opts, :condition)
 
     Adjudication.heal_candidates(db, cause, token, Keyword.take(opts, [:include_equal]))
-    |> Enum.filter(fn {session_key, _condition} -> is_nil(only) or session_key == only end)
-    |> Enum.each(fn {session_key, condition} ->
-      release_hold(config, db, session_key, condition, cause, encoded)
+    |> Enum.filter(fn {session_key, condition} ->
+      (is_nil(only) or session_key == only) and
+        (is_nil(only_condition) or condition == only_condition)
     end)
-
-    :ok
+    |> Enum.map(fn {session_key, condition} ->
+      {session_key, condition, release_hold(config, db, session_key, condition, cause, encoded)}
+    end)
   end
 
   # ONE atomic transition per held session: resolve the episode, dispose the
@@ -4404,18 +4406,51 @@ defmodule Tightbeam.Gateway do
       {:ok, {:released, delivery}} ->
         complete_delivery(db, delivery)
         Wakes.fire_due(config[:wake_scheduler] || Tightbeam.WakeScheduler)
+        :released
 
-      _ ->
-        # Lost the CAS (a human ruling owns this hold) or the probe could not be
-        # enqueued. Dark != silent: the decision NOT to probe is recorded, and
-        # nothing was written — a raise rolled the attempt back.
+      {:ok, :lost} ->
+        heal_lost(db, session_key, cause, condition, encoded_token)
+        :lost
+
+      {:error, %HealLost{}} ->
+        # The episode-state CAS lost mid-transaction; the raise rolled the
+        # attempt back. A legitimate no-op, same as losing the hold CAS.
+        heal_lost(db, session_key, cause, condition, encoded_token)
+        :lost
+
+      {:error, error} ->
+        # NOT a lost race — the transaction itself failed (probe not enqueued,
+        # DB error). A retry consumer must keep its wake pending on this arm:
+        # consuming it would eat the hold's only feeder.
+        Logger.error(
+          "adjudication heal errored for #{session_key} (#{condition}): #{inspect(error)}"
+        )
+
         EventLog.lifecycle(
           db,
-          "adjudication_heal_lost",
+          "adjudication_heal_error",
           session_key,
-          JSON.encode!(%{cause: cause, condition: condition, healToken: encoded_token})
+          JSON.encode!(%{
+            cause: cause,
+            condition: condition,
+            healToken: encoded_token,
+            error: inspect(error)
+          })
         )
+
+        {:error, error}
     end
+  end
+
+  # Dark != silent: the decision NOT to probe is recorded (a human ruling owns
+  # this hold, or another episode's release narrowed it first).
+  defp heal_lost(db, session_key, cause, condition, encoded_token) do
+    EventLog.lifecycle(
+      db,
+      "adjudication_heal_lost",
+      session_key,
+      JSON.encode!(%{cause: cause, condition: condition, healToken: encoded_token})
+    )
   end
 
   defp heal_level_check(config, db, session_key, cause, adapter_key) do
@@ -4434,62 +4469,92 @@ defmodule Tightbeam.Gateway do
   end
 
   # Probe RETRY (spec s4-operability-v1 §2, ruled 2026-07-28): the wake a
-  # non-delivered probe terminal armed, fired after its backoff. Readiness is
-  # re-read NOW — an equal token is permitted because this is a new hold's one
+  # non-delivered probe terminal armed, fired after its backoff. BOUND: the
+  # payload names the episode, cause, and the failed probe it retries, and the
+  # consumer acts only while that episode's re-hold is still current — a
+  # superseding probe or re-hold makes this wake a consumed no-op. Readiness is
+  # re-read NOW; an equal token is permitted because this is a new hold's one
   # probe, not a replayed ready event. A not-ready adapter probes nothing: the
-  # next genuine ready edge owns the wake-up. The wake is consumed either way;
-  # a raise leaves it pending for the scheduler's next tick (transient failure).
+  # next genuine ready edge (strictly newer — teardown bumps the generation)
+  # owns the wake-up. A heal transaction ERROR keeps the wake PENDING with its
+  # dueAt pushed one backoff out, and a malformed payload raises (loud, still
+  # pending) — only a completed attempt or a legitimate lost race consumes the
+  # hold's feeder.
   defp adapter_heal_retry(config, db, wake) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT DISTINCT cause FROM adjudication_episodes WHERE sessionKey = ?1 AND cause LIKE 'adapter_fault:%'",
-        [wake.session_key]
-      )
+    %{
+      "episodeId" => episode_id,
+      "sessionKey" => session_key,
+      "condition" => condition,
+      "cause" => cause,
+      "after" => after_wake
+    } = JSON.decode!(wake.prompt)
 
-    Enum.each(rows, fn [cause] ->
-      with {:ok, adapter_key} <- parse_adapter_fault_key(cause),
-           {:ok, token} <- AdapterCoordinator.ready_token(coordinator, adapter_key) do
+    episode = Adjudication.get(db, session_key, condition)
+
+    # Still-current: same episode incarnation, and no newer probe has replaced
+    # the failed one this wake retries (a reopen NULLs recoveryWakeId, which is
+    # this same failure re-briefed, not a successor).
+    current? =
+      is_map(episode) and episode.episode_id == episode_id and
+        (is_nil(episode.recovery_wake_id) or episode.recovery_wake_id == after_wake)
+
+    outcomes =
+      with true <- current?,
+           {:ok, token} <-
+             AdapterCoordinator.ready_token(coordinator, parse_adapter_fault_key!(cause)) do
         adapter_healed(config, db, cause, token,
-          session_key: wake.session_key,
+          session_key: session_key,
+          condition: condition,
           include_equal: true
         )
       else
-        _ -> :ok
+        _ -> []
       end
-    end)
 
-    {:ok, _} =
-      DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-          [wake.wake_id, System.system_time(:millisecond)]
-        )
+    case Enum.find(outcomes, &match?({_, _, {:error, _}}, &1)) do
+      nil ->
+        {:ok, _} =
+          DB.transaction(db, fn txn ->
+            Txn.q(
+              txn,
+              "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+              [wake.wake_id, System.system_time(:millisecond)]
+            )
+
+            :ok
+          end)
 
         :ok
-      end)
 
-    :ok
+      {_session_key, _condition, {:error, error}} ->
+        # release_hold already logged the error loudly; keep the feeder alive.
+        {:ok, _} =
+          DB.transaction(db, fn txn ->
+            Txn.q(
+              txn,
+              "UPDATE wakes SET dueAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+              [wake.wake_id, System.system_time(:millisecond) + Adjudication.probe_retry_ms()]
+            )
+
+            :ok
+          end)
+
+        {:error, error}
+    end
   end
 
   # Inverse of AdapterCoordinator.key_name/1, from the cause encoding: the
   # episode names the adapter it is waiting on, and the retry asks about THAT
-  # adapter — not whatever the session points at today.
-  defp parse_adapter_fault_key("adapter_fault:" <> key_name) do
-    with [harness, rest] <- String.split(key_name, ":", parts: 2),
-         [archetype, host] <- String.split(rest, "@", parts: 2) do
-      {:ok, {Harness.parse!(harness).id(), archetype, host}}
-    else
-      _ -> :error
-    end
-  rescue
-    ArgumentError -> :error
+  # adapter — not whatever the session points at today. §2.1 pins the canonical
+  # key encoding, so a shape this cannot parse is an invariant failure: raise
+  # where it is diagnosable rather than consume the hold's only feeder.
+  defp parse_adapter_fault_key!("adapter_fault:" <> key_name) do
+    [harness, rest] = String.split(key_name, ":", parts: 2)
+    [archetype, host] = String.split(rest, "@", parts: 2)
+    {Harness.parse!(harness).id(), archetype, host}
   end
-
-  defp parse_adapter_fault_key(_cause), do: :error
 
   defp arm_hold_in_txn(txn, session_key, wake_id) do
     Txn.q(txn, "UPDATE sessions SET adjudicationHold=?2, updatedAt=?3 WHERE sessionKey=?1", [

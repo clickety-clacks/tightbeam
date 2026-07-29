@@ -284,7 +284,9 @@ defmodule Tightbeam.Ledger do
       Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [[1]]
 
     if won and sessions_exist? do
-      if terminal == "delivered" or is_nil(probe_episode(txn, seq)) do
+      episode = if terminal == "delivered", do: nil, else: probe_episode(txn, seq)
+
+      if is_nil(episode) do
         Txn.q(
           txn,
           """
@@ -300,7 +302,7 @@ defmodule Tightbeam.Ledger do
         # land here and re-hold, so the adapter fault has to actually heal before
         # the session runs real work. The human recovery path is untouched — only
         # the heal sweep stamps the healToken this predicate requires.
-        rehold_probe(txn, seq, now)
+        rehold_probe(txn, seq, now, episode)
       end
     end
 
@@ -311,11 +313,12 @@ defmodule Tightbeam.Ledger do
   Re-hold the session of a probe turn identified by `seq`, wide (`'*'`), and arm
   the re-hold's probe retry (spec s4-operability-v1 §2: a re-hold is a NEW hold
   and owes its own probe — the failed probe's adapter may already be ready and
-  will then never emit another heal edge). Shared by the terminal writers;
+  will then never emit another heal edge). `episode` is the probe episode the
+  caller already resolved for this turn's wake. Shared by the terminal writers;
   idempotent, including the retry (one per failed probe wake).
   """
-  @spec rehold_probe(Txn.t(), integer(), integer()) :: :ok
-  def rehold_probe(%Txn{} = txn, seq, now) do
+  @spec rehold_probe(Txn.t(), integer(), integer(), map()) :: :ok
+  def rehold_probe(%Txn{} = txn, seq, now, episode) do
     Txn.q(
       txn,
       """
@@ -327,13 +330,7 @@ defmodule Tightbeam.Ledger do
     )
 
     if Txn.changes(txn) == 1 do
-      with [[wake_id]] when is_binary(wake_id) <-
-             Txn.q(txn, "SELECT wakeId FROM turns WHERE seq = ?1", [seq]),
-           %{} = episode <- Tightbeam.Adjudication.probe_episode_for_wake_in_txn(txn, wake_id) do
-        Tightbeam.Adjudication.schedule_probe_retry_in_txn(txn, episode)
-      else
-        _ -> :ok
-      end
+      Tightbeam.Adjudication.schedule_probe_retry_in_txn(txn, episode)
     end
 
     :ok
@@ -426,7 +423,9 @@ defmodule Tightbeam.Ledger do
         )
 
         if sessions_exist? do
-          for seq <- seqs, probe_episode(txn, seq), do: rehold_probe(txn, seq, now)
+          for seq <- seqs,
+              episode = probe_episode(txn, seq),
+              do: rehold_probe(txn, seq, now, episode)
         end
 
         seqs

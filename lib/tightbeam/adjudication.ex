@@ -581,50 +581,72 @@ defmodule Tightbeam.Adjudication do
   Arm a re-held session's probe retry (spec s4-operability-v1 §2): a re-hold is
   a NEW hold, and this wake delivers its one probe. Time, not a ready edge,
   carries the wake-up — the failed probe's adapter may already be ready and will
-  then never emit another edge (the task #103 wedge). Idempotent per failed
-  probe (`recoveryWakeId` at re-hold time), so the terminal writer and boot
-  reconciliation arm at most one retry for the same failure.
+  then never emit another edge (the task #103 wedge).
+
+  The wake is BOUND: its payload names the episode, cause, and the failed probe
+  it retries, and the consumer acts only on that episode's still-current
+  re-hold. Arming SUPERSEDES every prior pending heal-retry for the session —
+  at most one pending retry per session, the newest, honoring its own full
+  backoff (a stale retry must not probe a newer failure early). Idempotent per
+  failed probe (`recoveryWakeId` at re-hold time), so the terminal writer and
+  boot reconciliation arm at most one retry for the same failure. The callers
+  guarantee a probe episode with its failed probe wake in hand; anything else
+  is an invariant failure and raises rather than committing an unfed hold.
   """
   @spec schedule_probe_retry_in_txn(Txn.t(), map()) :: :ok
   def schedule_probe_retry_in_txn(%Txn{} = txn, episode) do
-    wakes_exist? =
-      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wakes'") == [[1]]
+    anchor = episode.recovery_wake_id
 
-    if wakes_exist? and is_binary(episode.recovery_wake_id) do
-      key =
-        Enum.join(
-          [
-            "adjudication",
-            episode.session_key,
-            episode.condition,
-            "heal_retry",
-            episode.recovery_wake_id
-          ],
-          ":"
-        )
+    unless is_binary(anchor) do
+      raise "probe retry armed without the failed probe's wake: #{inspect(episode)}"
+    end
 
-      unless Idempotency.get_in_txn(txn, episode.session_key, "wake", key) do
-        wake =
-          Wakes.schedule_in_txn(txn, %{
-            session_key: episode.session_key,
-            origin: "process:tightbeam",
-            consumer: @probe_retry_consumer,
-            due_at: now() + probe_retry_ms()
-          })
+    key =
+      Enum.join(
+        ["adjudication", episode.session_key, episode.condition, "heal_retry", anchor],
+        ":"
+      )
 
-        Idempotency.put_in_txn(txn, %{
-          owner_user_id: episode.session_key,
-          operation: "wake",
-          idempotency_key: key,
-          session_key: wake.wake_id
+    unless Idempotency.get_in_txn(txn, episode.session_key, "wake", key) do
+      Txn.q(
+        txn,
+        """
+        UPDATE wakes SET state = 'canceled', canceledAt = ?2
+        WHERE sessionKey = ?1 AND consumer = ?3 AND state = 'pending'
+        """,
+        [episode.session_key, now(), @probe_retry_consumer]
+      )
+
+      wake =
+        Wakes.schedule_in_txn(txn, %{
+          session_key: episode.session_key,
+          origin: "process:tightbeam",
+          consumer: @probe_retry_consumer,
+          prompt:
+            JSON.encode!(%{
+              episodeId: episode.episode_id,
+              sessionKey: episode.session_key,
+              condition: episode.condition,
+              cause: episode.cause,
+              after: anchor
+            }),
+          due_at: now() + probe_retry_ms()
         })
-      end
+
+      Idempotency.put_in_txn(txn, %{
+        owner_user_id: episode.session_key,
+        operation: "wake",
+        idempotency_key: key,
+        session_key: wake.wake_id
+      })
     end
 
     :ok
   end
 
-  defp probe_retry_ms,
+  @doc "The retry backoff (ms): how long a re-hold waits before its one probe."
+  @spec probe_retry_ms() :: non_neg_integer()
+  def probe_retry_ms,
     do: Application.get_env(:tightbeam, :adjudication_probe_retry_ms, 30_000)
 
   @doc """

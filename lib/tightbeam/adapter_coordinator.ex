@@ -12,7 +12,9 @@ defmodule Tightbeam.AdapterCoordinator do
 
   Invariants (binding):
   - GENERATION: a monotonic integer per adapter key, bumped on every adapter
-    death/restart. Lanes stamp the generation they ran a turn against; a lane
+    death — crash or planned teardown alike — so a successor process is always
+    a new generation and its ready token strictly outranks its predecessor's.
+    Lanes stamp the generation they ran a turn against; a lane
     seeing a stale generation at next turn start performs session/load LAZILY
     (parent-spec rule: no eager mass re-adoption).
   - Backoff: restart with exponential backoff 1s → 60s cap. After the configured
@@ -198,7 +200,11 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  @doc "Best-effort planned teardown of the currently running adapter for `key`."
+  @doc """
+  Best-effort planned teardown of the currently running adapter for `key`.
+  Bumps the generation: the successor's ready token must outrank every token
+  stamped against the closed process, exactly as after a crash.
+  """
   @spec close_adapter(GenServer.server(), adapter_key()) :: :ok
   def close_adapter(server \\ __MODULE__, key) do
     GenServer.call(server, {:close_adapter, key})
@@ -309,7 +315,11 @@ defmodule Tightbeam.AdapterCoordinator do
           :exit, _reason -> :ok
         end
 
-        entry = %{entry | pid: nil, monitor: nil, ready: false}
+        # A planned teardown IS a death in the token algebra: without the bump,
+        # the successor's ready re-mints the SAME {epoch, generation} token, and
+        # a session re-held on that token (a credential stop/start landing in
+        # its retry window) would never be swept (spec s4-operability-v1 §2).
+        entry = %{entry | pid: nil, monitor: nil, ready: false, generation: entry.generation + 1}
 
         {:reply, :ok,
          %{
