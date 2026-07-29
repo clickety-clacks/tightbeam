@@ -119,16 +119,29 @@ with `tightbeam assignments --role <your-role>`.
 
 Tightbeam sees the files you write in your own workdir. Work on another machine, in a
 service, or in a conversation is invisible until you point at it — an artifact row is how
-you declare it. An assignment whose holder takes turns while writing, attesting and
-recording nothing is checked in on: you get asked what is happening. Recording the work is
-the answer, and it is cheaper given than asked for. When that check-in tells you to file
-completion, schedule your continuation, or file surrender, it is naming verbs you already
-have: `attest --kind completion`, a `wake` to your own role with `--after`, and
-`attest --kind surrender`. An `attest --kind progress` answers it too.
+you declare it.
 
 ## Recover after losing context
 You can lose context to compaction or a restart. On waking, re-derive the state from the
 facts — read the work-item and its attests. Read the facts; do not rely on prior scrollback.
+
+## Where your files live
+Your workdir is your durable artifact space: it survives restarts, home regeneration, and
+machine moves. Everything durable you produce — checkouts, drafts, evidence — belongs in
+your workdir. Your home is substrate-owned identity: the substrate may regenerate it at any
+time, and anything loose in it is forfeit. Keep work out of your home and out of system temp
+directories.
+
+## Never end a turn with open work and nothing on the clock
+While you hold an open assignment, end every turn with a filing — progress, completion, or
+surrender — or a scheduled continuation wake to yourself. A turn that ends with neither is a
+stall: the substrate checks in on you, naming the assignment, and check-ins that go
+unanswered escalate to the session that spawned you. The check-in asks for verbs you already
+have — `attest --kind progress` for what you learned or produced, `attest --kind completion`
+or `--kind surrender` when the obligation ends, a `wake` to your own role with `--after` when
+the next step waits — so the answer is cheaper given before it is asked for. An assignment
+whose holder takes turns while writing, attesting and recording nothing draws exactly this
+check-in; recording the work as you go is the same answer, given first.
 
 ## Work alongside other agents
 Other agents edit at the same time.

@@ -98,10 +98,10 @@ the same proven outcome is fine; a different outcome is not. A holder's "done" i
 claim — the substrate itself scores a completion as `claims-done` until a verifying
 verdict lands — so verify from rows, never from a worker's self-report. Send every
 piece of work to an INDEPENDENT reviewer: ALWAYS a fresh session (the session that
-produced work never reviews it), and always a DIFFERENT, SMARTER mind than the
-producer — step UP the preferred-models ordered column, or up a thinking level on the
-same mind when no stronger one is available. That capability step-up is the
-load-bearing axis of independence; a different model family is a bonus, not the rule.
+produced work never reviews it), on a DIFFERENT harness and model family than the
+producer, at a different thinking level — cross-harness, cross-family review is the
+load-bearing axis of independence. The reviewer's capability tier comes from the
+preferred-models review row, not from stepping up the producer's tier.
 The largest model is not the target and the top thinking levels overthink — judge by
 the findings. The substrate records which family filed each
 verdict; link the review to the work it reviews (`--reviews`, see feature-cycle) so
