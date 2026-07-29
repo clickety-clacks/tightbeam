@@ -1,6 +1,6 @@
 ---
 name: feature-cycle
-description: The loop that takes a feature from intent to a user-verified result — spec, adversarial spec review, decompose, implement, review, integrate, real run, user verification, teardown. Use when you own a feature or bug and are driving it end to end.
+description: The loop that takes a feature from intent to a user-verified result — spec, adversarial spec review, decompose, implement, review, spirit review for substantial changes, integrate, real run, user verification, teardown. Use when you own a feature or bug and are driving it end to end.
 ---
 
 # Feature cycle
@@ -55,20 +55,46 @@ per-feature, but your attention across features is the scarce resource.
    a different provider than produced the work; a verdict filed without it is a claim
    of independence the rows cannot confirm. On `changes-requested`, wake the coder to
    iterate; repeat until `reviewed-clean`.
-6. **Integrate.** The coder reconciles the change with main
+6. **Spirit review (substantial changes).** A goal is substantial when it produces
+   product behavior with no product-owner-gated spec authority behind it —
+   behavior an agent or user experiences, an authority moved between homes, or a
+   change to what a fresh install boots as, that no owner-gated spec states. A
+   goal that delivers, restores, or preserves behavior an owner-gated spec states,
+   or touches no product surface (bug fixes, tests and infrastructure, legibility
+   text, dependency bumps that hold every behavior contract), is routine: the
+   spirit judgment on it already happened at the owner's spec gate, and gating it
+   again at merge would judge the same thing twice. An effort-check-in arriving
+   spec-less is substantial; a CVE bump that holds every contract is routine.
+   Cross-model spec review is quality control, not spirit — a spec cleared only by
+   cross-model review makes nothing routine.
+
+   A substantial goal does not integrate until the product owner has answered its
+   spirit summary. Wake the owner with what changed in product terms, which Spirit
+   clauses it serves, and what it forecloses:
+   `tightbeam wake --session <productOwner> --prompt "spirit review of <goalAssignmentId>: <summary>"`.
+   The answer is an attest on the goal's assignment in the owner-verdict shape:
+   `tightbeam attest <goalAssignmentId> --kind verdict --verdict spirit-accepted --note "<basis>"`,
+   or `--verdict changes-requested` with what the spirit refuses. An unanswered
+   gate queues the merge indefinitely — that wait is the accepted cost; chase it
+   up the existing wake rungs, never around the gate. An answer from before
+   integration is stale where integration changed the product-visible semantics,
+   exactly as a code review is. When you cannot tell which side a goal falls on,
+   that question goes to the product owner too — the ask costs one wake; a wrong
+   guess merges a change the spirit never accepted.
+7. **Integrate.** The coder reconciles the change with main
    (committing-and-pushing skill); the review that clears the work covers the
    post-reconciliation result — a review from before integration is stale where
    integration changed semantics.
-7. **Real run.** For work that touches live inputs, require a real run against real
+8. **Real run.** For work that touches live inputs, require a real run against real
    inputs before it ships: `tightbeam run-smoke <assignmentId>` runs the org's
    committed smoke command and stamps `real-run-passed`. Compiling, green tests, and a
    clean review are not that proof. (`run-tests <assignmentId>` likewise stamps
    `tests-passed` from the committed test command — cheap to require on every goal.)
-8. **Ready for user verification.** Wake the user —
+9. **Ready for user verification.** Wake the user —
    `tightbeam wake --user <id> --prompt "<what changed, how to try it, what decision remains>"`.
    Done means the user can try it; the user's verdict, when given, is attested on the
    work-item's assignment as `--kind verdict`.
-9. **Teardown.** Retire sessions whose job has ended
+10. **Teardown.** Retire sessions whose job has ended
    (`tightbeam retire --session <key>`), dependents first; a finished feature leaves no
    idle hires behind.
 

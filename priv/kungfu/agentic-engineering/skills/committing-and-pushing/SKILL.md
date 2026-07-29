@@ -35,10 +35,15 @@ Merging is a semantic integration problem, not a text-selection problem.
    the branch, after reconciliation.
 4. The review that clears the work covers the post-reconciliation result; a review from
    before reconciliation is stale where reconciliation changed semantics.
-5. Advancing main is the orchestrator's decision: it happens after the orchestrator has
-   cleared the work — the `reviewed-clean` verdict is on record. You execute the
-   mechanics: confirm main is an ancestor of the reconciled branch
-   (`git merge-base --is-ancestor main <branch>`), then advance main from the branch —
-   fast-forward, because the reconciliation already happened on the branch.
+5. Advancing main is the orchestrator's decision: it happens after the
+   orchestrator has cleared the work — the `reviewed-clean` verdict is on
+   record, and, for a substantial change (feature-cycle's spirit-review
+   definition), the product owner's `--kind verdict` attest is on the goal's
+   assignment. A routine change — a wire-spelling fix, not an effort-check-in —
+   advances on `reviewed-clean` alone. You execute the mechanics: confirm main
+   is an ancestor of the reconciled branch
+   (`git merge-base --is-ancestor main <branch>`), then advance main from the
+   branch — fast-forward, because the reconciliation already happened on the
+   branch.
 6. When main moved during reconciliation, merge it in again and re-prove before
    advancing.
