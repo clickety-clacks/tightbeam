@@ -116,6 +116,18 @@ defmodule Tightbeam.Dispatch do
         best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
         outcome
 
+      # A rail-check timeout denies AND summons (§A3). The caller gets the denial it
+      # already got — never `{:decision_pending, _}` — while the escalation engine opens
+      # the request that puts a mind on the sensor. `escalate/4` is the same hand-off the
+      # branch above makes, and its one-open-request index keeps a retried call from
+      # opening a second.
+      {:deny_escalate, statute, ctx} ->
+        {:decision_pending, _id} =
+          Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
+
+        best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
+        {:error, ctx.error}
+
       :allow ->
         consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1)})
 

@@ -14,6 +14,7 @@ defmodule Tightbeam.SupervisionTest do
     Idempotency,
     Ledger,
     Org,
+    Placement,
     Projection,
     RailRemedy,
     Roles,
@@ -76,8 +77,13 @@ defmodule Tightbeam.SupervisionTest do
     holder = session(db, "holder", supervisor.session_key)
     assignment(db, "asg_1", holder.session_key, "ship it", 1)
 
+    # Resolved, not just joined: containment refuses a write root with a symlink component,
+    # and macOS's tmp dir is one (`/var` → `/private/var`). A script-tier statute under an
+    # unresolved base never reaches its check.
+    {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
+
     base =
-      Path.join(System.tmp_dir!(), "tb-supervision-rules-#{System.unique_integer([:positive])}")
+      Path.join(String.trim(tmp), "tb-supervision-rules-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(base)
     handlers = Gateway.handlers(%{db: db})
@@ -374,6 +380,43 @@ defmodule Tightbeam.SupervisionTest do
                "statute" => "completion-still-owed"
              }
            ] = rail_sweep_details(ctx.db, "holder")
+  end
+
+  # The sweep is the second actor, so the ruling of 2026-07-29 (rails-mechanism §A3) has
+  # to reach it too: a rail-check timeout summons a mind here as well. What it must NOT do
+  # is park the session — parking is the escalate EFFECT's consequence, and the ruling
+  # changed what a timeout additionally does, not what it decides. So the sweep outcome
+  # stays the pure deny's: re-obligate, then the normal prod.
+  test "a turn-end timeout summons a mind and still re-obligates without parking", ctx do
+    stage_rail_wrapper(ctx, "rail-timeout")
+
+    write_rules(ctx, """
+    [[rule]]
+    name = "completion-check-times-out"
+    verb = "attest"
+    text = "completion is gated on a check"
+    edges = ["turn-end"]
+    [rule.check]
+    script = "rail-timeout"
+    returns = ["pass"]
+    [rule.check.effects]
+    pass = "allow"
+    """)
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert [
+             %{
+               "decision" => "re-obligate",
+               "ref" => "asg_1",
+               "statute" => "completion-check-times-out"
+             }
+           ] = rail_sweep_details(ctx.db, "holder")
+
+    assert {:ok, [["completion-check-times-out", "open", nil]]} =
+             DB.query(ctx.db, "SELECT statuteName, status, parkWakeId FROM decision_requests")
   end
 
   test "atomic target gate skips plain dead targets and re-runs the ladder for escalation", ctx do
@@ -1013,6 +1056,33 @@ defmodule Tightbeam.SupervisionTest do
       ]
       """
     )
+  end
+
+  # A script-tier statute needs the wrapper, the script, and a holder the rail will accept
+  # as local — `invocation_context` refuses a non-local holder before anything is spawned,
+  # which would class as `script_error` and never reach the timeout under test.
+  defp stage_rail_wrapper(ctx, script) do
+    # The rail resolves the holder's workdir through the host registry, so the table has
+    # to exist; without it the resolution fails and the deny classes `script_error`.
+    :ok = Placement.ensure_schema(ctx.db)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET host = 'testhost' WHERE sessionKey = ?1", [
+        "holder"
+      ])
+
+    scripts = Path.join([ctx.base, "identity", "rails", "scripts"])
+    bin = Path.join(ctx.base, "bin")
+    File.mkdir_p!(scripts)
+    File.mkdir_p!(bin)
+
+    path = Path.join(scripts, script)
+    File.write!(path, "#!/bin/sh\nexit 0\n")
+    File.chmod!(path, 0o755)
+
+    wrapper = Path.join(bin, "tightbeam")
+    File.cp!(Path.expand("fixtures/rail_exec/tightbeam", __DIR__), wrapper)
+    File.chmod!(wrapper, 0o755)
   end
 
   defp write_rules(ctx, contents) do

@@ -685,7 +685,122 @@ defmodule Tightbeam.RailScriptTest do
       denial.id
     end)
 
-    assert length(EventLog.lifecycle_events(ctx.db)) == length(cases)
+    events = EventLog.lifecycle_events(ctx.db)
+    assert Enum.count(events, &(&1.kind == "rail_script")) == length(cases)
+
+    # Exactly one of these classes also summons a mind — the timeout (§A3). The count is
+    # the guard against that widening to the others by accident.
+    assert Enum.count(events, &(&1.kind == "decision_request_opened")) == 1
+  end
+
+  # Flynn's ruling (§A3, 2026-07-29): "a timeout never silently decides against work —
+  # the call stays fail-closed, but every expiry summons a mind." The two halves pull in
+  # opposite directions, so both are asserted: the denial the caller receives is the one
+  # it received before the ruling, AND a decision request now names the statute behind it.
+  test "a timeout denies exactly as before and additionally summons a mind", ctx do
+    handlers = %{"post" => fn _call -> flunk("a timed-out rail must not run the handler") end}
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "script-escalate",
+              edge: "verb",
+              reason: "script_timeout",
+              script_exit_class: "timeout",
+              ref: "w-timeout"
+            }} = Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-timeout"}))
+
+    # The denial stands on its own row, unchanged and independent of the summons.
+    assert [denial] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert denial.reason == "script_timeout"
+    assert denial.script_exit_class == "timeout"
+
+    assert [%{"exit_class" => "timeout", "reason" => "script_timeout"}] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "rail_script"))
+             |> Enum.map(&JSON.decode!(&1.detail))
+
+    # And the summons carries what a mind needs to adjudicate the sensor: which statute,
+    # which reason code, which exit class.
+    assert {:ok, [["script-escalate", question, "open"]]} =
+             DB.query(ctx.db, "SELECT statuteName, question, status FROM decision_requests")
+
+    assert question =~ "script-escalate"
+    assert question =~ "denied script_timeout"
+    assert question =~ "script_exit_class timeout"
+  end
+
+  # The other producer of `script_timeout`: the wrapper never reports and the BEAM
+  # backstop closes the port at `timeout_ms + 2_000`, recording `unreported`. A ten-
+  # millisecond budget against a wrapper that sleeps for thirty seconds makes the expiry
+  # deterministic rather than load-dependent.
+  test "the backstop producer summons too, and a retry opens no second request", ctx do
+    handlers = %{"post" => fn _call -> flunk("a timed-out rail must not run the handler") end}
+
+    wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
+    File.write!(wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
+    File.chmod!(wrapper, 0o755)
+
+    put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}, timeout_ms: 10))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+    timed_out = call(%{work_item_id: "w-backstop"})
+
+    assert {:error, %{reason: "script_timeout", script_exit_class: "unreported"}} =
+             Dispatch.dispatch(ctx.db, handlers, timed_out)
+
+    assert {:ok, [["script-escalate", "open"]]} =
+             DB.query(ctx.db, "SELECT statuteName, status FROM decision_requests")
+
+    # The same call times out again. The deny recurs — it must — but the mind is already
+    # summoned, and escalation's one-open-request index is what keeps it single.
+    assert {:error, %{reason: "script_timeout", script_exit_class: "unreported"}} =
+             Dispatch.dispatch(ctx.db, handlers, timed_out)
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+  end
+
+  # Generalizing the summons to the other fail-closed classes is a separate ruling that
+  # has not been made. Until it is, an expiry is the ONLY class that summons.
+  test "the other fail-closed classes deny without summoning anyone", ctx do
+    handlers = %{"post" => fn _call -> flunk("a non-pass rail must not run the handler") end}
+
+    for {script, reason} <- [
+          {"rail-error", "script_error"},
+          {"rail-out-of-set", "script_out_of_set"},
+          {"rail-contained-refused", "script_contained_refused"}
+        ] do
+      put_statute(ctx, statute(script, %{"pass" => "allow"}))
+      Rules.load!(ctx.base_dir, ["post"], %{})
+
+      assert {:error, %{reason: ^reason}} =
+               Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-#{script}"}))
+    end
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+  end
+
+  # The summons is an EFFECT, so it belongs to the actors, not to the decision function
+  # (§B). `decide` runs the script and writes its row and stops there; `evaluate` is the
+  # legacy collapse, and fires nothing at all.
+  test "decide stays dry on a timeout and evaluate collapses it to the deny", ctx do
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+
+    assert {{:deny_escalate, %{name: "script-escalate"},
+             %{error: %{reason: "script_timeout", script_exit_class: "timeout"}}}, [], []} =
+             Rules.decide(ctx.db, call())
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+    assert [%{kind: "rail_script"}] = EventLog.lifecycle_events(ctx.db)
+
+    assert {:deny, %{reason: "script_timeout", script_exit_class: "timeout"}} =
+             Rules.evaluate(ctx.db, call())
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
   end
 
   if File.exists?(@release_binary) do
@@ -792,6 +907,7 @@ defmodule Tightbeam.RailScriptTest do
     verb = Keyword.get(opts, :verb, "post")
     edges = Keyword.get(opts, :edges)
     predicate = Keyword.get(opts, :predicate)
+    timeout_ms = Keyword.get(opts, :timeout_ms)
 
     """
     [[rule]]
@@ -803,6 +919,7 @@ defmodule Tightbeam.RailScriptTest do
     [rule.check]
     script = "#{script}"
     returns = #{inspect(Map.keys(effects))}
+    #{if timeout_ms, do: "timeout_ms = #{timeout_ms}", else: ""}
     [rule.check.effects]
     #{Enum.map_join(effects, "\n", fn {token, effect} -> "#{token} = \"#{effect}\"" end)}
     """

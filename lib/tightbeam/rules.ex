@@ -169,6 +169,7 @@ defmodule Tightbeam.Rules do
       {{:deny, error}, _to_close, _to_consume} -> {:deny, error}
       {{:remedy, _statute, _ref, error}, _to_close, _to_consume} -> {:deny, error}
       {{:escalate, _statute, ctx, _dr_id}, _to_close, _to_consume} -> {:deny, ctx.error}
+      {{:deny_escalate, _statute, ctx}, _to_close, _to_consume} -> {:deny, ctx.error}
     end
   end
 
@@ -774,6 +775,19 @@ defmodule Tightbeam.Rules do
                   exit_class
                 )
 
+              # A timeout is the clock bounding a wait, not a verdict on the work: no
+              # sensor observed anything (§A3, Flynn 2026-07-29). The deny is byte-identical
+              # to every other fail-closed class — same reason, same exit class, same
+              # legibility payload — and the event ALSO goes to the escalation engine, so a
+              # mind adjudicates the sensor instead of the deny recurring silently on every
+              # retry. Both producers reach here: the wrapper's own exit 20 (`timeout`) and
+              # the backstop that never heard from it (`unreported`).
+              {:error, "script_timeout", exit_class} ->
+                error = denial_error(rule, call, "script_timeout", exit_class)
+                ctx = %{question: timeout_question(rule, exit_class), error: error}
+
+                {{:deny_escalate, rule, ctx}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+
               {:error, reason, exit_class} ->
                 error = denial_error(rule, call, reason, exit_class)
                 {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
@@ -828,6 +842,15 @@ defmodule Tightbeam.Rules do
       {:needs_request, dr_id} ->
         {{:escalate, rule, ctx, dr_id}, Enum.reverse(to_close), Enum.reverse(to_consume)}
     end
+  end
+
+  # What the summoned mind is asked. It names the statute, the reason code, and the
+  # exit class, because those are what separate the three remedies available: raise the
+  # ceiling, fix the check, or rule on the work itself.
+  defp timeout_question(rule, exit_class) do
+    "#{rule.name}: #{rule.text}\n" <>
+      "The check rendered no verdict — denied script_timeout, script_exit_class " <>
+      "#{exit_class}. A timeout may bound waiting; it may never be the last word on work."
   end
 
   defp denial_error(rule, call, reason, script_exit_class) do

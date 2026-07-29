@@ -389,6 +389,17 @@ defmodule Tightbeam.Supervision do
           write_watermark(db, session_key, terminal_seq)
           {:acted, :rail_escalate}
 
+        # A rail-check timeout summons a mind, but its deny is the sweep's ordinary
+        # re-obligate (§A3): the session is NOT parked, because parking is the escalate
+        # effect's consequence and the ruling changed what a timeout ALSO does, not what
+        # it decides.
+        {:deny_escalate, statute, ctx} ->
+          {:decision_pending, _id} =
+            Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
+
+          rail_sweep_lifecycle(db, session_key, assignment.id, ctx.error.rule, "re-obligate")
+          :fallthrough
+
         {:deny, error} ->
           rail_sweep_lifecycle(db, session_key, assignment.id, error.rule, "re-obligate")
           :fallthrough
