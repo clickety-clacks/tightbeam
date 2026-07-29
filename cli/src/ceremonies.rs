@@ -595,11 +595,46 @@ fn run_openai_onboarding(staging: &str, timeout: Duration) -> Result<(), String>
     }
 }
 
+/// The pty height the ceremony pins alongside the width. Tall enough that the whole
+/// setup-token screen fits without scrolling; unlike the width, the exact value is not
+/// load-bearing — the replay in `screen` is unbounded — it only has to be sane and
+/// nonzero (headless, the pty is otherwise 0x0).
+const SETUP_TOKEN_PTY_ROWS: usize = 50;
+
+/// Pin the slave pty's geometry before claude starts, then exec it.
+///
+/// The ceremony's correctness must not depend on the operator's terminal width (issue
+/// #5): claude's TUI repaints without erase sequences, so at a terminal a little wider
+/// than the token a stale cell from an earlier frame can survive on the token's row and
+/// fuse to it. The pty belongs to this ceremony, so its geometry is pinned at exactly
+/// [`crate::screen::SETUP_TOKEN_LENGTH`] columns — the token's own length. At that
+/// width the hazard is unreachable by construction: no row can be wider than the token,
+/// so no stale cell can survive past its end (the token's repaint covers its row edge
+/// to edge), and the token never wraps (it fills exactly one row; the `gap:1` blank row
+/// after it keeps that decidable, as `screen` documents).
+///
+/// `stty` on the slave is the ONE mechanism claude's TUI honors, verified empirically
+/// against claude 2.1.220 on eezo (2026-07-28) with throwaway `setup-token` first
+/// screens: bare `script` headless leaves the pty 0x0 and the TUI falls back to 80
+/// columns; `COLUMNS` in the environment is ignored entirely (still 0x0/80); after
+/// `stty rows 50 cols N` on the slave, `stty size` reports the pin and the TUI
+/// hard-wraps at exactly N (N=97 and N=108 both verified). Inside the wrapper stdin IS
+/// the slave, so `stty` needs no arguments beyond the geometry. `;` rather than `&&`:
+/// if `stty` somehow fails, claude still runs unpinned, and the length-aware capture in
+/// `screen` remains the guard.
+fn pinned_pty_command(claude_argument: &str) -> String {
+    format!(
+        "stty rows {SETUP_TOKEN_PTY_ROWS} cols {}; exec {claude_argument} setup-token",
+        crate::screen::SETUP_TOKEN_LENGTH
+    )
+}
+
 /// `script(1)` argument order, which is NOT portable.
 ///
 /// The wrapper exists only to give `claude setup-token` a TTY (it refuses to run
-/// without one) and to capture the transcript `capture_setup_token` parses. The two
-/// implementations take the command in incompatible ways:
+/// without one), to pin that TTY's geometry, and to capture the transcript
+/// `capture_setup_token` parses. The two implementations take the command in
+/// incompatible ways:
 ///
 /// - BSD/macOS: `script [-q] <file> <command> [args...]`
 /// - util-linux: `script [-q] -c "<command>" <file>` — extra trailing args are an
@@ -612,13 +647,19 @@ fn run_openai_onboarding(staging: &str, timeout: Duration) -> Result<(), String>
 ///
 /// Dispatched at COMPILE time, like the containment seam: a platform with no named
 /// form fails to build rather than failing at a customer's terminal.
+///
+/// Both forms run the pinned-geometry wrapper through `sh`. util-linux already takes a
+/// shell string; on BSD the command is `sh -c '<wrapper>' <claude>`, with the claude
+/// path as `$0` so it needs no quoting.
 #[cfg(target_os = "macos")]
 fn script_args(transcript: &str, claude: &str) -> Vec<String> {
     vec![
         "-q".to_owned(),
         transcript.to_owned(),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        pinned_pty_command("\"$0\""),
         claude.to_owned(),
-        "setup-token".to_owned(),
     ]
 }
 
@@ -627,7 +668,7 @@ fn script_args(transcript: &str, claude: &str) -> Vec<String> {
     vec![
         "-q".to_owned(),
         "-c".to_owned(),
-        format!("{claude} setup-token"),
+        pinned_pty_command(claude),
         transcript.to_owned(),
     ]
 }
@@ -711,6 +752,11 @@ fn run_anthropic_onboarding(
         Some(token) => token,
         None => return Err(capture_failed(&raw)),
     };
+    // A screen that needed interpreting is never interpreted silently: when capture
+    // discarded stale repaint cells to reach the token, the operator is told which.
+    if let Some(note) = crate::screen::capture_note(&raw) {
+        println!("{note}");
+    }
 
     validate_setup_token(&token, machine, timeout)?;
 
@@ -1846,7 +1892,14 @@ mod tests {
     fn script_args_use_the_bsd_form_on_macos() {
         assert_eq!(
             script_args("/tmp/t.log", "renamed-claude"),
-            vec!["-q", "/tmp/t.log", "renamed-claude", "setup-token"]
+            vec![
+                "-q",
+                "/tmp/t.log",
+                "/bin/sh",
+                "-c",
+                "stty rows 50 cols 108; exec \"$0\" setup-token",
+                "renamed-claude"
+            ]
         );
     }
 
@@ -1857,7 +1910,25 @@ mod tests {
         // trailing args are "unexpected number of arguments" and exit 1.
         assert_eq!(
             script_args("/tmp/t.log", "renamed-claude"),
-            vec!["-q", "-c", "renamed-claude setup-token", "/tmp/t.log"]
+            vec![
+                "-q",
+                "-c",
+                "stty rows 50 cols 108; exec renamed-claude setup-token",
+                "/tmp/t.log"
+            ]
+        );
+    }
+
+    /// The pinned width is not a number that happens to work: it is the token's exact
+    /// length, which is what makes the issue-#5 stale-cell geometry unreachable (no
+    /// row can be wider than the token, so nothing survives past its end) and keeps
+    /// the token on exactly one row. One home for the number, asserted here so the pin
+    /// and the capture gate can never drift apart.
+    #[test]
+    fn the_pinned_width_is_the_token_length() {
+        assert!(
+            pinned_pty_command("claude")
+                .contains(&format!("cols {}", crate::screen::SETUP_TOKEN_LENGTH))
         );
     }
 

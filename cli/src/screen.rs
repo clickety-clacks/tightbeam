@@ -216,16 +216,60 @@ pub fn displayed_lines(transcript: &[u8]) -> Vec<String> {
     lines
 }
 
-/// The `sk-ant-oat…` token the TUI displayed, or None if it never displayed one.
+/// The exact length of a `sk-ant-oat…` setup token, in characters.
 ///
-/// The token must be the WHOLE displayed line, not a run found inside one. claude
-/// renders it as its own Text node with nothing beside it, so anything else sharing
-/// the line means the reconstruction is not what was displayed — a row rejoined that
-/// should not have been, or a shorter frame painted over a longer one without clearing
-/// the tail. Refusing there is the point: a captured token that is wrong by one
-/// character banks successfully and fails later as an auth error nobody traces back
-/// here, so an unexplained screen has to fail loudly instead of being mined for
-/// something token-shaped.
+/// An observed invariant of the vendor, not a contract: every setup token claude has
+/// minted here has been exactly 108 characters (live captures on 2026-07-26 and -28,
+/// the report on issue #5, docs/ONBOARDING.md), and the fixture below asserts it. The
+/// length is what makes a stale repaint cell separable from the credential it sits
+/// against: exactly this many token characters followed by anything outside the token
+/// alphabet is the token plus debris, and an unbroken run of any other length is
+/// nothing nameable. If claude ever changes its token length, capture refuses with
+/// both numbers in the message rather than guessing where the token ends — change this
+/// constant and the fixture together. `ceremonies` also pins the setup-token pty to
+/// exactly this many columns, which is what makes the debris case unreachable there.
+pub(crate) const SETUP_TOKEN_LENGTH: usize = 108;
+
+/// What the replayed screen holds where a token should be.
+///
+/// One reading, shared by `capture_setup_token`, `capture_note`, and `refusal_reason`,
+/// so the capture and the explanation can never describe two different screens.
+enum Reading {
+    /// Exactly [`SETUP_TOKEN_LENGTH`] token characters, with whatever a repaint left
+    /// beside them set aside — `discarded` names those cells when there were any.
+    Token {
+        token: String,
+        discarded: Option<String>,
+    },
+    /// No line on the screen begins `sk-ant-oat` at all.
+    Absent { lines: usize },
+    /// An unbroken token-alphabet run of the wrong length. One character over is the
+    /// dangerous shape: a stale cell that happens to sit in the token alphabet, fused
+    /// to the token with nothing to mark the seam.
+    WrongLength { length: usize },
+    /// The candidate line left the token alphabet before reaching full length, so it
+    /// carries something that is not the credential inside the token's own columns.
+    Broken { run: usize, length: usize },
+    /// Token-alphabet rows ran straight into other text with no blank row between,
+    /// where claude's `gap:1` panel always leaves one — the reconstruction cannot be
+    /// trusted end to end.
+    Ungapped { length: usize },
+}
+
+/// Read the token off the replayed lines, length-aware.
+///
+/// The token starts a displayed line — claude renders it as its own Text node — but the
+/// line is NOT required to be the token alone, because the TUI repaints without erase
+/// sequences and a prior frame's cells past the new content can survive on the token's
+/// row (issue #5: a 108-char token at 110 columns came back as a 109-char line, one
+/// stale cell fused to it). The token alphabet plus the fixed length decide instead:
+///
+///   - exactly [`SETUP_TOKEN_LENGTH`] token characters, then a character OUTSIDE the
+///     alphabet: the token, plus stale cells — extract the token, set the debris aside;
+///   - a longer unbroken run: a stale cell INSIDE the alphabet, indistinguishable from
+///     the credential — refuse, never guess where the token ends;
+///   - a shorter run against a longer line, or rows that end without the `gap:1` blank
+///     row: a reconstruction that cannot be trusted — refuse.
 ///
 /// ONE CASE RESTS ON AN OBSERVED PROPERTY OF THE VENDOR BINARY, not on a contract. A
 /// token exactly as wide as the terminal is indistinguishable, in a transcript, from one
@@ -237,17 +281,42 @@ pub fn displayed_lines(transcript: &[u8]) -> Vec<String> {
 /// claude drops that gap, this case stops being decidable — and it then fails CLOSED,
 /// with `refusal_reason` saying exactly that, rather than welding the next line onto the
 /// token.
-pub fn capture_setup_token(transcript: &[u8]) -> Option<String> {
-    let lines = displayed_lines(transcript);
-    let start = lines.iter().rposition(|line| is_bare_token(line.trim()))?;
+fn read_token(lines: &[String]) -> Reading {
+    let Some(start) = lines
+        .iter()
+        .rposition(|line| line.trim().starts_with("sk-ant-oat"))
+    else {
+        return Reading::Absent { lines: lines.len() };
+    };
+    let line = lines[start].trim();
+    let run = line
+        .chars()
+        .take_while(|character| is_token_character(*character))
+        .count();
+    let length = line.chars().count();
 
-    // The token's own rows, not the screen's. `displayed_lines` rejoins on ONE width --
-    // the widest row anywhere -- so it only reunites the token when the token wrapped at
-    // that same width. When the panel wraps narrower than the widest row on screen, the
-    // token's first row is short of that width, no rejoin happens, and the orphaned first
-    // row is ITSELF a well-formed bare token. Nothing downstream can tell it from a whole
-    // one. Continuing across adjacent token-character rows is what closes that: they are
-    // the remainder, and gap:1 means nothing else is ever adjacent.
+    if run < length {
+        // The line leaves the token alphabet somewhere. The alphabet boundary decides
+        // which side of it the credential is on.
+        return if run == SETUP_TOKEN_LENGTH {
+            Reading::Token {
+                token: line.chars().take(SETUP_TOKEN_LENGTH).collect(),
+                discarded: Some(line.chars().skip(SETUP_TOKEN_LENGTH).collect()),
+            }
+        } else if run > SETUP_TOKEN_LENGTH {
+            Reading::WrongLength { length: run }
+        } else {
+            Reading::Broken { run, length }
+        };
+    }
+
+    // A pure token-alphabet line: the token itself, possibly wrapped across rows.
+    // `displayed_lines` rejoins on ONE width -- the widest row anywhere -- so it only
+    // reunites the token when the token wrapped at that same width. When the panel
+    // wraps narrower than the widest row on screen, the token's first row is short of
+    // that width, no rejoin happens, and the orphaned first row is ITSELF a well-formed
+    // bare prefix. Continuing across adjacent token-character rows closes that: they
+    // are the remainder, and gap:1 means nothing else is ever adjacent.
     let mut end = start;
     while lines
         .get(end + 1)
@@ -255,57 +324,107 @@ pub fn capture_setup_token(transcript: &[u8]) -> Option<String> {
     {
         end += 1;
     }
+    let assembled: String = lines[start..=end].iter().map(|line| line.trim()).collect();
+    let assembled_length = assembled.chars().count();
 
-    // gap:1 again, now as a COMPLETENESS check rather than a decidability one: a whole
-    // token is always followed by a blank row, or by the end of the screen. Anything else
-    // sharing the token's neighbourhood means the reconstruction is not what was
-    // displayed, and a token wrong by one character banks fine and fails later as an auth
-    // error nobody traces back here.
+    // gap:1 as a COMPLETENESS check: a whole token is always followed by a blank row,
+    // or by the end of the screen.
     match lines.get(end + 1) {
         None => {}
         Some(next) if next.trim().is_empty() => {}
-        Some(_) => return None,
+        Some(_) => {
+            return Reading::Ungapped {
+                length: assembled_length,
+            };
+        }
     }
 
-    Some(lines[start..=end].iter().map(|line| line.trim()).collect())
+    if assembled_length == SETUP_TOKEN_LENGTH {
+        Reading::Token {
+            token: assembled,
+            discarded: None,
+        }
+    } else {
+        Reading::WrongLength {
+            length: assembled_length,
+        }
+    }
+}
+
+/// The `sk-ant-oat…` token the TUI displayed, or None if it never displayed one whole.
+///
+/// Refusing on anything unexplained is the point: a captured token that is wrong by one
+/// character banks successfully and fails later as an auth error nobody traces back
+/// here, so an ambiguous screen has to fail loudly instead of being mined for something
+/// token-shaped.
+pub fn capture_setup_token(transcript: &[u8]) -> Option<String> {
+    match read_token(&displayed_lines(transcript)) {
+        Reading::Token { token, .. } => Some(token),
+        _ => None,
+    }
+}
+
+/// What capture set aside on its way to the token, when it succeeded by discarding
+/// stale cells — None when it discarded nothing (or refused). Surfaced to the operator
+/// so a screen that needed interpreting is never interpreted silently.
+pub fn capture_note(transcript: &[u8]) -> Option<String> {
+    match read_token(&displayed_lines(transcript)) {
+        Reading::Token {
+            discarded: Some(cells),
+            ..
+        } => Some(format!(
+            "the token's row carried {} stale cell(s) after the token ({cells:?}), left \
+             there by an earlier frame that claude's repaint never cleared; they are \
+             outside the token alphabet, so the {SETUP_TOKEN_LENGTH}-character token \
+             before them was captured and they were discarded",
+            cells.chars().count(),
+        )),
+        _ => None,
+    }
 }
 
 /// Why capture refused, for the operator who has to act on it.
 ///
 /// "not captured" on its own is what cost two single-use authorization codes: it named
-/// neither what was searched for nor which of the two very different situations had
-/// occurred. A screen with no token at all means claude never displayed one. A screen
-/// whose token is not alone on its line means the reconstruction is ambiguous, which is
-/// recoverable — the operator can re-run at a different terminal width.
+/// neither what was searched for nor which situation had occurred. Each refusal names
+/// its mechanism — and the stale-repaint refusals say so outright, because the cause
+/// lives in claude's renderer, not in anything the operator did.
 pub fn refusal_reason(transcript: &[u8]) -> String {
-    let lines = displayed_lines(transcript);
-    let width = lines
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0);
-
-    match lines
-        .iter()
-        .map(|line| line.trim())
-        .find(|line| line.starts_with("sk-ant-oat"))
-    {
-        None => format!(
-            "no line of the {} line(s) on the replayed screen began with sk-ant-oat",
-            lines.len()
+    match read_token(&displayed_lines(transcript)) {
+        Reading::Token { .. } => "the token was captured; nothing was refused".to_owned(),
+        Reading::Absent { lines } => {
+            format!("no line of the {lines} line(s) on the replayed screen began with sk-ant-oat")
+        }
+        Reading::WrongLength { length } if length > SETUP_TOKEN_LENGTH => format!(
+            "a line beginning sk-ant-oat was an unbroken run of {length} token-alphabet \
+             characters, where a claude setup token is exactly {SETUP_TOKEN_LENGTH}. The \
+             likeliest cause is a stale cell from an earlier frame surviving right after \
+             the token — claude's TUI repaints without erasing, and a leftover cell that \
+             happens to sit in the token alphabet cannot be told from the credential — \
+             so this refuses rather than guessing which {} character(s) are not the \
+             token. Re-running the ceremony lays the screen out afresh; if every run \
+             refuses with this same arithmetic, claude has changed its token length and \
+             SETUP_TOKEN_LENGTH needs updating",
+            length - SETUP_TOKEN_LENGTH
         ),
-        Some(line) => format!(
-            "a line beginning sk-ant-oat was found, but it was {} characters long and \
-             carried more than the token, so it could not be told apart from a token that \
-             wrapped across rows (widest row: {width} columns). Re-running in a terminal \
-             of a different width will resolve it",
-            line.chars().count()
+        Reading::WrongLength { length } => format!(
+            "a line beginning sk-ant-oat held only {length} token characters, where a \
+             claude setup token is exactly {SETUP_TOKEN_LENGTH} — an incomplete \
+             reconstruction, not a credential. Re-run the ceremony"
+        ),
+        Reading::Broken { run, length } => format!(
+            "a line beginning sk-ant-oat was {length} characters long but left the token \
+             alphabet after {run}, where a claude setup token is exactly \
+             {SETUP_TOKEN_LENGTH} unbroken token characters — something that is not the \
+             credential sits inside the token's own columns. Re-run the ceremony"
+        ),
+        Reading::Ungapped { length } => format!(
+            "a line beginning sk-ant-oat was found ({length} token characters with its \
+             adjacent rows), but it ran straight into other text with no blank row \
+             between, where claude's token panel always leaves one — the reconstruction \
+             cannot be trusted end to end. Re-run the ceremony"
         ),
     }
-}
-
-fn is_bare_token(line: &str) -> bool {
-    line.starts_with("sk-ant-oat") && line.chars().all(is_token_character)
 }
 
 /// A row that could be the tail of a token split across rows: token characters and
@@ -336,7 +455,8 @@ mod tests {
     /// The length is load-bearing, so it is asserted rather than trusted.
     #[test]
     fn the_fixture_token_is_the_length_claude_issues() {
-        assert_eq!(TOKEN.chars().count(), 108);
+        assert_eq!(TOKEN.chars().count(), SETUP_TOKEN_LENGTH);
+        assert_eq!(SETUP_TOKEN_LENGTH, 108);
         assert!(TOKEN.starts_with("sk-ant-oat01-"));
         assert!(TOKEN.chars().all(is_token_character));
         assert!(
@@ -347,7 +467,28 @@ mod tests {
 
     const URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=Pc-oTIMUQocUA8wvn5TtJVCEDBZEzuNPuBGwxYh6ltk";
 
-    /// A model of the claude TUI's renderer, as observed live at 2.1.220 on 2026-07-27.
+    /// How the modeled renderer treats cells its new frame does not reach.
+    ///
+    /// claude 2.1.220 has been observed doing BOTH. The live capture of 2026-07-27
+    /// showed rows cleared by writing spaces over their tails (no erase sequences exist
+    /// in any real transcript, so padding is the only clearing there is). Issue #5 then
+    /// showed the opposite in the wild: at 110 columns a stale non-space cell survived
+    /// at column 109, right after the 108-char token — a repaint that did NOT pad past
+    /// its own content. An earlier version of this model stated padding as a universal
+    /// property, and that fixture structurally could not represent the screen the
+    /// operator actually got. So the model carries both behaviors, and the capture
+    /// layer must be exact under the first and never-wrong under the second.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Erase {
+        /// Every painted row is padded with spaces to the full terminal width, so no
+        /// cell of a prior frame survives.
+        PadsToWidth,
+        /// A row is painted only to its own content; whatever a prior frame left past
+        /// that keeps standing. Gap rows painted over old content leave ALL of it.
+        LeavesStaleCells,
+    }
+
+    /// A model of the claude TUI's renderer, as observed live at 2.1.220.
     ///
     /// Five properties, and every one of them was got WRONG in an early draft of this
     /// fixture, in each case producing a test that passed while proving nothing. They are
@@ -357,9 +498,9 @@ mod tests {
     ///      not written to fresh ones. Diffing against fresh rows loses the skipped cells
     ///      for real, so the test fails for the opposite of the reason it should.
     ///   2. NO ERASE SEQUENCES EXIST. Neither CSI K nor CSI J appears anywhere in a real
-    ///      transcript, so the only way to clear a shrinking row is to write spaces over
-    ///      its tail. A model that does not pad manufactures leftover characters that the
-    ///      renderer never leaves.
+    ///      transcript. Whether the renderer clears a shrinking row by writing spaces
+    ///      over its tail is [`Erase`]'s axis: it has been seen both padding and leaving
+    ///      stale cells, so both modes are modeled and swept.
     ///   3. THE CURSOR MOVES BY ROWS ACTUALLY PAINTED. Walking back up by the new frame's
     ///      height instead of the previous frame's silently shifts every subsequent frame
     ///      down the screen.
@@ -370,14 +511,25 @@ mod tests {
     ///      between rows -- not by the terminal's autowrap.
     struct Tui {
         width: usize,
+        erase: Erase,
         painted: Vec<String>,
         transcript: String,
     }
 
     impl Tui {
         fn new(width: usize) -> Self {
+            Self::with_erase(width, Erase::PadsToWidth)
+        }
+
+        /// The issue-#5 renderer: repaint without erase, stale cells surviving.
+        fn without_erase(width: usize) -> Self {
+            Self::with_erase(width, Erase::LeavesStaleCells)
+        }
+
+        fn with_erase(width: usize, erase: Erase) -> Self {
             Self {
                 width,
+                erase,
                 painted: Vec::new(),
                 transcript: String::from("\x1b[?25l"),
             }
@@ -399,10 +551,12 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let height = rows.len().max(self.painted.len());
-            rows.resize(height, String::new());
-            for row in &mut rows {
-                while row.chars().count() < self.width {
-                    row.push(' ');
+            if self.erase == Erase::PadsToWidth {
+                rows.resize(height, String::new());
+                for row in &mut rows {
+                    while row.chars().count() < self.width {
+                        row.push(' ');
+                    }
                 }
             }
 
@@ -410,12 +564,20 @@ mod tests {
                 self.transcript
                     .push_str(&format!("\r\x1b[{}A", self.painted.len()));
             }
+            // What each row holds afterwards: the new content, plus whatever old cells
+            // it did not reach. Under PadsToWidth the new content always reaches the
+            // full width, so nothing survives; under LeavesStaleCells the tail of a
+            // wider prior frame keeps standing -- that surviving tail IS issue #5.
+            let mut merged = Vec::with_capacity(height);
             for index in 0..height {
                 let was = self.painted.get(index).map(String::as_str).unwrap_or("");
-                self.transcript.push_str(&repaint(was, &rows[index]));
+                let now = rows.get(index).map(String::as_str).unwrap_or("");
+                self.transcript.push_str(&repaint(was, now));
                 self.transcript.push_str("\r\r\n");
+                let shown = now.chars().count();
+                merged.push(now.chars().chain(was.chars().skip(shown)).collect());
             }
-            self.painted = rows;
+            self.painted = merged;
             self
         }
 
@@ -459,37 +621,212 @@ mod tests {
             .collect()
     }
 
+    /// Small widths split the token inside the `sk-ant-oat` prefix itself; 108 is the
+    /// token's exact length; above it nothing wraps at all.
+    const SWEEP_WIDTHS: [usize; 17] = [
+        3, 5, 7, 9, 11, 13, 40, 60, 72, 80, 100, 107, 108, 109, 120, 200, 400,
+    ];
+
+    /// The panel claude 2.1.220 renders, blank lines included: its Box carries gap:1,
+    /// so every child is separated by an empty row. That blank row after the token is
+    /// what tells a token exactly as wide as the terminal apart from one that wrapped
+    /// -- without it the two are indistinguishable in a transcript. The frame before
+    /// the token lands is laid out the same way, so the stale characters sit on the
+    /// very rows the token is about to be painted over.
+    fn ceremony_transcript(width: usize, erase: Erase, stale: &str) -> String {
+        let label = "Your OAuth token (valid for 1 year):";
+        let footer = "Store this token securely. You won't be able to see it again.";
+        let mut tui = Tui::with_erase(width, erase);
+        tui.render(&["Browser didn't open? Use the url below to sign in", "", URL])
+            .render(&[label, "", stale, "", footer])
+            .render(&[label, "", TOKEN, "", footer]);
+        tui.transcript().to_owned()
+    }
+
     #[test]
     fn token_survives_repaint_and_wrap_at_every_plausible_width() {
         let stale = stale_frame();
-        // Small widths split the token inside the `sk-ant-oat` prefix itself; 108 is the
-        // token's exact length; above it nothing wraps at all.
-        for width in [
-            3usize, 5, 7, 9, 11, 13, 40, 60, 72, 80, 100, 107, 108, 109, 120, 200, 400,
-        ] {
-            // The panel claude 2.1.220 renders, blank lines included: its Box carries
-            // gap:1, so every child is separated by an empty row. That blank row after the
-            // token is what tells a token exactly as wide as the terminal apart from one
-            // that wrapped -- without it the two are indistinguishable in a transcript.
-            let label = "Your OAuth token (valid for 1 year):";
-            let footer = "Store this token securely. You won't be able to see it again.";
-            let mut tui = Tui::new(width);
-            tui.render(&["Browser didn't open? Use the url below to sign in", "", URL])
-                // The frame before the token lands, laid out the same way, so the stale
-                // characters sit on the very rows the token is about to be painted over.
-                .render(&[label, "", &stale, "", footer])
-                .render(&[label, "", TOKEN, "", footer]);
-
+        for width in SWEEP_WIDTHS {
+            let transcript = ceremony_transcript(width, Erase::PadsToWidth, &stale);
             assert!(
-                !tui.transcript().contains(TOKEN),
+                !transcript.contains(TOKEN),
                 "width {width}: the transcript must not contain the token contiguously"
             );
             assert_eq!(
-                capture_setup_token(tui.transcript().as_bytes()),
+                capture_setup_token(transcript.as_bytes()),
                 Some(TOKEN.to_owned()),
                 "width {width}"
             );
         }
+    }
+
+    /// The same sweep under the no-erase renderer. Under it, capture cannot promise
+    /// the exact token at every width -- a stale cell that lands in the token alphabet
+    /// is indistinguishable from the credential, and refusing IS the correct outcome
+    /// -- so the property here is safety: every width yields either the exact token or
+    /// a refusal that explains itself. No width may ever yield wrong bytes, which is
+    /// the failure worth more than all the others (it banks, then 401s a month later).
+    #[test]
+    fn under_repaint_without_erase_no_width_yields_a_wrong_token() {
+        let stale = stale_frame();
+        for width in SWEEP_WIDTHS {
+            let transcript = ceremony_transcript(width, Erase::LeavesStaleCells, &stale);
+            match capture_setup_token(transcript.as_bytes()) {
+                Some(token) => assert_eq!(token, TOKEN, "width {width}: wrong bytes captured"),
+                None => {
+                    let reason = refusal_reason(transcript.as_bytes());
+                    assert!(
+                        reason.contains("Re-run") || reason.contains("no line"),
+                        "width {width}: refusal must explain itself: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------------------
+    // Issue #5's geometry: `onboard anthropic` at a 110-column terminal. The OAuth URL
+    // hard-wrapped at 110 and pinned the widest row; the 108-char token did NOT wrap
+    // (108 < 110), but the reconstructed token line came back 109 characters -- one
+    // stale non-space cell at column 109, left by a prior frame the token's repaint
+    // never cleared. The prior capture rule required the token to be alone on its line,
+    // so it refused at an ordinary terminal width and told the operator to resize.
+    // --------------------------------------------------------------------------------
+
+    /// The ceremony screen issue #5 reported, rendered by the no-erase renderer at
+    /// `width`, where the row the token lands on previously held `stale_row`. The
+    /// prelude is identical in every frame so the only dirty row is the token's own.
+    fn issue_5_screen(width: usize, stale_row: &str) -> String {
+        let prelude = "Browser didn't open? Use the url below to sign in";
+        let label = "Your OAuth token (valid for 1 year):";
+        let footer = "Store this token securely. You won't be able to see it again.";
+        let mut tui = Tui::without_erase(width);
+        tui.render(&[prelude, "", URL])
+            .render(&[prelude, "", URL, "", label, "", stale_row, "", footer])
+            .render(&[prelude, "", URL, "", label, "", TOKEN, "", footer]);
+        tui.transcript().to_owned()
+    }
+
+    /// Issue #5 EXACTLY: 110 columns, token line 109 characters -- the 108-char token
+    /// plus one stale non-token cell at column 109. The token is extracted and the
+    /// stale cell is named, not silently eaten.
+    #[test]
+    fn issue_5_a_stale_cell_after_the_token_is_discarded_and_named() {
+        let stale = format!("{}%", "#".repeat(108)); // 109 wide; column 109 holds '%'
+        let screen = issue_5_screen(110, &stale);
+
+        let lines = displayed_lines(screen.as_bytes());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim().starts_with("sk-ant-oat") && line.chars().count() == 109),
+            "fixture must reproduce the 109-char token line; lines {lines:?}"
+        );
+
+        assert_eq!(
+            capture_setup_token(screen.as_bytes()).as_deref(),
+            Some(TOKEN),
+            "issue-5 geometry must capture; refusal was: {}",
+            refusal_reason(screen.as_bytes())
+        );
+        let note = capture_note(screen.as_bytes()).expect("the stale cell must be named");
+        assert!(note.contains("1 stale cell"), "{note}");
+        assert!(note.contains('%'), "{note}");
+    }
+
+    /// Boundaries around the reported geometry: the stale tail makes the token line
+    /// exactly the terminal width (so it rejoins as a full-width row), at 110 and 109
+    /// columns, and one past the width (so one stale cell wraps to the next row and
+    /// the rejoin welds it back). All must extract the exact token.
+    #[test]
+    fn issue_5_boundaries_extract_the_exact_token() {
+        for (width, stale_tail) in [(110usize, 2usize), (109, 1), (110, 3)] {
+            let stale = format!("{}{}", "#".repeat(108), "%".repeat(stale_tail));
+            let screen = issue_5_screen(width, &stale);
+            assert_eq!(
+                capture_setup_token(screen.as_bytes()).as_deref(),
+                Some(TOKEN),
+                "width {width}, stale tail {stale_tail}: {}",
+                refusal_reason(screen.as_bytes())
+            );
+        }
+    }
+
+    /// Issue #5's flagged near-miss: the stale cell holds a token-ALPHABET character,
+    /// so the 109-char line is an unbroken run and nothing marks where the token ends.
+    /// Capturing 109 bytes here is the wrong-token hazard; the length gate refuses and
+    /// the refusal does the arithmetic and names the stale-repaint cause.
+    #[test]
+    fn issue_5_near_miss_in_the_token_alphabet_refuses_with_the_arithmetic() {
+        let stale = format!("{}Z", "#".repeat(108)); // column 109 holds 'Z'
+        let screen = issue_5_screen(110, &stale);
+        assert_eq!(
+            capture_setup_token(screen.as_bytes()),
+            None,
+            "an unbroken 109-char run must never be banked as a token"
+        );
+        let reason = refusal_reason(screen.as_bytes());
+        assert!(reason.contains("109"), "{reason}");
+        assert!(reason.contains("exactly 108"), "{reason}");
+        assert!(reason.contains("stale cell"), "{reason}");
+    }
+
+    /// Control: the same layout with NO stale tail, at the boundary widths -- shows
+    /// the assertions above are about the stale cell, not the widths.
+    #[test]
+    fn issue_5_control_clean_token_at_boundary_widths() {
+        for width in [107usize, 108, 109, 110, 111] {
+            let screen = issue_5_screen(width, &stale_frame());
+            assert_eq!(
+                capture_setup_token(screen.as_bytes()).as_deref(),
+                Some(TOKEN),
+                "clean control failed at width {width}: {}",
+                refusal_reason(screen.as_bytes())
+            );
+        }
+    }
+
+    /// The ceremony pins its pty at exactly [`SETUP_TOKEN_LENGTH`] columns (see
+    /// `ceremonies::script_args`). At that width the issue-#5 mechanism is unreachable
+    /// even under the no-erase renderer: no row can be wider than the token, so no
+    /// stale cell can survive past its end -- the token's repaint covers its row edge
+    /// to edge. A full row of token-alphabet junk under the token, the worst stale
+    /// content there is, must still yield a clean exact capture with nothing to
+    /// discard.
+    #[test]
+    fn at_the_pinned_width_the_token_row_cannot_carry_stale_cells() {
+        let stale = "Z".repeat(SETUP_TOKEN_LENGTH);
+        let screen = issue_5_screen(SETUP_TOKEN_LENGTH, &stale);
+        assert_eq!(
+            capture_setup_token(screen.as_bytes()).as_deref(),
+            Some(TOKEN),
+            "{}",
+            refusal_reason(screen.as_bytes())
+        );
+        assert_eq!(
+            capture_note(screen.as_bytes()),
+            None,
+            "nothing may need discarding at the pinned width"
+        );
+    }
+
+    /// The pinned width protects the token's ROW; it cannot promise the rest of the
+    /// screen. If a no-erase repaint ever leaves token-alphabet junk standing on the
+    /// gap row BELOW the token, the reconstruction is undecidable and must refuse --
+    /// safely, never by extending the token.
+    #[test]
+    fn stale_content_on_the_gap_row_refuses_rather_than_extending_the_token() {
+        let label = "Your OAuth token (valid for 1 year):";
+        let mut tui = Tui::without_erase(SETUP_TOKEN_LENGTH);
+        tui.render(&[label, "", &stale_frame(), "0123456789abcdef"])
+            .render(&[label, "", TOKEN, ""]);
+        assert_eq!(
+            capture_setup_token(tui.transcript().as_bytes()),
+            None,
+            "junk on the gap row must refuse, not weld onto the token"
+        );
+        let reason = refusal_reason(tui.transcript().as_bytes());
+        assert!(reason.contains("Re-run"), "{reason}");
     }
 
     /// The shape reported from shrdlu: characters inside the token were never emitted,
@@ -525,17 +862,14 @@ mod tests {
         );
     }
 
-    /// The unsafe direction, pinned. If a shorter frame were ever painted over a longer
-    /// one WITHOUT clearing the tail, the leftover characters would sit on the token's
-    /// row, and a width-based rejoin would hand back the token with a tail glued to it.
-    /// Capture must refuse instead.
-    ///
-    /// claude 2.1.220 does not do this -- it emits no erase sequences, so it can only
-    /// clear a row by writing spaces, and the sweep above models that. This guards the
-    /// rejoin rule against a renderer that stops padding, which would otherwise turn a
-    /// wrapped token into a longer, well-formed, wrong one.
+    /// A shorter frame painted over a longer one WITHOUT clearing the tail: the
+    /// leftover cells sit on the token's row and the rejoin welds them onto it. The
+    /// welded tail here leaves the token alphabet immediately (`/` at the seam), so the
+    /// length gate can name the boundary: exactly [`SETUP_TOKEN_LENGTH`] token
+    /// characters, then debris — the token is extracted, the debris is discarded, and
+    /// `capture_note` says so out loud. Issue #5 is this exact shape in the wild.
     #[test]
-    fn an_uncleared_tail_refuses_instead_of_returning_a_longer_token() {
+    fn an_uncleared_tail_outside_the_alphabet_is_discarded_legibly() {
         let width = 40;
         let previous: String = URL.chars().take(width).collect();
         let mut screen = String::new();
@@ -550,9 +884,9 @@ mod tests {
             screen.push_str(&format!("{chunk}{uncovered}\r\n"));
         }
 
-        // Every row is now exactly full width, so the rejoin welds URL text onto the end
-        // of the token. That is the wrong answer this test exists to reject -- and it is
-        // wrong in the dangerous way, being longer rather than malformed.
+        // Every row is exactly full width, so the rejoin welds URL text onto the end of
+        // the token; the seam character must be outside the token alphabet for this to
+        // be the extractable case rather than the refusable one.
         let rejoined = displayed_lines(screen.as_bytes());
         assert!(
             rejoined
@@ -562,10 +896,12 @@ mod tests {
         );
 
         assert_eq!(
-            capture_setup_token(screen.as_bytes()),
-            None,
-            "a token with an uncleared tail glued to it must not be captured"
+            capture_setup_token(screen.as_bytes()).as_deref(),
+            Some(TOKEN)
         );
+        let note = capture_note(screen.as_bytes()).expect("discarded cells must be named");
+        assert!(note.contains("stale cell"), "{note}");
+        assert!(note.contains("discarded"), "{note}");
     }
 
     /// The two corruptions at once, stated rather than stumbled into: the wrap boundary
@@ -604,13 +940,27 @@ mod tests {
 
     /// A token displayed plainly, with no repaint and no wrapping -- the shape the old
     /// whitespace scan handled, kept so the fix is not narrower than what it replaces.
+    /// The token is the full-length fixture: capture is length-gated, so a token-shaped
+    /// string of any other length is not a token.
     #[test]
     fn captures_the_non_rotating_claude_setup_token() {
+        let plain = format!("browser output\n{TOKEN}\r\n");
         assert_eq!(
-            capture_setup_token(b"browser output\nsk-ant-oat01-example\r\n"),
-            Some("sk-ant-oat01-example".to_owned())
+            capture_setup_token(plain.as_bytes()),
+            Some(TOKEN.to_owned())
         );
         assert_eq!(capture_setup_token(b"no token here"), None);
+    }
+
+    /// The length gate itself: a plausible `sk-ant-oat…` line of the WRONG length is
+    /// refused, and the refusal does the arithmetic for the operator.
+    #[test]
+    fn a_token_shaped_run_of_the_wrong_length_is_refused_with_both_numbers() {
+        let short = b"sk-ant-oat01-example\r\n";
+        assert_eq!(capture_setup_token(short), None);
+        let reason = refusal_reason(short);
+        assert!(reason.contains("only 20 token characters"), "{reason}");
+        assert!(reason.contains("exactly 108"), "{reason}");
     }
 
     /// An OSC 8 hyperlink's payload must be consumed as an escape, never printed. The
@@ -797,18 +1147,31 @@ mod tests {
         );
     }
 
-    /// A refusal has to say which of the two situations happened, and the ambiguous one
-    /// has to say it is resolvable. "not captured" alone is what cost two codes.
+    /// A refusal has to say which situation happened and name its mechanism. "not
+    /// captured" alone is what cost two codes.
     #[test]
     fn a_refusal_says_why_it_refused() {
         let empty = refusal_reason(b"nothing token-shaped here\r\n");
         assert!(empty.contains("no line"), "{empty}");
         assert!(empty.contains("sk-ant-oat"), "{empty}");
 
-        let welded = refusal_reason(format!("{TOKEN}&code_challenge=Pc\r\n").as_bytes());
-        assert!(welded.contains("carried more than the token"), "{welded}");
-        assert!(welded.contains("wrapped across rows"), "{welded}");
-        assert!(welded.contains("different width"), "{welded}");
+        // One token-alphabet cell fused to the token: the near-miss. The refusal must
+        // do the arithmetic and name the stale-repaint cause, not tell the operator to
+        // resize a terminal the ceremony controls.
+        let fused = refusal_reason(format!("{TOKEN}Z\r\n").as_bytes());
+        assert!(fused.contains("109 token-alphabet characters"), "{fused}");
+        assert!(fused.contains("exactly 108"), "{fused}");
+        assert!(fused.contains("stale cell"), "{fused}");
+        assert!(fused.contains("repaints without erasing"), "{fused}");
+
+        // A non-token cell INSIDE the token's columns: the reconstruction is broken,
+        // not merely dirty at the edge.
+        let broken = refusal_reason(b"sk-ant-oat01-abc&def\r\n");
+        assert!(
+            broken.contains("left the token alphabet after 16"),
+            "{broken}"
+        );
+        assert!(broken.contains("exactly 108"), "{broken}");
     }
 
     /// A screen that wraps at TWO widths, which is what a real headless ceremony renders.
@@ -862,10 +1225,10 @@ mod tests {
         let welded = format!("{TOKEN}\r\n0123456789abcdef\r\nStore this token securely.\r\n");
         assert_eq!(capture_setup_token(welded.as_bytes()), None);
 
-        // And the operator is told which situation it was, and that it is recoverable.
+        // And the operator is told which situation it was.
         let reason = refusal_reason(welded.as_bytes());
         assert!(reason.contains("sk-ant-oat"), "{reason}");
-        assert!(reason.contains("carried more than the token"), "{reason}");
-        assert!(reason.contains("different width"), "{reason}");
+        assert!(reason.contains("no blank row"), "{reason}");
+        assert!(reason.contains("Re-run"), "{reason}");
     }
 }
