@@ -1064,15 +1064,90 @@ defmodule Tightbeam.RailScriptTest do
              DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
   end
 
-  # THE VERDICT WINDOW — the interleaving that killed the previous two designs, and which
-  # nothing covered because every earlier test summoned only AFTER `Rules.decide/2`
-  # returned. Here the malfunction lands in the gap the reviewer named: after the sensor
-  # rendered its verdict, before the evaluation's cutoff would have been read. Any cutoff
-  # derived after the verdict necessarily includes this summons and sweeps it. A cutoff
-  # minted BEFORE the check cannot, which is the whole reason it moved.
-  test "a malfunction landing between the verdict and the recovery is not swept", ctx do
+  # THE VERDICT WINDOW — the interleaving that killed the previous two designs, and the
+  # test that pins WHERE the cutoff is minted rather than merely asserting the outcome.
+  #
+  # The earlier version of this test called `RailEpisodes.evaluating/3` by hand, so moving
+  # the production mint after `RailScript.run/5` would not have failed it — it proved the
+  # writer works, not that `decide` mints at the right moment. The fix is to make the
+  # healthy evaluation the REAL `Rules.decide/2` path and land the malfunction WHILE its
+  # check is still executing. A cutoff minted before the check is below that summons; a
+  # cutoff minted after the check is above it and sweeps it.
+  #
+  # The ordering is deterministic, not timed: the healthy script blocks until this test
+  # releases it, and we wait on the writer's own sequence to prove the mint happened
+  # before firing the malfunction. A slow box makes this test RED, never falsely green.
+  test "the healthy evaluation's cutoff is minted before its check runs", ctx do
     handlers = %{"post" => fn _call -> %{ok: true} end}
-    subject = call(%{work_item_id: "w-verdict-window"})
+    subject = call(%{work_item_id: "w-mint-point"})
+    release = Path.join(ctx.base_dir, "release-the-check")
+
+    load = fn script ->
+      put_statute(ctx, statute(script, %{"pass" => "allow"}))
+      Rules.load!(ctx.base_dir, ["post"])
+    end
+
+    # A healthy check that hangs until released. Reads are permitted under the rail
+    # profile, so waiting on a file it can only observe is legal inside containment.
+    blocking = Path.join([ctx.base_dir, "identity", "rails", "scripts", "rail-blocks"])
+
+    File.write!(
+      blocking,
+      "#!/bin/sh\nwhile [ ! -f #{release} ]; do sleep 0.02; done\nprintf pass\n"
+    )
+
+    File.chmod!(blocking, 0o755)
+
+    # An episode is open for the timeout class.
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    assert {:ok, [[id]]} = DB.query(ctx.db, "SELECT id FROM decision_requests")
+
+    before_seq = writer_seq()
+    load.("rail-blocks")
+
+    # The real decide path: it mints, then blocks inside the check.
+    evaluation = Task.async(fn -> Rules.decide(ctx.db, subject) end)
+
+    # Proof we are PAST the mint and INSIDE the check — the writer's sequence moved and
+    # the script has not been released. No sleep, no guess.
+    wait_until(
+      fn -> writer_seq() > before_seq end,
+      "the writer's sequence never moved while the check was still running, so the " <>
+        "evaluation did not mint its cutoff BEFORE running the check"
+    )
+
+    # The malfunction lands here, in the window a post-check mint would have covered.
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    File.touch!(release)
+
+    assert {_decision, [{:episodes, name, position}], _} = Task.await(evaluation, 30_000)
+    assert {_incarnation, seq} = position
+    assert is_integer(seq)
+
+    # The actor enacts the healthy evaluation's recovery.
+    :ok = RailEpisodes.recovered(ctx.db, name, position)
+
+    # The malfunction that happened while the check was running still summons a mind.
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+  end
+
+  # BOUNDED WRITER STATE. An episode adjudicated by a mind leaves the open set without the
+  # writer withdrawing it, so a recovery that dropped only what IT withdrew would keep that
+  # episode's entry for the life of the process — unbounded under repeated adjudication.
+  # Recovery is the moment the writer learns the true open set, so it is the moment to
+  # forget everything of that statute's that is no longer in it.
+  test "an externally adjudicated episode is forgotten by the writer at recovery", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-bounded"})
 
     load = fn script ->
       put_statute(ctx, statute(script, %{"pass" => "allow"}))
@@ -1086,30 +1161,27 @@ defmodule Tightbeam.RailScriptTest do
 
     assert {:ok, [[id]]} = DB.query(ctx.db, "SELECT id FROM decision_requests")
 
-    # The cutoff is minted HERE, before the healthy check runs — this is `decide`'s first
-    # act on a check-tier statute, and the test stands in for it so the window after the
-    # verdict is reachable at all.
-    position = RailEpisodes.evaluating(ctx.db, "script-escalate")
-    assert {_incarnation, seq} = position
-    assert is_integer(seq)
+    # The writer is tracking it.
+    assert Map.has_key?(:sys.get_state(Tightbeam.RailEpisodes).last_summon, id)
 
-    # The sensor now answers healthy. Nothing has been enacted yet.
+    # A mind rules on it — it leaves the open set without the writer touching it.
+    assert %{status: "ruled"} =
+             Escalation.rule(
+               ctx.db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{request_id: id, decision: "allow"}
+               },
+               authorized: true
+             )
+
+    # A later healthy evaluation recovers. It withdraws nothing — there is nothing open —
+    # but it is where the writer learns the entry is dead.
     load.("rail-pass")
+    assert {:ok, %{ok: true}} = Dispatch.dispatch(ctx.db, handlers, subject)
 
-    # ...and INSIDE the post-verdict window, the same class malfunctions again and
-    # attaches. Under either previous design this summons would have been inside the
-    # cutoff and silenced.
-    load.("rail-timeout")
-
-    assert {:error, %{script_exit_class: "timeout"}} =
-             Dispatch.dispatch(ctx.db, handlers, subject)
-
-    # The healthy evaluation's recovery finally lands, carrying its pre-check cutoff.
-    :ok = RailEpisodes.recovered(ctx.db, "script-escalate", position)
-
-    # The malfunction that happened after the verdict is still summoning a mind.
-    assert {:ok, [["open"]]} =
-             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+    refute Map.has_key?(:sys.get_state(Tightbeam.RailEpisodes).last_summon, id)
   end
 
   # STALE POSITION ACROSS A RESTART. The episode side of a restart is safe for free — an
@@ -1165,25 +1237,33 @@ defmodule Tightbeam.RailScriptTest do
   # before any hand-off and must come back byte-identical with the writer absent.
   test "a malfunction denies identically when the episode writer is down", ctx do
     handlers = %{"post" => fn _call -> flunk("a malfunctioning rail must not run") end}
+    subject = call(%{work_item_id: "w-writer-down"})
 
     put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
     Rules.load!(ctx.base_dir, ["post"])
 
+    # BASELINE first, with the writer up. Asserting a partial map against no baseline
+    # would pass on a payload that had quietly lost half its fields, so the property is
+    # equality against what the same call produces normally — not a shape spot-check.
+    assert {:error, with_writer} = Dispatch.dispatch(ctx.db, handlers, subject)
+
     stop_supervised!(Tightbeam.RailEpisodes)
 
-    assert {:error,
-            %{
-              code: "rule_denied",
-              rule: "script-escalate",
-              edge: "verb",
-              reason: "script_timeout",
-              script_exit_class: "timeout",
-              ref: "w-writer-down"
-            }} = Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-writer-down"}))
+    assert {:error, without_writer} = Dispatch.dispatch(ctx.db, handlers, subject)
 
-    assert [denial] = EventLog.rail_denials(ctx.db, 0, 10)
-    assert denial.reason == "script_timeout"
-    assert denial.script_exit_class == "timeout"
+    # Whole payload, no exclusions: every field of a malfunction denial is a function of
+    # the statute and the call, and neither changed. Nothing here legitimately varies —
+    # if a future field does, it must be excluded HERE with a reason, not by weakening
+    # this to a partial match.
+    assert without_writer == with_writer
+
+    # And the durable denial rows agree too, so the equality is not just in the return.
+    assert [first, second] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert first.reason == second.reason
+    assert first.script_exit_class == second.script_exit_class
+    assert first.rule == second.rule
+    assert second.reason == "script_timeout"
+    assert second.script_exit_class == "timeout"
   end
 
   # WRITER DOWN, property 2: the summons fails soft exactly as an unreachable owner does —
@@ -1592,6 +1672,18 @@ defmodule Tightbeam.RailScriptTest do
            "real rail-exec integration binary missing: #{@release_binary}; run cargo build --release in cli/"
     test "a check whose input never arrived records unreported, not a child exit" do
       flunk("release binary is required when this test is enabled")
+    end
+  end
+
+  defp writer_seq, do: :sys.get_state(Tightbeam.RailEpisodes).seq
+
+  defp wait_until(condition, why, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 5_000
+
+    cond do
+      condition.() -> :ok
+      System.monotonic_time(:millisecond) > deadline -> flunk(why)
+      true -> Process.sleep(10) && wait_until(condition, why, deadline)
     end
   end
 

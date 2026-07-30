@@ -20,6 +20,11 @@ defmodule Tightbeam.RailEpisodes do
   `decide` effect-free (§B).
 
   Ordering state is `seq` plus the newest summons position per episode, held HERE. It is
+  BOUNDED: an entry is pruned as soon as its episode is no longer open, whether it left by
+  recovery, a ruling, or a waiver. The prune keys on the OPEN SET rather than on what a
+  call happened to withdraw, and it runs at `evaluating` as well as at recovery — recovery
+  only happens when something is open, so an externally adjudicated episode would never be
+  forgotten if that were the only prune point.
   deliberately not in `lifecycle_events`: those are observability-only and never decision
   inputs (§E3), and reading them to decide a closure is the authority violation that sank
   the previous attempt. Episodes themselves stay durable in `decision_requests`.
@@ -87,12 +92,15 @@ defmodule Tightbeam.RailEpisodes do
   def handle_call({:evaluating, db, statute}, _from, state) do
     state = %{state | seq: state.seq + 1}
 
-    position =
-      if Escalation.open_episodes(db, statute) == [],
-        do: nil,
-        else: {state.incarnation, state.seq}
+    open = Escalation.open_episodes(db, statute)
+    position = if open == [], do: nil, else: {state.incarnation, state.seq}
 
-    {:reply, position, state}
+    # Also the prune point, and the LOAD-BEARING one. Recovery only runs when something is
+    # open, so an episode adjudicated by a mind — which leaves the open set without the
+    # writer touching it — would never be forgotten there: no episode open means no
+    # recovery scheduled means no prune, forever. This read happens on EVERY check-tier
+    # evaluation including the empty ones, so it is where a dead entry actually dies.
+    {:reply, position, %{state | last_summon: prune(state.last_summon, statute, open)}}
   end
 
   def handle_call({:summon, db, call, statute, ctx}, _from, state) do
@@ -102,7 +110,7 @@ defmodule Tightbeam.RailEpisodes do
     # `decision_requests` row at all — is ordered exactly like a fresh open.
     state =
       case Escalation.summon(db, call, statute, ctx) do
-        {:ok, id} -> put_in(state.last_summon[id], state.seq)
+        {:ok, id} -> put_in(state.last_summon[id], {statute_name(statute), state.seq})
         :error -> state
       end
 
@@ -111,14 +119,13 @@ defmodule Tightbeam.RailEpisodes do
 
   def handle_call({:recovered, db, statute, {incarnation, seq}}, _from, state)
       when incarnation == :erlang.map_get(:incarnation, state) do
-    stale =
-      db
-      |> Escalation.open_episodes(statute)
-      |> Enum.filter(&(Map.get(state.last_summon, &1, 0) < seq))
+    open = Escalation.open_episodes(db, statute)
+
+    stale = Enum.filter(open, &(summon_seq(state, &1) < seq))
 
     :ok = Escalation.withdraw_episodes(db, stale, statute)
 
-    {:reply, :ok, %{state | last_summon: Map.drop(state.last_summon, stale)}}
+    {:reply, :ok, %{state | last_summon: prune(state.last_summon, statute, open -- stale)}}
   end
 
   # A position from a previous incarnation. Its `seq` is not old, it is meaningless — the
@@ -147,6 +154,26 @@ defmodule Tightbeam.RailEpisodes do
     _ -> :ok
   catch
     _, _ -> :ok
+  end
+
+  defp summon_seq(state, id) do
+    case Map.get(state.last_summon, id) do
+      {_statute, seq} -> seq
+      nil -> 0
+    end
+  end
+
+  # Keeps the map bounded. Recovery is the only moment the writer learns a statute's true
+  # open set, so it is the moment to forget everything of that statute's that is no longer
+  # in it — withdrawn here, ruled by a mind, or waived. Dropping only what THIS call
+  # withdrew would leak an entry for every externally adjudicated episode, unbounded under
+  # repeated adjudication.
+  defp prune(last_summon, statute, still_open) do
+    keep = MapSet.new(still_open)
+
+    Map.reject(last_summon, fn {id, {entry_statute, _seq}} ->
+      entry_statute == statute and not MapSet.member?(keep, id)
+    end)
   end
 
   defp statute_name(statute), do: Map.get(statute, :name) || Map.get(statute, "name")
