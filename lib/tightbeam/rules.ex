@@ -792,20 +792,18 @@ defmodule Tightbeam.Rules do
               # recurring silently on every retry. Only a declared token mapped to `deny`
               # above stays a bare deny; that one is the sensor answering.
               {:error, reason, exit_class} ->
-                error = denial_error(rule, call, reason, exit_class)
-
-                ctx = %{
-                  question: malfunction_question(rule, reason, exit_class),
-                  error: error,
-                  episode_key: exit_class
-                }
-
-                {{:deny_escalate, rule, ctx}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+                malfunction(rule, call, reason, exit_class, to_close, to_consume)
             end
 
+          # The invocation context could not be resolved, so NO script was spawned — the
+          # third `unreported` row of §A3's table, and a malfunction like the rest of it.
+          # It recorded `error:1` until now: a child exit asserted for a child that never
+          # existed, byte-identical to a script that really did exit 1. That is the task
+          # #43 fabrication, surviving here because it sits a level above `rail_script.ex`
+          # where the rest of it was cleaned out. The class no observation carried is
+          # exactly what `unreported` exists to say.
           :error ->
-            error = denial_error(rule, call, "script_error", "error:1")
-            {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+            malfunction(rule, call, "script_error", "unreported", to_close, to_consume)
         end
     end
   end
@@ -852,6 +850,18 @@ defmodule Tightbeam.Rules do
       {:needs_request, dr_id} ->
         {{:escalate, rule, ctx, dr_id}, Enum.reverse(to_close), Enum.reverse(to_consume)}
     end
+  end
+
+  # The one shape every malfunction takes, so the two sites that reach one cannot drift:
+  # the deny is byte-identical to what it always was, and the summons rides beside it.
+  defp malfunction(rule, call, reason, exit_class, to_close, to_consume) do
+    ctx = %{
+      question: malfunction_question(rule, reason, exit_class),
+      error: denial_error(rule, call, reason, exit_class),
+      episode_key: exit_class
+    }
+
+    {{:deny_escalate, rule, ctx}, Enum.reverse(to_close), Enum.reverse(to_consume)}
   end
 
   # What the summoned mind is asked. It names the statute, the reason code, and the exit

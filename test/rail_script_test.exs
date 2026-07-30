@@ -519,8 +519,20 @@ defmodule Tightbeam.RailScriptTest do
     assert {:allow, [], []} = Rules.decide(ctx.db, attest)
     assert EventLog.lifecycle_events(ctx.db) == []
 
-    assert {{:deny, %{edge: "turn-end", ref: "a-edge"}}, [], []} =
-             Rules.decide(ctx.db, Map.put(attest, :edge, :turn_end))
+    # What this pins is the EDGE: the statute is reached at turn-end and not at the verb
+    # edge, and the payload carries the gated ref. It is not the script's verdict — this
+    # suite has no `assignments` table, so `a-edge` never resolves and the check is never
+    # spawned. The old assertion named neither reason nor class, which is how it sat here
+    # asserting a fabricated `error:1` without anyone seeing it.
+    assert {{:deny_escalate, %{name: "script-escalate"},
+             %{
+               error: %{
+                 edge: "turn-end",
+                 ref: "a-edge",
+                 reason: "script_error",
+                 script_exit_class: "unreported"
+               }
+             }}, [], []} = Rules.decide(ctx.db, Map.put(attest, :edge, :turn_end))
 
     put_statute(
       ctx,
@@ -912,6 +924,50 @@ defmodule Tightbeam.RailScriptTest do
              Dispatch.dispatch(ctx.db, handlers, heal)
 
     assert open_episodes.() == 0
+  end
+
+  # The malfunction that never reached the engine: the invocation context could not be
+  # resolved, so NO script was spawned — the third `unreported` row of §A3's table. It
+  # recorded `error:1`, a child exit asserted for a child that never existed and
+  # byte-identical to a script that really did exit 1. That is task #43's fabrication,
+  # surviving here because it sits a level above `rail_script.ex` where the rest of it
+  # was cleaned out.
+  test "an unresolvable invocation context records unreported, never a fabricated exit", ctx do
+    handlers = %{
+      "post" => fn _call -> flunk("an unresolved context must not run the handler") end
+    }
+
+    put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+
+    # This suite has no `assignments` table, so resolving the named assignment raises
+    # inside the fact and the check is never spawned.
+    unresolvable = call(%{assignment_id: "a-missing"})
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "script-escalate",
+              reason: "script_error",
+              script_exit_class: exit_class,
+              ref: "a-missing"
+            }} = Dispatch.dispatch(ctx.db, handlers, unresolvable)
+
+    assert exit_class == "unreported"
+    refute exit_class == "error:1"
+
+    assert [denial] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert denial.script_exit_class == "unreported"
+
+    # Nothing was spawned, so nothing wrote a rail_script row to disagree with.
+    assert ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "rail_script")) == []
+
+    # And the episode carries the class the missing observation would have carried.
+    assert {:ok, [["script-escalate", question, "open"]]} =
+             DB.query(ctx.db, "SELECT statuteName, question, status FROM decision_requests")
+
+    assert question =~ "denied script_error"
+    assert question =~ "script_exit_class unreported"
   end
 
   # The summons is SUBORDINATE to the deny (§B3). A caller with no accountable owner
