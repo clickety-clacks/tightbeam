@@ -22,7 +22,10 @@ defmodule Tightbeam.ArtifactCarrierTest.PausingDb do
   @impl true
   def handle_call(:release, _from, %{held: {from, message}} = state) do
     GenServer.reply(from, GenServer.call(state.db, message))
-    {:reply, :ok, %{state | held: nil}}
+    # Re-armed: one hold is not always enough, because the durations a test can
+    # use are bracketed by the product's own timeouts and sometimes only several
+    # short holds fit between them.
+    {:reply, :ok, %{state | held: nil, armed: true}}
   end
 
   def handle_call(:release, _from, state), do: {:reply, :ok, state}
@@ -412,35 +415,55 @@ defmodule Tightbeam.ArtifactCarrierTest do
   # it and is STRENGTHENED to `tool-call-observed`. Degradation must not invent
   # evidence; that is the wrong direction to fail in.
   #
-  # This test spends the writer's real, shipped call timeout on purpose — the
-  # constant under test is the one the product uses. It holds the writer for
-  # longer than that timeout but comfortably less than `DB.query/3`'s own 5s
-  # ceiling, so the writer is still ALIVE to drop the post. A writer that died
-  # instead would produce the same evidence class for an entirely different
-  # reason, so its liveness is asserted rather than assumed.
+  # The post is stalled INSIDE its own ledger read, which is the interleaving an
+  # arrival-only check cannot see: the writer entered the callback in good time
+  # and the deadline passed while it was reading.
+  #
+  # THE THREE DURATIONS ARE NOT FREE CHOICES. They are boxed in by the product's
+  # own two timeouts, and each bound is there for a reason a previous version of
+  # this test got wrong:
+  #
+  #   * the post must be PICKED UP before its 2s deadline, or the arrival check
+  #     drops it and the in-flight crossing is never exercised at all — so the
+  #     first hold is short, and the second pause is asserted, which is what
+  #     proves the post really did enter the callback in time;
+  #   * the window must open AFTER the 5s that the unfenced writer made its
+  #     caller wait, or the baseline red is only "a post acted late" rather than
+  #     "a post acted for a caller that was already gone";
+  #   * no single hold may reach `DB.query/3`'s own 5s ceiling, or the writer
+  #     dies instead of deciding — a dead writer yields the same evidence class
+  #     for an entirely different reason, which is exactly how an earlier version
+  #     of this test passed while proving nothing.
+  #
+  # Those three leave roughly half a second of room at each end, which is why the
+  # time is spent across two holds rather than one, and why liveness is asserted
+  # rather than assumed. Every duration is wall-clock from a monotonic origin, so
+  # load moves the assertions, not the holds.
   @tag timeout: 60_000
   test "an observation its caller gave up on can never open a window later", ctx do
     running_message = start_turn(ctx)
     {proxy, _real} = pausing_db(ctx, "SELECT messageId FROM turns")
     writer = Process.whereis(TurnObservations)
 
-    # Occupy the writer: this post's own ledger read parks inside the proxy.
+    # Occupy the writer first, so the post that matters is queued behind a call
+    # already in progress — which is what makes its pickup time ours to choose.
     occupier = Task.async(fn -> TurnObservations.observe(proxy, "occupier-session") end)
     assert_receive {:db_paused, ^proxy}, 2_000
 
-    # Queued behind it, for the session that matters. Its caller waits out the
-    # timeout and gives up; the post is still sitting in the mailbox.
     posted_at = System.monotonic_time(:millisecond)
-    abandoned = Task.async(fn -> TurnObservations.observe(ctx.db, ctx.coder.session_key) end)
+    abandoned = Task.async(fn -> TurnObservations.observe(proxy, ctx.coder.session_key) end)
 
-    # Hold PAST the writer's own call timeout, and comfortably inside
-    # `DB.query/3`'s 5s ceiling. Both bounds are load-safe in the same direction:
-    # a slower machine only makes the post more expired when the writer reaches
-    # it, and the ceiling is the writer's, not this test's.
-    wait_until(posted_at + 3_000)
+    wait_until(posted_at + 1_000)
+    release_db(proxy)
+    assert Task.await(occupier, 5_000) == :ok
+
+    # The post is now INSIDE its callback, parked on its own ledger read, having
+    # entered a full second before its deadline.
+    assert_receive {:db_paused, ^proxy}, 2_000
+
+    wait_until(posted_at + 5_500)
     release_db(proxy)
 
-    assert Task.await(occupier, 5_000) == :ok
     assert Task.await(abandoned, 20_000) == :ok
 
     assert Process.alive?(writer),

@@ -348,17 +348,15 @@ defmodule Tightbeam.CliIntegrationTest do
 
   # verification-papertrail-v1 A7 (macOS half): A1/A2 walked end to end through
   # the real Bandit/Router stack and the real release CLI, against the shipped
-  # statutes exactly as relearn delivers them. ONE hop is still not the CLI: the
-  # review-link assign (#112 — the CLI's --reviews wire param is dropped by the
-  # handler seam), which goes through the gateway handlers instead.
+  # statutes exactly as relearn delivers them.
   #
-  # The report artifact used to be the second such hop, because artifact-record
-  # refused over the wire for want of a firing messages.id. It no longer is: the
-  # carrier ruling made the verb fail open, so the artifact now goes through the
-  # substrate's own PreToolUse hook and the real CLI like everything else.
-  # Everything but the review link — work item, coder assignment, the review
-  # verdict, both denials, both wakes, the verification verdict, the artifact,
-  # and the final completion — is the real CLI against the real stack.
+  # EVERY hop is the CLI now — work item, coder assignment, the review link, the
+  # review verdict, both denials, both wakes, the verification verdict, the
+  # report artifact, and the final completion. The two that used to be carved out
+  # are both closed: the artifact, because artifact-record refused over the wire
+  # for want of a firing messages.id until the carrier ruling made it fail open;
+  # and the review link, because `--reviews` reached the handler under a name no
+  # handler read until the router learned to alias it (#112).
   test "real CLI walks the verification papertrail end to end (A1/A2)", ctx do
     # A real bundle import, not a fixture copy: this is the arrival path §7
     # describes, so the walk fails if learn stops delivering rules/.
@@ -445,33 +443,36 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    # Second non-CLI hop (#112, pre-existing): the CLI sends the review link as
-    # wire param "reviews", which the assign handler never reads (it wants
-    # :reviews_assignment_id), so a CLI-created review link is silently
-    # dropped. Until #112 lands the review is opened through the REGISTERED
-    # "assign" handler the router serves — not Assignments.__handle__ directly —
-    # so the handler's assignment- and work-item-change composition still runs.
-    review =
-      ctx.handlers["assign"].(%{
-        verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        session_key: "cli-reviewer",
-        target_role: nil,
-        role_fallback: false,
-        params: %{
-          subject: "review of the feature",
-          work_item_id: item_id,
-          reviews_assignment_id: work_id
-        }
-      })
+    # The review link, through the real CLI. This was the last hop that was not:
+    # `--reviews` reached the handler as the wire word `reviews`, which no
+    # handler reads, so a CLI-created review link was silently dropped (#112).
+    # The router aliases it to `:reviews_assignment_id` now, so the bypass that
+    # stood in for it is gone.
+    {reviewed, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "review of the feature",
+          "--session",
+          "cli-reviewer",
+          "--work-item",
+          item_id,
+          "--reviews",
+          work_id,
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
 
-    # Proof the hop really traversed the registered table: only the router's
-    # wrapped handlers echo :cli_call. A direct Assignments.__handle__ call
-    # would skip the handler's change-callback composition and echo nothing.
+    # The link is what the CLI is on trial for here: an assignment that came back
+    # without it would still parse, and would still be a silently dropped edge.
     assert_receive {:cli_call, %{verb: "assign", params: %{reviews_assignment_id: ^work_id}}}
 
-    review_id = review.id
+    review_id = JSON.decode!(reviewed)["id"]
 
     {_verdict, 0} =
       System.cmd(

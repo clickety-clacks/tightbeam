@@ -42,8 +42,9 @@ defmodule Tightbeam.TurnObservations do
   treated as failed could otherwise open a window minutes later and STRENGTHEN
   some unrelated record to `tool-call-observed` — degradation inventing evidence,
   which is the wrong direction to fail in. Every post that MUTATES the window
-  therefore carries the deadline its caller will wait until, and one comparison
-  at processing time drops it if that deadline has passed.
+  therefore carries the deadline its caller will wait until, and the writer
+  compares against it immediately before mutating — after its own ledger read,
+  because that read is itself long enough to cross the deadline.
 
   The window is DELIBERATELY NOT DURABLE. A window that outlives the turn that
   opened it has no value, so `turns.requestRef` — the ledger's declared-unused
@@ -116,20 +117,36 @@ defmodule Tightbeam.TurnObservations do
   # The deadline rides only on the posts that MUTATE the window. A read carries
   # none: arriving late it changes nothing but the prune, which is idempotent
   # bookkeeping, and its caller has already answered itself from the ledger.
+  #
+  # It is compared TWICE, and the second one is the one that matters. Checking
+  # only on arrival leaves the ledger read itself inside the abandonment window:
+  # `DB.query/3` tolerates 5s and the caller waits 2s, so a stalled read can
+  # return to a writer whose caller left long ago and mutate anyway. The check
+  # that guards the mutation is the one immediately before it.
+  #
+  # The arrival check is not redundant, it is back-pressure. Posts expire
+  # precisely when reads are stalling, and that is the worst moment to issue one
+  # more read on behalf of a caller that is already gone.
   @impl true
   def handle_call({:observe, db, session_key, deadline}, _from, state) do
-    if now() >= deadline do
+    if expired?(deadline) do
       {:reply, :ok, state}
     else
-      now = now()
+      running = Ledger.running_turn_message_id(db, session_key)
 
-      windows =
-        case Ledger.running_turn_message_id(db, session_key) do
-          nil -> Map.delete(prune(state.windows, now), session_key)
-          message_id -> Map.put(prune(state.windows, now), session_key, {message_id, now})
-        end
+      if expired?(deadline) do
+        {:reply, :ok, state}
+      else
+        now = now()
 
-      {:reply, :ok, %{state | windows: windows}}
+        windows =
+          case running do
+            nil -> Map.delete(prune(state.windows, now), session_key)
+            message_id -> Map.put(prune(state.windows, now), session_key, {message_id, now})
+          end
+
+        {:reply, :ok, %{state | windows: windows}}
+      end
     end
   end
 
@@ -174,6 +191,8 @@ defmodule Tightbeam.TurnObservations do
   catch
     :exit, _ -> on_unavailable.()
   end
+
+  defp expired?(deadline), do: now() >= deadline
 
   defp now, do: System.monotonic_time(:millisecond)
 end
