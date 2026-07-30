@@ -1,0 +1,7 @@
+name = "surf-ace-controller"
+where = ["*"]
+skills = ["surf-ace"]
+
+[mcp.surf-ace]
+command = "tightbeam-surf-ace"
+args = ["mcp"]
