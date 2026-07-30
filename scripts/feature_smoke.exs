@@ -7,14 +7,20 @@
 #   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol[medium]' \
 #   mix run --no-start scripts/feature_smoke.exs
 #
-# Runs one explicit spawn/dispatch leg per Harness.all/0 entry and exits
-# non-zero on the first failed assertion. Every new roadmap feature that is
-# user-callable should get a check here (see the smoke-coverage practice).
+# Runs one explicit spawn/dispatch leg per SELECTED harness and exits non-zero on
+# the first failed assertion. Every new roadmap feature that is user-callable
+# should get a check here (see the smoke-coverage practice).
 #
-# ONE command runs BOTH legs; there is no per-leg invocation (tier-map GAP-3 —
-# FeatureSmokePlan.legs/1 maps over the compile-time registry and raises without
-# a model for each). That is not a limit for the gibson gate, which requires both
-# legs green anyway (artifact-carrier-proposal-v1 §7.3).
+# By default the selection is every Harness.all/0 entry, and a model is required
+# for each. TIGHTBEAM_SMOKE_LEGS narrows it (tier-map GAP-3):
+#
+#   TIGHTBEAM_SMOKE_LEGS=codex mix run --no-start scripts/feature_smoke.exs
+#
+# A narrowed run needs a model only for the legs it selected, which is what makes
+# one leg affordable rather than merely shorter. It also reports INCOMPLETE(parity)
+# by design and proves nothing about the leg it skipped, so the gibson gate still
+# wants both legs green (artifact-carrier-proposal-v1 §7.3); the filter is for
+# answering one leg's question quickly, not for satisfying the gate.
 #
 # The final group, artifact-record + completion-gate closure, additionally needs
 # the org's identity/rules to carry the shipped verification statutes
@@ -1031,12 +1037,20 @@ defmodule FeatureSmoke do
     }
   end
 
-  # The reviewer runs on a DIFFERENT registered harness wherever the registry offers one.
-  # This buys no extra enforcement — `assignment.independent_verdict_kinds` reads sessions,
-  # never harnesses — and it costs nothing either: `FeatureSmokePlan.legs/1` RAISES unless
-  # every registered harness has a model, and T2a already requires a live credential for
-  # each, so the other leg's material is a precondition of the run rather than a new one.
-  # What it buys is the cross-harness verdict path the live walk exercised.
+  # The reviewer runs on a different SELECTED leg wherever this run has one, and on the
+  # holder's own harness when it does not.
+  #
+  # On a default run that means cross-harness, which is the verdict path the live walk
+  # exercised, and it costs nothing: every selected leg already needs a model and a live
+  # credential, so the other leg's material is a precondition rather than a new one.
+  #
+  # Under TIGHTBEAM_SMOKE_LEGS the selection may be a single leg, and then the reviewer is
+  # a FRESH SESSION ON THE SAME HARNESS. That is a legitimate reviewer and not a degraded
+  # one: `assignment.independent_verdict_kinds` reads sessions, never harnesses, so
+  # independence turns on the review being held and filed by someone other than the holder
+  # — which a fresh same-harness session satisfies exactly. What a solo run loses is the
+  # cross-harness EVIDENCE, not the statute's satisfaction, and the run already reports
+  # itself INCOMPLETE(parity) for saying so.
   defp independent_leg(state) do
     Tightbeam.Harness.all()
     |> Tightbeam.FeatureSmokePlan.legs()
