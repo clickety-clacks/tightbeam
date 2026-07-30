@@ -548,26 +548,6 @@ defmodule Tightbeam.Ledger do
     :ok
   end
 
-  @doc "Newest adapter generation stamped by an earlier turn in the session, or nil."
-  @spec prior_adapter_generation(db(), String.t(), integer()) :: non_neg_integer() | nil
-  def prior_adapter_generation(db \\ Tightbeam.DB, session_key, before_seq) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-          SELECT adapterGen FROM turns
-          WHERE sessionKey = ?1 AND seq < ?2 AND adapterGen IS NOT NULL
-          ORDER BY seq DESC LIMIT 1
-        """,
-        [session_key, before_seq]
-      )
-
-    case rows do
-      [[generation]] -> generation
-      [] -> nil
-    end
-  end
-
   @doc "Conservation audit: non-terminal rows older than max_age_ms. Must be []."
   @spec non_terminal_older_than(db(), integer()) :: [integer()]
   def non_terminal_older_than(db \\ Tightbeam.DB, max_age_ms) do
