@@ -104,11 +104,7 @@ defmodule FeatureSmoke do
     before_home = if File.dir?(home), do: MapSet.new(leaf_entries(home)), else: MapSet.new()
     sentinel = Path.join(home, ".feature-smoke-durable-#{unique()}")
 
-    cwd =
-      Tightbeam.Placement.workdir_path(%{base_dir: state.base_dir}, %{
-        session_key: session_key,
-        host: machine
-      })
+    cwd = local_workdir_path(state.base_dir, session_key)
 
     try do
       redeploy!(state, session_key)
@@ -203,6 +199,36 @@ defmodule FeatureSmoke do
     )
   end
 
+  # The LOCAL host's workdir, computed without touching the database.
+  #
+  # WHY THIS IS NOT A CALL TO `Placement.workdir_path/2`. That function resolves the host
+  # through `Placement.hosts/2`, which since 42f976b reads the registry with
+  # `SELECT ... FROM hosts` — a `GenServer.call` into `Tightbeam.DB`. This script runs
+  # under `--no-start` (its header says why: a plain `mix run` boots a second gateway and
+  # clobbers the `gateway.json` the run is aimed at), so there is no DB process and that
+  # call takes the whole run down before the first group finishes.
+  #
+  # WHY REPLICATING IT IS FAITHFUL RATHER THAN A GUESS. For the local host the registry
+  # read cannot change the answer: `hosts/2` reads the table and then OVERWRITES the local
+  # entry with `%{base_dir: base_dir, ...}`, so a registered row for this machine is
+  # discarded by construction. This group only ever asks about `local_host_name/0`, which
+  # leaves `Path.join([base_dir, "work", <first 12 hex of sha256(sessionKey)>])` — the
+  # digest below, and nothing else, is all of `workdir_path/2` that survives for this case.
+  #
+  # NOT A GENERAL SUBSTITUTE, and the boundary is the whole reason to say so here: a
+  # satellite host's workdir really does live under its own registered base_dir, and
+  # anything asking about a non-local host must go through Placement with a live DB.
+  # If `workdir_path/2` changes shape, this drifts silently — that is the cost, and the
+  # citation above is what makes the drift findable.
+  defp local_workdir_path(base_dir, session_key) do
+    digest =
+      :crypto.hash(:sha256, session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    Path.join([base_dir, "work", digest])
+  end
+
   defp install_smoke_rule!(base_dir) do
     source = Path.expand("fixtures/smoke-escalation-probe.toml", __DIR__)
     target = Path.join([base_dir, "identity", "rules", "smoke-escalation-probe.toml"])
@@ -212,14 +238,82 @@ defmodule FeatureSmoke do
     # rules/ lives inside the identity repo, and the identity seam requires a clean
     # working tree. An uncommitted fixture wedges every identity verb, so commit it.
     dir = Path.join(base_dir, "identity")
-    {_, 0} = System.cmd("git", ["add", "--", "rules/smoke-escalation-probe.toml"], cd: dir)
+    smoke_git!(dir, ["add", "--", "rules/smoke-escalation-probe.toml"])
 
+    # `--quiet` reports "nothing staged" as exit 0, so this one reads the status rather
+    # than demanding success: a second run of the smoke has nothing to commit.
     case System.cmd("git", ["diff", "--cached", "--quiet"], cd: dir) do
       {_, 0} ->
         :ok
 
       _ ->
-        {_, 0} = System.cmd("git", ["commit", "-m", "feature-smoke: escalation probe"], cd: dir)
+        smoke_git!(dir, ["commit", "-m", "feature-smoke: escalation probe"])
+        publish_identity_live!(dir)
+    end
+  end
+
+  # Advance the identity repo's live ref onto the commit just made.
+  #
+  # ROADMAP 0a3: `Identity.publish_live!/1` is private and no verb exposes it, so anything
+  # that commits to the identity repo from OUTSIDE the Identity module — which is exactly
+  # what installing this fixture does — leaves `tightbeam/live` behind `main`. Delete this
+  # and call the verb the day one exists.
+  #
+  # WHAT THE STALENESS DOES AND DOES NOT BREAK, measured on a scratch identity repo rather
+  # than reasoned about. Statutes are unaffected: `Rules.load!` globs the WORKING TREE, so
+  # the probe arms at boot whatever live says, and the sha it stamps comes from HEAD so it
+  # stays consistent with the tree it read. Archetype snapshots are unaffected because
+  # rules are not part of one. And `identity-edit` calls `publish_live!` itself, so the
+  # identity group heals this partway through a run that gets that far.
+  #
+  # What is left is a window — and, for a run that stops before that group, a durable
+  # state — in which the org's published revision does not contain org law the org is
+  # already enforcing. No assertion trips over it today. It is still not a state to walk
+  # away from an operator's org in.
+  #
+  # Same shape as `publish_live!`: refuse rather than force when live cannot fast-forward,
+  # and use update-ref's compare-and-swap so a concurrent publisher loses the race
+  # visibly instead of being silently overwritten.
+  defp publish_identity_live!(dir) do
+    live = smoke_git!(dir, ["rev-parse", "tightbeam/live"])
+    main = smoke_git!(dir, ["rev-parse", "main"])
+
+    case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
+      {_out, 0} ->
+        smoke_git!(dir, ["update-ref", "refs/heads/tightbeam/live", main, live])
+
+      _ ->
+        raise Failure,
+          message:
+            "identity tightbeam/live (#{live}) cannot fast-forward to main (#{main}) in #{dir}"
+    end
+  end
+
+  # A run-scoped committer identity for the fixture commit, and a failure that names
+  # itself.
+  #
+  # `git commit` refuses outright on a host where the smoke user has no committer
+  # identity, and the bare `{_, 0} = System.cmd(...)` this replaces turned that refusal
+  # into a MatchError naming neither the command nor the reason. Supplying the identity in
+  # the call's own env is what `Tightbeam.Identity.git!/3` already does for every commit
+  # the substrate makes, and it keeps the identity scoped to this one commit: no global
+  # config is consulted, and the org's own git config is not rewritten by the act of
+  # smoking it.
+  @smoke_git_env [
+    {"GIT_AUTHOR_NAME", "tightbeam feature-smoke"},
+    {"GIT_AUTHOR_EMAIL", "feature-smoke@tightbeam.local"},
+    {"GIT_COMMITTER_NAME", "tightbeam feature-smoke"},
+    {"GIT_COMMITTER_EMAIL", "feature-smoke@tightbeam.local"}
+  ]
+
+  defp smoke_git!(dir, args) do
+    case System.cmd("git", args, cd: dir, stderr_to_stdout: true, env: @smoke_git_env) do
+      {out, 0} ->
+        String.trim(out)
+
+      {out, status} ->
+        raise Failure,
+          message: "git #{Enum.join(args, " ")} failed (#{status}) in #{dir}: #{String.trim(out)}"
     end
   end
 
