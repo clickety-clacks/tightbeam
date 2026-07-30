@@ -30,6 +30,25 @@ defmodule Tightbeam.Acp.AdapterTest do
       do: {:reply, true, parent}
   end
 
+  defmodule AdapterCallingWakeScheduler do
+    use GenServer
+
+    def start_link({adapter_slot, owner}) do
+      GenServer.start_link(__MODULE__, {adapter_slot, owner}, name: Tightbeam.WakeScheduler)
+    end
+
+    @impl true
+    def init(state), do: {:ok, state}
+
+    @impl true
+    def handle_call({:fire_matching, fact_id}, _from, {adapter_slot, owner} = state) do
+      adapter = Agent.get(adapter_slot, & &1)
+      resident? = Tightbeam.Acp.Adapter.knows_session?(adapter, "missing")
+      send(owner, {:matching_fired, fact_id, resident?})
+      {:reply, :ok, state}
+    end
+  end
+
   test "parse_model_ref splits effort" do
     assert Adapter.parse_model_ref("gpt-5.6-sol[medium]") == {"gpt-5.6-sol", "medium"}
     assert Adapter.parse_model_ref("haiku") == {"haiku", nil}
@@ -747,6 +766,102 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     assert_receive {:subagent, "sess-1", ^update}
+  end
+
+  test "placement subagent callback does not block the adapter on matching wake delivery" do
+    owner = self()
+
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tb-subagent-callback-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    File.mkdir_p!(base)
+
+    db = :"subagent_callback_db_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Placement.ensure_schema(db)
+
+    for module <- [
+          Tightbeam.EventLog,
+          Tightbeam.Idempotency,
+          Tightbeam.Ledger,
+          Tightbeam.Projection,
+          Tightbeam.Org,
+          Tightbeam.Roles,
+          Tightbeam.ConditionFacts,
+          Tightbeam.Wakes,
+          Tightbeam.SubagentMarkers
+        ],
+        do: :ok = module.ensure_schema(db)
+
+    Tightbeam.Archetypes.load!(base)
+    Tightbeam.Rails.load!(base)
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+
+    session =
+      Tightbeam.Org.create(db, %{
+        session_key: "parent",
+        display_name: "parent",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "fixture"
+      })
+
+    Tightbeam.Org.append_pointer(db, session.session_key, "sess-1", "created")
+    {:ok, adapter_slot} = Agent.start_link(fn -> nil end)
+    start_supervised!({AdapterCallingWakeScheduler, {adapter_slot, self()}})
+
+    placement_opts =
+      Tightbeam.Placement.adapter_opts(
+        %{
+          base_dir: base,
+          db: db,
+          cwd: "/tmp",
+          cli_bin: Path.join(base, "bin"),
+          credential_kind: :subscription
+        },
+        {:codex, "default", "testhost"}
+      )
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        on_subagent_event: placement_opts[:on_subagent_event],
+        on_ready: fn -> send(owner, :booted) end
+      )
+
+    Agent.update(adapter_slot, fn nil -> adapter end)
+    assert_ready(adapter, :booted)
+
+    update = %{
+      "sessionUpdate" => "tool_call_update",
+      "toolCallId" => "call-codex-1",
+      "status" => "completed",
+      "_meta" => %{
+        "codex" => %{
+          "subagentTerminated" => %{
+            "agentThreadId" => "thread-child-1",
+            "threadStatus" => %{"type" => "idle"}
+          }
+        }
+      }
+    }
+
+    send(
+      adapter,
+      {:acp_notification, "session/update", %{"sessionId" => "sess-1", "update" => update}}
+    )
+
+    assert_receive {:matching_fired, fact_id, false}, 2_000
+    assert is_integer(fact_id)
+    assert Process.alive?(adapter)
   end
 
   test "consecutive prompts reset the accumulator" do
