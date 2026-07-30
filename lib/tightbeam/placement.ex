@@ -1078,11 +1078,15 @@ defmodule Tightbeam.Placement do
   defp auth_event_handler(host, module) do
     fn classification, event ->
       if classification == :terminal do
-        Tightbeam.Credentials.mark_terminal(
-          module.credential_provider(),
-          event,
-          Tightbeam.Credentials.server(host)
-        )
+        Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+          Tightbeam.Credentials.mark_terminal(
+            module.credential_provider(),
+            event,
+            Tightbeam.Credentials.server(host)
+          )
+        end)
+
+        :ok
       end
     end
   end

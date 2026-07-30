@@ -647,6 +647,81 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert_receive :parked
   end
 
+  test "placement auth callback does not block the adapter on credential terminal handling" do
+    owner = self()
+
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tb-auth-callback-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    File.mkdir_p!(base)
+
+    db = :"auth_callback_db_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Placement.ensure_schema(db)
+    Tightbeam.Archetypes.load!(base)
+    Tightbeam.Rails.load!(base)
+
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+    {:ok, adapter_slot} = Agent.start_link(fn -> nil end)
+
+    start_supervised!(
+      {Tightbeam.Credentials,
+       name: Tightbeam.Credentials,
+       base_dir: base,
+       machine: "testhost",
+       park: fn :openai ->
+         adapter = Agent.get(adapter_slot, & &1)
+         _ = Adapter.knows_session?(adapter, "missing")
+         send(owner, :parked)
+         :ok
+       end}
+    )
+
+    placement_opts =
+      Tightbeam.Placement.adapter_opts(
+        %{
+          base_dir: base,
+          db: db,
+          cwd: "/tmp",
+          cli_bin: Path.join(base, "bin"),
+          credential_kind: :subscription
+        },
+        {:codex, "default", "testhost"}
+      )
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        on_auth_event: placement_opts[:on_auth_event],
+        on_ready: fn -> send(owner, :booted) end
+      )
+
+    Agent.update(adapter_slot, fn nil -> adapter end)
+    assert_ready(adapter, :booted)
+    monitor = Process.monitor(adapter)
+
+    send(
+      adapter,
+      {:acp_notification, "account/updated", %{"authMode" => nil, "planType" => nil}}
+    )
+
+    receive do
+      :parked ->
+        :ok
+
+      {:DOWN, ^monitor, :process, ^adapter, reason} ->
+        flunk("adapter died while handling the auth event: #{inspect(reason)}")
+    end
+
+    Process.demonitor(monitor, [:flush])
+    assert {:needs_onboarding, :revoked} = Tightbeam.Credentials.status(:openai)
+    assert Process.alive?(adapter)
+  end
+
   test "session updates reach the subagent marker callback with harness session identity" do
     owner = self()
 

@@ -203,6 +203,41 @@ defmodule Tightbeam.WakesTest do
              2
   end
 
+  test "fire_due called inside the scheduler queues another pass without self-calling", %{
+    db: db,
+    scheduler: scheduler
+  } do
+    test_pid = self()
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn _wake -> :ok end,
+       internal_consumers: %{
+         "self_fire" => fn wake ->
+           :ok = Wakes.fire_due(self())
+           send(test_pid, {:self_fire_returned, wake.wake_id})
+           Wakes.cancel(db, wake.wake_id, wake.origin)
+         end
+       }}
+    )
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        consumer: "self_fire",
+        due_at: System.system_time(:millisecond)
+      })
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_received {:self_fire_returned, wake_id}
+    assert wake_id == wake.wake_id
+    assert Wakes.get(db, wake.wake_id).state == "canceled"
+  end
+
   test "future wakes are not claimed", %{db: db, scheduler: scheduler} do
     test_pid = self()
 
