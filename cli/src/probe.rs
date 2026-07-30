@@ -1683,6 +1683,24 @@ mod tests {
     }
 
     #[test]
+    fn darwin_drops_candidate_when_final_lstart_changes() {
+        let io = FakeIo {
+            commands: std::cell::RefCell::new(vec![
+                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp\n".to_vec()),
+                Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
+                Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
+                Ok(b"7 00:03\n".to_vec()),
+                Ok(b"7 Fri Jul 31 12:34:56 2026\n".to_vec()),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut raw =
+            collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
+        add_elapsed(&io, &mut raw);
+        assert!(raw.processes.is_empty());
+    }
+
+    #[test]
     fn darwin_pass1_timeout_and_failure_are_fatal() {
         for (failure, expected) in [
             (CommandFailure::Timeout, "probe: ps enumeration timed out"),
