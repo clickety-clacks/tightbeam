@@ -30,7 +30,7 @@
 # inside a real harness turn, bound to that turn and reading tool-call-observed.
 #
 # "A REAL AGENT WALKS THE GATES" was proven in the field, not dropped. Both legs
-# did the whole lifecycle autonomously and honestly on 2026-07-31 — claude
+# did the whole lifecycle autonomously and honestly on 2026-07-30 — claude
 # 11:19:56 open → 11:20:48 verified → 11:21:02 recorded → 11:21:07 closed, codex
 # the same shape at 12:09–12:12, landing art_0f26ec21 tool-call-observed with a
 # non-null edge. Driving that chain through a scripted holder is what the split
@@ -625,49 +625,6 @@ defmodule FeatureSmoke do
     )
   end
 
-  # --- T2a final journey: artifact-record + completion-gate closure --------------
-  # artifact-carrier-proposal-v1 §7.3, the leg the gibson activation gate names.
-  #
-  # This is the ONLY place in the tree where `artifact-record` runs from the real CLI
-  # inside a real harness turn, which is the only way the substrate-reserved PreToolUse
-  # observation (`Tightbeam.Rails.observation_entry/0`) can fire at all. Every other
-  # artifact assertion we have drives the writer directly and therefore cannot see the
-  # hook.
-  #
-  # WHICH HALF OF CODEX IS ACTUALLY UNPROVEN. Codex as a verdict FILER is proven on this
-  # gateway — the live shrdlu walk filed reviewed-clean over codex twice, cleanly. What has
-  # never been proven is codex as the artifact RECORDER: whether a codex-hosted holder's
-  # `artifact-record` lands `tool-call-observed`, which rides the trust-gated
-  # `CODEX_CONFIG` hook seam and rests on the 0.145.0 spike alone (§5.2). The HOLDER is
-  # therefore always the leg's own harness, the evidence class is asserted PER LEG, and
-  # the codex leg's class assertion is the single most load-bearing line in this file.
-  #
-  # The chain, in the order the statutes deny (walked live on shrdlu, 2026-07-30):
-  #
-  #   attest completion  → rule_denied completion-requires-review
-  #   reviewed-clean     ← a session on the OTHER registered harness
-  #   attest completion  → rule_denied completion-requires-verification
-  #   verified           ← the holder itself; the statute reads `assignment.verdicts`,
-  #                        not the independent set, so the holder may file its own
-  #   attest completion  → rule_denied completion-requires-results-artifact
-  #   REAL CLI turn      → tightbeam artifact-record, over the wire, from the workdir
-  #   attest completion  → PASSES; the assignment closes `completed` and the artifact
-  #                        statute's remedy episode goes `live` → `closed` on its own
-  #
-  # TWO DEVICES CARRY THE SOUNDNESS OF ALL OF IT, and they are here because a holder's
-  # remedy turn runs concurrently with this group's own calls unless something stops it.
-  # A concurrent turn can read the transcript and learn any content this group hoped was
-  # distinguishing, file its own attest and land a denial beside the one being correlated,
-  # and leave an observation window a later record inherits. Those are three faces of one
-  # problem, so they get two structural answers rather than three patches:
-  #
-  #   SERIALIZE — the holder's lane is drained before every completion attempt and before
-  #   the prompted wake, so nothing this group measures happens beside another turn.
-  #
-  #   IDENTIFY — the prompted record is selected by `recordedMessageId` against the wake's
-  #   own `turns.messageId`, so the central assertion is a claim about a specific turn and
-  #   not about whichever row looked right. Identity from the substrate, not from content,
-  #   which is the same principle the carrier under test rests on.
   # --- T2a: the gate chain, enforced -------------------------------------------------
   # artifact-carrier-proposal-v1 §7.3, first of two halves.
   #
@@ -696,6 +653,30 @@ defmodule FeatureSmoke do
   # What this half proves is the LAW: each statute denies while its fact is unsatisfied,
   # in order, and the artifact releases the last one. An org carrying the eb0ea2b
   # workaround still fails at the third denial, so falsifiability is untouched.
+  #
+  # WHY THE HOLDER CANNOT QUIETLY LEAK INTO THIS, stated so it can be attacked rather than
+  # trusted. The verification and artifact statutes both remedy by WAKING the holder, so a
+  # summons really is issued mid-chain and the holder really is capable of acting on it.
+  # Cancelling that summons is NOT available: `RailRemedy` stamps its wake
+  # `origin: "remedy:<rule>"` and `Wakes.cancel_in_txn/3` matches `wakeId AND origin`, so
+  # the `cancel-wake` verb — which passes the CALLER's origin — cannot touch a remedy's
+  # wake. There is no way to make the holder structurally inert, and pretending otherwise
+  # would be the "drains and hope" this replaced.
+  #
+  # So isolation is MEASURED rather than assumed, and every way it could fail is fatal
+  # rather than silent:
+  #
+  #   NO TURN RAN. The group asserts the holder's session has ZERO turn rows at the end.
+  #   A wake that materialized into a turn means the agent was handed the prompt, which
+  #   voids the premise — whether or not it managed to act — and the group says so.
+  #
+  #   ONE REPORT, AND IT IS THE OPERATOR'S. Exactly one report artifact may exist on this
+  #   work item from this holder. A second row is a holder that recorded, and a strong
+  #   class on the one row is a holder that tool-called; either inverts what the negative
+  #   control below means, and either fails here instead of being read as a pass.
+  #
+  # The margin behind those assertions is an adapter spawn against six HTTP calls, which is
+  # why they should never fire. They exist because "should never" is not evidence.
   defp check_gate_chain_enforced(state) do
     u = unique()
     reviewer_leg = independent_leg(state)
@@ -850,11 +831,47 @@ defmodule FeatureSmoke do
 
       await_episode_status!(state, "completion-requires-results-artifact", asg_id, "closed")
 
+      # 6. The isolation proof. Everything above assumed no holder turn ran beside it; this
+      # is where that stops being an assumption. Both checks are cheap and both are fatal.
+      turns =
+        sqlite(state, "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(holder.key)}")
+
+      assert(
+        state,
+        turns == "0",
+        "gate chain: the holder ran #{turns} turn(s). This half is only meaningful while the " <>
+          "holder never acts — a remedy wake materialized into a turn, so the agent was handed " <>
+          "the prompt and every assertion above may be describing its work rather than the " <>
+          "operator's. Remedy wakes cannot be cancelled (origin-matched), so the answer is to " <>
+          "read this as a real leak, not to widen the assertion."
+      )
+
+      reports =
+        state
+        |> ok!("artifacts", %{
+          "workItemId" => wi_id,
+          "sessionKey" => holder.key,
+          "kind" => "report"
+        })
+        |> Map.get("artifacts", [])
+        |> List.wrap()
+
+      assert(
+        state,
+        Enum.map(reports, & &1["artifactId"]) == [recorded["artifactId"]],
+        "gate chain: the only report on #{wi_id} should be the operator's #{recorded["artifactId"]}, " <>
+          "but the work item carries " <>
+          "#{inspect(Enum.map(reports, &{&1["artifactId"], &1["recordedTurnEvidence"]}))}. A second " <>
+          "row is the holder having recorded one of its own, which means the release proven above " <>
+          "may not be the weak row's doing at all."
+      )
+
       pass(
         state,
         "gate chain enforced: review(#{reviewer_leg.wire_name}) → verification → artifact " <>
           "denied in order, released by a #{recorded["recordedTurnEvidence"]} row (gate is " <>
-          "evidence-blind, classes not spoofable), completes, episode closed"
+          "evidence-blind, classes not spoofable), completes, episode closed — holder ran " <>
+          "0 turns"
       )
     after
       # EVERY assertion about an assignment outcome stays above this line: `retire` REVOKES
@@ -974,6 +991,14 @@ defmodule FeatureSmoke do
       # job; one still working has not failed. Only abandonment is a failure, and
       # `surrendered` is roadmap 0a2 — the escape hatch a holder reaches for when a gate
       # cannot be satisfied, which is exactly what grounding the work is meant to prevent.
+      #
+      # SAMPLED AFTER THE LANE SETTLES, because the wait above returns the instant the
+      # record lands and that is normally MID-TURN. Reading the outcome there would ask the
+      # question before the holder had finished answering it: a holder that records and
+      # then surrenders in the same turn would have been read as "still working, fine" and
+      # the 0a2 oracle — the whole reason this matrix exists — would never fire. The matrix
+      # was right; the moment it was sampled was not.
+      await_lane_idle!(state, holder.key, "before reading the assignment's outcome")
       final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
       assert(
