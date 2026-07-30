@@ -74,10 +74,10 @@ defmodule Tightbeam.Acp.ConnTest do
     # only means what the test says it means once the harness is up.
     assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
     assert {:error, :timeout} = Conn.request(conn, "never", %{}, timeout: 100)
-    assert Conn.pending_count(conn) == 1
+    assert map_size(:sys.get_state(conn).pending) == 1
     # adapter eventually answers (via cancel path) -> entry resolves
     Conn.notify(conn, "session/cancel", %{})
-    assert eventually(fn -> Conn.pending_count(conn) == 0 end)
+    assert eventually(fn -> map_size(:sys.get_state(conn).pending) == 0 end)
   end
 
   test "requester death sends session/cancel; adapter's eventual answer is the quiescence signal" do
@@ -95,13 +95,13 @@ defmodule Tightbeam.Acp.ConnTest do
     # orphan to resolve and the assertion below waits on something nobody will
     # ever send. Waiting on the pending entry itself is that fact; the sleep it
     # replaces was a guess at how long a Task takes to start.
-    assert eventually(fn -> Conn.pending_count(conn) == 1 end)
+    assert eventually(fn -> map_size(:sys.get_state(conn).pending) == 1 end)
     Task.shutdown(task, :brutal_kill)
 
     # conn sends session/cancel for sess-1; fake answers the orphaned request;
     # conn emits quiescence instead of replying to the dead caller.
     assert_receive {:acp_orphan_resolved, "sess-1"}, 2_000
-    assert Conn.pending_count(conn) == 0
+    assert map_size(:sys.get_state(conn).pending) == 0
   end
 
   test "port exit fails outstanding requests and emits acp_exit" do
@@ -111,7 +111,7 @@ defmodule Tightbeam.Acp.ConnTest do
 
     # There has to BE an outstanding request for the close to fail one. The boot
     # barrier above means the count can only be the "never" below it.
-    assert eventually(fn -> Conn.pending_count(conn) == 1 end)
+    assert eventually(fn -> map_size(:sys.get_state(conn).pending) == 1 end)
     Conn.close(conn)
     assert {:error, :closed} = Task.await(task)
   end

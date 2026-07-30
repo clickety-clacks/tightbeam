@@ -105,10 +105,6 @@ defmodule Tightbeam.ConnRegistry do
     GenServer.cast(server, {:note_replayed, ref, session_key, seq})
   end
 
-  @doc "Number of live registered connections."
-  @spec count(server()) :: non_neg_integer()
-  def count(server \\ __MODULE__), do: GenServer.call(server, :count)
-
   @doc "Apply a global per-device sliding-window rate limit."
   @spec within_rate_limit(server(), String.t(), atom(), pos_integer(), pos_integer()) :: boolean()
   def within_rate_limit(server \\ __MODULE__, device_id, kind, limit, window_ms) do

@@ -61,10 +61,6 @@ defmodule Tightbeam.Acp.Conn do
   @spec notify(conn(), String.t(), map()) :: :ok
   def notify(conn, method, params), do: GenServer.cast(conn, {:notify, method, params})
 
-  @doc "Count of unresolved pending requests (quiescence probe)."
-  @spec pending_count(conn()) :: non_neg_integer()
-  def pending_count(conn), do: GenServer.call(conn, :pending_count)
-
   @doc "Close the Port; all still-waiting callers get `{:error, :closed}`."
   @spec close(conn()) :: :ok
   def close(conn), do: GenServer.cast(conn, :close)

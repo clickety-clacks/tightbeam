@@ -100,7 +100,7 @@ defmodule Tightbeam.ConnRegistryTest do
     ConnRegistry.unregister(reg, replaced)
 
     # :new still owns the device slot and is the only live conn
-    assert ConnRegistry.count(reg) == 1
+    assert map_size(:sys.get_state(reg).conns) == 1
     d = fn pid, p -> send(test_pid, {:sent, pid, p}) end
     :ok = ConnRegistry.broadcast(reg, "u", %{x: 1}, d)
     assert_received {:sent, :new, %{x: 1}}
@@ -120,7 +120,7 @@ defmodule Tightbeam.ConnRegistryTest do
 
     ConnRegistry.unregister(reg, ref)
     ConnRegistry.unregister(reg, ref)
-    assert ConnRegistry.count(reg) == 0
+    assert map_size(:sys.get_state(reg).conns) == 0
   end
 
   test "chat and both work grains fan out only to their subscribed owner sets", %{
