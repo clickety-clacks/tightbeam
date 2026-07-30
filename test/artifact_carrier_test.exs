@@ -462,9 +462,18 @@ defmodule Tightbeam.ArtifactCarrierTest do
     assert_receive {:db_paused, ^proxy}, 2_000
 
     wait_until(posted_at + 5_500)
-    release_db(proxy)
 
-    assert Task.await(abandoned, 20_000) == :ok
+    # ASSERTED BEFORE THE RELEASE, and that order is the whole point. Awaiting
+    # after it cannot tell a timeout fallback from a writer reply — both are
+    # `:ok` — so a caller whose start slipped by half a second would time out at
+    # the very moment the window opened, and the baseline red would quietly
+    # decay from "acted for a caller that was gone" back to "acted late".
+    # Checking here, with nothing released yet, there is nothing but the timeout
+    # this could be.
+    assert Task.yield(abandoned, 0) == {:ok, :ok},
+           "the caller had not abandoned yet, so opening the window now would not prove the defect"
+
+    release_db(proxy)
 
     assert Process.alive?(writer),
            "the writer died rather than dropping the post — this test would then pass for the wrong reason"

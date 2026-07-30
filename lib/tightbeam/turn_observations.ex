@@ -122,7 +122,9 @@ defmodule Tightbeam.TurnObservations do
   # only on arrival leaves the ledger read itself inside the abandonment window:
   # `DB.query/3` tolerates 5s and the caller waits 2s, so a stalled read can
   # return to a writer whose caller left long ago and mutate anyway. The check
-  # that guards the mutation is the one immediately before it.
+  # that guards the mutation is ADJACENT to it, with the read and the prune both
+  # completed before it runs — a guard with work still to come after it is not
+  # guarding that work.
   #
   # The arrival check is not redundant, it is back-pressure. Posts expire
   # precisely when reads are stalling, and that is the worst moment to issue one
@@ -133,16 +135,20 @@ defmodule Tightbeam.TurnObservations do
       {:reply, :ok, state}
     else
       running = Ledger.running_turn_message_id(db, session_key)
+      pruned = prune(state.windows, now())
+      now = now()
 
-      if expired?(deadline) do
+      # Everything that takes time is now BEHIND this comparison — the read and
+      # the whole-map prune both. A guard with work between it and the thing it
+      # guards is not a guard, however short that work is; the deadline is wall
+      # clock, so any work after the comparison can cross it.
+      if now >= deadline do
         {:reply, :ok, state}
       else
-        now = now()
-
         windows =
           case running do
-            nil -> Map.delete(prune(state.windows, now), session_key)
-            message_id -> Map.put(prune(state.windows, now), session_key, {message_id, now})
+            nil -> Map.delete(pruned, session_key)
+            message_id -> Map.put(pruned, session_key, {message_id, now})
           end
 
         {:reply, :ok, %{state | windows: windows}}
