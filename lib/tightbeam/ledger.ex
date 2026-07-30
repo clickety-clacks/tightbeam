@@ -469,6 +469,32 @@ defmodule Tightbeam.Ledger do
     seq
   end
 
+  @doc """
+  The `messages.id` of a session's running turn, or nil when none is running.
+
+  The lane serializes a session to at most one running turn, so there is never a
+  choice to make here. What this is NOT is proof that the running turn fired the
+  caller: the request carries no turn identity, so this is CONCURRENCY in exactly
+  the sense core-causality-fixes-v1 §C1 names — a separate request on the same
+  session token while a turn runs reads that turn, and a request arriving after a
+  cancel (which terminalizes before the kill) reads none. Callers record the
+  answer under a label that says so.
+  """
+  @spec running_turn_message_id(db(), String.t()) :: String.t() | nil
+  def running_turn_message_id(db \\ Tightbeam.DB, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT messageId FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+        [session_key]
+      )
+
+    case rows do
+      [[message_id]] -> message_id
+      [] -> nil
+    end
+  end
+
   @doc "Terminal rows not yet published (at-least-once publication feed)."
   @spec unpublished_terminals(db()) :: [map()]
   def unpublished_terminals(db \\ Tightbeam.DB) do

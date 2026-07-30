@@ -37,7 +37,12 @@ defmodule Tightbeam.RailsTest do
 
   test "empty and missing rails dirs are a valid empty set", ctx do
     assert Rails.load!(ctx.base_dir) == []
-    assert Rails.hook_settings() == nil
+
+    # No law, but still a hook: the observation entry is the substrate's, not the
+    # org's, and an org that has authored no statute still records artifacts.
+    assert Rails.hook_settings() == %{
+             "hooks" => %{"PreToolUse" => [Rails.observation_entry()]}
+           }
 
     File.rm_rf!(ctx.rails_dir)
     assert Rails.load!(ctx.base_dir) == []
@@ -105,7 +110,10 @@ defmodule Tightbeam.RailsTest do
     write_statute(ctx, %{})
     Rails.load!(ctx.base_dir)
 
-    assert %{"hooks" => %{"PreToolUse" => [entry]}} = Rails.hook_settings()
+    # Statutes first, in filename-then-table order; the reserved observation
+    # entry last, because it is not law and never decides anything.
+    assert %{"hooks" => %{"PreToolUse" => [entry, observation]}} = Rails.hook_settings()
+    assert observation == Rails.observation_entry()
     assert entry["matcher"] == "Bash"
     assert [%{"type" => "command", "command" => command}] = entry["hooks"]
 
@@ -113,6 +121,19 @@ defmodule Tightbeam.RailsTest do
              "sh -c 'grep -qE \"git (reset|stash|rebase|checkout \\\\.|restore|clean)\" - || exit 0; " <>
                "echo \"[gate: no-history-rewrites] History-rewriting git commands are forbidden here: " <>
                "other agents may have uncommitted work in this tree.\" >&2; exit 2'"
+  end
+
+  test "observation_entry compiles the byte-pinned reserved artifact-record observation" do
+    assert %{
+             "matcher" => "Bash",
+             "hooks" => [%{"type" => "command", "command" => command}]
+           } = Rails.observation_entry()
+
+    # grep-and-exit-0 first, so a Bash call that is not an artifact-record pays
+    # one local grep; and EVERY path exits 0 — this observes, it never refuses.
+    assert command ==
+             "sh -c 'grep -qE \"tightbeam[^\\\"]*artifact-record\" - || exit 0; " <>
+               "tightbeam tool-call-observed >/dev/null 2>&1; exit 0'"
   end
 
   test "escaping torture: ERE metacharacters and $ in pattern, single quote in text", ctx do
@@ -123,7 +144,7 @@ defmodule Tightbeam.RailsTest do
     })
 
     Rails.load!(ctx.base_dir)
-    %{"hooks" => %{"PreToolUse" => [entry]}} = Rails.hook_settings()
+    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} = Rails.hook_settings()
     [%{"command" => command}] = entry["hooks"]
 
     assert command ==

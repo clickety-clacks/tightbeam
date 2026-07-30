@@ -57,6 +57,11 @@ pub enum Command {
         work_item_id: Option<String>,
         session_key: Option<String>,
     },
+    /// Substrate-reserved: the PreToolUse hook reporting that this session is
+    /// about to run `artifact-record`. Carries no identity flag because the
+    /// observation is the session's by definition — the gateway resolves the
+    /// turn from the session token, so there is nothing for a flag to say.
+    ToolCallObserved,
     Spawn {
         identity: Identity,
         display_name: String,
@@ -821,6 +826,12 @@ fn parse_with_optional_catalog(
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
             })
+        }
+        "tool-call-observed" => {
+            if parsed.positional.len() != 1 || !flags.is_empty() {
+                return Err("usage: tightbeam tool-call-observed".to_owned());
+            }
+            Ok(Command::ToolCallObserved)
         }
         "artifacts" => {
             if parsed.positional.len() != 1

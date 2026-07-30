@@ -18,6 +18,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Org,
     Projection,
     RailRemedy,
+    Rails,
     Roles,
     Rules,
     Wakes,
@@ -517,30 +518,58 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:wake_delivered, artifact_wake}, 5_000
     assert artifact_wake.prompt =~ "no results artifact is recorded"
 
-    # The report artifact (see the Clause 8/11 note above this test).
-    message_id = "msg_papertrail_#{System.unique_integer([:positive])}"
+    # The report artifact, through the REAL CLI. This hop used to call the
+    # handler directly with a `recorded_message_id` no wire client can send,
+    # because over the wire the verb refused unconditionally — so the suite drove
+    # a path that did not exist and the live defect stayed invisible to it.
+    #
+    # The whole chain runs here: the substrate-reserved PreToolUse hook fires
+    # against a real tool-call payload, execs the real CLI, which posts to the
+    # real gateway, which captures the turn that is running right now.
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: "cli-coder",
+        role: "user",
+        content: "write up the verification results"
+      })
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId) VALUES (?1, 'cli-coder', 'assistant', 'verification results', 1, ?1)",
-        [message_id]
+    {:ok, _seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "cli-coder",
+        message_id: message.id,
+        origin: "user:flynn",
+        prompt: "write up the verification results"
+      })
+
+    {:ok, _turn} = Ledger.claim_next(ctx.db, "cli-coder", "cli-integration")
+
+    assert fire_observation_hook(
+             ctx,
+             coder_dir,
+             "tightbeam artifact-record --kind report --title 'verification results'"
+           ) == 0
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "verification results",
+          "--path",
+          "results.txt",
+          "--work-item",
+          item_id
+        ],
+        cd: coder_dir,
+        stderr_to_stdout: true
       )
 
-    refute Map.has_key?(
-             ctx.handlers["artifact-record"].(%{
-               principal: {:session, "cli-coder"},
-               session_key: "cli-coder",
-               recorded_message_id: message_id,
-               params: %{
-                 kind: "report",
-                 title: "verification results",
-                 origin_path: "results.txt",
-                 work_item_id: item_id
-               }
-             }),
-             :code
-           )
+    recorded = JSON.decode!(recorded)
+    assert recorded["recordedMessageId"] == message.id
+    assert recorded["recordedTurnEvidence"] == "tool-call-observed"
 
     # A2: the papertrail stands — the completion passes and the episodes close.
     {completed, 0} =
@@ -628,6 +657,89 @@ defmodule Tightbeam.CliIntegrationTest do
                "SELECT count(*) FROM wakes WHERE origin LIKE 'remedy:%'",
                []
              )
+  end
+
+  # The other half of the hook contract, and the reason the papertrail test's
+  # `tool-call-observed` means anything: without the hook the same record lands
+  # `session-concurrent`, so the grep really is what separates the two classes.
+  # It also pins the cost claim — a Bash call that is not an artifact-record must
+  # exit before it ever reaches the gateway.
+  test "the observation hook exits on every command that is not an artifact-record", ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_hookgate', 'hook gate', 'flynn', 'flynn', 1)"
+      )
+
+    coder_dir = session_workdir!(ctx, ctx.session)
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: ctx.session.session_key,
+        role: "user",
+        content: "build it"
+      })
+
+    {:ok, _seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.session.session_key,
+        message_id: message.id,
+        origin: "user:flynn",
+        prompt: "build it"
+      })
+
+    {:ok, _turn} = Ledger.claim_next(ctx.db, ctx.session.session_key, "cli-integration")
+
+    assert fire_observation_hook(ctx, coder_dir, "ls -la && make build") == 0
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "wrapped in a script",
+          "--path",
+          "out.txt",
+          "--work-item",
+          "wi_hookgate"
+        ],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
+    recorded = JSON.decode!(recorded)
+    assert recorded["recordedMessageId"] == message.id
+    assert recorded["recordedTurnEvidence"] == "session-concurrent"
+  end
+
+  # Runs the compiled hook EXACTLY as a harness runs it: the command string
+  # `Rails.observation_entry/0` projects into settings.json / hooks.json, with a
+  # real PreToolUse payload on stdin and the CLI reachable on PATH the way
+  # placement puts it there. Nothing about the hook's shape is restated here — a
+  # change to the grep or to the verb it execs has to survive this.
+  defp fire_observation_hook(ctx, cwd, command_text) do
+    %{"hooks" => [%{"command" => hook_command}]} = Rails.observation_entry()
+
+    payload =
+      JSON.encode!(%{
+        "tool_name" => "Bash",
+        "tool_input" => %{"command" => command_text}
+      })
+
+    payload_path = Path.join(cwd, "pre-tool-use.json")
+    File.write!(payload_path, payload)
+
+    {_output, status} =
+      System.cmd("sh", ["-c", "cat #{payload_path} | #{hook_command}"],
+        cd: cwd,
+        stderr_to_stdout: true,
+        env: [{"PATH", Path.dirname(ctx.binary) <> ":" <> System.get_env("PATH")}]
+      )
+
+    status
   end
 
   defp session_workdir!(ctx, session) do

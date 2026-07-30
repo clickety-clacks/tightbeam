@@ -563,9 +563,11 @@ defmodule Tightbeam.PlacementTest do
     assert is_function(opts[:on_auth_event], 2)
     assert {"TIGHTBEAM_LINEAGE", "tb1-Y29kZXhAdGVzdGhvc3Q"} in opts[:env]
 
+    # No law: no wiring-check probe. The trust seed is present regardless, because
+    # the reserved observation entry is projected regardless.
     refute Keyword.has_key?(opts, :probe_cwd)
     refute Keyword.has_key?(opts, :probe_model)
-    refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
+    assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     refute_receive {:unexpected_sh, _}
   end
@@ -669,6 +671,7 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
+             ~s(CODEX_CONFIG='{"bypass_hook_trust":true}'),
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]
 
@@ -732,10 +735,14 @@ defmodule Tightbeam.PlacementTest do
     refute Enum.any?(claude_opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
     refute Keyword.has_key?(claude_opts, :probe_cwd)
 
+    # Withdrawing the law withdraws the PROBE — nothing can deny any more, so
+    # nothing is worth failing a boot over. The trust seed stays: the substrate's
+    # reserved observation entry is still projected, and on codex a hook only arms
+    # when trust is bypassed.
     File.rm_rf!(Path.join([base_dir, "identity", "rails"]))
     Rails.load!(base_dir)
     lawless_opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
-    refute Enum.any?(lawless_opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
+    assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in lawless_opts[:cmd]
     refute Keyword.has_key?(lawless_opts, :probe_cwd)
     refute Keyword.has_key?(lawless_opts, :probe_model)
   end
@@ -786,7 +793,17 @@ defmodule Tightbeam.PlacementTest do
     assert File.read!(stamp_path) == stamp_before
     assert File.read!(marker) == "keep"
     refute File.exists?(Path.join(home, "settings.json"))
-    refute File.exists?(Path.join(home, "hooks.json"))
+
+    # Zero statutes is no longer zero hooks: the home carries the substrate's
+    # reserved entries — the observation, plus codex's own wiring-check probe —
+    # and no law at all.
+    hooks = File.read!(Path.join(home, "hooks.json")) |> JSON.decode!()
+
+    assert hooks == %{
+             "hooks" => %{
+               "PreToolUse" => [Rails.observation_entry(), Rails.probe_entry()]
+             }
+           }
   end
 
   defp collect_commands(acc) do

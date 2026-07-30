@@ -154,6 +154,17 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifacts", vec![], params))
         }
+        // Not a verb and not on /agent/dispatch: it changes no domain state, it
+        // tells the gateway to look at this session's running turn NOW, while the
+        // command it observed has not run yet.
+        Command::ToolCallObserved => Ok(RequestSpec {
+            path: "/agent/tool-call-observed",
+            headers_sans_token_value: [
+                ("authorization", "Bearer <token>"),
+                ("content-type", "application/json"),
+            ],
+            body_json: "{}".to_owned(),
+        }),
         Command::Spawn {
             identity,
             display_name,
@@ -861,8 +872,12 @@ fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
 }
 
 pub fn run(command: Command) -> Result<(), String> {
-    let session_identity =
-        command_identity(&command).is_some_and(|identity| matches!(identity, Identity::Session));
+    // `tool-call-observed` carries no identity flag, so it is not in
+    // `command_identity`; it is nonetheless a session call and only a session
+    // call, and saying so here makes a run from outside a workdir fail with the
+    // reason rather than with a 403 from the org token.
+    let session_identity = matches!(command, Command::ToolCallObserved)
+        || command_identity(&command).is_some_and(|identity| matches!(identity, Identity::Session));
     run_with(
         command,
         move || {
@@ -967,6 +982,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::ToolCallObserved
         | Command::Assimilate(_) => None,
     }
 }

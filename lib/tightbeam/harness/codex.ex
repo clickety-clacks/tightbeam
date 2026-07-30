@@ -127,10 +127,19 @@ defmodule Tightbeam.Harness.Codex do
   @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
+    # Two different questions. `rails?` — is a PreToolUse map projected at all —
+    # decides the trust seed, and is now always true because the substrate's own
+    # observation entry rides in that map; seeding an env var costs nothing and
+    # can fail nothing. `statutes?` — is there org LAW — decides the wiring-check
+    # probe, which FAILS THE BOOT when hooks are not arming. Only a denial is
+    # worth refusing to boot over; an observation that silently degrades to a
+    # weaker evidence class is not, and gating the probe on the map would have
+    # turned a hook-trust regression into a dead adapter for orgs with no law.
     rails? = Keyword.fetch!(opts, :rails) != nil
+    statutes? = Keyword.fetch!(opts, :statutes)
 
     probe =
-      if rails? do
+      if statutes? do
         probe_cwd = Path.join(target.host_config.base_dir, "work/gate-probe")
 
         if Support.local?(target) do

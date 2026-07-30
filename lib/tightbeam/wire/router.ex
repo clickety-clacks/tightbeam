@@ -20,6 +20,10 @@ defmodule Tightbeam.Wire.Router do
   - POST /agent/dispatch       — cliToken auth; body {verb, target?, params,
     as|asUser} → origin resolution; verb must be in the closed AGENT_VERBS
     set (post excluded on purpose: an agent DM IS a wake-with-prompt).
+  - POST /agent/tool-call-observed — SESSION token only; no body. The
+    substrate-reserved PreToolUse hook reporting that this session is about to
+    run `tightbeam artifact-record`. Not a verb: it writes no domain state, only
+    the in-memory observation window Artifacts reads for its evidence class.
   - GET  /api/streams          — device auth; owner-only catalog (even admins).
   - POST /api/streams          — spawn verb (displayName + idempotencyKey).
   - GET  /api/trackable-sessions — static {sessions: []} (client probe).
@@ -125,6 +129,22 @@ defmodule Tightbeam.Wire.Router do
       }
 
       dispatch_response(conn, call, 200, &%{"result" => &1})
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  # The hook seam (artifact-carrier-proposal-v1 §4.1). The turn is resolved HERE,
+  # at observation time, because the `artifact-record` that follows may arrive
+  # after that turn has ended — a slow command spanning a turn boundary, or a
+  # cancel, which terminalizes before it kills the serving task.
+  #
+  # A SESSION token is required: the org cliToken names no session, so there is
+  # no window to open for it. The org's own principal never runs inside a turn.
+  post "/agent/tool-call-observed" do
+    with {:ok, {:session, session}} <- session_cli_auth(conn) do
+      :ok = Tightbeam.TurnObservations.observe(db(conn), session.session_key)
+      json(conn, 200, %{"observed" => true})
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -374,6 +394,14 @@ defmodule Tightbeam.Wire.Router do
       token == deps(conn).cli_token -> {:ok, :org}
       session = token && Org.by_cli_token(db(conn), token) -> {:ok, {:session, session}}
       true -> {:error, 401, "auth_failed", nil}
+    end
+  end
+
+  defp session_cli_auth(conn) do
+    case cli_auth(conn) do
+      {:ok, {:session, _session} = session} -> {:ok, session}
+      {:ok, :org} -> {:error, 403, "session_required", "a session token names the caller's turn"}
+      error -> error
     end
   end
 
@@ -859,6 +887,12 @@ defmodule Tightbeam.Wire.Router do
   @substrate_only_params %{
     "wake" => ~w(assignment_id)a,
     "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
+    # The artifact's turn edge and the class of evidence behind it are the
+    # substrate's own observation, resolved in `Artifacts.record/2` from the hook
+    # window and the ledger. A caller-filled edge would be forgeable, which is
+    # precisely why no wire carrier can be proof (artifact-carrier-proposal-v1
+    # §1.2) — so the words are refused entry rather than trusted and checked.
+    "artifact-record" => ~w(recorded_message_id recorded_turn_evidence)a,
     # `attend` carries the agent's TIER election and nothing else. The turn it
     # applies to is the caller's running turn, derived by the substrate, and the
     # raw column value is never accepted — so a caller cannot elect on someone

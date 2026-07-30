@@ -1,7 +1,7 @@
 defmodule Tightbeam.ArtifactsTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Artifacts, DB, Gateway, Org, Projection, WorkItems}
+  alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Projection, WorkItems}
 
   setup do
     db = :"artifacts_db_#{System.unique_integer([:positive])}"
@@ -9,13 +9,14 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Org.ensure_schema(db)
     :ok = Projection.ensure_schema(db)
     :ok = WorkItems.ensure_schema(db)
+    :ok = Ledger.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
     parent = session(db, "parent", nil)
     child = session(db, "child", parent.session_key)
     seed_work_items(db)
-    seed_message(db, parent.session_key)
-    seed_message(db, child.session_key)
+    seed_running_turn(db, parent.session_key)
+    seed_running_turn(db, child.session_key)
 
     %{db: db, parent: parent, child: child}
   end
@@ -63,6 +64,7 @@ defmodule Tightbeam.ArtifactsTest do
     assert first.created_by_session == ctx.child.session_key
     assert first.parent_session == ctx.parent.session_key
     assert first.recorded_message_id == "msg_child"
+    assert first.recorded_turn_evidence == "session-concurrent"
     assert first.state == "in-workspace"
     assert first.home == nil
     assert first.origin_path == "specs/banana.md"
@@ -96,7 +98,6 @@ defmodule Tightbeam.ArtifactsTest do
     call = %{
       principal: {:session, ctx.child.session_key},
       session_key: ctx.child.session_key,
-      recorded_message_id: "msg_child",
       params: %{
         kind: "doc",
         title: "Guide",
@@ -125,10 +126,12 @@ defmodule Tightbeam.ArtifactsTest do
              message: "artifact-record requires a session caller"
            }
 
+    # The turn edge no longer gates the verb — clause 12's work-item edge, which
+    # this ruling leaves open, is the only thing left that can refuse here.
     assert handlers["artifact-record"].(%{
              principal: {:session, ctx.child.session_key},
              session_key: ctx.child.session_key,
-             params: call.params
+             params: Map.delete(call.params, :work_item_id)
            }) == %{
              code: "invalid",
              message: "artifact-record requires provenance edges"
@@ -144,8 +147,40 @@ defmodule Tightbeam.ArtifactsTest do
 
     assert Enum.map(columns, &Enum.at(&1, 1)) == ~w(
              artifactId kind title description createdBySession workItemId parentSession
-             originPath contentSha256 recordedMessageId state home createdAt updatedAt
+             originPath contentSha256 recordedMessageId recordedTurnEvidence state home
+             createdAt updatedAt
            )
+
+    # NULLABLE now, and paired with a closed evidence domain.
+    assert Enum.find(columns, &(Enum.at(&1, 1) == "recordedMessageId")) |> Enum.at(3) == 0
+    assert Enum.find(columns, &(Enum.at(&1, 1) == "recordedTurnEvidence")) |> Enum.at(3) == 1
+
+    for class <- ~w(tool-call-observed session-concurrent none) do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO artifacts
+                   (artifactId, kind, title, createdBySession, workItemId, originPath,
+                    recordedMessageId, recordedTurnEvidence, state, createdAt, updatedAt)
+                 VALUES (?1, 'other', 'Class', 'child', 'wi_banana', 'ok',
+                         NULL, ?2, 'in-workspace', 1, 1)
+                 """,
+                 ["art_class_#{class}", class]
+               )
+    end
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId, originPath,
+                  recordedMessageId, recordedTurnEvidence, state, createdAt, updatedAt)
+               VALUES ('art_badevidence', 'other', 'Bad', 'child', 'wi_banana', 'bad',
+                       NULL, 'hook-proven', 'in-workspace', 1, 1)
+               """
+             )
 
     assert {:ok, foreign_keys} = DB.query(ctx.db, "PRAGMA foreign_key_list(artifacts)")
 
@@ -252,6 +287,11 @@ defmodule Tightbeam.ArtifactsTest do
              origin_path: "specs/legacy.md",
              content_sha256: nil,
              recorded_message_id: "msg_child",
+             # The substrate never looked at this row, so it claims nothing about
+             # its turn — and its recorded id is kept rather than nulled to make
+             # the label tidy. The pair is what distinguishes a pre-migration row
+             # from one where the substrate looked and found nothing.
+             recorded_turn_evidence: "none",
              state: "archived",
              home: "/archive/specs/legacy.md",
              created_at: 1,
@@ -281,8 +321,13 @@ defmodule Tightbeam.ArtifactsTest do
              )
   end
 
-  test "persistent main-written null provenance row rolls migration back intact", _ctx do
-    path = persistent_db_path("rollback")
+  # This row used to ROLL THE WHOLE MIGRATION BACK: the old writer stored a null
+  # `recordedMessageId`, and the ratified shape's NOT NULL could not accept it
+  # without inventing provenance, so a real production row locked the schema out
+  # (conformance clause 14). A nullable edge paired with an evidence class is what
+  # lets it through with nothing fabricated.
+  test "a null-provenance row written by the old writer now migrates, claiming nothing", _ctx do
+    path = persistent_db_path("null-provenance")
     first_db = :"legacy_rollback_first_#{System.unique_integer([:positive])}"
     first_id = {:legacy_rollback_first, first_db}
 
@@ -309,14 +354,71 @@ defmodule Tightbeam.ArtifactsTest do
     second_id = {:legacy_rollback_second, second_db}
     start_db(second_id, second_db, path)
 
-    assert {:error, %DB.Error{message: message}} = Artifacts.ensure_schema(second_db)
-    assert message =~ "NOT NULL constraint failed: artifacts_new.recordedMessageId"
+    assert :ok = Artifacts.ensure_schema(second_db)
 
-    assert {:ok, [["art_main_writer", nil]]} =
+    assert {:ok, [["art_main_writer", nil, "none"]]} =
              DB.query(
                second_db,
-               "SELECT artifactId, recordedMessageId FROM artifacts"
+               "SELECT artifactId, recordedMessageId, recordedTurnEvidence FROM artifacts"
              )
+
+    # The migration really ran: the provenance edges are in place afterwards, and
+    # the scratch table is gone.
+    assert {:ok, foreign_keys} = DB.query(second_db, "PRAGMA foreign_key_list(artifacts)")
+
+    assert MapSet.new(Enum.map(foreign_keys, fn row -> {Enum.at(row, 3), Enum.at(row, 2)} end)) ==
+             MapSet.new([
+               {"createdBySession", "sessions"},
+               {"workItemId", "work_items"},
+               {"parentSession", "sessions"},
+               {"recordedMessageId", "messages"}
+             ])
+
+    assert {:ok, []} =
+             DB.query(
+               second_db,
+               "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'artifacts_new'"
+             )
+
+    assert {:ok, [[1]]} = DB.query(second_db, "PRAGMA foreign_keys")
+  end
+
+  # A rollback still has to work, so the property the old test guarded keeps a
+  # home: a row whose message edge points at nothing real cannot enter the shape,
+  # and the failure leaves the original table untouched.
+  test "a row whose message edge does not resolve still rolls the migration back intact", _ctx do
+    path = persistent_db_path("rollback")
+    first_db = :"legacy_dangling_first_#{System.unique_integer([:positive])}"
+    first_id = {:legacy_dangling_first, first_db}
+
+    on_exit(fn -> File.rm(path) end)
+
+    start_db(first_id, first_db, path)
+    seed_legacy_database(first_db)
+
+    {:ok, _} =
+      DB.query(
+        first_db,
+        """
+        INSERT INTO artifacts
+          (artifactId, kind, title, createdBySession, workItemId, parentSession,
+           originPath, recordedMessageId, state, home, createdAt, updatedAt)
+        VALUES ('art_dangling', 'report', 'Dangling edge', 'child', 'wi_banana',
+                'parent', 'reports/main.md', 'msg_vanished', 'in-workspace', NULL, 1, 1)
+        """
+      )
+
+    stop_supervised!(first_id)
+
+    second_db = :"legacy_dangling_second_#{System.unique_integer([:positive])}"
+    second_id = {:legacy_dangling_second, second_db}
+    start_db(second_id, second_db, path)
+
+    assert {:error, %DB.Error{message: message}} = Artifacts.ensure_schema(second_db)
+    assert message =~ "artifact foreign key check failed"
+
+    assert {:ok, [["art_dangling", "msg_vanished"]]} =
+             DB.query(second_db, "SELECT artifactId, recordedMessageId FROM artifacts")
 
     assert {:ok, []} = DB.query(second_db, "PRAGMA foreign_key_list(artifacts)")
 
@@ -656,11 +758,13 @@ defmodule Tightbeam.ArtifactsTest do
     refute File.exists?(workspace)
   end
 
+  # No `recorded_message_id`: the caller cannot supply one, so the fixture cannot
+  # either. The edge these rows carry comes from the running turn `setup` started
+  # for the session, which is what a real record has to go through.
   defp record(db, session_key, params) do
     Artifacts.record(db, %{
       principal: {:session, session_key},
       session_key: session_key,
-      recorded_message_id: Map.get(params, :recorded_message_id, "msg_#{session_key}"),
       params: Map.put_new(params, :work_item_id, "wi_banana")
     })
   end
@@ -691,6 +795,24 @@ defmodule Tightbeam.ArtifactsTest do
         """,
         ["msg_#{session_key}", session_key]
       )
+  end
+
+  # A record's turn edge is now derived, so a session that is supposed to end up
+  # with one needs a turn actually running — `session-concurrent`, the class an
+  # unobserved record gets.
+  defp seed_running_turn(db, session_key) do
+    seed_message(db, session_key)
+
+    {:ok, _seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: "msg_#{session_key}",
+        origin: "user:flynn",
+        prompt: "record the artifact"
+      })
+
+    {:ok, _turn} = Ledger.claim_next(db, session_key, "owner")
+    :ok
   end
 
   defp start_db(id, name, path) do

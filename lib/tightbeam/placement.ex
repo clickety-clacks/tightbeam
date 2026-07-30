@@ -974,6 +974,7 @@ defmodule Tightbeam.Placement do
         remote_env: remote_env,
         lineage: lineage,
         rails: Rails.hook_settings(),
+        statutes: Rails.statutes?(),
         credential_kind: credential_kind(config, module.credential_provider(), host),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)

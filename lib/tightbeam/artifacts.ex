@@ -1,7 +1,37 @@
 defmodule Tightbeam.Artifacts do
-  @moduledoc "Artifact pointers and provenance."
+  @moduledoc """
+  Artifact pointers and provenance.
 
-  alias Tightbeam.DB
+  ## The turn edge and its evidence class
+
+  `recordedMessageId` is NULLABLE and paired with `recordedTurnEvidence`, whose
+  domain is closed at three values (artifact-carrier-proposal-v1 §2,
+  conformance-handoff-ledger clauses 8 and 11 as amended):
+
+  - `tool-call-observed` — the substrate-reserved `PreToolUse` hook saw this
+    session about to run a `tightbeam artifact-record` command, and
+    `Tightbeam.TurnObservations` captured the turn's `messages.id` at that
+    moment. An OBSERVATION-QUALITY claim only: see `record/2`.
+  - `session-concurrent` — no hook observation, but a turn was running on the
+    caller's session when the request arrived. This is §C1's concurrency claim,
+    labelled as such.
+  - `none` — neither. `recordedMessageId` is NULL.
+
+  A row migrated from before this column existed also reads `none`, and keeps
+  whatever `recordedMessageId` the old writer stored. The pair distinguishes the
+  two: `(NULL, 'none')` means the substrate looked and found nothing, while a
+  non-NULL id with `none` is a pre-migration row whose id carries no evidence
+  claim at all. Nothing is nulled to make the shapes agree — that would destroy
+  a recorded id to tidy a label.
+
+  NO CONSUMER MAY TREAT `session-concurrent` OR `none` AS EXACT TURN PROOF. A
+  reader that needs the strongest available edge filters on
+  `recordedTurnEvidence = 'tool-call-observed'` and reads even that as an
+  observation. The only gate over artifacts, `assignment.artifact_kinds`, goes
+  through `recorded_kinds/3`, which reads neither column.
+  """
+
+  alias Tightbeam.{DB, Ledger, TurnObservations}
   alias Tightbeam.DB.Txn
 
   @outside_workspace "artifact origin is outside its session workspace"
@@ -16,7 +46,10 @@ defmodule Tightbeam.Artifacts do
     parentSession     TEXT REFERENCES sessions(sessionKey),
     originPath        TEXT NOT NULL,
     contentSha256     TEXT,
-    recordedMessageId TEXT NOT NULL REFERENCES messages(id),
+    recordedMessageId TEXT REFERENCES messages(id),
+    recordedTurnEvidence TEXT NOT NULL DEFAULT 'none'
+                      CHECK (recordedTurnEvidence IN
+                             ('tool-call-observed','session-concurrent','none')),
     state             TEXT NOT NULL DEFAULT 'in-workspace'
                       CHECK (state IN ('in-workspace','archived','released')),
     home              TEXT,
@@ -53,19 +86,25 @@ defmodule Tightbeam.Artifacts do
     end
   end
 
-  @doc "Record a deliberate artifact pointer for the authenticated calling session."
+  @doc """
+  Record a deliberate artifact pointer for the authenticated calling session.
+
+  FAILS OPEN on the turn edge. Whatever the substrate can establish about the
+  firing turn, the row lands — it is never refused for want of provenance. The
+  refusal it replaces was not cosmetic: `completion-requires-results-artifact`
+  denies a coder's completion until a report artifact exists and wakes them to
+  record one, so a verb that refuses held a correct agent in a loop it could not
+  exit and no operator could see. Recording the weaker edge under a label that
+  names it is strictly more truth than recording nothing.
+  """
   @spec record(DB.server(), map()) :: map()
   def record(db \\ Tightbeam.DB, call) do
-    case {
-      call[:principal],
-      call[:session_key],
-      call[:recorded_message_id],
-      call[:params][:work_item_id]
-    } do
-      {{:session, session_key}, session_key, recorded_message_id, work_item_id}
-      when is_binary(session_key) and is_binary(recorded_message_id) and is_binary(work_item_id) ->
+    case {call[:principal], call[:session_key], call[:params][:work_item_id]} do
+      {{:session, session_key}, session_key, work_item_id}
+      when is_binary(session_key) and is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
         parent_session = parent_session(db, session_key)
+        {recorded_message_id, evidence} = turn_evidence(db, session_key)
         now = now()
 
         {:ok, _} =
@@ -75,9 +114,9 @@ defmodule Tightbeam.Artifacts do
             INSERT INTO artifacts
               (artifactId, kind, title, description, createdBySession, workItemId,
                parentSession, originPath, contentSha256, recordedMessageId,
-               state, home, createdAt, updatedAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    'in-workspace', NULL, ?11, ?11)
+               recordedTurnEvidence, state, home, createdAt, updatedAt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    'in-workspace', NULL, ?12, ?12)
             """,
             [
               artifact_id,
@@ -90,18 +129,52 @@ defmodule Tightbeam.Artifacts do
               call.params.origin_path,
               call.params[:content_sha256],
               recorded_message_id,
+              evidence,
               now
             ]
           )
 
         get(db, artifact_id)
 
-      {{:session, session_key}, session_key, _recorded_message_id, _work_item_id}
-      when is_binary(session_key) ->
+      {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
         %{code: "invalid", message: "artifact-record requires provenance edges"}
 
       _ ->
         %{code: "invalid", message: "artifact-record requires a session caller"}
+    end
+  end
+
+  # The best edge the substrate OBSERVED, with the observation method named.
+  #
+  # `tool-call-observed` is a claim about OBSERVATION QUALITY and nothing more:
+  # the reserved PreToolUse hook saw this session about to run an
+  # `artifact-record` command and captured the running turn's `messages.id` at
+  # that moment. The captured window is joined to this request by SESSION AND
+  # TIME — not by a nonce, not by matching command text — so it is neither
+  # unforgeable nor a statement of exact causality. Read it as "the substrate
+  # observed this turn invoking this verb". Nonce injection is the only join that
+  # would be genuine proof, and it cannot exist on Codex, whose PreToolUse
+  # protocol is allow/deny with no input mutation (harness-support CAP-008).
+  #
+  # `session-concurrent` is weaker still and says so: §C1's concurrency claim,
+  # true in the normal case and wrong in both directions at the edges (a separate
+  # request on the same session token binds a turn that did not fire it; a
+  # request arriving after a cancel binds none).
+  #
+  # The caller never supplies either value. `recorded_message_id` and
+  # `recorded_turn_evidence` are stripped from params at the wire boundary
+  # (`Tightbeam.Wire.Router`), which is the whole reason a caller-selected id
+  # could not have been proof in the first place.
+  defp turn_evidence(db, session_key) do
+    case TurnObservations.observed(session_key) do
+      message_id when is_binary(message_id) ->
+        {message_id, "tool-call-observed"}
+
+      nil ->
+        case Ledger.running_turn_message_id(db, session_key) do
+          message_id when is_binary(message_id) -> {message_id, "session-concurrent"}
+          nil -> {nil, "none"}
+        end
     end
   end
 
@@ -311,7 +384,7 @@ defmodule Tightbeam.Artifacts do
 
     if target_shape?(columns, foreign_keys, table_sql),
       do: :ok,
-      else: rebuild_table(db)
+      else: rebuild_table(db, Enum.any?(columns, &(Enum.at(&1, 1) == "recordedTurnEvidence")))
   end
 
   defp target_shape?(columns, foreign_keys, table_sql) do
@@ -338,16 +411,33 @@ defmodule Tightbeam.Artifacts do
     column_shape["createdBySession"] == {"TEXT", 1} and
       column_shape["workItemId"] == {"TEXT", 1} and
       column_shape["parentSession"] == {"TEXT", 0} and
-      column_shape["recordedMessageId"] == {"TEXT", 1} and
+      column_shape["recordedMessageId"] == {"TEXT", 0} and
+      column_shape["recordedTurnEvidence"] == {"TEXT", 1} and
       actual_foreign_keys == expected_foreign_keys and
       String.contains?(
         normalized_sql,
         "CHECK((state='archived')=(homeISNOTNULL))"
+      ) and
+      String.contains?(
+        normalized_sql,
+        "CHECK(recordedTurnEvidenceIN('tool-call-observed','session-concurrent','none'))"
       )
   end
 
-  defp rebuild_table(db) do
+  # Rename-rebuild, not additive ALTERs: `recordedMessageId` drops its NOT NULL,
+  # which SQLite cannot do in place. No other table carries an FK INTO artifacts,
+  # so the DROP + RENAME leaves no dangling reference behind; the four OUTBOUND
+  # edges are what `foreign_key_check` re-proves before the transaction commits.
+  #
+  # A source table without `recordedTurnEvidence` predates the column, so its
+  # rows land `none` — the substrate never looked at them, exactly as C1's
+  # pre-existing rows land `known = 0`. Their `recordedMessageId` is copied
+  # through unchanged, including the NULLs the old writer stored that the NOT
+  # NULL shape used to reject outright.
+  defp rebuild_table(db, evidence_column?) do
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    evidence_source = if evidence_column?, do: "recordedTurnEvidence", else: "'none'"
 
     try do
       case DB.transaction(db, fn txn ->
@@ -359,11 +449,11 @@ defmodule Tightbeam.Artifacts do
                INSERT INTO artifacts_new
                  (artifactId, kind, title, description, createdBySession, workItemId,
                   parentSession, originPath, contentSha256, recordedMessageId,
-                  state, home, createdAt, updatedAt)
+                  recordedTurnEvidence, state, home, createdAt, updatedAt)
                SELECT
                  artifactId, kind, title, description, createdBySession, workItemId,
                  parentSession, originPath, contentSha256, recordedMessageId,
-                 state, home, createdAt, updatedAt
+                 #{evidence_source}, state, home, createdAt, updatedAt
                FROM artifacts
                """
              )
@@ -503,8 +593,8 @@ defmodule Tightbeam.Artifacts do
   defp columns do
     """
     artifactId, kind, title, description, createdBySession, workItemId,
-    parentSession, originPath, contentSha256, recordedMessageId, state, home,
-    createdAt, updatedAt
+    parentSession, originPath, contentSha256, recordedMessageId,
+    recordedTurnEvidence, state, home, createdAt, updatedAt
     """
   end
 
@@ -519,6 +609,7 @@ defmodule Tightbeam.Artifacts do
          origin_path,
          content_sha256,
          recorded_message_id,
+         recorded_turn_evidence,
          state,
          home,
          created_at,
@@ -535,6 +626,7 @@ defmodule Tightbeam.Artifacts do
       origin_path: origin_path,
       content_sha256: content_sha256,
       recorded_message_id: recorded_message_id,
+      recorded_turn_evidence: recorded_turn_evidence,
       state: state,
       home: home,
       created_at: created_at,

@@ -68,6 +68,12 @@ defmodule Tightbeam.Rails do
     pattern: "tightbeam-gate-probe",
     text: "Spawn wiring-check probe command; always refused by design."
   }
+  # Deliberately loose on what sits between the two words — the agent may write
+  # `tightbeam  artifact-record`, or reach the binary by path. Loose is the right
+  # direction here: a false match opens a window the record then binds, which is
+  # the same turn it would have bound anyway, while a miss silently downgrades a
+  # correct agent's evidence.
+  @observation_pattern "tightbeam[^\"]*artifact-record"
 
   @typedoc "A validated gate statute."
   @type statute :: %{
@@ -114,21 +120,73 @@ defmodule Tightbeam.Rails do
     statutes
   end
 
-  @doc "The compiled PreToolUse hook map embedded in each harness's rails artifact, or nil for an empty statute set."
-  @spec hook_settings() :: map() | nil
-  def hook_settings do
-    case :persistent_term.get(@persist_key, []) do
-      [] ->
-        nil
+  @doc """
+  The compiled PreToolUse hook map embedded in each harness's rails artifact.
 
-      statutes ->
-        %{"hooks" => %{"PreToolUse" => Enum.map(statutes, &pre_tool_use_entry/1)}}
-    end
+  Never nil: the substrate-reserved observation entry is present whatever the
+  statute set is. It is not law and is not gated on law — an org that has
+  authored no statute still needs `artifact-record` to be observable, and the
+  statute that makes artifacts load-bearing
+  (`completion-requires-results-artifact`) lives in the DISPATCH tier, so gating
+  the hook on the presence of GATE statutes would leave exactly the orgs that
+  need the observation without one.
+  """
+  @spec hook_settings() :: map()
+  def hook_settings do
+    statutes = :persistent_term.get(@persist_key, [])
+
+    %{
+      "hooks" => %{
+        "PreToolUse" => Enum.map(statutes, &pre_tool_use_entry/1) ++ [observation_entry()]
+      }
+    }
   end
+
+  @doc """
+  Whether any org LAW is loaded.
+
+  Distinct from `hook_settings/0` being present, which it now always is. Only law
+  can deny, so only law justifies the codex spawn wiring-check and its
+  fail-closed boot: the reserved observation entry must never be able to block
+  anything, a boot included.
+  """
+  @spec statutes?() :: boolean()
+  def statutes?, do: :persistent_term.get(@persist_key, []) != []
 
   @doc "The compiled PreToolUse entry for the substrate-reserved codex spawn wiring-check."
   @spec probe_entry() :: map()
   def probe_entry, do: pre_tool_use_entry(@probe_statute)
+
+  @doc """
+  The compiled PreToolUse entry for the substrate-reserved artifact-record
+  observation (artifact-carrier-proposal-v1 §4.1).
+
+  Shaped like a gate and priced like one: `grep` the raw tool-call JSON on stdin
+  and exit 0 immediately when the command is not an `artifact-record`, so every
+  other Bash call pays one local grep and nothing else. Only the matching call
+  pays the gateway round trip, which is what keeps a blocking pre-execution hop —
+  over SSH from a satellite — rare by construction.
+
+  It OBSERVES; it never refuses. Every path exits 0, including a failed call:
+  `artifact-record` fails open, so a hook that could not reach the gateway must
+  cost the agent nothing but the weaker evidence class it will get anyway. The
+  CLI resolves url, token, and session from the workdir's `.tightbeam-session`
+  exactly as the agent's own invocation does, so this stays self-contained — no
+  paths, no environment beyond the `tightbeam` already on the agent's PATH.
+  """
+  @spec observation_entry() :: map()
+  def observation_entry do
+    payload =
+      "grep -qE \"#{escape_double_quoted(@observation_pattern)}\" - || exit 0; " <>
+        "tightbeam tool-call-observed >/dev/null 2>&1; exit 0"
+
+    %{
+      "matcher" => "Bash",
+      "hooks" => [
+        %{"type" => "command", "command" => "sh -c '" <> escape_single_quotes(payload) <> "'"}
+      ]
+    }
+  end
 
   defp validate!(statute) when is_map(statute) do
     keys = Map.keys(statute) |> MapSet.new()

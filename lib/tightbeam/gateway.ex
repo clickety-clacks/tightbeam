@@ -356,6 +356,10 @@ defmodule Tightbeam.Gateway do
         # evaluation runs. Explicitly a child rather than lazily started — a lazy start
         # would let a missing spec here go unnoticed in production forever.
         {Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes},
+        # Ahead of Bandit for the same reason: the hook seam posts to the wire,
+        # so the window's writer must own the ordering before the first
+        # observation can arrive.
+        {Tightbeam.TurnObservations, name: Tightbeam.TurnObservations},
         {Tightbeam.Wakes,
          db: db,
          deliver: deliver,

@@ -310,7 +310,11 @@ defmodule Tightbeam.Harness.Support do
         common_env: [{"COMMON", "1"}],
         remote_env: ["REMOTE=1"],
         lineage: "tb-vector",
-        rails: if(rails == :railed, do: %{"hooks" => %{"PreToolUse" => []}}, else: nil),
+        # The projected map is unconditional now — the substrate's own observation
+        # entry rides in it — so the railed/lawless axis is org LAW, which is what
+        # the probe follows.
+        rails: %{"hooks" => %{"PreToolUse" => []}},
+        statutes: rails == :railed,
         credential_kind: kind,
         ensure_workdir: fn _host, _cwd, _content, _opts -> :ok end,
         sh_out: nil
@@ -333,7 +337,7 @@ defmodule Tightbeam.Harness.Support do
       if local? do
         extra =
           Map.fetch!(profile.local_extra_env, kind) ++
-            if(railed? and profile.rails_env, do: [profile.rails_env], else: [])
+            if(profile.rails_env, do: [profile.rails_env], else: [])
 
         [
           cmd: [adapter],
@@ -343,7 +347,7 @@ defmodule Tightbeam.Harness.Support do
         remote_env =
           profile.remote_prefix.(base, home, kind) ++
             ["REMOTE=1"] ++
-            if(railed? and profile.remote_rails_env,
+            if(profile.remote_rails_env,
               do: [profile.remote_rails_env],
               else: []
             )

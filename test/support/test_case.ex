@@ -64,6 +64,12 @@ defmodule Tightbeam.TestCase do
     # them; suites that never touch rails just have an idle process.
     start_supervised!({Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes})
 
+    # Same contract as the episode writer above: `Artifacts.record/2` reads the
+    # named process, and an absent one degrades to a weaker evidence class rather
+    # than failing loudly — so a suite that asserts `tool-call-observed` must find
+    # a real writer here or it would silently be asserting the fallback.
+    start_supervised!({Tightbeam.TurnObservations, name: Tightbeam.TurnObservations})
+
     :ok
   end
 

@@ -132,6 +132,7 @@ defmodule Tightbeam.CredentialKindsTest do
         remote_env: ["REMOTE=1"],
         lineage: "tb-kinds",
         rails: nil,
+        statutes: false,
         credential_kind: kind,
         ensure_workdir: fn _host, _cwd, _content, _opts -> :ok end,
         sh_out: nil
