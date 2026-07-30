@@ -475,18 +475,20 @@ defmodule Tightbeam.RailRemedyTest do
 
     handlers =
       Map.put(ctx.handlers, "assign", fn _call ->
-        {:ok, _} =
-          DB.query(
-            ctx.db,
-            """
-            UPDATE rail_remedy_episodes
-            SET status = 'live', producerKey = ?3
-            WHERE statute = ?1 AND subject = ?2 AND status = 'dispatched'
-            """,
-            [rule.name, assignment.id, winner]
-          )
+        assert {:ok, 1} =
+                 DB.transaction(ctx.db, fn txn ->
+                   DB.Txn.q(
+                     txn,
+                     """
+                     UPDATE rail_remedy_episodes
+                     SET status = 'live', producerKey = ?3
+                     WHERE statute = ?1 AND subject = ?2 AND status = 'dispatched'
+                     """,
+                     [rule.name, assignment.id, winner]
+                   )
 
-        assert DB.changes(ctx.db) == 1
+                   DB.Txn.changes(txn)
+                 end)
         %{id: "losing-producer"}
       end)
 
