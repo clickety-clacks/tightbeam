@@ -14,7 +14,7 @@ defmodule Tightbeam.Wire.Router do
   - Escalation: `202` + `{"decisionPending": {"decisionRequestId", "code",
     "message"}}` — the THIRD dispatch outcome, neither a result nor an error.
     The verb halted without denying and its decision-request is open
-    (escalation-substrate-v1 §2, §11 case 1), so it gets its own envelope
+    (escalation-substrate-v1 §2, §12 case 1), so it gets its own envelope
     rather than being dressed as a failure the caller could have avoided.
   - Anything that CHANGES state goes through Dispatch as a verb — handlers
     here NEVER write to Org/Projection/Devices directly. Reads query directly.
@@ -805,7 +805,7 @@ defmodule Tightbeam.Wire.Router do
   # while every real caller hard-failed.
   #
   # NOT an error envelope. escalation-substrate-v1 §2 pins the caller-facing tag
-  # as "distinct from any `{:deny,…}`", and §11's first case is "halt without
+  # as "distinct from any `{:deny,…}`", and §12's first case is "halt without
   # deny": nothing was refused, the action is waiting on its owner. 202 says
   # exactly that in the wire's own vocabulary — accepted, not yet complete —
   # where any 4xx would tell the caller it did something wrong.

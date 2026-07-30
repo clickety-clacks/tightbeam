@@ -745,6 +745,13 @@ defmodule Tightbeam.CliIntegrationTest do
     status
   end
 
+  defp open_request?(db, id) do
+    {:ok, rows} =
+      DB.query(db, "SELECT 1 FROM decision_requests WHERE id = ?1 AND status = 'open'", [id])
+
+    rows == [[1]]
+  end
+
   defp session_workdir!(ctx, session) do
     dir = Path.join([ctx.base_dir, "work", session.session_key])
     File.mkdir_p!(dir)
@@ -785,6 +792,34 @@ defmodule Tightbeam.CliIntegrationTest do
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
+    # THE WIRE CONTRACT ITSELF, off the real Bandit socket. Asserting only on what
+    # the CLI printed would leave the router free to drift to a 200, or to a
+    # 400 error envelope carrying the same three fields, with every test still
+    # green — the rendered text is identical either way, and both drifts change
+    # what a non-CLI client sees. So the status and the WHOLE envelope are pinned
+    # here, exactly, rather than by substring.
+    {:ok, {{_version, http_status, _reason}, _headers, raw_body}} =
+      :httpc.request(
+        :post,
+        {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
+         [{~c"authorization", ~c"Bearer #{ctx.session.cli_token}"}], ~c"application/json",
+         JSON.encode!(%{
+           "verb" => "assignments",
+           "params" => %{"sessionKey" => "cli-holder"}
+         })},
+        [],
+        []
+      )
+
+    assert http_status == 202
+    envelope = raw_body |> to_string() |> JSON.decode!()
+
+    # Exactly one top-level key: not a result, not an error, no companions.
+    assert Map.keys(envelope) == ["decisionPending"]
+    pending = envelope["decisionPending"]
+    assert Enum.sort(Map.keys(pending)) == ["code", "decisionRequestId", "message"]
+    assert pending["code"] == "decision_pending"
+
     {output, status} =
       System.cmd(ctx.binary, ["assignments", "--session", "cli-holder"],
         cd: ctx.workdir,
@@ -798,17 +833,14 @@ defmodule Tightbeam.CliIntegrationTest do
     refute output =~ "EOF"
     refute output =~ "CaseClauseError"
 
-    [[request_id]] =
-      (fn ->
-         {:ok, rows} =
-           DB.query(ctx.db, "SELECT id FROM decision_requests WHERE status = 'open'")
-
-         rows
-       end).()
-
-    # The id the caller was told is the row that is actually open — without it the
-    # message is unactionable prose.
-    assert output =~ request_id
+    # The id each caller was told is a row that is actually open — without that,
+    # the message is unactionable prose. Checked per caller rather than against a
+    # single row: dedup keys on (raiserId, statuteName, actionKey), and these two
+    # callers send different params, so two open requests here is correct and
+    # asserting one would be asserting a coincidence.
+    assert [request_id] = Regex.run(~r/dr_[0-9a-f-]+/, output)
+    assert open_request?(ctx.db, request_id)
+    assert open_request?(ctx.db, pending["decisionRequestId"])
 
     # THE EFFECT-APPLIES PROPERTY, which the fix must leave exactly alone: the
     # request opened and the handler never ran. Only the response changed.
