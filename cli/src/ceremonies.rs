@@ -303,8 +303,8 @@ fn run_bounded(
         if started.elapsed() >= timeout {
             // TERM the group, give it a moment to clean up, then KILL what ignored it.
             // These children are RUNNING, so TERM is delivered at once -- the
-            // TERM-before-CONT ordering matters only for an already-STOPped process,
-            // which is the producer fixture's case and not this one.
+            // TERM-before-CONT ordering would matter only for an already-STOPped
+            // process, which none of these are.
             unsafe {
                 libc::killpg(pgid, libc::SIGTERM);
             }

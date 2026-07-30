@@ -1,5 +1,0 @@
-[[rule]]
-name = "producer-backed-gate"
-verb = "attest"
-text = "requires tests"
-deny_when = [{ fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["tests-passed"] }]

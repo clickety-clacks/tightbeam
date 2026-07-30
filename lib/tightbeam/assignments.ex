@@ -279,19 +279,6 @@ defmodule Tightbeam.Assignments do
     end)
   end
 
-  @doc "Return distinct producer-stamped verdict kinds filed directly on an assignment."
-  @spec produced_verdict_kinds(DB.server(), String.t()) :: [String.t()]
-  def produced_verdict_kinds(db, assignment_id) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT DISTINCT verdictKind FROM attests WHERE assignmentId = ?1 AND kind = 'verdict' AND producer IS NOT NULL ORDER BY verdictKind",
-        [assignment_id]
-      )
-
-    Enum.map(rows, &hd/1)
-  end
-
   @doc "Return the declared file paths for an assignment."
   @spec declared_files(DB.server(), String.t()) :: [String.t()]
   def declared_files(db, assignment_id) do
@@ -314,43 +301,6 @@ defmodule Tightbeam.Assignments do
     {sql, params} = open_assignments_touching_query(paths, exclude_id)
     {:ok, rows} = DB.query(db, sql, params)
     Enum.map(rows, &hd/1)
-  end
-
-  @doc "Insert a producer-stamped verdict inside the caller's open transaction."
-  @spec insert_producer_verdict_in_txn(Txn.t(), map()) :: {:ok, map()} | {:error, map()}
-  def insert_producer_verdict_in_txn(%Txn{} = txn, input) do
-    assignment_id = input.assignment_id
-
-    case fetch_assignment(txn, assignment_id) do
-      nil ->
-        {:error, error("unknown_assignment", "unknown assignment: #{assignment_id}")}
-
-      %{state: state} when state != "open" ->
-        {:error, assignment_closed()}
-
-      _assignment ->
-        with :ok <- valid_verdict_kind(input.verdict_kind),
-             :ok <- valid_producer(input.producer) do
-          attest =
-            insert_attest_row(txn, %{
-              assignment_id: assignment_id,
-              kind: "verdict",
-              verdict_kind: input.verdict_kind,
-              note: nil,
-              by_session: input.by_session,
-              by_user: input.by_user,
-              producer: input.producer,
-              producer_command: input.producer_command,
-              by_harness: input.by_harness,
-              by_provider: input.by_provider
-            })
-
-          append_attest_marker(txn, attest)
-          {:ok, attest}
-        else
-          %{code: _} = failure -> {:error, failure}
-        end
-    end
   end
 
   @doc "List every attest filed against an assignment in deterministic order."
@@ -1553,19 +1503,6 @@ defmodule Tightbeam.Assignments do
 
   defp assignment_files("assign", params), do: valid_files(params[:files])
   defp assignment_files(_verb, _params), do: {:ok, []}
-
-  defp valid_producer(producer) when is_binary(producer) do
-    if String.length(producer) in 1..64 and
-         Regex.match?(~r/^[a-z0-9][a-z0-9-]*$/, producer),
-       do: :ok,
-       else:
-         error(
-           "invalid_producer",
-           "producer must be 1..64 lowercase letters, digits, or hyphens"
-         )
-  end
-
-  defp valid_producer(_), do: error("invalid_producer", "producer must be text")
 
   defp open_assignments_touching_in_txn(_txn, [], _exclude_id), do: []
 

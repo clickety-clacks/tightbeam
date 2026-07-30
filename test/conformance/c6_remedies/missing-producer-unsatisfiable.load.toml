@@ -1,9 +1,0 @@
-[loadset]
-name = "missing-producer-unsatisfiable"
-class = "C6"
-phase = "pending"
-blocking_phase = "P5"
-outcome = "load-raise"
-must_name = ["needs-tests", "tests-passed"]
-error_match = "no producer"
-source = "mechanism §F1 closed registry"

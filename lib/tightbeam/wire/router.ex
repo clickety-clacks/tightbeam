@@ -45,7 +45,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host identity-edit identity-status identity-relearn identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail run-tests run-smoke cancel-producer-job rule effort-rule waive revoke-waiver withdraw decision-requests decision-request transcript attend toplines topline)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical adjudicate inspect cancel tune approve-device deny-device revoke-device promote-user config register-host identity-edit identity-status identity-relearn identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw decision-requests decision-request transcript attend toplines topline)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -723,6 +723,9 @@ defmodule Tightbeam.Wire.Router do
 
   defp control_call(%{"action" => "cancel_current_run"}), do: {:ok, "cancel", %{}}
 
+  defp control_call(%{"action" => action}) when action in ~w(adopt unadopt),
+    do: {:ok, "tune", %{setting: "adopt", adopted: action == "adopt"}}
+
   defp control_call(%{"action" => "set_model", "model" => model}),
     do: {:ok, "tune", %{setting: "set_model", model: model}}
 
@@ -810,8 +813,6 @@ defmodule Tightbeam.Wire.Router do
 
   defp error_status("not_found"), do: 404
   defp error_status("unknown_assignment"), do: 404
-  defp error_status("unknown_producer_job"), do: 404
-  defp error_status("producer_unconfigured"), do: 403
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
   defp error_status(_), do: 400

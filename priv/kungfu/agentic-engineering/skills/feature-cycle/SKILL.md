@@ -44,8 +44,9 @@ per-feature, but your attention across features is the scarce resource.
 4. **Implement.** For each goal, assign a coder one goal with the spec path and the
    work-item id. The coder attests progress as it works — including when the goal
    builds clean and is ready for review. Completion is attested only after the review
-   verdict is `reviewed-clean` and integration is proven (a completion closes the
-   assignment, and the producer stamps and the user's verdict land only on open ones).
+   verdict is `reviewed-clean`, the verification papertrail is recorded, and
+   integration is proven (a completion closes the assignment, and verdicts land only
+   on open ones).
 5. **Code review.** Every goal ready for review goes to an independent reviewer: a
    session that did not produce the work, on a different model family than the
    producer, thinking hard; when one family is available, a fresh session at a higher
@@ -85,11 +86,15 @@ per-feature, but your attention across features is the scarce resource.
    (committing-and-pushing skill); the review that clears the work covers the
    post-reconciliation result — a review from before integration is stale where
    integration changed semantics.
-8. **Real run.** For work that touches live inputs, require a real run against real
-   inputs before it ships: `tightbeam run-smoke <assignmentId>` runs the org's
-   committed smoke command and stamps `real-run-passed`. Compiling, green tests, and a
-   clean review are not that proof. (`run-tests <assignmentId>` likewise stamps
-   `tests-passed` from the committed test command — cheap to require on every goal.)
+8. **Verification papertrail.** Before a goal completes, the coder verifies the work
+   the way the repository's prose defines verification (its AGENTS.md or equivalent),
+   records the results (output, logs, evidence) as a report artifact on the work item
+   with `tightbeam artifact-record`, and files
+   `tightbeam attest <assignmentId> --kind verdict --verdict verified` with a note
+   saying what was run and what was observed. Compiling, green tests, and a clean
+   review are not that proof; the verification statute blocks a completion whose
+   papertrail is missing. A repository that never defines verification is a process
+   gap — escalate it, do not guess.
 9. **Ready for user verification.** Wake the user —
    `tightbeam wake --user <id> --prompt "<what changed, how to try it, what decision remains>"`.
    Done means the user can try it; the user's verdict, when given, is attested on the

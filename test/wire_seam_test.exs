@@ -75,7 +75,7 @@ defmodule Tightbeam.Wire.SeamTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     handlers = Gateway.handlers(%{db: db, base_dir: base_dir})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers), %{})
+    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
 
     %{
       db: db,

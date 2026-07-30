@@ -1,7 +1,0 @@
-[loadset]
-name = "producer-present-satisfiable"
-class = "C6"
-phase = "pending"
-blocking_phase = "P5"
-outcome = "load-clean"
-source = "mechanism §F1 producers.toml registry input"

@@ -9,7 +9,7 @@ legibility = "event:denied(rule=capstone-real-run-before-ship);lifecycle:rail_sw
 [[fixture.rule]]
 name = "capstone-real-run-before-ship"
 verb = "attest"
-text = "shipping requires a mechanically produced real run"
+text = "shipping requires a filed real-run-passed verdict"
 edges = ["verb", "turn-end"]
-deny_when = [{ fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["real-run-passed"] }]
+deny_when = [{ fact = "assignment.verdicts", op = "not_in", value = ["real-run-passed"] }]
 external_producer = true

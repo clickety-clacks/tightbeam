@@ -24,9 +24,9 @@ is a rubber stamp.
      the assignment that covers it.
 3. The review does not pass while any clause is unsatisfied or unproven. An unproven
    clause blocks exactly as an unsatisfied one does; the remedy differs — produce the
-   missing evidence (a test, a real run — the `run-tests` and `run-smoke` producers
-   stamp `tests-passed` and `real-run-passed` verdicts mechanically) or return the
-   work.
+   missing evidence (a test, a real run — run it the way the repository's prose
+   defines verification, record the results as a report artifact, and file the
+   verification verdict) or return the work.
 4. Check the exclusions: behavior inside a named non-goal is an unrequested addition
    and a finding.
 5. Include the full clause table in the verdict note, so the next reader sees which

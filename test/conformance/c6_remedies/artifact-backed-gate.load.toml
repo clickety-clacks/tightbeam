@@ -1,0 +1,7 @@
+[loadset]
+name = "artifact-backed-gate"
+class = "C6"
+phase = "pending"
+blocking_phase = "P5"
+outcome = "load-clean"
+source = "verification-papertrail-v1 §2 D2 artifact-fact remedy eligibility"
