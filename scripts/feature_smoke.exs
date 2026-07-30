@@ -32,21 +32,12 @@ defmodule FeatureSmoke do
 
   @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "mike"
 
-  # How long the artifact-closure journey waits for the holder's REAL harness turns to
-  # land the PROMPTED record.
-  #
-  # The arithmetic, because it has to cover two turns and not one: the statute's own
-  # remedy wake is dispatched before this group's explicit wake, so the prompted turn is
-  # QUEUED BEHIND it on the holder's lane and both must finish. At the 180s per-turn
-  # worst case the client-e2e driver already budgets (`ClientE2E.@default_turn_timeout_ms`)
-  # that is 2 x 180s = 360s, plus 60s of slack for lane queueing and adapter spawn. A
-  # budget sized for one turn expires while the substrate is behaving correctly, which is
-  # the worst kind of red.
-  @artifact_turn_budget_ms 420_000
-
   # How long a remedy episode gets to reach a status. The transition rides the attest
   # that provoked it, so this covers scheduling, not model time.
   @episode_settle_ms 30_000
+
+  # Slack over one turn ceiling: lane queueing, adapter spawn, and the poll interval.
+  @lane_slack_ms 60_000
 
   def run do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
@@ -538,11 +529,29 @@ defmodule FeatureSmoke do
   #   REAL CLI turn      → tightbeam artifact-record, over the wire, from the workdir
   #   attest completion  → PASSES; the assignment closes `completed` and the artifact
   #                        statute's remedy episode goes `live` → `closed` on its own
+  #
+  # TWO DEVICES CARRY THE SOUNDNESS OF ALL OF IT, and they are here because a holder's
+  # remedy turn runs concurrently with this group's own calls unless something stops it.
+  # A concurrent turn can read the transcript and learn any content this group hoped was
+  # distinguishing, file its own attest and land a denial beside the one being correlated,
+  # and leave an observation window a later record inherits. Those are three faces of one
+  # problem, so they get two structural answers rather than three patches:
+  #
+  #   SERIALIZE — the holder's lane is drained before every completion attempt and before
+  #   the prompted wake, so nothing this group measures happens beside another turn.
+  #
+  #   IDENTIFY — the prompted record is selected by `recordedMessageId` against the wake's
+  #   own `turns.messageId`, so the central assertion is a claim about a specific turn and
+  #   not about whichever row looked right. Identity from the substrate, not from content,
+  #   which is the same principle the carrier under test rests on.
   defp check_artifact_record_closure(state) do
     u = unique()
-    # The salted filename is how the prompted record is told apart from anything the
-    # statute's own remedy turn may have recorded first. The remedy turn cannot produce it
-    # because the prompt carrying the salt has not been delivered when that turn runs.
+    # A HUMAN-LEGIBILITY marker, and deliberately not the selector. The prompted record is
+    # identified by the turn that produced it (`recordedMessageId`); this filename is what
+    # lets a failure say WHICH record it found and why it was rejected. Treating it as an
+    # identity would be wrong: a wake persists its prompt to the transcript while queued,
+    # so a turn running beside it can read the salt, and `u` is visible in the work-item
+    # title and assignment subject regardless.
     marker = "results-#{u}.md"
     reviewer_leg = independent_leg(state)
     preflight_independent!(state, reviewer_leg)
@@ -551,9 +560,13 @@ defmodule FeatureSmoke do
 
     # Spawning through the OTHER leg is the whole cross-harness move: `post/3` runs every
     # spawn through `FeatureSmokePlan.explicit_spawn/2`, which pins harness and model from
-    # `state.leg`, so swapping the leg for this one call is enough. The role is bound
-    # because a session acting under its OWN credential needs one for the router to derive
-    # an origin, not because anything here waits on the review remedy to target it.
+    # `state.leg`, so swapping the leg for this one call is enough.
+    #
+    # The `reviewer` bind does double duty, and both halves are load-bearing. A session
+    # acting under its OWN credential needs a bound role or the router refuses it
+    # `no_role`; and `Roles.bind/3` REPLACES `boundSessionKey`, so this is also what
+    # points the review statute's `target_role` at a live session instead of at whatever
+    # retired one a previous group left behind.
     reviewer =
       ok!(%{state | leg: reviewer_leg}, "spawn", %{
         "displayName" => "smoke-artifact-reviewer-#{u}",
@@ -603,26 +616,39 @@ defmodule FeatureSmoke do
 
     try do
       # 1. Review gate.
-      denied!(state, "completion-requires-review", asg_id, complete)
+      denied!(state, "completion-requires-review", coder_key, asg_id, complete)
 
-      # The review assignment is opened EXPLICITLY rather than taken from the statute's
-      # remedy. Depending on a remedy-created assignment makes the group hostage to
-      # whether `target_role` resolves in the org under test — on shrdlu the reviewer role
-      # is bound to a retired session and the remedy silently no-ops — and this group is
-      # not here to test the review remedy, which the flagship group already covers.
+      # The review this group files its verdict on is the one the REMEDY opened, and there
+      # is deliberately no second one.
       #
-      # Opened by the OWNER, and that is load-bearing rather than incidental:
-      # `Assignments.commissioned_review_authors/3` only counts a verdict when the review's
-      # `openedBySession` differs from the holder (a user-principal open leaves it NULL)
-      # AND the verdict's author is the review's own holder. A review the coder opened for
-      # itself yields no independent verdict and the gate would never release.
+      # An earlier revision opened it explicitly, on field advice that the remedy no-ops
+      # against a reviewer role bound to a retired session. That reason does not survive
+      # this group's own setup: the fresh reviewer is rebound above, and `Roles.bind/3`
+      # REPLACES `boundSessionKey`, so `target_role` resolves to the live session. Opening
+      # one anyway produced a duplicate review of the same assignment — two obligations
+      # where the org law asked for one, which is worse than either path alone.
+      #
+      # The independence condition holds either way, and it is worth naming because it is
+      # what the choice was originally made to protect: `commissioned_review_authors/3`
+      # counts a verdict only when the review's `openedBySession` differs from the holder
+      # and the author is the review's own holder. A remedy-opened review has
+      # `openedBySession` NULL, exactly as an owner-opened one does. What using the remedy
+      # additionally buys is the assertion below — that the remedy reached the right
+      # session — which the explicit open had silently dropped.
+      reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+
       review =
-        ok!(state, "assign", %{
-          "sessionKey" => reviewer_key,
-          "subject" => "review of assignment #{asg_id}",
-          "reviews" => asg_id,
-          "idempotencyKey" => "arrev-#{u}"
-        })
+        (reviews["assignments"] || reviews)
+        |> List.wrap()
+        |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
+
+      assert(
+        state,
+        is_map(review),
+        "artifact closure: the review remedy did not assign the #{reviewer_leg.wire_name} " <>
+          "reviewer a review of #{asg_id}. The role is rebound to this group's live reviewer, " <>
+          "so an unresolved target here is a real remedy failure. Got: #{inspect(reviews)}"
+      )
 
       v =
         post_as(state, reviewer_tok, "attest", %{
@@ -638,7 +664,7 @@ defmodule FeatureSmoke do
       )
 
       # 2. Verification gate, now reachable because the review gate stopped denying.
-      denied!(state, "completion-requires-verification", asg_id, complete)
+      denied!(state, "completion-requires-verification", coder_key, asg_id, complete)
 
       verified =
         post_as(state, coder_tok, "attest", %{
@@ -659,28 +685,40 @@ defmodule FeatureSmoke do
       # shrdlu. If that workaround is still installed in the org under test, THIS
       # assertion is what fails, which is what keeps the shrdlu leg falsifiable
       # (§7.3 gate item 4).
-      denied!(state, "completion-requires-results-artifact", asg_id, complete)
+      denied!(state, "completion-requires-results-artifact", coder_key, asg_id, complete)
 
-      # This remedy IS depended on, unlike the review one, and the difference is the target:
-      # it wakes `{holder_key}` directly, so there is no `target_role` to resolve and none
-      # of the role-binding fragility that makes remedy-created assignments a bad oracle.
-      # The episode going live is also the fail-before that makes the closure below mean
-      # something.
+      # The episode going live is the fail-before that makes the closure at the end mean
+      # something, and it is safe to depend on where the review remedy was not: this one
+      # wakes `{holder_key}` directly, so there is no `target_role` to resolve.
       await_episode_status!(state, "completion-requires-results-artifact", asg_id, "live")
 
-      # 4. The real turn. The statute's own remedy has already woken the holder, and that
-      # wake may satisfy the gate by itself — but its prompt names neither the work item
+      # 4. The real turn, and it runs ALONE.
+      #
+      # That remedy woke the holder, and its turn is now running. Draining it before this
+      # group's own wake is what makes everything downstream an identity claim rather than
+      # a guess: no concurrent reader of the transcript that carries the marker, no second
+      # attest landing a denial beside the correlated one, and no second turn racing to
+      # record. The remedy's turn may well satisfy the gate on its own — that is fine and
+      # it is not what is being measured, because the assertions below key on the turn
+      # THIS group prompts, not on whichever record appears.
+      #
+      # The prompt exists because the shipped remedy prompt names neither the work item
       # (which `Artifacts.record/2` REQUIRES) nor the direct-invocation constraint the
-      # observation depends on, so relying on it would make the leg's central assertion a
-      # coin flip on what the agent inferred. This wake queues behind it and says both
-      # things exactly. Whichever turn records first, the row is asserted the same way.
-      ok!(state, "wake", %{
-        "sessionKey" => coder_key,
-        "prompt" => artifact_prompt(u, marker, wi_id, asg_id),
-        "idempotencyKey" => "arwake-#{u}"
-      })
+      # observation depends on.
+      await_lane_idle!(state, coder_key, "before issuing this group's own artifact wake")
 
-      {prompted, reports} = await_prompted_report!(state, coder_key, wi_id, asg_id, marker)
+      wake =
+        ok!(state, "wake", %{
+          "sessionKey" => coder_key,
+          "prompt" => artifact_prompt(u, marker, wi_id, asg_id),
+          "idempotencyKey" => "arwake-#{u}"
+        })
+
+      message_id = await_turn_message_id!(state, wake["wakeId"])
+
+      {prompted, reports} =
+        await_prompted_report!(state, coder_key, wi_id, asg_id, marker, message_id)
+
       classes = Enum.map(reports, & &1["recordedTurnEvidence"])
 
       # The null-vs-non-null coupling, on EVERY row. Pure substrate: `tool-call-observed`
@@ -709,25 +747,29 @@ defmodule FeatureSmoke do
         end
       end)
 
-      # THE assertion this journey exists to force, per leg. It is exact twice over: on
-      # the CLASS, because both registered harnesses project the observation entry
-      # unconditionally (`Rails.hook_settings/0`) and the prompt forbids the
-      # script-wrapping that §1.3 names as the legitimate way to miss it; and on the ROW,
-      # because it is asserted against the artifact this group's own prompt produced
-      # rather than against whichever report happened to exist. "Some row was observed"
-      # would green on a remedy-produced record while the prompted one landed
-      # `session-concurrent`, which is precisely the outcome the codex leg exists to
-      # catch. On that leg this line IS the proof that converts §5.2 from spike evidence
-      # into a live one.
+      # THE assertion this journey exists to force, per leg, and it is now an IDENTITY
+      # claim: the row bound to the turn this group prompted must read
+      # `tool-call-observed`. Selecting on `recordedMessageId` is what makes the class
+      # unspoofable by anything else on the session — a record that inherited some other
+      # turn's window carries that turn's message id and never reaches this line.
+      #
+      # Exact rather than "any of the three classes", because both registered harnesses
+      # project the observation entry unconditionally (`Rails.hook_settings/0`) and the
+      # prompt forbids the script-wrapping §1.3 names as the legitimate way to miss it. A
+      # `session-concurrent` row HERE carries the prompted turn's own message id, which
+      # means the hook did not fire on a turn that ran alone — the exact failure the codex
+      # recorder leg exists to catch. On that leg this line IS the proof that converts
+      # §5.2 from spike evidence into a live one.
       assert(
         state,
         prompted["recordedTurnEvidence"] == "tool-call-observed",
-        "artifact closure: the prompted report #{marker} reads " <>
+        "artifact closure: the record bound to the prompted turn (message #{message_id}) reads " <>
           "#{inspect(prompted["recordedTurnEvidence"])}, not tool-call-observed — the reserved " <>
-          "PreToolUse observation did not fire for the #{state.leg.wire_name} holder, so this " <>
-          "leg's record rests on concurrency rather than observation. Read it as the RECORDER " <>
-          "side of #{state.leg.wire_name} failing; the filer side is a separate question this " <>
-          "group does not test. Row: #{inspect(prompted)}. All classes seen: #{inspect(classes)}"
+          "PreToolUse observation did not fire for the #{state.leg.wire_name} holder on a turn " <>
+          "that ran with no other turn on its lane, so this leg's record rests on concurrency " <>
+          "rather than observation. Read it as the RECORDER side of #{state.leg.wire_name} " <>
+          "failing; the filer side is a separate question this group does not test. " <>
+          "Row: #{inspect(prompted)}. All classes seen: #{inspect(classes)}"
       )
 
       # NOTHING here asserts artifact lifecycle `state`. Retirement moves rows
@@ -855,14 +897,23 @@ defmodule FeatureSmoke do
   # map becomes `inspect` output, which is why `json_valid` is in the WHERE clause: it is
   # exactly what separates statute denials from handler denials.
   #
-  # Correlation is by ref plus a watermark taken immediately before the call — the
-  # `since_id` shape `EventLog.rail_denials/3` already uses — so an earlier step's denial
-  # of the same statute on the same assignment cannot satisfy a later one. Taking the
-  # watermark inside this function is what keeps it honest: there is no window in which a
-  # caller can drift the two apart.
-  defp denied!(state, statute, assignment_id, attempt) when is_function(attempt, 0) do
+  # Correlation is by ref inside a window BOUNDED ON BOTH SIDES, and the lane is drained
+  # first. A watermark alone is not enough: it closes the gap before the call but leaves
+  # one after it, so a concurrently running turn could file its own attest and land the
+  # expected statute against the same assignment while the wire returned a DIFFERENT
+  # statute's denial — newest-row-after-watermark would pass that. Draining the lane means
+  # no other turn is running to file anything, and the ceiling is read the instant the
+  # response returns, because `best_effort_denial/6` writes before the call returns.
+  #
+  # The window must hold EXACTLY ONE row for this assignment. Requiring one rather than
+  # taking the newest is what makes the correlation exact: if two denials land in it, this
+  # group's premise about serialization is wrong and it says so instead of picking.
+  defp denied!(state, statute, holder_key, assignment_id, attempt) when is_function(attempt, 0) do
+    await_lane_idle!(state, holder_key, "before attesting completion against #{statute}")
+
     watermark = events_watermark(state)
     res = attempt.()
+    ceiling = events_watermark(state)
 
     assert(
       state,
@@ -870,33 +921,138 @@ defmodule FeatureSmoke do
       "artifact closure: completion should be denied by #{statute}, got #{inspect(res)}"
     )
 
-    recorded = recorded_denial(state, watermark, assignment_id)
+    recorded = recorded_denials(state, watermark, ceiling, assignment_id)
 
     assert(
       state,
-      recorded == statute,
-      "artifact closure: the denial recorded against #{assignment_id} is #{inspect(recorded)}, " <>
-        "not #{inspect(statute)}. The wire said #{inspect(res)}, but the wire cannot name a " <>
-        "statute — if `recorded` is nil the denial row is missing entirely (best-effort " <>
-        "append, or a non-statute refusal), and if it names another statute the chain is " <>
-        "not where this group thinks it is."
+      recorded == [statute],
+      "artifact closure: the denials recorded against #{assignment_id} by this call are " <>
+        "#{inspect(recorded)}, not exactly [#{inspect(statute)}]. The wire said #{inspect(res)}, " <>
+        "but the wire cannot name a statute — an empty list means the denial row is missing " <>
+        "(best-effort append, or a non-statute refusal), another name means the chain is not " <>
+        "where this group thinks it is, and more than one means something else filed against " <>
+        "this assignment while the call was in flight."
     )
+  end
+
+  # The REAL runtime turn ceiling, read from the same env var the runtime reads.
+  # `config/runtime.exs:27` maps `TIGHTBEAM_TURN_TIMEOUT_MS` onto `:turn_timeout_ms`, whose
+  # default is 600s at `Tightbeam.ACP.Adapter.prompt/5`. Deriving the budget from that env
+  # var rather than restating a number keeps ONE source of truth: a runner who tightens the
+  # ceiling for a run tightens these waits with it, and a runner who does not gets the
+  # ceiling the adapter will actually enforce. The client-e2e driver's 180s is a DRIVER's
+  # wait budget, not the runtime ceiling, and using it here would expire while the
+  # substrate was still behaving correctly.
+  defp turn_ceiling_ms do
+    case System.get_env("TIGHTBEAM_TURN_TIMEOUT_MS") do
+      nil -> 600_000
+      value -> String.to_integer(value)
+    end
+  end
+
+  # ONE turn's worth, because this group serializes: the statute's remedy turn is drained
+  # before the prompted wake is issued, so nothing is queued behind the turn being awaited.
+  defp turn_budget_ms, do: turn_ceiling_ms() + @lane_slack_ms
+
+  # Wait for the holder's lane to go quiet.
+  #
+  # SERIALIZATION IS A CORRECTNESS DEVICE HERE, not tidiness. A turn running concurrently
+  # with this group's calls can contaminate every selector it owns: it can read the session
+  # transcript and learn a marker the prompt has already persisted, it can file its own
+  # attest and land a denial row beside the one being correlated, and it can open an
+  # observation window that a later record inherits. Draining the lane first removes the
+  # whole class rather than patching each symptom.
+  #
+  # Deliberately NOT `await_turn_boundary!/2`: that one is scoped to the local-deployment
+  # group and its 30s budget is right for what it waits on. This waits on real model turns.
+  defp await_lane_idle!(state, session_key, label) do
+    await_lane_idle!(
+      state,
+      session_key,
+      label,
+      System.monotonic_time(:millisecond) + turn_budget_ms()
+    )
+  end
+
+  defp await_lane_idle!(state, session_key, label, deadline) do
+    pending =
+      sqlite(
+        state,
+        "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(session_key)} " <>
+          "AND status IN ('queued','running')"
+      )
+
+    cond do
+      pending == "0" ->
+        state
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        assert(
+          state,
+          false,
+          "artifact closure: the holder's lane never went quiet #{label} — #{pending} turn(s) " <>
+            "still queued or running after #{div(turn_budget_ms(), 1000)}s. This group " <>
+            "serializes turns on purpose; it will not run its assertions beside one."
+        )
+
+      true ->
+        Process.sleep(1_000)
+        await_lane_idle!(state, session_key, label, deadline)
+    end
+  end
+
+  # The prompted turn's own `messages.id`, which is what makes the artifact assertion an
+  # identity claim rather than a content one. A wake is SCHEDULED, then fired, so the turn
+  # row appears asynchronously — but `turns.wakeId` is UNIQUE, so once it exists the join
+  # is exact and needs no time window.
+  defp await_turn_message_id!(state, wake_id) do
+    assert(
+      state,
+      is_binary(wake_id) and wake_id != "",
+      "artifact closure: the wake returned no wakeId, so the prompted turn cannot be identified"
+    )
+
+    await_turn_message_id!(
+      state,
+      wake_id,
+      System.monotonic_time(:millisecond) + @episode_settle_ms
+    )
+  end
+
+  defp await_turn_message_id!(state, wake_id, deadline) do
+    case sqlite(state, "SELECT messageId FROM turns WHERE wakeId = #{sql_quote(wake_id)}") do
+      "" ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          assert(
+            state,
+            false,
+            "artifact closure: wake #{wake_id} never produced a turn row within " <>
+              "#{div(@episode_settle_ms, 1000)}s, so the prompted turn has no identity to bind"
+          )
+        else
+          Process.sleep(250)
+          await_turn_message_id!(state, wake_id, deadline)
+        end
+
+      message_id ->
+        message_id
+    end
   end
 
   defp events_watermark(state) do
     state |> sqlite("SELECT COALESCE(MAX(id), 0) FROM events") |> String.to_integer()
   end
 
-  defp recorded_denial(state, watermark, assignment_id) do
-    case sqlite(state, """
-         SELECT json_extract(payload, '$.rule') FROM events
-         WHERE kind = 'denied' AND id > #{watermark} AND json_valid(payload)
-           AND json_extract(payload, '$.ref') = #{sql_quote(assignment_id)}
-         ORDER BY id DESC LIMIT 1
-         """) do
-      "" -> nil
-      rule -> rule
-    end
+  defp recorded_denials(state, watermark, ceiling, assignment_id) do
+    state
+    |> sqlite("""
+    SELECT json_extract(payload, '$.rule') FROM events
+    WHERE kind = 'denied' AND id > #{watermark} AND id <= #{ceiling}
+      AND json_valid(payload)
+      AND json_extract(payload, '$.ref') = #{sql_quote(assignment_id)}
+    ORDER BY id
+    """)
+    |> String.split("\n", trim: true)
   end
 
   defp sqlite(state, sql) do
@@ -904,31 +1060,46 @@ defmodule FeatureSmoke do
     String.trim(out)
   end
 
-  # Wait for THE PROMPTED artifact, not for any artifact.
+  # Wait for the record bound to THE PROMPTED TURN, identified by turn identity rather
+  # than by content.
   #
-  # The statute's remedy wake runs first and may well record a report of its own. Taking
-  # the first report to appear would run the provenance assertions against a row this
-  # group never asked for, before the prompted turn has even started — a race whose green
-  # and red are both meaningless. The prompted row is identified by the salted marker in
-  # its origin path, which the remedy turn cannot know because the prompt carrying it has
-  # not been delivered yet.
+  # Content cannot identify it. The salted filename is data, not a secret: the explicit
+  # wake persists its prompt to the session transcript while still queued, so a turn
+  # running beside it can read the marker, and `u` is already visible in the work-item
+  # title and the assignment subject anyway. Serializing the lane removes the concurrent
+  # reader, but the selector should not depend on that having worked.
   #
-  # Matched on BASENAME rather than on the exact string. The CLI forwards `--path`
-  # verbatim (`dispatch.rs` sends `originPath` as given), so the row holds whatever form
-  # the holder typed, and `./results-x.md` or an absolute path is the same artifact by any
-  # honest reading. The salt is what makes the match specific; the path's shape is not.
-  defp await_prompted_report!(state, session_key, work_item_id, assignment_id, marker) do
+  # `recordedMessageId` is the identity. `turns.wakeId` is UNIQUE, so the wake this group
+  # issued names exactly one turn and that turn names exactly one message. A row carrying
+  # that message id was bound to THIS turn by the substrate — the same principle the
+  # carrier itself rests on, identity from the substrate rather than from content.
+  #
+  # This is also what closes the stale-window hole. Observation windows are session-scoped,
+  # non-consuming, and live for minutes, so a record whose own hook missed can inherit an
+  # earlier turn's `tool-call-observed` window — and would then carry that EARLIER turn's
+  # message id. Under a content selector such a row reads as a pass; under this one it does
+  # not match, and the marker earns its keep as the diagnostic that says so out loud.
+  defp await_prompted_report!(state, session_key, work_item_id, assignment_id, marker, message_id) do
     await_prompted_report!(
       state,
       session_key,
       work_item_id,
       assignment_id,
       marker,
-      System.monotonic_time(:millisecond) + @artifact_turn_budget_ms
+      message_id,
+      System.monotonic_time(:millisecond) + turn_budget_ms()
     )
   end
 
-  defp await_prompted_report!(state, session_key, work_item_id, assignment_id, marker, deadline) do
+  defp await_prompted_report!(
+         state,
+         session_key,
+         work_item_id,
+         assignment_id,
+         marker,
+         message_id,
+         deadline
+       ) do
     reports =
       state
       |> ok!("artifacts", %{
@@ -939,16 +1110,35 @@ defmodule FeatureSmoke do
       |> Map.get("artifacts", [])
       |> List.wrap()
 
-    prompted =
-      Enum.find(reports, fn row -> Path.basename(row["originPath"] || "") == marker end)
+    prompted = Enum.find(reports, &(&1["recordedMessageId"] == message_id))
+    # Matched on BASENAME: the CLI forwards `--path` verbatim, so the row holds whatever
+    # form the holder typed and `./x` or an absolute path is the same artifact.
+    by_marker = Enum.find(reports, &(Path.basename(&1["originPath"] || "") == marker))
 
     cond do
       prompted ->
         {prompted, reports}
 
-      # An abandoned assignment is DETECTED AND NAMED, never waited out. This loop's
-      # deadline is seven minutes of real model time, and a holder that surrendered will
-      # never record — so without this the roadmap 0a2 hazard reads as a confusing timeout
+      # The record this group asked for exists but is NOT bound to the turn that produced
+      # it. Failing here rather than waiting out the budget is the whole reason the marker
+      # is still carried: it turns the stale-window inheritance into a named diagnosis
+      # instead of a silent timeout.
+      by_marker ->
+        assert(
+          state,
+          false,
+          "artifact closure: #{marker} was recorded, but it is bound to message " <>
+            "#{inspect(by_marker["recordedMessageId"])} rather than to the prompted turn's " <>
+            "#{inspect(message_id)}, with class " <>
+            "#{inspect(by_marker["recordedTurnEvidence"])}. The prompted turn's own hook did " <>
+            "not fire: an observation window is session-scoped and non-consuming, so this " <>
+            "record inherited an EARLIER turn's window. A content-matching oracle would have " <>
+            "called this a pass. Row: #{inspect(by_marker)}"
+        )
+
+      # An abandoned assignment is DETECTED AND NAMED, never waited out. The budget here is
+      # a full turn ceiling of real model time, and a holder that surrendered will never
+      # record — so without this the roadmap 0a2 hazard reads as a confusing timeout
       # instead of the confirmed live failure it is. `revoked` is a different animal
       # (`retire` revokes a session's open assignments), so it is named separately rather
       # than folded in.
@@ -965,10 +1155,10 @@ defmodule FeatureSmoke do
           state,
           false,
           "artifact closure: the holder never recorded #{marker} on #{work_item_id} within " <>
-            "#{div(@artifact_turn_budget_ms, 1000)}s, with #{assignment_id} still open. Either " <>
-            "the real CLI `artifact-record` refused (the §1.1 defect this carrier fixed) or the " <>
-            "holder's turns never ran it. Reports seen meanwhile, none of them this group's: " <>
-            "#{inspect(Enum.map(reports, & &1["originPath"]))}"
+            "#{div(turn_budget_ms(), 1000)}s, with #{assignment_id} still open. Either the real " <>
+            "CLI `artifact-record` refused (the §1.1 defect this carrier fixed) or the prompted " <>
+            "turn never ran it. Reports seen meanwhile, none bound to the prompted turn: " <>
+            "#{inspect(Enum.map(reports, &{&1["originPath"], &1["recordedMessageId"]}))}"
         )
 
       true ->
@@ -980,6 +1170,7 @@ defmodule FeatureSmoke do
           work_item_id,
           assignment_id,
           marker,
+          message_id,
           deadline
         )
     end
