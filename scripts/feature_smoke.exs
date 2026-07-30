@@ -25,7 +25,8 @@
 # The last two groups cover artifact-carrier-proposal-v1 §7.3 as a pair, and the
 # split between them is deliberate. `check_gate_chain_enforced/1` proves the LAW —
 # each statute denies while its fact is unsatisfied, and the artifact releases the
-# last one — driven entirely over HTTP so no model turn can reach the gates first.
+# last one — driven entirely over HTTP, so the holder's remedy turns are never STARTED
+# while it runs, which the group measures rather than assumes.
 # `check_carrier_on_real_turn/1` proves the CARRIER: a real CLI artifact-record
 # inside a real harness turn, bound to that turn and reading tool-call-observed.
 #
@@ -629,8 +630,10 @@ defmodule FeatureSmoke do
   # artifact-carrier-proposal-v1 §7.3, first of two halves.
   #
   # OPERATOR-DRIVEN END TO END, and that is the design rather than a shortcut. Every step
-  # here is an HTTP call, so no model turn has to run for any of it and no holder can
-  # reach the gates before the assertions do.
+  # here is an HTTP call, so no model turn has to RUN for any of it. A remedy wake still
+  # materializes a queued turn — that is unavoidable and expected — but nothing starts it
+  # inside the window this group occupies, and the group proves that rather than trusting
+  # it.
   #
   # The earlier shape drove this chain through a real holder, and both field runs proved
   # it unassertable that way. Handed grounded work and the statute's own remedy prompt, a
@@ -675,8 +678,10 @@ defmodule FeatureSmoke do
   #   class on the one row is a holder that tool-called; either inverts what the negative
   #   control below means, and either fails here instead of being read as a pass.
   #
-  # The margin behind those assertions is an adapter spawn against six HTTP calls, which is
-  # why they should never fire. They exist because "should never" is not evidence.
+  # The margin behind those assertions is the lane claiming a queued turn against six HTTP
+  # calls, which is why they should never fire. They exist because "should never" is not
+  # evidence — and because an earlier version of this same tripwire was itself wrong, in the
+  # direction of demanding something the substrate can never provide.
   defp check_gate_chain_enforced(state) do
     u = unique()
     reviewer_leg = independent_leg(state)
@@ -831,19 +836,39 @@ defmodule FeatureSmoke do
 
       await_episode_status!(state, "completion-requires-results-artifact", asg_id, "closed")
 
-      # 6. The isolation proof. Everything above assumed no holder turn ran beside it; this
-      # is where that stops being an assumption. Both checks are cheap and both are fatal.
-      turns =
+      # 6. The isolation proof. Everything above assumed the holder never acted; this is
+      # where that stops being an assumption.
+      #
+      # A TURN ROW IS NOT ACTION, and conflating the two makes the check unsatisfiable by
+      # construction. The denial's remedy wake is immediate-due, the gateway fires due wakes
+      # synchronously, and delivery INSERTS the turn row before the denying request returns
+      # — so by the time any denial above has a response there is already a row, `queued`,
+      # holding a prompt nothing has read. An earlier version of this assertion demanded
+      # zero rows and could never have passed.
+      #
+      # `startedAt` is the honest line. It is written at exactly one place — the
+      # `queued → running` claim, where the lane takes ownership and hands the prompt on
+      # (`Ledger`) — and it is never cleared, so a turn that ran and finished still carries
+      # it. Materialized is expected and gets reported; STARTED is the leak.
+      started =
+        sqlite(
+          state,
+          "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(holder.key)} " <>
+            "AND startedAt IS NOT NULL"
+        )
+
+      materialized =
         sqlite(state, "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(holder.key)}")
 
       assert(
         state,
-        turns == "0",
-        "gate chain: the holder ran #{turns} turn(s). This half is only meaningful while the " <>
-          "holder never acts — a remedy wake materialized into a turn, so the agent was handed " <>
-          "the prompt and every assertion above may be describing its work rather than the " <>
-          "operator's. Remedy wakes cannot be cancelled (origin-matched), so the answer is to " <>
-          "read this as a real leak, not to widen the assertion."
+        started == "0",
+        "gate chain: #{started} of the holder's #{materialized} turn(s) STARTED. This half is " <>
+          "only meaningful while the holder never acts, and a started turn means the lane took " <>
+          "ownership and handed the prompt on — so every assertion above may be describing the " <>
+          "agent's work rather than the operator's. Remedy wakes cannot be cancelled " <>
+          "(origin-matched), so read this as a real leak and a real margin problem, not as an " <>
+          "assertion to widen."
       )
 
       reports =
@@ -1227,7 +1252,7 @@ defmodule FeatureSmoke do
   #
   # An earlier version also DRAINED the holder's lane here. It no longer needs to: the only
   # caller is `check_gate_chain_enforced/1`, which drives every step over HTTP precisely so
-  # that no turn of the holder's is ever in flight. Draining was worse than redundant there
+  # that no turn of the holder's is ever STARTED. Draining was worse than redundant there
   # — it waited for the remedy turn, which is exactly how a capable holder came to satisfy
   # the whole chain before the next denial could be asserted.
   #
