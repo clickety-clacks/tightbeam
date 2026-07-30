@@ -1003,16 +1003,21 @@ defmodule Tightbeam.RailScriptTest do
     assert {:error, %{script_exit_class: "error:7"}} =
              Dispatch.dispatch(ctx.db, handlers, subject)
 
-    # The mechanism, measured rather than argued: the episode that arrived inside the
+    # The mechanism, measured rather than argued: the summons that arrived inside the
     # interval sits ABOVE the watermark the healthy evaluation captured. The unbounded
-    # "close everything open for this statute" this replaced had no upper bound in its
-    # SELECT, so it necessarily picked this row up too.
+    # "close everything open for this statute" this replaced had no upper bound at all, so
+    # it necessarily picked this episode up too.
     assert {:ok, [[newer]]} =
              DB.query(
                ctx.db,
-               "SELECT rowid FROM decision_requests WHERE actionKey = 'episode:error:7'"
+               """
+               SELECT MAX(le.id) FROM lifecycle_events le
+               JOIN decision_requests dr ON dr.id = le.subject
+               WHERE le.kind = 'episode_summoned' AND dr.actionKey = 'episode:error:7'
+               """
              )
 
+    assert is_integer(newer)
     assert newer > watermark
 
     # Only now does the delayed actor run the close it was handed.
@@ -1023,6 +1028,102 @@ defmodule Tightbeam.RailScriptTest do
     # The observed episode recovered; the one that arrived afterwards still summons.
     assert {:ok, [["episode:timeout", "withdrawn"], ["episode:error:7", "open"]]} =
              DB.query(ctx.db, "SELECT actionKey, status FROM decision_requests ORDER BY rowid")
+  end
+
+  # The same interleaving through the ATTACH path, which the class-differing case above
+  # cannot reach. A recurrence of a class already open writes NO new row and moves no
+  # rowid — `ON CONFLICT DO NOTHING` — so ordering recovery by the episode row is blind to
+  # it, and a stale close withdrew an episode that had just been re-summoned. Ordering over
+  # SUMMONS sees it, because the attach leaves a mark even though it leaves no row.
+  test "a same-class recurrence attaching to an open episode is not swept away", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-samekey"})
+
+    load = fn script ->
+      put_statute(ctx, statute(script, %{"pass" => "allow"}))
+      Rules.load!(ctx.base_dir, ["post"])
+    end
+
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    assert {:ok, [[id]]} = DB.query(ctx.db, "SELECT id FROM decision_requests")
+
+    # A healthy evaluation observes it and is handed the close — its actor has NOT run.
+    load.("rail-pass")
+    {_decision, [{:episodes, name, watermark}], _} = Rules.decide(ctx.db, subject)
+
+    # The SAME class malfunctions again inside the interval, and attaches.
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    # No new row: this is precisely why a row-ordered watermark could not see it.
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+
+    # But the summons DID leave a mark, and it is above the watermark.
+    assert {:ok, [[latest]]} =
+             DB.query(
+               ctx.db,
+               "SELECT MAX(id) FROM lifecycle_events WHERE kind = 'episode_summoned'"
+             )
+
+    # `is_integer/1` first: Elixir's term ordering makes `nil > 2` TRUE, so a bare
+    # comparison would silently pass on a tree that records no summons marks at all.
+    assert is_integer(latest)
+    assert latest > watermark
+
+    # The delayed actor runs its now-stale close.
+    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+
+    # The recurrence was never repaired, so its episode still summons.
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+  end
+
+  # The close side of the same CAS as the recovery-then-ruling test: a ruling lands first,
+  # and the delayed recovery must not withdraw a row that is no longer open. `status =
+  # 'open'` in the UPDATE is what holds this, and nothing else does.
+  test "a ruling that lands first is not withdrawn by a delayed recovery", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-ruled-first"})
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    assert {:ok, [[id]]} = DB.query(ctx.db, "SELECT id FROM decision_requests")
+
+    put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+    {_decision, [{:episodes, name, watermark}], _} = Rules.decide(ctx.db, subject)
+
+    # The mind rules before the healthy actor gets to run.
+    assert %{status: "ruled"} =
+             Escalation.rule(
+               ctx.db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{request_id: id, decision: "allow"}
+               },
+               authorized: true
+             )
+
+    # The stale recovery lands afterwards and leaves the ruling alone.
+    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+
+    assert {:ok, [["ruled", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status, withdrawnReason FROM decision_requests WHERE id = ?1",
+               [id]
+             )
   end
 
   # Both actors close, and the sweep is the one with no coverage before this. It also has

@@ -419,6 +419,57 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "SELECT statuteName, status, parkWakeId FROM decision_requests")
   end
 
+  # Recovery through the SWEEP, driven by the real `Supervision.evaluate/5` wiring rather
+  # than by calling `Rules.decide` and the close by hand — the point is that the sweep
+  # actually runs its `to_close`, which hand-calling the pieces would assume rather than
+  # prove. The sensor heals between two turn-ends and the episode closes with no operator
+  # verb anywhere in the loop.
+  test "the turn-end sweep recovers an episode once the check answers again", ctx do
+    stage_rail_wrapper(ctx, "rail-timeout")
+
+    gate = fn script ->
+      write_rules(ctx, """
+      [[rule]]
+      name = "completion-check-times-out"
+      verb = "attest"
+      text = "completion is gated on a check"
+      edges = ["turn-end"]
+      [rule.check]
+      script = "#{script}"
+      returns = ["pass"]
+      [rule.check.effects]
+      pass = "allow"
+      """)
+    end
+
+    gate.("rail-timeout")
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal!(ctx.db, "holder"))
+
+    assert {:ok, [[id, "open"]]} =
+             DB.query(ctx.db, "SELECT id, status FROM decision_requests")
+
+    # A pending prod wake suppresses the next sweep, so clear it the way the prod-counter
+    # tests do — the turn under test is the one AFTER the sensor heals.
+    for wake <- Wakes.list_pending(ctx.db), do: Wakes.cancel(ctx.db, wake.wake_id, wake.origin)
+
+    # The check recovers. The next sweep renders an observed verdict and the episode goes
+    # with it — through the sweep's own actor path.
+    stage_rail_script(ctx, "rail-pass", "#!/bin/sh\nprintf pass\n")
+    gate.("rail-pass")
+
+    assert {:prodded, _} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal!(ctx.db, "holder"))
+
+    assert {:ok, [["withdrawn", "process:tightbeam", "sensor-recovered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status, withdrawnBy, withdrawnReason FROM decision_requests WHERE id = ?1",
+               [id]
+             )
+  end
+
   test "atomic target gate skips plain dead targets and re-runs the ladder for escalation", ctx do
     registry = start_supervised!({ConnRegistry, name: :supervision_conn_registry})
     lane = start_supervised!({LaneDoorbell, :supervision_lane_manager})
@@ -1076,13 +1127,18 @@ defmodule Tightbeam.SupervisionTest do
     File.mkdir_p!(scripts)
     File.mkdir_p!(bin)
 
-    path = Path.join(scripts, script)
-    File.write!(path, "#!/bin/sh\nexit 0\n")
-    File.chmod!(path, 0o755)
+    stage_rail_script(ctx, script, "#!/bin/sh\nexit 0\n")
 
     wrapper = Path.join(bin, "tightbeam")
     File.cp!(Path.expand("fixtures/rail_exec/tightbeam", __DIR__), wrapper)
     File.chmod!(wrapper, 0o755)
+  end
+
+  defp stage_rail_script(ctx, name, body) do
+    path = Path.join([ctx.base, "identity", "rails", "scripts", name])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, body)
+    File.chmod!(path, 0o755)
   end
 
   defp write_rules(ctx, contents) do

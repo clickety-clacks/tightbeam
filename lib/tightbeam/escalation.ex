@@ -16,6 +16,14 @@ defmodule Tightbeam.Escalation do
   # here because `digest/1` is a hex SHA-256 and can never collide with it.
   @episode_prefix "episode:"
 
+  # One row per SUMMONS — the one that opens an episode and every later one that attaches
+  # to it. Recovery orders against these, never against the episode row: an attach creates
+  # no row and moves no rowid, so a row-ordered watermark is blind to a recurrence and lets
+  # a stale close withdraw an episode that was just re-summoned. `lifecycle_events.id` is
+  # INTEGER PRIMARY KEY AUTOINCREMENT, so the ordering is monotonic by construction rather
+  # than by an argument about what does and does not delete rows.
+  @summon_kind "episode_summoned"
+
   @ddl """
   CREATE TABLE IF NOT EXISTS decision_requests (
     id                TEXT PRIMARY KEY,
@@ -224,6 +232,18 @@ defmodule Tightbeam.Escalation do
                 due_at: now,
                 target_gate: 0
               })
+            end
+
+            # In the SAME transaction as the insert-or-attach, so a summons is never
+            # complete without its mark. Both paths write one: the attach is exactly the
+            # case a row-ordered watermark cannot see.
+            if is_binary(episode_key) do
+              EventLog.lifecycle_in_txn(
+                txn,
+                @summon_kind,
+                request.id,
+                "statute=#{statute_name} class=#{episode_key} opened=#{inserted?}"
+              )
             end
 
             request
@@ -484,27 +504,37 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc """
-  Effect-free: the newest open episode this statute has, as an ordering watermark.
+  Effect-free: an ordering watermark over SUMMONS, or `nil` when nothing is open.
 
-  Returns the `rowid` of the newest open episode-keyed request, or `nil` when the statute
-  has none. The caller hands this back to `close_episodes/3` so recovery withdraws the
-  episodes the EVALUATION observed rather than whatever happens to be open by the time
-  the actor runs — see that function for the interleaving this exists to stop.
+  Returns `nil` unless this statute currently has an open episode — a healthy check with
+  nothing outstanding has no recovery to schedule. Otherwise it returns the newest summons
+  mark in existence, and the caller hands that back to `close_episodes/3`.
 
-  `rowid` is the ordering because it is assigned monotonically on insert and this table
-  never deletes rows. (`ensure_request_shape/1` rebuilds and renumbers, but that is a
-  boot-time migration inside one transaction, with no evaluation in flight across it.)
+  The mark counts SUMMONS, not episode rows, and that distinction is the whole point. A
+  recurrence of a class that is already open ATTACHES: `ON CONFLICT DO NOTHING` writes no
+  row and moves no rowid, so an episode-row watermark cannot tell "still the same
+  malfunction I observed" from "it just happened again". Ordering over summons sees both,
+  because every summons leaves a mark whether it opened the episode or joined it.
   """
   @spec episode_watermark(DB.server(), String.t()) :: integer() | nil
   def episode_watermark(db, statute_name) do
-    {:ok, [[watermark]]} =
+    {:ok, [[open]]} =
       DB.query(
         db,
-        "SELECT MAX(rowid) FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
+        "SELECT COUNT(*) FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
         [statute_name, @episode_prefix <> "%"]
       )
 
-    watermark
+    if open > 0 do
+      {:ok, [[mark]]} =
+        DB.query(
+          db,
+          "SELECT COALESCE(MAX(id), 0) FROM lifecycle_events WHERE kind = ?1",
+          [@summon_kind]
+        )
+
+      mark
+    end
   end
 
   @doc """
@@ -518,9 +548,13 @@ defmodule Tightbeam.Escalation do
   The watermark is what makes recovery ordered by EVALUATION rather than by whenever the
   actor got around to running. `decide` is effect-free, so an unbounded interval sits
   between the read that observed the episode and this withdrawal; a statute-wide "close
-  everything open" would sweep away an episode opened inside that interval and silence a
-  malfunction that had not been repaired at all — exactly the state §A3 forbids. Rows
-  newer than the watermark were never observed as recovered, so they survive.
+  everything open" would sweep away a malfunction that landed inside that interval and had
+  not been repaired at all — exactly the state §A3 forbids.
+
+  An episode survives when its NEWEST summons is above the watermark, which covers both
+  shapes the interval can take: a malfunction of a new class (a fresh episode) and a
+  recurrence of a class already open (an attach, which writes no row). Only the second
+  needs the summons ordering; the first would survive a row-ordered bound too.
   """
   @spec close_episodes(DB.server(), String.t(), integer()) :: :ok
   def close_episodes(db, statute_name, watermark) when is_integer(watermark) do
@@ -528,8 +562,19 @@ defmodule Tightbeam.Escalation do
       DB.transaction(db, fn txn ->
         txn
         |> Txn.q(
-          "SELECT id FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open' AND rowid <= ?3",
-          [statute_name, @episode_prefix <> "%", watermark]
+          """
+          SELECT dr.id FROM decision_requests dr
+          WHERE dr.statuteName = ?1
+            AND dr.raiserId = 'process:tightbeam'
+            AND dr.actionKey LIKE ?2
+            AND dr.status = 'open'
+            AND COALESCE(
+                  (SELECT MAX(le.id) FROM lifecycle_events le
+                    WHERE le.kind = ?4 AND le.subject = dr.id),
+                  0
+                ) <= ?3
+          """,
+          [statute_name, @episode_prefix <> "%", watermark, @summon_kind]
         )
         |> Enum.each(fn [id] ->
           Txn.q(
