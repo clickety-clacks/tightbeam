@@ -23,12 +23,27 @@ defmodule Tightbeam.TurnObservations do
   why the class it produces is `tool-call-observed` — "the substrate observed
   this turn invoking this verb" — and never an unforgeability claim.
 
-  ORDERING LIVES HERE, and nowhere else. Both the capture (which reads the
-  ledger) and the read happen inside this one serialized process, in arrival
-  order — never across a process gap, never reconstructed from a timestamp
-  comparison after the fact. A newer observation supersedes the session's
-  previous window, including the observation that finds no running turn: the
-  freshest look wins, so a stale message cannot outlive a look that saw none.
+  ORDERING LIVES HERE, and nowhere else. The capture and the WHOLE evidence
+  resolution — window lookup AND the ledger fallback — happen inside this one
+  serialized process, in arrival order, never across a process gap. Resolving in
+  two places was the first version's defect: the window was read here and the
+  ledger in the request process, so a turn could terminalize in the scheduling
+  gap between them and the row landed `none` describing an instant neither read
+  saw. Inside one callback there is no such gap — nothing can change the window
+  mid-resolution, because the only thing that changes it is a message to this
+  same process, and this process is busy.
+
+  A newer observation supersedes the session's previous window, including the
+  observation that finds no running turn: the freshest look wins, so a stale
+  message cannot outlive a look that saw none.
+
+  A CALL THE CALLER GAVE UP ON MUST NOT ACT LATER. A `GenServer.call` that times
+  out leaves its message in this mailbox, so an observation the caller already
+  treated as failed could otherwise open a window minutes later and STRENGTHEN
+  some unrelated record to `tool-call-observed` — degradation inventing evidence,
+  which is the wrong direction to fail in. Every post that MUTATES the window
+  therefore carries the deadline its caller will wait until, and one comparison
+  at processing time drops it if that deadline has passed.
 
   The window is DELIBERATELY NOT DURABLE. A window that outlives the turn that
   opened it has no value, so `turns.requestRef` — the ledger's declared-unused
@@ -44,6 +59,20 @@ defmodule Tightbeam.TurnObservations do
   use GenServer
 
   alias Tightbeam.Ledger
+
+  # How long a caller waits, and therefore the deadline it stamps on its post.
+  # One number for both, so "the caller gave up" and "the post expired" are the
+  # same instant by construction and cannot drift apart.
+  #
+  # Deliberately WELL INSIDE `DB.query/3`'s own 5s call timeout. At 5s the two
+  # coincide, and then the writer is as likely to be killed by its own ledger
+  # read as it is to survive and drop the abandoned post — which would make the
+  # fence below unreachable exactly when it is needed. The fence only works if
+  # the writer outlives the caller that gave up. Two seconds is also the right
+  # product answer on its own terms: this sits in the artifact-record request
+  # path, and a writer that cannot answer a single indexed read in two seconds
+  # should be degraded around rather than waited on.
+  @call_timeout_ms 2_000
 
   # How long a captured turn stays bindable. The hook fires immediately before
   # the command runs, so a bare `tightbeam artifact-record` consumes its window
@@ -66,44 +95,64 @@ defmodule Tightbeam.TurnObservations do
   """
   @spec observe(GenServer.server(), String.t(), GenServer.server()) :: :ok
   def observe(db, session_key, server \\ __MODULE__) do
-    call(server, {:observe, db, session_key}, :ok)
+    call(server, {:observe, db, session_key, now() + @call_timeout_ms}, fn -> :ok end)
   end
 
-  @doc "The message captured for this session's open window, or nil."
-  @spec observed(String.t(), GenServer.server()) :: String.t() | nil
-  def observed(session_key, server \\ __MODULE__) do
-    call(server, {:observed, session_key}, nil)
+  @doc """
+  The whole turn edge for a record, decided in ONE serialized operation.
+
+  Both sources are consulted here, with nothing able to run between them, so the
+  answer is one snapshot rather than two reads of two different instants.
+  """
+  @spec evidence(GenServer.server(), String.t(), GenServer.server()) ::
+          {String.t() | nil, String.t()}
+  def evidence(db, session_key, server \\ __MODULE__) do
+    call(server, {:evidence, db, session_key}, fn -> ledger_evidence(db, session_key) end)
   end
 
   @impl true
   def init(:ok), do: {:ok, %{windows: %{}}}
 
+  # The deadline rides only on the posts that MUTATE the window. A read carries
+  # none: arriving late it changes nothing but the prune, which is idempotent
+  # bookkeeping, and its caller has already answered itself from the ledger.
   @impl true
-  def handle_call({:observe, db, session_key}, _from, state) do
-    now = now()
+  def handle_call({:observe, db, session_key, deadline}, _from, state) do
+    if now() >= deadline do
+      {:reply, :ok, state}
+    else
+      now = now()
 
-    windows =
-      case Ledger.running_turn_message_id(db, session_key) do
-        nil -> Map.delete(prune(state.windows, now), session_key)
-        message_id -> Map.put(prune(state.windows, now), session_key, {message_id, now})
-      end
+      windows =
+        case Ledger.running_turn_message_id(db, session_key) do
+          nil -> Map.delete(prune(state.windows, now), session_key)
+          message_id -> Map.put(prune(state.windows, now), session_key, {message_id, now})
+        end
 
-    {:reply, :ok, %{state | windows: windows}}
+      {:reply, :ok, %{state | windows: windows}}
+    end
   end
 
   # Reading does NOT consume. §4.1 rules the open-window join: every
   # artifact-record from the session while the window is open binds the captured
   # message, so one command recording several artifacts labels all of them alike.
-  def handle_call({:observed, session_key}, _from, state) do
+  def handle_call({:evidence, db, session_key}, _from, state) do
     windows = prune(state.windows, now())
 
-    observed =
+    evidence =
       case Map.get(windows, session_key) do
-        {message_id, _opened_at} -> message_id
-        nil -> nil
+        {message_id, _opened_at} -> {message_id, "tool-call-observed"}
+        nil -> ledger_evidence(db, session_key)
       end
 
-    {:reply, observed, %{state | windows: windows}}
+    {:reply, evidence, %{state | windows: windows}}
+  end
+
+  defp ledger_evidence(db, session_key) do
+    case Ledger.running_turn_message_id(db, session_key) do
+      message_id when is_binary(message_id) -> {message_id, "session-concurrent"}
+      nil -> {nil, "none"}
+    end
   end
 
   # Every entry is visited on every call, which is what keeps the map bounded
@@ -117,11 +166,13 @@ defmodule Tightbeam.TurnObservations do
 
   # The writer is a named child, and a call path that must not refuse cannot be
   # allowed to raise because it is absent. Missing writer = no observation, which
-  # is exactly the hookless case the evidence classes already describe.
+  # is exactly the hookless case the evidence classes already describe. A timeout
+  # exits here too, and the deadline riding on the message is what stops the
+  # abandoned call from acting after this process has moved on.
   defp call(server, message, on_unavailable) do
-    GenServer.call(server, message)
+    GenServer.call(server, message, @call_timeout_ms)
   catch
-    :exit, _ -> on_unavailable
+    :exit, _ -> on_unavailable.()
   end
 
   defp now, do: System.monotonic_time(:millisecond)

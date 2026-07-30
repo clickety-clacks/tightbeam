@@ -1,3 +1,45 @@
+defmodule Tightbeam.ArtifactCarrierTest.PausingDb do
+  @moduledoc """
+  A `Tightbeam.DB` transport interposer for forcing one interleaving.
+
+  It implements no database behaviour of its own: every call is forwarded
+  verbatim to the real server, so what runs is the real SQL against the real
+  connection. The single power it adds is holding ONE call — the first whose SQL
+  contains `fragment` — open until the test releases it, which is how a test can
+  stand inside a gap instead of racing to hit it.
+  """
+
+  use GenServer
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+
+  @doc "Answer the held call and stop holding."
+  def release(server), do: GenServer.call(server, :release, 10_000)
+
+  @impl true
+  def init(opts), do: {:ok, Map.merge(opts, %{armed: true, held: nil})}
+
+  @impl true
+  def handle_call(:release, _from, %{held: {from, message}} = state) do
+    GenServer.reply(from, GenServer.call(state.db, message))
+    {:reply, :ok, %{state | held: nil}}
+  end
+
+  def handle_call(:release, _from, state), do: {:reply, :ok, state}
+
+  def handle_call(message, from, state) do
+    if state.armed and holds?(message, state.fragment) do
+      send(state.notify, {:db_paused, self()})
+      {:noreply, %{state | armed: false, held: {from, message}}}
+    else
+      {:reply, GenServer.call(state.db, message), state}
+    end
+  end
+
+  defp holds?({:query, sql, _params}, fragment), do: String.contains?(sql, fragment)
+  defp holds?(_message, _fragment), do: false
+end
+
 defmodule Tightbeam.ArtifactCarrierTest do
   @moduledoc """
   The artifact-record firing-turn carrier (artifact-carrier-proposal-v1).
@@ -33,6 +75,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
     WorkState
   }
 
+  alias Tightbeam.ArtifactCarrierTest.PausingDb
   alias Tightbeam.Wire.Router
 
   setup do
@@ -310,7 +353,137 @@ defmodule Tightbeam.ArtifactCarrierTest do
     assert result["recordedTurnEvidence"] == "session-concurrent"
   end
 
+  ## Concurrency — the two interleavings, forced rather than sampled.
+
+  # THE property: evidence resolution is ONE writer-owned operation, so nothing
+  # can run between the window lookup and the ledger fallback.
+  #
+  # It is measured by writer OCCUPANCY, because that is what actually differs.
+  # When the ledger read is paused mid-flight, the question "is the writer busy?"
+  # answers "who owns this resolution": resolved in one operation the writer is
+  # inside it and can serve nothing else; split across processes the writer
+  # handed back its half and sits idle while the request process reads the
+  # ledger — and idle is exactly the state in which some other message gets in
+  # between the two halves.
+  #
+  # What this does NOT claim: that a turn can never terminalize during a
+  # resolution. A single ledger read observes whatever instant it runs at, and
+  # nothing here makes the ledger and the window one atomic snapshot of the
+  # world. What is eliminated is the SCHEDULING GAP — an unbounded round trip
+  # plus rescheduling, versus two adjacent statements no message can split.
+  test "nothing can be served between the window lookup and the ledger fallback", ctx do
+    running_message = start_turn(ctx)
+    {proxy, _real} = pausing_db(ctx, "SELECT messageId FROM turns")
+
+    recorder =
+      Task.async(fn ->
+        Artifacts.record(proxy, %{
+          principal: {:session, ctx.coder.session_key},
+          session_key: ctx.coder.session_key,
+          params: %{
+            kind: "report",
+            title: "Contended",
+            origin_path: "results.txt",
+            work_item_id: ctx.work_item_id
+          }
+        })
+      end)
+
+    assert_receive {:db_paused, ^proxy}, 2_000
+
+    # The ledger read is in flight RIGHT NOW. Ask the writer for anything at all.
+    probe = Task.async(fn -> TurnObservations.observe(ctx.db, "probe-session") end)
+
+    refute Task.yield(probe, 500),
+           "the writer answered a call while an evidence resolution was in flight — " <>
+             "the resolution is not writer-owned, so something can land between its two reads"
+
+    release_db(proxy)
+
+    assert %{recorded_turn_evidence: "session-concurrent", recorded_message_id: ^running_message} =
+             Task.await(recorder, 5_000)
+
+    Task.await(probe, 5_000)
+  end
+
+  # A post its caller has abandoned must never act. The caller's `GenServer.call`
+  # times out but the message stays in the mailbox, so without a deadline riding
+  # on it the writer opens the window LATE — and a later, unrelated record reads
+  # it and is STRENGTHENED to `tool-call-observed`. Degradation must not invent
+  # evidence; that is the wrong direction to fail in.
+  #
+  # This test spends the writer's real, shipped call timeout on purpose — the
+  # constant under test is the one the product uses. It holds the writer for
+  # longer than that timeout but comfortably less than `DB.query/3`'s own 5s
+  # ceiling, so the writer is still ALIVE to drop the post. A writer that died
+  # instead would produce the same evidence class for an entirely different
+  # reason, so its liveness is asserted rather than assumed.
+  @tag timeout: 60_000
+  test "an observation its caller gave up on can never open a window later", ctx do
+    running_message = start_turn(ctx)
+    {proxy, _real} = pausing_db(ctx, "SELECT messageId FROM turns")
+    writer = Process.whereis(TurnObservations)
+
+    # Occupy the writer: this post's own ledger read parks inside the proxy.
+    occupier = Task.async(fn -> TurnObservations.observe(proxy, "occupier-session") end)
+    assert_receive {:db_paused, ^proxy}, 2_000
+
+    # Queued behind it, for the session that matters. Its caller waits out the
+    # timeout and gives up; the post is still sitting in the mailbox.
+    posted_at = System.monotonic_time(:millisecond)
+    abandoned = Task.async(fn -> TurnObservations.observe(ctx.db, ctx.coder.session_key) end)
+
+    # Hold PAST the writer's own call timeout, and comfortably inside
+    # `DB.query/3`'s 5s ceiling. Both bounds are load-safe in the same direction:
+    # a slower machine only makes the post more expired when the writer reaches
+    # it, and the ceiling is the writer's, not this test's.
+    wait_until(posted_at + 3_000)
+    release_db(proxy)
+
+    assert Task.await(occupier, 5_000) == :ok
+    assert Task.await(abandoned, 20_000) == :ok
+
+    assert Process.alive?(writer),
+           "the writer died rather than dropping the post — this test would then pass for the wrong reason"
+
+    # Mailbox order: this post is behind the abandoned one, so its answer proves
+    # the abandoned one has already been processed. No sleeping, no polling.
+    assert TurnObservations.observe(ctx.db, "barrier-session") == :ok
+
+    result = record_over_wire(ctx, %{"kind" => "report", "title" => "After the abandoned post"})
+
+    assert result["recordedMessageId"] == running_message
+
+    assert result["recordedTurnEvidence"] == "session-concurrent",
+           "an abandoned observation opened a window and strengthened a later record"
+  end
+
   ## Helpers — every one of them a real path.
+
+  # A transport interposer, NOT a fake database: it speaks `Tightbeam.DB`'s own
+  # call protocol and forwards every message to the real server. Its only power
+  # is to hold ONE matching call open, which is how an interleaving gets forced
+  # instead of sampled for.
+  defp pausing_db(ctx, sql_fragment) do
+    {:ok, proxy} = PausingDb.start_link(db: ctx.db, fragment: sql_fragment, notify: self())
+    on_exit(fn -> if Process.alive?(proxy), do: GenServer.stop(proxy) end)
+    {proxy, ctx.db}
+  end
+
+  defp release_db(proxy), do: PausingDb.release(proxy)
+
+  # Monotonic, so the wait is the elapsed time it claims to be even if the wall
+  # clock moves under it.
+  defp wait_until(target) do
+    case target - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 ->
+        Process.sleep(remaining)
+        wait_until(target)
+
+      _ ->
+        :ok
+    end
+  end
 
   defp record_over_wire(ctx, params) do
     params = Map.merge(%{"originPath" => "results.txt", "workItemId" => ctx.work_item_id}, params)

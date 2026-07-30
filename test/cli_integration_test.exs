@@ -348,15 +348,17 @@ defmodule Tightbeam.CliIntegrationTest do
 
   # verification-papertrail-v1 A7 (macOS half): A1/A2 walked end to end through
   # the real Bandit/Router stack and the real release CLI, against the shipped
-  # statutes exactly as relearn delivers them. Two hops are not the CLI, both
-  # pre-existing wire-seam gaps tracked elsewhere: the report artifact (the wire
-  # dispatch seam does not yet bind the firing messages.id onto artifact-record,
-  # conformance-handoff-ledger Clauses 8/11) and the review-link assign (#112:
-  # the CLI's --reviews wire param is dropped by the handler seam). Those two
-  # rows go through the gateway handlers with explicit provenance, exactly as
-  # artifacts_test does. Everything else — work item, coder assignment, the
-  # review verdict, both denials, both wakes, the verification verdict, and the
-  # final completion — is the real CLI against the real Bandit/Router stack.
+  # statutes exactly as relearn delivers them. ONE hop is still not the CLI: the
+  # review-link assign (#112 — the CLI's --reviews wire param is dropped by the
+  # handler seam), which goes through the gateway handlers instead.
+  #
+  # The report artifact used to be the second such hop, because artifact-record
+  # refused over the wire for want of a firing messages.id. It no longer is: the
+  # carrier ruling made the verb fail open, so the artifact now goes through the
+  # substrate's own PreToolUse hook and the real CLI like everything else.
+  # Everything but the review link — work item, coder assignment, the review
+  # verdict, both denials, both wakes, the verification verdict, the artifact,
+  # and the final completion — is the real CLI against the real stack.
   test "real CLI walks the verification papertrail end to end (A1/A2)", ctx do
     # A real bundle import, not a fixture copy: this is the arrival path §7
     # describes, so the walk fails if learn stops delivering rules/.

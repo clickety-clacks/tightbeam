@@ -32,12 +32,21 @@ defmodule Tightbeam.Rails do
 
   DISTINCT from permission bypass, codex adds a hook-TRUST layer with no
   claude analog. Untrusted hooks are silently skipped headless, so placement
-  seeds the harness trust override whenever statutes exist; the adapter
-  spreads that request override into every thread config and arms the
-  substrate-projected home's rails artifact. The seed is
-  `CODEX_CONFIG={"bypass_hook_trust":true}`. Because either seed or file can
-  fail silently, the adapter drives the reserved probe at boot and fails
-  closed unless it observes the refusal.
+  seeds `CODEX_CONFIG={"bypass_hook_trust":true}` on EVERY codex spawn; the
+  adapter spreads that request override into every thread config and arms the
+  substrate-projected home's rails artifact. Unconditional because the
+  projected map is unconditional: the reserved observation entry rides in it
+  whether or not the org has authored law, and on codex a hook that is not
+  trusted does not arm at all. Seeding an env var costs nothing and can fail
+  nothing.
+
+  The boot-time PROBE is the part that stays gated on law. Because either seed
+  or file can fail silently, the adapter drives the reserved probe at spawn and
+  fails CLOSED unless it observes the refusal — and only a DENIAL is worth
+  refusing to boot over. An observation that does not arm degrades to a weaker
+  evidence class and nothing else, so a law-free org must not lose its adapter
+  to a hook-trust regression. `statutes?/0`, not the presence of the map, is
+  what the probe follows.
 
   Rails-tier denial on both harnesses is for a cooperative agent — enumerated
   call denial, wired proven at boot for codex, not a sandbox or tamper-proof.

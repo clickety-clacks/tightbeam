@@ -18,11 +18,17 @@ defmodule Tightbeam.Artifacts do
   - `none` — neither. `recordedMessageId` is NULL.
 
   A row migrated from before this column existed also reads `none`, and keeps
-  whatever `recordedMessageId` the old writer stored. The pair distinguishes the
-  two: `(NULL, 'none')` means the substrate looked and found nothing, while a
-  non-NULL id with `none` is a pre-migration row whose id carries no evidence
-  claim at all. Nothing is nulled to make the shapes agree — that would destroy
-  a recorded id to tidy a label.
+  whatever `recordedMessageId` the old writer stored — nothing is nulled to make
+  the shapes agree, because that would destroy a recorded id to tidy a label.
+
+  That leaves migrated rows only PARTLY distinguishable, and the limit is worth
+  stating rather than glossing. A migrated row with a non-NULL id is
+  recognisable: `none` never writes an id, so the pair cannot occur otherwise,
+  and the id it carries makes no evidence claim. A migrated row whose id was
+  already NULL — what the old writer stored on the path clause 14 describes — is
+  `(NULL, 'none')`, byte-identical to a fresh record where the substrate looked
+  and found nothing. Those two are NOT separable in this table, and no reader
+  should be written as though they were.
 
   NO CONSUMER MAY TREAT `session-concurrent` OR `none` AS EXACT TURN PROOF. A
   reader that needs the strongest available edge filters on
@@ -31,7 +37,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, Ledger, TurnObservations}
+  alias Tightbeam.{DB, TurnObservations}
   alias Tightbeam.DB.Txn
 
   @outside_workspace "artifact origin is outside its session workspace"
@@ -165,18 +171,12 @@ defmodule Tightbeam.Artifacts do
   # `recorded_turn_evidence` are stripped from params at the wire boundary
   # (`Tightbeam.Wire.Router`), which is the whole reason a caller-selected id
   # could not have been proof in the first place.
-  defp turn_evidence(db, session_key) do
-    case TurnObservations.observed(session_key) do
-      message_id when is_binary(message_id) ->
-        {message_id, "tool-call-observed"}
-
-      nil ->
-        case Ledger.running_turn_message_id(db, session_key) do
-          message_id when is_binary(message_id) -> {message_id, "session-concurrent"}
-          nil -> {nil, "none"}
-        end
-    end
-  end
+  #
+  # It is ONE operation and not two reads in two processes, which is what the
+  # first version got wrong: the window came back from the writer, this process
+  # then queried the ledger, and a turn terminalizing in the scheduling gap
+  # between them made the row describe an instant neither read had seen.
+  defp turn_evidence(db, session_key), do: TurnObservations.evidence(db, session_key)
 
   @doc "Fetch one artifact row, or nil."
   @spec get(DB.server(), String.t()) :: map() | nil
