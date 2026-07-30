@@ -38,12 +38,9 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "residency waits behind slow adapter boot and dead adapters fail promptly" do
     adapter = start_supervised!({SlowBootAdapter, self()})
     assert_receive {:adapter_booting, ^adapter}
-    parent = self()
 
     queued =
       Task.async(fn ->
-        send(parent, :calling)
-
         try do
           Adapter.knows_session?(adapter, "resident")
         catch
@@ -56,12 +53,16 @@ defmodule Tightbeam.Acp.AdapterTest do
     # have given up. There is no way to observe "did not give up at 5s" in under
     # 5s, so the wait below is the price of the assertion, not slack.
     #
-    # :calling is what makes it honest. Anchored to Task.async instead, the window
-    # measured task STARTUP too, and only 100ms separated 5_100 from the 5_000 it
-    # had to outlast — so a reverted 5s budget stayed invisible whenever the task
-    # took >100ms to reach the call. The marker lands microseconds before the call
-    # arms its timer, so the 500ms band now covers only that gap.
-    assert_receive :calling
+    # The barrier has to prove the call's TIMER is armed, and only the adapter can
+    # evidence that. A marker the task sends about itself proves nothing: it is
+    # sent before `knows_session?/2` is even entered, and the task can be
+    # descheduled in the gap, so a reverted 5s budget stayed invisible whenever
+    # that gap ran past the 500ms band. The call sitting in the ADAPTER's mailbox
+    # is the send having already happened — `GenServer.call` arms its timer at the
+    # send — and the adapter is parked in its boot `receive`, so the message stays
+    # there to be observed. What is left inside the band is one process resuming
+    # into the next instruction.
+    assert call_queued_at?(adapter, {:knows_session?, "resident"})
     Process.sleep(5_500)
     assert Task.yield(queued, 0) == nil
 
@@ -279,6 +280,28 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       {:DOWN, ^ref, :process, ^adapter, reason} ->
         flunk("adapter died before reporting ready: #{inspect(reason)}")
+    end
+  end
+
+  # Has `request` actually reached `adapter`'s mailbox? The only barrier for a call
+  # that is SUPPOSED to sit unanswered: the callee cannot reply, so nothing it does
+  # can evidence receipt, and the caller can only speak for itself. Matching the
+  # queued `$gen_call` names the specific request rather than counting messages, so
+  # an unrelated one arriving first cannot satisfy it.
+  defp call_queued_at?(adapter, request, remaining \\ 200) do
+    queued? =
+      case Process.info(adapter, :messages) do
+        {:messages, messages} ->
+          Enum.any?(messages, &match?({:"$gen_call", _from, ^request}, &1))
+
+        nil ->
+          flunk("adapter died before the call reached it")
+      end
+
+    cond do
+      queued? -> true
+      remaining == 0 -> false
+      true -> Process.sleep(10) && call_queued_at?(adapter, request, remaining - 1)
     end
   end
 

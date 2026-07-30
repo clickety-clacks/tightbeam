@@ -104,6 +104,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            end)
   end
 
+  # How many borrowers the coordinator itself knows have asked: granted plus
+  # queued. Reading its state rather than a marker is the point — this is the one
+  # observation a coordinator that never enforced the cap cannot produce.
+  defp load_slot_askers(coordinator) do
+    state = :sys.get_state(coordinator)
+    map_size(state.load_active) + :queue.len(state.load_queue)
+  end
+
   defp wait_until(fun, tries \\ 200) do
     cond do
       fun.() ->
@@ -340,10 +348,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # before a sibling was scheduled, and a correct cap read as 2.
     for _ <- 1..6, do: assert_receive({:asking, _})
 
-    # All six have reached the call and :sys.get_state is answered in mailbox
-    # order, so every acquire has been granted or queued before the refute below —
-    # which can no longer pass merely because the remaining tasks had not asked.
-    :sys.get_state(coordinator)
+    # The COORDINATOR's own books are the barrier, because only it can evidence
+    # that a borrower asked. Mailbox order is a guarantee about ONE sender pair,
+    # and these are six senders: a `:sys.get_state` from the test process can be
+    # answered before a borrower's acquire arrives, leaving the refute below free
+    # to pass because the stragglers had not asked yet rather than because the cap
+    # held. Waiting until the coordinator accounts for all six — three granted,
+    # three queued — is what an uncapped coordinator cannot fake.
+    assert wait_until(fn -> load_slot_askers(coordinator) == 6 end)
 
     holders = for _ <- 1..3, do: assert_receive({:entered, _i, _pid})
     refute_receive {:entered, _, _}, 50
@@ -396,10 +408,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     # The barrier the refute needs: nothing here proved the second task had even
     # been SCHEDULED, so a cap that wrongly admitted it still looked blocked for
-    # the whole 50ms window. The marker says the task is running and the
-    # mailbox-ordered :sys.get_state says its acquire has been answered.
+    # the whole 50ms window. The marker alone does not fix that — it is the task
+    # speaking about itself, and a `:sys.get_state` from THIS process cannot be
+    # ordered against a call sent by that one. The coordinator counting two
+    # borrowers, one holding and one queued, is the acquire having actually
+    # landed there.
     assert_receive :second_asking
-    :sys.get_state(coordinator)
+    assert wait_until(fn -> load_slot_askers(coordinator) == 2 end)
     refute_receive :second_entered, 50
     send(first.pid, :release_first)
     assert_receive :second_entered

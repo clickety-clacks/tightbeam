@@ -3369,21 +3369,6 @@ end
 defmodule Tightbeam.ConformanceTest do
   use Tightbeam.TestCase, async: false
 
-  # ExUnit's per-test default is 60s, which is right for the ~1000 in-memory unit tests in
-  # this suite and wrong for this module alone: the fixtures here seed real git checkouts
-  # and drive the release rail-exec through the containment layer, so a single test can be
-  # dozens of OS process creations deep. That default was the BINDING budget here, tighter
-  # than every rail budget beneath it (serialize_check/1's 5_000ms plus RailScript's
-  # 2_000ms backstop at rail_script.ex:200) — so the layer under test could not render its
-  # verdict before the harness gave up, and the failure arrived as a timeout instead of as
-  # the deny the case was written to judge. Measured on a loaded dev box, the C5 rail-exec
-  # test alone ran 40.8s once and 88.2s an hour later: a coin flip against a number nobody
-  # chose for it. Declared per-module rather than globally, because raising it in
-  # test_helper would hide genuine hangs across the whole suite to accommodate this one.
-  # This weakens no assertion — the reason-pinning in assert_rule_result/5 is what keeps a
-  # slow run from passing falsely; this only stops the clock from pre-empting the verdict.
-  @moduletag timeout: 300_000
-
   alias Tightbeam.ConformanceSupport, as: Corpus
 
   @root Corpus.corpus_root()
@@ -3532,6 +3517,23 @@ defmodule Tightbeam.ConformanceTest do
     Corpus.run_acting_layer(fixture)
   end
 
+  # ExUnit's per-test default is 60s, a number chosen for the in-memory unit tests that
+  # make up most of this suite. This test is the one site in the module that earns a
+  # different one: it drives the release rail-exec through the containment layer for
+  # three script guards, so it is dozens of OS process creations deep and its cost is
+  # fork latency, which scales with the box rather than with anything the test does.
+  # Measured end to end: 12.4s at load 19 and 19.6s at load 45 on this box, and 40.8s
+  # once and 88.2s an hour later on a loaded dev box — straddling the default, so the
+  # test was a coin flip against a budget nobody chose for it. 300s is ~3.4x the worst
+  # yet observed.
+  #
+  # Per-test and not @moduletag: the other 100-odd tests here are unit-scale (the
+  # measured distribution drops to ~1.5s below the four script-driving sites), and
+  # handing them all 300s would hide a genuine hang in any of them to accommodate this
+  # one. This weakens no assertion either — the reason-pinning in assert_rule_result/5
+  # is what keeps a slow run from passing falsely; the budget only stops the clock from
+  # pre-empting a verdict the layer was still rendering.
+  @tag timeout: 300_000
   test "C5 real rail-exec drives git state, observed files, exit bands, CWD, and laziness" do
     for name <- [
           "reconcile-with-main",
@@ -3641,6 +3643,13 @@ defmodule Tightbeam.ConformanceTest do
     )
   end
 
+  # The module's other rail-exec driver, and the same reasoning at its own measured
+  # scale: 4.5s at load 19 and 13.8s at load 45. That is inside the 60s default today,
+  # but the load factor that took the test above from 19.6s to 88.2s puts this one at
+  # ~62s — astride the default, which is the coin-flip condition rather than a margin.
+  # 180s is ~2.9x the projected worst; it is not the neighbour's 300s, because this
+  # site did not measure the neighbour's number.
+  @tag timeout: 180_000
   test "C5 script tokens drive C6 dispatch remedies and C7 turn-end remedies" do
     for {class, name} <- [
           {"C6", "script-result-remedy"},

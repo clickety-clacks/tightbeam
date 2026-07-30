@@ -264,11 +264,14 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert count(db, "SELECT COUNT(*) FROM turns") == 0
     stop_supervised!(db)
 
-    # FAIL-BEFORE: without the Wakes child nothing recovers. Sampled across the
-    # window rather than napped through, and the window is denominated in the
-    # PASS-AFTER leg's own tick: 20 periods of the 25ms boot tick that leg needs
-    # to fire this wake. A recovery producer on anything like that cadence is
-    # therefore observed, and observed at the sample it first fires.
+    # FAIL-BEFORE: without the Wakes child nothing recovers. The window has to be
+    # long enough that a recovery which DID happen would have been seen, so it is
+    # denominated in the PASS-AFTER leg's own measured latency, not in a round
+    # number. That leg — same fixture, same 25ms boot tick — fires this wake in
+    # 27-52ms on this box at load 24 and 32-129ms at load 42, i.e. one to five
+    # ticks. The 20 periods below are 500ms, ~4x the slowest recovery yet
+    # observed, so a producer on anything like that cadence lands inside the
+    # window rather than after it.
     restarted = :"delivery_file_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: path, name: restarted}, id: restarted)
 
@@ -1089,10 +1092,15 @@ defmodule Tightbeam.EscalationDeliveryTest do
   end
 
   # `eventually`'s negative twin: the condition must hold at EVERY sample across
-  # the window, not merely at the end of one nap. A fixed sleep asserting that
-  # nothing happened only ever observes the last instant of its own budget, so a
-  # producer that fires early and a producer that never fires read identically —
-  # and a producer slower than the nap is not observed at all.
+  # the window. Be precise about what that buys here, because the state under
+  # observation is DURABLE — a wake that goes pending -> fired stays fired, so a
+  # single check at the end of a nap would also catch an early fire. The win is
+  # the WINDOW, not the sampling: a producer slower than the nap is not observed
+  # at all, and a nap is only ever as good as the number someone picked for it.
+  # The sampling earns its keep on the diagnostic, reporting the failure at the
+  # sample it first fires rather than at the end of the budget. Reach for the
+  # sampling itself when the state is transient, where a final snapshot really
+  # can miss a value that came and went.
   defp consistently(check, remaining \\ 20) do
     cond do
       not check.() -> false

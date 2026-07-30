@@ -153,22 +153,25 @@ end
 # nothing guaranteed the refuted work had even STARTED — the absence being
 # asserted was the absence of a beginning.
 #
-# The floor below is raised, but understand what it does and does not buy. It
-# covers scheduler- and mailbox-scale delay. It does NOT cover the quantities
-# that actually made those sites unsound, which were process-spawn scale:
-# measured on this project, /bin/sh reaching a fork is 235-1668ms and a `node`
-# ACP stub boot is worse. A floor that covered THAT would have to be seconds,
-# and every passing refute pays its window in full — at the 34 sites that take
-# the default, a 2s floor would cost the suite over a minute per run to buy
-# something a barrier buys for free.
+# The floor is deliberately NOT raised, and the reason is worth keeping. It would
+# cover scheduler- and mailbox-scale delay, which is not what made those sites
+# unsound: the quantities there were process-spawn scale — measured on this
+# project, /bin/sh reaching a fork is 235-1668ms and a `node` ACP stub boot is
+# worse. A floor that covered THAT would have to be seconds. Meanwhile every
+# PASSING refute pays its window in full, so the cost is paid by the healthy
+# path at all 34 sites that take the default and none of it is paid by the bug.
 #
-# So the floor is defence in depth for a future author, never a substitute for
-# the barrier. If you are refuting a message, first make the racing side signal
-# that it has STARTED, assert_receive that signal, and only then refute — or use
-# an existing barrier that is answered in mailbox order (:sys.get_state/1, any
-# GenServer.call into the target). test/support/test_case.ex documents the
-# sanctioned ones.
-ExUnit.start(assert_receive_timeout: 1_000, refute_receive_timeout: 500)
+# So a global floor buys no soundness it can name while charging every site for
+# it, and the number would be chosen for no site in particular. If a specific
+# refute needs a longer window, measure that site and widen it there.
+#
+# What actually closes the hole is the barrier. If you are refuting a message,
+# first make the racing side signal that it has STARTED, assert_receive that
+# signal, and only then refute — or use a barrier the TARGET answers, which for
+# a multi-sender race means reading the target's own books rather than trusting
+# mailbox order between processes that never exchanged a message.
+# test/support/test_case.ex documents the sanctioned ones.
+ExUnit.start(assert_receive_timeout: 1_000)
 
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 
