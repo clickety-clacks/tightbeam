@@ -12,11 +12,8 @@ defmodule Tightbeam.SessionLane do
     block on — it is designed to wait and is monitored by the Conn, which
     cancels on its death).
 
-  Quarantine: a turn recovered as failed_unknown quarantines its
-  session; the lane will not start the next queued turn until the orphaned ACP
-  request is observed resolved (Conn.pending_count hits 0 / orphan_resolved) or
-  the adapter generation is recycled. E1 proves the mechanism with a fake; the
-  coordinator generation wiring lands with the AdapterCoordinator.
+  There is currently no interlock between an orphaned ACP request and the next
+  queued turn.
   """
 
   use GenServer
@@ -33,8 +30,7 @@ defmodule Tightbeam.SessionLane do
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
-    current_message_id: nil,
-    quarantined: false
+    current_message_id: nil
   ]
 
   @doc """
@@ -193,7 +189,6 @@ defmodule Tightbeam.SessionLane do
   ## Internals
 
   defp maybe_start(%{task_ref: ref} = state) when not is_nil(ref), do: state
-  defp maybe_start(%{quarantined: true} = state), do: state
 
   defp maybe_start(state) do
     if Tightbeam.Application.draining?() do
