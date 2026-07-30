@@ -68,15 +68,11 @@ defmodule Tightbeam.GatewayTest do
     WorkState
   }
 
-  test "all archetype-to-MCP projections retain the builtin fallback" do
-    source = File.read!("lib/tightbeam/gateway.ex")
+  test "an unknown archetype projects the builtin default MCP servers" do
+    Archetypes.load!(role_test_base("unknown-mcp-fallback"))
 
-    assert length(
-             Regex.scan(
-               ~r/session\.archetype\s*\|>\s*Archetypes\.get\(\)\s*\|>\s*Archetypes\.acp_mcp_servers\(\)/,
-               source
-             )
-           ) == 0
+    assert Gateway.mcp_servers_for_archetype("unknown") ==
+             Archetypes.acp_mcp_servers(Archetypes.builtin_default())
   end
 
   alias Tightbeam.Wire.Payloads

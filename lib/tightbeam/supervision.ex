@@ -145,6 +145,7 @@ defmodule Tightbeam.Supervision do
           | :stranded
           | {:acted, :rail_remedy}
           | {:acted, :rail_escalate}
+          | {:retry, :rail_escalate}
           | {:held, :adjudication_hold}
           | {:refused, String.t()}
   def evaluate(db, handlers, n, session_key, terminal_seq) do
@@ -310,6 +311,7 @@ defmodule Tightbeam.Supervision do
   defp turn_end_step(:rail_enforcement, ctx) do
     case rail_step(ctx.db, ctx.handlers, ctx.session_key, ctx.assignment, ctx.terminal_seq) do
       {:acted, _tag} = acted -> {:halt, acted}
+      {:retry, _tag} = retry -> {:halt, retry}
       :fallthrough -> :cont
     end
   end
@@ -385,10 +387,22 @@ defmodule Tightbeam.Supervision do
                 id
             end
 
-          park_escalation(db, session_key, decision_request_id)
-          rail_sweep_lifecycle(db, session_key, assignment.id, statute.name, "escalate-park")
-          write_watermark(db, session_key, terminal_seq)
-          {:acted, :rail_escalate}
+          case park_escalation(db, session_key, decision_request_id) do
+            :parked ->
+              rail_sweep_lifecycle(
+                db,
+                session_key,
+                assignment.id,
+                statute.name,
+                "escalate-park"
+              )
+
+              write_watermark(db, session_key, terminal_seq)
+              {:acted, :rail_escalate}
+
+            :skipped ->
+              {:retry, :rail_escalate}
+          end
 
         # A sensor malfunction summons a mind, but its deny is the sweep's ordinary
         # re-obligate (§A3): the session is NOT parked, because parking is the escalate
@@ -446,8 +460,13 @@ defmodule Tightbeam.Supervision do
             [decision_request_id, wake.wake_id]
           )
 
-        _ ->
-          nil
+          :parked
+
+        [[_deadline_at, park_wake_id, _assignment_id]] when is_binary(park_wake_id) ->
+          :parked
+
+        [] ->
+          :skipped
       end
     end)
   end

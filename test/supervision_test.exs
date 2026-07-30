@@ -384,9 +384,10 @@ defmodule Tightbeam.SupervisionTest do
 
     proxy = :"ruling_race_db_#{System.unique_integer([:positive])}"
     start_supervised!({RulingRaceDB, {proxy, ctx.db, self()}})
+    retry_seq = terminal!(ctx.db, "holder")
 
-    assert {:acted, :rail_escalate} =
-             Supervision.evaluate(proxy, ctx.handlers, 3, "holder", terminal!(ctx.db, "holder"))
+    assert {:retry, :rail_escalate} =
+             Supervision.evaluate(proxy, ctx.handlers, 3, "holder", retry_seq)
 
     assert_receive {:ruled_before_park, ^id}
 
@@ -394,6 +395,24 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "SELECT status, parkWakeId FROM decision_requests WHERE id = ?1", [
                id
              ])
+
+    assert [
+             %{
+               "decision" => "escalate-park",
+               "ref" => "asg_1",
+               "statute" => "completion-needs-owner"
+             }
+           ] = rail_sweep_details(ctx.db, "holder")
+
+    refute match?(
+             %{lastEvaluatedTerminal: ^retry_seq},
+             Supervision.watermark(ctx.db, "holder")
+           )
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", retry_seq)
+
+    assert %{lastEvaluatedTerminal: ^retry_seq} = Supervision.watermark(ctx.db, "holder")
   end
 
   test "only a durable self-created continuation suppresses the turn-end remedy", ctx do
