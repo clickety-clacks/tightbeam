@@ -511,9 +511,15 @@ defmodule FeatureSmoke do
   # inside a real harness turn, which is the only way the substrate-reserved PreToolUse
   # observation (`Tightbeam.Rails.observation_entry/0`) can fire at all. Every other
   # artifact assertion we have drives the writer directly and therefore cannot see the
-  # hook. On the codex leg this is load-bearing twice over: §5.2 records the codex hook
-  # path as resting on the 0.145.0 spike, never on a Tightbeam live proof, and codex is
-  # the primary coding harness.
+  # hook.
+  #
+  # WHICH HALF OF CODEX IS ACTUALLY UNPROVEN. Codex as a verdict FILER is proven on this
+  # gateway — the live shrdlu walk filed reviewed-clean over codex twice, cleanly. What has
+  # never been proven is codex as the artifact RECORDER: whether a codex-hosted holder's
+  # `artifact-record` lands `tool-call-observed`, which rides the trust-gated
+  # `CODEX_CONFIG` hook seam and rests on the 0.145.0 spike alone (§5.2). The HOLDER is
+  # therefore always the leg's own harness, the evidence class is asserted PER LEG, and
+  # the codex leg's class assertion is the single most load-bearing line in this file.
   #
   # The chain, in the order the statutes deny (walked live on shrdlu, 2026-07-30):
   #
@@ -535,9 +541,9 @@ defmodule FeatureSmoke do
 
     # Spawning through the OTHER leg is the whole cross-harness move: `post/3` runs every
     # spawn through `FeatureSmokePlan.explicit_spawn/2`, which pins harness and model from
-    # `state.leg`, so swapping the leg for this one call is enough. `role-bind` REPLACES
-    # `boundSessionKey` (`Roles.bind/3`), so the flagship group's retired reviewer does not
-    # linger as the remedy's target.
+    # `state.leg`, so swapping the leg for this one call is enough. The role is bound
+    # because a session acting under its OWN credential needs one for the router to derive
+    # an origin, not because anything here waits on the review remedy to target it.
     reviewer =
       ok!(%{state | leg: reviewer_leg}, "spawn", %{
         "displayName" => "smoke-artifact-reviewer-#{u}",
@@ -586,25 +592,31 @@ defmodule FeatureSmoke do
     end
 
     try do
-      # 1. Review gate. Its remedy assigns the bound reviewer a review of this assignment.
+      # 1. Review gate.
       denied!(state, complete.(), "completion-requires-review")
 
-      reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
-
-      review_asg =
-        (reviews["assignments"] || reviews)
-        |> List.wrap()
-        |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
-
-      assert(
-        state,
-        is_map(review_asg),
-        "artifact closure: remedy did not assign the #{reviewer_leg.wire_name} reviewer a review of #{asg_id}; got #{inspect(reviews)}"
-      )
+      # The review assignment is opened EXPLICITLY rather than taken from the statute's
+      # remedy. Depending on a remedy-created assignment makes the group hostage to
+      # whether `target_role` resolves in the org under test — on shrdlu the reviewer role
+      # is bound to a retired session and the remedy silently no-ops — and this group is
+      # not here to test the review remedy, which the flagship group already covers.
+      #
+      # Opened by the OWNER, and that is load-bearing rather than incidental:
+      # `Assignments.commissioned_review_authors/3` only counts a verdict when the review's
+      # `openedBySession` differs from the holder (a user-principal open leaves it NULL)
+      # AND the verdict's author is the review's own holder. A review the coder opened for
+      # itself yields no independent verdict and the gate would never release.
+      review =
+        ok!(state, "assign", %{
+          "sessionKey" => reviewer_key,
+          "subject" => "review of assignment #{asg_id}",
+          "reviews" => asg_id,
+          "idempotencyKey" => "arrev-#{u}"
+        })
 
       v =
         post_as(state, reviewer_tok, "attest", %{
-          "assignmentId" => review_asg["id"] || review_asg["assignmentId"],
+          "assignmentId" => review["id"] || review["assignmentId"],
           "kind" => "verdict",
           "verdictKind" => "reviewed-clean"
         })
@@ -639,6 +651,11 @@ defmodule FeatureSmoke do
       # (§7.3 gate item 4).
       denied!(state, complete.(), "completion-requires-results-artifact")
 
+      # This remedy IS depended on, unlike the review one, and the difference is the target:
+      # it wakes `{holder_key}` directly, so there is no `target_role` to resolve and none
+      # of the role-binding fragility that makes remedy-created assignments a bad oracle.
+      # The episode going live is also the fail-before that makes the closure below mean
+      # something.
       await_episode_status!(state, "completion-requires-results-artifact", asg_id, "live")
 
       # 4. The real turn. The statute's own remedy has already woken the holder, and that
@@ -653,7 +670,7 @@ defmodule FeatureSmoke do
         "idempotencyKey" => "arwake-#{u}"
       })
 
-      reports = await_recorded_report!(state, coder_key, wi_id)
+      reports = await_recorded_report!(state, coder_key, wi_id, asg_id)
       classes = Enum.map(reports, & &1["recordedTurnEvidence"])
 
       # The null-vs-non-null coupling, on EVERY row. Pure substrate: `tool-call-observed`
@@ -682,22 +699,32 @@ defmodule FeatureSmoke do
         end
       end)
 
-      # THE assertion this journey exists to force, and it is deliberately exact rather
-      # than "any of the three classes". Both registered harnesses project the observation
-      # entry unconditionally (`Rails.hook_settings/0`), and the prompt above forbids the
-      # script-wrapping that §1.3 names as the legitimate way to miss it. So on a leg where
-      # the hook works the row MUST read `tool-call-observed`; accepting `session-concurrent`
-      # here would make the leg vacuous on exactly the harness it was added to prove.
+      # THE assertion this journey exists to force, per leg, and it is deliberately exact
+      # rather than "any of the three classes". Both registered harnesses project the
+      # observation entry unconditionally (`Rails.hook_settings/0`), and the prompt above
+      # forbids the script-wrapping that §1.3 names as the legitimate way to miss it. So on
+      # a leg where the hook works the row MUST read `tool-call-observed`; accepting
+      # `session-concurrent` would make the leg vacuous on exactly the harness it exists to
+      # prove. On the codex leg this line IS the proof that converts §5.2 from spike
+      # evidence into a live one.
       assert(
         state,
         "tool-call-observed" in classes,
         "artifact closure: no report artifact on #{wi_id} reads tool-call-observed — the " <>
           "reserved PreToolUse observation did not fire for the #{state.leg.wire_name} " <>
-          "harness, so this leg's rows rest on concurrency rather than observation. " <>
+          "holder, so this leg's rows rest on concurrency rather than observation. " <>
+          "Read it as the RECORDER side of #{state.leg.wire_name} failing; the filer side " <>
+          "is a separate question this group does not test. " <>
           "Classes seen: #{inspect(classes)}. Rows: #{inspect(reports)}"
       )
 
-      # `createdBySession` and `workItemId` are not re-asserted here: the query above
+      # NOTHING here asserts artifact lifecycle `state`. Retirement moves rows
+      # in-workspace → released, and the gate is state-blind on purpose
+      # (`Artifacts.recorded_kinds/3` reads neither state nor the turn edge), so a state
+      # assertion would be a brittle oracle for a fact the substrate does not gate on.
+      # Kind and provenance are the whole contract. Do not add one.
+      #
+      # `createdBySession` and `workItemId` are not re-asserted either: the query above
       # already filters on both, so a row that reached this point cannot fail them. The
       # origin path is the one param the substrate copies rather than derives, so it is
       # what proves the real CLI carried this journey's arguments into the row.
@@ -733,6 +760,12 @@ defmodule FeatureSmoke do
           "verified → artifact denied → real CLI record #{inspect(classes)} → completes, episode closed"
       )
     after
+      # EVERY assertion about an assignment outcome must stay above this line. `retire`
+      # REVOKES a session's open assignments, so a retired holder reads `revoked` — which
+      # is a distinct outcome from the `surrendered` the 0a2 oracle looks for, and an
+      # assertion moved below here would read teardown's revocation as the journey's
+      # result. Retirement also moves this holder's artifacts in-workspace → released,
+      # which is the other reason nothing above asserts artifact lifecycle state.
       retire(state, reviewer)
       retire(state, coder)
     end
@@ -809,16 +842,17 @@ defmodule FeatureSmoke do
     )
   end
 
-  defp await_recorded_report!(state, session_key, work_item_id) do
+  defp await_recorded_report!(state, session_key, work_item_id, assignment_id) do
     await_recorded_report!(
       state,
       session_key,
       work_item_id,
+      assignment_id,
       System.monotonic_time(:millisecond) + @artifact_turn_budget_ms
     )
   end
 
-  defp await_recorded_report!(state, session_key, work_item_id, deadline) do
+  defp await_recorded_report!(state, session_key, work_item_id, assignment_id, deadline) do
     reports =
       state
       |> ok!("artifacts", %{
@@ -833,18 +867,53 @@ defmodule FeatureSmoke do
       reports != [] ->
         reports
 
+      # An abandoned assignment is DETECTED AND NAMED, never waited out. This loop's
+      # deadline is four minutes of real model time, and a holder that surrendered will
+      # never record — so without this the roadmap 0a2 hazard reads as a confusing timeout
+      # instead of the confirmed live failure it is. `revoked` is a different animal
+      # (`retire` revokes a session's open assignments), so it is named separately rather
+      # than folded in.
+      outcome = terminal_outcome(state, assignment_id) ->
+        assert(
+          state,
+          false,
+          "artifact closure: assignment #{assignment_id} closed #{inspect(outcome)} before any " <>
+            "report artifact was recorded. " <> abandonment_note(outcome)
+        )
+
       System.monotonic_time(:millisecond) >= deadline ->
         assert(
           state,
           false,
           "artifact closure: the holder recorded no report artifact on #{work_item_id} within " <>
-            "#{div(@artifact_turn_budget_ms, 1000)}s. Either the real CLI `artifact-record` " <>
-            "refused (the §1.1 defect this carrier fixed) or the holder's turns never ran it."
+            "#{div(@artifact_turn_budget_ms, 1000)}s, with #{assignment_id} still open. Either " <>
+            "the real CLI `artifact-record` refused (the §1.1 defect this carrier fixed) or " <>
+            "the holder's turns never ran it."
         )
 
       true ->
         Process.sleep(1_000)
-        await_recorded_report!(state, session_key, work_item_id, deadline)
+        await_recorded_report!(state, session_key, work_item_id, assignment_id, deadline)
+    end
+  end
+
+  defp abandonment_note("surrendered") do
+    "That is roadmap 0a2: the holder abandoned the assignment rather than satisfying the " <>
+      "gate, which closes the work permanently. The gate IS satisfiable here — check " <>
+      "whether the holder's turn ever saw this group's prompt."
+  end
+
+  defp abandonment_note(_revoked) do
+    "Something revoked it mid-journey — a teardown or an operator, not the statute."
+  end
+
+  # `surrendered` or `revoked` only — `completed` is not terminal for this loop's purpose,
+  # because the only way it can appear is the holder completing after a record this loop
+  # has not read yet, and the next poll finds that record.
+  defp terminal_outcome(state, assignment_id) do
+    case ok!(state, "assignment-get", %{"assignmentId" => assignment_id})["outcome"] do
+      outcome when outcome in ["surrendered", "revoked"] -> outcome
+      _ -> nil
     end
   end
 
