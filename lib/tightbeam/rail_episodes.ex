@@ -163,11 +163,14 @@ defmodule Tightbeam.RailEpisodes do
     end
   end
 
-  # Keeps the map bounded. Recovery is the only moment the writer learns a statute's true
-  # open set, so it is the moment to forget everything of that statute's that is no longer
-  # in it — withdrawn here, ruled by a mind, or waived. Dropping only what THIS call
-  # withdrew would leak an entry for every externally adjudicated episode, unbounded under
-  # repeated adjudication.
+  # Keeps the map bounded. Called wherever the writer has just read a statute's true open
+  # set, and forgets everything of that statute's that is no longer in it — withdrawn by
+  # recovery, ruled by a mind, or waived.
+  #
+  # The prune that matters runs at `evaluating`, NOT at recovery. Recovery only runs when
+  # something is open, and an externally adjudicated episode has already left the open set
+  # — so no episode open means no recovery scheduled means no prune, ever. Pruning only at
+  # recovery is the one placement that cannot reach the leak it is meant to fix.
   defp prune(last_summon, statute, still_open) do
     keep = MapSet.new(still_open)
 

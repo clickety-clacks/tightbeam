@@ -1143,9 +1143,13 @@ defmodule Tightbeam.RailScriptTest do
   # BOUNDED WRITER STATE. An episode adjudicated by a mind leaves the open set without the
   # writer withdrawing it, so a recovery that dropped only what IT withdrew would keep that
   # episode's entry for the life of the process — unbounded under repeated adjudication.
-  # Recovery is the moment the writer learns the true open set, so it is the moment to
-  # forget everything of that statute's that is no longer in it.
-  test "an externally adjudicated episode is forgotten by the writer at recovery", ctx do
+  #
+  # The forgetting happens at the EVALUATION's read of the open set, not at recovery.
+  # Recovery never runs in this scenario at all: nothing is open once the ruling lands, so
+  # no recovery is ever scheduled. That is exactly why pruning at recovery — the obvious
+  # place — cannot fix this leak, and why this test drives a plain healthy evaluation
+  # rather than a recovery.
+  test "an externally adjudicated episode is forgotten at the next evaluation", ctx do
     handlers = %{"post" => fn _call -> %{ok: true} end}
     subject = call(%{work_item_id: "w-bounded"})
 
@@ -1176,8 +1180,8 @@ defmodule Tightbeam.RailScriptTest do
                authorized: true
              )
 
-    # A later healthy evaluation recovers. It withdraws nothing — there is nothing open —
-    # but it is where the writer learns the entry is dead.
+    # A later healthy evaluation. It schedules NO recovery — nothing is open to recover —
+    # and its read of the open set is where the writer learns the entry is dead.
     load.("rail-pass")
     assert {:ok, %{ok: true}} = Dispatch.dispatch(ctx.db, handlers, subject)
 
