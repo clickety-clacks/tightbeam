@@ -410,7 +410,9 @@ defmodule Tightbeam.Supervision do
   end
 
   # The sweep closes both kinds of episode the verb edge does (§C3.5, §A3).
-  defp close_episode(db, {:episodes, statute}), do: Escalation.close_episodes(db, statute)
+  defp close_episode(db, {:episodes, statute, watermark}),
+    do: Escalation.close_episodes(db, statute, watermark)
+
   defp close_episode(db, {statute, subject}), do: RailRemedy.close(db, statute, subject)
 
   defp park_escalation(db, session_key, decision_request_id) do

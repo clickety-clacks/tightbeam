@@ -158,7 +158,9 @@ defmodule Tightbeam.Dispatch do
   # whose statute passed; a malfunction episode closes because the statute's check
   # answered at all, whatever it answered. The atom tag is unambiguous — a statute name
   # is a lowercase string, never an atom.
-  defp close(db, {:episodes, statute}), do: Escalation.close_episodes(db, statute)
+  defp close(db, {:episodes, statute, watermark}),
+    do: Escalation.close_episodes(db, statute, watermark)
+
   defp close(db, {statute, subject}), do: RailRemedy.close(db, statute, subject)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do

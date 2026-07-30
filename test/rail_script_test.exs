@@ -970,6 +970,174 @@ defmodule Tightbeam.RailScriptTest do
     assert question =~ "script_exit_class unreported"
   end
 
+  # BLOCKING review finding. Recovery used to be ordered by the ACTOR's delayed mutation
+  # instead of by what the evaluation observed: `decide` read "this statute has an open
+  # episode", and the actor later withdrew EVERY open episode for that statute — including
+  # ones opened in the interval between. A malfunction landing inside that window was
+  # silenced without being repaired, which is exactly the state §A3 forbids. Expressed
+  # sequentially here rather than with racing processes, because the hazard is the
+  # ordering, not the concurrency: these are the operations in the order that breaks it.
+  test "a malfunction landing after a healthy evaluation is not swept away by it", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-race"})
+
+    load = fn script ->
+      put_statute(ctx, statute(script, %{"pass" => "allow"}))
+      Rules.load!(ctx.base_dir, ["post"])
+    end
+
+    # An episode is open for the timeout class.
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    # A healthy evaluation observes it and is handed the close — but its actor has NOT run.
+    load.("rail-pass")
+    {_decision, to_close, _to_consume} = Rules.decide(ctx.db, subject)
+    assert [{:episodes, "script-escalate", watermark}] = to_close
+
+    # Inside that interval a different malfunction opens its own episode.
+    load.("rail-error")
+
+    assert {:error, %{script_exit_class: "error:7"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    # The mechanism, measured rather than argued: the episode that arrived inside the
+    # interval sits ABOVE the watermark the healthy evaluation captured. The unbounded
+    # "close everything open for this statute" this replaced had no upper bound in its
+    # SELECT, so it necessarily picked this row up too.
+    assert {:ok, [[newer]]} =
+             DB.query(
+               ctx.db,
+               "SELECT rowid FROM decision_requests WHERE actionKey = 'episode:error:7'"
+             )
+
+    assert newer > watermark
+
+    # Only now does the delayed actor run the close it was handed.
+    Enum.each(to_close, fn {:episodes, name, mark} ->
+      Escalation.close_episodes(ctx.db, name, mark)
+    end)
+
+    # The observed episode recovered; the one that arrived afterwards still summons.
+    assert {:ok, [["episode:timeout", "withdrawn"], ["episode:error:7", "open"]]} =
+             DB.query(ctx.db, "SELECT actionKey, status FROM decision_requests ORDER BY rowid")
+  end
+
+  # Both actors close, and the sweep is the one with no coverage before this. It also has
+  # to be idempotent: the verb edge and the sweep can each be handed a close for the same
+  # statute, and the second must be a no-op rather than a second withdrawal.
+  test "the sweep recovers an episode too, and a double close is harmless", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-double"})
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+    {_decision, to_close, _} = Rules.decide(ctx.db, subject)
+    assert [{:episodes, name, watermark}] = to_close
+
+    # First close recovers it and writes exactly one withdrawal row.
+    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+
+    withdrawals = fn ->
+      ctx.db
+      |> EventLog.lifecycle_events()
+      |> Enum.count(&(&1.kind == "decision_request_withdrawn"))
+    end
+
+    assert withdrawals.() == 1
+
+    # The other actor runs the same close. Nothing is open, so nothing happens twice.
+    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+    assert withdrawals.() == 1
+
+    assert {:ok, [["withdrawn"]]} = DB.query(ctx.db, "SELECT status FROM decision_requests")
+  end
+
+  # Recovery and a ruling race for the same row. Both are single-statement CASes on
+  # `status = 'open'`, so exactly one can win: a recovered episode must not then be
+  # rulable, and a ruled one must not be silently withdrawn out from under the ruling.
+  test "recovery and a ruling cannot both land on one episode", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-cas"})
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    assert {:ok, [[id]]} = DB.query(ctx.db, "SELECT id FROM decision_requests")
+
+    put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+    {_decision, [{:episodes, name, watermark}], _} = Rules.decide(ctx.db, subject)
+
+    # Recovery lands first.
+    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+
+    # The ruling now finds nothing open to rule on, and does not resurrect it.
+    ruling =
+      Escalation.rule(
+        ctx.db,
+        %{
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          params: %{request_id: id, decision: "allow"}
+        },
+        authorized: true
+      )
+
+    refute match?(%{status: "ruled"}, ruling)
+
+    assert {:ok, [["withdrawn", "sensor-recovered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status, withdrawnReason FROM decision_requests WHERE id = ?1",
+               [id]
+             )
+  end
+
+  # The dedup rests entirely on `decision_requests_one_open`, so the index has to hold
+  # under a genuine simultaneous insert, not just under sequential calls. Both processes
+  # hand off at once; one row exists and both callers learn the same episode.
+  test "two processes tripping the same malfunction at once open exactly one episode", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+
+    gate = self()
+
+    racers =
+      for n <- 1..2 do
+        Task.async(fn ->
+          send(gate, {:ready, self()})
+          assert_receive :go, 5_000
+          Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-racer-#{n}"}))
+        end)
+      end
+
+    for _ <- racers, do: assert_receive({:ready, pid}, 5_000) && send(pid, :go)
+
+    for task <- racers do
+      assert {:error, %{reason: "script_timeout", script_exit_class: "timeout"}} =
+               Task.await(task, 30_000)
+    end
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+
+    assert {:ok, [["episode:timeout", "open"]]} =
+             DB.query(ctx.db, "SELECT actionKey, status FROM decision_requests")
+  end
+
   # The summons is SUBORDINATE to the deny (§B3). A caller with no accountable owner
   # cannot have a mind summoned on its behalf — `owner_user_id!/2` raises for it — and
   # before this that raise escaped the actor and turned a settled denial into a crashed

@@ -892,10 +892,15 @@ defmodule Tightbeam.Rules do
       params["work_item_id"]
   end
 
+  # The watermark rides the entry because recovery must be ordered by what THIS evaluation
+  # observed. `decide` is effect-free, so the actor's withdrawal lands an unbounded
+  # interval later; without it, an episode opened in between would be withdrawn by a
+  # healthy run that never saw it, silencing a malfunction nobody repaired.
   defp maybe_close_episodes(rule, db, to_close) do
-    if Escalation.live_episodes?(db, rule.name),
-      do: [{:episodes, rule.name} | to_close],
-      else: to_close
+    case Escalation.episode_watermark(db, rule.name) do
+      nil -> to_close
+      watermark -> [{:episodes, rule.name, watermark} | to_close]
+    end
   end
 
   defp maybe_close(rule, db, call, to_close) do

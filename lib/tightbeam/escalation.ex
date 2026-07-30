@@ -483,35 +483,53 @@ defmodule Tightbeam.Escalation do
     :ok
   end
 
-  @doc "Effect-free: does this statute have an open episode-keyed request?"
-  @spec live_episodes?(DB.server(), String.t()) :: boolean()
-  def live_episodes?(db, statute_name) do
-    {:ok, [[count]]} =
+  @doc """
+  Effect-free: the newest open episode this statute has, as an ordering watermark.
+
+  Returns the `rowid` of the newest open episode-keyed request, or `nil` when the statute
+  has none. The caller hands this back to `close_episodes/3` so recovery withdraws the
+  episodes the EVALUATION observed rather than whatever happens to be open by the time
+  the actor runs — see that function for the interleaving this exists to stop.
+
+  `rowid` is the ordering because it is assigned monotonically on insert and this table
+  never deletes rows. (`ensure_request_shape/1` rebuilds and renumbers, but that is a
+  boot-time migration inside one transaction, with no evaluation in flight across it.)
+  """
+  @spec episode_watermark(DB.server(), String.t()) :: integer() | nil
+  def episode_watermark(db, statute_name) do
+    {:ok, [[watermark]]} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
+        "SELECT MAX(rowid) FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
         [statute_name, @episode_prefix <> "%"]
       )
 
-    count > 0
+    watermark
   end
 
   @doc """
-  Close every open episode-keyed request for one statute — the sensor answered again.
+  Close the open episodes this statute had AT `watermark` — the sensor answered again.
 
   Dark-factory recovery: the malfunction episode exists because a check stopped
   rendering verdicts, so an observed verdict IS the repair, and demanding an operator
   verb to acknowledge a sensor that already healed is the stall the episode was meant to
   prevent. Withdrawal, not a ruling: nothing was decided, the question simply expired.
+
+  The watermark is what makes recovery ordered by EVALUATION rather than by whenever the
+  actor got around to running. `decide` is effect-free, so an unbounded interval sits
+  between the read that observed the episode and this withdrawal; a statute-wide "close
+  everything open" would sweep away an episode opened inside that interval and silence a
+  malfunction that had not been repaired at all — exactly the state §A3 forbids. Rows
+  newer than the watermark were never observed as recovered, so they survive.
   """
-  @spec close_episodes(DB.server(), String.t()) :: :ok
-  def close_episodes(db, statute_name) do
+  @spec close_episodes(DB.server(), String.t(), integer()) :: :ok
+  def close_episodes(db, statute_name, watermark) when is_integer(watermark) do
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
         txn
         |> Txn.q(
-          "SELECT id FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
-          [statute_name, @episode_prefix <> "%"]
+          "SELECT id FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open' AND rowid <= ?3",
+          [statute_name, @episode_prefix <> "%", watermark]
         )
         |> Enum.each(fn [id] ->
           Txn.q(
