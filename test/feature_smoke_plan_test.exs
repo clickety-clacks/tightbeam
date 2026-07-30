@@ -3,9 +3,26 @@ defmodule Tightbeam.FeatureSmokePlanTest do
 
   alias Tightbeam.{FeatureSmokePlan, Harness}
 
+  # Every model is present unless overridden; every OTHER key — the leg filter included —
+  # is unset unless a case sets it. A double that answered every key was fine while models
+  # were the only thing read, and became a lie the moment a second key existed.
+  defp env(overrides \\ %{}) do
+    fn key ->
+      case Map.fetch(overrides, key) do
+        {:ok, value} ->
+          value
+
+        :error ->
+          if String.starts_with?(key, "TIGHTBEAM_SMOKE_MODEL_"),
+            do: "model-for-" <> String.downcase(key)
+      end
+    end
+  end
+
+  defp names(legs), do: Enum.map(legs, & &1.wire_name)
+
   test "one explicitly modeled leg is driven for every registered harness" do
-    getenv = fn key -> "model-for-" <> String.downcase(key) end
-    legs = FeatureSmokePlan.legs(Harness.all(), getenv)
+    legs = FeatureSmokePlan.legs(Harness.all(), env())
 
     assert Enum.map(legs, & &1.harness) == Harness.all()
     assert Enum.all?(legs, &is_binary(&1.model))
@@ -22,6 +39,60 @@ defmodule Tightbeam.FeatureSmokePlanTest do
   test "a missing per-harness model refuses the smoke before any leg runs" do
     assert_raise ArgumentError, ~r/missing TIGHTBEAM_SMOKE_MODEL_/, fn ->
       FeatureSmokePlan.legs(Harness.all(), fn _key -> nil end)
+    end
+  end
+
+  # e2e-tier-map-v1 GAP-3. Written against the REGISTRY rather than against literal harness
+  # names, so the seam guard stays satisfied and a third registered harness does not
+  # silently invalidate the cases.
+  describe "leg filter" do
+    test "unset runs every registered leg, which is the unchanged default" do
+      assert names(FeatureSmokePlan.legs(Harness.all(), env(%{}))) ==
+               Enum.map(Harness.all(), & &1.wire_name())
+
+      assert FeatureSmokePlan.selection(Harness.all(), env(%{})) ==
+               %{run: Enum.map(Harness.all(), & &1.wire_name()), filtered: []}
+    end
+
+    test "naming one leg runs exactly that leg and holds the rest back" do
+      [first | rest] = Enum.map(Harness.all(), & &1.wire_name())
+      getenv = env(%{"TIGHTBEAM_SMOKE_LEGS" => first})
+
+      assert names(FeatureSmokePlan.legs(Harness.all(), getenv)) == [first]
+      assert FeatureSmokePlan.selection(Harness.all(), getenv) == %{run: [first], filtered: rest}
+    end
+
+    test "a selected leg needs no model for the legs it filtered out" do
+      [first | rest] = Enum.map(Harness.all(), & &1.wire_name())
+
+      only_first =
+        Map.new(rest, &{"TIGHTBEAM_SMOKE_MODEL_" <> String.upcase(&1), nil})
+        |> Map.put("TIGHTBEAM_SMOKE_LEGS", first)
+
+      assert names(FeatureSmokePlan.legs(Harness.all(), env(only_first))) == [first]
+    end
+
+    test "selection order follows the registry, never the env" do
+      reversed = Harness.all() |> Enum.map(& &1.wire_name()) |> Enum.reverse() |> Enum.join(",")
+
+      assert names(
+               FeatureSmokePlan.legs(Harness.all(), env(%{"TIGHTBEAM_SMOKE_LEGS" => reversed}))
+             ) ==
+               Enum.map(Harness.all(), & &1.wire_name())
+    end
+
+    test "an unregistered leg name is a named refusal, not a silent empty run" do
+      assert_raise ArgumentError, ~r/names unregistered leg\(s\): frobnicate/, fn ->
+        FeatureSmokePlan.legs(Harness.all(), env(%{"TIGHTBEAM_SMOKE_LEGS" => "frobnicate"}))
+      end
+    end
+
+    test "set-but-empty refuses rather than running zero legs and exiting green" do
+      for blank <- ["", "   ", ",", " , "] do
+        assert_raise ArgumentError, ~r/names no legs/, fn ->
+          FeatureSmokePlan.legs(Harness.all(), env(%{"TIGHTBEAM_SMOKE_LEGS" => blank}))
+        end
+      end
     end
   end
 end

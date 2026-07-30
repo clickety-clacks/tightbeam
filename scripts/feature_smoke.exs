@@ -45,6 +45,8 @@ defmodule FeatureSmoke do
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
 
+    announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
+
     Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
     |> Enum.each(fn leg ->
       IO.puts("\nfeature-smoke leg #{leg.wire_name} model=#{leg.model}")
@@ -2251,6 +2253,28 @@ defmodule FeatureSmoke do
   defp finish_leg(state) do
     IO.puts("feature-smoke leg #{state.leg.wire_name}: #{state.pass} checks PASS")
     :ok
+  end
+
+  # Say what this run covers BEFORE it runs, and say it again in the words a scorecard
+  # needs. A narrowed run is a legitimate answer to a narrow question, but only while it
+  # is legible as narrow — an operator reading "all checks PASS" with no statement of
+  # scope has been told a full-coverage story the run did not earn. The tier map's verdict
+  # for this shape is INCOMPLETE(parity), so the line names it in those terms.
+  defp announce_selection!(%{run: [], filtered: filtered}) do
+    raise Failure,
+      message: "feature-smoke selected no legs (all filtered: #{Enum.join(filtered, ", ")})"
+  end
+
+  defp announce_selection!(%{run: run, filtered: []}) do
+    IO.puts("feature-smoke legs: #{Enum.join(run, ", ")} (every registered leg — full parity)")
+  end
+
+  defp announce_selection!(%{run: run, filtered: filtered}) do
+    IO.puts(
+      "feature-smoke legs: #{Enum.join(run, ", ")} — FILTERED, holding back " <>
+        "#{Enum.join(filtered, ", ")}. This run is INCOMPLETE(parity) by design and proves " <>
+        "nothing about the leg(s) it did not run."
+    )
   end
 
   defp unique, do: "#{Process.get(:salt, "")}#{System.unique_integer([:positive])}"
