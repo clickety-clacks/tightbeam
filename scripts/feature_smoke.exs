@@ -699,11 +699,23 @@ defmodule FeatureSmoke do
     ok!(state, "role-bind", %{"name" => "coder-artifact-#{u}", "sessionKey" => coder_key})
     coder_tok = session_token(state, coder_key)
 
+    # REAL WORK, ON THE HOST, BEFORE THE ASSIGNMENT EXISTS.
+    #
+    # Four holders refused this chain on the live run, and they were RIGHT to: the
+    # assignment named no files and pointed at nothing runnable, so there was nothing on
+    # the host to verify, and one of them called the seed "an ungrounded fabrication I'm
+    # not repeating". That is this product's own doctrine working — the refusal is the
+    # behavior `surrender-escalates-to-owner` and the verification statutes exist to
+    # produce. The fixture has to MEET it, not prompt around it, so the group seeds a
+    # thing that can actually be run and observed and hands the holder its name.
+    check = seed_verifiable_work!(state, coder_key, u)
+
     asg =
       ok!(state, "assign", %{
         "sessionKey" => coder_key,
-        "subject" => "artifact impl #{u}",
+        "subject" => "run #{check.name} and record its output — artifact closure #{u}",
         "workItemId" => wi_id,
+        "files" => [check.name],
         "idempotencyKey" => "aras-#{u}"
       })
 
@@ -765,11 +777,23 @@ defmodule FeatureSmoke do
       # 2. Verification gate, now reachable because the review gate stopped denying.
       denied!(state, "completion-requires-verification", coder_key, asg_id, complete)
 
+      # A verdict with a TRUE note, because a bare one is indistinguishable from a
+      # fabrication and gets treated as one. The live run's holder named this exactly: a
+      # prior `verified` carrying `note: null` "appears to have been filed without any
+      # actual verification", and it declined to build on it. It was right — nothing had
+      # been verified.
+      #
+      # So the operator verifies, and then says what it did. `check.output` is the real
+      # stdout of the real script, captured by `seed_verifiable_work!/3` when it actually
+      # ran it. Pre-seeding rather than making the holder file this keeps the group
+      # deterministic and one turn shorter, and it stays honest because the claim in the
+      # note is a thing that happened.
       verified =
         post_as(state, coder_tok, "attest", %{
           "assignmentId" => asg_id,
           "kind" => "verdict",
-          "verdictKind" => "verified"
+          "verdictKind" => "verified",
+          "note" => check.note
         })
 
       assert(
@@ -809,7 +833,7 @@ defmodule FeatureSmoke do
       wake =
         ok!(state, "wake", %{
           "sessionKey" => coder_key,
-          "prompt" => artifact_prompt(u, marker, wi_id, asg_id),
+          "prompt" => artifact_prompt(u, marker, check.name, wi_id, asg_id),
           "idempotencyKey" => "arwake-#{u}"
         })
 
@@ -929,6 +953,53 @@ defmodule FeatureSmoke do
     end
   end
 
+  # Put something real in the holder's workdir, run it, and keep what it said.
+  #
+  # The smallest thing that satisfies "can be executed and observed": one script with a
+  # known output. It is deliberately not a fake diff or a spec pointing at absent code —
+  # a holder asked to verify either would be right to refuse again, and this group must
+  # never be the thing that provokes the refusal it also asserts against.
+  #
+  # Seeding before the first turn is safe: `Placement.ensure_workdir/4` does `mkdir -p`
+  # and writes only `.tightbeam-session`, so it creates the directory around this file
+  # rather than over it.
+  #
+  # The operator runs it HERE, and that run is what makes the verdict's note true rather
+  # than decorative — the note quotes output this function actually observed.
+  defp seed_verifiable_work!(state, session_key, u) do
+    workdir = local_workdir_path(state.base_dir, session_key)
+    name = "check-#{u}.sh"
+    path = Path.join(workdir, name)
+    expected = "artifact-closure-check #{u}: PASS"
+
+    File.mkdir_p!(workdir)
+
+    File.write!(
+      path,
+      "#!/bin/sh\n# feature-smoke fixture: the unit of work under assignment #{u}.\necho '#{expected}'\n"
+    )
+
+    File.chmod!(path, 0o755)
+
+    {out, status} = System.cmd("/bin/sh", [path], stderr_to_stdout: true)
+    output = String.trim(out)
+
+    assert(
+      state,
+      status == 0 and output == expected,
+      "artifact closure: the seeded work does not run cleanly — #{path} exited #{status} " <>
+        "with #{inspect(output)}, expected #{inspect(expected)}. The group refuses to hand a " <>
+        "holder work it could not verify itself."
+    )
+
+    %{
+      name: name,
+      path: path,
+      output: output,
+      note: "Ran `sh #{name}` in this assignment's workdir; it exited 0 and printed: #{output}"
+    }
+  end
+
   # The reviewer runs on a DIFFERENT registered harness wherever the registry offers one.
   # This buys no extra enforcement — `assignment.independent_verdict_kinds` reads sessions,
   # never harnesses — and it costs nothing either: `FeatureSmokePlan.legs/1` RAISES unless
@@ -971,12 +1042,15 @@ defmodule FeatureSmoke do
   # agent meeting a gate it could not satisfy surrendered and closed the work permanently.
   # The gate is satisfiable now; the instruction is here so a leg cannot fail on an agent
   # reaching for the old escape.
-  defp artifact_prompt(u, marker, wi_id, asg_id) do
+  defp artifact_prompt(u, marker, check, wi_id, asg_id) do
     """
     Substrate smoke check #{u} on assignment #{asg_id}. Do exactly these two steps.
 
-    1. Write a file named #{marker} in your current working directory containing
-       one line: smoke verification results #{u}
+    1. Run the script this assignment declares and capture its real output:
+       sh #{check} > #{marker} 2>&1
+       #{marker} must contain what the script actually printed. Do not write it by hand
+       and do not paste an expected value — the point is that the report carries an
+       observation, not a claim.
 
     2. Run this as a single shell command, exactly as written:
        tightbeam artifact-record --kind report --title 'smoke report #{u}' --path #{marker} --work-item #{wi_id}
