@@ -68,10 +68,10 @@ defmodule Tightbeam.Wire.SocketTest do
 
     config = %{db: ctx.db, base_dir: System.tmp_dir!(), port: 0}
     handlers = Gateway.handlers(config)
-    Rules.load!(Path.join(System.tmp_dir!(), "missing-socket-e2e-rules"), Map.keys(handlers), %{})
+    Rules.load!(Path.join(System.tmp_dir!(), "missing-socket-e2e-rules"), Map.keys(handlers))
 
     on_exit(fn ->
-      Rules.load!(Path.join(System.tmp_dir!(), "missing-socket-e2e-reset"), [], %{})
+      Rules.load!(Path.join(System.tmp_dir!(), "missing-socket-e2e-reset"), [])
     end)
 
     {:paired, device} =

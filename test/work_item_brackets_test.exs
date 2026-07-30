@@ -70,7 +70,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     base = Path.join(System.tmp_dir!(), "tb-brackets-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(base, Map.keys(handlers), %{})
+    Rules.load!(base, Map.keys(handlers))
     on_exit(fn -> File.rm_rf!(base) end)
 
     %{
@@ -888,7 +888,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     base = Path.join(System.tmp_dir!(), "tb-brackets-rules-#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(base, "identity/rules"))
     File.write!(Path.join(base, "identity/rules/statute.toml"), toml)
-    Rules.load!(base, Map.keys(ctx.handlers), %{})
+    Rules.load!(base, Map.keys(ctx.handlers))
   end
 
   defp maybe_put(map, _key, nil), do: map

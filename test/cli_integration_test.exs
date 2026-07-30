@@ -17,7 +17,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Ledger,
     Org,
     Projection,
-    Producers,
+    RailRemedy,
     Roles,
     Rules,
     Wakes,
@@ -66,7 +66,7 @@ defmodule Tightbeam.CliIntegrationTest do
           WorkState,
           EventLog,
           Escalation,
-          Producers,
+          Tightbeam.RailRemedy,
           Tightbeam.Placement
         ],
         do: :ok = module.ensure_schema(db)
@@ -110,14 +110,12 @@ defmodule Tightbeam.CliIntegrationTest do
     gateway_config = %{
       db: db,
       base_dir: base_dir,
-      cwd: base_dir,
-      producer_config: %{tests: "true", smoke: "true", timeout_ms: 60_000},
-      producer_runner: nil
+      cwd: base_dir
     }
 
     Archetypes.load!(base_dir)
     real_handlers = Gateway.handlers(gateway_config)
-    Rules.load!(base_dir, Map.keys(real_handlers), %{})
+    Rules.load!(base_dir, Map.keys(real_handlers))
     test_pid = self()
 
     handlers =
@@ -155,8 +153,11 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     %{
+      base_dir: base_dir,
       binary: binary,
       db: db,
+      handlers: handlers,
+      port: port,
       session: session,
       worker: worker,
       workdir: workdir,
@@ -344,46 +345,321 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
   end
 
-  test "real CLI runs producers, lists decisions, and rules effort continue and dismiss", ctx do
+  # verification-papertrail-v1 A7 (macOS half): A1/A2 walked end to end through
+  # the real Bandit/Router stack and the real release CLI, against the shipped
+  # statutes exactly as relearn delivers them. Two hops are not the CLI, both
+  # pre-existing wire-seam gaps tracked elsewhere: the report artifact (the wire
+  # dispatch seam does not yet bind the firing messages.id onto artifact-record,
+  # conformance-handoff-ledger Clauses 8/11) and the review-link assign (#112:
+  # the CLI's --reviews wire param is dropped by the handler seam). Those two
+  # rows go through the gateway handlers with explicit provenance, exactly as
+  # artifacts_test does. Everything else — work item, coder assignment, the
+  # review verdict, both denials, both wakes, the verification verdict, and the
+  # final completion — is the real CLI against the real Bandit/Router stack.
+  test "real CLI walks the verification papertrail end to end (A1/A2)", ctx do
+    # A real bundle import, not a fixture copy: this is the arrival path §7
+    # describes, so the walk fails if learn stops delivering rules/.
+    assert :initialized = Archetypes.init_identity!(ctx.base_dir)
+    Archetypes.load!(ctx.base_dir)
+
+    for file <- ["engineering.toml", "verification.toml"] do
+      assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
+             "learn did not deliver rules/#{file} into the org's identity tree"
+    end
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    test_pid = self()
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       deliver: fn wake ->
+         send(test_pid, {:wake_delivered, wake})
+         true
+       end,
+       tick_ms: 60_000,
+       name: Tightbeam.WakeScheduler}
+    )
+
+    coder =
+      Org.create(ctx.db, %{
+        session_key: "cli-coder",
+        display_name: "CLI Coder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    reviewer =
+      Org.create(ctx.db, %{
+        session_key: "cli-reviewer",
+        display_name: "CLI Reviewer",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "reviewer",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "test"
+      })
+
+    Roles.create!(ctx.db, "cli-coder", "flynn", coder.session_key)
+    Roles.create!(ctx.db, "cli-reviewer", "flynn", reviewer.session_key)
+    coder_dir = session_workdir!(ctx, coder)
+    reviewer_dir = session_workdir!(ctx, reviewer)
+
+    {created, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "papertrail e2e", "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    item_id = JSON.decode!(created)["id"]
+
     {assigned, 0} =
       System.cmd(
         ctx.binary,
         [
           "assign",
           "--subject",
-          "mechanical checks",
+          "implement the feature",
           "--session",
-          "cli-holder",
-          "--key",
-          "producer-cli"
+          "cli-coder",
+          "--work-item",
+          item_id,
+          "--as-user",
+          "flynn"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
-    assignment_id = JSON.decode!(assigned)["id"]
-    assert_receive {:cli_call, %{verb: "assign", params: %{idempotency_key: "producer-cli"}}}
+    work_id = JSON.decode!(assigned)["id"]
 
-    {tests, 0} =
-      System.cmd(ctx.binary, ["run-tests", assignment_id],
+    # Second non-CLI hop (#112, pre-existing): the CLI sends the review link as
+    # wire param "reviews", which the assign handler never reads (it wants
+    # :reviews_assignment_id), so a CLI-created review link is silently
+    # dropped. Until #112 lands the review is opened through the REGISTERED
+    # "assign" handler the router serves — not Assignments.__handle__ directly —
+    # so the handler's assignment- and work-item-change composition still runs.
+    review =
+      ctx.handlers["assign"].(%{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "cli-reviewer",
+        target_role: nil,
+        role_fallback: false,
+        params: %{
+          subject: "review of the feature",
+          work_item_id: item_id,
+          reviews_assignment_id: work_id
+        }
+      })
+
+    # Proof the hop really traversed the registered table: only the router's
+    # wrapped handlers echo :cli_call. A direct Assignments.__handle__ call
+    # would skip the handler's change-callback composition and echo nothing.
+    assert_receive {:cli_call, %{verb: "assign", params: %{reviews_assignment_id: ^work_id}}}
+
+    review_id = review.id
+
+    {_verdict, 0} =
+      System.cmd(
+        ctx.binary,
+        ["attest", review_id, "--kind", "verdict", "--verdict", "reviewed-clean"],
+        cd: reviewer_dir,
+        stderr_to_stdout: true
+      )
+
+    # A1 first denial: the completion is refused and the wake names the
+    # missing verification verdict.
+    {denied, denied_status} =
+      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
+    assert denied_status != 0
+    assert denied =~ "completion-requires-verification"
+
+    assert %{status: "live"} =
+             RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
+
+    assert_receive {:wake_delivered, verification_wake}, 5_000
+    assert verification_wake.session_key == "cli-coder"
+    assert verification_wake.prompt =~ "no verification verdict is filed"
+    assert verification_wake.prompt =~ work_id
+
+    {_verified, 0} =
+      System.cmd(
+        ctx.binary,
+        ["attest", work_id, "--kind", "verdict", "--verdict", "verified"],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
+    # A1 second denial: the artifact statute prods next, naming its own record.
+    {denied_again, denied_again_status} =
+      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
+    assert denied_again_status != 0
+    assert denied_again =~ "completion-requires-results-artifact"
+    assert_receive {:wake_delivered, artifact_wake}, 5_000
+    assert artifact_wake.prompt =~ "no results artifact is recorded"
+
+    # The report artifact (see the Clause 8/11 note above this test).
+    message_id = "msg_papertrail_#{System.unique_integer([:positive])}"
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId) VALUES (?1, 'cli-coder', 'assistant', 'verification results', 1, ?1)",
+        [message_id]
+      )
+
+    refute Map.has_key?(
+             ctx.handlers["artifact-record"].(%{
+               principal: {:session, "cli-coder"},
+               session_key: "cli-coder",
+               recorded_message_id: message_id,
+               params: %{
+                 kind: "report",
+                 title: "verification results",
+                 origin_path: "results.txt",
+                 work_item_id: item_id
+               }
+             }),
+             :code
+           )
+
+    # A2: the papertrail stands — the completion passes and the episodes close.
+    {completed, 0} =
+      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
+    assert completed =~ "closed"
+
+    assert {:ok, [["closed", "completed"]]} =
+             DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id = ?1", [work_id])
+
+    assert %{status: "closed"} =
+             RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
+
+    assert %{status: "closed"} =
+             RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
+  end
+
+  # verification-papertrail-v1 A7 x A5 (macOS half): an org with no learned
+  # statutes completes bare through the real CLI — no denial, no episode, no
+  # remedy wake.
+  test "real CLI bare completion passes on a rule-free org (A5)", ctx do
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    coder =
+      Org.create(ctx.db, %{
+        session_key: "cli-neutral-coder",
+        display_name: "Neutral Coder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    Roles.create!(ctx.db, coder.session_key, "flynn", coder.session_key)
+    coder_dir = session_workdir!(ctx, coder)
+
+    {created, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "neutral e2e", "--as-user", "flynn"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
-    assert tests =~ "pj_"
+    item_id = JSON.decode!(created)["id"]
 
-    assert_receive {:cli_call, %{verb: "run-tests", params: %{assignment_id: ^assignment_id}}}
-
-    {smoke, 0} =
-      System.cmd(ctx.binary, ["run-smoke", assignment_id],
+    {assigned, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "neutral bare completion",
+          "--session",
+          coder.session_key,
+          "--work-item",
+          item_id,
+          "--as-user",
+          "flynn"
+        ],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
-    assert smoke =~ "pj_"
+    work_id = JSON.decode!(assigned)["id"]
 
-    assert_receive {:cli_call, %{verb: "run-smoke", params: %{assignment_id: ^assignment_id}}}
+    {completed, 0} =
+      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
 
+    assert completed =~ "closed"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM rail_remedy_episodes", [])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE origin LIKE 'remedy:%'",
+               []
+             )
+  end
+
+  defp session_workdir!(ctx, session) do
+    dir = Path.join([ctx.base_dir, "work", session.session_key])
+    File.mkdir_p!(dir)
+
+    File.write!(
+      Path.join(dir, ".tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{ctx.port}",
+        token: session.cli_token,
+        sessionKey: session.session_key
+      })
+    )
+
+    dir
+  end
+
+  test "real CLI retired producer verbs are unknown commands", ctx do
+    for verb <- ["run-tests", "run-smoke", "cancel-producer-job"] do
+      {output, status} =
+        System.cmd(ctx.binary, [verb, "asg_1"],
+          cd: ctx.workdir,
+          stderr_to_stdout: true
+        )
+
+      assert status != 0
+      assert output =~ "unknown command"
+    end
+  end
+
+  test "real CLI lists decisions and rules effort continue and dismiss", ctx do
     continue_request = open_effort_request(ctx, "continue")
 
     {requests, 0} =

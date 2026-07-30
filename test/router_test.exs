@@ -1427,6 +1427,51 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
+  test "session-control adopt and unadopt reach tune, and a foreign session is refused", ctx do
+    key = "adopt-control"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", fn call -> send_call(call) end)
+
+    for {action, adopted} <- [{"adopt", true}, {"unadopt", false}] do
+      response = post_control(opts, ctx.device.token, key, action)
+
+      assert response.status == 200
+
+      assert %{"ok" => true, "action" => ^action, "sessionKey" => ^key} =
+               JSON.decode!(response.resp_body)
+
+      assert_received {:call,
+                       %{
+                         verb: "tune",
+                         origin: origin,
+                         session_key: ^key,
+                         params: %{setting: "adopt", adopted: ^adopted}
+                       }}
+
+      assert origin == "user:#{ctx.device.user_id}"
+    end
+
+    # Adoption invents no authorization rule of its own: the seam already refuses
+    # a session the caller neither owns nor administers, before dispatch and
+    # indistinguishably from one that does not exist (the existence oracle).
+    stranger = approved_device(ctx.db, "adopt-stranger", "Stranger")
+    response = post_control(opts, stranger.token, key, "adopt")
+
+    assert response.status == 404
+    assert %{"error" => %{"code" => "not_found"}} = JSON.decode!(response.resp_body)
+    refute_received {:call, %{verb: "tune"}}
+  end
+
+  defp post_control(opts, token, session_key, action) do
+    conn(
+      :post,
+      "/api/session-control",
+      JSON.encode!(%{"sessionKey" => session_key, "action" => action})
+    )
+    |> put_req_header("authorization", "Bearer #{token}")
+    |> Router.call(Router.init(opts))
+  end
+
   defp with_handler(opts, verb, handler) do
     Keyword.update!(opts, :handlers, &Map.put(&1, verb, handler))
   end

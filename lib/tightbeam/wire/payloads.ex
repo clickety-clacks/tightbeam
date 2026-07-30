@@ -11,7 +11,12 @@ defmodule Tightbeam.Wire.Payloads do
   never from text parsing; the bible's §wakes origin-class set is the
   source of truth):
   - Origin classes are a CLOSED set: `user:<id>` (human), `agent:<handle>`
-    (session), `process:<name>` (automation — cron/CI/webhooks).
+    (session), `process:<name>` (automation — cron/CI/webhooks), plus the
+    substrate-reserved `remedy:<statute>` a rail remedy dispatches under.
+  - A stream carries `startedBy` (user | agent | substrate) — the origin's
+    class already collapsed for rendering, TOTAL, classified in
+    `Tightbeam.Origin`. `origin` stays beside it as the detailed provenance;
+    clients render from `startedBy` and never parse the origin string.
   - A message's class is derivable from wire fields alone:
     role=user + deviceId/clientMessageId, no sender → typed on a device;
     role=user + sender=<origin> → delivered by wake (colleague DM,
@@ -157,7 +162,8 @@ defmodule Tightbeam.Wire.Payloads do
         "isBuiltIn" => Map.fetch!(s, :is_built_in),
         "createdAt" => Map.fetch!(s, :created_at),
         "updatedAt" => Map.fetch!(s, :updated_at),
-        "adopted" => Map.fetch!(s, :adopted)
+        "adopted" => Map.fetch!(s, :adopted),
+        "startedBy" => Tightbeam.Origin.started_by(s[:origin])
       },
       for(
         {key, value} <- [{"origin", s[:origin]}, {"spawnedBy", s[:spawned_by]}],

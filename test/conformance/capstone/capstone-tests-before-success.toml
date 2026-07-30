@@ -9,7 +9,7 @@ legibility = "event:denied(rule=capstone-tests-before-success);lifecycle:rail_sc
 [[fixture.rule]]
 name = "reconcile-before-build"
 verb = "attest"
-text = "the holder branch must be reconciled before the test producer runs"
+text = "the holder branch must be reconciled before verification runs"
 edges = ["verb", "turn-end"]
 deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
 [fixture.rule.check]
@@ -22,7 +22,7 @@ behind = "deny"
 [[fixture.rule]]
 name = "capstone-tests-before-success"
 verb = "attest"
-text = "reconcile then require mechanically produced tests"
+text = "reconcile then require a filed tests-passed verdict"
 edges = ["verb", "turn-end"]
-deny_when = [{ fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["tests-passed"] }]
+deny_when = [{ fact = "assignment.verdicts", op = "not_in", value = ["tests-passed"] }]
 external_producer = true

@@ -142,7 +142,7 @@ defmodule Tightbeam.RailRemedyTest do
     assignment = assignment(ctx, "script-gated-producer")
     install_script_assign_gate!(ctx)
     put_rules(ctx, review_gate() <> script_assign_gate())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     assert {:error,
             %{
@@ -259,7 +259,7 @@ defmodule Tightbeam.RailRemedyTest do
     assignment = assignment(ctx, "spawn-replay")
     put_rules(ctx, spawn_remedy())
     handlers = spawn_handlers(ctx)
-    Rules.load!(ctx.base_dir, Map.keys(handlers), %{})
+    Rules.load!(ctx.base_dir, Map.keys(handlers))
 
     assert {:error, %{producer: producer}} =
              Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
@@ -332,7 +332,7 @@ defmodule Tightbeam.RailRemedyTest do
   test "wake remedy reclaims a retired target through its wake ledger row", ctx do
     assignment = assignment(ctx, "wake-reclaim")
     put_rules(ctx, wake_gate())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     assert {:error, %{producer: producer}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
@@ -465,7 +465,7 @@ defmodule Tightbeam.RailRemedyTest do
   test "multi-statute actor closure closes only the statute that passed", ctx do
     assignment = assignment(ctx, "multi")
     put_rules(ctx, two_external_gates())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     now = System.system_time(:millisecond)
 
@@ -546,7 +546,7 @@ defmodule Tightbeam.RailRemedyTest do
       String.replace(review_gate(), "review {assignment_id}", "review {work_item_id}")
     )
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     assert {:error, %{reason: "remedy_fired", producer: nil}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
@@ -583,33 +583,53 @@ defmodule Tightbeam.RailRemedyTest do
     )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{}) end
+      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
 
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "does not require"
 
-    put_rules(ctx, produced_gate())
+    # D2: an artifact-gated remedy loads WITHOUT produces — the requirement is
+    # statically satisfiable (artifact-record is constitutional) — and escapes
+    # the F2 chain walk even where a verdict-gated shape would cycle.
+    put_rules(ctx, artifact_gate())
+    assert [_] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    # produces stays verdict-only: an artifact-only gate must omit it.
+    put_rules(
+      ctx,
+      String.replace(
+        artifact_gate(),
+        "action = \"wake\"",
+        ~s(action = "wake"\nproduces = "verified")
+      )
+    )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{}) end
+      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
 
-    assert error.message =~ "F1"
-    assert error.message =~ "produced-gate"
-    assert error.message =~ "tests-passed"
+    assert error.message =~ "valid only on a verdict-fact gate"
 
-    assert [_] =
-             Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{tests: "mix test"})
+    # A verdict-gated remedy still requires produces.
+    put_rules(
+      ctx,
+      String.replace(review_gate(), ~s(produces = "reviewed-clean"\n), "")
+    )
+
+    error =
+      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+
+    assert error.message =~ "must be a verdictKind required by the gate"
 
     put_rules(ctx, external_missing_gate())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{}) end
+      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
 
     assert error.message =~ "F1"
     assert error.message =~ "missing-producer"
 
     put_rules(ctx, review_gate())
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["attest"], %{}) end
+    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["attest"]) end
     assert error.message =~ "F2"
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "assign"
@@ -617,7 +637,7 @@ defmodule Tightbeam.RailRemedyTest do
     put_rules(ctx, review_gate() <> pure_blocker())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{}) end
+      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
 
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "block-remedy-assign"
@@ -625,14 +645,14 @@ defmodule Tightbeam.RailRemedyTest do
     put_rules(ctx, cycle_rules())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{}) end
+      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
 
     assert error.message =~ "F2 producer cycle"
     assert error.message =~ "cycle-assign"
     assert error.message =~ "cycle-wake"
 
     put_rules(ctx, review_gate() <> conditional_blocker())
-    assert [_gate, _blocker] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+    assert [_gate, _blocker] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     assignment = assignment(ctx, "conditional")
 
@@ -673,7 +693,7 @@ defmodule Tightbeam.RailRemedyTest do
 
       error =
         assert_raise ArgumentError, fn ->
-          Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+          Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
         end
 
       assert error.message =~ message
@@ -682,7 +702,7 @@ defmodule Tightbeam.RailRemedyTest do
 
   defp load_review_gate(ctx) do
     put_rules(ctx, review_gate())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), %{})
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
   end
 
   defp put_rules(ctx, contents) do
@@ -760,15 +780,23 @@ defmodule Tightbeam.RailRemedyTest do
     File.chmod!(wrapper, 0o755)
   end
 
-  defp produced_gate do
+  defp artifact_gate do
+    # verb "wake" with action "wake" would self-cycle in the F2 walk if the
+    # artifact requirement did not make the statute escaping.
     """
     [[rule]]
-    name = "produced-gate"
-    verb = "attest"
-    text = "tests required"
+    name = "artifact-gate"
+    verb = "wake"
+    text = "a results artifact is required"
+    effect = "remedy"
     deny_when = [
-      { fact = "assignment.produced_verdict_kinds", op = "not_in", value = ["tests-passed"] }
+      { fact = "assignment.artifact_kinds", op = "not_in", value = ["report"] }
     ]
+    [rule.remedy]
+    action = "wake"
+    target_session = "{holder_key}"
+    [rule.remedy.params]
+    prompt = "record the results artifact for {assignment_id}"
     """
   end
 

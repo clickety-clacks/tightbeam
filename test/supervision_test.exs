@@ -87,7 +87,7 @@ defmodule Tightbeam.SupervisionTest do
 
     File.mkdir_p!(base)
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(base, Map.keys(handlers), %{})
+    Rules.load!(base, Map.keys(handlers))
     on_exit(fn -> File.rm_rf!(base) end)
 
     %{
@@ -1089,7 +1089,7 @@ defmodule Tightbeam.SupervisionTest do
     rules_dir = Path.join(ctx.base, "identity/rules")
     File.mkdir_p!(rules_dir)
     File.write!(Path.join(rules_dir, "turn-end.toml"), contents)
-    Rules.load!(ctx.base, Map.keys(ctx.handlers), %{})
+    Rules.load!(ctx.base, Map.keys(ctx.handlers))
   end
 
   defp rail_sweep_details(db, session_key) do

@@ -105,10 +105,11 @@ preferred-models review row, not from stepping up the producer's tier.
 The largest model is not the target and the top thinking levels overthink — judge by
 the findings. The substrate records which family filed each
 verdict; link the review to the work it reviews (`--reviews`, see feature-cycle) so
-that independence is a fact on the record, not a claim. For work that touches live
-inputs, a real run against real inputs is required before it ships — green tests and a
-clean review are not that proof; `run-smoke` runs the org's committed smoke command
-and stamps the `real-run-passed` verdict that is.
+that independence is a fact on the record, not a claim. Real proof of working behavior
+is the verification statute's papertrail: the holder verifies the way the repository's
+prose defines verification, records the results as a report artifact, and files the
+`verified` verdict — green tests and a clean review are not that proof, and the
+substrate blocks a completion that lacks the papertrail.
 
 ## You do not edit source
 If you find yourself editing code, stop: staff a coder-archetype session — it carries

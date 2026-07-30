@@ -54,7 +54,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     holder = session(db, "holder", "flynn")
     other = session(db, "other-session", "other")
-    Rules.load!(System.tmp_dir!(), Map.keys(Gateway.handlers(%{db: db})), %{})
+    Rules.load!(System.tmp_dir!(), Map.keys(Gateway.handlers(%{db: db})))
     %{db: db, holder: holder, other: other, handlers: Gateway.handlers(%{db: db})}
   end
 
@@ -774,7 +774,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert is_binary(after_close.id)
   end
 
-  test "ordinary and producer verdicts freeze provenance and expose produced reads", ctx do
+  test "verdict attests freeze provenance and project inert producer history columns", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "verdict stamps"))
 
     ordinary =
@@ -785,6 +785,8 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert ordinary.attest.byHarness == "claude"
     assert ordinary.attest.byProvider == "anthropic"
+    # The producer columns are read-only history: nothing writes them anymore,
+    # and the projection keeps carrying them as nil on every new row.
     assert ordinary.attest.producer == nil
     assert ordinary.attest.producerCommand == nil
 
@@ -797,48 +799,12 @@ defmodule Tightbeam.AssignmentsTest do
     assert user_verdict.attest.byHarness == nil
     assert user_verdict.attest.byProvider == nil
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE sessions SET harness = 'codex', provider = 'openai' WHERE sessionKey = 'holder'"
-      )
-
-    assert {:ok, {:ok, produced}} =
-             DB.transaction(ctx.db, fn txn ->
-               Assignments.insert_producer_verdict_in_txn(txn, %{
-                 assignment_id: assignment.id,
-                 verdict_kind: "tests-passed",
-                 producer: "build",
-                 producer_command: "mix test --seed 0",
-                 by_session: "holder",
-                 by_user: nil,
-                 by_harness: "claude",
-                 by_provider: "anthropic"
-               })
-             end)
-
-    assert produced.producer == "build"
-    assert produced.producerCommand == "mix test --seed 0"
-    assert produced.byHarness == "claude"
-    assert produced.byProvider == "anthropic"
-    assert Assignments.produced_verdict_kinds(ctx.db, assignment.id) == ["tests-passed"]
-
     rows = Assignments.list_attests(ctx.db, assignment.id)
     assert Enum.find(rows, &(&1.id == ordinary.attest.id)).byHarness == "claude"
-    assert Enum.find(rows, &(&1.id == produced.id)).producerCommand == "mix test --seed 0"
+    assert Enum.all?(rows, &(&1.producer == nil and &1.producerCommand == nil))
 
     closed = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
     assert closed.assignment.state == "closed"
-
-    assert {:ok, {:error, %{code: "assignment_closed"}}} =
-             DB.transaction(ctx.db, fn txn ->
-               Assignments.insert_producer_verdict_in_txn(txn, producer_input(assignment.id))
-             end)
-
-    assert {:ok, {:error, %{code: "unknown_assignment"}}} =
-             DB.transaction(ctx.db, fn txn ->
-               Assignments.insert_producer_verdict_in_txn(txn, producer_input("missing"))
-             end)
   end
 
   test "commissioned review authors enforce the full review-link predicate", ctx do
@@ -1171,7 +1137,7 @@ defmodule Tightbeam.AssignmentsTest do
     """)
 
     on_exit(fn -> File.rm_rf!(base) end)
-    Rules.load!(base, Map.keys(ctx.handlers), %{})
+    Rules.load!(base, Map.keys(ctx.handlers))
 
     assert {:error, %{code: "rule_denied"}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, assign_call({:session, "holder"}, "denied"))
@@ -1341,19 +1307,6 @@ defmodule Tightbeam.AssignmentsTest do
   defp origin({:user, user}), do: "user:#{user}"
   defp origin({:process, process}), do: "process:#{process}"
   defp origin(nil), do: "agent:declared"
-
-  defp producer_input(assignment_id) do
-    %{
-      assignment_id: assignment_id,
-      verdict_kind: "tests-passed",
-      producer: "build",
-      producer_command: "mix test",
-      by_session: "holder",
-      by_user: nil,
-      by_harness: "claude",
-      by_provider: "anthropic"
-    }
-  end
 
   defp migration_base_ddl do
     """

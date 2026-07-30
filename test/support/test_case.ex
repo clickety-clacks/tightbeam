@@ -7,7 +7,6 @@ defmodule Tightbeam.TestCase do
     Tightbeam.Rules,
     Tightbeam.Rails,
     Tightbeam.Archetypes,
-    Tightbeam.Producers,
     {Tightbeam.Application, :draining}
   ]
 

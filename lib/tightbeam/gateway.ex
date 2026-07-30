@@ -82,7 +82,6 @@ defmodule Tightbeam.Gateway do
     ModelCatalog,
     Org,
     Projection,
-    Producers,
     RailRemedy,
     Rails,
     Rules,
@@ -178,7 +177,6 @@ defmodule Tightbeam.Gateway do
           EffortCheckin,
           Placement,
           RailRemedy,
-          Producers,
           Supervision,
           WorkState
         ] do
@@ -240,23 +238,18 @@ defmodule Tightbeam.Gateway do
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config, db)
     on_terminal = fn session_key, seq -> Supervision.notify_terminal(session_key, seq) end
-    producer_config = Producers.load!(config.base_dir)
-    producer_runner = Map.get(config, :producer_runner, Tightbeam.ProducerRunner)
 
     on_retired = fn session_key ->
       Supervision.notify_retired(session_key)
-      Producers.cancel_for_holder(db, session_key, runner: producer_runner)
     end
 
     handler_table =
       config
       |> Map.put(:db, db)
       |> Map.put(:on_retired, on_retired)
-      |> Map.put(:producer_config, producer_config)
-      |> Map.put(:producer_runner, producer_runner)
       |> handlers()
 
-    Rules.load!(config.base_dir, Map.keys(handler_table), producer_config)
+    Rules.load!(config.base_dir, Map.keys(handler_table))
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
@@ -371,14 +364,6 @@ defmodule Tightbeam.Gateway do
         {Tightbeam.Supervision,
          db: db, handlers: handler_table, prod_limit: prod_limit, name: Tightbeam.Supervision},
         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
-        %{
-          id: Tightbeam.ProducerSupervisor,
-          start:
-            {DynamicSupervisor, :start_link,
-             [[strategy: :one_for_one, name: Tightbeam.ProducerSupervisor]]}
-        },
-        {Tightbeam.ProducerRunner,
-         db: db, config: config, supervisor: Tightbeam.ProducerSupervisor, name: producer_runner},
         {Tightbeam.AdapterCoordinator,
          adapter_sup: Tightbeam.AdapterSupervisor,
          adapter_opts: adapter_opts,
@@ -823,23 +808,6 @@ defmodule Tightbeam.Gateway do
         )
       end,
       "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
-      "run-tests" => fn call ->
-        Producers.__handle__(db, "run-tests", call,
-          config: Map.get(config, :producer_config, Producers.config()),
-          runner: Map.get(config, :producer_runner)
-        )
-      end,
-      "run-smoke" => fn call ->
-        Producers.__handle__(db, "run-smoke", call,
-          config: Map.get(config, :producer_config, Producers.config()),
-          runner: Map.get(config, :producer_runner)
-        )
-      end,
-      "cancel-producer-job" => fn call ->
-        Producers.__handle__(db, "cancel-producer-job", call,
-          runner: Map.get(config, :producer_runner)
-        )
-      end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
       "critical" => fn call -> critical_result(config, db, call) end,
@@ -2905,6 +2873,12 @@ defmodule Tightbeam.Gateway do
         stream = Payloads.stream_session(session)
         broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
         %{stream: stream}
+
+      p[:setting] == "adopt" and is_boolean(p[:adopted]) ->
+        session = Org.set_adopted(db, call.session_key, p.adopted)
+        stream = Payloads.stream_session(session)
+        broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
+        %{ok: true}
 
       p[:setting] == "set_harness" and is_binary(p[:harness]) ->
         case Org.get(db, call.session_key) do

@@ -106,14 +106,6 @@ pub enum Command {
         identity: Identity,
         assignment_id: String,
     },
-    RunTests {
-        identity: Identity,
-        assignment_id: String,
-    },
-    RunSmoke {
-        identity: Identity,
-        assignment_id: String,
-    },
     WorkItemCreate {
         identity: Identity,
         title: String,
@@ -394,9 +386,6 @@ COMMANDS:
       List decision requests visible to your principal.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
-  run-tests <assignmentId>
-  run-smoke <assignmentId>
-      Queue the committed mechanical producer for an assignment.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
@@ -984,24 +973,6 @@ fn parse_with_optional_catalog(
                 assignment_id: parsed.positional[1].clone(),
             })
         }
-        "run-tests" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam run-tests <assignmentId>".to_owned());
-            }
-            Ok(Command::RunTests {
-                identity: identity(flags)?,
-                assignment_id: parsed.positional[1].clone(),
-            })
-        }
-        "run-smoke" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam run-smoke <assignmentId>".to_owned());
-            }
-            Ok(Command::RunSmoke {
-                identity: identity(flags)?,
-                assignment_id: parsed.positional[1].clone(),
-            })
-        }
         "work-item-create" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
@@ -1286,7 +1257,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate"
         )),
     }
 }
@@ -1543,8 +1514,6 @@ mod tests {
                 "onboard",
                 "retire",
                 "revoke-assignment",
-                "run-smoke",
-                "run-tests",
                 "spawn",
                 "wake",
                 "work-item-close",
@@ -1857,7 +1826,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate, run-smoke, run-tests".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate".to_owned())
         );
     }
 
@@ -1876,7 +1845,6 @@ mod tests {
             "decision-request",
             "critical",
             "adjudicate",
-            "cancel-producer-job",
             "work-item-update",
             "work-item-list",
             "assignment-get",
