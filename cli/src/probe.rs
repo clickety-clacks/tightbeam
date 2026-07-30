@@ -815,7 +815,6 @@ fn add_elapsed(io: &impl ProbeIo, raw: &mut RawFacts) {
             }
             Err(failure) => {
                 note_failure(&mut raw.notes, "ps identity", failure);
-                raw.processes.clear();
             }
         }
     }
@@ -1765,6 +1764,26 @@ mod tests {
             collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
         add_elapsed(&io, &mut raw);
         assert!(raw.processes.is_empty());
+    }
+
+    #[test]
+    fn darwin_retains_candidate_with_failure_note_when_identity_check_fails() {
+        let io = FakeIo {
+            commands: std::cell::RefCell::new(vec![
+                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp\n".to_vec()),
+                Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
+                Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
+                Ok(b"7 00:03\n".to_vec()),
+                Err(CommandFailure::Timeout),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut raw =
+            collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
+        add_elapsed(&io, &mut raw);
+        assert_eq!(raw.processes.len(), 1);
+        assert_eq!(raw.processes[0].pid, 7);
+        assert_eq!(raw.notes, vec!["ps identity timed out"]);
     }
 
     #[test]
