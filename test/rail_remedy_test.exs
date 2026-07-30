@@ -138,6 +138,35 @@ defmodule Tightbeam.RailRemedyTest do
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
   end
 
+  test "replaying a first occurrence close leaves the second occurrence live", ctx do
+    assignment = assignment(ctx, "reentered")
+    [rule] = load_review_gate(ctx)
+    completion = completion_call(assignment.id)
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    verdict(ctx, review_id, "reviewed-clean")
+
+    assert {:allow, [{"completion-needs-review", subject, occurrence}], []} =
+             Rules.decide(ctx.db, completion)
+
+    assert subject == assignment.id
+    assert occurrence == 1
+    assert RailRemedy.close(ctx.db, "completion-needs-review", subject, occurrence)
+
+    assert %{outcome: "reopened-dispatched"} =
+             RailRemedy.fire(ctx.db, ctx.handlers, rule, subject, completion)
+
+    assert %{status: "live", occurrence: 2} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", subject)
+
+    refute RailRemedy.close(ctx.db, "completion-needs-review", subject, occurrence)
+
+    assert %{status: "live", occurrence: 2} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", subject)
+  end
+
   test "remedy producer assign traverses dispatch and is denied by a script statute", ctx do
     assignment = assignment(ctx, "script-gated-producer")
     install_script_assign_gate!(ctx)
@@ -242,7 +271,7 @@ defmodule Tightbeam.RailRemedyTest do
 
     assert {:error, %{producer: producer}} = Task.await(reclaimed)
     send(original_pid, :release_original_dispatch)
-    assert {:error, %{producer: ^producer}} = Task.await(original)
+    assert {:error, %{producer: nil}} = Task.await(original)
 
     assert %{occurrence: 1, producer_key: ^producer, status: "live"} =
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
@@ -369,7 +398,7 @@ defmodule Tightbeam.RailRemedyTest do
     assert {:error, %{producer: first}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
 
-    assert RailRemedy.close(ctx.db, "completion-needs-review", assignment.id)
+    assert RailRemedy.close(ctx.db, "completion-needs-review", assignment.id, 1)
 
     assert {:error, %{producer: second}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
@@ -435,6 +464,41 @@ defmodule Tightbeam.RailRemedyTest do
                "SELECT COUNT(*) FROM assignments WHERE reviewsAssignmentId = ?1 AND id = ?2",
                [assignment.id, producer]
              )
+  end
+
+  test "post-dispatch CAS loser returns quietly without reporting its producer", ctx do
+    assignment = assignment(ctx, "post-dispatch-cas-loser")
+    [rule] = load_review_gate(ctx)
+    winner = "winner-producer"
+
+    handlers =
+      Map.put(ctx.handlers, "assign", fn _call ->
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            """
+            UPDATE rail_remedy_episodes
+            SET status = 'live', producerKey = ?3
+            WHERE statute = ?1 AND subject = ?2 AND status = 'dispatched'
+            """,
+            [rule.name, assignment.id, winner]
+          )
+
+        assert DB.changes(ctx.db) == 1
+        %{id: "losing-producer"}
+      end)
+
+    assert %{outcome: "claimed-dispatched", producer_id: nil} =
+             RailRemedy.fire(
+               ctx.db,
+               handlers,
+               rule,
+               assignment.id,
+               completion_call(assignment.id)
+             )
+
+    assert %{status: "live", producer_key: ^winner, occurrence: 1} =
+             RailRemedy.episode(ctx.db, rule.name, assignment.id)
   end
 
   test "denied producer dispatch releases the lease and the next edge retries", ctx do
