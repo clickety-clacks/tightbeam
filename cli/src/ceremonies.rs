@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::args::{AssimilateArgs, Identity};
-use crate::dispatch::{self, RequestSpec};
+use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
 use crate::preflight;
 
@@ -45,7 +45,25 @@ fn lease_timeout(ready: &serde_json::Value) -> Duration {
         .map_or(CEREMONY_FALLBACK_TIMEOUT, Duration::from_millis)
 }
 
-pub fn onboard(identity: &Identity, provider: &str, api_key: bool) -> Result<(), String> {
+fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
+    now + lease_timeout(ready)
+}
+
+struct Ceremony<'a> {
+    endpoint: &'a Endpoint,
+    deadline: Instant,
+}
+
+pub fn onboard<S>(
+    identity: &Identity,
+    provider: &str,
+    api_key: bool,
+    endpoint: &Endpoint,
+    send_request: S,
+) -> Result<(), String>
+where
+    S: Fn(&Endpoint, &RequestSpec) -> Result<Option<serde_json::Value>, String>,
+{
     let kind = if api_key { "apiKey" } else { "subscription" };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
@@ -61,15 +79,16 @@ pub fn onboard(identity: &Identity, provider: &str, api_key: bool) -> Result<(),
         machine.as_deref(),
         None,
     );
-    let ready = dispatch::send(&begin)?
+    let ready = send_request(endpoint, &begin)?
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
+    let deadline = lease_deadline(&ready, Instant::now());
     let staging = staging_path(&ready)?;
-    let timeout = lease_timeout(&ready);
+    let ceremony = Ceremony { endpoint, deadline };
 
     let staged = if api_key {
-        run_api_key_onboarding(provider, staging, machine.as_deref(), timeout)
+        run_api_key_onboarding(provider, staging, machine.as_deref(), &ceremony)
     } else {
-        run_provider_onboarding(provider, staging, machine.as_deref(), timeout)
+        run_provider_onboarding(provider, staging, machine.as_deref(), &ceremony)
     };
 
     if let Err(reason) = staged {
@@ -87,7 +106,7 @@ pub fn onboard(identity: &Identity, provider: &str, api_key: bool) -> Result<(),
             machine.as_deref(),
             classified,
         );
-        let _ = dispatch::send(&cancel);
+        let _ = send_request(ceremony.endpoint, &cancel);
         return Err(reason);
     }
 
@@ -99,7 +118,7 @@ pub fn onboard(identity: &Identity, provider: &str, api_key: bool) -> Result<(),
         machine.as_deref(),
         None,
     );
-    match dispatch::send(&finish) {
+    match send_request(ceremony.endpoint, &finish) {
         Ok(Some(result)) => {
             println!(
                 "{}",
@@ -117,7 +136,7 @@ pub fn onboard(identity: &Identity, provider: &str, api_key: bool) -> Result<(),
                 machine.as_deref(),
                 None,
             );
-            let _ = dispatch::send(&cancel);
+            let _ = send_request(ceremony.endpoint, &cancel);
             return Err(reason);
         }
     }
@@ -233,8 +252,8 @@ fn set_terminal_group(fd: libc::c_int, pgid: libc::pid_t) -> bool {
     }
 }
 
-/// Run an interactive ceremony bounded by `timeout`, terminating its whole process group if
-/// it outlives that. `what` names the ceremony in the timeout error: "timed out" alone does
+/// Run an interactive ceremony bounded by `deadline`, terminating its whole process group if
+/// it outlives that. `what` names the ceremony in the expiry error: "lease expired" alone does
 /// not tell an operator which process was killed on their terminal.
 ///
 /// codex self-limits its device-auth at 15 minutes. `claude setup-token` does not, and an
@@ -248,9 +267,15 @@ fn set_terminal_group(fd: libc::c_int, pgid: libc::pid_t) -> bool {
 fn run_bounded(
     mut command: ProcessCommand,
     what: &str,
-    timeout: Duration,
+    deadline: Instant,
     stdin: Option<&[u8]>,
 ) -> Result<ExitStatus, String> {
+    if Instant::now() >= deadline {
+        return Err(format!(
+            "{what} refused to start because its onboarding lease already expired"
+        ));
+    }
+
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -291,8 +316,6 @@ fn run_bounded(
         libc::killpg(pgid, libc::SIGCONT);
     }
 
-    let started = Instant::now();
-
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -300,7 +323,7 @@ fn run_bounded(
             Err(error) => return Err(error.to_string()),
         }
 
-        if started.elapsed() >= timeout {
+        if Instant::now() >= deadline {
             // TERM the group, give it a moment to clean up, then KILL what ignored it.
             // These children are RUNNING, so TERM is delivered at once -- the
             // TERM-before-CONT ordering would matter only for an already-STOPped
@@ -315,8 +338,8 @@ fn run_bounded(
             let _ = child.wait();
 
             return Err(format!(
-                "{what} did not finish within {}s; terminated it and its process group ({pgid})",
-                timeout.as_secs()
+                "{what} did not finish before its onboarding lease expired; terminated it and \
+                 its process group ({pgid})"
             ));
         }
 
@@ -328,11 +351,11 @@ fn run_provider_onboarding(
     provider: &str,
     staging: &str,
     machine: Option<&str>,
-    timeout: Duration,
+    ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
     match provider {
-        "openai" => run_openai_onboarding(staging, timeout),
-        "anthropic" => run_anthropic_onboarding(staging, machine, timeout),
+        "openai" => run_openai_onboarding(staging, ceremony),
+        "anthropic" => run_anthropic_onboarding(staging, machine, ceremony),
         #[cfg(test)]
         "fixture-provider" => std::fs::write(
             std::path::Path::new(staging).join("fixture.json"),
@@ -354,12 +377,12 @@ fn run_api_key_onboarding(
     provider: &str,
     staging: &str,
     machine: Option<&str>,
-    timeout: Duration,
+    ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
     let key = read_api_key()?;
-    validate_api_key(provider, &key, machine, timeout)?;
+    validate_api_key(provider, &key, machine, ceremony.deadline)?;
     match provider {
-        "openai" => bank_openai_api_key(staging, &key, timeout),
+        "openai" => bank_openai_api_key(staging, &key, ceremony),
         "anthropic" => bank_anthropic_api_key(staging, &key),
         #[cfg(test)]
         "fixture-provider" => fs::write(std::path::Path::new(staging).join("fixture.json"), &key)
@@ -419,10 +442,12 @@ fn validate_api_key(
     provider: &str,
     key: &str,
     machine: Option<&str>,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<(), String> {
     let host = machine.map(str::to_owned).unwrap_or_else(this_host);
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(deadline.saturating_duration_since(Instant::now()))
+        .build();
     let request = match provider {
         "anthropic" => agent
             .get("https://api.anthropic.com/v1/models?limit=1")
@@ -466,8 +491,8 @@ fn validate_api_key(
 ///
 /// Bounded by the same watchdog as every other ceremony child: a new path that
 /// spawned an unbounded child would reopen the orphan leak the watchdog closed.
-fn bank_openai_api_key(staging: &str, key: &str, timeout: Duration) -> Result<(), String> {
-    let codex = harness_cli("openai")?;
+fn bank_openai_api_key(staging: &str, key: &str, ceremony: &Ceremony<'_>) -> Result<(), String> {
+    let codex = harness_cli("openai", ceremony.endpoint)?;
     let mut command = ProcessCommand::new(&codex);
     command
         .args(["login", "--with-api-key"])
@@ -479,7 +504,7 @@ fn bank_openai_api_key(staging: &str, key: &str, timeout: Duration) -> Result<()
     let status = run_bounded(
         command,
         "codex login --with-api-key",
-        timeout,
+        ceremony.deadline,
         Some(key.as_bytes()),
     )?;
 
@@ -523,13 +548,13 @@ fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
 /// here; it is the pairing `Harness.credential_provider/0` states on the Elixir side.
 /// When the catalog cannot be reached the harness's own name is used, which is what both
 /// binaries are called today.
-fn harness_cli(provider: &str) -> Result<String, String> {
+fn harness_cli(provider: &str, endpoint: &Endpoint) -> Result<String, String> {
     let harness = match provider {
         "openai" => "codex",
         "anthropic" => "claude",
         _ => return Err(format!("unsupported provider: {provider}")),
     };
-    let binary = crate::harnesses::load_optional()
+    let binary = crate::harnesses::load_optional_from(endpoint)
         .and_then(|catalog| {
             catalog
                 .harnesses
@@ -576,8 +601,8 @@ fn this_host() -> String {
         .unwrap_or_else(|| "this machine".to_owned())
 }
 
-fn run_openai_onboarding(staging: &str, timeout: Duration) -> Result<(), String> {
-    let codex = harness_cli("openai")?;
+fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), String> {
+    let codex = harness_cli("openai", ceremony.endpoint)?;
     let mut command = ProcessCommand::new(&codex);
     command
         .args(["login", "--device-auth"])
@@ -586,7 +611,7 @@ fn run_openai_onboarding(staging: &str, timeout: Duration) -> Result<(), String>
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = run_bounded(command, "codex device-code login", timeout, None)?;
+    let status = run_bounded(command, "codex device-code login", ceremony.deadline, None)?;
 
     if status.success() {
         Ok(())
@@ -686,9 +711,9 @@ fn script_args(transcript: &str, claude: &str) -> Vec<String> {
 fn run_anthropic_onboarding(
     staging: &str,
     machine: Option<&str>,
-    timeout: Duration,
+    ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
-    let claude = harness_cli("anthropic")?;
+    let claude = harness_cli("anthropic", ceremony.endpoint)?;
     require_on_path(
         "script",
         &search_path(),
@@ -728,7 +753,7 @@ fn run_anthropic_onboarding(
     let status = run_bounded(
         command,
         "claude setup-token (under script(1))",
-        timeout,
+        ceremony.deadline,
         None,
     )?;
 
@@ -758,7 +783,7 @@ fn run_anthropic_onboarding(
         println!("{note}");
     }
 
-    validate_setup_token(&token, machine, timeout)?;
+    validate_setup_token(&token, machine, ceremony.deadline)?;
 
     let path = PathBuf::from(staging).join("oauth-token");
     let mut file = fs::OpenOptions::new()
@@ -803,11 +828,13 @@ fn subscription_probe(token: &str) -> (&'static str, [(&'static str, String); 2]
 fn validate_setup_token(
     token: &str,
     machine: Option<&str>,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<(), String> {
     let host = machine.map(str::to_owned).unwrap_or_else(this_host);
     let (url, headers) = subscription_probe(token);
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(deadline.saturating_duration_since(Instant::now()))
+        .build();
     let mut request = agent.get(url);
     for (name, value) in &headers {
         request = request.set(name, value);
@@ -1402,13 +1429,22 @@ mod tests {
             std::env::temp_dir().join(format!("tightbeam-fixture-provider-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(&staging).unwrap();
+        let endpoint = Endpoint {
+            base: "https://ceremony.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: None,
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + CEREMONY_FALLBACK_TIMEOUT,
+        };
 
         assert_eq!(
             run_provider_onboarding(
                 "fixture-provider",
                 staging.to_str().unwrap(),
                 None,
-                CEREMONY_FALLBACK_TIMEOUT
+                &ceremony
             ),
             Ok(())
         );
@@ -1446,8 +1482,13 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let error =
-            run_bounded(command, "a stub ceremony", Duration::from_secs(1), None).unwrap_err();
+        let error = run_bounded(
+            command,
+            "a stub ceremony",
+            Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .unwrap_err();
 
         // Named, not merely "timed out": an operator has to know what was killed on their
         // terminal.
@@ -1475,6 +1516,48 @@ mod tests {
             .map(|out| !out.stdout.trim_ascii().is_empty())
             .expect("could not determine whether the grandchild is alive: `ps` did not run");
         assert!(!alive, "grandchild {grandchild} outlived the group kill");
+    }
+
+    #[test]
+    fn lease_deadline_starts_from_the_begin_reply() {
+        let ready = serde_json::json!({"leaseTtlMs": 12_345});
+        let now = Instant::now();
+
+        assert_eq!(
+            lease_deadline(&ready, now).duration_since(now),
+            Duration::from_millis(12_345)
+        );
+    }
+
+    #[test]
+    fn an_expired_lease_refuses_before_spawning_the_ceremony() {
+        let marker = std::env::temp_dir().join(format!(
+            "tightbeam-expired-ceremony-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&marker);
+        let mut command = ProcessCommand::new("sh");
+        command
+            .args(["-c", &format!("touch '{}'", marker.display())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let error = run_bounded(
+            command,
+            "an expired stub ceremony",
+            Instant::now() - Duration::from_millis(1),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("an expired stub ceremony"), "{error}");
+        assert!(error.contains("lease already expired"), "{error}");
+        assert!(
+            !marker.exists(),
+            "the child ran even though the lease was already expired"
+        );
     }
 
     #[derive(Default)]
@@ -2081,8 +2164,13 @@ mod tests {
                 "{provider}: the projection must state {harness}'s CLI binary"
             );
         }
+        let endpoint = Endpoint {
+            base: "https://ceremony.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: None,
+        };
         assert_eq!(
-            harness_cli("nonesuch"),
+            harness_cli("nonesuch", &endpoint),
             Err("unsupported provider: nonesuch".to_owned())
         );
     }
