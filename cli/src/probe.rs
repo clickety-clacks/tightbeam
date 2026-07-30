@@ -144,6 +144,7 @@ impl ProbeIo for SystemIo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawProcess {
     pid: u32,
+    lstart: Option<Vec<u8>>,
     ppid: Option<u32>,
     pgid: Option<u32>,
     token: Option<Vec<u8>>,
@@ -435,6 +436,7 @@ fn collect_linux(
         }
         processes.push(RawProcess {
             pid,
+            lstart: None,
             ppid: Some(first.0),
             pgid: Some(first.1),
             token,
@@ -492,24 +494,12 @@ fn parse_darwin_pass1(
 ) -> Vec<RawProcess> {
     let mut processes = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
-        let trimmed = line
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .map_or(&[][..], |start| &line[start..]);
-        let pid_end = trimmed
-            .iter()
-            .position(|byte| byte.is_ascii_whitespace())
-            .unwrap_or(trimmed.len());
-        let Some(pid) = std::str::from_utf8(&trimmed[..pid_end])
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
+        let Some((pid, lstart, command)) = parse_pid_lstart_line(line) else {
             continue;
         };
         if pid == own_pid {
             continue;
         }
-        let command = &trimmed[pid_end..];
         let token = preferred_token(command);
         let harnesses = adapter_harnesses(command, catalog);
         if token.is_none() && harnesses.is_empty() {
@@ -522,6 +512,7 @@ fn parse_darwin_pass1(
         };
         processes.push(RawProcess {
             pid,
+            lstart: Some(lstart.to_vec()),
             ppid: None,
             pgid: None,
             token,
@@ -533,6 +524,55 @@ fn parse_darwin_pass1(
         });
     }
     processes
+}
+
+fn parse_pid_lstart_line(line: &[u8]) -> Option<(u32, &[u8], &[u8])> {
+    let mut cursor = 0usize;
+    while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let pid_start = cursor;
+    while line
+        .get(cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        cursor += 1;
+    }
+    let pid = std::str::from_utf8(&line[pid_start..cursor])
+        .ok()?
+        .parse::<u32>()
+        .ok()?;
+    while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let lstart_start = cursor;
+    let mut lstart_end = cursor;
+    for _ in 0..5 {
+        let field_start = cursor;
+        while line
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+        if cursor == field_start {
+            return None;
+        }
+        lstart_end = cursor;
+        while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+    }
+    Some((pid, &line[lstart_start..lstart_end], &line[cursor..]))
+}
+
+fn parse_pid_lstart(bytes: &[u8]) -> BTreeMap<u32, Vec<u8>> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            parse_pid_lstart_line(line).map(|(pid, lstart, _)| (pid, lstart.to_vec()))
+        })
+        .collect()
 }
 
 fn pid_list(processes: &[RawProcess]) -> OsString {
@@ -661,7 +701,7 @@ fn collect_darwin(
     let pass1 = io
         .command(
             "ps",
-            &["-axEww".into(), "-o".into(), "pid=,command=".into()],
+            &["-axEww".into(), "-o".into(), "pid=,lstart=,command=".into()],
             Duration::from_millis(1500),
         )
         .map_err(|failure| match failure {
@@ -753,6 +793,30 @@ fn add_elapsed(io: &impl ProbeIo, raw: &mut RawFacts) {
             }
         }
         Err(failure) => note_failure(&mut raw.notes, "ps etime", failure),
+    }
+    if raw.platform == "macos" {
+        match io.command(
+            "ps",
+            &[
+                "-o".into(),
+                "pid=,lstart=".into(),
+                "-p".into(),
+                pid_list(&raw.processes),
+            ],
+            Duration::from_millis(1000),
+        ) {
+            Ok(bytes) => {
+                let identities = parse_pid_lstart(&bytes);
+                raw.processes.retain(|process| {
+                    identities
+                        .get(&process.pid)
+                        .is_some_and(|lstart| process.lstart.as_ref() == Some(lstart))
+                });
+            }
+            Err(failure) => {
+                note_failure(&mut raw.notes, "ps identity", failure);
+            }
+        }
     }
 }
 
@@ -1491,7 +1555,8 @@ mod tests {
     #[test]
     fn darwin_rows_distinguish_spoofable_marker_and_unmarked_adapter_evidence() {
         let rows = parse_darwin_pass1(
-            b"7 node TIGHTBEAM_LINEAGE=tb1-YUBi\n8 codex-acp\n",
+            b"7 Thu Jul 30 12:34:56 2026 node TIGHTBEAM_LINEAGE=tb1-YUBi\n\
+              8 Thu Jul 30 12:34:56 2026 codex-acp\n",
             999,
             Some(&crate::harnesses::catalog().unwrap()),
         );
@@ -1654,7 +1719,8 @@ mod tests {
 
     #[test]
     fn darwin_deadline_degradation_retains_rows_and_successful_absence_drops() {
-        let pass1 = b"7 node codex-acp TIGHTBEAM_LINEAGE=tb1-YUBi\n".to_vec();
+        let pass1 =
+            b"7 Thu Jul 30 12:34:56 2026 node codex-acp TIGHTBEAM_LINEAGE=tb1-YUBi\n".to_vec();
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![
                 Ok(pass1.clone()),
@@ -1683,6 +1749,44 @@ mod tests {
     }
 
     #[test]
+    fn darwin_drops_candidate_when_final_lstart_changes() {
+        let io = FakeIo {
+            commands: std::cell::RefCell::new(vec![
+                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp\n".to_vec()),
+                Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
+                Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
+                Ok(b"7 00:03\n".to_vec()),
+                Ok(b"7 Fri Jul 31 12:34:56 2026\n".to_vec()),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut raw =
+            collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
+        add_elapsed(&io, &mut raw);
+        assert!(raw.processes.is_empty());
+    }
+
+    #[test]
+    fn darwin_retains_candidate_with_failure_note_when_identity_check_fails() {
+        let io = FakeIo {
+            commands: std::cell::RefCell::new(vec![
+                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp\n".to_vec()),
+                Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
+                Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
+                Ok(b"7 00:03\n".to_vec()),
+                Err(CommandFailure::Timeout),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut raw =
+            collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
+        add_elapsed(&io, &mut raw);
+        assert_eq!(raw.processes.len(), 1);
+        assert_eq!(raw.processes[0].pid, 7);
+        assert_eq!(raw.notes, vec!["ps identity timed out"]);
+    }
+
+    #[test]
     fn darwin_pass1_timeout_and_failure_are_fatal() {
         for (failure, expected) in [
             (CommandFailure::Timeout, "probe: ps enumeration timed out"),
@@ -1703,7 +1807,7 @@ mod tests {
     fn privacy_discards_full_command_buffers() {
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![
-                Ok(b"7 node codex-acp --token SECRETXYZ\n".to_vec()),
+                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp --token SECRETXYZ\n".to_vec()),
                 Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
                 Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
             ]),
@@ -1734,6 +1838,7 @@ mod tests {
             pids_env_unreadable: Some(0),
             processes: vec![RawProcess {
                 pid: 4,
+                lstart: None,
                 ppid: Some(1),
                 pgid: Some(4),
                 token: Some(b"tb2-raw".to_vec()),
@@ -1901,6 +2006,7 @@ mod tests {
             processes: vec![
                 RawProcess {
                     pid: 9,
+                    lstart: None,
                     ppid: Some(2),
                     pgid: Some(9),
                     token: Some(b"raw\xff".to_vec()),
@@ -1912,6 +2018,7 @@ mod tests {
                 },
                 RawProcess {
                     pid: 4,
+                    lstart: None,
                     ppid: Some(1),
                     pgid: Some(4),
                     token: Some(b"tb1-YUBi".to_vec()),
