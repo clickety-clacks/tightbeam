@@ -43,12 +43,23 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, _pid, _gen} =
              AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
 
-    assert wait_until(fn ->
-             match?(
-               %{"claude:default@testhost" => %{circuit: :open}},
-               AdapterCoordinator.health(coordinator)
-             )
-           end)
+    # MEASURED 2026-07-29, this cascade timed directly on an idle 16-core mac with
+    # only four test files running: 90, 99, 127, 2211, 2532 ms. Bimodal, and the
+    # slow mode is not the nominal work — five `sh -c false` spawns plus a
+    # 1,2,4,8,16ms backoff is the ~100ms cluster. The ~2.2s cluster is fork/exec
+    # contention with the `node` spawns of sibling suites, so what this budget
+    # actually races is process-spawn pressure from the rest of the run, which no
+    # barrier here can remove. The old 200-try (2s) budget lost to it in 2 of 3
+    # combined runs on an IDLE machine; CI is 4-core and busier.
+    assert wait_until(
+             fn ->
+               match?(
+                 %{"claude:default@testhost" => %{circuit: :open}},
+                 AdapterCoordinator.health(coordinator)
+               )
+             end,
+             1_500
+           )
 
     assert {:error, :degraded} =
              AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
@@ -309,24 +320,40 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          name: :"coordinator_#{System.unique_integer([:positive])}"}
       )
 
-    {:ok, counts} = Agent.start_link(fn -> %{active: 0, max: 0} end)
+    parent = self()
 
     tasks =
-      for _ <- 1..6 do
+      for i <- 1..6 do
         Task.async(fn ->
-          AdapterCoordinator.with_load_slot(coordinator, fn ->
-            Agent.update(counts, fn s ->
-              %{active: s.active + 1, max: max(s.max, s.active + 1)}
-            end)
+          send(parent, {:asking, i})
 
-            Process.sleep(40)
-            Agent.update(counts, &%{&1 | active: &1.active - 1})
+          AdapterCoordinator.with_load_slot(coordinator, fn ->
+            send(parent, {:entered, i, self()})
+            receive do: (:release -> :ok)
           end)
         end)
       end
 
-    Enum.each(tasks, &Task.await(&1, 2_000))
-    assert Agent.get(counts, & &1.max) == 3
+    # Every borrower HOLDS its slot until released, so "three at once" is observed
+    # rather than inferred. The old shape gave each borrower a 40ms sleep and read
+    # a high-water mark afterwards: under load a borrower could enter and leave
+    # before a sibling was scheduled, and a correct cap read as 2.
+    for _ <- 1..6, do: assert_receive({:asking, _})
+
+    # All six have reached the call and :sys.get_state is answered in mailbox
+    # order, so every acquire has been granted or queued before the refute below —
+    # which can no longer pass merely because the remaining tasks had not asked.
+    :sys.get_state(coordinator)
+
+    holders = for _ <- 1..3, do: assert_receive({:entered, _i, _pid})
+    refute_receive {:entered, _, _}, 50
+
+    release = fn entered -> for {:entered, _i, pid} <- entered, do: send(pid, :release) end
+    release.(holders)
+
+    # The queue drains onto the freed slots rather than staying wedged.
+    release.(for _ <- 1..3, do: assert_receive({:entered, _i, _pid}))
+    Enum.each(tasks, &Task.await(&1, 5_000))
   end
 
   test "load soft cap uses application config", ctx do
@@ -363,9 +390,16 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     second =
       Task.async(fn ->
+        send(parent, :second_asking)
         AdapterCoordinator.with_load_slot(coordinator, fn -> send(parent, :second_entered) end)
       end)
 
+    # The barrier the refute needs: nothing here proved the second task had even
+    # been SCHEDULED, so a cap that wrongly admitted it still looked blocked for
+    # the whole 50ms window. The marker says the task is running and the
+    # mailbox-ordered :sys.get_state says its acquire has been answered.
+    assert_receive :second_asking
+    :sys.get_state(coordinator)
     refute_receive :second_entered, 50
     send(first.pid, :release_first)
     assert_receive :second_entered

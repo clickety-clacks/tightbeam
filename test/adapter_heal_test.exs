@@ -289,6 +289,23 @@ defmodule Tightbeam.AdapterHealTest do
     # The DESIGNED shape, carrying the REAL spawn error — sh wrote that line,
     # and its wording is the OS's (macOS "cannot execute", Linux
     # "Permission denied"), so the assertion is on substance.
+    #
+    # These four already accept BOTH informative outcomes of the boot race and
+    # reject only the uninformative one, so they are deliberately left as they
+    # are. The turn either queued behind the failing boot and carries
+    # {:initialize_failed, _} directly, or it arrived after the death and the
+    # gateway enriched :noproc from the coordinator's attempt-scoped record
+    # (gateway.ex enrich_adapter_unavailable/4) — and that record IS the
+    # adapter's exit reason, {:adapter_fault, %{reason: {:initialize_failed, _},
+    # stderr: line}}, which failure_text/1 renders with all three tokens below.
+    # Both sides name the binary; that is what #78 entitles a caller to.
+    #
+    # The THIRD outcome is the one this must keep catching: if the coordinator
+    # has not yet processed the :DOWN, last_failure returns nil and the caller
+    # gets the bare string "adapter is not running", naming neither the binary
+    # nor the stderr. A red here under load is that window being visible, NOT a
+    # flake to silence — see #121. Widening this to accept the bare string would
+    # delete the only binary-naming assertion in the suite.
     assert {:adapter_unavailable, text} = reason
     assert text =~ "initialize_failed"
     assert text =~ binary
@@ -635,10 +652,18 @@ defmodule Tightbeam.AdapterHealTest do
     heal(ctx, {7, 2})
     assert {:ok, probe} = Ledger.claim_next(ctx.db, "k1", "lane")
     assert :ok = Ledger.finish(ctx.db, probe.seq, "failed")
-    assert [%{state: "pending"}] = retry_wakes(ctx.db)
+    assert [%{state: "pending", due_at: due_at}] = retry_wakes(ctx.db)
 
     # BEFORE the backoff elapses, the scheduler's fire delivers nothing — even
     # with the adapter ready and the hold eligible.
+    #
+    # The dueAt check states the precondition this negative rests on: the few
+    # statements above have to fit inside the 400ms backoff. Load makes that RED
+    # rather than a false pass — an overrun DELIVERS the probe — and this way the
+    # failure names the overrun instead of blaming the probe count for it.
+    assert due_at > System.system_time(:millisecond),
+           "the backoff elapsed before the pre-deadline fire; this run proves nothing"
+
     Wakes.fire_due(scheduler)
     assert probe_count(ctx.db) == 1
     assert [%{state: "pending"}] = retry_wakes(ctx.db)

@@ -1,6 +1,41 @@
 defmodule Tightbeam.TestCase do
   @moduledoc false
 
+  # WAITING ON THINGS — read this before adding a sleep or a refute.
+  #
+  # `start_supervised!` is NOT a boot barrier for an adapter. `Acp.Adapter.init/1`
+  # returns `{:ok, nil, {:continue, {:boot, opts}}}`, so it returns before `node`
+  # is spawned and before the `initialize` round trip; anything sent to a fresh
+  # adapter queues behind that boot.
+  #
+  # The sanctioned barriers, in order of preference. `assert_ready/2` (an
+  # unbounded receive plus a death monitor, acp_adapter_test.exs) for adapter
+  # boot. A `GenServer.call` into the target — including `:sys.get_state/1` —
+  # when the thing you are waiting on is a `cast`: both are answered in mailbox
+  # order, so the cast has RUN when the call returns.
+  #
+  # A fixed sleep before a `refute_receive`/`refute_received` is a false-pass
+  # generator, not a budget: if the work has not started yet, the absence you
+  # assert is the absence of a beginning. Make the racing side signal before it
+  # acts, `assert_receive` that signal, then refute.
+  #
+  # A predicate-poll helper that returns `false` on exhaustion must be called
+  # under `assert` — in statement position its timeout is silent, and the test
+  # passes having proven nothing.
+  #
+  # Which SIDE the budget sits on decides how it fails, and the two are not
+  # symmetric. A CHECK-side wait — how long you will watch for an effect —
+  # under-detects: for effect time T and window W, T<W is observed and T>W is
+  # missed, and load only raises T, so a longer check-side wait is never worse
+  # (neither a written file nor a received message is reversible once it lands).
+  # A SETUP-side budget is the dangerous one: it is the window the effect must
+  # land INSIDE, so load closes it and the test suppresses nothing while still
+  # going green. The case that established this: a kill test whose fixture slept
+  # 2s, which at load 97 finished on its own before the kill arrived, so the test
+  # passed having killed nothing. Give such a fixture a window load cannot close.
+  # Do not "simplify" a widened check-side wait back down on a symmetry that does
+  # not hold.
+
   use ExUnit.CaseTemplate
 
   @persistent_keys [

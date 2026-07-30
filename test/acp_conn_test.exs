@@ -68,6 +68,11 @@ defmodule Tightbeam.Acp.ConnTest do
 
   test "timeout replies but KEEPS the pending entry until resolution" do
     conn = start_conn("timeout")
+    # Same boot barrier as the notification test, and here it also fixes WHY the
+    # request below times out: with a cold harness the 100ms expires because
+    # `node` has not started, not because "never" went unanswered. The timeout
+    # only means what the test says it means once the harness is up.
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
     assert {:error, :timeout} = Conn.request(conn, "never", %{}, timeout: 100)
     assert Conn.pending_count(conn) == 1
     # adapter eventually answers (via cancel path) -> entry resolves
@@ -86,7 +91,11 @@ defmodule Tightbeam.Acp.ConnTest do
         Conn.request(conn, "never", %{}, session_id: "sess-1", timeout: 60_000)
       end)
 
-    Process.sleep(100)
+    # The request must be REGISTERED before the requester dies, or there is no
+    # orphan to resolve and the assertion below waits on something nobody will
+    # ever send. Waiting on the pending entry itself is that fact; the sleep it
+    # replaces was a guess at how long a Task takes to start.
+    assert eventually(fn -> Conn.pending_count(conn) == 1 end)
     Task.shutdown(task, :brutal_kill)
 
     # conn sends session/cancel for sess-1; fake answers the orphaned request;
@@ -97,8 +106,12 @@ defmodule Tightbeam.Acp.ConnTest do
 
   test "port exit fails outstanding requests and emits acp_exit" do
     conn = start_conn("exit")
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
     task = Task.async(fn -> Conn.request(conn, "never", %{}, timeout: 60_000) end)
-    Process.sleep(100)
+
+    # There has to BE an outstanding request for the close to fail one. The boot
+    # barrier above means the count can only be the "never" below it.
+    assert eventually(fn -> Conn.pending_count(conn) == 1 end)
     Conn.close(conn)
     assert {:error, :closed} = Task.await(task)
   end

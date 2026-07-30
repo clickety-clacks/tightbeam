@@ -29,6 +29,39 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   alias Tightbeam.DB.Txn
 
+  # Records the doorbells one subscriber actually received, drained by a call.
+  #
+  # The drain is what makes the assertions timing-free. `ConnRegistry` delivers
+  # with a bare `send` from inside its own `handle_call`, so a doorbell is in
+  # this process's mailbox before the publishing verb returns to the test; the
+  # `drain/1` call the test issues next is therefore enqueued behind it, and a
+  # GenServer serves its mailbox in order. Whatever was published has been
+  # recorded by the time `drain/1` answers.
+  #
+  # This replaced a `spawn`ed process that forwarded each push onward to the
+  # test. That hop was unsynchronized: a verb returning proved only that the
+  # doorbell had reached the relay, never that the relay had been scheduled to
+  # pass it on, so every `refute_receive` across it could pass on a loaded
+  # machine simply because the relay had not run yet — a false PASS on the
+  # assertions that exist to catch a doorbell being emitted when it must not be.
+  defmodule Observer do
+    use GenServer
+
+    def start_link(_opts), do: GenServer.start_link(__MODULE__, [])
+
+    @doc "Every payload received since the last drain, oldest first."
+    def drain(observer), do: GenServer.call(observer, :drain)
+
+    @impl true
+    def init(received), do: {:ok, received}
+
+    @impl true
+    def handle_call(:drain, _from, received), do: {:reply, Enum.reverse(received), []}
+
+    @impl true
+    def handle_info({:push, payload}, received), do: {:noreply, [payload | received]}
+  end
+
   setup do
     db = :"brackets_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -572,19 +605,19 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 15: an actual create publishes to the owner's board (unassigned); replay is silent",
        ctx do
-    observe("flynn", :flynn)
-    observe("eve", :eve)
+    flynn = observe("flynn")
+    eve = observe("eve")
 
     # An UNASSIGNED item has no holders: the doorbell must still reach its owner.
     item = create(ctx, {:user, "flynn"}, %{title: "Doorbell", idempotency_key: "dk"})
     assert doorbell_count(ctx.db, item.id) == 1
-    assert_receive {:flynn, {:push, %{"type" => "work_item_event", "kind" => "metadata"}}}
-    refute_receive {:eve, {:push, _}}
+    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(flynn)
+    assert Observer.drain(eve) == []
 
     replay = create(ctx, {:user, "flynn"}, %{title: "Doorbell", idempotency_key: "dk"})
     assert replay.id == item.id
     assert doorbell_count(ctx.db, item.id) == 1
-    refute_receive {:flynn, {:push, _}}
+    assert Observer.drain(flynn) == []
 
     assert item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "flynn"}))
     refute item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "eve"}))
@@ -661,15 +694,15 @@ defmodule Tightbeam.WorkItemBracketsTest do
     base = doorbell_count(ctx.db, item.id)
 
     # A disposition on an UNASSIGNED item still reaches the owner's board.
-    observe("flynn", :flynn)
+    flynn = observe("flynn")
     dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 1
-    assert_receive {:flynn, {:push, %{"type" => "work_item_event", "kind" => "metadata"}}}
+    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(flynn)
 
     # Same-state no-op: no doorbell, no publish.
     dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 1
-    refute_receive {:flynn, {:push, _}}
+    assert Observer.drain(flynn) == []
 
     dispose(ctx, "work-item-reopen", {:user, "flynn"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 2
@@ -858,30 +891,22 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   defp item_ids(%{items: items}), do: Enum.map(items, & &1.workItem.id)
 
-  # Register a work-state subscriber for a user, relaying its pushes to the test
-  # process tagged so owner vs non-owner delivery can be asserted independently.
-  defp observe(user_id, tag) do
-    test = self()
-    relay = spawn(fn -> relay_loop(test, tag) end)
+  # Register a work-state subscriber for a user. Each subscriber is its own
+  # process because attribution is the subject here — which user's board a
+  # doorbell reached — and `ConnRegistry` addresses a subscriber only by pid.
+  defp observe(user_id) do
+    observer = start_supervised!({Observer, []}, id: {:observer, user_id})
 
     {:ok, _, _} =
       Tightbeam.ConnRegistry.register(Tightbeam.ConnRegistry, %{
-        pid: relay,
+        pid: observer,
         user_id: user_id,
         device_id: "obs-#{user_id}",
         is_admin: false,
         subscriptions: MapSet.new(["work_state"])
       })
 
-    relay
-  end
-
-  defp relay_loop(test, tag) do
-    receive do
-      msg -> send(test, {tag, msg})
-    end
-
-    relay_loop(test, tag)
+    observer
   end
 
   defp load_rules(ctx, toml) do

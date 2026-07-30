@@ -264,11 +264,15 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert count(db, "SELECT COUNT(*) FROM turns") == 0
     stop_supervised!(db)
 
-    # FAIL-BEFORE: without the Wakes child nothing recovers, however long we wait.
+    # FAIL-BEFORE: without the Wakes child nothing recovers. Sampled across the
+    # window rather than napped through, and the window is denominated in the
+    # PASS-AFTER leg's own tick: 20 periods of the 25ms boot tick that leg needs
+    # to fire this wake. A recovery producer on anything like that cadence is
+    # therefore observed, and observed at the sample it first fires.
     restarted = :"delivery_file_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: path, name: restarted}, id: restarted)
-    Process.sleep(120)
-    assert Wakes.get(restarted, wake.wake_id).state == "pending"
+
+    assert consistently(fn -> Wakes.get(restarted, wake.wake_id).state == "pending" end)
 
     # PASS-AFTER: the exact gateway child, no operator verb, no fire_due/1.
     {Wakes, opts} = wakes_child(config(ctx.base_dir, restarted) |> Map.put(:wake_tick_ms, 25))
@@ -1081,6 +1085,19 @@ defmodule Tightbeam.EscalationDeliveryTest do
       check.() -> true
       remaining == 0 -> false
       true -> Process.sleep(25) && eventually(check, remaining - 1)
+    end
+  end
+
+  # `eventually`'s negative twin: the condition must hold at EVERY sample across
+  # the window, not merely at the end of one nap. A fixed sleep asserting that
+  # nothing happened only ever observes the last instant of its own budget, so a
+  # producer that fires early and a producer that never fires read identically —
+  # and a producer slower than the nap is not observed at all.
+  defp consistently(check, remaining \\ 20) do
+    cond do
+      not check.() -> false
+      remaining == 0 -> true
+      true -> Process.sleep(25) && consistently(check, remaining - 1)
     end
   end
 end

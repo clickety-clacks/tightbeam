@@ -804,10 +804,10 @@ defmodule Tightbeam.ClientE2ETest do
 
       assert LegGateway.teardown(gateway, exit_timeout_ms: 3_000, reap_timeout_ms: 3_000) == :ok
 
-      assert {_, 1} = System.cmd("kill", ["-0", grand], stderr_to_stdout: true),
+      assert await_process_gone(grand, 10_000) == :ok,
              "the SIGTERM-ignoring GRANDCHILD (#{grand}) outlived teardown"
 
-      assert {_, 1} = System.cmd("kill", ["-0", mid], stderr_to_stdout: true),
+      assert await_process_gone(mid, 10_000) == :ok,
              "the intermediate child (#{mid}) outlived teardown"
     end
 
@@ -848,7 +848,11 @@ defmodule Tightbeam.ClientE2ETest do
 
       refute LegGateway.ours?(gateway), "a mismatched command line must not read as ours"
 
-      LegGateway.teardown(gateway, exit_timeout_ms: 1_000, reap_timeout_ms: 1_000)
+      # Assert the RETURN, not just the side effect. A discarded return cannot
+      # tell "refused on identity, took the clean path" from "signalled and the
+      # kill happened to fail", and those are the two stories this test exists
+      # to separate.
+      assert LegGateway.teardown(gateway, exit_timeout_ms: 1_000, reap_timeout_ms: 1_000) == :ok
 
       assert {_, 0} =
                System.cmd("kill", ["-0", Integer.to_string(bystander)], stderr_to_stdout: true),
@@ -868,7 +872,11 @@ defmodule Tightbeam.ClientE2ETest do
 
       bystander = port |> Port.info(:os_pid) |> elem(1) |> Integer.to_string()
 
-      LegGateway.reap_descendants([{bystander, "/bin/nonexistent-captured-command"}], 1_000)
+      assert LegGateway.reap_descendants(
+               [{bystander, "/bin/nonexistent-captured-command"}],
+               1_000
+             ) ==
+               :ok
 
       assert {_, 0} = System.cmd("kill", ["-0", bystander], stderr_to_stdout: true),
              "a pid whose identity no longer matches the capture must not be signalled"
@@ -1314,6 +1322,31 @@ defmodule Tightbeam.ClientE2ETest do
     |> Enum.find(&(&1 == :done))
 
     assert File.exists?(path), "the survivor process never signalled readiness"
+  end
+
+  # A signalled process is not instantly gone: it can sit as a zombie until its
+  # parent — or launchd, once teardown has killed the parent and the survivors
+  # are reparented — reaps it, and `kill -0` reports a zombie as alive. Sampling
+  # once the instant teardown returns races the kernel rather than testing the
+  # reaper, so poll for the disappearance instead.
+  defp await_process_gone(pid, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    poll = fn poll ->
+      cond do
+        match?({_, 1}, System.cmd("kill", ["-0", pid], stderr_to_stdout: true)) ->
+          :ok
+
+        System.monotonic_time(:millisecond) >= deadline ->
+          :still_alive
+
+        true ->
+          Process.sleep(50)
+          poll.(poll)
+      end
+    end
+
+    poll.(poll)
   end
 
   defp registered_harness, do: Tightbeam.Harness.all() |> hd() |> then(& &1.wire_name())

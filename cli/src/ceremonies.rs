@@ -1463,11 +1463,17 @@ mod tests {
             "the stub never recorded a grandchild"
         );
 
+        // A failed `ps` spawn means this test learned NOTHING about the grandchild, and
+        // "learned nothing" must not collapse into the answer this assertion wants. The
+        // `unwrap_or(false)` here read a spawn failure as "not alive" and passed green —
+        // under load, where a spawn is most likely to fail, is exactly when the swallow
+        // fires. Same principle as the forged `child exit:` line in #43: a channel that
+        // cannot report must not be allowed to report success.
         let alive = ProcessCommand::new("ps")
             .args(["-o", "pid=", "-p", grandchild.trim()])
             .output()
             .map(|out| !out.stdout.trim_ascii().is_empty())
-            .unwrap_or(false);
+            .expect("could not determine whether the grandchild is alive: `ps` did not run");
         assert!(!alive, "grandchild {grandchild} outlived the group kill");
     }
 

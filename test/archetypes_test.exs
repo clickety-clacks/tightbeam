@@ -86,6 +86,21 @@ defmodule Tightbeam.ArchetypesTest do
            )
   end
 
+  # Every archetype x both harnesses, and each `snapshot_at!` is a chain of
+  # SEQUENTIAL git forks (rev-parse for the required refs, ls-tree for the
+  # guidance set, then a `git show` per fragment, manifest and skill). A single
+  # `git rev-parse HEAD` measured 1.6-2.6s on this box under a five-lane load
+  # against ~5ms idle, so the loop's cost is dominated by fork latency and
+  # scales with machine load, not with anything the test does.
+  #
+  # ExUnit's default per-test timeout is 60s and this run exceeded it — a
+  # BUDGET failure, not a defect the test found. It is the same root as
+  # @cold_runner_prompt_timeout in gateway_test and the same missing contract
+  # (#111): there is nothing to wait on, so there is nothing to barrier against.
+  # Both tests that walk this loop are tagged, not just the one that happened to
+  # blow up, because a budget fixed one site at a time leaves its twin holding
+  # the number already shown to be wrong.
+  @tag timeout: 180_000
   test "one composer delivers operating guidance to every archetype for both harnesses", ctx do
     Identity.init!(ctx.base_dir)
     loaded = Archetypes.load!(ctx.base_dir)
@@ -111,6 +126,8 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  # Same loop, same git-fork cost, same reason — see the tag above.
+  @tag timeout: 180_000
   test "every archetype's served snapshot carries the operating manual", ctx do
     Identity.init!(ctx.base_dir)
     loaded = Archetypes.load!(ctx.base_dir)

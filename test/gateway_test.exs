@@ -1,5 +1,40 @@
 defmodule Tightbeam.GatewayTest do
   use Tightbeam.TestCase, async: false
+
+  # How long a COLD runner Task is allowed to take to reach `Adapter.prompt`.
+  #
+  # One budget rather than three literals, because the three sites that wait on
+  # this are the same race and they had drifted apart: after the measurement
+  # below, one was raised to 15s and its two structurally identical siblings —
+  # same `Task.async(fn -> runner.(...) end)`, same `{:prompt_started, adapter}`
+  # — were left at 1s. A budget with no single home gets fixed one site at a
+  # time, and the sites that were not in the failing sample keep the number that
+  # was already shown to be wrong.
+  #
+  # MEASURED: at 1s this failed 2 of 5 samples on loaded macOS CI while the SAME
+  # runner Task went on to complete (the Task.await below it passes), so the
+  # message is sent and received, just later than 1s. #56 gave a bare `node`
+  # handshake 1s for the same reason (fdb2a21); a full turn needs more.
+  #
+  # RE-MEASURED 2026-07-29 under a 5-lane load (load average ~93 on 16 cores),
+  # which moved both the number and the explanation:
+  #
+  #   at 1_000:  4 of 4 runs failed here, and 5 of 5 at the mcp-servers wait
+  #   at 15_000: 15498 / 17886 / 21518 ms observed — 2 of 3 samples OVER it
+  #
+  # The cost is not scheduler contention. A cold turn's identity work is a chain
+  # of SEQUENTIAL git subprocess forks — three `rev-parse --verify` for the
+  # required refs, one `rev-parse` for the live revision, one `ls-tree` for the
+  # guidance set, then one `git show` per fragment, per manifest and per skill —
+  # and on this box a single git fork measured 1.6-2.6s (10 samples) at that
+  # load. Ten-odd forks is the entire budget. Fork latency scales with machine
+  # load, so the headroom here is deliberate rather than fitted to the max.
+  #
+  # This is a BUDGET because there is no readiness contract to wait on: the
+  # runner Task exposes no "started" signal a test can block against (#111). It
+  # weakens nothing — assert_receive still fails if the message never arrives.
+  @cold_runner_prompt_timeout 60_000
+
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
@@ -1914,7 +1949,21 @@ defmodule Tightbeam.GatewayTest do
           })
         end)
 
-      assert %{host: ^machine} = Task.await(reregister, 500)
+      # Two bounds, and the budget must sit between them. It must exceed a real
+      # register-host round (DB write, host-registry read-modify-write, endpoint
+      # staging) — measured in the hundreds of ms, but this box has taken 2s+ for
+      # a single subprocess under load. And it must stay well under the 5s
+      # GenServer.call default, because a re-registration that DID consult the
+      # suspended server would block on exactly that call: a budget at or past 5s
+      # would let the hang complete as a timeout and stop proving non-blocking.
+      #
+      # So the budget is pinned INSIDE a hard interval rather than measured: the
+      # upper bound is a property of the code (the 5s call default), the lower is
+      # the 2s+ subprocess this box has been seen to take. 2s sat on the lower
+      # bound itself, which is the racing regime; 3.5s is the middle of the only
+      # room the interval leaves. Widening past 5s would not be a safer budget,
+      # it would be a different and weaker test.
+      assert %{host: ^machine} = Task.await(reregister, 3_500)
       assert GenServer.whereis(server) == first_pid
     after
       :ok = :sys.resume(first_pid)
@@ -3039,6 +3088,7 @@ defmodule Tightbeam.GatewayTest do
          end}
       )
 
+    barrier_lane_started(lane)
     assert_receive :cancel_runner_started
 
     assert %{ok: true} =
@@ -3090,6 +3140,7 @@ defmodule Tightbeam.GatewayTest do
          end}
       )
 
+    barrier_lane_started(lane)
     assert_receive :dead_adapter_runner_started
 
     assert %{ok: true} =
@@ -3137,6 +3188,7 @@ defmodule Tightbeam.GatewayTest do
          end}
       )
 
+    barrier_lane_started(lane)
     assert_receive :slow_adapter_runner_started
 
     cancel =
@@ -3739,6 +3791,11 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = 'w_1'")
   end
 
+  # @cold_runner_prompt_timeout is 60_000 and ExUnit's default per-test timeout is
+  # also 60_000, so the budget would be capped by the test timeout and would report
+  # as "test timed out" rather than naming the wait that actually ran out. Raise the
+  # ceiling above the budget it contains.
+  @tag timeout: 180_000
   test "one fake-adapter turn publishes the golden frame order", ctx do
     exact_registry =
       start_supervised!(%{
@@ -3829,9 +3886,10 @@ defmodule Tightbeam.GatewayTest do
                         ]
                       }
                     ]},
-                   1_000
+                   @cold_runner_prompt_timeout
 
-    assert_receive {:prompt_started, ^adapter}, 1_000
+    # Four ms behind the wait above in every sample: the forks are already paid.
+    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
 
     digest =
       :crypto.hash(:sha256, "k1")
@@ -3987,6 +4045,11 @@ defmodule Tightbeam.GatewayTest do
   defp await_host_catalog(host, harness, 0),
     do: flunk("catalog did not become fresh: #{harness} on #{host}")
 
+  # @cold_runner_prompt_timeout is 60_000 and ExUnit's default per-test timeout is
+  # also 60_000, so the budget would be capped by the test timeout and would report
+  # as "test timed out" rather than naming the wait that actually ran out. Raise the
+  # ceiling above the budget it contains.
+  @tag timeout: 180_000
   test "next turn after set_host delivers the advertised remote URL", ctx do
     exact_registry =
       start_supervised!(%{
@@ -4095,20 +4158,19 @@ defmodule Tightbeam.GatewayTest do
              "sessionKey" => "k1"
            }
 
-    # Proven late, not lost. This fails only intermittently on loaded macOS CI (2 of 5
-    # samples) while the SAME runner Task completes successfully (Task.await below), so the
-    # message is genuinely sent and received — just after the 1s global budget, because the
-    # runner's full turn (rsync staging + adapter drive) competes for schedulers under load.
-    # #56 gave a bare node handshake 1s for the same reason (fdb2a21); a whole turn needs
-    # more. assert_receive still fails if the message never arrives, so a genuinely lost
-    # message is not hidden — only cold-runner latency is tolerated.
-    assert_receive {:prompt_started, ^adapter}, 15_000
+    # Proven late, not lost -- see @cold_runner_prompt_timeout for the measurement.
+    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
     publish.("delivered")
   end
 
+  # @cold_runner_prompt_timeout is 60_000 and ExUnit's default per-test timeout is
+  # also 60_000, so the budget would be capped by the test timeout and would report
+  # as "test timed out" rather than naming the wait that actually ran out. Raise the
+  # ceiling above the budget it contains.
+  @tag timeout: 180_000
   test "a fallback turn appends the context-reset marker between echo and reply", ctx do
     exact_registry =
       start_supervised!(%{
@@ -4165,7 +4227,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
     task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
-    assert_receive {:prompt_started, ^adapter}, 1_000
+    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
@@ -4353,14 +4415,6 @@ defmodule Tightbeam.GatewayTest do
                &1
              )
            )
-  end
-
-  defp collect_tagged_commands(tag, acc) do
-    receive do
-      {^tag, command} -> collect_tagged_commands(tag, [command | acc])
-    after
-      0 -> Enum.reverse(acc)
-    end
   end
 
   test "identity relearn reports a non-conflict git failure legibly", ctx do
@@ -5026,6 +5080,19 @@ defmodule Tightbeam.GatewayTest do
 
     Path.join([base_dir, "work", digest])
   end
+
+  # `SessionLane.init/1` ends `send(self(), :nudge)` and returns, so
+  # `start_supervised!` hands back a lane that has NOT yet claimed its turn.
+  # The nudge sits ahead of this call in the lane's own mailbox, so a reply
+  # here proves the claim ran and the runner task was spawned — collapsing
+  # four unbarriered hops (supervisor start, lane init, sqlite claim, task
+  # spawn) that a bare assert_receive would otherwise be timing.
+  #
+  # It does NOT prove the runner has RUN: the runner body executes in the
+  # task process, so the send we then wait for is still one scheduling hop
+  # away. That last hop is why the assert_receive stays. Measured under a
+  # 5-lane load (load average ~90): 0-106ms against the 1000ms default.
+  defp barrier_lane_started(lane), do: :sys.get_state(lane)
 
   defp collect_pushes(0, acc), do: Enum.reverse(acc)
 

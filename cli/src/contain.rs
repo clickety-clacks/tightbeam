@@ -1406,37 +1406,57 @@ mod tests {
     fn timeout_kills_the_whole_process_group() {
         let dir = temp_dir();
         let marker = dir.join("descendant-survived");
+        let gate = dir.join("gate");
+        let forked = dir.join("descendant-forked");
+        // `sleep 300`, not `sleep 5`: the leader has to still be hanging when the budget
+        // below expires, and that budget is now 8s rather than 40ms.
         let check = script(
             &dir,
             "hangs",
-            &format!("{}\nsleep 5", escaped_writer(&marker)),
+            &format!("{}\nsleep 300", escaped_writer(&marker, &gate, &forked)),
         );
         let status = run_with_input(
             RailExecArgs {
                 profile: permissive_profile(),
-                timeout: Duration::from_millis(40),
+                timeout: DESCENDANT_BUDGET,
                 script: check,
             },
             b"{}\n".to_vec(),
         );
         assert_eq!(status, SCRIPT_TIMEOUT);
-        assert_never_written(&marker);
+        assert_never_written(&marker, &gate, &forked);
         fs::remove_dir_all(dir).unwrap();
     }
+
+    /// How long the wrapper is given before it times out and kills the group, in the two
+    /// tests that need a DESCENDANT to exist by then.
+    ///
+    /// This is a budget, and it is a budget because there is no way to tell the wrapper
+    /// "time out once the descendant is up" — its deadline is fixed at spawn, before the
+    /// thing it has to outlast exists. So it is placed outside the racing regime instead
+    /// of tuned: /bin/sh reaches the fork at 235ms min / 1214ms median / 1668ms worst,
+    /// measured over 20 samples at load1≈55 on 16 cores, and 8s is ~4.8x that worst case.
+    /// The 40ms it replaces was 0.03x it, which made both tests vacuous 20 times in 20.
+    ///
+    /// If this is ever wrong again it can no longer be silent: `assert_never_written`
+    /// refuses a run in which the descendant was not forked.
+    const DESCENDANT_BUDGET: Duration = Duration::from_secs(8);
 
     #[test]
     fn timeout_stays_armed_when_the_leader_exits_before_a_descendant() {
         let dir = temp_dir();
         let marker = dir.join("descendant-survived");
+        let gate = dir.join("gate");
+        let forked = dir.join("descendant-forked");
         let check = script(
             &dir,
             "leader-exits",
-            &format!("{}\nexit 0", escaped_writer(&marker)),
+            &format!("{}\nexit 0", escaped_writer(&marker, &gate, &forked)),
         );
         let status = run_with_input(
             RailExecArgs {
                 profile: permissive_profile(),
-                timeout: Duration::from_millis(40),
+                timeout: DESCENDANT_BUDGET,
                 script: check,
             },
             b"{}\n".to_vec(),
@@ -1448,7 +1468,7 @@ mod tests {
         // through the window, is the proof that the timeout stayed armed. Timing the return
         // against a fixed 500ms budget proved the same thing by racing a fork and an exec
         // on a loaded runner, and lost (#51).
-        assert_never_written(&marker);
+        assert_never_written(&marker, &gate, &forked);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1512,19 +1532,42 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A descendant that outlives the wrapper and then writes CONTINUOUSLY.
+    /// A descendant that outlives the wrapper and then writes CONTINUOUSLY — but only
+    /// once the test says go.
     ///
-    /// The initial sleep is what makes the test about anything: the wrapper's budget is
-    /// 40ms, so a group kill that works lands during the sleep and the loop never runs.
-    /// It is not lengthened here — a longer sleep makes a false pass MORE likely, not
-    /// less, because it pushes the first write further past whatever window is watching.
+    /// The gate replaces a `sleep 1`, and it replaces it because that sleep was TWO fixed
+    /// budgets wearing one number. It had to be long enough that a working group kill
+    /// landed before the first write (or a correct wrapper fails), and short enough that a
+    /// SURVIVOR's first write landed inside whatever window was watching (or a broken
+    /// wrapper passes). Both sides were racing the machine, and the second side lost:
+    /// MEASURED at 20 samples of this exact shape, spawn-to-first-write is 1118ms mean
+    /// 2010ms / WORST 3228ms under load1≈84 on 16 cores (24 spinners plus a from-scratch
+    /// `cargo build --release`) — against the 3000ms window below. One sample in 20 wrote
+    /// AFTER the window closed, which is a containment failure recorded green.
     ///
-    /// Bounded rather than infinite: a survivor is a bug, and a bug should not leave a
-    /// shell looping on a shared box forever (#87). Ten seconds outlasts the poll window
-    /// with room and then exits on its own.
-    fn escaped_writer(marker: &Path) -> String {
+    /// Waiting on the gate is not a budget at all, it is a happens-before edge. The test
+    /// creates the gate only after the wrapper has RETURNED — that is, after the kill has
+    /// been issued and the child reaped — so the kill has unbounded time to land and can
+    /// no longer be beaten by a slow one. What the window has to outlast afterwards is not
+    /// a sleep but a survivor NOTICING the gate: one 50ms poll plus a fork and a write.
+    ///
+    /// Bounded rather than infinite on both loops: a survivor is a bug, and a bug should
+    /// not leave a shell looping on a shared box forever (#87). The gate wait gives up
+    /// after 200 polls, and the write loop after 200 iterations.
+    ///
+    /// The write loop counts in shell arithmetic rather than `for _ in $(seq 1 200)`
+    /// because that command substitution is a fork and an exec standing between the gate
+    /// and the first write — the very quantity the window downstream has to beat. Dropping
+    /// it moved the measured gate-to-first-write median from 1013ms to 561ms at load1≈80.
+    ///
+    /// The `forked` marker is written FIRST, before the descendant waits on anything, and
+    /// it is what makes the whole test non-vacuous — see `assert_never_written`.
+    fn escaped_writer(marker: &Path, gate: &Path, forked: &Path) -> String {
         format!(
-            "(sleep 1; for _ in $(seq 1 200); do echo survived > '{}'; sleep 0.05; done) &",
+            "(echo up > '{}'; n=0; while [ ! -e '{}' ] && [ $n -lt 200 ]; do n=$((n+1)); sleep 0.05; done; \
+             w=0; while [ $w -lt 200 ]; do w=$((w+1)); echo survived > '{}'; sleep 0.05; done) &",
+            forked.display(),
+            gate.display(),
             marker.display()
         )
     }
@@ -1533,13 +1576,56 @@ mod tests {
     /// after a fixed nap.
     ///
     /// The nap this replaces slept 1.1s and looked once. Its failure mode was a FALSE
-    /// PASS: under parallel `cargo test` the descendant's own `sleep 1` lands late, so the
+    /// PASS: under parallel `cargo test` the descendant's own sleep landed late, so the
     /// single look happened before the write, the marker was absent, and a containment
-    /// failure was recorded green. Polling inverts that — a survivor writes every 50ms, so
-    /// any survivor is caught within one interval, and the window is 3s to leave the
-    /// descendant's sleep three times its nominal length before this can miss it.
-    fn assert_never_written(marker: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+    /// failure was recorded green (#86). Polling inverts that — a survivor writes every
+    /// 50ms, so any survivor is caught within one interval.
+    ///
+    /// Three quantities have to stay ordered here, and this window sits on the right:
+    ///
+    ///     kill latency  <  [gate opens]  <  survivor's notice+write  <  WINDOW
+    ///
+    /// The left side is no longer timed at all: the gate is written below, after the
+    /// wrapper has RETURNED, so the kill has unbounded time to land and a slow kill can no
+    /// longer fail a correct wrapper. Only the right side is still a budget.
+    ///
+    /// What it has to beat, MEASURED rather than guessed (#51), 20 samples of this exact
+    /// shape at load1≈80 on 16 cores: gate-to-first-write is 120ms min / 561ms median /
+    /// 1620ms WORST. That tail is not the 50ms poll, it is fork-and-exec of `sleep` under
+    /// 5x oversubscription, and it is why this number is 10s and not 2s: 10s is 6.2x the
+    /// worst observed, where 3s would be 1.9x — still inside the racing regime.
+    ///
+    /// For contrast, the shape this replaces made the window race a `sleep 1` in the
+    /// descendant, whose spawn-to-first-write measured 1118ms min / 2010ms mean / 3228ms
+    /// WORST at load1≈84 against a 3000ms window — 0.93x, and one sample in 20 landed
+    /// outside it. A survivor missed is a containment failure recorded GREEN, so that
+    /// budget never showed as a red run; `cargo test --release` passed 5 of 5 while it was
+    /// live. Widening alone would not have been enough — the quantity being raced had to
+    /// become a small bounded one first.
+    fn assert_never_written(marker: &Path, gate: &Path, forked: &Path) {
+        // The scenario has to EXIST before its absence means anything. This test spent its
+        // life vacuous: with the wrapper's budget at 40ms, the group kill landed before
+        // /bin/sh ever reached the `( ... ) &`, so there was no descendant to kill and the
+        // test passed on the strength of a descendant that was never born.
+        //
+        // MEASURED, spawn to the fork actually happening, 20 samples at load1≈55 on 16
+        // cores: 235ms min / 1214ms median / 1668ms worst — 20 of 20 samples later than
+        // the 40ms budget. Proof that this mattered rather than an inference: regressing
+        // the wrapper's `killpg` to a single-child `kill` — the exact defect these two
+        // tests exist to catch — left BOTH of them green at 40ms, and at 200ms, and at
+        // 500ms. The regression was only caught once the budget reached 800ms idle and
+        // 2000ms under load. A test that cannot fail on its own regression is not a
+        // budget problem, it is an absent test, so the budget below is now 8s and this
+        // assertion refuses to let the vacuous case be silent ever again.
+        assert!(
+            forked.exists(),
+            "the descendant was never forked before the wrapper's kill landed, so this \
+             run proved NOTHING about group killing — it is the vacuous pass, not a pass"
+        );
+
+        fs::write(gate, b"go").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             assert!(
                 !marker.exists(),

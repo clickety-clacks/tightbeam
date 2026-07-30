@@ -78,6 +78,29 @@ missing =
     end
   end)
   |> then(fn acc ->
+    # The C5 script guards are real /bin/sh scripts and they parse their input with
+    # `jq` and resolve their workdir with `realpath`
+    # (test/conformance/c5_script_guards/scripts/*). A host without either does not
+    # fail loudly: the script dies, the wrapper reports a nonzero exit, the
+    # substrate classifies it `script_error` — and every C5 POSITIVE case expects a
+    # denial, so it is handed the denial it was looking for and passes having
+    # exercised no guard at all. That is the same hole the conformance suite now
+    # closes from the other side by pinning the denial REASON and not just the rule
+    # name; this closes it from the host side.
+    case Enum.reject(["jq", "realpath"], &System.find_executable/1) do
+      [] ->
+        acc
+
+      missing ->
+        [
+          "#{Enum.join(missing, " and ")} on PATH (the C5 rail-guard scripts parse\n" <>
+            "      their input with jq and resolve holder_workdir with realpath; without\n" <>
+            "      them every C5 positive case passes vacuously)."
+          | acc
+        ]
+    end
+  end)
+  |> then(fn acc ->
     # rail_script, conformance's rail-exec fixtures and cli_integration exec the
     # RELEASE binary, not a debug build and not `cargo run`.
     binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
@@ -119,9 +142,33 @@ end
 #
 # This weakens no assertion. Every one of these tests still requires its exact
 # message and still fails if it never arrives; the only thing that changes is how
-# long a correct message is allowed to take. Tests that assert something must NOT
-# arrive use refute_receive, whose own timeout is untouched.
-ExUnit.start(assert_receive_timeout: 1_000)
+# long a correct message is allowed to take.
+#
+# refute_receive is the OPPOSITE case and the dangerous one, so read this before
+# reaching for it. It fails toward GREEN: a message that should have arrived but
+# has merely been delayed past the window is indistinguishable from a message
+# that was correctly never sent, so load turns a real defect into a pass. The
+# 100ms default was left in place here for a long time with a note calling it
+# deliberate, and the census behind #83 found twelve sites relying on it where
+# nothing guaranteed the refuted work had even STARTED — the absence being
+# asserted was the absence of a beginning.
+#
+# The floor below is raised, but understand what it does and does not buy. It
+# covers scheduler- and mailbox-scale delay. It does NOT cover the quantities
+# that actually made those sites unsound, which were process-spawn scale:
+# measured on this project, /bin/sh reaching a fork is 235-1668ms and a `node`
+# ACP stub boot is worse. A floor that covered THAT would have to be seconds,
+# and every passing refute pays its window in full — at the 34 sites that take
+# the default, a 2s floor would cost the suite over a minute per run to buy
+# something a barrier buys for free.
+#
+# So the floor is defence in depth for a future author, never a substitute for
+# the barrier. If you are refuting a message, first make the racing side signal
+# that it has STARTED, assert_receive that signal, and only then refute — or use
+# an existing barrier that is answered in mailbox order (:sys.get_state/1, any
+# GenServer.call into the target). test/support/test_case.ex documents the
+# sanctioned ones.
+ExUnit.start(assert_receive_timeout: 1_000, refute_receive_timeout: 500)
 
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 
