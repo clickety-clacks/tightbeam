@@ -10,6 +10,20 @@
 # Runs one explicit spawn/dispatch leg per Harness.all/0 entry and exits
 # non-zero on the first failed assertion. Every new roadmap feature that is
 # user-callable should get a check here (see the smoke-coverage practice).
+#
+# ONE command runs BOTH legs; there is no per-leg invocation (tier-map GAP-3 —
+# FeatureSmokePlan.legs/1 maps over the compile-time registry and raises without
+# a model for each). That is not a limit for the gibson gate, which requires both
+# legs green anyway (artifact-carrier-proposal-v1 §7.3).
+#
+# The final group, artifact-record + completion-gate closure, additionally needs
+# the org's identity/rules to carry the shipped verification statutes
+# (completion-requires-verification, completion-requires-results-artifact) AND a
+# `coder` archetype. Rules load once at gateway BOOT, so an org whose law changed
+# under a running gateway must be rebooted before the run. On shrdlu that means
+# the eb0ea2b org-law workaround must be REVERTED first: with it installed the
+# artifact statute never denies and the group fails at its third denial, which is
+# exactly what keeps that leg falsifiable.
 
 defmodule FeatureSmoke do
   defmodule Failure do
@@ -17,6 +31,16 @@ defmodule FeatureSmoke do
   end
 
   @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "mike"
+
+  # How long the artifact-closure journey waits for the holder's REAL harness turns to
+  # land the record. Two turns can queue on that lane — the statute's own remedy wake
+  # and this journey's explicit one — against the 180s per-turn ceiling the client-e2e
+  # driver already treats as the worst case for one turn.
+  @artifact_turn_budget_ms 240_000
+
+  # How long a remedy episode gets to reach a status. The transition rides the attest
+  # that provoked it, so this covers scheduling, not model time.
+  @episode_settle_ms 30_000
 
   def run do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
@@ -49,6 +73,7 @@ defmodule FeatureSmoke do
       |> check_flagship_review_loop()
       |> check_escalation_to_owner()
       |> check_toplines_board()
+      |> check_artifact_record_closure()
       |> finish_leg()
     end)
   end
@@ -477,6 +502,389 @@ defmodule FeatureSmoke do
       state,
       "flagship reviewer-loop enforced end-to-end: blocked → reviewer assigned → verdict → completes"
     )
+  end
+
+  # --- T2a final journey: artifact-record + completion-gate closure --------------
+  # artifact-carrier-proposal-v1 §7.3, the leg the gibson activation gate names.
+  #
+  # This is the ONLY place in the tree where `artifact-record` runs from the real CLI
+  # inside a real harness turn, which is the only way the substrate-reserved PreToolUse
+  # observation (`Tightbeam.Rails.observation_entry/0`) can fire at all. Every other
+  # artifact assertion we have drives the writer directly and therefore cannot see the
+  # hook. On the codex leg this is load-bearing twice over: §5.2 records the codex hook
+  # path as resting on the 0.145.0 spike, never on a Tightbeam live proof, and codex is
+  # the primary coding harness.
+  #
+  # The chain, in the order the statutes deny (walked live on shrdlu, 2026-07-30):
+  #
+  #   attest completion  → rule_denied completion-requires-review
+  #   reviewed-clean     ← a session on the OTHER registered harness
+  #   attest completion  → rule_denied completion-requires-verification
+  #   verified           ← the holder itself; the statute reads `assignment.verdicts`,
+  #                        not the independent set, so the holder may file its own
+  #   attest completion  → rule_denied completion-requires-results-artifact
+  #   REAL CLI turn      → tightbeam artifact-record, over the wire, from the workdir
+  #   attest completion  → PASSES; the assignment closes `completed` and the artifact
+  #                        statute's remedy episode goes `live` → `closed` on its own
+  defp check_artifact_record_closure(state) do
+    u = unique()
+    reviewer_leg = independent_leg(state)
+    preflight_independent!(state, reviewer_leg)
+
+    post(state, "role-create", %{"name" => "reviewer"})
+
+    # Spawning through the OTHER leg is the whole cross-harness move: `post/3` runs every
+    # spawn through `FeatureSmokePlan.explicit_spawn/2`, which pins harness and model from
+    # `state.leg`, so swapping the leg for this one call is enough. `role-bind` REPLACES
+    # `boundSessionKey` (`Roles.bind/3`), so the flagship group's retired reviewer does not
+    # linger as the remedy's target.
+    reviewer =
+      ok!(%{state | leg: reviewer_leg}, "spawn", %{
+        "displayName" => "smoke-artifact-reviewer-#{u}",
+        "idempotencyKey" => "arv-#{u}"
+      })
+
+    reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
+    ok!(state, "role-bind", %{"name" => "reviewer", "sessionKey" => reviewer_key})
+    reviewer_tok = session_token(state, reviewer_key)
+
+    wi =
+      ok!(state, "work-item-create", %{
+        "title" => "artifact closure #{u}",
+        "idempotencyKey" => "arwi-#{u}"
+      })
+
+    wi_id = wi["workItemId"] || wi["id"]
+
+    # `holder_archetype in ["coder"]` is a deny_when condition on BOTH verification
+    # statutes, so the holder must actually BE a coder. A default-archetype holder walks
+    # straight past them and the journey would pass while proving nothing.
+    coder =
+      ok!(state, "spawn", %{
+        "archetype" => "coder",
+        "displayName" => "smoke-artifact-coder-#{u}",
+        "idempotencyKey" => "arcd-#{u}"
+      })
+
+    coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
+    post(state, "role-create", %{"name" => "coder-artifact-#{u}"})
+    ok!(state, "role-bind", %{"name" => "coder-artifact-#{u}", "sessionKey" => coder_key})
+    coder_tok = session_token(state, coder_key)
+
+    asg =
+      ok!(state, "assign", %{
+        "sessionKey" => coder_key,
+        "subject" => "artifact impl #{u}",
+        "workItemId" => wi_id,
+        "idempotencyKey" => "aras-#{u}"
+      })
+
+    asg_id = asg["id"] || asg["assignmentId"]
+
+    complete = fn ->
+      post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+    end
+
+    try do
+      # 1. Review gate. Its remedy assigns the bound reviewer a review of this assignment.
+      denied!(state, complete.(), "completion-requires-review")
+
+      reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+
+      review_asg =
+        (reviews["assignments"] || reviews)
+        |> List.wrap()
+        |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
+
+      assert(
+        state,
+        is_map(review_asg),
+        "artifact closure: remedy did not assign the #{reviewer_leg.wire_name} reviewer a review of #{asg_id}; got #{inspect(reviews)}"
+      )
+
+      v =
+        post_as(state, reviewer_tok, "attest", %{
+          "assignmentId" => review_asg["id"] || review_asg["assignmentId"],
+          "kind" => "verdict",
+          "verdictKind" => "reviewed-clean"
+        })
+
+      assert(
+        state,
+        not (is_map(v) and Map.has_key?(v, "error")),
+        "artifact closure: cross-harness reviewed-clean from #{reviewer_leg.wire_name} failed: #{inspect(v)}"
+      )
+
+      # 2. Verification gate, now reachable because the review gate stopped denying.
+      denied!(state, complete.(), "completion-requires-verification")
+
+      verified =
+        post_as(state, coder_tok, "attest", %{
+          "assignmentId" => asg_id,
+          "kind" => "verdict",
+          "verdictKind" => "verified"
+        })
+
+      assert(
+        state,
+        not (is_map(verified) and Map.has_key?(verified, "error")),
+        "artifact closure: holder verified verdict failed: #{inspect(verified)}"
+      )
+
+      # 3. The artifact gate — the statute this whole journey exists for. Before the
+      # carrier landed, `artifact-record` refused unconditionally from a real CLI client
+      # and this deny was unsatisfiable, which is the loop `eb0ea2b` worked around on
+      # shrdlu. If that workaround is still installed in the org under test, THIS
+      # assertion is what fails, which is what keeps the shrdlu leg falsifiable
+      # (§7.3 gate item 4).
+      denied!(state, complete.(), "completion-requires-results-artifact")
+
+      await_episode_status!(state, "completion-requires-results-artifact", asg_id, "live")
+
+      # 4. The real turn. The statute's own remedy has already woken the holder, and that
+      # wake may satisfy the gate by itself — but its prompt names neither the work item
+      # (which `Artifacts.record/2` REQUIRES) nor the direct-invocation constraint the
+      # observation depends on, so relying on it would make the leg's central assertion a
+      # coin flip on what the agent inferred. This wake queues behind it and says both
+      # things exactly. Whichever turn records first, the row is asserted the same way.
+      ok!(state, "wake", %{
+        "sessionKey" => coder_key,
+        "prompt" => artifact_prompt(u, wi_id, asg_id),
+        "idempotencyKey" => "arwake-#{u}"
+      })
+
+      reports = await_recorded_report!(state, coder_key, wi_id)
+      classes = Enum.map(reports, & &1["recordedTurnEvidence"])
+
+      # The null-vs-non-null coupling, on EVERY row. Pure substrate: `tool-call-observed`
+      # and `session-concurrent` each name a turn and must carry its id, `none` names no
+      # turn and must carry NULL. A row that breaks the pairing is a carrier defect
+      # regardless of what the agent chose to run.
+      Enum.each(reports, fn row ->
+        assert(
+          state,
+          row["recordedTurnEvidence"] in ~w(tool-call-observed session-concurrent none),
+          "artifact closure: recordedTurnEvidence outside its closed domain: #{inspect(row)}"
+        )
+
+        if row["recordedTurnEvidence"] == "none" do
+          assert(
+            state,
+            is_nil(row["recordedMessageId"]),
+            "artifact closure: evidence 'none' must carry a NULL recordedMessageId: #{inspect(row)}"
+          )
+        else
+          assert(
+            state,
+            is_binary(row["recordedMessageId"]),
+            "artifact closure: evidence #{inspect(row["recordedTurnEvidence"])} names a turn but recordedMessageId is NULL: #{inspect(row)}"
+          )
+        end
+      end)
+
+      # THE assertion this journey exists to force, and it is deliberately exact rather
+      # than "any of the three classes". Both registered harnesses project the observation
+      # entry unconditionally (`Rails.hook_settings/0`), and the prompt above forbids the
+      # script-wrapping that §1.3 names as the legitimate way to miss it. So on a leg where
+      # the hook works the row MUST read `tool-call-observed`; accepting `session-concurrent`
+      # here would make the leg vacuous on exactly the harness it was added to prove.
+      assert(
+        state,
+        "tool-call-observed" in classes,
+        "artifact closure: no report artifact on #{wi_id} reads tool-call-observed — the " <>
+          "reserved PreToolUse observation did not fire for the #{state.leg.wire_name} " <>
+          "harness, so this leg's rows rest on concurrency rather than observation. " <>
+          "Classes seen: #{inspect(classes)}. Rows: #{inspect(reports)}"
+      )
+
+      # `createdBySession` and `workItemId` are not re-asserted here: the query above
+      # already filters on both, so a row that reached this point cannot fail them. The
+      # origin path is the one param the substrate copies rather than derives, so it is
+      # what proves the real CLI carried this journey's arguments into the row.
+      observed = Enum.find(reports, &(&1["recordedTurnEvidence"] == "tool-call-observed"))
+
+      assert(
+        state,
+        (observed["originPath"] || "") =~ "results-#{u}",
+        "artifact closure: observed row does not carry the origin path the CLI was given: #{inspect(observed)}"
+      )
+
+      # 5. Closure. The gate releases, and the assignment reaches `closed`/`completed`
+      # whether this attest or the holder's own turn filed the completion — both are the
+      # same substrate fact, and neither `surrendered` nor a still-open assignment can be
+      # mistaken for it. `surrendered` here is the roadmap 0a2 failure: an agent escaping
+      # an unsatisfiable gate by abandoning the work permanently.
+      done = complete.()
+      final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
+
+      assert(
+        state,
+        final["state"] == "closed" and final["outcome"] == "completed",
+        "artifact closure: with the report recorded, completion should close #{asg_id} as completed; " <>
+          "assignment reads state=#{inspect(final["state"])} outcome=#{inspect(final["outcome"])} " <>
+          "(attest returned #{inspect(done)})"
+      )
+
+      await_episode_status!(state, "completion-requires-results-artifact", asg_id, "closed")
+
+      pass(
+        state,
+        "artifact-record + completion-gate closure: review(#{reviewer_leg.wire_name}) → " <>
+          "verified → artifact denied → real CLI record #{inspect(classes)} → completes, episode closed"
+      )
+    after
+      retire(state, reviewer)
+      retire(state, coder)
+    end
+  end
+
+  # The reviewer runs on a DIFFERENT registered harness wherever the registry offers one.
+  # This buys no extra enforcement — `assignment.independent_verdict_kinds` reads sessions,
+  # never harnesses — and it costs nothing either: `FeatureSmokePlan.legs/1` RAISES unless
+  # every registered harness has a model, and T2a already requires a live credential for
+  # each, so the other leg's material is a precondition of the run rather than a new one.
+  # What it buys is the cross-harness verdict path the live walk exercised.
+  defp independent_leg(state) do
+    Tightbeam.Harness.all()
+    |> Tightbeam.FeatureSmokePlan.legs()
+    |> Enum.find(state.leg, &(&1.wire_name != state.leg.wire_name))
+  end
+
+  # A missing credential is a NAMED WAIVER, never an onboarding. Onboarding is its own
+  # rarely-run runbook and it mints material; a smoke that reaches for it turns a reported
+  # gap into a silent repair.
+  defp preflight_independent!(state, leg) do
+    if leg.wire_name == state.leg.wire_name do
+      state
+    else
+      row = Tightbeam.ClientE2E.preflight(leg.wire_name, state.base_dir)
+
+      assert(
+        state,
+        row.status == :pass,
+        "artifact closure: no usable #{leg.wire_name} credential for the independent reviewer " <>
+          "(#{row.step}: #{row.status} — #{row.note}). Do NOT onboard from inside the smoke: file " <>
+          "this leg INCOMPLETE with a named waiver for the missing #{leg.wire_name} credential, " <>
+          "run the onboarding runbook, and re-run."
+      )
+    end
+  end
+
+  # Everything the holder's turn needs that the statute's own remedy prompt does not say.
+  #
+  # DIRECT INVOCATION is a substrate requirement, not a style note: the observation greps
+  # the tool call's own command text, so a wrapped call is one of §1.3's legitimately
+  # hookless calls and would land `session-concurrent` truthfully.
+  #
+  # KEEPING THE ASSIGNMENT OPEN is the guidance-side mitigation for roadmap 0a2, where an
+  # agent meeting a gate it could not satisfy surrendered and closed the work permanently.
+  # The gate is satisfiable now; the instruction is here so a leg cannot fail on an agent
+  # reaching for the old escape.
+  defp artifact_prompt(u, wi_id, asg_id) do
+    """
+    Substrate smoke check #{u} on assignment #{asg_id}. Do exactly these two steps.
+
+    1. Write a file named results-#{u}.md in your current working directory containing
+       one line: smoke verification results #{u}
+
+    2. Run this as a single shell command, exactly as written:
+       tightbeam artifact-record --kind report --title 'smoke report #{u}' --path results-#{u}.md --work-item #{wi_id}
+
+    Run step 2 DIRECTLY as the shell command. Do not put it in a script file, a Makefile,
+    or any wrapper, and do not run it through one — the substrate reads the command text of
+    the call itself, and a wrapped invocation records weaker provenance than the real one.
+
+    Keep assignment #{asg_id} OPEN. Do not surrender it, do not revoke it, and do not
+    attest completion — the operator files completion. If something denies you, satisfy
+    that gate and carry on in order; never abandon the assignment to get out of a gate.
+    """
+  end
+
+  defp denied!(state, res, statute) do
+    assert(
+      state,
+      get_in(res, ["error", "rule"]) == statute or
+        (get_in(res, ["error", "message"]) || "") =~ statute,
+      "artifact closure: completion should be denied by #{statute}, got #{inspect(res)}"
+    )
+  end
+
+  defp await_recorded_report!(state, session_key, work_item_id) do
+    await_recorded_report!(
+      state,
+      session_key,
+      work_item_id,
+      System.monotonic_time(:millisecond) + @artifact_turn_budget_ms
+    )
+  end
+
+  defp await_recorded_report!(state, session_key, work_item_id, deadline) do
+    reports =
+      state
+      |> ok!("artifacts", %{
+        "workItemId" => work_item_id,
+        "sessionKey" => session_key,
+        "kind" => "report"
+      })
+      |> Map.get("artifacts", [])
+      |> List.wrap()
+
+    cond do
+      reports != [] ->
+        reports
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        assert(
+          state,
+          false,
+          "artifact closure: the holder recorded no report artifact on #{work_item_id} within " <>
+            "#{div(@artifact_turn_budget_ms, 1000)}s. Either the real CLI `artifact-record` " <>
+            "refused (the §1.1 defect this carrier fixed) or the holder's turns never ran it."
+        )
+
+      true ->
+        Process.sleep(1_000)
+        await_recorded_report!(state, session_key, work_item_id, deadline)
+    end
+  end
+
+  # `rail_remedy_episodes` has no wire projection, so this reads the DB directly — the
+  # same local-harness shortcut `session_token/2` and `await_turn_boundary!/2` already take.
+  defp await_episode_status!(state, statute, subject, want) do
+    await_episode_status!(
+      state,
+      statute,
+      subject,
+      want,
+      System.monotonic_time(:millisecond) + @episode_settle_ms
+    )
+  end
+
+  defp await_episode_status!(state, statute, subject, want, deadline) do
+    {out, 0} =
+      System.cmd("sqlite3", [
+        Path.join(state.base_dir, "state.db"),
+        "SELECT status FROM rail_remedy_episodes WHERE statute = #{sql_quote(statute)} AND subject = #{sql_quote(subject)}"
+      ])
+
+    got = String.trim(out)
+
+    cond do
+      got == want ->
+        state
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        assert(
+          state,
+          false,
+          "artifact closure: remedy episode #{statute}/#{subject} should be #{inspect(want)}, " <>
+            "reads #{inspect(got)}"
+        )
+
+      true ->
+        Process.sleep(250)
+        await_episode_status!(state, statute, subject, want, deadline)
+    end
   end
 
   # Fetch a session's own CLI bearer token from the state DB (local test harness only).
