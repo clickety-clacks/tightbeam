@@ -394,10 +394,8 @@ defmodule Tightbeam.Supervision do
         # effect's consequence and the ruling changed what a malfunction ALSO does, not
         # what it decides.
         {:deny_escalate, statute, ctx} ->
-          {:decision_pending, _id} =
-            Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
-
           rail_sweep_lifecycle(db, session_key, assignment.id, ctx.error.rule, "re-obligate")
+          :ok = Escalation.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
           :fallthrough
 
         {:deny, error} ->

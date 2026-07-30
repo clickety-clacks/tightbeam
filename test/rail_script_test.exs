@@ -914,6 +914,91 @@ defmodule Tightbeam.RailScriptTest do
     assert open_episodes.() == 0
   end
 
+  # The summons is SUBORDINATE to the deny (§B3). A caller with no accountable owner
+  # cannot have a mind summoned on its behalf — `owner_user_id!/2` raises for it — and
+  # before this that raise escaped the actor and turned a settled denial into a crashed
+  # call. An unreachable mind is a recorded gap; it is never an outage.
+  test "a summons with no reachable owner still denies, and records the failure", ctx do
+    handlers = %{
+      "post" => fn _call -> flunk("a malfunctioning rail must not run the handler") end
+    }
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+
+    ownerless = %{
+      call(%{work_item_id: "w-ownerless"})
+      | origin: "process:tightbeam",
+        principal: nil
+    }
+
+    # Byte-identical to the denial an owned caller receives for the same malfunction.
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "script-escalate",
+              edge: "verb",
+              reason: "script_timeout",
+              script_exit_class: "timeout",
+              ref: "w-ownerless"
+            }} = Dispatch.dispatch(ctx.db, handlers, ownerless)
+
+    assert [denial] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert denial.reason == "script_timeout"
+    assert denial.script_exit_class == "timeout"
+
+    # Nobody was summoned...
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+
+    # ...and that gap is legible rather than silent.
+    assert [%{subject: "script-escalate", detail: detail}] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "decision_request_failed"))
+
+    assert detail =~ "summons failed"
+    assert detail =~ "no accountable owner"
+  end
+
+  # Dedup binds only LIVE requests (§B3). A mind ruling on the WORK does not repair the
+  # SENSOR, so a malfunction arriving after a resolved-but-unhealed request must open a
+  # fresh episode — otherwise the second failure is exactly the silent recurrence §A3
+  # forbids, hidden behind a request that was already answered.
+  test "a malfunction after a resolved request opens a fresh episode", ctx do
+    handlers = %{
+      "post" => fn _call -> flunk("a malfunctioning rail must not run the handler") end
+    }
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+    broken = call(%{work_item_id: "w-resolved"})
+
+    assert {:error, %{script_exit_class: "timeout"}} = Dispatch.dispatch(ctx.db, handlers, broken)
+    assert {:ok, [[id, "open"]]} = DB.query(ctx.db, "SELECT id, status FROM decision_requests")
+
+    assert %{status: "ruled"} =
+             Escalation.rule(
+               ctx.db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{request_id: id, decision: "allow"}
+               },
+               authorized: true
+             )
+
+    # The sensor is still broken, so the deny recurs — and it must not recur silently
+    # under the ruling that was about the work, not the clock.
+    assert {:error, %{script_exit_class: "timeout"}} = Dispatch.dispatch(ctx.db, handlers, broken)
+
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+
+    assert {:ok, [[fresh]]} =
+             DB.query(ctx.db, "SELECT id FROM decision_requests WHERE status = 'open'")
+
+    refute fresh == id
+  end
+
   # The summons is an EFFECT, so it belongs to the actors, not to the decision function
   # (§B). `decide` runs the script and writes its row and stops there; `evaluate` is the
   # legacy collapse, and fires nothing at all.

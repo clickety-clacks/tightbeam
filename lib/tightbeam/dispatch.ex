@@ -118,14 +118,14 @@ defmodule Tightbeam.Dispatch do
 
       # A sensor malfunction denies AND summons (§A3). The caller gets the denial it
       # already got — never `{:decision_pending, _}` — while the escalation engine opens
-      # the request that puts a mind on the sensor. `escalate/4` is the same hand-off the
-      # branch above makes; the episode key in `ctx` is what makes its one-open-request
-      # index dedupe on the CONDITION, so a retry loop cannot storm the engine.
+      # the request that puts a mind on the sensor. The episode key in `ctx` is what
+      # makes the one-open-request index dedupe on the CONDITION, so a retry loop cannot
+      # storm the engine. The deny is settled FIRST and the summons is `summon/4`, which
+      # cannot raise: the summons is subordinate to the deny (§B3), so an unreachable
+      # mind is a recorded gap and never a crashed call.
       {:deny_escalate, statute, ctx} ->
-        {:decision_pending, _id} =
-          Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
-
         best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
+        :ok = Escalation.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
         {:error, ctx.error}
 
       :allow ->

@@ -233,6 +233,45 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  @doc """
+  The SUBORDINATE summons: `escalate/4` that can never raise into the call path (§B3).
+
+  A malfunction's denial is already decided before the summons is attempted, and it
+  must return byte-identical whether or not a mind can actually be reached — so a
+  hand-off that cannot complete (no accountable owner resolves for the caller's
+  principal or origin, the store is unavailable) is RECORDED and swallowed, never
+  propagated. That is the difference between an unreachable mind and a call that
+  crashes: one is a legible gap, the other is the silent stall §A3 exists to prevent.
+
+  The recording is itself best-effort, for the same reason the deny cannot depend on
+  the summons: an observability row that will not land must not become an outage.
+  """
+  @spec summon(DB.server(), map(), map(), map()) :: :ok
+  def summon(db, call, statute, ctx) do
+    {:decision_pending, _id} = escalate(db, call, statute, ctx)
+    :ok
+  rescue
+    error -> summons_failed(db, statute, Exception.message(error))
+  catch
+    kind, value -> summons_failed(db, statute, "#{kind}: #{inspect(value)}")
+  end
+
+  defp summons_failed(db, statute, reason) do
+    _ =
+      EventLog.lifecycle(
+        db,
+        "decision_request_failed",
+        statute_name(statute),
+        String.slice("summons failed: #{reason}", 0, 512)
+      )
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
   @doc "Spend one ruled authorization. Batch rollback is deliberately not provided."
   @spec consume(DB.server(), String.t()) :: boolean()
   def consume(db, ruling_id) do
