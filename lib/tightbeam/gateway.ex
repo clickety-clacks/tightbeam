@@ -1796,7 +1796,7 @@ defmodule Tightbeam.Gateway do
 
               snapshot = served_snapshot(config, session, harness, revision)
 
-              AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, fn ->
+              AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, session.host, fn ->
                 case Adapter.load_session(
                        adapter,
                        pointer.harness_session_id,
@@ -3259,7 +3259,7 @@ defmodule Tightbeam.Gateway do
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
               snapshot = served_snapshot(config, session, harness, revision)
 
-              AdapterCoordinator.with_load_slot(coordinator, fn ->
+              AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
                 Adapter.load_session(
                   adapter,
                   pointer.harness_session_id,

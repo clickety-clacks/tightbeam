@@ -107,7 +107,7 @@ defmodule Tightbeam.GatewayTest do
       {:reply, reply, state}
     end
 
-    def handle_call({:acquire_load_slot, _borrower}, _from, state),
+    def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
     def handle_call({:close_adapter, key}, _from, {adapter, parent} = state) do
@@ -116,7 +116,7 @@ defmodule Tightbeam.GatewayTest do
       {:reply, :ok, state}
     end
 
-    def handle_cast({:release_load_slot, _slot}, state), do: {:noreply, state}
+    def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
   end
 
   defmodule AdapterStub do
