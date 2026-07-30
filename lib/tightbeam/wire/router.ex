@@ -868,13 +868,29 @@ defmodule Tightbeam.Wire.Router do
     "attend" => ~w(turn_seq session_key reply_attention attention_tier)a
   }
 
+  # WIRE WORD -> HANDLER ATOM, PER VERB: the few params whose wire spelling and
+  # handler spelling are deliberately different, because the word the caller says
+  # and the edge it sets are not the same noun. `assign --reviews <id>` names the
+  # REVIEWED assignment and sets `reviewsAssignmentId`; p3-observables-producers-v1
+  # §Review-of relation pins both names ("wire `reviews`, atomized
+  # `:reviews_assignment_id`"). Underscoring alone yields `:reviews`, which no
+  # handler reads, so the link silently never landed.
+  @param_aliases %{
+    "assign" => %{reviews: :reviews_assignment_id}
+  }
+
   @doc false
   # Exposed so the Law-0 boundary strip is provable at its own seam.
   def atomize_params_for_test(verb, params), do: atomize_params(verb, params)
 
   defp atomize_params(verb, params) when is_map(params) do
+    aliases = Map.get(@param_aliases, verb, %{})
+
     params
-    |> Map.new(fn {key, value} -> {key |> Macro.underscore() |> String.to_atom(), value} end)
+    |> Map.new(fn {key, value} ->
+      atom = key |> Macro.underscore() |> String.to_atom()
+      {Map.get(aliases, atom, atom), value}
+    end)
     |> Map.drop(Map.get(@substrate_only_params, verb, []))
   end
 
