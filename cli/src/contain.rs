@@ -126,6 +126,46 @@ fn spawn_contained(command: &mut std::process::Command) -> io::Result<std::proce
     unreachable!("the loop returns on the final attempt")
 }
 
+/// Has the leader exited? Asked WITHOUT reaping it.
+///
+/// A pid is a valid signal target only until it is reaped — that is a state transition,
+/// not a window, and no delay makes signalling a reaped pid safer. `try_wait` here would
+/// reap: `waitpid(WNOHANG)` returns the status and frees the pid in the same call. The
+/// wait loop below deliberately stays armed past the leader's exit, because a descendant
+/// may still hold stdout, so the pid it eventually hands to `killpg` would by then be a
+/// number the kernel was free to reissue — on a busy linux host, with `pid_max` at 32768,
+/// to an unrelated process group that then takes an unhandleable SIGKILL.
+///
+/// `WNOWAIT` is the one flag that separates the two things `waitpid` does at once: it
+/// reports the exit and leaves the child a zombie. A zombie still occupies its pid, and
+/// the pid is the group id, so the group the wrapper is holding a claim on cannot be
+/// reissued underneath it. The reap moves to after the signal.
+///
+/// `waitid` rather than `waitpid` because `WNOWAIT` is documented as a `waitid`-only
+/// option on both platforms — it is not in `waitpid`'s option set. The struct is zeroed
+/// first and read back through `si_signo`, which POSIX.1-2008 TC1 requires to be cleared
+/// when `WNOHANG` finds nothing, and which is a plain field on both linux and darwin (the
+/// `si_pid` the same paragraph names is behind an accessor on linux and a field on
+/// darwin, and would have cost a `cfg` to read for no additional guarantee).
+fn exited_without_reaping(child: &std::process::Child) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(info.si_signo != 0)
+}
+
 fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     // Staging happens before the fork so a containment that cannot be built is a fact
     // this process observes directly, rather than an exit code to be inferred from a
@@ -222,12 +262,11 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     });
 
     let started = Instant::now();
-    let mut status = None;
+    let mut leader_exited = false;
     let timed_out = loop {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(child_status)) => status = Some(child_status),
-                Ok(None) => {}
+        if !leader_exited {
+            match exited_without_reaping(&child) {
+                Ok(exited) => leader_exited = exited,
                 Err(error) => {
                     eprintln!("rail-exec wait failed: {error}");
                     let pgid = child.id() as libc::pid_t;
@@ -240,7 +279,7 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
             }
         }
 
-        if status.is_some()
+        if leader_exited
             && stdin_writer
                 .as_ref()
                 .is_none_or(thread::JoinHandle::is_finished)
@@ -257,9 +296,10 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
                 libc::killpg(pgid, libc::SIGKILL);
             }
 
-            if status.is_none() {
-                let _ = child.wait();
-            }
+            // Reaped only here, after the signal has gone out. Nothing above this line
+            // has ever waited the leader, so the pgid just named was still this
+            // wrapper's own — and the kernel could not have handed it to anyone else.
+            let _ = child.wait();
 
             break true;
         }
@@ -273,6 +313,17 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         drop(stderr_reader);
         return SCRIPT_TIMEOUT;
     }
+
+    // The leader's exit was observed without reaping it, so this is the first and only
+    // `waitpid` on the clean path — it returns at once against the zombie the loop left
+    // standing, and it is what finally releases the pid.
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("rail-exec wait failed: {error}");
+            return SCRIPT_ERROR;
+        }
+    };
 
     let stdin_delivered = match stdin_writer {
         None => true,
@@ -301,8 +352,6 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         eprintln!("rail-exec: script input undelivered; no child verdict");
         return SCRIPT_ERROR;
     }
-
-    let status = status.expect("child status present when pipe workers finish");
 
     if status.success() {
         let _ = io::stdout().write_all(&stdout);
@@ -1470,6 +1519,73 @@ mod tests {
         // on a loaded runner, and lost (#51).
         assert_never_written(&marker, &gate, &forked);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_leaders_pid_is_still_the_wrappers_when_the_timeout_kill_goes_out() {
+        let dir = temp_dir();
+        let forked = dir.join("descendant-forked");
+        let released = dir.join("leader-pid-released");
+        let check = script(
+            &dir,
+            "leader-exits-then-watches",
+            &format!("{}\nexit 0", reap_watcher(&forked, &released)),
+        );
+        let status = run_with_input(
+            RailExecArgs {
+                profile: permissive_profile(),
+                timeout: DESCENDANT_BUDGET,
+                script: check,
+            },
+            b"{}\n".to_vec(),
+        );
+        assert_eq!(status, SCRIPT_TIMEOUT);
+        assert!(
+            forked.exists(),
+            "the descendant was never forked, so nothing watched the leader's pid — this \
+             run proved NOTHING about who owns it at kill time"
+        );
+        assert!(
+            !released.exists(),
+            "the leader's pid was released while the timeout was still armed, so the \
+             killpg at the end of the window named a pid the wrapper no longer owned"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A descendant that holds stdout open — so the wrapper stays armed — and watches the
+    /// one thing this test is about: whether the LEADER's pid is still a pid the wrapper
+    /// owns.
+    ///
+    /// `kill -0` on the leader is the whole instrument, and it reads a state rather than a
+    /// duration: an exited-but-unreaped leader is a zombie, which still answers signal 0,
+    /// and a reaped one is gone. So the watcher does not have to catch a moment — the
+    /// released state is permanent once it happens, and it happens (when it happens) at
+    /// the wrapper's very first `waitpid`, milliseconds in, against an 8s window the
+    /// watcher polls 20 times a second.
+    ///
+    /// The leader pid is captured OUTSIDE the subshell, because `$$` in POSIX sh is the
+    /// invoking shell's pid whether or not a subshell is reading it, and it is the
+    /// invoking shell that the wrapper spawned, set as its own process-group leader, and
+    /// will name to `killpg`.
+    ///
+    /// The watcher does NOT stop when it sees the release, and that is load-bearing: the
+    /// first shape did, and exiting closed the last hold on stdout, so the wrapper's
+    /// readers hit EOF and it returned the leader's own `exit 0` as band 0. Both worlds
+    /// have to reach the same band — 20, at the same deadline — or the marker is not the
+    /// thing under test. Holding the pipe for 20s against an 8s budget is what keeps the
+    /// run armed until the kill either way.
+    ///
+    /// Bounded, not infinite, on the same reasoning as `escaped_writer` (#87): a survivor
+    /// here is a bug, and a bug must not leave a shell spinning on a shared box.
+    fn reap_watcher(forked: &Path, released: &Path) -> String {
+        format!(
+            "leader=$$\n\
+             (echo up > '{}'; n=0; while [ $n -lt 400 ]; do n=$((n+1)); \
+             kill -0 $leader 2>/dev/null || echo released > '{}'; sleep 0.05; done) &",
+            forked.display(),
+            released.display()
+        )
     }
 
     #[test]
