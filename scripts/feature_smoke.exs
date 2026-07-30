@@ -297,13 +297,18 @@ defmodule FeatureSmoke do
   # into a MatchError naming neither the command nor the reason. Supplying the identity in
   # the call's own env is what `Tightbeam.Identity.git!/3` already does for every commit
   # the substrate makes, and it keeps the identity scoped to this one commit: no global
-  # config is consulted, and the org's own git config is not rewritten by the act of
-  # smoking it.
+  # identity is required or selected, and the org's own git config is not rewritten by the
+  # act of smoking it.
+  #
+  # The address follows `Identity.git_env/1`'s own derivation rather than being chosen
+  # freely — it sanitizes the name into the local part, so the name below yields exactly
+  # this address. Matching it keeps the two producers of tightbeam commits indistinguishable
+  # in the log.
   @smoke_git_env [
     {"GIT_AUTHOR_NAME", "tightbeam feature-smoke"},
-    {"GIT_AUTHOR_EMAIL", "feature-smoke@tightbeam.local"},
+    {"GIT_AUTHOR_EMAIL", "tightbeam-feature-smoke@tightbeam.local"},
     {"GIT_COMMITTER_NAME", "tightbeam feature-smoke"},
-    {"GIT_COMMITTER_EMAIL", "feature-smoke@tightbeam.local"}
+    {"GIT_COMMITTER_EMAIL", "tightbeam-feature-smoke@tightbeam.local"}
   ]
 
   defp smoke_git!(dir, args) do
