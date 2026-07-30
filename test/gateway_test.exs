@@ -214,6 +214,9 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
+    # A RESIDENT session: the adapter still holds it, so apply bounces it.
+    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
+
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:identity_apply_close, sid})
       {:reply, :ok, parent}
@@ -226,6 +229,46 @@ defmodule Tightbeam.GatewayTest do
         ) do
       send(parent, {:identity_apply_load, sid, model, cwd, mcp_servers, guidance})
       {:reply, :ok, parent}
+    end
+  end
+
+  # The state EVERY started session is in after a gateway restart: its pointer row
+  # survives in the DB, the adapter process is new and holds nothing.
+  defmodule GoneSessionAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:knows_session?, sid}, _from, parent) do
+      send(parent, {:gone_residency_asked, sid})
+      {:reply, false, parent}
+    end
+
+    # Answering these at all is the point: the harness never heard of this
+    # session, so asking it to close one is what produced the raw -32603.
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:gone_close_attempted, sid})
+      {:reply, {:error, %{"code" => -32603, "message" => "Session not found"}}, parent}
+    end
+
+    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:gone_load_attempted, sid})
+      {:reply, :ok, parent}
+    end
+  end
+
+  # A LIVE adapter that holds the session and fails for its own reason — which
+  # must still refuse, and must not be swallowed by the residency branch.
+  defmodule ApplyErrorAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
+
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:apply_error_close, sid})
+      {:reply, {:error, %{"code" => -32000, "message" => "harness is shutting down"}}, parent}
     end
   end
 
@@ -4593,6 +4636,133 @@ defmodule Tightbeam.GatewayTest do
     assert session_key == session.session_key
     assert Org.current_pointer(ctx.db, session.session_key) == nil
     refute_receive {:push, %{"type" => "stream_updated"}}
+  end
+
+  # Regression, found live on shrdlu: a pointer row outlives the adapter that
+  # made it, so after ANY gateway restart EVERY started session has a pointer
+  # naming a harness session no adapter holds. Apply bounced it anyway and the
+  # harness answered "Session not found" as a raw JSON-RPC -32603, which the
+  # verb then raised — so `identity apply --all` was broken org-wide until every
+  # session happened to resume. Main always qualifies.
+  test "identity apply advances the stamp of a started session the adapter no longer holds",
+       ctx do
+    base_dir = role_test_base("identity-apply-gone")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-gone",
+        display_name: "Identity apply gone",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-vanished", "created")
+
+    next =
+      Identity.edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "guidance the restart must not lose",
+        "test"
+      )
+
+    adapter = start_supervised!({GoneSessionAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "identity-apply-gone-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{applied: [session_key], identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert session_key == session.session_key
+    assert_receive {:gone_residency_asked, "thread-vanished"}
+
+    # Nothing is asked of a harness that never heard of this session.
+    refute_receive {:gone_close_attempted, _}
+    refute_receive {:gone_load_attempted, _}
+
+    # THE STAMP IS THE APPLICATION here. The next start reloads from
+    # `identity_revision`, not from live, so a session left behind would
+    # materialize stale forever while `identity status` kept calling it stale.
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+
+    # And the pointer chain records only what happened: nothing was loaded.
+    assert Org.current_pointer(ctx.db, session.session_key).harness_session_id ==
+             "thread-vanished"
+
+    assert Org.current_pointer(ctx.db, session.session_key).reason == "created"
+  end
+
+  test "identity apply refuses by name when a live adapter fails for its own reason", ctx do
+    base_dir = role_test_base("identity-apply-error")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-error",
+        display_name: "Identity apply error",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-resident", "created")
+
+    Identity.edit!(
+      base_dir,
+      "coder",
+      {:skill, "worktree-session", false},
+      "guidance that cannot be delivered",
+      "test"
+    )
+
+    adapter = start_supervised!({ApplyErrorAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    # A NAMED refusal, not a raise and not a raw JSON-RPC envelope from three
+    # layers down. The residency branch must not have swallowed this.
+    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert session_key == session.session_key
+    assert result.message =~ "harness is shutting down"
+    refute result.message =~ "-32000"
+    assert_receive {:apply_error_close, "thread-resident"}
+
+    # A refused apply changes nothing.
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
   end
 
   test "credential transitions publish the captured provider-session set exactly once", ctx do

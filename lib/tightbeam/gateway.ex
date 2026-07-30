@@ -2065,35 +2065,45 @@ defmodule Tightbeam.Gateway do
   defp identity_apply_at_boundary(config, db, sessions, []) do
     live = Identity.live_revision!(config.base_dir)
 
-    applied =
-      Enum.map(sessions, fn session ->
-        case identity_apply_session(config, db, session, live) do
-          :applied ->
-            best_effort(fn ->
-              stream = db |> Org.get(session.session_key) |> Payloads.stream_session()
-              broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
-            end)
+    sessions
+    |> Enum.reduce_while([], fn session, applied ->
+      case identity_apply_session(config, db, session, live) do
+        :applied ->
+          best_effort(fn ->
+            stream = db |> Org.get(session.session_key) |> Payloads.stream_session()
+            broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
+          end)
 
-          :noop ->
-            :ok
-        end
+          {:cont, [session.session_key | applied]}
 
-        session.session_key
-      end)
+        :noop ->
+          {:cont, [session.session_key | applied]}
 
-    %{applied: applied, identity_revision: live}
+        {:error, refusal} ->
+          {:halt, refusal}
+      end
+    end)
+    |> case do
+      applied when is_list(applied) ->
+        %{applied: Enum.reverse(applied), identity_revision: live}
+
+      refusal ->
+        refusal
+    end
   end
 
   defp identity_apply_session(config, db, session, revision) do
     case Org.current_pointer(db, session.session_key) do
+      # A session that has never started has no harness session to bounce AND no
+      # stamp to correct: it materializes from `tightbeam/live` at its first
+      # start (§Sessions stamp the revision they materialized from), so it is
+      # already on the applied revision by construction. Nothing to do is the
+      # true answer here, and the only place it is.
       nil -> :noop
       pointer -> identity_apply_started_session(config, db, session, revision, pointer)
     end
   end
 
-  # A session that has never started has no harness session to bounce. It materializes
-  # from `tightbeam/live` at its first start (§Sessions stamp the revision they
-  # materialized from), so it is already on the applied revision by construction.
   defp identity_apply_started_session(config, db, session, revision, pointer) do
     harness = Harness.parse!(session.harness).id()
     key = {harness, "shared", session.host}
@@ -2103,6 +2113,12 @@ defmodule Tightbeam.Gateway do
 
     with {:ok, adapter, _generation} <-
            AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key),
+         # The adapter PROCESS is the authority on residency, the same way the
+         # start and tune paths ask it. A pointer row only records that a harness
+         # session once existed; after a gateway restart every pointer names a
+         # session no adapter holds, and bouncing it asks the harness to close
+         # something it has never heard of.
+         true <- Adapter.knows_session?(adapter, pointer.harness_session_id),
          :ok <- Adapter.close_session(adapter, pointer.harness_session_id),
          :ok <-
            Adapter.load_session(
@@ -2117,10 +2133,33 @@ defmodule Tightbeam.Gateway do
       Org.set_identity_revision(db, session.session_key, snapshot.revision)
       :applied
     else
+      # No resident session to bounce, so the stamp IS the application. The next
+      # start reloads from `session.identity_revision`, not from `live`, so
+      # leaving the stamp behind would mean this session materialized stale
+      # forever while `identity status` kept calling it stale and apply kept
+      # reporting it applied. No pointer event is appended: nothing was loaded,
+      # and the pointer chain does not record things that did not happen.
+      false ->
+        Org.set_identity_revision(db, session.session_key, snapshot.revision)
+        :applied
+
       {:error, reason} ->
-        raise "identity apply failed for #{session.session_key}: #{inspect(reason)}"
+        {:error,
+         %{
+           code: "apply_failed",
+           message:
+             "identity apply could not reach #{session.session_key}: #{apply_failure(reason)}",
+           sessions: [session.session_key]
+         }}
     end
   end
+
+  # A live adapter that fails for its own reasons still surfaces, but as this
+  # verb's named refusal rather than as a raw JSON-RPC envelope from three layers
+  # down. The general error-boundary seam is its own ticket; this is one call
+  # site's error made legible.
+  defp apply_failure(%{"message" => message}) when is_binary(message), do: message
+  defp apply_failure(reason), do: inspect(reason)
 
   @onboarding_providers ["openai", "anthropic"] ++
                           if(Application.compile_env(:tightbeam, :fixture_harness, false),
