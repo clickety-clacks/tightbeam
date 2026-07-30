@@ -669,12 +669,14 @@ defmodule FeatureSmoke do
   # So isolation is MEASURED rather than assumed, and every way it could fail is fatal
   # rather than silent:
   #
-  #   NO TURN STARTED. Turn ROWS are expected: the remedy wake is immediate-due, the
-  #   gateway fires due wakes synchronously, and delivery inserts the row before the
-  #   denying request returns, so a `queued` row exists by construction and carries a
-  #   prompt nothing has read. The group asserts that none of them was ever STARTED —
-  #   `startedAt` marks the lane claiming a turn and handing the prompt on — and reports
-  #   both counts either way, so the normal outcome reads as what it is.
+  #   THE HOLDER'S ACTIONS, not its turn states. Turn rows are expected and so is a turn
+  #   reaching `running`: the wake is immediate-due, the gateway fires due wakes
+  #   synchronously, delivery inserts the row before the denying request returns, and the
+  #   lane claims it in milliseconds. Field evidence settles this rather than argument —
+  #   the operator's own row came back `session-concurrent`, a class only reachable when a
+  #   turn is already `running`. Turn state tracks the LANE; what takes seconds, and what
+  #   this half actually needs not to happen, is the MODEL acting. Both counts are
+  #   reported as the margin; neither is asserted.
   #
   #   ONE REPORT, AND IT IS THE OPERATOR'S. Exactly one report artifact may exist on this
   #   work item from this holder. A second row is a holder that recorded, and a strong
@@ -802,7 +804,7 @@ defmodule FeatureSmoke do
       File.write!(Path.join(Path.dirname(holder.check.path), results), holder.check.output)
 
       recorded =
-        post_as(state, holder.token, "artifact-record", %{
+        ok_as!(state, holder.token, "artifact-record", %{
           "kind" => "report",
           "title" => "operator report #{u}",
           # `originPath`, NOT `path`. `--path` is the CLI's FLAG name; the Rust client
@@ -856,10 +858,29 @@ defmodule FeatureSmoke do
       # holding a prompt nothing has read. An earlier version of this assertion demanded
       # zero rows and could never have passed.
       #
-      # `startedAt` is the honest line. It is written at exactly one place — the
-      # `queued → running` claim, where the lane takes ownership and hands the prompt on
-      # (`Ledger`) — and it is never cleared, so a turn that ran and finished still carries
-      # it. Materialized is expected and gets reported; STARTED is the leak.
+      # `startedAt` IS NOT THE LINE EITHER, and the field disproved it before it ever ran.
+      # The operator's row above came back `session-concurrent`, and that class is returned
+      # only when `Ledger.running_turn_message_id/2` finds a turn at `status = 'running'` —
+      # the same UPDATE that writes `startedAt`. So on the run that produced art_d968e72a a
+      # turn was ALREADY running, and an assertion on `startedAt` would have failed a group
+      # that was otherwise behaving exactly as designed.
+      #
+      # The mistake was the same one twice: turn STATE tracks the LANE, not the agent.
+      # `running` means the lane claimed the turn and is handing it to an adapter, which
+      # happens in milliseconds; the model producing a tool call is what takes seconds. Two
+      # tripwires in a row measured the fast half and called it the slow one.
+      #
+      # So the turn counts are REPORTED, not asserted — they are the margin, and a runner
+      # watching them climb learns something before anything breaks — and isolation is
+      # asserted where the agent's action actually lands:
+      #
+      #   EXACTLY ONE DENIAL per bounded window, above, catches a holder that attested.
+      #   EXACTLY ONE REPORT, below, catches a holder that recorded.
+      #
+      # Those two are complete over the ways a holder could change this half's outcome. It
+      # cannot close the assignment without a report, because that is the gate under test,
+      # and a second report fails the check below — so the false-green path this group
+      # feared is closed by the artifact assertion rather than by a clock.
       started =
         sqlite(
           state,
@@ -869,17 +890,6 @@ defmodule FeatureSmoke do
 
       materialized =
         sqlite(state, "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(holder.key)}")
-
-      assert(
-        state,
-        started == "0",
-        "gate chain: #{started} of the holder's #{materialized} turn(s) STARTED. This half is " <>
-          "only meaningful while the holder never acts, and a started turn means the lane took " <>
-          "ownership and handed the prompt on — so every assertion above may be describing the " <>
-          "agent's work rather than the operator's. Remedy wakes cannot be cancelled " <>
-          "(origin-matched), so read this as a real leak and a real margin problem, not as an " <>
-          "assertion to widen."
-      )
 
       reports =
         state
@@ -1650,6 +1660,20 @@ defmodule FeatureSmoke do
 
   defp post_as(state, token, verb, params) do
     post(state |> Map.put(:token, token) |> Map.put(:as_session, true), verb, params)
+  end
+
+  # `post_as/4` is to `post/3` what this is to `ok!/3`. The pair matters because the two
+  # halves differ in more than the token: `ok!` raises on an error envelope and UNWRAPS
+  # `"result"`, `post_as` does neither. A caller that reads a success field off a raw
+  # `post_as` response gets nil from a map whose payload is one key deeper — which is not
+  # obvious in the failure message, because the map printed there contains the value that
+  # was being looked for.
+  #
+  # Use this whenever a session-authenticated call's RESULT is read. Keep `post_as/4` for
+  # the calls whose error envelope is the thing under test — every attest in this file is
+  # one of those, and unwrapping would be meaningless rather than wrong there.
+  defp ok_as!(state, token, verb, params) do
+    ok!(state |> Map.put(:token, token) |> Map.put(:as_session, true), verb, params)
   end
 
   defp redeploy!(state, session_key) do
