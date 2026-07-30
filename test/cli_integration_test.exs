@@ -156,6 +156,7 @@ defmodule Tightbeam.CliIntegrationTest do
       base_dir: base_dir,
       binary: binary,
       db: db,
+      handlers: handlers,
       port: port,
       session: session,
       worker: worker,
@@ -356,16 +357,17 @@ defmodule Tightbeam.CliIntegrationTest do
   # review verdict, both denials, both wakes, the verification verdict, and the
   # final completion — is the real CLI against the real Bandit/Router stack.
   test "real CLI walks the verification papertrail end to end (A1/A2)", ctx do
-    File.mkdir_p!(Path.join([ctx.base_dir, "identity", "rules"]))
+    # A real bundle import, not a fixture copy: this is the arrival path §7
+    # describes, so the walk fails if learn stops delivering rules/.
+    assert :initialized = Archetypes.init_identity!(ctx.base_dir)
+    Archetypes.load!(ctx.base_dir)
 
     for file <- ["engineering.toml", "verification.toml"] do
-      File.cp!(
-        "priv/kungfu/agentic-engineering/rules/#{file}",
-        Path.join([ctx.base_dir, "identity", "rules", file])
-      )
+      assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
+             "learn did not deliver rules/#{file} into the org's identity tree"
     end
 
-    Rules.load!(ctx.base_dir, Map.keys(Gateway.handlers(%{db: ctx.db})))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     test_pid = self()
 
     start_supervised!(
@@ -443,10 +445,11 @@ defmodule Tightbeam.CliIntegrationTest do
     # Second non-CLI hop (#112, pre-existing): the CLI sends the review link as
     # wire param "reviews", which the assign handler never reads (it wants
     # :reviews_assignment_id), so a CLI-created review link is silently
-    # dropped. The commissioned review is opened through the gateway handler
-    # until #112 lands.
+    # dropped. Until #112 lands the review is opened through the REGISTERED
+    # "assign" handler the router serves — not Assignments.__handle__ directly —
+    # so the handler's assignment- and work-item-change composition still runs.
     review =
-      Assignments.__handle__(ctx.db, "assign", %{
+      ctx.handlers["assign"].(%{
         verb: "assign",
         origin: "user:flynn",
         principal: {:user, "flynn"},
@@ -459,6 +462,11 @@ defmodule Tightbeam.CliIntegrationTest do
           reviews_assignment_id: work_id
         }
       })
+
+    # Proof the hop really traversed the registered table: only the router's
+    # wrapped handlers echo :cli_call. A direct Assignments.__handle__ call
+    # would skip the handler's change-callback composition and echo nothing.
+    assert_receive {:cli_call, %{verb: "assign", params: %{reviews_assignment_id: ^work_id}}}
 
     review_id = review.id
 
@@ -520,7 +528,7 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     refute Map.has_key?(
-             Gateway.handlers(%{db: ctx.db})["artifact-record"].(%{
+             ctx.handlers["artifact-record"].(%{
                principal: {:session, "cli-coder"},
                session_key: "cli-coder",
                recorded_message_id: message_id,
@@ -557,7 +565,7 @@ defmodule Tightbeam.CliIntegrationTest do
   # statutes completes bare through the real CLI — no denial, no episode, no
   # remedy wake.
   test "real CLI bare completion passes on a rule-free org (A5)", ctx do
-    Rules.load!(ctx.base_dir, Map.keys(Gateway.handlers(%{db: ctx.db})))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder =
       Org.create(ctx.db, %{

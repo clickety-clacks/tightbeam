@@ -1,10 +1,4 @@
-# The engineering school's completion papertrail (verification-papertrail-v1):
-# completion claims must be backed by evidence of verification — an inference-filed
-# verification verdict plus a recorded results artifact. The substrate records and
-# gates on records; it never performs the verification. HOW to verify lives in each
-# repository's prose (AGENTS.md or equivalent); these rules state only WHAT record
-# is missing. Every token below except the fact names and operators is org
-# vocabulary, editable on main after learn.
+# rules/verification.toml — the engineering school's completion papertrail
 [[rule]]
 name = "completion-requires-verification"
 verb = "attest"
