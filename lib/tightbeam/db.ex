@@ -64,10 +64,6 @@ defmodule Tightbeam.DB do
     GenServer.call(server, {:transaction, fun})
   end
 
-  @doc "Rows changed by the last statement on this connection."
-  @spec changes(server()) :: non_neg_integer()
-  def changes(server \\ __MODULE__), do: GenServer.call(server, :changes)
-
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
 
   defmodule Txn do

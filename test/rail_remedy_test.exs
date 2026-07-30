@@ -416,18 +416,20 @@ defmodule Tightbeam.RailRemedyTest do
     assert {:error, %{producer: producer}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        """
-        UPDATE rail_remedy_episodes SET status = 'dispatched'
-        WHERE statute = 'completion-needs-review' AND subject = ?1
-          AND status = 'claimed' AND claimToken = 'superseded'
-        """,
-        [assignment.id]
-      )
+    assert {:ok, 0} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 UPDATE rail_remedy_episodes SET status = 'dispatched'
+                 WHERE statute = 'completion-needs-review' AND subject = ?1
+                   AND status = 'claimed' AND claimToken = 'superseded'
+                 """,
+                 [assignment.id]
+               )
 
-    assert DB.changes(ctx.db) == 0
+               DB.Txn.changes(txn)
+             end)
 
     assert {:ok, [[1]]} =
              DB.query(

@@ -1146,18 +1146,21 @@ defmodule Tightbeam.ConformanceSupport do
               original = fire.()
               stale_at = System.system_time(:millisecond) - 60_001
 
-              {:ok, _} =
-                DB.query(
-                  db,
-                  """
-                  UPDATE rail_remedy_episodes
-                  SET status='claimed', producerKey=NULL, claimToken='stale', openedAt=?3
-                  WHERE statute=?1 AND subject=?2 AND status='live'
-                  """,
-                  [statute, assignment_id, stale_at]
-                )
+              assert {:ok, 1} =
+                       DB.transaction(db, fn txn ->
+                         DB.Txn.q(
+                           txn,
+                           """
+                           UPDATE rail_remedy_episodes
+                           SET status='claimed', producerKey=NULL, claimToken='stale', openedAt=?3
+                           WHERE statute=?1 AND subject=?2 AND status='live'
+                           """,
+                           [statute, assignment_id, stale_at]
+                         )
 
-              assert DB.changes(db) == 1
+                         DB.Txn.changes(txn)
+                       end)
+
               reclaimed = fire.()
               assert reclaimed == original
 
@@ -1302,17 +1305,20 @@ defmodule Tightbeam.ConformanceSupport do
       assert {:error, %{producer: fenced_producer}} =
                Dispatch.dispatch(db, handlers, completion_call(fenced))
 
-      {:ok, _} =
-        DB.query(
-          db,
-          """
-          UPDATE rail_remedy_episodes SET status='dispatched'
-          WHERE statute=?1 AND subject=?2 AND status='claimed' AND claimToken='superseded'
-          """,
-          [fixture_rule_name(fixture), fenced]
-        )
+      assert {:ok, 0} =
+               DB.transaction(db, fn txn ->
+                 DB.Txn.q(
+                   txn,
+                   """
+                   UPDATE rail_remedy_episodes SET status='dispatched'
+                   WHERE statute=?1 AND subject=?2 AND status='claimed' AND claimToken='superseded'
+                   """,
+                   [fixture_rule_name(fixture), fenced]
+                 )
 
-      assert DB.changes(db) == 0
+                 DB.Txn.changes(txn)
+               end)
+
       assert review_effect_count(db, fenced) == 1
       assert is_binary(fenced_producer)
 
