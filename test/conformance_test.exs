@@ -3649,6 +3649,21 @@ end
 defmodule Tightbeam.ConformanceTest do
   use Tightbeam.TestCase, async: false
 
+  # ExUnit's per-test default is 60s, which is right for the ~1000 in-memory unit tests in
+  # this suite and wrong for this module alone: the fixtures here seed real git checkouts
+  # and drive the release rail-exec through the containment layer, so a single test can be
+  # dozens of OS process creations deep. That default was the BINDING budget here, tighter
+  # than every rail budget beneath it (serialize_check/1's 5_000ms plus RailScript's
+  # 2_000ms backstop at rail_script.ex:200) — so the layer under test could not render its
+  # verdict before the harness gave up, and the failure arrived as a timeout instead of as
+  # the deny the case was written to judge. Measured on a loaded dev box, the C5 rail-exec
+  # test alone ran 40.8s once and 88.2s an hour later: a coin flip against a number nobody
+  # chose for it. Declared per-module rather than globally, because raising it in
+  # test_helper would hide genuine hangs across the whole suite to accommodate this one.
+  # This weakens no assertion — the reason-pinning in assert_rule_result/5 is what keeps a
+  # slow run from passing falsely; this only stops the clock from pre-empting the verdict.
+  @moduletag timeout: 300_000
+
   alias Tightbeam.ConformanceSupport, as: Corpus
 
   @root Corpus.corpus_root()
@@ -3798,14 +3813,6 @@ defmodule Tightbeam.ConformanceTest do
     Corpus.run_producer_cas_races(fixture!("C4", "producer-cas-verdict-txn"))
   end
 
-  # ExUnit's per-test default is 60s and nobody chose it for a test that seeds fifteen real
-  # git repos and drives the release rail-exec through the containment layer for every case
-  # — roughly forty process creations, none of them BEAM-side. Measured end to end on a
-  # loaded dev box: 40.8s once and 88.2s an hour later, straddling the default, so the test
-  # was a coin flip against a number that describes in-memory unit tests. The budget being
-  # declared is what makes the timeout mean "the rail layer wedged" instead of "the box was
-  # busy"; the reason assertions, not this, are what keep a slow run from passing falsely.
-  @tag timeout: 300_000
   test "C5 real rail-exec drives git state, observed files, exit bands, CWD, and laziness" do
     for name <- [
           "reconcile-with-main",

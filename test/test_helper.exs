@@ -78,6 +78,29 @@ missing =
     end
   end)
   |> then(fn acc ->
+    # The C5 script guards are real /bin/sh scripts and they parse their input with
+    # `jq` and resolve their workdir with `realpath`
+    # (test/conformance/c5_script_guards/scripts/*). A host without either does not
+    # fail loudly: the script dies, the wrapper reports a nonzero exit, the
+    # substrate classifies it `script_error` — and every C5 POSITIVE case expects a
+    # denial, so it is handed the denial it was looking for and passes having
+    # exercised no guard at all. That is the same hole the conformance suite now
+    # closes from the other side by pinning the denial REASON and not just the rule
+    # name; this closes it from the host side.
+    case Enum.reject(["jq", "realpath"], &System.find_executable/1) do
+      [] ->
+        acc
+
+      missing ->
+        [
+          "#{Enum.join(missing, " and ")} on PATH (the C5 rail-guard scripts parse\n" <>
+            "      their input with jq and resolve holder_workdir with realpath; without\n" <>
+            "      them every C5 positive case passes vacuously)."
+          | acc
+        ]
+    end
+  end)
+  |> then(fn acc ->
     # rail_script, conformance's rail-exec fixtures and cli_integration exec the
     # RELEASE binary, not a debug build and not `cargo run`.
     binary = Path.expand("../cli/target/release/tightbeam", __DIR__)

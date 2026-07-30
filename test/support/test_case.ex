@@ -22,6 +22,18 @@ defmodule Tightbeam.TestCase do
   # A predicate-poll helper that returns `false` on exhaustion must be called
   # under `assert` — in statement position its timeout is silent, and the test
   # passes having proven nothing.
+  #
+  # Which SIDE the budget sits on decides how it fails, and the two are not
+  # symmetric. A CHECK-side wait — how long you will watch for an effect —
+  # under-detects: for effect time T and window W, T<W is observed and T>W is
+  # missed, and load only raises T, so a longer check-side wait is never worse
+  # (neither a written file nor a received message is reversible once it lands).
+  # A SETUP-side budget is the dangerous one: it is the window the effect must
+  # land INSIDE, so load closes it and the test suppresses nothing while still
+  # going green. The live example is a producer fixture whose grandchild slept 2s
+  # — at load 97 the tree finished on its own before the kill, and the test passed
+  # having killed nothing. It sleeps 30 now. Do not "simplify" a widened
+  # check-side wait back down on a symmetry that does not hold.
 
   use ExUnit.CaseTemplate
 

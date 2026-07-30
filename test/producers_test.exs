@@ -278,7 +278,20 @@ defmodule Tightbeam.ProducersTest do
     end)
 
     pids = descendant_pids(tree)
-    assert Enum.all?(pids, &process_exists?/1)
+
+    # No liveness assertion here, unlike the cancel test above, and the difference
+    # is which side of the clock the budget sits on. This producer's own
+    # `timeout_ms` is 1_000 — it is a SETUP-side window, the time the tree is
+    # allowed to be alive for — so "are they still running?" races the very kill
+    # the test is about. Under a five-lane load the pid files landed, the state
+    # reached `running`, and the producer had already timed out and reaped the
+    # tree before this line ran, failing a correct implementation.
+    #
+    # The pid FILES are the evidence that survives that race: each is written by
+    # the process it names, so their existence (asserted above via
+    # descendant_pids_ready?) proves the tree was really created, and unlike
+    # liveness it cannot be undone by the kill arriving early. That is the whole
+    # precondition this line was carrying.
     assert_wait(fn -> Producers.get(ctx.db, job_id).state == "failed" end)
     # No wait for the grandchild's window to elapse: the line below proves the whole tree is
     # gone, and only the child shell writes `finished`, so the delayed effect has no process
