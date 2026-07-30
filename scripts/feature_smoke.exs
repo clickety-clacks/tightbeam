@@ -805,7 +805,14 @@ defmodule FeatureSmoke do
         post_as(state, holder.token, "artifact-record", %{
           "kind" => "report",
           "title" => "operator report #{u}",
-          "path" => results,
+          # `originPath`, NOT `path`. `--path` is the CLI's FLAG name; the Rust client
+          # serializes it to `originPath` on the wire, and only `originPath` underscores to
+          # the `:origin_path` the handler reads. Nothing aliases `path` — the router's
+          # alias map carries one entry, for assign — so the flag spelling reaches
+          # `Artifacts.record/2` as a missing key and takes the group down before its first
+          # assertion. Every CLI-driven record worked all night precisely because the CLI
+          # does this translation; an HTTP caller has to do it itself.
+          "originPath" => results,
           "workItemId" => wi_id
         })
 
