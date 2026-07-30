@@ -3903,9 +3903,12 @@ defmodule Tightbeam.Gateway do
 
     # A ruling validated as `notified` can still lose to an adapter heal before
     # its action transaction commits (the inverse TOCTOU of the heal's own CAS).
-    # That is an acknowledged no-op, not a crash: the transaction already rolled
-    # back, so nothing partial survives, and the caller gets the same denial it
-    # would have got a millisecond earlier (F3).
+    # That is an acknowledged no-op, not a crash: the transaction rolled back, so
+    # nothing the RULING decides survives, and the caller gets the same denial it
+    # would have got a millisecond earlier. What it does NOT undo is a live
+    # harness mutation the ruling already made — `swap` is the one action that
+    # makes one, and it survives on purpose, because the harness owns which model
+    # is loaded and `project_applied_model/6` commits that fact separately (F3).
     try do
       action.()
     rescue
@@ -3920,7 +3923,7 @@ defmodule Tightbeam.Gateway do
   # hard {:ok, _} match on it is a MatchError that crashes the wire call instead of
   # denying the ruling (cross-review round 2, F3). Re-raising OUTSIDE the
   # transaction is what puts it in reach of adjudicate_action's rescue; the
-  # transaction has already rolled back, so nothing partial survives.
+  # transaction has already rolled back, so nothing the ruling decided survives.
   defp ruling_transaction(db, fun) do
     case DB.transaction(db, fun) do
       {:ok, result} -> {:ok, result}
@@ -4088,6 +4091,8 @@ defmodule Tightbeam.Gateway do
       else
         case strict_apply_current_model(db, session, call.params.model) do
           :ok ->
+            project_applied_model(db, session, call, episode, harness, provider)
+
             {:ok, {delivery, wake_id}} =
               ruling_transaction(db, fn txn ->
                 current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
@@ -4103,17 +4108,6 @@ defmodule Tightbeam.Gateway do
                     current.session_key,
                     recovery_prompt
                   )
-
-                case Org.swap_model_in_txn(
-                       txn,
-                       current.session_key,
-                       {session.model, session.harness},
-                       {call.params.model, harness, provider}
-                     ) do
-                  {:ok, _} -> :ok
-                  {:duplicate, _} -> :ok
-                  :stale -> raise("model mutation race")
-                end
 
                 unless Adjudication.resolve_in_txn(txn, current, wake_id),
                   do: raise(superseded_or_stale(current))
@@ -4131,23 +4125,6 @@ defmodule Tightbeam.Gateway do
 
                 arm_hold_in_txn(txn, current.session_key, wake_id)
 
-                EventLog.lifecycle_in_txn(
-                  txn,
-                  "model_adjudication",
-                  current.session_key,
-                  JSON.encode!(%{
-                    from_model: session.model,
-                    to_model: call.params.model,
-                    from_harness: session.harness,
-                    to_harness: harness,
-                    trigger: current.condition,
-                    adjudicated_by: current.owner_target,
-                    correlationKey: current.correlation_key,
-                    harness_crossed: false,
-                    context_discarded: false
-                  })
-                )
-
                 {delivery, wake_id}
               end)
 
@@ -4161,6 +4138,51 @@ defmodule Tightbeam.Gateway do
     else
       {:error, error} -> error
     end
+  end
+
+  # `apply_model_strict` has already set the value AND read it back, reverting on
+  # mismatch, so an `:ok` here is the harness saying it holds the new model —
+  # T2/T-SOURCE: the harness OWNS which model is loaded, and `sessions.model` is
+  # its projection. That is why this write cannot ride on the ruling
+  # transaction, which compare-and-swaps a DIFFERENT fact (the adjudication
+  # episode) and rolls back whole when a heal wins that CAS. Riding on it was
+  # F3: the harness kept the new model while the record reverted to the old one,
+  # with nothing anywhere that re-reads the harness to break the tie — and
+  # `sessions.model` is what the next residency reload pushes AT the harness, so
+  # a record left behind the owner is not merely stale, it is a queued overwrite
+  # of the owner's truth. The projection follows the owner unconditionally; what
+  # the RULING gets to decide (recovery wake, hold, prompt) is decided after.
+  defp project_applied_model(db, session, call, episode, harness, provider) do
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        case Org.swap_model_in_txn(
+               txn,
+               session.session_key,
+               {session.model, session.harness},
+               {call.params.model, harness, provider}
+             ) do
+          {:ok, _} -> :ok
+          {:duplicate, _} -> :ok
+          :stale -> raise("model mutation race")
+        end
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "model_adjudication",
+          session.session_key,
+          JSON.encode!(%{
+            from_model: session.model,
+            to_model: call.params.model,
+            from_harness: session.harness,
+            to_harness: harness,
+            trigger: episode.condition,
+            adjudicated_by: episode.owner_target,
+            correlationKey: episode.correlation_key,
+            harness_crossed: false,
+            context_discarded: false
+          })
+        )
+      end)
   end
 
   defp adjudicate_respawn(config, db, call, episode),

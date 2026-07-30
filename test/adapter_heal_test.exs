@@ -64,6 +64,31 @@ defmodule Tightbeam.AdapterHealTest do
       do: {:reply, Map.fetch!(state, :load_session), state}
   end
 
+  # The HARNESS side of a model swap, and the only authority on which model is
+  # loaded: `held/1` is a read of the running agent, never of the substrate's
+  # record. `on_applied` fires INSIDE the accepted swap, which is the seam F3
+  # needs — the live harness has already moved, and nothing the ruling does has
+  # run yet.
+  defmodule SwapAdapterStub do
+    @moduledoc false
+    use GenServer
+    def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+    def init(state), do: {:ok, state}
+
+    def held(pid), do: GenServer.call(pid, :held)
+
+    def handle_call({:apply_model_strict, _sid, model, _prior_model}, _from, state) do
+      state = Map.put(state, :model, model)
+      if fire = state[:on_applied], do: fire.()
+      {:reply, :ok, state}
+    end
+
+    def handle_call(:held, _from, state), do: {:reply, state.model, state}
+
+    def handle_call({:on_applied, fun}, _from, state),
+      do: {:reply, :ok, Map.put(state, :on_applied, fun)}
+  end
+
   defmodule DyingAdapter do
     @moduledoc false
     use GenServer
@@ -1165,6 +1190,92 @@ defmodule Tightbeam.AdapterHealTest do
            )
   end
 
+  test "F3: a swap that loses to a heal AFTER the harness moved leaves no divergence", ctx do
+    adapter = swap_harness(ctx, checkout: {:error, :degraded})
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+
+    # The interleaving F3 names, staged at the only point where it exists: the
+    # harness ACCEPTS the new model, and the heal resolves the episode before the
+    # ruling's own compare-and-swap gets to run. No sleep and no transaction
+    # counter — the seam is the harness accepting, which is the event itself.
+    parent = self()
+
+    swap_ready(adapter, fn ->
+      heal(ctx, {7, 2})
+      send(parent, {:healed_mid_swap, hold(ctx.db)})
+    end)
+
+    result =
+      Gateway.handlers(ctx.config)["adjudicate"].(%{
+        origin: "user:flynn",
+        principal: {:session, episode.owner_target},
+        params: %{
+          episode: episode.correlation_key,
+          action: "swap",
+          model: "claude-sonnet-4-6"
+        }
+      })
+
+    # The heal really did land mid-swap, and really did take the hold.
+    assert_received {:healed_mid_swap, probe}
+    assert is_binary(probe) and probe != "*"
+
+    # The ruling lost: its wake, hold and recovery prompt all rolled back.
+    assert %{code: "denied"} = result
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "adjudication_ruling_superseded")
+           )
+
+    # THE DIVERGENCE. Which model is loaded is the HARNESS's fact; the record is
+    # its projection. The harness moved and cannot be un-moved by a rollback, so
+    # the record must carry what the harness carries — the record is reconciled
+    # FROM the owner, never the reverse.
+    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+
+    assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter),
+           "the record disagrees with the running agent about which model is loaded"
+
+    # And it is legible: `sessions.model` moved, so the row that says WHY has to
+    # be there whether or not the ruling that asked for it survived.
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "model_adjudication"))
+
+    # Not self-healing on its own: nothing in the substrate re-reads the harness
+    # after this point, and `sessions.model` is what the next residency reload
+    # PUSHES at the harness. A record left behind the owner would therefore not
+    # sit stale, it would overwrite the owner on the next load — which is the
+    # divergence being permanent rather than transient.
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+  end
+
+  test "F3: a swap that WINS records the model the harness confirmed, exactly once", ctx do
+    adapter = swap_harness(ctx, checkout: {:error, :degraded})
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+
+    swap_ready(adapter, nil)
+
+    assert %{ok: true, action: "swap", model: "claude-sonnet-4-6"} =
+             Gateway.handlers(ctx.config)["adjudicate"].(%{
+               origin: "user:flynn",
+               principal: {:session, episode.owner_target},
+               params: %{
+                 episode: episode.correlation_key,
+                 action: "swap",
+                 model: "claude-sonnet-4-6"
+               }
+             })
+
+    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert Adjudication.get(ctx.db, "k1", "other").status == "resolved"
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "model_adjudication")) == 1
+  end
+
   test "F4: a remembered death reason is served ONLY to the generation that died", ctx do
     sup =
       start_supervised!(
@@ -1294,6 +1405,73 @@ defmodule Tightbeam.AdapterHealTest do
   end
 
   defp heal(ctx, token), do: Gateway.adapter_healed(ctx.config, ctx.db, @cause, token)
+
+  # The harness half of a model swap: a coordinator checkout that can be flipped
+  # from faulted to serving, plus the catalog inventory and residency pointer the
+  # swap path reads. Returns the adapter — the owner of the loaded model.
+  defp swap_harness(ctx, opts) do
+    start_supervised!(%{
+      id: :swap_checkout,
+      start:
+        {Agent, :start_link, [fn -> Keyword.fetch!(opts, :checkout) end, [name: :swap_checkout]]}
+    })
+
+    start_supervised!({CoordinatorStub, checkout: fn -> Agent.get(:swap_checkout, & &1) end})
+    adapter = start_supervised!({SwapAdapterStub, model: "claude-fable-5"}, id: :swap_adapter)
+
+    seed_swap_catalog(ctx)
+    Org.append_pointer(ctx.db, "k1", "harness-sid-1", "created")
+    adapter
+  end
+
+  defp swap_ready(adapter, on_applied) do
+    :ok = GenServer.call(adapter, {:on_applied, on_applied})
+    Agent.update(:swap_checkout, fn _ -> {:ok, adapter, 1} end)
+  end
+
+  # `harness_for_ref/2` reads the OWNING host's inventory, so the catalog has to
+  # know testhost at all — the setup's instance enumerates the real registry and
+  # drops it.
+  defp seed_swap_catalog(ctx) do
+    stop_supervised!(ModelCatalog)
+
+    start_supervised!(
+      {ModelCatalog,
+       base_dir: ctx.config.base_dir,
+       db: ctx.db,
+       hosts: fn ->
+         %{"testhost" => %{ssh: nil, base_dir: ctx.config.base_dir, cli_bin: nil}}
+       end,
+       codex_home: Path.join(ctx.config.base_dir, "codex"),
+       claude_fetch: fn _, _ -> {:error, :offline} end,
+       codex_read: fn _ -> {:error, :offline} end}
+    )
+
+    entries =
+      for ref <- ["claude-fable-5", "claude-sonnet-4-6"] do
+        %{
+          ref: ref,
+          display_name: ref,
+          name: ref,
+          efforts: [],
+          max_input_tokens: 200_000,
+          capabilities: %{},
+          provider: :anthropic
+        }
+      end
+
+    :sys.replace_state(ModelCatalog, fn state ->
+      now = state.now.()
+
+      put_in(state.entries[{"testhost", "claude"}], %{
+        entries: entries,
+        derived_at: now,
+        attempted_at: now,
+        reason: nil,
+        refreshing: false
+      })
+    end)
+  end
 
   # Collapse the retry backoff so the next scheduler fire delivers it; the app
   # env is global, so it is restored when the test exits.
