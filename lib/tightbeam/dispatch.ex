@@ -24,7 +24,7 @@ defmodule Tightbeam.Dispatch do
   still appends a "verb" row with the error.
   """
 
-  alias Tightbeam.{Assignments, DB, Escalation, EventLog, RailRemedy, Rules}
+  alias Tightbeam.{Assignments, DB, Escalation, EventLog, RailEpisodes, RailRemedy, Rules}
 
   @typedoc """
   A verb call. `origin` is WHO (\"user:flynn\" | \"agent:<handle>\") — never
@@ -125,7 +125,7 @@ defmodule Tightbeam.Dispatch do
       # mind is a recorded gap and never a crashed call.
       {:deny_escalate, statute, ctx} ->
         best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
-        :ok = Escalation.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
+        :ok = RailEpisodes.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
         {:error, ctx.error}
 
       :allow ->
@@ -158,8 +158,8 @@ defmodule Tightbeam.Dispatch do
   # whose statute passed; a malfunction episode closes because the statute's check
   # answered at all, whatever it answered. The atom tag is unambiguous — a statute name
   # is a lowercase string, never an atom.
-  defp close(db, {:episodes, statute, watermark}),
-    do: Escalation.close_episodes(db, statute, watermark)
+  defp close(db, {:episodes, statute, position}),
+    do: RailEpisodes.recovered(db, statute, position)
 
   defp close(db, {statute, subject}), do: RailRemedy.close(db, statute, subject)
 

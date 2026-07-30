@@ -351,6 +351,11 @@ defmodule Tightbeam.Gateway do
       [
         {ModelCatalog, base_dir: config.base_dir, db: db},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+        # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
+        # statute, and the episode writer must already own the ordering before the first
+        # evaluation runs. Explicitly a child rather than lazily started — a lazy start
+        # would let a missing spec here go unnoticed in production forever.
+        {Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes},
         {Tightbeam.Wakes,
          db: db,
          deliver: deliver,

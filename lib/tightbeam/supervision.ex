@@ -14,6 +14,7 @@ defmodule Tightbeam.Supervision do
     Gateway,
     Ledger,
     Org,
+    RailEpisodes,
     RailRemedy,
     Rules,
     Wakes
@@ -395,7 +396,7 @@ defmodule Tightbeam.Supervision do
         # what it decides.
         {:deny_escalate, statute, ctx} ->
           rail_sweep_lifecycle(db, session_key, assignment.id, ctx.error.rule, "re-obligate")
-          :ok = Escalation.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
+          :ok = RailEpisodes.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
           :fallthrough
 
         {:deny, error} ->
@@ -410,8 +411,8 @@ defmodule Tightbeam.Supervision do
   end
 
   # The sweep closes both kinds of episode the verb edge does (§C3.5, §A3).
-  defp close_episode(db, {:episodes, statute, watermark}),
-    do: Escalation.close_episodes(db, statute, watermark)
+  defp close_episode(db, {:episodes, statute, position}),
+    do: RailEpisodes.recovered(db, statute, position)
 
   defp close_episode(db, {statute, subject}), do: RailRemedy.close(db, statute, subject)
 

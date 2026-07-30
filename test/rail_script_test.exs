@@ -23,6 +23,7 @@ defmodule Tightbeam.RailScriptTest do
     Dispatch,
     Escalation,
     EventLog,
+    RailEpisodes,
     Org,
     Placement,
     RailScript,
@@ -995,7 +996,7 @@ defmodule Tightbeam.RailScriptTest do
     # A healthy evaluation observes it and is handed the close — but its actor has NOT run.
     load.("rail-pass")
     {_decision, to_close, _to_consume} = Rules.decide(ctx.db, subject)
-    assert [{:episodes, "script-escalate", watermark}] = to_close
+    assert [{:episodes, "script-escalate", position}] = to_close
 
     # Inside that interval a different malfunction opens its own episode.
     load.("rail-error")
@@ -1003,29 +1004,14 @@ defmodule Tightbeam.RailScriptTest do
     assert {:error, %{script_exit_class: "error:7"}} =
              Dispatch.dispatch(ctx.db, handlers, subject)
 
-    # The mechanism, measured rather than argued: the summons that arrived inside the
-    # interval sits ABOVE the watermark the healthy evaluation captured. The unbounded
-    # "close everything open for this statute" this replaced had no upper bound at all, so
-    # it necessarily picked this episode up too.
-    assert {:ok, [[newer]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT MAX(le.id) FROM lifecycle_events le
-               JOIN decision_requests dr ON dr.id = le.subject
-               WHERE le.kind = 'episode_summoned' AND dr.actionKey = 'episode:error:7'
-               """
-             )
-
-    # `is_integer/1` first, and it is NOT redundant: Elixir's term ordering makes
-    # `nil > 2` TRUE, so a bare comparison would pass silently on a tree that records no
-    # summons marks at all — the exact false-green a mechanism assertion exists to catch.
-    assert is_integer(newer)
-    assert newer > watermark
+    # A real cutoff was minted, and it predates this summons — the writer holds the
+    # ordering, so the proof of it is behavioral rather than a number read back out of
+    # SQL. That is the point of the redesign: there is no table quantity left to compare.
+    assert is_integer(position)
 
     # Only now does the delayed actor run the close it was handed.
     Enum.each(to_close, fn {:episodes, name, mark} ->
-      Escalation.close_episodes(ctx.db, name, mark)
+      RailEpisodes.recovered(ctx.db, name, mark)
     end)
 
     # The observed episode recovered; the one that arrived afterwards still summons.
@@ -1034,10 +1020,9 @@ defmodule Tightbeam.RailScriptTest do
   end
 
   # The same interleaving through the ATTACH path, which the class-differing case above
-  # cannot reach. A recurrence of a class already open writes NO new row and moves no
-  # rowid — `ON CONFLICT DO NOTHING` — so ordering recovery by the episode row is blind to
-  # it, and a stale close withdrew an episode that had just been re-summoned. Ordering over
-  # SUMMONS sees it, because the attach leaves a mark even though it leaves no row.
+  # cannot reach. A recurrence of a class already open writes NO new row — `ON CONFLICT DO
+  # NOTHING` — so any cutoff taken over rows is blind to it. The writer is not: it stamps
+  # the attach with its own sequence, inside the process that also decides the closure.
   test "a same-class recurrence attaching to an open episode is not swept away", ctx do
     handlers = %{"post" => fn _call -> %{ok: true} end}
     subject = call(%{work_item_id: "w-samekey"})
@@ -1056,7 +1041,7 @@ defmodule Tightbeam.RailScriptTest do
 
     # A healthy evaluation observes it and is handed the close — its actor has NOT run.
     load.("rail-pass")
-    {_decision, [{:episodes, name, watermark}], _} = Rules.decide(ctx.db, subject)
+    {_decision, [{:episodes, name, position}], _} = Rules.decide(ctx.db, subject)
 
     # The SAME class malfunctions again inside the interval, and attaches.
     load.("rail-timeout")
@@ -1064,27 +1049,155 @@ defmodule Tightbeam.RailScriptTest do
     assert {:error, %{script_exit_class: "timeout"}} =
              Dispatch.dispatch(ctx.db, handlers, subject)
 
-    # No new row: this is precisely why a row-ordered watermark could not see it.
+    # No new row: this is precisely why any row-ordered cutoff was blind to it. The writer
+    # is not, because it stamped the attach with its own sequence.
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
-
-    # But the summons DID leave a mark, and it is above the watermark.
-    assert {:ok, [[latest]]} =
-             DB.query(
-               ctx.db,
-               "SELECT MAX(id) FROM lifecycle_events WHERE kind = 'episode_summoned'"
-             )
-
-    # `is_integer/1` first, and it is NOT redundant — see the same guard in the
-    # new-class test above: `nil > 2` is TRUE under Elixir's term ordering.
-    assert is_integer(latest)
-    assert latest > watermark
+    assert is_integer(position)
 
     # The delayed actor runs its now-stale close.
-    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+    :ok = RailEpisodes.recovered(ctx.db, name, position)
 
     # The recurrence was never repaired, so its episode still summons.
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+  end
+
+  # THE VERDICT WINDOW — the interleaving that killed the previous two designs, and which
+  # nothing covered because every earlier test summoned only AFTER `Rules.decide/2`
+  # returned. Here the malfunction lands in the gap the reviewer named: after the sensor
+  # rendered its verdict, before the evaluation's cutoff would have been read. Any cutoff
+  # derived after the verdict necessarily includes this summons and sweeps it. A cutoff
+  # minted BEFORE the check cannot, which is the whole reason it moved.
+  test "a malfunction landing between the verdict and the recovery is not swept", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-verdict-window"})
+
+    load = fn script ->
+      put_statute(ctx, statute(script, %{"pass" => "allow"}))
+      Rules.load!(ctx.base_dir, ["post"])
+    end
+
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    assert {:ok, [[id]]} = DB.query(ctx.db, "SELECT id FROM decision_requests")
+
+    # The cutoff is minted HERE, before the healthy check runs — this is `decide`'s first
+    # act on a check-tier statute, and the test stands in for it so the window after the
+    # verdict is reachable at all.
+    position = RailEpisodes.evaluating(ctx.db, "script-escalate")
+    assert is_integer(position)
+
+    # The sensor now answers healthy. Nothing has been enacted yet.
+    load.("rail-pass")
+
+    # ...and INSIDE the post-verdict window, the same class malfunctions again and
+    # attaches. Under either previous design this summons would have been inside the
+    # cutoff and silenced.
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    # The healthy evaluation's recovery finally lands, carrying its pre-check cutoff.
+    :ok = RailEpisodes.recovered(ctx.db, "script-escalate", position)
+
+    # The malfunction that happened after the verdict is still summoning a mind.
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+  end
+
+  # WRITER DOWN, property 1: a denial never depends on the writer. The deny is decided
+  # before any hand-off and must come back byte-identical with the writer absent.
+  test "a malfunction denies identically when the episode writer is down", ctx do
+    handlers = %{"post" => fn _call -> flunk("a malfunctioning rail must not run") end}
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+
+    stop_supervised!(Tightbeam.RailEpisodes)
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "script-escalate",
+              edge: "verb",
+              reason: "script_timeout",
+              script_exit_class: "timeout",
+              ref: "w-writer-down"
+            }} = Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-writer-down"}))
+
+    assert [denial] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert denial.reason == "script_timeout"
+    assert denial.script_exit_class == "timeout"
+  end
+
+  # WRITER DOWN, property 2: the summons fails soft exactly as an unreachable owner does —
+  # nobody is summoned, and the gap is recorded rather than silent.
+  test "a summons with the writer down fails soft and is recorded", ctx do
+    handlers = %{"post" => fn _call -> flunk("a malfunctioning rail must not run") end}
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"])
+    stop_supervised!(Tightbeam.RailEpisodes)
+
+    assert {:error, %{reason: "script_timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-soft"}))
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+
+    # Both hand-offs this call makes record their own gap: `evaluating` before the check
+    # and `summon` after it. The summons one is the property under test.
+    assert ["evaluating", "summon"] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "rail_episode_writer_unavailable"))
+             |> Enum.map(& &1.detail)
+  end
+
+  # WRITER DOWN, property 3: recovery does not happen that evaluation, is recorded, and
+  # RESUMES when the writer returns. The episode must survive the outage rather than be
+  # swept or stranded.
+  test "recovery skips while the writer is down and resumes when it returns", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-resume"})
+
+    load = fn script ->
+      put_statute(ctx, statute(script, %{"pass" => "allow"}))
+      Rules.load!(ctx.base_dir, ["post"])
+    end
+
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    # The writer goes down, and a healthy evaluation runs without it.
+    stop_supervised!(Tightbeam.RailEpisodes)
+    load.("rail-pass")
+
+    {_decision, to_close, _} = Rules.decide(ctx.db, subject)
+
+    # No cutoff could be minted, so no recovery is scheduled — and the skip is recorded.
+    assert to_close == []
+
+    assert [%{detail: "evaluating"}] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "rail_episode_writer_unavailable"))
+
+    # The episode is untouched: not swept, still summoning.
+    assert {:ok, [["open"]]} = DB.query(ctx.db, "SELECT status FROM decision_requests")
+
+    # The writer returns and the next healthy evaluation recovers normally.
+    start_supervised!({Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes})
+
+    assert {:ok, %{ok: true}} = Dispatch.dispatch(ctx.db, handlers, subject)
+
+    assert {:ok, [["withdrawn", "sensor-recovered"]]} =
+             DB.query(ctx.db, "SELECT status, withdrawnReason FROM decision_requests")
   end
 
   # The close side of the same CAS as the recovery-then-ruling test: a ruling lands first,
@@ -1104,7 +1217,7 @@ defmodule Tightbeam.RailScriptTest do
 
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
     Rules.load!(ctx.base_dir, ["post"])
-    {_decision, [{:episodes, name, watermark}], _} = Rules.decide(ctx.db, subject)
+    {_decision, [{:episodes, name, position}], _} = Rules.decide(ctx.db, subject)
 
     # The mind rules before the healthy actor gets to run.
     assert %{status: "ruled"} =
@@ -1119,7 +1232,7 @@ defmodule Tightbeam.RailScriptTest do
              )
 
     # The stale recovery lands afterwards and leaves the ruling alone.
-    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+    :ok = RailEpisodes.recovered(ctx.db, name, position)
 
     assert {:ok, [["ruled", nil]]} =
              DB.query(
@@ -1145,10 +1258,10 @@ defmodule Tightbeam.RailScriptTest do
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
     Rules.load!(ctx.base_dir, ["post"])
     {_decision, to_close, _} = Rules.decide(ctx.db, subject)
-    assert [{:episodes, name, watermark}] = to_close
+    assert [{:episodes, name, position}] = to_close
 
     # First close recovers it and writes exactly one withdrawal row.
-    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+    :ok = RailEpisodes.recovered(ctx.db, name, position)
 
     withdrawals = fn ->
       ctx.db
@@ -1159,7 +1272,7 @@ defmodule Tightbeam.RailScriptTest do
     assert withdrawals.() == 1
 
     # The other actor runs the same close. Nothing is open, so nothing happens twice.
-    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+    :ok = RailEpisodes.recovered(ctx.db, name, position)
     assert withdrawals.() == 1
 
     assert {:ok, [["withdrawn"]]} = DB.query(ctx.db, "SELECT status FROM decision_requests")
@@ -1182,10 +1295,10 @@ defmodule Tightbeam.RailScriptTest do
 
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
     Rules.load!(ctx.base_dir, ["post"])
-    {_decision, [{:episodes, name, watermark}], _} = Rules.decide(ctx.db, subject)
+    {_decision, [{:episodes, name, position}], _} = Rules.decide(ctx.db, subject)
 
     # Recovery lands first.
-    :ok = Escalation.close_episodes(ctx.db, name, watermark)
+    :ok = RailEpisodes.recovered(ctx.db, name, position)
 
     # The ruling now finds nothing open to rule on, and does not resurrect it.
     ruling =

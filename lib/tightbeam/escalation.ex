@@ -16,12 +16,12 @@ defmodule Tightbeam.Escalation do
   # here because `digest/1` is a hex SHA-256 and can never collide with it.
   @episode_prefix "episode:"
 
-  # One row per SUMMONS — the one that opens an episode and every later one that attaches
-  # to it. Recovery orders against these, never against the episode row: an attach creates
-  # no row and moves no rowid, so a row-ordered watermark is blind to a recurrence and lets
-  # a stale close withdraw an episode that was just re-summoned. `lifecycle_events.id` is
-  # INTEGER PRIMARY KEY AUTOINCREMENT, so the ordering is monotonic by construction rather
-  # than by an argument about what does and does not delete rows.
+  # WRITE-ONLY observability: one row per summons, including the attaches that write no
+  # `decision_requests` row and would otherwise leave no trace at all. NOTHING READS THIS
+  # TO DECIDE ANYTHING. An earlier version ordered recovery against these ids, which put a
+  # decision input in the observability plane and violated §E3; ordering now lives in
+  # `Tightbeam.RailEpisodes`, the single writer. Keep the row for legibility, and keep it
+  # unread — if a closure ever needs to consult it, the closure is in the wrong place.
   @summon_kind "episode_summoned"
 
   @ddl """
@@ -234,15 +234,11 @@ defmodule Tightbeam.Escalation do
               })
             end
 
-            # MUST stay in the SAME transaction as the insert-or-attach: a summons is
-            # never complete without its mark. Move this write outside the transaction and
-            # the same-key hole reopens — a summons could complete, a concurrent healthy
-            # close could read a watermark that does not yet include its mark, and the
-            # episode it just re-summoned would be withdrawn.
-            #
-            # BOTH paths write one. The attach (`inserted?` false) is the case that
-            # matters: it writes no `decision_requests` row, so it is invisible to any
-            # ordering taken over rows.
+            # Observability only (see @summon_kind). Ordering does not depend on this
+            # row landing, or on its position — the single writer stamped its own
+            # sequence before this transaction was opened. It stays inside the
+            # transaction so the record matches what actually happened, not because
+            # anything reads it back.
             if is_binary(episode_key) do
               EventLog.lifecycle_in_txn(
                 txn,
@@ -272,10 +268,10 @@ defmodule Tightbeam.Escalation do
   The recording is itself best-effort, for the same reason the deny cannot depend on
   the summons: an observability row that will not land must not become an outage.
   """
-  @spec summon(DB.server(), map(), map(), map()) :: :ok
+  @spec summon(DB.server(), map(), map(), map()) :: {:ok, String.t()} | :error
   def summon(db, call, statute, ctx) do
-    {:decision_pending, _id} = escalate(db, call, statute, ctx)
-    :ok
+    {:decision_pending, id} = escalate(db, call, statute, ctx)
+    {:ok, id}
   rescue
     error -> summons_failed(db, statute, Exception.message(error))
   catch
@@ -291,11 +287,11 @@ defmodule Tightbeam.Escalation do
         String.slice("summons failed: #{reason}", 0, 512)
       )
 
-    :ok
+    :error
   rescue
-    _ -> :ok
+    _ -> :error
   catch
-    _, _ -> :ok
+    _, _ -> :error
   end
 
   @doc "Spend one ruled authorization. Batch rollback is deliberately not provided."
@@ -510,88 +506,50 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc """
-  Effect-free: an ordering watermark over SUMMONS, or `nil` when nothing is open.
+  Effect-free: the ids of this statute's currently open episodes.
 
-  Returns `nil` unless this statute currently has an open episode — a healthy check with
-  nothing outstanding has no recovery to schedule. Otherwise it returns the newest summons
-  mark in existence, and the caller hands that back to `close_episodes/3`.
-
-  The mark counts SUMMONS, not episode rows, and that distinction is the whole point. A
-  recurrence of a class that is already open ATTACHES: `ON CONFLICT DO NOTHING` writes no
-  row and moves no rowid, so an episode-row watermark cannot tell "still the same
-  malfunction I observed" from "it just happened again". Ordering over summons sees both,
-  because every summons leaves a mark whether it opened the episode or joined it.
+  A read only — the ordering decision over these ids belongs to `Tightbeam.RailEpisodes`,
+  the single writer, which is the only caller. Nothing here compares positions or decides
+  what is stale; that is exactly the logic that must not live in SQL.
   """
-  @spec episode_watermark(DB.server(), String.t()) :: integer() | nil
-  def episode_watermark(db, statute_name) do
-    {:ok, [[open]]} =
+  @spec open_episodes(DB.server(), String.t()) :: [String.t()]
+  def open_episodes(db, statute_name) do
+    {:ok, rows} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
+        "SELECT id FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
         [statute_name, @episode_prefix <> "%"]
       )
 
-    if open > 0 do
-      {:ok, [[mark]]} =
-        DB.query(
-          db,
-          "SELECT COALESCE(MAX(id), 0) FROM lifecycle_events WHERE kind = ?1",
-          [@summon_kind]
-        )
-
-      mark
-    end
+    Enum.map(rows, fn [id] -> id end)
   end
 
   @doc """
-  Close the open episodes this statute had AT `watermark` — the sensor answered again.
+  Withdraw the named episodes as `sensor-recovered`. Called ONLY by the single writer.
 
-  Dark-factory recovery: the malfunction episode exists because a check stopped
-  rendering verdicts, so an observed verdict IS the repair, and demanding an operator
-  verb to acknowledge a sensor that already healed is the stall the episode was meant to
-  prevent. Withdrawal, not a ruling: nothing was decided, the question simply expired.
+  Dark-factory recovery: the episode exists because a check stopped rendering verdicts, so
+  an observed verdict IS the repair, and demanding an operator verb to acknowledge a
+  sensor that already healed is the stall the episode was meant to prevent. Withdrawal,
+  not a ruling: nothing was decided, the question expired.
 
-  The watermark is what makes recovery ordered by EVALUATION rather than by whenever the
-  actor got around to running. `decide` is effect-free, so an unbounded interval sits
-  between the read that observed the episode and this withdrawal; a statute-wide "close
-  everything open" would sweep away a malfunction that landed inside that interval and had
-  not been repaired at all — exactly the state §A3 forbids.
+  WHICH episodes is not decided here. The writer has already chosen them by comparing each
+  episode's newest summons against a position minted before the check ran; this call only
+  enacts that choice. `status = 'open'` still guards the UPDATE, so a ruling that landed
+  first wins and is not overwritten.
 
-  An episode survives when its NEWEST summons is above the watermark, which covers both
-  shapes the interval can take: a malfunction of a new class (a fresh episode) and a
-  recurrence of a class already open (an attach, which writes no row). Only the second
-  needs the summons ordering; the first would survive a row-ordered bound too.
-
-  THE MIRROR CASE IS RULED ACCEPTED — do not "fix" it. A summons that was evaluated before
-  a healthy close but lands after it opens an episode for a sensor that has already
+  THE MIRROR CASE IS RULED ACCEPTED — do not "fix" it. A summons evaluated before a
+  healthy close but landing after it opens an episode for a sensor that has already
   recovered. That is ACCEPTED BOUNDED STALENESS, not a defect (§A3/§B, ruled 2026-07-29):
   the malfunction genuinely occurred and genuinely denied a call, so the summons is
-  truthful, and the next healthy evaluation closes it. Ordering it away would need a
-  per-statute generation counter — withdrawal UPDATEs rows in place, so there is no
-  monotonic mark to order a close against a later-landing evaluation — and it would buy
-  strict serialization at the cost of machinery the ruling does not require.
+  truthful, and the next healthy evaluation closes it.
   """
-  @spec close_episodes(DB.server(), String.t(), integer()) :: :ok
-  def close_episodes(db, statute_name, watermark) when is_integer(watermark) do
+  @spec withdraw_episodes(DB.server(), [String.t()], String.t()) :: :ok
+  def withdraw_episodes(_db, [], _statute_name), do: :ok
+
+  def withdraw_episodes(db, ids, statute_name) do
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
-        txn
-        |> Txn.q(
-          """
-          SELECT dr.id FROM decision_requests dr
-          WHERE dr.statuteName = ?1
-            AND dr.raiserId = 'process:tightbeam'
-            AND dr.actionKey LIKE ?2
-            AND dr.status = 'open'
-            AND COALESCE(
-                  (SELECT MAX(le.id) FROM lifecycle_events le
-                    WHERE le.kind = ?4 AND le.subject = dr.id),
-                  0
-                ) <= ?3
-          """,
-          [statute_name, @episode_prefix <> "%", watermark, @summon_kind]
-        )
-        |> Enum.each(fn [id] ->
+        Enum.each(ids, fn id ->
           Txn.q(
             txn,
             "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'sensor-recovered', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",

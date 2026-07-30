@@ -21,6 +21,14 @@ defmodule Tightbeam.TestCase do
     assert_hermetic_tmp!()
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
+
+    # The ONE place the episode writer starts for tests. Not per-suite ceremony and
+    # deliberately not lazy: call sites use the named process and a missing one is loud,
+    # so a suite that evaluates a check-tier statute must find a real writer here rather
+    # than silently conjuring one. Fresh per test, so ordering state never leaks between
+    # them; suites that never touch rails just have an idle process.
+    start_supervised!({Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes})
+
     :ok
   end
 

@@ -49,6 +49,7 @@ defmodule Tightbeam.Rules do
     EventLog,
     ObligationFacts,
     Org,
+    RailEpisodes,
     RailRemedy,
     RailScript,
     Roles
@@ -753,6 +754,15 @@ defmodule Tightbeam.Rules do
       _check ->
         case fetch_fact("$assignment", db, call, cache) do
           {:ok, assignment, cache} ->
+            # Minted BEFORE the sensor looks. That ordering is the whole fix: a verdict may
+            # only authorize closing episodes that already existed when its check started,
+            # so a malfunction landing during or after this run — fresh or attach — cannot
+            # be swept by it, however long the actor takes to enact. A cutoff taken after
+            # the verdict could always grow to cover events the verdict never saw, which is
+            # what two rounds of review kept finding. `nil` means nothing is open to
+            # recover. Minting touches no episode state, so `decide` stays effect-free.
+            position = RailEpisodes.evaluating(db, rule.name)
+
             case RailScript.run(db, rule.base_dir, rule, call, assignment) do
               # The sensor answered. Whatever the token maps to — allow or a genuine deny —
               # this statute's check is rendering verdicts again, which IS the repair for
@@ -769,7 +779,7 @@ defmodule Tightbeam.Rules do
                   db,
                   call,
                   cache,
-                  maybe_close_episodes(rule, db, to_close),
+                  recovery(rule, position, to_close),
                   to_consume,
                   exit_class
                 )
@@ -892,16 +902,12 @@ defmodule Tightbeam.Rules do
       params["work_item_id"]
   end
 
-  # The watermark rides the entry because recovery must be ordered by what THIS evaluation
-  # observed. `decide` is effect-free, so the actor's withdrawal lands an unbounded
-  # interval later; without it, an episode opened in between would be withdrawn by a
-  # healthy run that never saw it, silencing a malfunction nobody repaired.
-  defp maybe_close_episodes(rule, db, to_close) do
-    case Escalation.episode_watermark(db, rule.name) do
-      nil -> to_close
-      watermark -> [{:episodes, rule.name, watermark} | to_close]
-    end
-  end
+  # The position rides the entry so the ACTOR can hand recovery to the writer; the writer,
+  # not this list and not SQL, decides which episodes the position covers. `nil` means the
+  # statute had nothing open when the check started, so there is no recovery to schedule
+  # and `to_close` stays empty.
+  defp recovery(_rule, nil, to_close), do: to_close
+  defp recovery(rule, position, to_close), do: [{:episodes, rule.name, position} | to_close]
 
   defp maybe_close(rule, db, call, to_close) do
     subject = gated_ref(call)
