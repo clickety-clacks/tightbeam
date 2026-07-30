@@ -1017,6 +1017,9 @@ defmodule Tightbeam.RailScriptTest do
                """
              )
 
+    # `is_integer/1` first, and it is NOT redundant: Elixir's term ordering makes
+    # `nil > 2` TRUE, so a bare comparison would pass silently on a tree that records no
+    # summons marks at all — the exact false-green a mechanism assertion exists to catch.
     assert is_integer(newer)
     assert newer > watermark
 
@@ -1071,8 +1074,8 @@ defmodule Tightbeam.RailScriptTest do
                "SELECT MAX(id) FROM lifecycle_events WHERE kind = 'episode_summoned'"
              )
 
-    # `is_integer/1` first: Elixir's term ordering makes `nil > 2` TRUE, so a bare
-    # comparison would silently pass on a tree that records no summons marks at all.
+    # `is_integer/1` first, and it is NOT redundant — see the same guard in the
+    # new-class test above: `nil > 2` is TRUE under Elixir's term ordering.
     assert is_integer(latest)
     assert latest > watermark
 

@@ -234,9 +234,15 @@ defmodule Tightbeam.Escalation do
               })
             end
 
-            # In the SAME transaction as the insert-or-attach, so a summons is never
-            # complete without its mark. Both paths write one: the attach is exactly the
-            # case a row-ordered watermark cannot see.
+            # MUST stay in the SAME transaction as the insert-or-attach: a summons is
+            # never complete without its mark. Move this write outside the transaction and
+            # the same-key hole reopens — a summons could complete, a concurrent healthy
+            # close could read a watermark that does not yet include its mark, and the
+            # episode it just re-summoned would be withdrawn.
+            #
+            # BOTH paths write one. The attach (`inserted?` false) is the case that
+            # matters: it writes no `decision_requests` row, so it is invisible to any
+            # ordering taken over rows.
             if is_binary(episode_key) do
               EventLog.lifecycle_in_txn(
                 txn,
@@ -555,6 +561,15 @@ defmodule Tightbeam.Escalation do
   shapes the interval can take: a malfunction of a new class (a fresh episode) and a
   recurrence of a class already open (an attach, which writes no row). Only the second
   needs the summons ordering; the first would survive a row-ordered bound too.
+
+  THE MIRROR CASE IS RULED ACCEPTED — do not "fix" it. A summons that was evaluated before
+  a healthy close but lands after it opens an episode for a sensor that has already
+  recovered. That is ACCEPTED BOUNDED STALENESS, not a defect (§A3/§B, ruled 2026-07-29):
+  the malfunction genuinely occurred and genuinely denied a call, so the summons is
+  truthful, and the next healthy evaluation closes it. Ordering it away would need a
+  per-statute generation counter — withdrawal UPDATEs rows in place, so there is no
+  monotonic mark to order a close against a later-landing evaluation — and it would buy
+  strict serialization at the cost of machinery the ruling does not require.
   """
   @spec close_episodes(DB.server(), String.t(), integer()) :: :ok
   def close_episodes(db, statute_name, watermark) when is_integer(watermark) do
