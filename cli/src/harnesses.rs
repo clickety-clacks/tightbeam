@@ -127,6 +127,10 @@ pub fn load_optional() -> Option<HarnessCatalog> {
     load().ok()
 }
 
+pub(crate) fn load_optional_from(endpoint: &dispatch::Endpoint) -> Option<HarnessCatalog> {
+    load_from_with(&home_dir(), || load_endpoint(endpoint)).ok()
+}
+
 #[cfg(not(test))]
 pub fn catalog() -> Result<HarnessCatalog, String> {
     load()

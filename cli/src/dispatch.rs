@@ -834,7 +834,7 @@ pub fn send(request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to(&endpoint, request)
 }
 
-fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
+pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
     let url = format!("{}{}", endpoint.base, request.path);
     let call = ureq::post(&url)
         .set("authorization", &format!("Bearer {}", endpoint.token))
@@ -914,7 +914,7 @@ pub fn run(command: Command) -> Result<(), String> {
 fn run_with<D, S>(command: Command, discover_endpoint: D, send_request: S) -> Result<(), String>
 where
     D: FnOnce() -> Result<Endpoint, String>,
-    S: FnOnce(&Endpoint, &RequestSpec) -> Result<Option<Value>, String>,
+    S: Fn(&Endpoint, &RequestSpec) -> Result<Option<Value>, String>,
 {
     match command {
         Command::Help | Command::CommandHelp(_) => {
@@ -929,7 +929,7 @@ where
         } => {
             let endpoint = discover_endpoint()?;
             require_session_endpoint(&identity, &endpoint)?;
-            crate::ceremonies::onboard(&identity, &provider, api_key)
+            crate::ceremonies::onboard(&identity, &provider, api_key, &endpoint, send_request)
         }
         command => {
             let endpoint = discover_endpoint()?;
@@ -1787,6 +1787,75 @@ mod tests {
         assert!(identity_required(&cwd).contains(
             "no .tightbeam-session was found walking up from '/tmp/tightbeam-no-session' to the filesystem root"
         ));
+    }
+
+    #[test]
+    fn onboarding_discovers_once_and_keeps_every_phase_on_that_endpoint() {
+        use std::cell::{Cell, RefCell};
+
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-onboard-endpoint-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+        let prior_machine = std::env::var_os("TIGHTBEAM_MACHINE");
+        unsafe {
+            std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
+        }
+
+        let discoveries = Cell::new(0);
+        let calls = RefCell::new(Vec::new());
+        let result = run_with(
+            Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "fixture-provider".to_owned(),
+                api_key: false,
+            },
+            || {
+                discoveries.set(discoveries.get() + 1);
+                Ok(Endpoint {
+                    base: "https://one-gateway.test".to_owned(),
+                    token: "tbc_one".to_owned(),
+                    session_file: None,
+                })
+            },
+            |endpoint, request| {
+                let phase = if request.body_json.contains(r#""phase":"begin""#) {
+                    "begin"
+                } else if request.body_json.contains(r#""phase":"finish""#) {
+                    "finish"
+                } else {
+                    panic!("unexpected onboarding request: {}", request.body_json);
+                };
+                calls.borrow_mut().push((endpoint.base.clone(), phase));
+                if phase == "begin" {
+                    Ok(Some(serde_json::json!({
+                        "stagingPath": staging,
+                        "leaseTtlMs": 60_000
+                    })))
+                } else {
+                    Ok(None)
+                }
+            },
+        );
+
+        match prior_machine {
+            Some(value) => unsafe { std::env::set_var("TIGHTBEAM_MACHINE", value) },
+            None => unsafe { std::env::remove_var("TIGHTBEAM_MACHINE") },
+        }
+        let _ = fs::remove_dir_all(&staging);
+
+        result.unwrap();
+        assert_eq!(discoveries.get(), 1);
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                ("https://one-gateway.test".to_owned(), "begin"),
+                ("https://one-gateway.test".to_owned(), "finish"),
+            ]
+        );
     }
 
     #[test]
