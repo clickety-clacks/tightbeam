@@ -43,6 +43,38 @@ defmodule Tightbeam.SupervisionTest do
     end
   end
 
+  defmodule RulingRaceDB do
+    use GenServer
+
+    def start_link({name, db, parent}),
+      do: GenServer.start_link(__MODULE__, {db, parent}, name: name)
+
+    def init({db, parent}), do: {:ok, %{db: db, parent: parent}}
+
+    def handle_call({:query, sql, _params} = request, _from, state) do
+      result = GenServer.call(state.db, request)
+
+      if String.contains?(sql, "FROM decision_requests WHERE raiserId") and
+           String.contains?(sql, "ORDER BY rowid DESC LIMIT 1") do
+        {:ok, [[id | _]]} = result
+
+        {:ok, _} =
+          DB.query(
+            state.db,
+            "UPDATE decision_requests SET status = 'ruled', decision = 'allow', ruledAt = 1 WHERE id = ?1",
+            [id]
+          )
+
+        send(state.parent, {:ruled_before_park, id})
+      end
+
+      {:reply, result, state}
+    end
+
+    def handle_call(request, _from, state),
+      do: {:reply, GenServer.call(state.db, request), state}
+  end
+
   setup do
     db = :"supervision_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -321,6 +353,47 @@ defmodule Tightbeam.SupervisionTest do
                "statute" => "completion-needs-owner"
              }
            ] = rail_sweep_details(ctx.db, "holder")
+  end
+
+  test "turn-end escalation rechecks openness before parking a stale request", ctx do
+    write_rules(
+      ctx,
+      """
+      [[rule]]
+      name = "completion-needs-owner"
+      verb = "attest"
+      text = "owner approval required"
+      edges = ["verb", "turn-end"]
+      effect = "escalate"
+      deny_when = [
+        { fact = "attest.kind", op = "eq", value = "completion" }
+      ]
+      """
+    )
+
+    assert {:acted, :rail_escalate} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal!(ctx.db, "holder"))
+
+    {:ok, [[id, park_wake_id]]} =
+      DB.query(ctx.db, "SELECT id, parkWakeId FROM decision_requests")
+
+    assert Wakes.cancel(ctx.db, park_wake_id, "process:tightbeam")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE decision_requests SET parkWakeId = NULL WHERE id = ?1", [id])
+
+    proxy = :"ruling_race_db_#{System.unique_integer([:positive])}"
+    start_supervised!({RulingRaceDB, {proxy, ctx.db, self()}})
+
+    assert {:acted, :rail_escalate} =
+             Supervision.evaluate(proxy, ctx.handlers, 3, "holder", terminal!(ctx.db, "holder"))
+
+    assert_receive {:ruled_before_park, ^id}
+
+    assert {:ok, [["ruled", nil]]} =
+             DB.query(ctx.db, "SELECT status, parkWakeId FROM decision_requests WHERE id = ?1", [
+               id
+             ])
   end
 
   test "only a durable self-created continuation suppresses the turn-end remedy", ctx do

@@ -131,34 +131,39 @@ defmodule Tightbeam.WorkState do
   @doc "Insert an assignment doorbell iff the derived state changed."
   @spec emit(DB.server(), String.t(), String.t() | nil) :: map() | nil
   def emit(db, assignment_id, from) do
-    to = status(db, assignment_id)
+    transaction(db, fn txn ->
+      to = status_in_txn(txn, assignment_id)
 
-    if is_nil(to) or (not is_nil(from) and from == to) do
-      nil
-    else
-      ts = System.system_time(:millisecond)
+      if is_nil(to) or (not is_nil(from) and from == to) do
+        nil
+      else
+        ts = System.system_time(:millisecond)
 
-      id =
-        transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "INSERT INTO work_state_events (ts, assignmentId, fromState, toState) VALUES (?1, ?2, ?3, ?4)",
+          [ts, assignment_id, from, to]
+        )
+
+        [[id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+        [[session_key]] =
           Txn.q(
             txn,
-            "INSERT INTO work_state_events (ts, assignmentId, fromState, toState) VALUES (?1, ?2, ?3, ?4)",
-            [ts, assignment_id, from, to]
+            "SELECT holderKey FROM assignments WHERE id = ?1",
+            [assignment_id]
           )
 
-          [[id]] = Txn.q(txn, "SELECT last_insert_rowid()")
-          id
-        end)
-
-      %{
-        assignmentId: assignment_id,
-        sessionKey: assignment_holder(db, assignment_id),
-        fromState: from,
-        toState: to,
-        cursor: id,
-        ts: ts
-      }
-    end
+        %{
+          assignmentId: assignment_id,
+          sessionKey: session_key,
+          fromState: from,
+          toState: to,
+          cursor: id,
+          ts: ts
+        }
+      end
+    end)
   end
 
   @doc "Insert and return one work-item doorbell."
@@ -297,11 +302,11 @@ defmodule Tightbeam.WorkState do
     %{sessionKey: key, state: state, displayName: display_name}
   end
 
-  defp assignment_holder(db, assignment_id) do
-    {:ok, [[holder]]} =
-      DB.query(db, "SELECT holderKey FROM assignments WHERE id = ?1", [assignment_id])
-
-    holder
+  defp status_in_txn(txn, assignment_id) do
+    case Txn.q(txn, assignment_query("a.id = ?1"), [assignment_id]) do
+      [row] -> row |> assignment() |> Map.fetch!(:status)
+      [] -> nil
+    end
   end
 
   defp cursors(txn) do

@@ -68,6 +68,17 @@ defmodule Tightbeam.GatewayTest do
     WorkState
   }
 
+  test "all archetype-to-MCP projections retain the builtin fallback" do
+    source = File.read!("lib/tightbeam/gateway.ex")
+
+    assert length(
+             Regex.scan(
+               ~r/session\.archetype\s*\|>\s*Archetypes\.get\(\)\s*\|>\s*Archetypes\.acp_mcp_servers\(\)/,
+               source
+             )
+           ) == 0
+  end
+
   alias Tightbeam.Wire.Payloads
 
   defmodule LaneDoorbell do

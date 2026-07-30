@@ -28,6 +28,34 @@ defmodule Tightbeam.Wire.SocketTest do
     end
   end
 
+  defmodule MainSeedRaceDB do
+    use GenServer
+
+    def start_link({name, db}), do: GenServer.start_link(__MODULE__, db, name: name)
+    def init(db), do: {:ok, %{db: db, waiting: nil, armed: true}}
+
+    def handle_call({:query, sql, _params} = request, from, state) do
+      if state.armed and String.contains?(sql, "FROM sessions") and
+           String.contains?(sql, "WHERE sessionKey = ?1") do
+        result = GenServer.call(state.db, request)
+
+        case state.waiting do
+          nil ->
+            {:noreply, %{state | waiting: {from, result}}}
+
+          {first_from, first_result} ->
+            GenServer.reply(first_from, first_result)
+            {:reply, result, %{state | waiting: nil, armed: false}}
+        end
+      else
+        {:reply, GenServer.call(state.db, request), state}
+      end
+    end
+
+    def handle_call(request, _from, state),
+      do: {:reply, GenServer.call(state.db, request), state}
+  end
+
   setup do
     db = :"socket_db_#{System.unique_integer([:positive])}"
     registry = :"socket_registry_#{System.unique_integer([:positive])}"
@@ -290,6 +318,41 @@ defmodule Tightbeam.Wire.SocketTest do
     {:push, [{:text, sync}], live} = Socket.handle_info(:finish_replay, replaying)
     assert JSON.decode!(sync) == %{"type" => "sync_complete"}
     assert live.phase == :live
+  end
+
+  test "concurrent first auths converge on one personal main stream", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{device_id: "race", claimed_name: "Flynn", platform: nil, model: nil})
+
+    proxy = :"main_seed_race_db_#{System.unique_integer([:positive])}"
+    start_supervised!({MainSeedRaceDB, {proxy, ctx.db}})
+    deps = %{ctx.deps | db: proxy}
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+    parent = self()
+
+    refs =
+      for _ <- 1..2 do
+        {:ok, state} = Socket.init(deps)
+
+        spawn_monitor(fn ->
+          send(
+            parent,
+            {:auth_result, Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)}
+          )
+        end)
+        |> elem(1)
+      end
+
+    for _ <- refs do
+      assert_receive {:auth_result, {:push, _frames, _state}}
+    end
+
+    for ref <- refs do
+      assert_receive {:DOWN, ^ref, :process, _pid, :normal}
+    end
+
+    assert [%{session_key: key}] = Org.list_for_user(ctx.db, device.user_id, false)
+    assert key == Org.personal_session_key(device.user_id)
   end
 
   test "drain filters a mid-replay push already covered by the replay window", ctx do

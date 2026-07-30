@@ -418,35 +418,36 @@ defmodule Tightbeam.Supervision do
 
   defp park_escalation(db, session_key, decision_request_id) do
     transaction!(db, fn txn ->
-      [[deadline_at, park_wake_id, assignment_id]] =
-        Txn.q(
-          txn,
-          "SELECT deadlineAt, parkWakeId, assignmentId FROM decision_requests WHERE id = ?1",
-          [decision_request_id]
-        )
+      case Txn.q(
+             txn,
+             "SELECT deadlineAt, parkWakeId, assignmentId FROM decision_requests WHERE id = ?1 AND status = 'open'",
+             [decision_request_id]
+           ) do
+        [[deadline_at, nil, assignment_id]] ->
+          wake =
+            Wakes.schedule_in_txn(txn, %{
+              session_key: session_key,
+              target_role: nil,
+              origin: "process:tightbeam",
+              prompt:
+                "Decision request #{decision_request_id} was ruled; re-adjudicate the obligation.",
+              due_at: deadline_at,
+              condition_kind: "escalation-ruled",
+              condition_scope: decision_request_id,
+              creator_session_key: nil,
+              # A decision-DEADLINE wake resolves its assignment from the REQUEST
+              # row, where it is durable (spec job-forensics-v2 §1).
+              assignment_id: assignment_id
+            })
 
-      if is_nil(park_wake_id) do
-        wake =
-          Wakes.schedule_in_txn(txn, %{
-            session_key: session_key,
-            target_role: nil,
-            origin: "process:tightbeam",
-            prompt:
-              "Decision request #{decision_request_id} was ruled; re-adjudicate the obligation.",
-            due_at: deadline_at,
-            condition_kind: "escalation-ruled",
-            condition_scope: decision_request_id,
-            creator_session_key: nil,
-            # A decision-DEADLINE wake resolves its assignment from the REQUEST
-            # row, where it is durable (spec job-forensics-v2 §1).
-            assignment_id: assignment_id
-          })
+          Txn.q(
+            txn,
+            "UPDATE decision_requests SET parkWakeId = ?2 WHERE id = ?1 AND parkWakeId IS NULL",
+            [decision_request_id, wake.wake_id]
+          )
 
-        Txn.q(
-          txn,
-          "UPDATE decision_requests SET parkWakeId = ?2 WHERE id = ?1 AND parkWakeId IS NULL",
-          [decision_request_id, wake.wake_id]
-        )
+        _ ->
+          nil
       end
     end)
   end
