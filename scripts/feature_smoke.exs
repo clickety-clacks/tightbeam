@@ -22,14 +22,30 @@
 # wants both legs green (artifact-carrier-proposal-v1 §7.3); the filter is for
 # answering one leg's question quickly, not for satisfying the gate.
 #
-# The final group, artifact-record + completion-gate closure, additionally needs
-# the org's identity/rules to carry the shipped verification statutes
-# (completion-requires-verification, completion-requires-results-artifact) AND a
-# `coder` archetype. Rules load once at gateway BOOT, so an org whose law changed
-# under a running gateway must be rebooted before the run. On shrdlu that means
-# the eb0ea2b org-law workaround must be REVERTED first: with it installed the
-# artifact statute never denies and the group fails at its third denial, which is
-# exactly what keeps that leg falsifiable.
+# The last two groups cover artifact-carrier-proposal-v1 §7.3 as a pair, and the
+# split between them is deliberate. `check_gate_chain_enforced/1` proves the LAW —
+# each statute denies while its fact is unsatisfied, and the artifact releases the
+# last one — driven entirely over HTTP so no model turn can reach the gates first.
+# `check_carrier_on_real_turn/1` proves the CARRIER: a real CLI artifact-record
+# inside a real harness turn, bound to that turn and reading tool-call-observed.
+#
+# "A REAL AGENT WALKS THE GATES" was proven in the field, not dropped. Both legs
+# did the whole lifecycle autonomously and honestly on 2026-07-31 — claude
+# 11:19:56 open → 11:20:48 verified → 11:21:02 recorded → 11:21:07 closed, codex
+# the same shape at 12:09–12:12, landing art_0f26ec21 tool-call-observed with a
+# non-null edge. Driving that chain through a scripted holder is what the split
+# gives up, because a capable holder finishes it before any scripted denial can
+# fire; the second group keeps the substrate half under assertion every run and
+# accepts the holder completing its own assignment rather than calling it a race.
+#
+# Both groups additionally need the org's identity/rules to carry the shipped
+# verification statutes (completion-requires-verification,
+# completion-requires-results-artifact) AND a `coder` archetype that admits this
+# host. Rules load once at gateway BOOT, so an org whose law changed under a
+# running gateway must be rebooted before the run. On shrdlu that means the
+# eb0ea2b org-law workaround must be REVERTED first: with it installed the
+# artifact statute never denies and the gate-chain group fails at its third
+# denial, which is exactly what keeps that leg falsifiable.
 
 defmodule FeatureSmoke do
   defmodule Failure do
@@ -78,7 +94,8 @@ defmodule FeatureSmoke do
       |> check_flagship_review_loop()
       |> check_escalation_to_owner()
       |> check_toplines_board()
-      |> check_artifact_record_closure()
+      |> check_gate_chain_enforced()
+      |> check_carrier_on_real_turn()
       |> finish_leg()
     end)
   end
@@ -651,33 +668,50 @@ defmodule FeatureSmoke do
   #   own `turns.messageId`, so the central assertion is a claim about a specific turn and
   #   not about whichever row looked right. Identity from the substrate, not from content,
   #   which is the same principle the carrier under test rests on.
-  defp check_artifact_record_closure(state) do
+  # --- T2a: the gate chain, enforced -------------------------------------------------
+  # artifact-carrier-proposal-v1 §7.3, first of two halves.
+  #
+  # OPERATOR-DRIVEN END TO END, and that is the design rather than a shortcut. Every step
+  # here is an HTTP call, so no model turn has to run for any of it and no holder can
+  # reach the gates before the assertions do.
+  #
+  # The earlier shape drove this chain through a real holder, and both field runs proved
+  # it unassertable that way. Handed grounded work and the statute's own remedy prompt, a
+  # competent holder verified, recorded its report and completed before the scripted
+  # denials could fire — claude 11:19:56 open → 11:20:48 verified → 11:21:02 recorded →
+  # 11:21:07 closed, and codex the same shape at 12:09–12:12. The scripted denial then hit
+  # `assignment_closed`. The agents were right and the journey was wrong: it had been
+  # asserting that a capable holder would fail to do its job.
+  #
+  # WHERE THE REAL-AGENT PROOF LIVES NOW, so no one reads this split as a proof dropped
+  # rather than relocated. Those two field runs ARE the "a real agent walks the gates"
+  # evidence, and they are stronger than the scripted version was: both holders verified
+  # with grounded notes of their own, recorded over the real CLI — codex landed
+  # art_0f26ec21 `tool-call-observed` with a non-null edge, which is the R7 datum itself —
+  # and completed, autonomously and honestly, on both harnesses. What remains under
+  # assertion every run is the substrate half, in `check_carrier_on_real_turn/1` below,
+  # which accepts the holder completing its own assignment as the legitimate outcome it is
+  # rather than as a race to be suppressed.
+  #
+  # What this half proves is the LAW: each statute denies while its fact is unsatisfied,
+  # in order, and the artifact releases the last one. An org carrying the eb0ea2b
+  # workaround still fails at the third denial, so falsifiability is untouched.
+  defp check_gate_chain_enforced(state) do
     u = unique()
-    # A HUMAN-LEGIBILITY marker, and deliberately not the selector. The prompted record is
-    # identified by the turn that produced it (`recordedMessageId`); this filename is what
-    # lets a failure say WHICH record it found and why it was rejected. Treating it as an
-    # identity would be wrong: a wake persists its prompt to the transcript while queued,
-    # so a turn running beside it can read the salt, and `u` is visible in the work-item
-    # title and assignment subject regardless.
-    marker = "results-#{u}.md"
     reviewer_leg = independent_leg(state)
     preflight_independent!(state, reviewer_leg)
 
     post(state, "role-create", %{"name" => "reviewer"})
 
-    # Spawning through the OTHER leg is the whole cross-harness move: `post/3` runs every
-    # spawn through `FeatureSmokePlan.explicit_spawn/2`, which pins harness and model from
-    # `state.leg`, so swapping the leg for this one call is enough.
-    #
-    # The `reviewer` bind does double duty, and both halves are load-bearing. A session
-    # acting under its OWN credential needs a bound role or the router refuses it
-    # `no_role`; and `Roles.bind/3` REPLACES `boundSessionKey`, so this is also what
-    # points the review statute's `target_role` at a live session instead of at whatever
-    # retired one a previous group left behind.
+    # The reviewer is spawned through the other SELECTED leg where this run has one. The
+    # `reviewer` bind does double duty: a session acting under its own credential needs a
+    # bound role or the router refuses it `no_role`, and `Roles.bind/3` REPLACES
+    # `boundSessionKey`, which is what points the review statute's `target_role` at a live
+    # session instead of whatever retired one a previous group left behind.
     reviewer =
       ok!(%{state | leg: reviewer_leg}, "spawn", %{
-        "displayName" => "smoke-artifact-reviewer-#{u}",
-        "idempotencyKey" => "arv-#{u}"
+        "displayName" => "smoke-gate-reviewer-#{u}",
+        "idempotencyKey" => "grv-#{u}"
       })
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
@@ -686,86 +720,23 @@ defmodule FeatureSmoke do
 
     wi =
       ok!(state, "work-item-create", %{
-        "title" => "artifact closure #{u}",
-        "idempotencyKey" => "arwi-#{u}"
+        "title" => "gate chain #{u}",
+        "idempotencyKey" => "gwi-#{u}"
       })
 
     wi_id = wi["workItemId"] || wi["id"]
-
-    # `holder_archetype in ["coder"]` is a deny_when condition on BOTH verification
-    # statutes, so the holder must actually BE a coder. A default-archetype holder walks
-    # straight past them and the journey would pass while proving nothing.
-    #
-    # THE HOST IS PINNED, and the seed below depends on it. `Placement.resolve/3` treats a
-    # nil host as "first of archetype.where" unless the archetype grants `["*"]`, and the
-    # shipped coder archetype is `where = ["eezo", "racter"]` — so an unpinned spawn on any
-    # other gateway places the holder on a DIFFERENT machine while the seed is written
-    # locally from `state.base_dir`. The holder would then find nothing, and the report
-    # would faithfully capture the shell error saying so. T2a is single-host by design, so
-    # the pin states that rather than relying on the where-list's first entry happening to
-    # be this box. If the org's coder archetype does not admit this host the spawn is now
-    # refused `host_not_allowed` by name, which is the right failure: loud, and about the
-    # org's law rather than about a file that mysteriously is not there.
-    coder =
-      ok!(state, "spawn", %{
-        "archetype" => "coder",
-        "host" => Tightbeam.Placement.local_host_name(),
-        "displayName" => "smoke-artifact-coder-#{u}",
-        "idempotencyKey" => "arcd-#{u}"
-      })
-
-    coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
-    post(state, "role-create", %{"name" => "coder-artifact-#{u}"})
-    ok!(state, "role-bind", %{"name" => "coder-artifact-#{u}", "sessionKey" => coder_key})
-    coder_tok = session_token(state, coder_key)
-
-    # REAL WORK, ON THE HOST, BEFORE THE ASSIGNMENT EXISTS.
-    #
-    # Four holders refused this chain on the live run, and they were RIGHT to: the
-    # assignment named no files and pointed at nothing runnable, so there was nothing on
-    # the host to verify, and one of them called the seed "an ungrounded fabrication I'm
-    # not repeating". That is this product's own doctrine working — the refusal is the
-    # behavior `surrender-escalates-to-owner` and the verification statutes exist to
-    # produce. The fixture has to MEET it, not prompt around it, so the group seeds a
-    # thing that can actually be run and observed and hands the holder its name.
-    check = seed_verifiable_work!(state, coder_key, u)
-
-    asg =
-      ok!(state, "assign", %{
-        "sessionKey" => coder_key,
-        "subject" => "run #{check.name} and record its output — artifact closure #{u}",
-        "workItemId" => wi_id,
-        "files" => [check.name],
-        "idempotencyKey" => "aras-#{u}"
-      })
-
-    asg_id = asg["id"] || asg["assignmentId"]
+    holder = open_grounded_assignment!(state, u, wi_id, "gate chain #{u}", "g")
+    asg_id = holder.assignment_id
 
     complete = fn ->
-      post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+      post_as(state, holder.token, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
     end
 
     try do
-      # 1. Review gate.
-      denied!(state, "completion-requires-review", coder_key, asg_id, complete)
+      # 1. Review gate. Its remedy assigns the bound reviewer, synchronously inside the
+      # attest, so the review exists by the time the denial response returns.
+      denied!(state, "completion-requires-review", asg_id, complete)
 
-      # The review this group files its verdict on is the one the REMEDY opened, and there
-      # is deliberately no second one.
-      #
-      # An earlier revision opened it explicitly, on field advice that the remedy no-ops
-      # against a reviewer role bound to a retired session. That reason does not survive
-      # this group's own setup: the fresh reviewer is rebound above, and `Roles.bind/3`
-      # REPLACES `boundSessionKey`, so `target_role` resolves to the live session. Opening
-      # one anyway produced a duplicate review of the same assignment — two obligations
-      # where the org law asked for one, which is worse than either path alone.
-      #
-      # The independence condition holds either way, and it is worth naming because it is
-      # what the choice was originally made to protect: `commissioned_review_authors/3`
-      # counts a verdict only when the review's `openedBySession` differs from the holder
-      # and the author is the review's own holder. A remedy-opened review has
-      # `openedBySession` NULL, exactly as an owner-opened one does. What using the remedy
-      # additionally buys is the assertion below — that the remedy reached the right
-      # session — which the explicit open had silently dropped.
       reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
 
       review =
@@ -776,11 +747,16 @@ defmodule FeatureSmoke do
       assert(
         state,
         is_map(review),
-        "artifact closure: the review remedy did not assign the #{reviewer_leg.wire_name} " <>
-          "reviewer a review of #{asg_id}. The role is rebound to this group's live reviewer, " <>
-          "so an unresolved target here is a real remedy failure. Got: #{inspect(reviews)}"
+        "gate chain: the review remedy did not assign the #{reviewer_leg.wire_name} reviewer a " <>
+          "review of #{asg_id}. The role is rebound to this group's live reviewer, so an " <>
+          "unresolved target here is a real remedy failure. Got: #{inspect(reviews)}"
       )
 
+      # Independence is a property of the SESSION, never of the harness:
+      # `commissioned_review_authors/3` counts a verdict only when the review's
+      # `openedBySession` differs from the holder and the author is the review's own holder.
+      # A remedy-opened review has `openedBySession` NULL, so it qualifies, and on a
+      # filtered single-leg run a fresh same-harness reviewer qualifies just as fully.
       v =
         post_as(state, reviewer_tok, "attest", %{
           "assignmentId" => review["id"] || review["assignmentId"],
@@ -791,70 +767,146 @@ defmodule FeatureSmoke do
       assert(
         state,
         not (is_map(v) and Map.has_key?(v, "error")),
-        "artifact closure: cross-harness reviewed-clean from #{reviewer_leg.wire_name} failed: #{inspect(v)}"
+        "gate chain: reviewed-clean from the #{reviewer_leg.wire_name} reviewer failed: #{inspect(v)}"
       )
 
-      # 2. Verification gate, now reachable because the review gate stopped denying.
-      denied!(state, "completion-requires-verification", coder_key, asg_id, complete)
+      # 2. Verification gate, reachable now that the review gate stopped denying.
+      denied!(state, "completion-requires-verification", asg_id, complete)
 
-      # A verdict with a TRUE note, because a bare one is indistinguishable from a
-      # fabrication and gets treated as one. The live run's holder named this exactly: a
-      # prior `verified` carrying `note: null` "appears to have been filed without any
-      # actual verification", and it declined to build on it. It was right — nothing had
-      # been verified.
-      #
-      # So the operator verifies, and then says what it did. `check.output` is the real
-      # stdout of the real script, captured by `seed_verifiable_work!/3` when it actually
-      # ran it. Pre-seeding rather than making the holder file this keeps the group
-      # deterministic and one turn shorter, and it stays honest because the claim in the
-      # note is a thing that happened.
       verified =
-        post_as(state, coder_tok, "attest", %{
+        post_as(state, holder.token, "attest", %{
           "assignmentId" => asg_id,
           "kind" => "verdict",
           "verdictKind" => "verified",
-          "note" => check.note
+          "note" => holder.check.note
         })
 
       assert(
         state,
         not (is_map(verified) and Map.has_key?(verified, "error")),
-        "artifact closure: holder verified verdict failed: #{inspect(verified)}"
+        "gate chain: the holder-token verified verdict failed: #{inspect(verified)}"
       )
 
-      # 3. The artifact gate — the statute this whole journey exists for. Before the
-      # carrier landed, `artifact-record` refused unconditionally from a real CLI client
-      # and this deny was unsatisfiable, which is the loop `eb0ea2b` worked around on
-      # shrdlu. If that workaround is still installed in the org under test, THIS
-      # assertion is what fails, which is what keeps the shrdlu leg falsifiable
-      # (§7.3 gate item 4).
-      denied!(state, "completion-requires-results-artifact", coder_key, asg_id, complete)
-
-      # The episode going live is the fail-before that makes the closure at the end mean
-      # something, and it is safe to depend on where the review remedy was not: this one
-      # wakes `{holder_key}` directly, so there is no `target_role` to resolve.
+      # 3. The artifact gate.
+      denied!(state, "completion-requires-results-artifact", asg_id, complete)
       await_episode_status!(state, "completion-requires-results-artifact", asg_id, "live")
 
-      # 4. The real turn, and it runs ALONE.
+      # 4. The report, recorded BY THE OPERATOR over HTTP on the holder's own token — and
+      # its WEAKER evidence class is an assertion here rather than a compromise.
       #
-      # That remedy woke the holder, and its turn is now running. Draining it before this
-      # group's own wake is what makes everything downstream an identity claim rather than
-      # a guess: no concurrent reader of the transcript that carries the marker, no second
-      # attest landing a denial beside the correlated one, and no second turn racing to
-      # record. The remedy's turn may well satisfy the gate on its own — that is fine and
-      # it is not what is being measured, because the assertions below key on the turn
-      # THIS group prompts, not on whichever record appears.
+      # No hook can observe an HTTP call, so this row cannot read `tool-call-observed`.
+      # Two ruled properties fall out of that, on a row this half needs anyway:
       #
-      # The prompt exists because the shipped remedy prompt names neither the work item
-      # (which `Artifacts.record/2` REQUIRES) nor the direct-invocation constraint the
-      # observation depends on.
-      await_lane_idle!(state, coder_key, "before issuing this group's own artifact wake")
+      #   THE GATE IS EVIDENCE-BLIND (§7.2 item 9, R5). `Artifacts.recorded_kinds/3`
+      #   selects on workItemId and createdBySession and reads neither the class nor the
+      #   edge, so a weak row releases the statute exactly as a strong one would. That was
+      #   unit-only until now; the completion below is its live proof.
+      #
+      #   THE CLASSES ARE NOT SPOOFABLE. If an operator HTTP call could read
+      #   `tool-call-observed`, the strongest class would be obtainable without any tool
+      #   call, and every conclusion `check_carrier_on_real_turn/1` draws would be void.
+      #   This is the standing negative control that says it cannot.
+      #
+      # The content is the output the operator really observed, written where the holder's
+      # own report would go — the same honesty the note carries.
+      results = "results-#{u}.md"
+      File.write!(Path.join(Path.dirname(holder.check.path), results), holder.check.output)
+
+      recorded =
+        post_as(state, holder.token, "artifact-record", %{
+          "kind" => "report",
+          "title" => "operator report #{u}",
+          "path" => results,
+          "workItemId" => wi_id
+        })
+
+      assert(
+        state,
+        is_binary(recorded["artifactId"]),
+        "gate chain: the operator's artifact-record did not land a row: #{inspect(recorded)}"
+      )
+
+      assert(
+        state,
+        recorded["recordedTurnEvidence"] in ~w(session-concurrent none),
+        "gate chain: an artifact-record made over HTTP, with no tool call to observe, reads " <>
+          "#{inspect(recorded["recordedTurnEvidence"])}. `tool-call-observed` here would mean " <>
+          "the strongest evidence class is obtainable WITHOUT a tool call, which would void " <>
+          "the carrier proof in the other half of this group. Row: #{inspect(recorded)}"
+      )
+
+      # 5. Release. The gate had denied three times; with a report on record — a WEAK one —
+      # completion passes, which is the evidence-blindness above proven end to end.
+      done = complete.()
+      final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
+
+      assert(
+        state,
+        final["state"] == "closed" and final["outcome"] == "completed",
+        "gate chain: with a report recorded, completion should close #{asg_id} as completed; " <>
+          "assignment reads state=#{inspect(final["state"])} outcome=#{inspect(final["outcome"])} " <>
+          "(attest returned #{inspect(done)})"
+      )
+
+      await_episode_status!(state, "completion-requires-results-artifact", asg_id, "closed")
+
+      pass(
+        state,
+        "gate chain enforced: review(#{reviewer_leg.wire_name}) → verification → artifact " <>
+          "denied in order, released by a #{recorded["recordedTurnEvidence"]} row (gate is " <>
+          "evidence-blind, classes not spoofable), completes, episode closed"
+      )
+    after
+      # EVERY assertion about an assignment outcome stays above this line: `retire` REVOKES
+      # a session's open assignments, so a retired holder reads `revoked`, and an assertion
+      # moved below would read teardown's revocation as this group's result.
+      retire(state, reviewer)
+      retire(state, holder.session)
+    end
+  end
+
+  # --- T2a: the carrier, on a real turn ----------------------------------------------
+  # artifact-carrier-proposal-v1 §7.3, second half and the R7 datum.
+  #
+  # The ONLY place in the tree where `artifact-record` runs from the real CLI inside a real
+  # harness turn, which is the only way the substrate-reserved PreToolUse observation
+  # (`Tightbeam.Rails.observation_entry/0`) can fire at all. Every other artifact assertion
+  # drives the writer directly and therefore cannot see the hook.
+  #
+  # WHICH HALF OF CODEX THIS PROVES. Codex as a verdict FILER is proven on this gateway —
+  # the live walks filed reviewed-clean over codex cleanly. What rests on the trust-gated
+  # `CODEX_CONFIG` hook seam is codex as the artifact RECORDER, and until the field runs it
+  # had only the 0.145.0 spike behind it (§5.2). The holder is therefore always the leg's
+  # own harness and the class is asserted PER LEG, which is what makes a filtered
+  # single-leg run a complete answer to that one question.
+  #
+  # NO GATES ARE DRIVEN HERE, so no remedy wakes fire and there is nothing to serialize
+  # against beyond this group's own wake. The holder completing its assignment afterwards
+  # is ACCEPTED AND NOT REQUIRED: that is what a capable holder does with grounded work,
+  # it is what both field runs did, and a journey that treated it as a failure would be
+  # asserting that good agents behave badly.
+  defp check_carrier_on_real_turn(state) do
+    u = unique()
+    marker = "results-#{u}.md"
+
+    wi =
+      ok!(state, "work-item-create", %{
+        "title" => "carrier proof #{u}",
+        "idempotencyKey" => "cwi-#{u}"
+      })
+
+    wi_id = wi["workItemId"] || wi["id"]
+    holder = open_grounded_assignment!(state, u, wi_id, "carrier proof #{u}", "c")
+    asg_id = holder.assignment_id
+
+    try do
+      await_lane_idle!(state, holder.key, "before issuing the artifact wake")
 
       wake =
         ok!(state, "wake", %{
-          "sessionKey" => coder_key,
-          "prompt" => artifact_prompt(u, marker, check.name, wi_id, asg_id),
-          "idempotencyKey" => "arwake-#{u}"
+          "sessionKey" => holder.key,
+          "prompt" => artifact_prompt(u, marker, holder.check.name, wi_id, asg_id),
+          "idempotencyKey" => "cwake-#{u}"
         })
 
       wake_id = wake["wakeId"]
@@ -865,112 +917,126 @@ defmodule FeatureSmoke do
         marker: marker
       }
 
-      {prompted, reports} = await_prompted_report!(state, coder_key, wi_id, asg_id, proof)
+      {prompted, reports} = await_prompted_report!(state, holder.key, wi_id, asg_id, proof)
       classes = Enum.map(reports, & &1["recordedTurnEvidence"])
 
       # The null-vs-non-null coupling, on EVERY row. Pure substrate: `tool-call-observed`
       # and `session-concurrent` each name a turn and must carry its id, `none` names no
-      # turn and must carry NULL. A row that breaks the pairing is a carrier defect
-      # regardless of what the agent chose to run.
+      # turn and must carry NULL. A row breaking the pairing is a carrier defect whatever
+      # the agent chose to run.
       Enum.each(reports, fn row ->
         assert(
           state,
           row["recordedTurnEvidence"] in ~w(tool-call-observed session-concurrent none),
-          "artifact closure: recordedTurnEvidence outside its closed domain: #{inspect(row)}"
+          "carrier proof: recordedTurnEvidence outside its closed domain: #{inspect(row)}"
         )
 
         if row["recordedTurnEvidence"] == "none" do
           assert(
             state,
             is_nil(row["recordedMessageId"]),
-            "artifact closure: evidence 'none' must carry a NULL recordedMessageId: #{inspect(row)}"
+            "carrier proof: evidence 'none' must carry a NULL recordedMessageId: #{inspect(row)}"
           )
         else
           assert(
             state,
             is_binary(row["recordedMessageId"]),
-            "artifact closure: evidence #{inspect(row["recordedTurnEvidence"])} names a turn but recordedMessageId is NULL: #{inspect(row)}"
+            "carrier proof: evidence #{inspect(row["recordedTurnEvidence"])} names a turn but " <>
+              "recordedMessageId is NULL: #{inspect(row)}"
           )
         end
       end)
 
-      # THE assertion this journey exists to force, per leg, and it is now an IDENTITY
-      # claim: the row bound to the turn this group prompted must read
-      # `tool-call-observed`. Selecting on `recordedMessageId` is what makes the class
-      # unspoofable by anything else on the session — a record that inherited some other
-      # turn's window carries that turn's message id and never reaches this line.
-      #
-      # Exact rather than "any of the three classes", because both registered harnesses
-      # project the observation entry unconditionally (`Rails.hook_settings/0`) and the
-      # prompt forbids the script-wrapping §1.3 names as the legitimate way to miss it. A
-      # `session-concurrent` row HERE carries the prompted turn's own message id, which
-      # means the hook did not fire on a turn that ran alone — the exact failure the codex
-      # recorder leg exists to catch. On that leg this line IS the proof that converts
-      # §5.2 from spike evidence into a live one.
+      # THE R7 assertion, per leg, and an IDENTITY claim rather than a content one: the row
+      # bound to the turn this group prompted must read `tool-call-observed`. Selecting on
+      # `recordedMessageId` is what makes the class unspoofable by anything else on the
+      # session — a record that inherited another turn's window carries that turn's id and
+      # never reaches this line — and the negative control in `check_gate_chain_enforced/1`
+      # is what proves the class cannot be reached without a tool call at all.
       assert(
         state,
         prompted["recordedTurnEvidence"] == "tool-call-observed",
-        "artifact closure: the record bound to the prompted turn (message #{proof.message_id}) reads " <>
-          "#{inspect(prompted["recordedTurnEvidence"])}, not tool-call-observed — the reserved " <>
-          "PreToolUse observation did not fire for the #{state.leg.wire_name} holder on a turn " <>
-          "that ran with no other turn on its lane, so this leg's record rests on concurrency " <>
-          "rather than observation. Read it as the RECORDER side of #{state.leg.wire_name} " <>
-          "failing; the filer side is a separate question this group does not test. " <>
+        "carrier proof: the record bound to the prompted turn (message #{proof.message_id}) " <>
+          "reads #{inspect(prompted["recordedTurnEvidence"])}, not tool-call-observed — the " <>
+          "reserved PreToolUse observation did not fire for the #{state.leg.wire_name} holder " <>
+          "on a turn that ran with no other turn on its lane, so this leg's record rests on " <>
+          "concurrency rather than observation. Read it as the RECORDER side of " <>
+          "#{state.leg.wire_name} failing; the filer side is a separate question. " <>
           "Row: #{inspect(prompted)}. All classes seen: #{inspect(classes)}"
       )
 
       # NOTHING here asserts artifact lifecycle `state`. Retirement moves rows
-      # in-workspace → released, and the gate is state-blind on purpose
-      # (`Artifacts.recorded_kinds/3` reads neither state nor the turn edge), so a state
+      # in-workspace → released and the gate is state-blind on purpose, so a state
       # assertion would be a brittle oracle for a fact the substrate does not gate on.
       # Kind and provenance are the whole contract. Do not add one.
       #
-      # Nor is anything re-asserted that the selection already settled: `createdBySession`
-      # and `workItemId` are query filters, and `originPath` is how `prompted` was found —
-      # a row carrying this marker at all is the proof that the real CLI carried this
-      # group's `--path` argument through to the substrate.
-
-      # 5. Closure. The gate releases, and the assignment reaches `closed`/`completed`
-      # whether this attest or the holder's own turn filed the completion — both are the
-      # same substrate fact, and neither `surrendered` nor a still-open assignment can be
-      # mistaken for it. `surrendered` here is the roadmap 0a2 failure: an agent escaping
-      # an unsatisfiable gate by abandoning the work permanently.
-      #
-      # Drained first, like every other completion attempt. The wait above returns the
-      # moment the record lands, which is typically MID-TURN — the prompted turn is still
-      # running and free to attest on its own — so without this the barrier would have a
-      # hole at the one attempt whose denial window has to be trustworthy for the closure
-      # to mean anything.
-      await_lane_idle!(state, coder_key, "before the final completion attempt")
-
-      done = complete.()
+      # The outcome is ACCEPTED, not required. A holder that went on to complete did the
+      # job; one still working has not failed. Only abandonment is a failure, and
+      # `surrendered` is roadmap 0a2 — the escape hatch a holder reaches for when a gate
+      # cannot be satisfied, which is exactly what grounding the work is meant to prevent.
       final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
       assert(
         state,
-        final["state"] == "closed" and final["outcome"] == "completed",
-        "artifact closure: with the report recorded, completion should close #{asg_id} as completed; " <>
-          "assignment reads state=#{inspect(final["state"])} outcome=#{inspect(final["outcome"])} " <>
-          "(attest returned #{inspect(done)})"
+        final["outcome"] in [nil, "completed"],
+        "carrier proof: #{asg_id} ended #{inspect(final["outcome"])}. Completing is accepted and " <>
+          "still working is fine; abandoning is not. " <> abandonment_note(final["outcome"])
       )
-
-      await_episode_status!(state, "completion-requires-results-artifact", asg_id, "closed")
 
       pass(
         state,
-        "artifact-record + completion-gate closure: review(#{reviewer_leg.wire_name}) → " <>
-          "verified → artifact denied → real CLI record #{inspect(classes)} → completes, episode closed"
+        "carrier on a real #{state.leg.wire_name} turn: CLI artifact-record bound to its own " <>
+          "turn, #{prompted["recordedTurnEvidence"]} with a non-null edge; assignment " <>
+          "#{inspect(final["outcome"] || "open")}"
       )
     after
-      # EVERY assertion about an assignment outcome must stay above this line. `retire`
-      # REVOKES a session's open assignments, so a retired holder reads `revoked` — which
-      # is a distinct outcome from the `surrendered` the 0a2 oracle looks for, and an
-      # assertion moved below here would read teardown's revocation as the journey's
-      # result. Retirement also moves this holder's artifacts in-workspace → released,
-      # which is the other reason nothing above asserts artifact lifecycle state.
-      retire(state, reviewer)
-      retire(state, coder)
+      retire(state, holder.session)
     end
+  end
+
+  # A host-pinned coder holding grounded work. Both halves need exactly this, and the
+  # pieces are load-bearing in ways worth keeping together rather than duplicating.
+  #
+  # `holder_archetype in ["coder"]` is a deny_when condition on both verification statutes,
+  # so a default-archetype holder would walk straight past them and prove nothing.
+  #
+  # THE HOST IS PINNED, and the seed depends on it. `Placement.resolve/3` reads a nil host
+  # as "first of archetype.where" unless the archetype grants `["*"]`, and the shipped coder
+  # archetype is `where = ["eezo", "racter"]` — so an unpinned spawn on any other gateway
+  # places the holder on a DIFFERENT machine while the seed is written locally. Where an
+  # org's coder archetype does not admit this host the spawn is refused `host_not_allowed`
+  # by name, which is the right failure: about the org's law, not about a file that
+  # mysteriously is not there.
+  defp open_grounded_assignment!(state, u, wi_id, subject, tag) do
+    session =
+      ok!(state, "spawn", %{
+        "archetype" => "coder",
+        "host" => Tightbeam.Placement.local_host_name(),
+        "displayName" => "smoke-#{tag}-coder-#{u}",
+        "idempotencyKey" => "#{tag}cd-#{u}"
+      })
+
+    key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
+    post(state, "role-create", %{"name" => "coder-#{tag}-#{u}"})
+    ok!(state, "role-bind", %{"name" => "coder-#{tag}-#{u}", "sessionKey" => key})
+    check = seed_verifiable_work!(state, key, u)
+
+    assignment =
+      ok!(state, "assign", %{
+        "sessionKey" => key,
+        "subject" => "run #{check.name} and record its output — #{subject}",
+        "workItemId" => wi_id,
+        "files" => [check.name],
+        "idempotencyKey" => "#{tag}as-#{u}"
+      })
+
+    %{
+      session: session,
+      key: key,
+      token: session_token(state, key),
+      check: check,
+      assignment_id: assignment["id"] || assignment["assignmentId"]
+    }
   end
 
   # Put something real in the holder's workdir, run it, and keep what it said.
@@ -1127,20 +1193,24 @@ defmodule FeatureSmoke do
   # map becomes `inspect` output, which is why `json_valid` is in the WHERE clause: it is
   # exactly what separates statute denials from handler denials.
   #
-  # Correlation is by ref inside a window BOUNDED ON BOTH SIDES, and the lane is drained
-  # first. A watermark alone is not enough: it closes the gap before the call but leaves
-  # one after it, so a concurrently running turn could file its own attest and land the
+  # Correlation is by ref inside a window BOUNDED ON BOTH SIDES. A watermark alone closes
+  # the gap before the call and leaves one after it, so a concurrent writer could land the
   # expected statute against the same assignment while the wire returned a DIFFERENT
-  # statute's denial — newest-row-after-watermark would pass that. Draining the lane means
-  # no other turn is running to file anything, and the ceiling is read the instant the
-  # response returns, because `best_effort_denial/6` writes before the call returns.
+  # statute's denial, and newest-row-after-watermark would pass that. The ceiling is read
+  # the instant the response returns — `best_effort_denial/6` writes before the call
+  # returns — which narrows the window to this one HTTP round trip.
+  #
+  # An earlier version also DRAINED the holder's lane here. It no longer needs to: the only
+  # caller is `check_gate_chain_enforced/1`, which drives every step over HTTP precisely so
+  # that no turn of the holder's is ever in flight. Draining was worse than redundant there
+  # — it waited for the remedy turn, which is exactly how a capable holder came to satisfy
+  # the whole chain before the next denial could be asserted.
   #
   # The window must hold EXACTLY ONE row for this assignment. Requiring one rather than
-  # taking the newest is what makes the correlation exact: if two denials land in it, this
-  # group's premise about serialization is wrong and it says so instead of picking.
-  defp denied!(state, statute, holder_key, assignment_id, attempt) when is_function(attempt, 0) do
-    await_lane_idle!(state, holder_key, "before attesting completion against #{statute}")
-
+  # taking the newest is what keeps the correlation exact without the drain: anything else
+  # writing a denial against this assignment inside the round trip fails the group loudly
+  # instead of being silently picked over.
+  defp denied!(state, statute, assignment_id, attempt) when is_function(attempt, 0) do
     watermark = events_watermark(state)
     res = attempt.()
     ceiling = events_watermark(state)
