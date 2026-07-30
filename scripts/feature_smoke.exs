@@ -714,11 +714,15 @@ defmodule FeatureSmoke do
           "idempotencyKey" => "arwake-#{u}"
         })
 
-      message_id = await_turn_message_id!(state, wake["wakeId"])
+      wake_id = wake["wakeId"]
 
-      {prompted, reports} =
-        await_prompted_report!(state, coder_key, wi_id, asg_id, marker, message_id)
+      proof = %{
+        wake_id: wake_id,
+        message_id: await_turn_message_id!(state, wake_id),
+        marker: marker
+      }
 
+      {prompted, reports} = await_prompted_report!(state, coder_key, wi_id, asg_id, proof)
       classes = Enum.map(reports, & &1["recordedTurnEvidence"])
 
       # The null-vs-non-null coupling, on EVERY row. Pure substrate: `tool-call-observed`
@@ -763,7 +767,7 @@ defmodule FeatureSmoke do
       assert(
         state,
         prompted["recordedTurnEvidence"] == "tool-call-observed",
-        "artifact closure: the record bound to the prompted turn (message #{message_id}) reads " <>
+        "artifact closure: the record bound to the prompted turn (message #{proof.message_id}) reads " <>
           "#{inspect(prompted["recordedTurnEvidence"])}, not tool-call-observed — the reserved " <>
           "PreToolUse observation did not fire for the #{state.leg.wire_name} holder on a turn " <>
           "that ran with no other turn on its lane, so this leg's record rests on concurrency " <>
@@ -788,6 +792,14 @@ defmodule FeatureSmoke do
       # same substrate fact, and neither `surrendered` nor a still-open assignment can be
       # mistaken for it. `surrendered` here is the roadmap 0a2 failure: an agent escaping
       # an unsatisfiable gate by abandoning the work permanently.
+      #
+      # Drained first, like every other completion attempt. The wait above returns the
+      # moment the record lands, which is typically MID-TURN — the prompted turn is still
+      # running and free to attest on its own — so without this the barrier would have a
+      # hole at the one attempt whose denial window has to be trustworthy for the closure
+      # to mean anything.
+      await_lane_idle!(state, coder_key, "before the final completion attempt")
+
       done = complete.()
       final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
@@ -975,30 +987,63 @@ defmodule FeatureSmoke do
   end
 
   defp await_lane_idle!(state, session_key, label, deadline) do
-    pending =
-      sqlite(
-        state,
-        "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(session_key)} " <>
-          "AND status IN ('queued','running')"
-      )
+    [turns, wakes] = lane_pending(state, session_key)
 
     cond do
-      pending == "0" ->
+      turns == "0" and wakes == "0" ->
         state
 
       System.monotonic_time(:millisecond) >= deadline ->
         assert(
           state,
           false,
-          "artifact closure: the holder's lane never went quiet #{label} — #{pending} turn(s) " <>
-            "still queued or running after #{div(turn_budget_ms(), 1000)}s. This group " <>
-            "serializes turns on purpose; it will not run its assertions beside one."
+          "artifact closure: the holder's lane never went quiet #{label} — #{turns} turn(s) " <>
+            "queued or running and #{wakes} wake(s) due but not yet fired, after " <>
+            "#{div(turn_budget_ms(), 1000)}s. This group serializes turns on purpose; it will " <>
+            "not run its assertions beside one."
         )
 
       true ->
         Process.sleep(1_000)
         await_lane_idle!(state, session_key, label, deadline)
     end
+  end
+
+  # A DUE WAKE IS PENDING WORK EVEN WITH NO TURN ROW YET, and missing that was what made
+  # an earlier version of this barrier porous. A live remedy episode re-waking the holder
+  # schedules an immediate-due wake without nudging the scheduler
+  # (`RailRemedy` rewake path), so between the schedule and the moment something
+  # materializes it there is a window with zero queued turns and real work outstanding.
+  # Draining on turns alone declares idle inside that window, and the remedy's turn then
+  # queues AHEAD of the wake this group is about to issue — which is exactly the
+  # concurrency the barrier exists to prevent, reintroduced by the barrier itself.
+  #
+  # Both counts come from ONE statement so the pair cannot straddle a wake firing.
+  # `dueAt` is bounded by a short grace rather than by `<= now`, so a wake that becomes
+  # due while the scheduler is between ticks is still counted; a wake genuinely scheduled
+  # for later is not, and does not stall the group forever.
+  @wake_due_grace_ms 2_000
+
+  defp lane_pending(state, session_key) do
+    due_by = System.system_time(:millisecond) + @wake_due_grace_ms
+
+    state
+    |> sqlite("""
+    SELECT
+      (SELECT count(*) FROM turns
+        WHERE sessionKey = #{sql_quote(session_key)}
+          AND status IN ('queued','running')),
+      (SELECT count(*) FROM wakes
+        WHERE sessionKey = #{sql_quote(session_key)}
+          AND state = 'pending' AND dueAt <= #{due_by})
+    """)
+    |> String.split("|")
+  end
+
+  # Terminal statuses for the prompted turn — the ledger's own closed set minus the two
+  # live ones (`Ledger` DDL: queued, running, delivered, canceled, failed, failed_unknown).
+  defp prompted_turn_terminal?(state, wake_id) do
+    sqlite(state, "SELECT status FROM turns WHERE wakeId = #{sql_quote(wake_id)}") in ~w(delivered canceled failed failed_unknown)
   end
 
   # The prompted turn's own `messages.id`, which is what makes the artifact assertion an
@@ -1079,27 +1124,24 @@ defmodule FeatureSmoke do
   # earlier turn's `tool-call-observed` window — and would then carry that EARLIER turn's
   # message id. Under a content selector such a row reads as a pass; under this one it does
   # not match, and the marker earns its keep as the diagnostic that says so out loud.
-  defp await_prompted_report!(state, session_key, work_item_id, assignment_id, marker, message_id) do
+  defp await_prompted_report!(state, session_key, work_item_id, assignment_id, proof) do
     await_prompted_report!(
       state,
       session_key,
       work_item_id,
       assignment_id,
-      marker,
-      message_id,
+      proof,
       System.monotonic_time(:millisecond) + turn_budget_ms()
     )
   end
 
-  defp await_prompted_report!(
-         state,
-         session_key,
-         work_item_id,
-         assignment_id,
-         marker,
-         message_id,
-         deadline
-       ) do
+  defp await_prompted_report!(state, session_key, work_item_id, assignment_id, proof, deadline) do
+    # Terminality is sampled BEFORE the rows are read, and the order is the whole
+    # correctness of the fast path below: a record committed after this sample is still
+    # seen by the read that follows it, so "the turn ended and recorded nothing" can never
+    # be a race against a row landing.
+    turn_ended? = prompted_turn_terminal?(state, proof.wake_id)
+
     reports =
       state
       |> ok!("artifacts", %{
@@ -1110,30 +1152,24 @@ defmodule FeatureSmoke do
       |> Map.get("artifacts", [])
       |> List.wrap()
 
-    prompted = Enum.find(reports, &(&1["recordedMessageId"] == message_id))
-    # Matched on BASENAME: the CLI forwards `--path` verbatim, so the row holds whatever
-    # form the holder typed and `./x` or an absolute path is the same artifact.
-    by_marker = Enum.find(reports, &(Path.basename(&1["originPath"] || "") == marker))
+    prompted = Enum.find(reports, &(&1["recordedMessageId"] == proof.message_id))
 
     cond do
       prompted ->
         {prompted, reports}
 
-      # The record this group asked for exists but is NOT bound to the turn that produced
-      # it. Failing here rather than waiting out the budget is the whole reason the marker
-      # is still carried: it turns the stale-window inheritance into a named diagnosis
-      # instead of a silent timeout.
-      by_marker ->
+      # Gated on the PROMPTED TURN being over, never on a record's content. An earlier
+      # version fired as soon as a row carrying the marker appeared, which let a record
+      # from another turn preempt a prompted record still on its way — the marker deciding
+      # an outcome again, by the back door. Now the marker only chooses words: the trigger
+      # is that the turn this group prompted has ended with nothing bound to it, which is a
+      # settled fact whatever any other turn recorded.
+      turn_ended? ->
         assert(
           state,
           false,
-          "artifact closure: #{marker} was recorded, but it is bound to message " <>
-            "#{inspect(by_marker["recordedMessageId"])} rather than to the prompted turn's " <>
-            "#{inspect(message_id)}, with class " <>
-            "#{inspect(by_marker["recordedTurnEvidence"])}. The prompted turn's own hook did " <>
-            "not fire: an observation window is session-scoped and non-consuming, so this " <>
-            "record inherited an EARLIER turn's window. A content-matching oracle would have " <>
-            "called this a pass. Row: #{inspect(by_marker)}"
+          "artifact closure: the prompted turn ended with no artifact bound to it " <>
+            "(message #{proof.message_id}). #{marker_diagnosis(reports, proof)}"
         )
 
       # An abandoned assignment is DETECTED AND NAMED, never waited out. The budget here is
@@ -1154,25 +1190,37 @@ defmodule FeatureSmoke do
         assert(
           state,
           false,
-          "artifact closure: the holder never recorded #{marker} on #{work_item_id} within " <>
-            "#{div(turn_budget_ms(), 1000)}s, with #{assignment_id} still open. Either the real " <>
-            "CLI `artifact-record` refused (the §1.1 defect this carrier fixed) or the prompted " <>
-            "turn never ran it. Reports seen meanwhile, none bound to the prompted turn: " <>
-            "#{inspect(Enum.map(reports, &{&1["originPath"], &1["recordedMessageId"]}))}"
+          "artifact closure: no artifact was bound to the prompted turn on #{work_item_id} " <>
+            "within #{div(turn_budget_ms(), 1000)}s, with #{assignment_id} still open and the " <>
+            "turn still going. Either the real CLI `artifact-record` refused (the §1.1 defect " <>
+            "this carrier fixed) or the prompted turn never ran it. " <>
+            marker_diagnosis(reports, proof)
         )
 
       true ->
         Process.sleep(1_000)
+        await_prompted_report!(state, session_key, work_item_id, assignment_id, proof, deadline)
+    end
+  end
 
-        await_prompted_report!(
-          state,
-          session_key,
-          work_item_id,
-          assignment_id,
-          marker,
-          message_id,
-          deadline
-        )
+  # The marker's ONLY job: say which record was found and what it was bound to, so a
+  # failure reads as a diagnosis instead of an absence. It decides nothing.
+  #
+  # Matched on BASENAME because the CLI forwards `--path` verbatim, so the row holds
+  # whatever form the holder typed and `./x` or an absolute path is the same file.
+  defp marker_diagnosis(reports, proof) do
+    case Enum.find(reports, &(Path.basename(&1["originPath"] || "") == proof.marker)) do
+      nil ->
+        "#{proof.marker} was never recorded at all. Reports seen: " <>
+          "#{inspect(Enum.map(reports, &{&1["originPath"], &1["recordedMessageId"]}))}"
+
+      row ->
+        "#{proof.marker} WAS recorded, but bound to message " <>
+          "#{inspect(row["recordedMessageId"])} rather than the prompted turn's " <>
+          "#{inspect(proof.message_id)}, with class #{inspect(row["recordedTurnEvidence"])}. " <>
+          "That is the prompted turn's hook failing to fire and the record inheriting an " <>
+          "EARLIER turn's window — observation windows are session-scoped and non-consuming. " <>
+          "A content-matching oracle would have called this a pass. Row: #{inspect(row)}"
     end
   end
 
