@@ -761,6 +761,60 @@ defmodule Tightbeam.CliIntegrationTest do
     dir
   end
 
+  # Regression, found by smoke group 12. `Dispatch.dispatch/3` declares three
+  # returns and the router's dispatch_response served two, so an escalating verb
+  # reached `case` with no clause: CaseClauseError, an empty body from Bandit,
+  # and the CLI dying on EOF. The EFFECT had already applied — the
+  # decision-request opens and the handler does not run — so a test asserting on
+  # the DB stayed green while every real caller of an escalating verb hard-failed.
+  # That is why this one runs the REAL binary and asserts on what it PRINTS.
+  test "real CLI renders an escalated verb as decision_pending instead of dying on EOF", ctx do
+    File.mkdir_p!(Path.join([ctx.base_dir, "identity", "rules"]))
+
+    File.write!(
+      Path.join([ctx.base_dir, "identity", "rules", "escalate.toml"]),
+      """
+      [[rule]]
+      name = "assignments-need-a-ruling"
+      verb = "assignments"
+      text = "listing assignments is an owner decision in this fixture org"
+      effect = "escalate"
+      deny_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
+      """
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    {output, status} =
+      System.cmd(ctx.binary, ["assignments", "--session", "cli-holder"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    # It does NOT crash, and it says what happened in words the agent can act on.
+    assert status != 0
+    assert output =~ "decision_pending"
+    assert output =~ "needs an owner decision"
+    refute output =~ "EOF"
+    refute output =~ "CaseClauseError"
+
+    [[request_id]] =
+      (fn ->
+         {:ok, rows} =
+           DB.query(ctx.db, "SELECT id FROM decision_requests WHERE status = 'open'")
+
+         rows
+       end).()
+
+    # The id the caller was told is the row that is actually open — without it the
+    # message is unactionable prose.
+    assert output =~ request_id
+
+    # THE EFFECT-APPLIES PROPERTY, which the fix must leave exactly alone: the
+    # request opened and the handler never ran. Only the response changed.
+    refute_receive {:cli_call, %{verb: "assignments"}}
+  end
+
   test "real CLI retired producer verbs are unknown commands", ctx do
     for verb <- ["run-tests", "run-smoke", "cancel-producer-job"] do
       {output, status} =

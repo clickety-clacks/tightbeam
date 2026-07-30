@@ -868,6 +868,25 @@ fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
     if json.get("error").is_some_and(|error| !error.is_null()) {
         return Err(serde_json::to_string_pretty(&json).expect("JSON value serializes"));
     }
+
+    // The third outcome (202). It is not a result: the verb HALTED and its
+    // decision-request is open, so returning Ok here would exit 0 and tell an
+    // agent the action happened. It is not the error envelope either, so it
+    // needs its own branch or it falls through to `result` -- absent -- and
+    // becomes a silent success. Rendered like a refusal because that is what
+    // the caller must do about it: the action did not take effect.
+    if let Some(pending) = json.get("decisionPending") {
+        let id = pending
+            .get("decisionRequestId")
+            .and_then(Value::as_str)
+            .unwrap_or("undefined");
+        let message = pending
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("this action needs an owner decision");
+        return Err(format!("decision_pending: {message} ({id})"));
+    }
+
     Ok(json.get("result").cloned())
 }
 
@@ -1768,6 +1787,39 @@ mod tests {
         assert!(identity_required(&cwd).contains(
             "no .tightbeam-session was found walking up from '/tmp/tightbeam-no-session' to the filesystem root"
         ));
+    }
+
+    #[test]
+    fn the_third_outcome_renders_named_and_keeps_the_other_two_intact() {
+        // 202 + decisionPending: not a result, not an error. Without its own
+        // branch it falls through to an absent "result" and becomes Ok(None) --
+        // a silent exit 0 telling an agent the action happened.
+        assert_eq!(
+            parse_response(
+                202,
+                r#"{"decisionPending":{"decisionRequestId":"dr_7","code":"decision_pending","message":"this action needs an owner decision; request dr_7 is open"}}"#
+            ),
+            Err(
+                "decision_pending: this action needs an owner decision; request dr_7 is open (dr_7)"
+                    .to_owned()
+            )
+        );
+
+        // A malformed pending envelope still names itself rather than vanishing.
+        assert_eq!(
+            parse_response(202, r#"{"decisionPending":{}}"#),
+            Err("decision_pending: this action needs an owner decision (undefined)".to_owned())
+        );
+
+        // The two shapes that already worked are untouched.
+        assert_eq!(
+            parse_response(200, r#"{"result":{"id":"asg_1"}}"#),
+            Ok(Some(serde_json::json!({"id": "asg_1"})))
+        );
+        assert_eq!(
+            parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
+            Err("denied: no".to_owned())
+        );
     }
 
     #[test]

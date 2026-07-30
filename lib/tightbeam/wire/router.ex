@@ -11,6 +11,11 @@ defmodule Tightbeam.Wire.Router do
     device tokens (Devices.by_token) for client routes; the gateway-owned
     cliToken for POST /agent/dispatch (the tightbeam CLI facade).
   - Errors: `{"error": {"code", "message"?}}` + matching HTTP status.
+  - Escalation: `202` + `{"decisionPending": {"decisionRequestId", "code",
+    "message"}}` — the THIRD dispatch outcome, neither a result nor an error.
+    The verb halted without denying and its decision-request is open
+    (escalation-substrate-v1 §2, §11 case 1), so it gets its own envelope
+    rather than being dressed as a failure the caller could have avoided.
   - Anything that CHANGES state goes through Dispatch as a verb — handlers
     here NEVER write to Org/Projection/Devices directly. Reads query directly.
 
@@ -786,7 +791,32 @@ defmodule Tightbeam.Wire.Router do
 
       {:error, result} ->
         error(conn, error_status(result[:code]), result[:code], result[:message])
+
+      {:decision_pending, decision_request_id} ->
+        decision_pending(conn, decision_request_id)
     end
+  end
+
+  # THE THIRD OUTCOME. `Dispatch.dispatch/3` has always declared three returns and
+  # this seam served two, so an escalating verb reached `case` with no clause:
+  # CaseClauseError, empty body, and a CLI dying on EOF. The effect had already
+  # applied by then — the decision-request opens and the handler does not run —
+  # so only the answer was lost, which is why DB-asserting tests stayed green
+  # while every real caller hard-failed.
+  #
+  # NOT an error envelope. escalation-substrate-v1 §2 pins the caller-facing tag
+  # as "distinct from any `{:deny,…}`", and §11's first case is "halt without
+  # deny": nothing was refused, the action is waiting on its owner. 202 says
+  # exactly that in the wire's own vocabulary — accepted, not yet complete —
+  # where any 4xx would tell the caller it did something wrong.
+  defp decision_pending(conn, decision_request_id) do
+    json(conn, 202, %{
+      "decisionPending" => %{
+        "decisionRequestId" => decision_request_id,
+        "code" => "decision_pending",
+        "message" => "this action needs an owner decision; request #{decision_request_id} is open"
+      }
+    })
   end
 
   defp control_response(conn, call, session_key, action) do
