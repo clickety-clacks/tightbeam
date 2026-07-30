@@ -27,6 +27,14 @@ defmodule Tightbeam.RailEpisodes do
   A restart empties the map, so every surviving episode reads as older than any later
   evaluation and the next healthy verdict closes it. That is the conservative direction
   and it is truthful: the episode really is older than the evaluation asking.
+
+  The POSITION side of a restart needs its own guard, and does not get one for free. A
+  position minted by a previous incarnation may still be held by a slow actor, and after a
+  restart `seq` counts from zero again — so that stale number is not merely old, it is
+  MEANINGLESS against the new sequence, and for some values it would authorize closing
+  episodes summoned after the restart. Positions therefore carry the incarnation that
+  minted them, and a recovery quoting a foreign one is a recorded no-op: recovery for that
+  evaluation simply does not happen, exactly as when the writer is unavailable.
   """
 
   use GenServer
@@ -44,7 +52,9 @@ defmodule Tightbeam.RailEpisodes do
   `nil` means this statute has no open episode, so the evaluation carries no recovery and
   `to_close` stays empty — a healthy check with nothing outstanding schedules no work.
   """
-  @spec evaluating(DB.server(), String.t(), GenServer.server()) :: integer() | nil
+  @type position :: {reference(), pos_integer()}
+
+  @spec evaluating(DB.server(), String.t(), GenServer.server()) :: position() | nil
   def evaluating(db, statute, server \\ __MODULE__) do
     call(server, {:evaluating, db, statute}, fn ->
       unavailable(db, statute, "evaluating")
@@ -62,7 +72,7 @@ defmodule Tightbeam.RailEpisodes do
   end
 
   @doc "Hand recovery to the writer for a verdict minted at `position`."
-  @spec recovered(DB.server(), String.t(), integer(), GenServer.server()) :: :ok
+  @spec recovered(DB.server(), String.t(), position(), GenServer.server()) :: :ok
   def recovered(db, statute, position, server \\ __MODULE__) do
     call(server, {:recovered, db, statute, position}, fn ->
       unavailable(db, statute, "recovered")
@@ -71,13 +81,16 @@ defmodule Tightbeam.RailEpisodes do
   end
 
   @impl true
-  def init(:ok), do: {:ok, %{seq: 0, last_summon: %{}}}
+  def init(:ok), do: {:ok, %{incarnation: make_ref(), seq: 0, last_summon: %{}}}
 
   @impl true
   def handle_call({:evaluating, db, statute}, _from, state) do
     state = %{state | seq: state.seq + 1}
 
-    position = if Escalation.open_episodes(db, statute) == [], do: nil, else: state.seq
+    position =
+      if Escalation.open_episodes(db, statute) == [],
+        do: nil,
+        else: {state.incarnation, state.seq}
 
     {:reply, position, state}
   end
@@ -96,15 +109,25 @@ defmodule Tightbeam.RailEpisodes do
     {:reply, :ok, state}
   end
 
-  def handle_call({:recovered, db, statute, position}, _from, state) do
+  def handle_call({:recovered, db, statute, {incarnation, seq}}, _from, state)
+      when incarnation == :erlang.map_get(:incarnation, state) do
     stale =
       db
       |> Escalation.open_episodes(statute)
-      |> Enum.filter(&(Map.get(state.last_summon, &1, 0) < position))
+      |> Enum.filter(&(Map.get(state.last_summon, &1, 0) < seq))
 
     :ok = Escalation.withdraw_episodes(db, stale, statute)
 
     {:reply, :ok, %{state | last_summon: Map.drop(state.last_summon, stale)}}
+  end
+
+  # A position from a previous incarnation. Its `seq` is not old, it is meaningless — the
+  # counter restarted — so comparing it would be arithmetic on two different sequences and
+  # could authorize closing episodes summoned since the restart. Recovery for that
+  # evaluation does not happen, and the skip is recorded like any other degraded pass.
+  def handle_call({:recovered, db, statute, _foreign}, _from, state) do
+    unavailable(db, statute, "recovered:foreign-incarnation")
+    {:reply, :ok, state}
   end
 
   # The writer is a named child; calling it when it is absent must not raise into a call

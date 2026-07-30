@@ -1007,7 +1007,8 @@ defmodule Tightbeam.RailScriptTest do
     # A real cutoff was minted, and it predates this summons — the writer holds the
     # ordering, so the proof of it is behavioral rather than a number read back out of
     # SQL. That is the point of the redesign: there is no table quantity left to compare.
-    assert is_integer(position)
+    assert {_incarnation, seq} = position
+    assert is_integer(seq)
 
     # Only now does the delayed actor run the close it was handed.
     Enum.each(to_close, fn {:episodes, name, mark} ->
@@ -1052,7 +1053,8 @@ defmodule Tightbeam.RailScriptTest do
     # No new row: this is precisely why any row-ordered cutoff was blind to it. The writer
     # is not, because it stamped the attach with its own sequence.
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
-    assert is_integer(position)
+    assert {_incarnation, seq} = position
+    assert is_integer(seq)
 
     # The delayed actor runs its now-stale close.
     :ok = RailEpisodes.recovered(ctx.db, name, position)
@@ -1088,7 +1090,8 @@ defmodule Tightbeam.RailScriptTest do
     # act on a check-tier statute, and the test stands in for it so the window after the
     # verdict is reachable at all.
     position = RailEpisodes.evaluating(ctx.db, "script-escalate")
-    assert is_integer(position)
+    assert {_incarnation, seq} = position
+    assert is_integer(seq)
 
     # The sensor now answers healthy. Nothing has been enacted yet.
     load.("rail-pass")
@@ -1107,6 +1110,55 @@ defmodule Tightbeam.RailScriptTest do
     # The malfunction that happened after the verdict is still summoning a mind.
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+  end
+
+  # STALE POSITION ACROSS A RESTART. The episode side of a restart is safe for free — an
+  # empty map reads older-than-everything, so a later verdict closes what survived. The
+  # POSITION side is not: `seq` restarts from zero, so a position a slow actor still holds
+  # from the previous incarnation is not merely old, it is meaningless against the new
+  # sequence, and for some values it would authorize closing episodes summoned SINCE the
+  # restart. The incarnation tag is what makes that arithmetic impossible rather than
+  # unlikely.
+  test "a position from a previous writer incarnation authorizes nothing", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+    subject = call(%{work_item_id: "w-incarnation"})
+
+    load = fn script ->
+      put_statute(ctx, statute(script, %{"pass" => "allow"}))
+      Rules.load!(ctx.base_dir, ["post"])
+    end
+
+    load.("rail-timeout")
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    # A cutoff is minted, and its holder then stalls.
+    stale_position = RailEpisodes.evaluating(ctx.db, "script-escalate")
+    assert {_incarnation, _seq} = stale_position
+
+    # The writer restarts. New incarnation, sequence back to zero, map empty.
+    stop_supervised!(Tightbeam.RailEpisodes)
+    start_supervised!({Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes})
+
+    # A malfunction summons under the NEW incarnation, taking a low seq — precisely the
+    # value a naive numeric comparison against the stale position would sweep.
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, subject)
+
+    assert {:ok, [[id]]} = DB.query(ctx.db, "SELECT id FROM decision_requests")
+
+    # The stalled actor finally lands, quoting the dead incarnation.
+    :ok = RailEpisodes.recovered(ctx.db, "script-escalate", stale_position)
+
+    # Nothing was authorized, and the skip is legible rather than silent.
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+
+    assert [%{detail: "recovered:foreign-incarnation"}] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "rail_episode_writer_unavailable"))
   end
 
   # WRITER DOWN, property 1: a denial never depends on the writer. The deny is decided
