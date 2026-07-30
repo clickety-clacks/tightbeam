@@ -61,6 +61,7 @@ defmodule Tightbeam.GatewayTest do
     Projection,
     Rails,
     Roles,
+    SessionLane,
     Wakes,
     WorkItems,
     WorkState
@@ -232,6 +233,32 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # Holds the bounce OPEN, so the apply-vs-claim window is real elapsed time
+  # rather than a scheduling accident the test hopes for: close_session parks
+  # until the test releases it.
+  defmodule HoldingAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
+
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:holding_close, sid})
+
+      receive do
+        :release -> :ok
+      end
+
+      {:reply, :ok, parent}
+    end
+
+    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:holding_load, sid})
+      {:reply, :ok, parent}
+    end
+  end
+
   # The state EVERY started session is in after a gateway restart: its pointer row
   # survives in the DB, the adapter process is new and holds nothing.
   defmodule GoneSessionAdapterStub do
@@ -327,6 +354,9 @@ defmodule Tightbeam.GatewayTest do
     :ok = Placement.ensure_schema(db)
     start_supervised!({ConnRegistry, name: registry})
     lane = start_supervised!({LaneDoorbell, self()})
+    # Production always has this (Application.children/0); the test env boots no
+    # tree, and identity apply now looks a session's lane up by name.
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
 
     catalog_base =
       Path.join(System.tmp_dir!(), "gateway-catalog-#{System.unique_integer([:positive])}")
@@ -3120,7 +3150,6 @@ defmodule Tightbeam.GatewayTest do
     Org.set_identity(ctx.db, "k1", overrides, identity_name)
     Org.append_pointer(ctx.db, "k1", "cancel-session", "created")
 
-    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
     task_sup = start_supervised!({Task.Supervisor, name: :override_cancel_tasks})
 
     start_supervised!(%{
@@ -3174,7 +3203,6 @@ defmodule Tightbeam.GatewayTest do
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
     Org.append_pointer(ctx.db, "k1", "dead-session", "created")
-    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
     task_sup = start_supervised!({Task.Supervisor, name: :dead_cancel_tasks})
     ensure_global_registry()
 
@@ -3225,7 +3253,6 @@ defmodule Tightbeam.GatewayTest do
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
     Org.append_pointer(ctx.db, "k1", "slow-session", "created")
-    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
     task_sup = start_supervised!({Task.Supervisor, name: :slow_cancel_tasks})
     ensure_global_registry()
     adapter = start_supervised!({SlowConnAdapterStub, self()})
@@ -4769,6 +4796,120 @@ defmodule Tightbeam.GatewayTest do
     # Neither leg is refused, and leg one's OWN backlog did not exempt it either.
     assert "agent:leg-one" in applied
     assert "agent:leg-two" in applied
+  end
+
+  # TOCTOU regression, found in review of the queued/running fix. The busy check
+  # and the adapter bounce are separated by adapter work, and the LANE can claim a
+  # queued turn inside that window — so apply would close and reload a harness
+  # session whose turn had just started, which is precisely the mid-turn identity
+  # change the boundary exists to prevent (T-CONCURRENCY; served-identity §520).
+  # Checking status twice cannot close this: any gateway-side sample is stale the
+  # instant it is read. Ordering is decided where serialization already exists —
+  # the lane's own mailbox — so apply asks the lane to perform-or-refuse.
+  #
+  # The old queued-counts-as-busy behavior MASKED this by rejecting the queued row
+  # outright, so this window is newly reachable and gets its own adversarial test.
+  test "a queued turn cannot start while apply is bouncing the session", ctx do
+    base_dir = role_test_base("identity-apply-toctou")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-toctou",
+        display_name: "Identity apply toctou",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-toctou", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    next =
+      Identity.edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "identity an in-flight turn must not be switched onto",
+        "test"
+      )
+
+    adapter = start_supervised!({HoldingAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
+    task_sup =
+      start_supervised!(
+        {Task.Supervisor, name: :"toctou_tsup_#{System.unique_integer([:positive])}"}
+      )
+
+    test_pid = self()
+
+    start_supervised!(
+      {SessionLane,
+       session_key: session.session_key,
+       db: ctx.db,
+       task_sup: task_sup,
+       runner: fn turn ->
+         send(test_pid, {:turn_started, turn.seq})
+         {:ok, %{}}
+       end}
+    )
+
+    # The precondition the whole race depends on: nothing is running, so the busy
+    # check passes and apply proceeds into the bounce.
+    refute Ledger.running?(ctx.db, session.session_key)
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    applier =
+      Task.async(fn ->
+        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+      end)
+
+    # Apply is now INSIDE the bounce, parked in close_session.
+    assert_receive {:holding_close, "thread-toctou"}, 5_000
+
+    # THE WINDOW: a turn arrives and the lane is nudged, exactly as a client post
+    # or a wake delivery would do it.
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: session.session_key,
+               message_id: "toctou-1",
+               origin: "user:flynn",
+               prompt: "must not start under the bounce"
+             })
+
+    assert :ok = SessionLane.nudge(session.session_key)
+
+    # THE ASSERTION: no turn starts while the session is being reloaded.
+    #
+    # The budget is deliberately generous and the asymmetry is the reason. While
+    # the boundary holds, this message never arrives at ANY budget, so a larger
+    # number cannot make the test flaky — it only costs wall time on the happy
+    # path. What it buys is the regression direction: if the seam is ever removed,
+    # the lane must be given enough room to claim on a loaded box, or this test
+    # goes quietly green while broken. Sized for load, not fitted to the observed
+    # fail-before (which fired in under 300ms on an idle machine).
+    refute_receive {:turn_started, _}, 2_000
+
+    send(adapter, :release)
+
+    assert %{applied: [session_key], identity_revision: ^next} = Task.await(applier, 10_000)
+    assert session_key == session.session_key
+
+    # Deferred, never dropped — the nudge waited in the lane's mailbox and the turn
+    # runs once the boundary is free, against the identity apply just installed.
+    assert_receive {:turn_started, _}, 5_000
   end
 
   # Regression: spawn creates the harness session LAZILY, so a freshly spawned session

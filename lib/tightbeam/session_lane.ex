@@ -82,6 +82,28 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  @doc """
+  Run `fun` at a turn boundary, or refuse — the lane IS the serialization point.
+
+  The lane claims turns in its own message loop (`maybe_start/1`), so it cannot
+  claim one while it is servicing this call: the caller's check and its act are
+  atomic in the lane's mailbox, and a nudge arriving during `fun` waits there
+  rather than racing it. `:busy` means a turn is already in flight.
+
+  `fun` runs INSIDE the lane process and blocks it, which is the point; it must
+  not call back into the same lane. There is no outer timeout because `fun`'s own
+  work carries its own (the adapter's are 30-185s), and a shorter bound here
+  would fire while the work it is guarding is still running.
+  """
+  @spec at_turn_boundary(String.t(), (-> result)) :: {:ok, result} | :busy | :no_lane
+        when result: term()
+  def at_turn_boundary(session_key, fun) when is_function(fun, 0) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, {:at_turn_boundary, fun}, :infinity)
+      [] -> :no_lane
+    end
+  end
+
   ## Server
 
   @impl true
@@ -121,6 +143,12 @@ defmodule Tightbeam.SessionLane do
         {:reply, :not_running, state}
     end
   end
+
+  def handle_call({:at_turn_boundary, _fun}, _from, %{task_ref: ref} = state)
+      when not is_nil(ref),
+      do: {:reply, :busy, state}
+
+  def handle_call({:at_turn_boundary, fun}, _from, state), do: {:reply, {:ok, fun.()}, state}
 
   @impl true
   def handle_cast(:nudge, state), do: {:noreply, maybe_start(state)}

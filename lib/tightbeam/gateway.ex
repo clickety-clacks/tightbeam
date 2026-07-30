@@ -2059,13 +2059,8 @@ defmodule Tightbeam.Gateway do
     identity_apply_at_boundary(config, db, sessions, busy)
   end
 
-  defp identity_apply_at_boundary(_config, _db, _sessions, [_ | _] = busy) do
-    %{
-      code: "turn_in_progress",
-      message: "identity apply requires a turn boundary",
-      sessions: busy
-    }
-  end
+  defp identity_apply_at_boundary(_config, _db, _sessions, [_ | _] = busy),
+    do: turn_in_progress(busy)
 
   defp identity_apply_at_boundary(config, db, sessions, []) do
     live = Identity.live_revision!(config.base_dir)
@@ -2105,7 +2100,32 @@ defmodule Tightbeam.Gateway do
       # already on the applied revision by construction. Nothing to do is the
       # true answer here, and the only place it is.
       nil -> :noop
-      pointer -> identity_apply_started_session(config, db, session, revision, pointer)
+      pointer -> identity_apply_at_lane(config, db, session, revision, pointer)
+    end
+  end
+
+  # The busy check and this bounce are separated by adapter work, and the lane can
+  # claim a queued turn in that window — so sampling status in the gateway would
+  # leave apply reloading a session whose turn had just started. Claiming is
+  # serialized in the LANE, so the decision belongs in its mailbox: while it runs
+  # this call it cannot claim, and a nudge that arrives waits behind it. A session
+  # with no lane has nothing that can claim a turn, so the direct call is already
+  # atomic.
+  defp turn_in_progress(sessions) do
+    %{
+      code: "turn_in_progress",
+      message: "identity apply requires a turn boundary",
+      sessions: sessions
+    }
+  end
+
+  defp identity_apply_at_lane(config, db, session, revision, pointer) do
+    bounce = fn -> identity_apply_started_session(config, db, session, revision, pointer) end
+
+    case Tightbeam.SessionLane.at_turn_boundary(session.session_key, bounce) do
+      {:ok, result} -> result
+      :no_lane -> bounce.()
+      :busy -> {:error, turn_in_progress([session.session_key])}
     end
   end
 
