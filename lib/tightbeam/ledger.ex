@@ -456,6 +456,26 @@ defmodule Tightbeam.Ledger do
     count
   end
 
+  @doc """
+  Is a turn RUNNING for this session — started and not yet terminal?
+
+  `claim_next/3` sets `status = 'running'` and `startedAt` in one UPDATE, so this
+  single predicate IS that conjunction, and it is the same line the smoke's
+  isolation check reads (`Tightbeam.ClientE2E.Substrate.running_by_session/1`).
+  Deliberately not `pending_count/2`, which counts queued turns too.
+  """
+  @spec running?(db(), String.t()) :: boolean()
+  def running?(db \\ Tightbeam.DB, session_key) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT count(*) FROM turns WHERE sessionKey = ?1 AND status = 'running'",
+        [session_key]
+      )
+
+    count > 0
+  end
+
   @doc "Newest terminal turn sequence for a session, or nil."
   @spec last_terminal_seq(db(), String.t()) :: integer() | nil
   def last_terminal_seq(db \\ Tightbeam.DB, session_key) do

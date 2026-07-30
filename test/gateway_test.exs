@@ -4589,13 +4589,18 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
              "new served skill"
 
-    assert {:ok, _seq} =
+    assert {:ok, seq} =
              Ledger.enqueue(ctx.db, %{
                session_key: session.session_key,
                message_id: "identity-apply-busy",
                origin: "user:flynn",
                prompt: "busy"
              })
+
+    # Claimed, not merely enqueued: the boundary is a turn IN FLIGHT. This test
+    # once asserted the refusal on the queued row alone, which is the conflation
+    # T-CONCURRENCY names.
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
 
     assert %{code: "turn_in_progress", sessions: [session_key]} =
              apply.(%{
@@ -4605,6 +4610,165 @@ defmodule Tightbeam.GatewayTest do
 
     assert session_key == session.session_key
     refute_receive {:push, %{"type" => "stream_updated"}}
+  end
+
+  # T-CONCURRENCY (PRIME INVARIANT): an org-wide operation may wait on RUNNING
+  # work, never on QUEUED work. Field-proven consequence of getting this wrong:
+  # a headless org's Main queues indefinitely with no client — the NORMAL state
+  # per TEST-HOSTS §3a — so counting queued as busy made org-wide apply
+  # permanently impossible, and the smoke manufactured its own wedge every run
+  # (drain series 25/11/6/13/8/6/8) from its own bracket nags and DR notifications.
+  test "identity apply proceeds with queued turns that have not started", ctx do
+    base_dir = role_test_base("identity-apply-queued")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-queued",
+        display_name: "Identity apply queued",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    # No pointer: the queued/running question is decided before any adapter work,
+    # so the never-started session isolates it from the whole harness layer.
+    for n <- 1..3 do
+      assert {:ok, _seq} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: session.session_key,
+                 message_id: "identity-apply-queued-#{n}",
+                 origin: "user:flynn",
+                 prompt: "queued, never started"
+               })
+    end
+
+    assert Ledger.pending_count(ctx.db, session.session_key) == 3
+    refute Ledger.running?(ctx.db, session.session_key)
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{applied: [session_key], identity_revision: ^revision} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert session_key == session.session_key
+
+    # The queued turns are untouched — apply is not a drain.
+    assert Ledger.pending_count(ctx.db, session.session_key) == 3
+  end
+
+  # The other half of the same line, and the one that must NOT weaken: a turn
+  # whose world is already composed still defers apply. `claim_next/3` sets
+  # `status = 'running'` and `startedAt` in one UPDATE, so this is the honest
+  # started-and-not-terminal discriminator.
+  test "identity apply refuses while a turn is genuinely running", ctx do
+    base_dir = role_test_base("identity-apply-running")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-running",
+        display_name: "Identity apply running",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: session.session_key,
+               message_id: "identity-apply-running-1",
+               origin: "user:flynn",
+               prompt: "in flight"
+             })
+
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
+    assert Ledger.running?(ctx.db, session.session_key)
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{code: "turn_in_progress", sessions: [session_key]} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert session_key == session.session_key
+
+    # And org-wide is refused for the same reason, naming only the running session.
+    assert %{code: "turn_in_progress", sessions: [^session_key]} =
+             apply.(%{origin: "user:flynn", params: %{all: true}})
+
+    # Terminalizing it releases the boundary — nothing else had to change.
+    assert Ledger.finish(ctx.db, seq, "delivered") == :ok
+    refute Ledger.running?(ctx.db, session.session_key)
+
+    assert %{applied: applied, identity_revision: ^revision} =
+             apply.(%{origin: "user:flynn", params: %{all: true}})
+
+    assert session.session_key in applied
+  end
+
+  # The parity scenario, as a fixture. Measured on shrdlu 2026-07-30 13:47Z:
+  # leg 1 left queued turns on ITS session, which wedged leg 2's `identity apply
+  # --all` — so single-invocation two-harness parity was structurally impossible,
+  # and a pre-run drain could not help because the backlog is created BETWEEN the
+  # legs, inside the invocation. One session's queued work must never be another
+  # session's barrier.
+  test "queued turns on a bystander session do not block org-wide apply", ctx do
+    base_dir = role_test_base("identity-apply-bystander")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    for {key, name} <- [{"agent:leg-one", "Leg one"}, {"agent:leg-two", "Leg two"}] do
+      Org.create(ctx.db, %{
+        session_key: key,
+        display_name: name,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+    end
+
+    # Leg one's own bracket nags and DR notifications, as the smoke produces them.
+    for n <- 1..8 do
+      assert {:ok, _seq} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: "agent:leg-one",
+                 message_id: "bystander-#{n}",
+                 origin: "process:tightbeam",
+                 prompt: "nag #{n}"
+               })
+    end
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{applied: applied, identity_revision: ^revision} =
+             apply.(%{origin: "user:flynn", params: %{all: true}})
+
+    # Neither leg is refused, and leg one's OWN backlog did not exempt it either.
+    assert "agent:leg-one" in applied
+    assert "agent:leg-two" in applied
   end
 
   # Regression: spawn creates the harness session LAZILY, so a freshly spawned session

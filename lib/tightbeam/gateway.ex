@@ -2046,9 +2046,14 @@ defmodule Tightbeam.Gateway do
     do: %{code: "not_found", message: "no matching session"}
 
   defp identity_apply_sessions(config, db, sessions) do
+    # Busy means RUNNING, never merely queued (tenet T-CONCURRENCY). The hazard
+    # this guard exists for is work IN FLIGHT: instructions must not change under
+    # a turn whose world is already composed. A queued turn has composed nothing
+    # and reads live identity when it starts, which is indistinguishable from any
+    # turn started after the apply.
     busy =
       sessions
-      |> Enum.filter(&(Ledger.pending_count(db, &1.session_key) > 0))
+      |> Enum.filter(&Ledger.running?(db, &1.session_key))
       |> Enum.map(& &1.session_key)
 
     identity_apply_at_boundary(config, db, sessions, busy)
