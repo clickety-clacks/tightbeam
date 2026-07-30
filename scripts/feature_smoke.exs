@@ -687,9 +687,21 @@ defmodule FeatureSmoke do
     # `holder_archetype in ["coder"]` is a deny_when condition on BOTH verification
     # statutes, so the holder must actually BE a coder. A default-archetype holder walks
     # straight past them and the journey would pass while proving nothing.
+    #
+    # THE HOST IS PINNED, and the seed below depends on it. `Placement.resolve/3` treats a
+    # nil host as "first of archetype.where" unless the archetype grants `["*"]`, and the
+    # shipped coder archetype is `where = ["eezo", "racter"]` — so an unpinned spawn on any
+    # other gateway places the holder on a DIFFERENT machine while the seed is written
+    # locally from `state.base_dir`. The holder would then find nothing, and the report
+    # would faithfully capture the shell error saying so. T2a is single-host by design, so
+    # the pin states that rather than relying on the where-list's first entry happening to
+    # be this box. If the org's coder archetype does not admit this host the spawn is now
+    # refused `host_not_allowed` by name, which is the right failure: loud, and about the
+    # org's law rather than about a file that mysteriously is not there.
     coder =
       ok!(state, "spawn", %{
         "archetype" => "coder",
+        "host" => Tightbeam.Placement.local_host_name(),
         "displayName" => "smoke-artifact-coder-#{u}",
         "idempotencyKey" => "arcd-#{u}"
       })
@@ -960,9 +972,15 @@ defmodule FeatureSmoke do
   # a holder asked to verify either would be right to refuse again, and this group must
   # never be the thing that provokes the refusal it also asserts against.
   #
-  # Seeding before the first turn is safe: `Placement.ensure_workdir/4` does `mkdir -p`
-  # and writes only `.tightbeam-session`, so it creates the directory around this file
-  # rather than over it.
+  # Seeding before the first turn is safe: `Placement.ensure_workdir/4` does `mkdir -p`,
+  # writes `.tightbeam-session`, and appends that name to `.git/info/exclude` when the
+  # workdir is a git repo. It touches nothing else, so it forms the directory around this
+  # file rather than over it.
+  #
+  # LOCALITY DEPENDS ON THE HOLDER'S SPAWN BEING HOST-PINNED. This path is derived from the
+  # gateway's own base_dir, so a holder placed on another machine would leave the seed on
+  # this one. The pin at the spawn is what makes that impossible; do not remove one without
+  # the other.
   #
   # The operator runs it HERE, and that run is what makes the verdict's note true rather
   # than decorative — the note quotes output this function actually observed.
@@ -970,33 +988,44 @@ defmodule FeatureSmoke do
     workdir = local_workdir_path(state.base_dir, session_key)
     name = "check-#{u}.sh"
     path = Path.join(workdir, name)
-    expected = "artifact-closure-check #{u}: PASS"
+
+    # BYTE-EXACT, `echo`'s trailing newline included. Trimming before comparing would let
+    # stray whitespace pass and then disappear from the note; keeping the newline in the
+    # expectation and quoting the observation with `inspect/1` shows it instead of
+    # swallowing it.
+    expected = "artifact-closure-check #{u}: PASS\n"
 
     File.mkdir_p!(workdir)
 
-    File.write!(
-      path,
-      "#!/bin/sh\n# feature-smoke fixture: the unit of work under assignment #{u}.\necho '#{expected}'\n"
-    )
+    File.write!(path, """
+    #!/bin/sh
+    # feature-smoke fixture: the unit of work under assignment #{u}.
+    echo 'artifact-closure-check #{u}: PASS'
+    """)
 
     File.chmod!(path, 0o755)
 
-    {out, status} = System.cmd("/bin/sh", [path], stderr_to_stdout: true)
-    output = String.trim(out)
+    # Run it the way the note says it was run — same cwd, same command form. Executing an
+    # absolute path from the smoke's own directory and then writing "sh <name> in this
+    # assignment's workdir" would put a sentence on the record that was only half observed,
+    # in the one group whose whole subject is records claiming more than was seen.
+    {output, status} = System.cmd("sh", [name], cd: workdir, stderr_to_stdout: true)
 
     assert(
       state,
       status == 0 and output == expected,
-      "artifact closure: the seeded work does not run cleanly — #{path} exited #{status} " <>
-        "with #{inspect(output)}, expected #{inspect(expected)}. The group refuses to hand a " <>
-        "holder work it could not verify itself."
+      "artifact closure: the seeded work does not run cleanly — `sh #{name}` in #{workdir} " <>
+        "exited #{status} and printed #{inspect(output)}, expected #{inspect(expected)}. The " <>
+        "group refuses to hand a holder work it could not verify itself."
     )
 
     %{
       name: name,
       path: path,
       output: output,
-      note: "Ran `sh #{name}` in this assignment's workdir; it exited 0 and printed: #{output}"
+      note:
+        "Ran `sh #{name}` in this assignment's workdir (#{workdir}); it exited 0 and printed " <>
+          "exactly #{inspect(output)}"
     }
   end
 
