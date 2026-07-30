@@ -865,10 +865,17 @@ defmodule FeatureSmoke do
       # turn was ALREADY running, and an assertion on `startedAt` would have failed a group
       # that was otherwise behaving exactly as designed.
       #
-      # The mistake was the same one twice: turn STATE tracks the LANE, not the agent.
-      # `running` means the lane claimed the turn and is handing it to an adapter, which
-      # happens in milliseconds; the model producing a tool call is what takes seconds. Two
-      # tripwires in a row measured the fast half and called it the slow one.
+      # THE LESSON, which is worth more here than any assertion: TURN STATE TRACKS THE
+      # LANE, NOT THE AGENT. `running` means the lane claimed the turn and is handing it to
+      # an adapter, which happens in milliseconds; the model producing a tool call is what
+      # takes seconds. Two tripwires in a row measured the fast half and called it the slow
+      # one — first the row's existence, then the lane's claim — and both would have failed
+      # healthy runs. Only an action-based check held. If you are tempted to add a third
+      # turn-state assertion here, this paragraph is why it will not work either.
+      #
+      # A terminal-state variant is worse than weak, and was considered and rejected: a
+      # turn can act without terminalizing, so it could PASS a contaminated run. Unsound in
+      # the direction that matters.
       #
       # So the turn counts are REPORTED, not asserted — they are the margin, and a runner
       # watching them climb learns something before anything breaks — and isolation is
@@ -877,10 +884,18 @@ defmodule FeatureSmoke do
       #   EXACTLY ONE DENIAL per bounded window, above, catches a holder that attested.
       #   EXACTLY ONE REPORT, below, catches a holder that recorded.
       #
-      # Those two are complete over the ways a holder could change this half's outcome. It
-      # cannot close the assignment without a report, because that is the gate under test,
-      # and a second report fails the check below — so the false-green path this group
-      # feared is closed by the artifact assertion rather than by a clock.
+      # THAT PAIR IS ARGUED COMPLETE, NOT PROVEN COMPLETE, and the distinction is recorded
+      # deliberately by an author who got two completeness claims wrong before this one.
+      # The argument: a holder cannot close the assignment without a report, that being the
+      # gate under test, and a second report fails the check below.
+      #
+      # What makes the residual risk tolerable is not the argument but a structural
+      # backstop. This half's claims are about THE OPERATOR'S OWN SEQUENCE — the denials
+      # fired in order, and the operator's weak-class row released the gate — and both stay
+      # independently true whatever else happened on that session. So an uncaught third
+      # action would make this half prove LESS than advertised; it cannot make it prove
+      # something FALSE. A false green is out of reach even where the completeness argument
+      # is not.
       started =
         sqlite(
           state,
