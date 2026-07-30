@@ -373,6 +373,52 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     Enum.each(tasks, &Task.await(&1, 5_000))
   end
 
+  test "load slots for different machines run concurrently", ctx do
+    old_value = Application.get_env(:tightbeam, :adapter_load_soft_cap)
+
+    on_exit(fn ->
+      if old_value,
+        do: Application.put_env(:tightbeam, :adapter_load_soft_cap, old_value),
+        else: Application.delete_env(:tightbeam, :adapter_load_soft_cap)
+    end)
+
+    Application.put_env(:tightbeam, :adapter_load_soft_cap, 1)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_opts: fn _ -> [] end,
+         db: ctx.db,
+         name: :per_machine_load_cap}
+      )
+
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        AdapterCoordinator.with_load_slot(coordinator, fn ->
+          send(parent, {:entered, "machine-a"})
+          receive do: (:release -> :ok)
+        end)
+      end)
+
+    assert_receive {:entered, "machine-a"}
+
+    second =
+      Task.async(fn ->
+        AdapterCoordinator.with_load_slot(coordinator, fn ->
+          send(parent, {:entered, "machine-b"})
+        end)
+      end)
+
+    assert wait_until(fn -> load_slot_split(coordinator) == {1, 1} end)
+    assert_receive {:entered, "machine-b"}, 50
+    send(first.pid, :release)
+    Task.await(first)
+    Task.await(second)
+  end
+
   test "load soft cap uses application config", ctx do
     old_value = Application.get_env(:tightbeam, :adapter_load_soft_cap)
 
