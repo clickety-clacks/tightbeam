@@ -107,9 +107,17 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   # What the coordinator itself says it is doing: {holding a slot, waiting for one}.
   # Kept as a pair rather than a total because the total is what an uncapped
   # coordinator can also produce — the queued half is the cap's only footprint.
-  defp load_slot_split(coordinator) do
+  defp load_slot_split(coordinator, machine) do
     state = :sys.get_state(coordinator)
-    {map_size(state.load_active), :queue.len(state.load_queue)}
+    active = Map.get(state.load_active, machine, %{})
+    queue = Map.get(state.load_queue, machine, :queue.new())
+    {map_size(active), :queue.len(queue)}
+  end
+
+  defp coordinator_generation(coordinator, key) do
+    coordinator
+    |> :sys.get_state()
+    |> get_in([:adapters, key, :generation])
   end
 
   defp wait_until(fun, tries \\ 200) do
@@ -172,7 +180,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
                    2_000
 
     assert eventually(fn ->
-             AdapterCoordinator.generation(coordinator, {:claude, "default", "testhost"}) == 2
+             coordinator_generation(coordinator, {:claude, "default", "testhost"}) == 2
            end)
 
     assert [
@@ -256,7 +264,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     Process.exit(adapter, :kill)
 
     assert eventually(fn ->
-             AdapterCoordinator.generation(coordinator, {:claude, "default", "testhost"}) == 2
+             coordinator_generation(coordinator, {:claude, "default", "testhost"}) == 2
            end)
 
     assert [%{kind: "adapter_down", subject: "claude:default@testhost"}] =
@@ -302,7 +310,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # window would re-mint the SAME ready token and the strict heal sweep would
     # never feed the re-held session (task #103 review). Still no crash
     # bookkeeping: no lifecycle row, no failure count.
-    assert AdapterCoordinator.generation(coordinator, key) == 2
+    assert coordinator_generation(coordinator, key) == 2
     assert EventLog.lifecycle_events(ctx.db) == []
 
     # The successor boots as generation 2, and its ready token strictly
@@ -335,7 +343,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         Task.async(fn ->
           send(parent, {:asking, i})
 
-          AdapterCoordinator.with_load_slot(coordinator, fn ->
+          AdapterCoordinator.with_load_slot(coordinator, "testhost", fn ->
             send(parent, {:entered, i, self()})
             receive do: (:release -> :ok)
           end)
@@ -360,7 +368,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # refute passes whenever only three of them happen to resume inside its 50ms.
     # {3, 3} is a shape only a coordinator that actually held the cap can produce, so
     # the fail-before stops depending on how the scheduler feels.
-    assert wait_until(fn -> load_slot_split(coordinator) == {3, 3} end)
+    assert wait_until(fn -> load_slot_split(coordinator, "testhost") == {3, 3} end)
 
     holders = for _ <- 1..3, do: assert_receive({:entered, _i, _pid})
     refute_receive {:entered, _, _}, 50
@@ -371,6 +379,51 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # The queue drains onto the freed slots rather than staying wedged.
     release.(for _ <- 1..3, do: assert_receive({:entered, _i, _pid}))
     Enum.each(tasks, &Task.await(&1, 5_000))
+  end
+
+  test "load slots for different machines run concurrently", ctx do
+    old_value = Application.get_env(:tightbeam, :adapter_load_soft_cap)
+
+    on_exit(fn ->
+      if old_value,
+        do: Application.put_env(:tightbeam, :adapter_load_soft_cap, old_value),
+        else: Application.delete_env(:tightbeam, :adapter_load_soft_cap)
+    end)
+
+    Application.put_env(:tightbeam, :adapter_load_soft_cap, 1)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_opts: fn _ -> [] end,
+         db: ctx.db,
+         name: :per_machine_load_cap}
+      )
+
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        AdapterCoordinator.with_load_slot(coordinator, "machine-a", fn ->
+          send(parent, {:entered, "machine-a"})
+          receive do: (:release -> :ok)
+        end)
+      end)
+
+    assert_receive {:entered, "machine-a"}
+
+    second =
+      Task.async(fn ->
+        AdapterCoordinator.with_load_slot(coordinator, "machine-b", fn ->
+          send(parent, {:entered, "machine-b"})
+        end)
+      end)
+
+    assert_receive {:entered, "machine-b"}, 500
+    send(first.pid, :release)
+    Task.await(first)
+    Task.await(second)
   end
 
   test "load soft cap uses application config", ctx do
@@ -397,7 +450,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     first =
       Task.async(fn ->
-        AdapterCoordinator.with_load_slot(coordinator, fn ->
+        AdapterCoordinator.with_load_slot(coordinator, "testhost", fn ->
           send(parent, :first_entered)
           receive do: (:release_first -> :ok)
         end)
@@ -408,7 +461,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     second =
       Task.async(fn ->
         send(parent, :second_asking)
-        AdapterCoordinator.with_load_slot(coordinator, fn -> send(parent, :second_entered) end)
+
+        AdapterCoordinator.with_load_slot(coordinator, "testhost", fn ->
+          send(parent, :second_entered)
+        end)
       end)
 
     # The barrier the refute needs: nothing here proved the second task had even
@@ -420,7 +476,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # staying descheduled. Only {1, 1} — one holding, one waiting its turn — says
     # the cap turned the second borrower away rather than admitting it.
     assert_receive :second_asking
-    assert wait_until(fn -> load_slot_split(coordinator) == {1, 1} end)
+    assert wait_until(fn -> load_slot_split(coordinator, "testhost") == {1, 1} end)
     refute_receive :second_entered, 50
     send(first.pid, :release_first)
     assert_receive :second_entered

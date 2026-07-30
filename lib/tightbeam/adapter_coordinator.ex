@@ -23,8 +23,9 @@ defmodule Tightbeam.AdapterCoordinator do
     with a clear reason, /version|/health reflects it, the gateway stays up.
     A successful restart closes the circuit and resets the count.
   - Re-adoption semaphore: at most the configured number of concurrent session/load
-    calls per coordinator (no thundering herd after an adapter bounce). session/load
-    failure → that session degraded + turn failed with reason.
+    calls per machine (no thundering herd after an adapter bounce, and no machine
+    queues behind another machine's recovery). session/load failure → that session
+    degraded + turn failed with reason.
   - Planned idle-reap is a coordinator action and its lifecycle event is
     flagged as planned — distinguishable from crashes in lifecycle_events.
   - The coordinator MONITORS adapters (never links); adapter death emits a
@@ -76,24 +77,18 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, {:adapter_for, key}, 30_000)
   end
 
-  @doc "Current generation for a key (0 if never started) — the lane's staleness probe."
-  @spec generation(GenServer.server(), adapter_key()) :: non_neg_integer()
-  def generation(server \\ __MODULE__, key) do
-    GenServer.call(server, {:generation, key})
-  end
-
   @doc """
-  Run `fun` under the re-adoption semaphore (max 3 concurrent). Used by lanes
-  performing lazy session/load after a generation bump.
+  Run `fun` under the machine's re-adoption semaphore (max 3 concurrent). Used
+  by lanes performing lazy session/load after a generation bump.
   """
-  @spec with_load_slot(GenServer.server(), (-> result)) :: result when result: term()
-  def with_load_slot(server \\ __MODULE__, fun) do
-    slot = GenServer.call(server, {:acquire_load_slot, self()}, :infinity)
+  @spec with_load_slot(GenServer.server(), String.t(), (-> result)) :: result when result: term()
+  def with_load_slot(server \\ __MODULE__, machine, fun) do
+    slot = GenServer.call(server, {:acquire_load_slot, machine, self()}, :infinity)
 
     try do
       fun.()
     after
-      GenServer.cast(server, {:release_load_slot, slot})
+      GenServer.cast(server, {:release_load_slot, machine, slot})
     end
   end
 
@@ -229,7 +224,7 @@ defmodule Tightbeam.AdapterCoordinator do
        adapters: %{},
        monitors: %{},
        load_active: %{},
-       load_queue: :queue.new()
+       load_queue: %{}
      }}
   end
 
@@ -248,10 +243,6 @@ defmodule Tightbeam.AdapterCoordinator do
         {reply, state} = start_adapter(key, entry, state)
         {:reply, reply, state}
     end
-  end
-
-  def handle_call({:generation, key}, _from, state) do
-    {:reply, get_in(state.adapters, [key, :generation]) || 0, state}
   end
 
   def handle_call({:last_failure, key, generation}, _from, state) do
@@ -278,12 +269,13 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, reply, state}
   end
 
-  def handle_call({:acquire_load_slot, borrower}, from, state) do
-    if map_size(state.load_active) < state.load_soft_cap do
-      {slot, state} = grant_slot(borrower, state)
+  def handle_call({:acquire_load_slot, machine, borrower}, from, state) do
+    if map_size(machine_active(state, machine)) < state.load_soft_cap do
+      {slot, state} = grant_slot(machine, borrower, state)
       {:reply, slot, state}
     else
-      {:noreply, %{state | load_queue: :queue.in({from, borrower}, state.load_queue)}}
+      queue = :queue.in({from, borrower}, machine_queue(state, machine))
+      {:noreply, %{state | load_queue: Map.put(state.load_queue, machine, queue)}}
     end
   end
 
@@ -334,8 +326,8 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   @impl true
-  def handle_cast({:release_load_slot, slot}, state) do
-    {:noreply, release_slot(slot, state)}
+  def handle_cast({:release_load_slot, machine, slot}, state) do
+    {:noreply, release_slot(machine, slot, state)}
   end
 
   @impl true
@@ -382,8 +374,9 @@ defmodule Tightbeam.AdapterCoordinator do
           {:noreply, state}
         end
 
-      slot = slot_for_monitor(state.load_active, ref) ->
-        {:noreply, release_slot(slot, state, false)}
+      load_slot = slot_for_monitor(state.load_active, ref) ->
+        {machine, slot} = load_slot
+        {:noreply, release_slot(machine, slot, state, false)}
 
       true ->
         {:noreply, state}
@@ -501,41 +494,65 @@ defmodule Tightbeam.AdapterCoordinator do
   defp backoff(state, failures),
     do: min(state.backoff_base_ms * Integer.pow(2, max(failures - 1, 0)), 60_000)
 
-  defp grant_slot(borrower, state) do
+  defp grant_slot(machine, borrower, state) do
     slot = make_ref()
     monitor = Process.monitor(borrower)
-    active = Map.put(state.load_active, slot, %{borrower: borrower, monitor: monitor})
-    {slot, %{state | load_active: active}}
+
+    active =
+      Map.put(machine_active(state, machine), slot, %{borrower: borrower, monitor: monitor})
+
+    load_active = Map.put(state.load_active, machine, active)
+    {slot, %{state | load_active: load_active}}
   end
 
-  defp release_slot(slot, state, demonitor? \\ true) do
-    case Map.pop(state.load_active, slot) do
+  defp release_slot(machine, slot, state, demonitor? \\ true) do
+    case Map.pop(machine_active(state, machine), slot) do
       {nil, _} ->
         state
 
       {%{monitor: monitor}, active} ->
         if demonitor?, do: Process.demonitor(monitor, [:flush])
-        grant_next(%{state | load_active: active})
+
+        state =
+          %{state | load_active: put_unless_empty(state.load_active, machine, active)}
+
+        grant_next(machine, state)
     end
   end
 
-  defp grant_next(state) do
-    case :queue.out(state.load_queue) do
+  defp grant_next(machine, state) do
+    case :queue.out(machine_queue(state, machine)) do
       {:empty, _} ->
-        state
+        %{state | load_queue: Map.delete(state.load_queue, machine)}
 
       {{:value, {from, borrower}}, queue} ->
+        state = %{state | load_queue: put_queue(state.load_queue, machine, queue)}
+
         if Process.alive?(borrower) do
-          {slot, state} = grant_slot(borrower, %{state | load_queue: queue})
+          {slot, state} = grant_slot(machine, borrower, state)
           GenServer.reply(from, slot)
           state
         else
-          grant_next(%{state | load_queue: queue})
+          grant_next(machine, state)
         end
     end
   end
 
   defp slot_for_monitor(active, ref) do
-    Enum.find_value(active, fn {slot, entry} -> if entry.monitor == ref, do: slot end)
+    Enum.find_value(active, fn {machine, slots} ->
+      Enum.find_value(slots, fn {slot, entry} ->
+        if entry.monitor == ref, do: {machine, slot}
+      end)
+    end)
+  end
+
+  defp machine_active(state, machine), do: Map.get(state.load_active, machine, %{})
+  defp machine_queue(state, machine), do: Map.get(state.load_queue, machine, :queue.new())
+
+  defp put_unless_empty(map, key, entries) when map_size(entries) == 0, do: Map.delete(map, key)
+  defp put_unless_empty(map, key, entries), do: Map.put(map, key, entries)
+
+  defp put_queue(map, key, queue) do
+    if :queue.is_empty(queue), do: Map.delete(map, key), else: Map.put(map, key, queue)
   end
 end

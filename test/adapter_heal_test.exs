@@ -156,10 +156,10 @@ defmodule Tightbeam.AdapterHealTest do
     def handle_call({:set_ready, token}, _from, state),
       do: {:reply, :ok, Map.put(state, :ready, token)}
 
-    def handle_call({:acquire_load_slot, _borrower}, _from, state),
+    def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
-    def handle_cast({:release_load_slot, _slot}, state), do: {:noreply, state}
+    def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
   end
 
   setup do
