@@ -104,12 +104,12 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            end)
   end
 
-  # How many borrowers the coordinator itself knows have asked: granted plus
-  # queued. Reading its state rather than a marker is the point — this is the one
-  # observation a coordinator that never enforced the cap cannot produce.
-  defp load_slot_askers(coordinator) do
+  # What the coordinator itself says it is doing: {holding a slot, waiting for one}.
+  # Kept as a pair rather than a total because the total is what an uncapped
+  # coordinator can also produce — the queued half is the cap's only footprint.
+  defp load_slot_split(coordinator) do
     state = :sys.get_state(coordinator)
-    map_size(state.load_active) + :queue.len(state.load_queue)
+    {map_size(state.load_active), :queue.len(state.load_queue)}
   end
 
   defp wait_until(fun, tries \\ 200) do
@@ -353,9 +353,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # and these are six senders: a `:sys.get_state` from the test process can be
     # answered before a borrower's acquire arrives, leaving the refute below free
     # to pass because the stragglers had not asked yet rather than because the cap
-    # held. Waiting until the coordinator accounts for all six — three granted,
-    # three queued — is what an uncapped coordinator cannot fake.
-    assert wait_until(fn -> load_slot_askers(coordinator) == 6 end)
+    # held.
+    #
+    # It is the SPLIT that has to be asserted, not the total. Six borrowers accounted
+    # for is satisfied by an uncapped coordinator reporting six ACTIVE, and then the
+    # refute passes whenever only three of them happen to resume inside its 50ms.
+    # {3, 3} is a shape only a coordinator that actually held the cap can produce, so
+    # the fail-before stops depending on how the scheduler feels.
+    assert wait_until(fn -> load_slot_split(coordinator) == {3, 3} end)
 
     holders = for _ <- 1..3, do: assert_receive({:entered, _i, _pid})
     refute_receive {:entered, _, _}, 50
@@ -410,11 +415,12 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # been SCHEDULED, so a cap that wrongly admitted it still looked blocked for
     # the whole 50ms window. The marker alone does not fix that — it is the task
     # speaking about itself, and a `:sys.get_state` from THIS process cannot be
-    # ordered against a call sent by that one. The coordinator counting two
-    # borrowers, one holding and one queued, is the acquire having actually
-    # landed there.
+    # ordered against a call sent by that one. Nor does a count of two: an uncapped
+    # coordinator reports two ACTIVE, and the refute then rides on the second task
+    # staying descheduled. Only {1, 1} — one holding, one waiting its turn — says
+    # the cap turned the second borrower away rather than admitting it.
     assert_receive :second_asking
-    assert wait_until(fn -> load_slot_askers(coordinator) == 2 end)
+    assert wait_until(fn -> load_slot_split(coordinator) == {1, 1} end)
     refute_receive :second_entered, 50
     send(first.pid, :release_first)
     assert_receive :second_entered

@@ -53,16 +53,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     # have given up. There is no way to observe "did not give up at 5s" in under
     # 5s, so the wait below is the price of the assertion, not slack.
     #
-    # The barrier has to prove the call's TIMER is armed, and only the adapter can
-    # evidence that. A marker the task sends about itself proves nothing: it is
-    # sent before `knows_session?/2` is even entered, and the task can be
-    # descheduled in the gap, so a reverted 5s budget stayed invisible whenever
-    # that gap ran past the 500ms band. The call sitting in the ADAPTER's mailbox
-    # is the send having already happened — `GenServer.call` arms its timer at the
-    # send — and the adapter is parked in its boot `receive`, so the message stays
-    # there to be observed. What is left inside the band is one process resuming
-    # into the next instruction.
-    assert call_queued_at?(adapter, {:knows_session?, "resident"})
+    # The barrier has to prove the call's TIMER is armed, which takes two separate
+    # facts. Neither alone is enough, and a marker the task sends about itself is
+    # neither: it is sent before `knows_session?/2` is even entered.
+    assert call_armed?(adapter, queued.pid, {:knows_session?, "resident"})
     Process.sleep(5_500)
     assert Task.yield(queued, 0) == nil
 
@@ -283,25 +277,48 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
-  # Has `request` actually reached `adapter`'s mailbox? The only barrier for a call
-  # that is SUPPOSED to sit unanswered: the callee cannot reply, so nothing it does
-  # can evidence receipt, and the caller can only speak for itself. Matching the
-  # queued `$gen_call` names the specific request rather than counting messages, so
-  # an unrelated one arriving first cannot satisfy it.
-  defp call_queued_at?(adapter, request, remaining \\ 200) do
-    queued? =
-      case Process.info(adapter, :messages) do
-        {:messages, messages} ->
-          Enum.any?(messages, &match?({:"$gen_call", _from, ^request}, &1))
-
-        nil ->
-          flunk("adapter died before the call reached it")
-      end
-
+  # Is `request` sent AND is its timeout running? Two facts, because a call that is
+  # supposed to sit unanswered can be evidenced by neither party alone: the callee
+  # cannot reply, and the caller can only speak about itself.
+  #
+  # `queued_at?` is the send. Matching the `$gen_call` names the specific request
+  # rather than counting messages, so an unrelated one cannot satisfy it.
+  #
+  # `waiting_in_gen_call?` is the timer, and it is the half that matters. OTP runs
+  # `erlang:send` and only THEN enters `receive ... after Timeout` (gen.erl:262), so
+  # the message can be queued while the caller has not yet armed anything — and a
+  # caller descheduled in that gap would push a reverted 5s budget past the 5.5s
+  # window below, passing the test on a defect. A process in that gap is `:runnable`;
+  # `:waiting` means it is suspended IN a receive, and the only blocking receive in
+  # `do_call/4` is the timed one. So `:waiting` there is the `after` clause armed,
+  # which is exactly the fact the window needs and the one the gap cannot fake.
+  #
+  # The MFA is OTP-internal on purpose — nothing public reports it. If a future OTP
+  # renames it this stops matching, the barrier exhausts, and the test fails loudly
+  # rather than going quietly back to proving nothing.
+  defp call_armed?(adapter, caller, request, remaining \\ 500) do
     cond do
-      queued? -> true
+      queued_at?(adapter, request) and waiting_in_gen_call?(caller) -> true
       remaining == 0 -> false
-      true -> Process.sleep(10) && call_queued_at?(adapter, request, remaining - 1)
+      true -> Process.sleep(10) && call_armed?(adapter, caller, request, remaining - 1)
+    end
+  end
+
+  defp queued_at?(adapter, request) do
+    case Process.info(adapter, :messages) do
+      {:messages, messages} ->
+        Enum.any?(messages, &match?({:"$gen_call", _from, ^request}, &1))
+
+      nil ->
+        flunk("adapter died before the call reached it")
+    end
+  end
+
+  defp waiting_in_gen_call?(caller) do
+    case {Process.info(caller, :status), Process.info(caller, :current_function)} do
+      {{:status, :waiting}, {:current_function, {:gen, :do_call, _arity}}} -> true
+      {nil, _} -> flunk("caller died before its call armed a timer")
+      _ -> false
     end
   end
 
