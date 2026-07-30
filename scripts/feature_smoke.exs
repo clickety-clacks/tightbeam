@@ -687,9 +687,21 @@ defmodule FeatureSmoke do
     # `holder_archetype in ["coder"]` is a deny_when condition on BOTH verification
     # statutes, so the holder must actually BE a coder. A default-archetype holder walks
     # straight past them and the journey would pass while proving nothing.
+    #
+    # THE HOST IS PINNED, and the seed below depends on it. `Placement.resolve/3` treats a
+    # nil host as "first of archetype.where" unless the archetype grants `["*"]`, and the
+    # shipped coder archetype is `where = ["eezo", "racter"]` — so an unpinned spawn on any
+    # other gateway places the holder on a DIFFERENT machine while the seed is written
+    # locally from `state.base_dir`. The holder would then find nothing, and the report
+    # would faithfully capture the shell error saying so. T2a is single-host by design, so
+    # the pin states that rather than relying on the where-list's first entry happening to
+    # be this box. If the org's coder archetype does not admit this host the spawn is now
+    # refused `host_not_allowed` by name, which is the right failure: loud, and about the
+    # org's law rather than about a file that mysteriously is not there.
     coder =
       ok!(state, "spawn", %{
         "archetype" => "coder",
+        "host" => Tightbeam.Placement.local_host_name(),
         "displayName" => "smoke-artifact-coder-#{u}",
         "idempotencyKey" => "arcd-#{u}"
       })
@@ -699,11 +711,23 @@ defmodule FeatureSmoke do
     ok!(state, "role-bind", %{"name" => "coder-artifact-#{u}", "sessionKey" => coder_key})
     coder_tok = session_token(state, coder_key)
 
+    # REAL WORK, ON THE HOST, BEFORE THE ASSIGNMENT EXISTS.
+    #
+    # Four holders refused this chain on the live run, and they were RIGHT to: the
+    # assignment named no files and pointed at nothing runnable, so there was nothing on
+    # the host to verify, and one of them called the seed "an ungrounded fabrication I'm
+    # not repeating". That is this product's own doctrine working — the refusal is the
+    # behavior `surrender-escalates-to-owner` and the verification statutes exist to
+    # produce. The fixture has to MEET it, not prompt around it, so the group seeds a
+    # thing that can actually be run and observed and hands the holder its name.
+    check = seed_verifiable_work!(state, coder_key, u)
+
     asg =
       ok!(state, "assign", %{
         "sessionKey" => coder_key,
-        "subject" => "artifact impl #{u}",
+        "subject" => "run #{check.name} and record its output — artifact closure #{u}",
         "workItemId" => wi_id,
+        "files" => [check.name],
         "idempotencyKey" => "aras-#{u}"
       })
 
@@ -765,11 +789,23 @@ defmodule FeatureSmoke do
       # 2. Verification gate, now reachable because the review gate stopped denying.
       denied!(state, "completion-requires-verification", coder_key, asg_id, complete)
 
+      # A verdict with a TRUE note, because a bare one is indistinguishable from a
+      # fabrication and gets treated as one. The live run's holder named this exactly: a
+      # prior `verified` carrying `note: null` "appears to have been filed without any
+      # actual verification", and it declined to build on it. It was right — nothing had
+      # been verified.
+      #
+      # So the operator verifies, and then says what it did. `check.output` is the real
+      # stdout of the real script, captured by `seed_verifiable_work!/3` when it actually
+      # ran it. Pre-seeding rather than making the holder file this keeps the group
+      # deterministic and one turn shorter, and it stays honest because the claim in the
+      # note is a thing that happened.
       verified =
         post_as(state, coder_tok, "attest", %{
           "assignmentId" => asg_id,
           "kind" => "verdict",
-          "verdictKind" => "verified"
+          "verdictKind" => "verified",
+          "note" => check.note
         })
 
       assert(
@@ -809,7 +845,7 @@ defmodule FeatureSmoke do
       wake =
         ok!(state, "wake", %{
           "sessionKey" => coder_key,
-          "prompt" => artifact_prompt(u, marker, wi_id, asg_id),
+          "prompt" => artifact_prompt(u, marker, check.name, wi_id, asg_id),
           "idempotencyKey" => "arwake-#{u}"
         })
 
@@ -929,6 +965,70 @@ defmodule FeatureSmoke do
     end
   end
 
+  # Put something real in the holder's workdir, run it, and keep what it said.
+  #
+  # The smallest thing that satisfies "can be executed and observed": one script with a
+  # known output. It is deliberately not a fake diff or a spec pointing at absent code —
+  # a holder asked to verify either would be right to refuse again, and this group must
+  # never be the thing that provokes the refusal it also asserts against.
+  #
+  # Seeding before the first turn is safe: `Placement.ensure_workdir/4` does `mkdir -p`,
+  # writes `.tightbeam-session`, and appends that name to `.git/info/exclude` when the
+  # workdir is a git repo. It touches nothing else, so it forms the directory around this
+  # file rather than over it.
+  #
+  # LOCALITY DEPENDS ON THE HOLDER'S SPAWN BEING HOST-PINNED. This path is derived from the
+  # gateway's own base_dir, so a holder placed on another machine would leave the seed on
+  # this one. The pin at the spawn is what makes that impossible; do not remove one without
+  # the other.
+  #
+  # The operator runs it HERE, and that run is what makes the verdict's note true rather
+  # than decorative — the note quotes output this function actually observed.
+  defp seed_verifiable_work!(state, session_key, u) do
+    workdir = local_workdir_path(state.base_dir, session_key)
+    name = "check-#{u}.sh"
+    path = Path.join(workdir, name)
+
+    # BYTE-EXACT, `echo`'s trailing newline included. Trimming before comparing would let
+    # stray whitespace pass and then disappear from the note; keeping the newline in the
+    # expectation and quoting the observation with `inspect/1` shows it instead of
+    # swallowing it.
+    expected = "artifact-closure-check #{u}: PASS\n"
+
+    File.mkdir_p!(workdir)
+
+    File.write!(path, """
+    #!/bin/sh
+    # feature-smoke fixture: the unit of work under assignment #{u}.
+    echo 'artifact-closure-check #{u}: PASS'
+    """)
+
+    File.chmod!(path, 0o755)
+
+    # Run it the way the note says it was run — same cwd, same command form. Executing an
+    # absolute path from the smoke's own directory and then writing "sh <name> in this
+    # assignment's workdir" would put a sentence on the record that was only half observed,
+    # in the one group whose whole subject is records claiming more than was seen.
+    {output, status} = System.cmd("sh", [name], cd: workdir, stderr_to_stdout: true)
+
+    assert(
+      state,
+      status == 0 and output == expected,
+      "artifact closure: the seeded work does not run cleanly — `sh #{name}` in #{workdir} " <>
+        "exited #{status} and printed #{inspect(output)}, expected #{inspect(expected)}. The " <>
+        "group refuses to hand a holder work it could not verify itself."
+    )
+
+    %{
+      name: name,
+      path: path,
+      output: output,
+      note:
+        "Ran `sh #{name}` in this assignment's workdir (#{workdir}); it exited 0 and printed " <>
+          "exactly #{inspect(output)}"
+    }
+  end
+
   # The reviewer runs on a DIFFERENT registered harness wherever the registry offers one.
   # This buys no extra enforcement — `assignment.independent_verdict_kinds` reads sessions,
   # never harnesses — and it costs nothing either: `FeatureSmokePlan.legs/1` RAISES unless
@@ -971,12 +1071,15 @@ defmodule FeatureSmoke do
   # agent meeting a gate it could not satisfy surrendered and closed the work permanently.
   # The gate is satisfiable now; the instruction is here so a leg cannot fail on an agent
   # reaching for the old escape.
-  defp artifact_prompt(u, marker, wi_id, asg_id) do
+  defp artifact_prompt(u, marker, check, wi_id, asg_id) do
     """
     Substrate smoke check #{u} on assignment #{asg_id}. Do exactly these two steps.
 
-    1. Write a file named #{marker} in your current working directory containing
-       one line: smoke verification results #{u}
+    1. Run the script this assignment declares and capture its real output:
+       sh #{check} > #{marker} 2>&1
+       #{marker} must contain what the script actually printed. Do not write it by hand
+       and do not paste an expected value — the point is that the report carries an
+       observation, not a claim.
 
     2. Run this as a single shell command, exactly as written:
        tightbeam artifact-record --kind report --title 'smoke report #{u}' --path #{marker} --work-item #{wi_id}
