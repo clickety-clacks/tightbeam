@@ -718,7 +718,7 @@ defmodule Tightbeam.RailScriptTest do
     handlers = %{"post" => fn _call -> flunk("a timed-out rail must not run the handler") end}
 
     put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
 
     assert {:error,
             %{
@@ -763,7 +763,7 @@ defmodule Tightbeam.RailScriptTest do
     File.chmod!(wrapper, 0o755)
 
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}, timeout_ms: 10))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
     timed_out = call(%{work_item_id: "w-backstop"})
 
     assert {:error, %{reason: "script_timeout", script_exit_class: "unreported"}} =
@@ -795,7 +795,7 @@ defmodule Tightbeam.RailScriptTest do
 
     for {script, reason, exit_class} <- cases do
       put_statute(ctx, statute(script, %{"pass" => "allow"}))
-      Rules.load!(ctx.base_dir, ["post"], %{})
+      Rules.load!(ctx.base_dir, ["post"])
 
       assert {:error, %{reason: ^reason, script_exit_class: ^exit_class}} =
                Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-#{script}"}))
@@ -823,7 +823,7 @@ defmodule Tightbeam.RailScriptTest do
     handlers = %{"post" => fn _call -> flunk("a denied rail must not run the handler") end}
 
     put_statute(ctx, statute("rail-deny", %{"blocked" => "deny"}))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
 
     assert {:error, %{reason: "rule_denied", script_exit_class: "returned"}} =
              Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-token-deny"}))
@@ -840,7 +840,7 @@ defmodule Tightbeam.RailScriptTest do
     handlers = %{"post" => fn _call -> flunk("a non-pass rail must not run the handler") end}
 
     put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
 
     # Same statute, same class, but a different caller AND a different action each time.
     assert {:error, %{script_exit_class: "timeout"}} =
@@ -858,7 +858,7 @@ defmodule Tightbeam.RailScriptTest do
 
     # A different class on the same statute is a different malfunction and a different fix.
     put_statute(ctx, statute("rail-error", %{"pass" => "allow"}))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
 
     assert {:error, %{script_exit_class: "error:7"}} =
              Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-one"}))
@@ -885,7 +885,7 @@ defmodule Tightbeam.RailScriptTest do
 
     load = fn script, effects ->
       put_statute(ctx, statute(script, effects))
-      Rules.load!(ctx.base_dir, ["post"], %{})
+      Rules.load!(ctx.base_dir, ["post"])
     end
 
     open_episodes = fn ->
@@ -938,7 +938,7 @@ defmodule Tightbeam.RailScriptTest do
     }
 
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
 
     # This suite has no `assignments` table, so resolving the named assignment raises
     # inside the fact and the check is never spawned.
@@ -980,7 +980,7 @@ defmodule Tightbeam.RailScriptTest do
     }
 
     put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
 
     ownerless = %{
       call(%{work_item_id: "w-ownerless"})
@@ -1026,7 +1026,7 @@ defmodule Tightbeam.RailScriptTest do
     }
 
     put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
     broken = call(%{work_item_id: "w-resolved"})
 
     assert {:error, %{script_exit_class: "timeout"}} = Dispatch.dispatch(ctx.db, handlers, broken)
@@ -1060,7 +1060,7 @@ defmodule Tightbeam.RailScriptTest do
   # legacy collapse, and fires nothing at all.
   test "decide stays dry on a timeout and evaluate collapses it to the deny", ctx do
     put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
-    Rules.load!(ctx.base_dir, ["post"], %{})
+    Rules.load!(ctx.base_dir, ["post"])
 
     assert {{:deny_escalate, %{name: "script-escalate"},
              %{error: %{reason: "script_timeout", script_exit_class: "timeout"}}}, [], []} =
