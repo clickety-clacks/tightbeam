@@ -912,10 +912,14 @@ defmodule Tightbeam.Rules do
   defp maybe_close(rule, db, call, to_close) do
     subject = gated_ref(call)
 
-    if not is_nil(rule.remedy) and is_binary(subject) and
-         RailRemedy.live?(db, rule.name, subject),
-       do: [{rule.name, subject} | to_close],
-       else: to_close
+    if not is_nil(rule.remedy) and is_binary(subject) do
+      case RailRemedy.live?(db, rule.name, subject) do
+        nil -> to_close
+        occurrence -> [{rule.name, subject, occurrence} | to_close]
+      end
+    else
+      to_close
+    end
   end
 
   defp evaluate_conditions([], _rule, _db, _call, cache), do: {:match, cache}

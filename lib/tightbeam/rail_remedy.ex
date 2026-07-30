@@ -46,30 +46,29 @@ defmodule Tightbeam.RailRemedy do
     result
   end
 
-  @doc "True when one statute/subject episode is live."
-  @spec live?(DB.server(), String.t(), String.t()) :: boolean()
+  @doc "Return the occurrence when one statute/subject episode is live."
+  @spec live?(DB.server(), String.t(), String.t()) :: pos_integer() | nil
   def live?(db, statute, subject) do
     case DB.query(
            db,
-           "SELECT 1 FROM rail_remedy_episodes WHERE statute = ?1 AND subject = ?2 AND status = 'live'",
+           "SELECT occurrence FROM rail_remedy_episodes WHERE statute = ?1 AND subject = ?2 AND status = 'live'",
            [statute, subject]
          ) do
-      {:ok, [[1]]} -> true
-      _ -> false
+      {:ok, [[occurrence]]} -> occurrence
+      _ -> nil
     end
   end
 
-  @doc "Actor-owned live-to-closed CAS for one passed statute."
-  @spec close(DB.server(), String.t(), String.t()) :: boolean()
-  def close(db, statute, subject) do
+  @doc "Actor-owned live-to-closed CAS for one passed statute occurrence."
+  @spec close(DB.server(), String.t(), String.t(), pos_integer()) :: boolean()
+  def close(db, statute, subject, occurrence) do
     cas(
       db,
       """
-      UPDATE rail_remedy_episodes
-      SET status = 'closed', closedAt = ?3
-      WHERE statute = ?1 AND subject = ?2 AND status = 'live'
+      UPDATE rail_remedy_episodes SET status = 'closed', closedAt = ?4
+      WHERE statute = ?1 AND subject = ?2 AND occurrence = ?3 AND status = 'live'
       """,
-      [statute, subject, now()]
+      [statute, subject, occurrence, now()]
     )
   end
 
@@ -228,21 +227,23 @@ defmodule Tightbeam.RailRemedy do
            {:ok, result} <- Dispatch.dispatch(db, handlers, producer_call),
            producer_id when is_binary(producer_id) <-
              producer_id(rule.remedy.action, result, producer_hint) do
-        cas(
-          db,
-          """
-          UPDATE rail_remedy_episodes
-          SET status = 'live', producerKey = ?4
-          WHERE statute = ?1 AND subject = ?2
-            AND status = 'dispatched' AND claimToken = ?3
-          """,
-          [rule.name, subject, token, producer_id]
-        )
-
-        %{
-          outcome: if(reopened?, do: "reopened-dispatched", else: "claimed-dispatched"),
-          producer_id: producer_id
-        }
+        if cas(
+             db,
+             """
+             UPDATE rail_remedy_episodes
+             SET status = 'live', producerKey = ?4
+             WHERE statute = ?1 AND subject = ?2
+               AND status = 'dispatched' AND claimToken = ?3
+             """,
+             [rule.name, subject, token, producer_id]
+           ) do
+          %{
+            outcome: if(reopened?, do: "reopened-dispatched", else: "claimed-dispatched"),
+            producer_id: producer_id
+          }
+        else
+          %{outcome: "claimed-dispatched", producer_id: nil}
+        end
       else
         _ ->
           release_dispatch(db, rule.name, subject, token)

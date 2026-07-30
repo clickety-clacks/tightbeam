@@ -161,7 +161,8 @@ defmodule Tightbeam.Dispatch do
   defp close(db, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
 
-  defp close(db, {statute, subject}), do: RailRemedy.close(db, statute, subject)
+  defp close(db, {statute, subject, occurrence}),
+    do: RailRemedy.close(db, statute, subject, occurrence)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
     case Map.fetch(handlers, verb) do

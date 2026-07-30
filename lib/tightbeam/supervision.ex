@@ -414,7 +414,8 @@ defmodule Tightbeam.Supervision do
   defp close_episode(db, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
 
-  defp close_episode(db, {statute, subject}), do: RailRemedy.close(db, statute, subject)
+  defp close_episode(db, {statute, subject, occurrence}),
+    do: RailRemedy.close(db, statute, subject, occurrence)
 
   defp park_escalation(db, session_key, decision_request_id) do
     transaction!(db, fn txn ->

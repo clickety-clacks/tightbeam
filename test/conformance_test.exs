@@ -1132,7 +1132,7 @@ defmodule Tightbeam.ConformanceSupport do
             case_id
             when case_id in ~w(reclaim-closed-bumps-occurrence fresh-occurrence-new-producer) ->
               first = fire.()
-              assert RailRemedy.close(db, statute, assignment_id)
+              assert RailRemedy.close(db, statute, assignment_id, 1)
               assert kase["phase2"]["call"] != nil
               second = fire.()
               refute second == first
@@ -1252,7 +1252,7 @@ defmodule Tightbeam.ConformanceSupport do
       reopened = new_assignment!(db, "holder", "reopen")
       reopen_call = completion_call(reopened)
       assert {:error, %{producer: first}} = Dispatch.dispatch(db, handlers, reopen_call)
-      assert RailRemedy.close(db, fixture_rule_name(fixture), reopened)
+      assert RailRemedy.close(db, fixture_rule_name(fixture), reopened, 1)
       assert {:error, %{producer: second}} = Dispatch.dispatch(db, handlers, reopen_call)
       refute second == first
 
