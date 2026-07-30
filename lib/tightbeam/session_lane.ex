@@ -72,12 +72,21 @@ defmodule Tightbeam.SessionLane do
   way), then the task is killed and the lane drains on. Returns
   {:ok, %{seq, message_id}} when this call won the transition; :not_running
   when no turn is in flight or the turn just finished.
+
+  No timeout, for the same reason as `at_turn_boundary/2` — one decision, not two
+  coincidences. This inherited `GenServer.call/2`'s 5s default while the lane only
+  ever did fast work; `at_turn_boundary/2` made the lane occupiable for a whole
+  adapter bounce, and the default became a deadline nobody chose. There is no edge
+  here to gate on: this caller has no deadline of its own, and the work it queues
+  behind is already bounded by the adapter's own timeouts, so something does
+  eventually give. Waiting for the true answer beats inventing a second, smaller,
+  unrelated number that turns a clean `:not_running` into a timeout exit.
   """
   @spec cancel_current(String.t()) ::
           {:ok, %{seq: integer(), message_id: String.t()}} | :not_running | :no_lane
   def cancel_current(session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> GenServer.call(pid, :cancel_current)
+      [{pid, _}] -> GenServer.call(pid, :cancel_current, :infinity)
       [] -> :no_lane
     end
   end
@@ -93,7 +102,8 @@ defmodule Tightbeam.SessionLane do
   `fun` runs INSIDE the lane process and blocks it, which is the point; it must
   not call back into the same lane. There is no outer timeout because `fun`'s own
   work carries its own (the adapter's are 30-185s), and a shorter bound here
-  would fire while the work it is guarding is still running.
+  would fire while the work it is guarding is still running. `cancel_current/1`
+  is unbounded for the same reason — see there; the two are one decision.
   """
   @spec at_turn_boundary(String.t(), (-> result)) :: {:ok, result} | :busy | :no_lane
         when result: term()

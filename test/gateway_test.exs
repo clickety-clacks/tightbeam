@@ -54,6 +54,7 @@ defmodule Tightbeam.GatewayTest do
     Gateway,
     Identity,
     Idempotency,
+    LaneManager,
     Ledger,
     ModelCatalog,
     Org,
@@ -77,6 +78,14 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:ensure_lane, key}, _from, parent) do
       send(parent, {:ensure_lane, key})
+      {:reply, :ok, parent}
+    end
+
+    # identity apply ensures a lane WITHOUT ringing the doorbell. This stub only
+    # records it; tests that need a real lane start one themselves, so that the
+    # boundary they exercise is a real mailbox rather than a stub's reply.
+    def handle_call({:ensure_lane_quiet, key}, _from, parent) do
+      send(parent, {:ensure_lane_quiet, key})
       {:reply, :ok, parent}
     end
   end
@@ -353,7 +362,10 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Placement.ensure_schema(db)
     start_supervised!({ConnRegistry, name: registry})
-    lane = start_supervised!({LaneDoorbell, self()})
+    # Named globally, like CoordinatorStub: identity apply reaches its lane manager
+    # through `config[:lane_manager] || Tightbeam.LaneManager`, so the default has
+    # to resolve to something for every test that applies to a started session.
+    lane = start_supervised!({LaneDoorbell, {self(), Tightbeam.LaneManager}})
     # Production always has this (Application.children/0); the test env boots no
     # tree, and identity apply now looks a session's lane up by name.
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
@@ -1383,11 +1395,6 @@ defmodule Tightbeam.GatewayTest do
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
     })
 
-    start_supervised!(%{
-      id: :role_lane_manager,
-      start: {LaneDoorbell, :start_link, [{self(), Tightbeam.LaneManager}]}
-    })
-
     start_supervised!({Wakes, Keyword.put(wake_opts, :name, scheduler)})
 
     old = create_session(ctx.db, "agent:old", "flynn")
@@ -1463,11 +1470,6 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!(%{
       id: :effort_conn_registry,
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-    })
-
-    start_supervised!(%{
-      id: :effort_lane_manager,
-      start: {LaneDoorbell, :start_link, [{self(), Tightbeam.LaneManager}]}
     })
 
     start_supervised!({Wakes, Keyword.put(wake_opts, :name, scheduler)})
@@ -4560,6 +4562,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-stable", "created")
+    start_lane!(ctx.db, session.session_key)
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
     old_body = File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md"))
@@ -4847,23 +4850,12 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({CoordinatorStub, {adapter, self()}})
     ensure_global_registry()
 
-    task_sup =
-      start_supervised!(
-        {Task.Supervisor, name: :"toctou_tsup_#{System.unique_integer([:positive])}"}
-      )
-
     test_pid = self()
 
-    start_supervised!(
-      {SessionLane,
-       session_key: session.session_key,
-       db: ctx.db,
-       task_sup: task_sup,
-       runner: fn turn ->
-         send(test_pid, {:turn_started, turn.seq})
-         {:ok, %{}}
-       end}
-    )
+    start_lane!(ctx.db, session.session_key, fn turn ->
+      send(test_pid, {:turn_started, turn.seq})
+      {:ok, %{}}
+    end)
 
     # The precondition the whole race depends on: nothing is running, so the busy
     # check passes and apply proceeds into the bounce.
@@ -4910,6 +4902,192 @@ defmodule Tightbeam.GatewayTest do
     # Deferred, never dropped — the nudge waited in the lane's mailbox and the turn
     # runs once the boundary is free, against the identity apply just installed.
     assert_receive {:turn_started, _}, 5_000
+  end
+
+  # The same race through the door the first fix left open: a session with NO lane.
+  # "No lane exists" is a sample of a mutable fact, not a guarantee — a lane can be
+  # BORN inside the window, because a delivery calls ensure_lane and the newborn
+  # claims on its own init nudge. Most reachable exactly where apply matters most:
+  # after a restart every started session has a pointer and no lane. Apply now
+  # ensures the lane before deciding, so there is one path rather than two.
+  test "a lane born during the bounce cannot claim a turn either", ctx do
+    base_dir = role_test_base("identity-apply-newborn")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-newborn",
+        display_name: "Identity apply newborn",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-newborn", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    next =
+      Identity.edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "identity a newborn lane must not race",
+        "test"
+      )
+
+    adapter = start_supervised!({HoldingAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
+    test_pid = self()
+
+    # A REAL LaneManager, because the thing under test is lane CREATION racing the
+    # bounce. Its scan interval is parked so the only lane births in this test are
+    # the ones the test causes.
+    task_sup =
+      start_supervised!(
+        {Task.Supervisor, name: :"newborn_tasks_#{System.unique_integer([:positive])}"}
+      )
+
+    lane_sup =
+      start_supervised!(
+        {DynamicSupervisor,
+         strategy: :one_for_one, name: :"newborn_lanes_#{System.unique_integer([:positive])}"}
+      )
+
+    manager_name = :"newborn_manager_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {LaneManager,
+       name: manager_name,
+       db: ctx.db,
+       lane_sup: lane_sup,
+       task_sup: task_sup,
+       interval: 600_000,
+       runner: fn turn ->
+         send(test_pid, {:turn_started, turn.seq})
+         {:ok, %{}}
+       end}
+    )
+
+    # THE PRECONDITION: no lane exists for this session when apply begins.
+    assert Registry.lookup(Tightbeam.LaneRegistry, session.session_key) == []
+
+    config = Map.put(gateway_config(base_dir, ctx.db, 0), :lane_manager, manager_name)
+    apply = Gateway.handlers(config)["identity-apply"]
+
+    applier =
+      Task.async(fn ->
+        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+      end)
+
+    assert_receive {:holding_close, "thread-newborn"}, 5_000
+
+    # THE WINDOW: a delivery arrives — enqueue, then ensure_lane exactly as
+    # complete_delivery/3 does it. On the sampled version this is what creates the
+    # lane that then claims under the bounce.
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: session.session_key,
+               message_id: "newborn-1",
+               origin: "user:flynn",
+               prompt: "arrives while the session is being reloaded"
+             })
+
+    assert :ok = LaneManager.ensure_lane(manager_name, session.session_key)
+
+    refute_receive {:turn_started, _}, 2_000
+
+    send(adapter, :release)
+
+    assert %{applied: [session_key], identity_revision: ^next} = Task.await(applier, 10_000)
+    assert session_key == session.session_key
+
+    assert_receive {:turn_started, _}, 5_000
+  end
+
+  # The cancel verb inherited GenServer.call's 5s default back when the lane only
+  # ever did fast work. at_turn_boundary/2 made the lane occupiable for a whole
+  # adapter bounce, so that unchosen default became a deadline: a cancel issued
+  # during a bounce died of timeout instead of answering. Nothing was running, so
+  # the true answer was :not_running all along — a timeout exit reads as "something
+  # is broken" when the truth is "nothing was running".
+  test "cancel waits for the boundary instead of timing out under it", ctx do
+    base_dir = role_test_base("identity-apply-cancel-wait")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-cancel-wait",
+        display_name: "Identity apply cancel wait",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-cancel-wait", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    Identity.edit!(
+      base_dir,
+      "coder",
+      {:skill, "worktree-session", false},
+      "identity applied while a cancel waits",
+      "test"
+    )
+
+    adapter = start_supervised!({HoldingAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+    start_lane!(ctx.db, session.session_key)
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    applier =
+      Task.async(fn ->
+        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+      end)
+
+    assert_receive {:holding_close, "thread-cancel-wait"}, 5_000
+
+    # A cancel arrives while the lane is occupied by the bounce.
+    parent = self()
+
+    canceller =
+      spawn(fn ->
+        send(parent, {:cancel_result, SessionLane.cancel_current(session.session_key)})
+      end)
+
+    ref = Process.monitor(canceller)
+
+    # The wait is the subject, not incidental: it must outlast the 5s default this
+    # call used to inherit. Under that default the caller is already dead here.
+    refute_receive {:DOWN, ^ref, :process, _, _}, 5_500
+    refute_received {:cancel_result, _}
+
+    send(adapter, :release)
+
+    # The true answer, late rather than never: nothing was running.
+    assert_receive {:cancel_result, :not_running}, 10_000
+    assert %{applied: [_]} = Task.await(applier, 10_000)
   end
 
   # Regression: spawn creates the harness session LAZILY, so a freshly spawned session
@@ -4993,6 +5171,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-vanished", "created")
+    start_lane!(ctx.db, session.session_key)
 
     next =
       Identity.edit!(
@@ -5073,6 +5252,8 @@ defmodule Tightbeam.GatewayTest do
 
     resident = make.("agent:apply-all-resident", "thread-resident")
     gone = make.("agent:apply-all-gone", "thread-gone")
+    start_lane!(ctx.db, "agent:apply-all-resident")
+    start_lane!(ctx.db, "agent:apply-all-gone")
     unstarted = make.("agent:apply-all-unstarted", nil)
 
     next =
@@ -5137,6 +5318,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-resident", "created")
+    start_lane!(ctx.db, session.session_key)
 
     Identity.edit!(
       base_dir,
@@ -5605,6 +5787,23 @@ defmodule Tightbeam.GatewayTest do
       principal: {:user, "flynn"},
       session_key: nil,
       params: %{title: title}
+    })
+  end
+
+  # A REAL lane for a session, because identity apply now decides its boundary in
+  # the lane's mailbox: a session without one cannot be applied to at all. The
+  # default runner is inert — these lanes exist to own a boundary, not to work.
+  defp start_lane!(db, session_key, runner \\ fn _turn -> {:ok, %{}} end) do
+    task_sup =
+      start_supervised!(
+        {Task.Supervisor, name: :"lane_tasks_#{System.unique_integer([:positive])}"}
+      )
+
+    start_supervised!(%{
+      id: {:lane, session_key},
+      start:
+        {SessionLane, :start_link,
+         [[session_key: session_key, db: db, task_sup: task_sup, runner: runner]]}
     })
   end
 

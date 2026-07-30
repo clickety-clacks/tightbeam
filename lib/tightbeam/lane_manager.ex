@@ -37,6 +37,20 @@ defmodule Tightbeam.LaneManager do
   def ensure_lane(server \\ __MODULE__, session_key),
     do: GenServer.call(server, {:ensure_lane, session_key})
 
+  @doc """
+  Ensure a lane exists (idempotent) WITHOUT ringing its doorbell.
+
+  For callers that need a session to have a boundary owner rather than need its
+  work started — `identity apply` is the one. Nudging would make an idle lane
+  claim a queued turn, so a caller that must not wait on queued work would have
+  manufactured the very running turn it then defers to (tenet T-CONCURRENCY).
+  A lane created here still self-nudges once from `init/1`; what this avoids is
+  the caller ADDING a doorbell to a lane that already exists.
+  """
+  @spec ensure_lane_quiet(GenServer.server(), String.t()) :: :ok
+  def ensure_lane_quiet(server \\ __MODULE__, session_key),
+    do: GenServer.call(server, {:ensure_lane_quiet, session_key})
+
   @impl true
   def init(opts) do
     state = %__MODULE__{
@@ -61,6 +75,11 @@ defmodule Tightbeam.LaneManager do
   def handle_call({:ensure_lane, session_key}, _from, state) do
     ensure(state, session_key)
     SessionLane.nudge(session_key)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:ensure_lane_quiet, session_key}, _from, state) do
+    ensure(state, session_key)
     {:reply, :ok, state}
   end
 

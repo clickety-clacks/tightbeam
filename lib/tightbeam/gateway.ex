@@ -2104,13 +2104,6 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # The busy check and this bounce are separated by adapter work, and the lane can
-  # claim a queued turn in that window — so sampling status in the gateway would
-  # leave apply reloading a session whose turn had just started. Claiming is
-  # serialized in the LANE, so the decision belongs in its mailbox: while it runs
-  # this call it cannot claim, and a nudge that arrives waits behind it. A session
-  # with no lane has nothing that can claim a turn, so the direct call is already
-  # atomic.
   defp turn_in_progress(sessions) do
     %{
       code: "turn_in_progress",
@@ -2119,13 +2112,38 @@ defmodule Tightbeam.Gateway do
     }
   end
 
+  # The busy check and this bounce are separated by adapter work, and the lane can
+  # claim a queued turn in that window — so sampling status in the gateway would
+  # leave apply reloading a session whose turn had just started. Claiming is
+  # serialized in the LANE, so the decision belongs in its mailbox: while it runs
+  # this call it cannot claim, and a nudge that arrives waits behind it.
+  #
+  # There is no direct path for a session that has no lane. "No lane exists" is a
+  # sample of a mutable fact, and a lane can be BORN inside the window — a
+  # delivery calls ensure_lane and the newborn claims on its own init nudge — so
+  # ensuring first leaves ONE path to keep correct. Either ordering then resolves
+  # inside the lane: if the init nudge claims first we get :busy and defer; if
+  # this call lands first, the nudge waits behind it.
+  #
+  # QUIET, deliberately: ensure_lane/2 also nudges, which would make an idle lane
+  # claim a queued turn and hand back the very refusal the queued/running boundary
+  # exists to remove. Apply must never manufacture the turn it then defers to.
   defp identity_apply_at_lane(config, db, session, revision, pointer) do
     bounce = fn -> identity_apply_started_session(config, db, session, revision, pointer) end
+    LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
 
     case Tightbeam.SessionLane.at_turn_boundary(session.session_key, bounce) do
-      {:ok, result} -> result
-      :no_lane -> bounce.()
-      :busy -> {:error, turn_in_progress([session.session_key])}
+      {:ok, result} ->
+        result
+
+      :busy ->
+        {:error, turn_in_progress([session.session_key])}
+
+      # Unreachable once the lane is ensured — this is the lane dying in the gap,
+      # not a state to design around. Defer rather than bounce outside a lane:
+      # the point of the seam is that no bounce happens unowned.
+      :no_lane ->
+        {:error, turn_in_progress([session.session_key])}
     end
   end
 
