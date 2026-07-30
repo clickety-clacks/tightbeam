@@ -257,6 +257,27 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # One adapter, three sessions, one truthful answer each — the org-wide shape
+  # `--all` actually meets.
+  defmodule MixedResidencyAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:knows_session?, sid}, _from, parent),
+      do: {:reply, sid == "thread-resident", parent}
+
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:mixed_close, sid})
+      {:reply, :ok, parent}
+    end
+
+    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:mixed_load, sid})
+      {:reply, :ok, parent}
+    end
+  end
+
   # A LIVE adapter that holds the session and fails for its own reason — which
   # must still refuse, and must not be swallowed by the residency branch.
   defmodule ApplyErrorAdapterStub do
@@ -4712,6 +4733,81 @@ defmodule Tightbeam.GatewayTest do
              "thread-vanished"
 
     assert Org.current_pointer(ctx.db, session.session_key).reason == "created"
+  end
+
+  # The condition this fix meets FIRST, not someday: deploying it restarts the
+  # gateway, which stales every started session's pointer at once, so the very
+  # next `identity apply --all` hits all three shapes together on a real org.
+  # Single-session coverage would not have pinned that.
+  test "identity apply --all handles resident, gone, and never-started sessions in one pass",
+       ctx do
+    base_dir = role_test_base("identity-apply-all")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    make = fn key, pointer ->
+      session =
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "coder",
+          identity_name: "coder",
+          identity_revision: revision,
+          host: "testhost",
+          harness: "codex",
+          provider: "openai",
+          model: "gpt-5.6-sol[medium]"
+        })
+
+      if pointer, do: Org.append_pointer(ctx.db, key, pointer, "created")
+      session
+    end
+
+    resident = make.("agent:apply-all-resident", "thread-resident")
+    gone = make.("agent:apply-all-gone", "thread-gone")
+    unstarted = make.("agent:apply-all-unstarted", nil)
+
+    next =
+      Identity.edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "org-wide guidance",
+        "test"
+      )
+
+    adapter = start_supervised!({MixedResidencyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{applied: applied, identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{all: true}})
+
+    for key <- [resident.session_key, gone.session_key, unstarted.session_key] do
+      assert key in applied
+    end
+
+    # Only the resident one is bounced, and only it.
+    assert_receive {:mixed_close, "thread-resident"}
+    assert_receive {:mixed_load, "thread-resident"}
+    refute_receive {:mixed_close, "thread-gone"}
+    refute_receive {:mixed_load, "thread-gone"}
+
+    # Both started sessions come out on the applied revision — the resident one
+    # through the bounce, the gone one through its stamp.
+    assert Org.get(ctx.db, resident.session_key).identity_revision == next
+    assert Org.get(ctx.db, gone.session_key).identity_revision == next
+
+    # The never-started one is left alone and does not need the stamp: it reads
+    # `live` at its first start rather than its stamp, so it self-corrects. That
+    # is the whole difference between it and the gone session, which reads its
+    # stamp and would otherwise materialize stale forever.
+    assert Org.current_pointer(ctx.db, unstarted.session_key) == nil
   end
 
   test "identity apply refuses by name when a live adapter fails for its own reason", ctx do
