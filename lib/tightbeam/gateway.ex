@@ -2874,6 +2874,12 @@ defmodule Tightbeam.Gateway do
         broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
         %{stream: stream}
 
+      p[:setting] == "adopt" and is_boolean(p[:adopted]) ->
+        session = Org.set_adopted(db, call.session_key, p.adopted)
+        stream = Payloads.stream_session(session)
+        broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
+        %{ok: true}
+
       p[:setting] == "set_harness" and is_binary(p[:harness]) ->
         case Org.get(db, call.session_key) do
           nil ->

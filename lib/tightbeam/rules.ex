@@ -1298,20 +1298,7 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  defp parse_origin(origin) when is_binary(origin) do
-    case String.split(origin, ":", parts: 2) do
-      ["remedy", rest] when rest != "" ->
-        {:remedy, rest}
-
-      [prefix, rest] when prefix in ~w(user agent process) and rest != "" ->
-        {String.to_existing_atom(prefix), rest}
-
-      _ ->
-        :malformed
-    end
-  end
-
-  defp parse_origin(_), do: :malformed
+  defp parse_origin(origin), do: Tightbeam.Origin.parse(origin)
 
   defp compare(left, "eq", right), do: left == right
   defp compare(left, "ne", right), do: left != right
