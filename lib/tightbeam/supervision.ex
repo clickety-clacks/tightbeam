@@ -362,7 +362,7 @@ defmodule Tightbeam.Supervision do
       }
 
       {decision, to_close, _to_consume} = Rules.decide(db, call)
-      Enum.each(to_close, fn {statute, subject} -> RailRemedy.close(db, statute, subject) end)
+      Enum.each(to_close, &close_episode(db, &1))
 
       case decision do
         {:remedy, statute, ref, _error} ->
@@ -389,10 +389,10 @@ defmodule Tightbeam.Supervision do
           write_watermark(db, session_key, terminal_seq)
           {:acted, :rail_escalate}
 
-        # A rail-check timeout summons a mind, but its deny is the sweep's ordinary
+        # A sensor malfunction summons a mind, but its deny is the sweep's ordinary
         # re-obligate (§A3): the session is NOT parked, because parking is the escalate
-        # effect's consequence and the ruling changed what a timeout ALSO does, not what
-        # it decides.
+        # effect's consequence and the ruling changed what a malfunction ALSO does, not
+        # what it decides.
         {:deny_escalate, statute, ctx} ->
           {:decision_pending, _id} =
             Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
@@ -410,6 +410,10 @@ defmodule Tightbeam.Supervision do
       end
     end
   end
+
+  # The sweep closes both kinds of episode the verb edge does (§C3.5, §A3).
+  defp close_episode(db, {:episodes, statute}), do: Escalation.close_episodes(db, statute)
+  defp close_episode(db, {statute, subject}), do: RailRemedy.close(db, statute, subject)
 
   defp park_escalation(db, session_key, decision_request_id) do
     transaction!(db, fn txn ->

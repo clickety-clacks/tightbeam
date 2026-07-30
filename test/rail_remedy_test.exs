@@ -9,6 +9,7 @@ defmodule Tightbeam.RailRemedyTest do
     DB,
     Devices,
     Dispatch,
+    Escalation,
     EventLog,
     Gateway,
     Idempotency,
@@ -39,6 +40,9 @@ defmodule Tightbeam.RailRemedyTest do
           WorkState,
           EventLog,
           RailRemedy,
+          # A statute whose check renders a verdict asks whether it left a malfunction
+          # episode open, so the rail path reads this table on the healthy road too.
+          Escalation,
           Tightbeam.Placement
         ] do
       :ok = module.ensure_schema(db)

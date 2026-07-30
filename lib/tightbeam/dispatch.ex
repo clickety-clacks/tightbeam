@@ -93,7 +93,7 @@ defmodule Tightbeam.Dispatch do
 
   defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
     {decision, to_close, to_consume} = Rules.decide(db, call)
-    Enum.each(to_close, fn {statute, subject} -> RailRemedy.close(db, statute, subject) end)
+    Enum.each(to_close, &close(db, &1))
 
     case decision do
       {:deny, error} ->
@@ -116,11 +116,11 @@ defmodule Tightbeam.Dispatch do
         best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
         outcome
 
-      # A rail-check timeout denies AND summons (§A3). The caller gets the denial it
+      # A sensor malfunction denies AND summons (§A3). The caller gets the denial it
       # already got — never `{:decision_pending, _}` — while the escalation engine opens
       # the request that puts a mind on the sensor. `escalate/4` is the same hand-off the
-      # branch above makes, and its one-open-request index keeps a retried call from
-      # opening a second.
+      # branch above makes; the episode key in `ctx` is what makes its one-open-request
+      # index dedupe on the CONDITION, so a retry loop cannot storm the engine.
       {:deny_escalate, statute, ctx} ->
         {:decision_pending, _id} =
           Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
@@ -153,6 +153,13 @@ defmodule Tightbeam.Dispatch do
         end
     end
   end
+
+  # Two closures ride the same actor-owned list. A remedy episode closes for a subject
+  # whose statute passed; a malfunction episode closes because the statute's check
+  # answered at all, whatever it answered. The atom tag is unambiguous — a statute name
+  # is a lowercase string, never an atom.
+  defp close(db, {:episodes, statute}), do: Escalation.close_episodes(db, statute)
+  defp close(db, {statute, subject}), do: RailRemedy.close(db, statute, subject)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
     case Map.fetch(handlers, verb) do

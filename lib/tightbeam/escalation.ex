@@ -12,6 +12,10 @@ defmodule Tightbeam.Escalation do
 
   @default_decision_deadline_ms 86_400_000
 
+  # Marks an `actionKey` as naming a CONDITION rather than one caller's action. Reserved
+  # here because `digest/1` is a hex SHA-256 and can never collide with it.
+  @episode_prefix "episode:"
+
   @ddl """
   CREATE TABLE IF NOT EXISTS decision_requests (
     id                TEXT PRIMARY KEY,
@@ -144,11 +148,11 @@ defmodule Tightbeam.Escalation do
 
       nil ->
         now = now()
-        raiser_id = raiser_id(call)
-        raiser_session_key = raiser_session_key(call)
+        episode_key = Map.get(ctx, :episode_key) || Map.get(ctx, "episode_key")
+        {raiser_id, raiser_session_key} = raiser(call, episode_key)
         owner_user_id = owner_user_id!(db, call)
         statute_name = statute_name(statute)
-        action_key = digest(call)
+        action_key = action_key(call, episode_key)
         assignment_id = assignment_id(call)
         request_id = "dr_" <> Tightbeam.Id.uuid4()
         question = fetch_string!(ctx, :question)
@@ -431,6 +435,59 @@ defmodule Tightbeam.Escalation do
 
           if Txn.changes(txn) == 1 do
             EventLog.lifecycle_in_txn(txn, "waiver_revoked", id, "by=process:tightbeam")
+          end
+        end)
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  @doc "Effect-free: does this statute have an open episode-keyed request?"
+  @spec live_episodes?(DB.server(), String.t()) :: boolean()
+  def live_episodes?(db, statute_name) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
+        [statute_name, @episode_prefix <> "%"]
+      )
+
+    count > 0
+  end
+
+  @doc """
+  Close every open episode-keyed request for one statute — the sensor answered again.
+
+  Dark-factory recovery: the malfunction episode exists because a check stopped
+  rendering verdicts, so an observed verdict IS the repair, and demanding an operator
+  verb to acknowledge a sensor that already healed is the stall the episode was meant to
+  prevent. Withdrawal, not a ruling: nothing was decided, the question simply expired.
+  """
+  @spec close_episodes(DB.server(), String.t()) :: :ok
+  def close_episodes(db, statute_name) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        txn
+        |> Txn.q(
+          "SELECT id FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
+          [statute_name, @episode_prefix <> "%"]
+        )
+        |> Enum.each(fn [id] ->
+          Txn.q(
+            txn,
+            "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'sensor-recovered', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
+            [id, now()]
+          )
+
+          if Txn.changes(txn) == 1 do
+            EventLog.lifecycle_in_txn(
+              txn,
+              "decision_request_withdrawn",
+              id,
+              "by=process:tightbeam reason=sensor-recovered statute=#{statute_name}"
+            )
           end
         end)
 
@@ -978,6 +1035,23 @@ defmodule Tightbeam.Escalation do
 
     Enum.join(parts, "?")
   end
+
+  # An ordinary request is keyed by the exact action its raiser attempted. An EPISODE is
+  # keyed by the condition instead, so every caller tripping the same condition on the
+  # same statute lands on one request: `decision_requests_one_open` then does the dedup
+  # that already exists, with no second mechanism to keep in step.
+  defp action_key(_call, episode_key) when is_binary(episode_key),
+    do: @episode_prefix <> episode_key
+
+  defp action_key(call, nil), do: digest(call)
+
+  # An episode-keyed request is raised by the substrate, not by whoever happened to trip
+  # it: the dedup key is (statute, episode_key) alone, so binding it to a session would
+  # both fragment the episode per caller and let `withdraw_for_retired/2` retire an
+  # episode that outlives any one session. The owner still comes from the real call, so
+  # the notification lands with an accountable person. Same shape the effort requests use.
+  defp raiser(_call, episode_key) when is_binary(episode_key), do: {"process:tightbeam", nil}
+  defp raiser(call, nil), do: {raiser_id(call), raiser_session_key(call)}
 
   defp raiser_id(%{principal: {:session, key}}), do: "session:" <> key
   defp raiser_id(call), do: Map.fetch!(call, :origin)

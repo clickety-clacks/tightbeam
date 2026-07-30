@@ -534,7 +534,10 @@ defmodule Tightbeam.RailScriptTest do
     assert {:allow, [], []} = Rules.decide(ctx.db, call())
     assert length(EventLog.lifecycle_events(ctx.db)) == before_count
 
-    assert {{:deny, %{reason: "script_error", script_exit_class: "error:99"}}, [], []} =
+    # A crashing script is a malfunction, so the decision carries the summons alongside
+    # the unchanged deny (§A3); `decide` still opens nothing.
+    assert {{:deny_escalate, %{name: "script-escalate"},
+             %{error: %{reason: "script_error", script_exit_class: "error:99"}}}, [], []} =
              Rules.decide(ctx.db, %{call() | origin: "agent:coder"})
   end
 
@@ -688,15 +691,17 @@ defmodule Tightbeam.RailScriptTest do
     events = EventLog.lifecycle_events(ctx.db)
     assert Enum.count(events, &(&1.kind == "rail_script")) == length(cases)
 
-    # Exactly one of these classes also summons a mind — the timeout (§A3). The count is
-    # the guard against that widening to the others by accident.
-    assert Enum.count(events, &(&1.kind == "decision_request_opened")) == 1
+    # Four of these five also summon a mind (§A3). The one that does not is `rail-deny`:
+    # the sensor answered with a declared token that the statute maps to `deny`. Every
+    # other row is a malfunction — a clock, a crash, a refusal, a token outside the
+    # declared set — and each opens its own episode, because the key is the exit class.
+    assert Enum.count(events, &(&1.kind == "decision_request_opened")) == 4
   end
 
-  # Flynn's ruling (§A3, 2026-07-29): "a timeout never silently decides against work —
-  # the call stays fail-closed, but every expiry summons a mind." The two halves pull in
-  # opposite directions, so both are asserted: the denial the caller receives is the one
-  # it received before the ruling, AND a decision request now names the statute behind it.
+  # Flynn's ruling (§A3, 2026-07-29): "no sensor malfunction silently decides against
+  # work." The two halves pull in opposite directions, so both are asserted: the denial
+  # the caller receives is the one it received before the ruling, AND a decision request
+  # now names the statute behind it.
   test "a timeout denies exactly as before and additionally summons a mind", ctx do
     handlers = %{"post" => fn _call -> flunk("a timed-out rail must not run the handler") end}
 
@@ -763,24 +768,150 @@ defmodule Tightbeam.RailScriptTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
   end
 
-  # Generalizing the summons to the other fail-closed classes is a separate ruling that
-  # has not been made. Until it is, an expiry is the ONLY class that summons.
-  test "the other fail-closed classes deny without summoning anyone", ctx do
+  # A crash, a containment refusal, and a token outside the declared set are malfunctions
+  # for the same reason a timeout is: something other than a mind decided, and the
+  # available repairs differ per class, so each carries its own reason code and class into
+  # its own episode.
+  test "every malfunction class summons a mind naming its own reason and class", ctx do
     handlers = %{"post" => fn _call -> flunk("a non-pass rail must not run the handler") end}
 
-    for {script, reason} <- [
-          {"rail-error", "script_error"},
-          {"rail-out-of-set", "script_out_of_set"},
-          {"rail-contained-refused", "script_contained_refused"}
-        ] do
+    cases = [
+      {"rail-error", "script_error", "error:7"},
+      {"rail-out-of-set", "script_out_of_set", "out-of-set"},
+      {"rail-contained-refused", "script_contained_refused", "contained"}
+    ]
+
+    for {script, reason, exit_class} <- cases do
       put_statute(ctx, statute(script, %{"pass" => "allow"}))
       Rules.load!(ctx.base_dir, ["post"], %{})
 
-      assert {:error, %{reason: ^reason}} =
+      assert {:error, %{reason: ^reason, script_exit_class: ^exit_class}} =
                Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-#{script}"}))
     end
 
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               "SELECT question, status FROM decision_requests ORDER BY rowid"
+             )
+
+    assert length(rows) == 3
+
+    for {[question, status], {_script, reason, exit_class}} <- Enum.zip(rows, cases) do
+      assert status == "open"
+      assert question =~ "denied #{reason}"
+      assert question =~ "script_exit_class #{exit_class}"
+    end
+  end
+
+  # The one non-pass outcome that is NOT a malfunction: the script answered, with a
+  # declared token, and `[rule.check.effects]` maps that token to `deny`. The sensor did
+  # its job — there is nothing for a mind to repair, so nobody is summoned.
+  test "a token-mapped deny is the sensor answering, and summons nobody", ctx do
+    handlers = %{"post" => fn _call -> flunk("a denied rail must not run the handler") end}
+
+    put_statute(ctx, statute("rail-deny", %{"blocked" => "deny"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+
+    assert {:error, %{reason: "rule_denied", script_exit_class: "returned"}} =
+             Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-token-deny"}))
+
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+  end
+
+  # DEDUP (§A3): one live episode per (statute, script_exit_class). The key is the
+  # CONDITION, not the caller and not the action — two different callers tripping the same
+  # broken check land on one episode, which is what stops a retry loop from storming the
+  # engine. Two different classes on the same statute stay separate, because they are
+  # different repairs.
+  test "identical malfunctions share one episode; different classes get their own", ctx do
+    handlers = %{"post" => fn _call -> flunk("a non-pass rail must not run the handler") end}
+
+    put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+
+    # Same statute, same class, but a different caller AND a different action each time.
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-one"}))
+
+    assert {:error, %{script_exit_class: "timeout"}} =
+             Dispatch.dispatch(ctx.db, handlers, %{
+               call(%{work_item_id: "w-two"})
+               | origin: "agent:rail-holder",
+                 principal: {:session, ctx.holder.session_key}
+             })
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status = 'open'")
+
+    # A different class on the same statute is a different malfunction and a different fix.
+    put_statute(ctx, statute("rail-error", %{"pass" => "allow"}))
+    Rules.load!(ctx.base_dir, ["post"], %{})
+
+    assert {:error, %{script_exit_class: "error:7"}} =
+             Dispatch.dispatch(ctx.db, handlers, call(%{work_item_id: "w-one"}))
+
+    assert {:ok, [[2]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status = 'open'")
+  end
+
+  # AUTO-CLOSE (§A3): recovery is automatic when the cause heals. An observed verdict —
+  # pass OR a genuine token-deny — means the check is rendering verdicts again, which is
+  # the repair itself. No operator verb, and the episode must not linger demanding that a
+  # mind acknowledge a sensor that already recovered.
+  test "an observed verdict closes the episode with no operator verb", ctx do
+    parent = self()
+
+    handlers = %{
+      "post" => fn _call ->
+        send(parent, :handler_ran)
+        %{ok: true}
+      end
+    }
+
+    heal = call(%{work_item_id: "w-heal"})
+
+    load = fn script, effects ->
+      put_statute(ctx, statute(script, effects))
+      Rules.load!(ctx.base_dir, ["post"], %{})
+    end
+
+    open_episodes = fn ->
+      {:ok, [[count]]} =
+        DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status = 'open'")
+
+      count
+    end
+
+    load.("rail-timeout", %{"pass" => "allow"})
+    assert {:error, %{script_exit_class: "timeout"}} = Dispatch.dispatch(ctx.db, handlers, heal)
+    assert {:ok, [[id, "open"]]} = DB.query(ctx.db, "SELECT id, status FROM decision_requests")
+
+    # The check recovers and passes.
+    load.("rail-pass", %{"pass" => "allow"})
+    assert {:ok, %{ok: true}} = Dispatch.dispatch(ctx.db, handlers, heal)
+    assert_received :handler_ran
+
+    assert {:ok, [["withdrawn", "process:tightbeam", "sensor-recovered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status, withdrawnBy, withdrawnReason FROM decision_requests WHERE id = ?1",
+               [id]
+             )
+
+    # It breaks again, and a fresh episode opens — the closure was recovery, not a mute.
+    load.("rail-timeout", %{"pass" => "allow"})
+    assert {:error, %{script_exit_class: "timeout"}} = Dispatch.dispatch(ctx.db, handlers, heal)
+    assert open_episodes.() == 1
+
+    # A genuine token-deny is an observed verdict too, and closes the episode just as a
+    # pass does: what healed is the sensor, not the verdict it renders.
+    load.("rail-deny", %{"blocked" => "deny"})
+
+    assert {:error, %{reason: "rule_denied", script_exit_class: "returned"}} =
+             Dispatch.dispatch(ctx.db, handlers, heal)
+
+    assert open_episodes.() == 0
   end
 
   # The summons is an EFFECT, so it belongs to the actors, not to the decision function

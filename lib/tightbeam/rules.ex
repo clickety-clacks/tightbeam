@@ -762,6 +762,13 @@ defmodule Tightbeam.Rules do
         case fetch_fact("$assignment", db, call, cache) do
           {:ok, assignment, cache} ->
             case RailScript.run(db, rule.base_dir, rule, call, assignment) do
+              # The sensor answered. Whatever the token maps to — allow or a genuine deny —
+              # this statute's check is rendering verdicts again, which IS the repair for
+              # any malfunction episode it left open (§A3). The close rides `to_close`
+              # because it is an EFFECT and `decide` is effect-free on enforcement (§B):
+              # the actors own it, at both edges, whatever the fold decides afterwards. The
+              # read is what keeps `to_close` a list of work rather than a no-op on every
+              # healthy check — the same shape `maybe_close/4` uses for remedy episodes.
               {:ok, token, exit_class} ->
                 fold_effect(
                   rule.check.effects[token],
@@ -770,27 +777,30 @@ defmodule Tightbeam.Rules do
                   db,
                   call,
                   cache,
-                  to_close,
+                  maybe_close_episodes(rule, db, to_close),
                   to_consume,
                   exit_class
                 )
 
-              # A timeout is the clock bounding a wait, not a verdict on the work: no
-              # sensor observed anything (§A3, Flynn 2026-07-29). The deny is byte-identical
-              # to every other fail-closed class — same reason, same exit class, same
-              # legibility payload — and the event ALSO goes to the escalation engine, so a
-              # mind adjudicates the sensor instead of the deny recurring silently on every
-              # retry. Both producers reach here: the wrapper's own exit 20 (`timeout`) and
-              # the backstop that never heard from it (`unreported`).
-              {:error, "script_timeout", exit_class} ->
-                error = denial_error(rule, call, "script_timeout", exit_class)
-                ctx = %{question: timeout_question(rule, exit_class), error: error}
-
-                {{:deny_escalate, rule, ctx}, Enum.reverse(to_close), Enum.reverse(to_consume)}
-
+              # Everything else is a MALFUNCTION, not a verdict (§A3, Flynn 2026-07-29,
+              # generalized under dark-factory doctrine): a clock, a crash, a containment
+              # refusal, a token outside the declared set, or one of the four paths that
+              # reached a deny with nothing observed at all. A clock or a crash decided,
+              # not a mind. The deny is byte-identical to what it always was — same reason,
+              # same exit class, same legibility payload — and the event ALSO goes to the
+              # escalation engine so a mind adjudicates the sensor instead of the deny
+              # recurring silently on every retry. Only a declared token mapped to `deny`
+              # above stays a bare deny; that one is the sensor answering.
               {:error, reason, exit_class} ->
                 error = denial_error(rule, call, reason, exit_class)
-                {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+
+                ctx = %{
+                  question: malfunction_question(rule, reason, exit_class),
+                  error: error,
+                  episode_key: exit_class
+                }
+
+                {{:deny_escalate, rule, ctx}, Enum.reverse(to_close), Enum.reverse(to_consume)}
             end
 
           :error ->
@@ -844,13 +854,13 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  # What the summoned mind is asked. It names the statute, the reason code, and the
-  # exit class, because those are what separate the three remedies available: raise the
-  # ceiling, fix the check, or rule on the work itself.
-  defp timeout_question(rule, exit_class) do
+  # What the summoned mind is asked. It names the statute, the reason code, and the exit
+  # class, because those are what separate the available repairs: raise the ceiling, fix
+  # the script, repair the host, or reclassify the check as work.
+  defp malfunction_question(rule, reason, exit_class) do
     "#{rule.name}: #{rule.text}\n" <>
-      "The check rendered no verdict — denied script_timeout, script_exit_class " <>
-      "#{exit_class}. A timeout may bound waiting; it may never be the last word on work."
+      "The check rendered no verdict — denied #{reason}, script_exit_class " <>
+      "#{exit_class}. A malfunction may bound a call; it may never be the last word on work."
   end
 
   defp denial_error(rule, call, reason, script_exit_class) do
@@ -878,6 +888,12 @@ defmodule Tightbeam.Rules do
 
     params[:assignment_id] || params[:work_item_id] || params["assignment_id"] ||
       params["work_item_id"]
+  end
+
+  defp maybe_close_episodes(rule, db, to_close) do
+    if Escalation.live_episodes?(db, rule.name),
+      do: [{:episodes, rule.name} | to_close],
+      else: to_close
   end
 
   defp maybe_close(rule, db, call, to_close) do
