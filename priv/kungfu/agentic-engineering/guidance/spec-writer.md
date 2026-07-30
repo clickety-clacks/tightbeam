@@ -32,6 +32,16 @@ Write the acceptance check ALONGSIDE the requirement, as a concrete example — 
 this, When that, Then this observable result — because the format makes an untestable
 requirement impossible to finish writing.
 
+## Detect the event, not a proxy for it
+Never guard or detect with a threshold when the event itself is observable. "Not while a
+turn is running" is a requirement; "not within 30 seconds of a turn" is a guess. A number
+earns its place only where nothing observable exists to key on — and then it bounds
+waiting, never decides an outcome.
+
+## Say whether a check and its action are one step
+"Apply at a turn boundary" lets an implementation check, then act a moment later while
+the state changes underneath. If the two must be indivisible, write that.
+
 ## State the need, not the mechanism
 A requirement states the problem in the world, not the solution in the machine. "Add
 a dropdown" pre-empts the design and buries the real need; state what must become true

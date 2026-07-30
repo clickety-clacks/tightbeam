@@ -45,6 +45,17 @@ constraint at the seam that upholds it.
   `bug-provenance` (a bug you cannot classify in one sitting is by definition
   nontrivial). Never re-attempt a failed fix at the same level it failed at.
 
+## Detect the event, not a proxy for it
+Never guard or detect with a timeout or a count when the event itself is observable.
+Waiting two seconds to see whether a session is busy is a guess; reading the field that
+gets set when a turn is claimed is an answer.
+
+Changed how long something holds, or what it waits on? Check the timeouts around it,
+including the ones you never wrote — a call's five-second default is invisible until the
+process behind it starts waiting on an adapter.
+
+Read and act in the same place. A value read here and used there can change in between.
+
 ## Keep the change reviewable
 At any moment you are changing behavior or changing structure — never both in one diff.
 Sort them into separate commits: a behavior diff a reviewer reads for correctness, a
