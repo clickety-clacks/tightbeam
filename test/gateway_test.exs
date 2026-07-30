@@ -68,11 +68,29 @@ defmodule Tightbeam.GatewayTest do
     WorkState
   }
 
-  test "an unknown archetype projects the builtin default MCP servers" do
-    Archetypes.load!(role_test_base("unknown-mcp-fallback"))
+  defmodule McpArchetypes do
+    def get("unknown"), do: nil
 
-    assert Gateway.mcp_servers_for_archetype("unknown") ==
-             Archetypes.acp_mcp_servers(Archetypes.builtin_default())
+    def builtin_default do
+      %{Archetypes.builtin_default() | mcp: [server()]}
+    end
+
+    def acp_mcp_servers(archetype), do: Archetypes.acp_mcp_servers(archetype)
+
+    defp server do
+      %{name: "builtin", command: "builtin-mcp", args: ["--default"], env: %{"MODE" => "test"}}
+    end
+  end
+
+  test "an unknown archetype projects the builtin default MCP servers" do
+    assert Gateway.mcp_servers_for_archetype("unknown", McpArchetypes) == [
+             %{
+               "name" => "builtin",
+               "command" => "builtin-mcp",
+               "args" => ["--default"],
+               "env" => [%{"name" => "MODE", "value" => "test"}]
+             }
+           ]
   end
 
   alias Tightbeam.Wire.Payloads

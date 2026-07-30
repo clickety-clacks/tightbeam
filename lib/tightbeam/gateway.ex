@@ -1761,11 +1761,11 @@ defmodule Tightbeam.Gateway do
   end
 
   @doc false
-  def mcp_servers_for_archetype(archetype_name) do
+  def mcp_servers_for_archetype(archetype_name, archetypes \\ Archetypes) do
     archetype_name
-    |> Archetypes.get()
-    |> Kernel.||(Archetypes.builtin_default())
-    |> Archetypes.acp_mcp_servers()
+    |> archetypes.get()
+    |> Kernel.||(archetypes.builtin_default())
+    |> archetypes.acp_mcp_servers()
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
