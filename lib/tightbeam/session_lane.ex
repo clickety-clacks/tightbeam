@@ -12,8 +12,6 @@ defmodule Tightbeam.SessionLane do
     block on — it is designed to wait and is monitored by the Conn, which
     cancels on its death).
 
-  There is currently no interlock between an orphaned ACP request and the next
-  queued turn.
   """
 
   use GenServer

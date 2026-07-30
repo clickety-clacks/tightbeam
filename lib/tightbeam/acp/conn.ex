@@ -111,8 +111,6 @@ defmodule Tightbeam.Acp.Conn do
     end
   end
 
-  def handle_call(:pending_count, _from, state), do: {:reply, map_size(state.pending), state}
-
   @impl true
   def handle_cast({:notify, method, params}, state) do
     unless state.closed,

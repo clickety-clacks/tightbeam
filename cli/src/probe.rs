@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
@@ -84,8 +84,12 @@ impl ProbeIo for SystemIo {
         args: &[OsString],
         deadline: Duration,
     ) -> Result<Vec<u8>, CommandFailure> {
-        let mut child = Command::new(program)
-            .args(args)
+        let mut command = Command::new(program);
+        command.args(args);
+        if program == "ps" {
+            command.env("LC_ALL", "C");
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -491,10 +495,15 @@ fn parse_darwin_pass1(
     bytes: &[u8],
     own_pid: u32,
     catalog: Option<&crate::harnesses::HarnessCatalog>,
-) -> Vec<RawProcess> {
+) -> (Vec<RawProcess>, usize) {
     let mut processes = Vec::new();
+    let mut unparseable_rows = 0;
     for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
         let Some((pid, lstart, command)) = parse_pid_lstart_line(line) else {
+            unparseable_rows += 1;
             continue;
         };
         if pid == own_pid {
@@ -523,7 +532,7 @@ fn parse_darwin_pass1(
             harnesses,
         });
     }
-    processes
+    (processes, unparseable_rows)
 }
 
 fn parse_pid_lstart_line(line: &[u8]) -> Option<(u32, &[u8], &[u8])> {
@@ -547,6 +556,7 @@ fn parse_pid_lstart_line(line: &[u8]) -> Option<(u32, &[u8], &[u8])> {
     }
     let lstart_start = cursor;
     let mut lstart_end = cursor;
+    let mut fields = Vec::new();
     for _ in 0..5 {
         let field_start = cursor;
         while line
@@ -558,21 +568,62 @@ fn parse_pid_lstart_line(line: &[u8]) -> Option<(u32, &[u8], &[u8])> {
         if cursor == field_start {
             return None;
         }
+        fields.push(&line[field_start..cursor]);
         lstart_end = cursor;
         while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
     }
+    let [weekday, month, day, time, year] = fields.as_slice() else {
+        return None;
+    };
+    let valid_weekday = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"]
+        .iter()
+        .any(|value| *weekday == value.as_slice());
+    let valid_month = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ]
+    .iter()
+    .any(|value| *month == value.as_slice());
+    let valid_day = (1..=2).contains(&day.len()) && day.iter().all(u8::is_ascii_digit);
+    let valid_time = time.len() == 8
+        && time[2] == b':'
+        && time[5] == b':'
+        && time
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit());
+    let valid_year = year.len() == 4 && year.iter().all(u8::is_ascii_digit);
+    if !(valid_weekday && valid_month && valid_day && valid_time && valid_year) {
+        return None;
+    }
     Some((pid, &line[lstart_start..lstart_end], &line[cursor..]))
 }
 
-fn parse_pid_lstart(bytes: &[u8]) -> BTreeMap<u32, Vec<u8>> {
-    bytes
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| {
-            parse_pid_lstart_line(line).map(|(pid, lstart, _)| (pid, lstart.to_vec()))
-        })
-        .collect()
+fn parse_pid_lstart(bytes: &[u8]) -> (BTreeMap<u32, Vec<u8>>, BTreeSet<u32>, usize) {
+    let mut identities = BTreeMap::new();
+    let mut malformed_pids = BTreeSet::new();
+    let mut unparseable_rows = 0;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        if let Some((pid, lstart, _)) = parse_pid_lstart_line(line) {
+            identities.insert(pid, lstart.to_vec());
+        } else {
+            unparseable_rows += 1;
+            if let Some(pid) = line
+                .split(|byte| byte.is_ascii_whitespace())
+                .find(|field| !field.is_empty())
+                .and_then(|field| std::str::from_utf8(field).ok())
+                .and_then(|field| field.parse::<u32>().ok())
+            {
+                malformed_pids.insert(pid);
+            }
+        }
+    }
+    (identities, malformed_pids, unparseable_rows)
 }
 
 fn pid_list(processes: &[RawProcess]) -> OsString {
@@ -693,6 +744,13 @@ fn note_failure(notes: &mut Vec<String>, command: &str, failure: CommandFailure)
     notes.push(format!("{command} {suffix}"));
 }
 
+fn note_unparseable_rows(notes: &mut Vec<String>, command: &str, count: usize) {
+    if count > 0 {
+        let suffix = if count == 1 { "row" } else { "rows" };
+        notes.push(format!("{command} contained {count} unparseable {suffix}"));
+    }
+}
+
 fn collect_darwin(
     io: &impl ProbeIo,
     own_pid: u32,
@@ -712,8 +770,9 @@ fn collect_darwin(
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.iter().all(|byte| byte.is_ascii_whitespace()))
         .count();
-    let mut processes = parse_darwin_pass1(&pass1, own_pid, catalog);
     let mut notes = Vec::new();
+    let (mut processes, unparseable_rows) = parse_darwin_pass1(&pass1, own_pid, catalog);
+    note_unparseable_rows(&mut notes, "ps enumeration", unparseable_rows);
     if !processes.is_empty() {
         let list = pid_list(&processes);
         match io.command(
@@ -806,11 +865,13 @@ fn add_elapsed(io: &impl ProbeIo, raw: &mut RawFacts) {
             Duration::from_millis(1000),
         ) {
             Ok(bytes) => {
-                let identities = parse_pid_lstart(&bytes);
+                let (identities, malformed_pids, unparseable_rows) = parse_pid_lstart(&bytes);
+                note_unparseable_rows(&mut raw.notes, "ps identity", unparseable_rows);
                 raw.processes.retain(|process| {
-                    identities
-                        .get(&process.pid)
-                        .is_some_and(|lstart| process.lstart.as_ref() == Some(lstart))
+                    malformed_pids.contains(&process.pid)
+                        || identities
+                            .get(&process.pid)
+                            .is_some_and(|lstart| process.lstart.as_ref() == Some(lstart))
                 });
             }
             Err(failure) => {
@@ -1069,6 +1130,9 @@ fn human(report: &Report) -> String {
             &adapters
         }
     ));
+    for note in &report.epistemics.notes {
+        lines.push(format!("note: {note}"));
+    }
     let unreadable = report
         .epistemics
         .pids_env_unreadable
@@ -1554,12 +1618,13 @@ mod tests {
 
     #[test]
     fn darwin_rows_distinguish_spoofable_marker_and_unmarked_adapter_evidence() {
-        let rows = parse_darwin_pass1(
+        let (rows, unparseable_rows) = parse_darwin_pass1(
             b"7 Thu Jul 30 12:34:56 2026 node TIGHTBEAM_LINEAGE=tb1-YUBi\n\
               8 Thu Jul 30 12:34:56 2026 codex-acp\n",
             999,
             Some(&crate::harnesses::catalog().unwrap()),
         );
+        assert_eq!(unparseable_rows, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].evidence, "argv_or_env_indistinguishable");
         assert_eq!(rows[1].evidence, "none_observed");
@@ -1784,6 +1849,55 @@ mod tests {
         assert_eq!(raw.processes.len(), 1);
         assert_eq!(raw.processes[0].pid, 7);
         assert_eq!(raw.notes, vec!["ps identity timed out"]);
+        let report = assemble(
+            raw,
+            1,
+            2,
+            "host".to_owned(),
+            BaseDir {
+                path: "/tmp/tightbeam".to_owned(),
+                status: "absent",
+                entries: entries_with("absent"),
+                adapter_stderr_log_count: None,
+            },
+        );
+        assert!(human(&report).contains("note: ps identity timed out"));
+    }
+
+    #[test]
+    fn darwin_retains_candidate_and_notes_unparseable_identity_lstart() {
+        let io = FakeIo {
+            commands: std::cell::RefCell::new(vec![
+                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp\n".to_vec()),
+                Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
+                Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
+                Ok(b"7 00:03\n".to_vec()),
+                Ok(b"7 7\xe6\x9c\x88 30 12:34:56 2026\n".to_vec()),
+            ]),
+            ..FakeIo::default()
+        };
+        let mut raw =
+            collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
+        add_elapsed(&io, &mut raw);
+        assert_eq!(raw.processes.len(), 1);
+        assert_eq!(raw.processes[0].pid, 7);
+        assert_eq!(raw.notes, vec!["ps identity contained 1 unparseable row"]);
+    }
+
+    #[test]
+    fn darwin_notes_unparseable_non_c_lstart_instead_of_treating_it_as_command() {
+        let io = FakeIo {
+            commands: std::cell::RefCell::new(vec![Ok(
+                b"7 7\xe6\x9c\x88 30 12:34:56 2026 node harmless\n".to_vec(),
+            )]),
+            ..FakeIo::default()
+        };
+        let raw = collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
+        assert!(raw.processes.is_empty());
+        assert_eq!(
+            raw.notes,
+            vec!["ps enumeration contained 1 unparseable row"]
+        );
     }
 
     #[test]
