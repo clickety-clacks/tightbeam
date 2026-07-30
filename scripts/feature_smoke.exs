@@ -669,9 +669,12 @@ defmodule FeatureSmoke do
   # So isolation is MEASURED rather than assumed, and every way it could fail is fatal
   # rather than silent:
   #
-  #   NO TURN RAN. The group asserts the holder's session has ZERO turn rows at the end.
-  #   A wake that materialized into a turn means the agent was handed the prompt, which
-  #   voids the premise — whether or not it managed to act — and the group says so.
+  #   NO TURN STARTED. Turn ROWS are expected: the remedy wake is immediate-due, the
+  #   gateway fires due wakes synchronously, and delivery inserts the row before the
+  #   denying request returns, so a `queued` row exists by construction and carries a
+  #   prompt nothing has read. The group asserts that none of them was ever STARTED —
+  #   `startedAt` marks the lane claiming a turn and handing the prompt on — and reports
+  #   both counts either way, so the normal outcome reads as what it is.
   #
   #   ONE REPORT, AND IT IS THE OPERATOR'S. Exactly one report artifact may exist on this
   #   work item from this holder. A second row is a holder that recorded, and a strong
@@ -895,8 +898,8 @@ defmodule FeatureSmoke do
         state,
         "gate chain enforced: review(#{reviewer_leg.wire_name}) → verification → artifact " <>
           "denied in order, released by a #{recorded["recordedTurnEvidence"]} row (gate is " <>
-          "evidence-blind, classes not spoofable), completes, episode closed — holder ran " <>
-          "0 turns"
+          "evidence-blind, classes not spoofable), completes, episode closed — holder: " <>
+          "#{materialized} turn(s) materialized, #{started} started"
       )
     after
       # EVERY assertion about an assignment outcome stays above this line: `retire` REVOKES
@@ -1251,10 +1254,12 @@ defmodule FeatureSmoke do
   # returns — which narrows the window to this one HTTP round trip.
   #
   # An earlier version also DRAINED the holder's lane here. It no longer needs to: the only
-  # caller is `check_gate_chain_enforced/1`, which drives every step over HTTP precisely so
-  # that no turn of the holder's is ever STARTED. Draining was worse than redundant there
-  # — it waited for the remedy turn, which is exactly how a capable holder came to satisfy
-  # the whole chain before the next denial could be asserted.
+  # caller is `check_gate_chain_enforced/1`, which drives every step over HTTP and therefore
+  # gives the lane no reason to be waited on. That does not CAUSE the holder's queued turns
+  # to stay unstarted — the lane may claim one at any moment — which is exactly why that
+  # group measures whether any did rather than asserting none could. Draining was worse than
+  # redundant here: it waited for the remedy turn, which is how a capable holder came to
+  # satisfy the whole chain before the next denial could be asserted.
   #
   # The window must hold EXACTLY ONE row for this assignment. Requiring one rather than
   # taking the newest is what keeps the correlation exact without the drain: anything else
