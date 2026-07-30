@@ -5090,6 +5090,140 @@ defmodule Tightbeam.GatewayTest do
     assert %{applied: [_]} = Task.await(applier, 10_000)
   end
 
+  # THE ACCEPTED RESIDUAL of ensuring the lane, documented so it is not rediscovered
+  # as a bug. A lane created here self-nudges from its own `init/1` — that nudge is
+  # in its mailbox before `at_turn_boundary/2` can land — so if claimable queued work
+  # exists, the newborn claims it and apply defers to the turn it just caused.
+  #
+  # Why that is acceptable, which is the whole argument and not a caveat on it: the
+  # wedge this branch removes was PERMANENT BY CONSTRUCTION — a headless org's Main
+  # queues forever, nothing drains it, org-wide apply impossible for the life of the
+  # org, no retry helps. This is TRANSIENT BY CONSTRUCTION — it needs an absent lane
+  # AND claimable queued work, the reconciler ensures a lane for every pending session
+  # each tick, and the turn we caused would have started inside that tick anyway. Those
+  # are different classes, not degrees: "impossible forever" versus "try again in a
+  # second". The refusal is also TRUE rather than spurious — a turn really is running
+  # by the time we ask — so nothing is ever bounced mid-turn.
+  #
+  # Note what is NOT claimed: "no lane implies no pending work" is not an invariant.
+  # A delivery commits its turn before it calls ensure_lane, so this state has a real
+  # window and is reachable rather than theoretical.
+  #
+  # Filed separately, deliberately not fixed here: under `--all` a refusal halts the
+  # whole pass (identity_apply_at_boundary's reduce_while), so one such session defers
+  # the org-wide apply. Changing that is a product decision about partial results, not
+  # this seam's to make.
+  test "a lane ensured over queued work defers, and the retry after it succeeds", ctx do
+    base_dir = role_test_base("identity-apply-residual")
+    Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-residual",
+        display_name: "Identity apply residual",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "gpt-5.6-sol[medium]"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-residual", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    next =
+      Identity.edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "identity the retry must land",
+        "test"
+      )
+
+    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
+    test_pid = self()
+
+    task_sup =
+      start_supervised!(
+        {Task.Supervisor, name: :"residual_tasks_#{System.unique_integer([:positive])}"}
+      )
+
+    lane_sup =
+      start_supervised!(
+        {DynamicSupervisor,
+         strategy: :one_for_one, name: :"residual_lanes_#{System.unique_integer([:positive])}"}
+      )
+
+    manager_name = :"residual_manager_#{System.unique_integer([:positive])}"
+
+    # The runner HOLDS the turn open, so the refusal below is a stable state rather
+    # than a race the assertion has to win.
+    start_supervised!(
+      {LaneManager,
+       name: manager_name,
+       db: ctx.db,
+       lane_sup: lane_sup,
+       task_sup: task_sup,
+       interval: 600_000,
+       on_terminal: fn key, seq -> send(test_pid, {:turn_terminal, key, seq}) end,
+       runner: fn turn ->
+         send(test_pid, {:turn_started, turn.seq})
+
+         receive do
+           :finish_turn -> {:ok, %{}}
+         end
+       end}
+    )
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: session.session_key,
+               message_id: "residual-1",
+               origin: "user:flynn",
+               prompt: "queued before any lane existed"
+             })
+
+    # THE PRECONDITION: queued work, and no lane to run it.
+    assert Registry.lookup(Tightbeam.LaneRegistry, session.session_key) == []
+    refute Ledger.running?(ctx.db, session.session_key)
+
+    config = Map.put(gateway_config(base_dir, ctx.db, 0), :lane_manager, manager_name)
+    apply = Gateway.handlers(config)["identity-apply"]
+
+    assert %{code: "turn_in_progress", sessions: [session_key]} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert session_key == session.session_key
+
+    # The refusal is TRUE, not a lie: the newborn lane really did start the turn, and
+    # the stamp is untouched because nothing was bounced.
+    assert_receive {:turn_started, _}, 5_000
+    assert Ledger.running?(ctx.db, session.session_key)
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+
+    # TRANSIENT: the turn terminals and the retry lands. This is the "try again in a
+    # second" half, and it is what makes the trade a trade.
+    Enum.each(Task.Supervisor.children(task_sup), &send(&1, :finish_turn))
+
+    assert_receive {:turn_terminal, _, _}, 5_000
+    refute Ledger.running?(ctx.db, session.session_key)
+
+    assert %{applied: [^session_key], identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+  end
+
   # Regression: spawn creates the harness session LAZILY, so a freshly spawned session
   # has no harness pointer until its first turn. identity-apply once raised on it —
   # bricking `--all` org-wide whenever any never-started session existed (found by
