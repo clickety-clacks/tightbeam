@@ -437,7 +437,7 @@ defmodule Tightbeam.Wire.SocketTest do
     {:push, [{:text, sync}], live} = Socket.handle_info(:finish_replay, replaying)
     assert JSON.decode!(sync) == %{"type" => "sync_complete"}
     assert live.subscriptions == MapSet.new(["chat"])
-    assert ConnRegistry.count(ctx.registry) == 1
+    assert map_size(:sys.get_state(ctx.registry).conns) == 1
 
     {:push, reauth_frames, reauthing} =
       Socket.handle_in({JSON.encode!(auth), opcode: :text}, live)
@@ -449,7 +449,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
     assert reauthing.conn_ref == live.conn_ref
     assert reauthing.subscriptions == MapSet.new(["chat"])
-    assert ConnRegistry.count(ctx.registry) == 1
+    assert map_size(:sys.get_state(ctx.registry).conns) == 1
     refute_receive {:takeover_close}
 
     {:push, [{:text, second_sync}], live_again} =
@@ -478,7 +478,7 @@ defmodule Tightbeam.Wire.SocketTest do
                Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
 
       assert JSON.decode!(error)["code"] == "invalid_message"
-      assert ConnRegistry.count(ctx.registry) == 0
+      assert map_size(:sys.get_state(ctx.registry).conns) == 0
       assert Org.list_for_user(ctx.db, device.user_id, false) == []
     end
   end
