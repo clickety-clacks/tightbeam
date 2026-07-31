@@ -227,6 +227,44 @@ defmodule Tightbeam.AdapterHealTest do
       do: {:reply, GenServer.call(state.real, message, 30_000), state}
   end
 
+  defmodule ModelReadBarrierDB do
+    @moduledoc false
+    use GenServer
+
+    @doc "Forwards to `real`; blocks the turn's first post-session-read query."
+    def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+
+    def init(state), do: {:ok, Map.merge(state, %{blocked: false, read_model: nil})}
+
+    def handle_call({:query, sql, params} = message, _from, state) do
+      state =
+        if not state.blocked and String.contains?(sql, "FROM messages WHERE id = ?1") do
+          send(state.parent, {:turn_has_read_model, self(), state.read_model})
+
+          receive do
+            :release_turn -> :ok
+          end
+
+          %{state | blocked: true}
+        else
+          state
+        end
+
+      reply = GenServer.call(state.real, message, 30_000)
+
+      state =
+        case {String.contains?(sql, "FROM sessions"), params, reply} do
+          {true, ["k1"], {:ok, [row]}} -> Map.put(state, :read_model, Enum.at(row, 17))
+          _ -> state
+        end
+
+      {:reply, reply, state}
+    end
+
+    def handle_call(message, _from, state),
+      do: {:reply, GenServer.call(state.real, message, 30_000), state}
+  end
+
   defmodule WakeSchedulerStub do
     @moduledoc false
     use GenServer
@@ -1607,16 +1645,25 @@ defmodule Tightbeam.AdapterHealTest do
     assert_receive {:tune_model_applied, "claude-sonnet-4-6"}
     assert_receive {:tune_waiting_to_commit, db_proxy}
 
-    turn = Task.async(fn -> run_residency_pass(ctx) end)
+    turn_db =
+      start_supervised!(
+        {ModelReadBarrierDB, real: ctx.db, parent: self()},
+        id: :model_read_barrier_db
+      )
+
+    turn_ctx = put_in(ctx.config.db, turn_db)
+    turn = Task.async(fn -> run_residency_pass(turn_ctx) end)
+
+    assert_receive {:turn_has_read_model, turn_proxy, "claude-fable-5"}
 
     try do
-      refute_receive {:tune_model_applied, "claude-fable-5"}, 100
-      assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
-    after
       send(db_proxy, :release_tune_commit)
+      assert %{ok: true} = Task.await(tune)
+      assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    after
+      send(turn_proxy, :release_turn)
     end
 
-    assert %{ok: true} = Task.await(tune)
     assert :ok = Task.await(turn)
     assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
     assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
