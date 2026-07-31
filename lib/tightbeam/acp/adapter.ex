@@ -42,6 +42,7 @@ defmodule Tightbeam.Acp.Adapter do
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
+    subagent_tasks: %{},
     known: MapSet.new(),
     models: %{}
   ]
@@ -509,7 +510,7 @@ defmodule Tightbeam.Acp.Adapter do
     sid = params["sessionId"]
     update = params["update"] || %{}
     maybe_emit_account_update(state, update)
-    maybe_emit_subagent_event(state, sid, update)
+    state = maybe_emit_subagent_event(state, sid, update)
     state = emit_progress(state, sid, update)
     state = remember_config_model(state, sid, update)
 
@@ -538,6 +539,35 @@ defmodule Tightbeam.Acp.Adapter do
     GenServer.reply(from, reply)
     state = %{state | progress: Map.delete(state.progress, sid)}
     {:noreply, put_in(state.chunks[sid], [])}
+  end
+
+  def handle_info({:subagent_event_ingested, event_ref, {:ok, _result}}, state) do
+    {:noreply, clear_subagent_task(state, event_ref)}
+  end
+
+  def handle_info({:subagent_event_ingested, event_ref, {:error, reason}}, state) do
+    {context, state} = pop_subagent_task(state, event_ref)
+
+    Logger.error(
+      "subagent event ingestion failed retry=false context=#{inspect(context)} reason=#{inspect(reason)}"
+    )
+
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, monitor, :process, _pid, reason}, state) do
+    case Enum.find(state.subagent_tasks, fn {_event_ref, task} -> task.monitor == monitor end) do
+      {event_ref, task} ->
+        Logger.error(
+          "subagent event ingestion failed retry=false context=#{inspect(task.context)} " <>
+            "reason=#{inspect({:task_exit, reason})}"
+        )
+
+        {:noreply, %{state | subagent_tasks: Map.delete(state.subagent_tasks, event_ref)}}
+
+      nil ->
+        {:noreply, state}
+    end
   end
 
   # The harness OS process died. The Conn survives that (closed, failing
@@ -584,8 +614,51 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp maybe_emit_subagent_event(state, sid, update) do
-    with handler when is_function(handler, 2) <- state.on_subagent_event do
-      handler.(sid, update)
+    case state.on_subagent_event do
+      handler when is_function(handler, 2) ->
+        case handler.(sid, update) do
+          {:async, event_ref, pid, context} ->
+            monitor = Process.monitor(pid)
+
+            state =
+              put_in(state.subagent_tasks[event_ref], %{
+                monitor: monitor,
+                context: context
+              })
+
+            send(pid, {:consume_subagent_event, event_ref, self()})
+            state
+
+          {:error, context, reason} ->
+            Logger.error(
+              "subagent event ingestion failed retry=false context=#{inspect(context)} " <>
+                "reason=#{inspect(reason)}"
+            )
+
+            state
+
+          _other ->
+            state
+        end
+
+      _other ->
+        state
+    end
+  end
+
+  defp clear_subagent_task(state, event_ref) do
+    {_context, state} = pop_subagent_task(state, event_ref)
+    state
+  end
+
+  defp pop_subagent_task(state, event_ref) do
+    case Map.pop(state.subagent_tasks, event_ref) do
+      {nil, tasks} ->
+        {%{event_ref: event_ref}, %{state | subagent_tasks: tasks}}
+
+      {%{monitor: monitor, context: context}, tasks} ->
+        Process.demonitor(monitor, [:flush])
+        {context, %{state | subagent_tasks: tasks}}
     end
   end
 

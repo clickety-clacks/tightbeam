@@ -70,11 +70,14 @@ defmodule Tightbeam.SubagentMarkers do
     harness = input |> Map.fetch!(:harness) |> to_string()
     at = Map.fetch!(input, :at)
 
-    # A session can hold several open assignments at once, so the unique durable
-    # carrier at EMISSION time is the parent's RUNNING turn — never a guess from
-    # the session's open assignments (spec job-forensics-v2 §1). No running turn,
-    # or a turn with no attribution, stamps NULL.
-    assignment_id = running_turn_assignment_in_txn(txn, principal)
+    # A captured assignment (including captured nil) is event-time truth. Direct
+    # append callers have no earlier event boundary, so they resolve the running
+    # carrier in this transaction as before.
+    assignment_id =
+      case Map.fetch(input, :assignment_id) do
+        {:ok, assignment_id} -> assignment_id
+        :error -> running_turn_assignment_in_txn(txn, principal)
+      end
 
     Txn.q(
       txn,
@@ -132,6 +135,21 @@ defmodule Tightbeam.SubagentMarkers do
           map()
         ) :: map() | :skip | {:error, map()}
   def consume_update(db, scheduler, harness, machine, harness_session_id, update) do
+    db
+    |> capture_update(harness, machine, harness_session_id, update)
+    |> consume_captured(db, scheduler)
+  end
+
+  @doc """
+  Capture the marker's parent and running-turn carrier at ACP event receipt.
+
+  The returned value contains every mutable fact whose later re-read could
+  cross a prompt boundary. Durable insertion and wake delivery may happen
+  later without changing that attribution.
+  """
+  @spec capture_update(DB.server(), atom(), String.t(), String.t(), map()) ::
+          :skip | {:ok, map()} | {:error, map()}
+  def capture_update(db, harness, machine, harness_session_id, update) do
     case classify(harness, update) do
       :skip ->
         :skip
@@ -139,39 +157,47 @@ defmodule Tightbeam.SubagentMarkers do
       {:marker, kind, tool_call_id, child_id} ->
         source_session_ref = Org.source_session_ref(harness, machine, harness_session_id)
 
-        result =
-          DB.transaction(db, fn txn ->
-            case parent_for_source_in_txn(txn, source_session_ref) do
-              nil ->
-                {:error,
-                 %{
-                   code: "unknown_source_session",
-                   message: "no parent mapping for harness session"
-                 }}
+        transaction!(db, fn txn ->
+          case parent_for_source_in_txn(txn, source_session_ref) do
+            nil ->
+              {:error,
+               %{
+                 code: "unknown_source_session",
+                 message: "no parent mapping for harness session"
+               }}
 
-              principal ->
-                append_in_txn(txn, %{
-                  kind: kind,
-                  principal: principal,
-                  subagent_ref: subagent_ref(source_session_ref, child_id),
-                  source_event_ref: source_event_ref(source_session_ref, tool_call_id),
-                  harness: harness,
-                  at: System.system_time(:millisecond)
-                })
-            end
-          end)
+            principal ->
+              {:ok,
+               %{
+                 kind: kind,
+                 principal: principal,
+                 subagent_ref: subagent_ref(source_session_ref, child_id),
+                 source_event_ref: source_event_ref(source_session_ref, tool_call_id),
+                 harness: harness,
+                 at: System.system_time(:millisecond),
+                 assignment_id: running_turn_assignment_in_txn(txn, principal)
+               }}
+          end
+        end)
+    end
+  end
 
-        case result do
-          {:ok, %{fact_id: fact_id} = marker} when is_integer(fact_id) ->
-            Wakes.fire_matching(scheduler, fact_id)
-            marker
+  @doc "Persist a previously captured ACP marker and fire its matching wake."
+  @spec consume_captured(:skip | {:ok, map()} | {:error, map()}, DB.server(), GenServer.server()) ::
+          map() | :skip | {:error, map()}
+  def consume_captured(:skip, _db, _scheduler), do: :skip
+  def consume_captured({:error, _error} = error, _db, _scheduler), do: error
 
-          {:ok, value} ->
-            value
+  def consume_captured({:ok, input}, db, scheduler) do
+    result = transaction!(db, &append_in_txn(&1, input))
 
-          {:error, error} ->
-            raise error
-        end
+    case result do
+      %{fact_id: fact_id} = marker when is_integer(fact_id) ->
+        Wakes.fire_matching(scheduler, fact_id)
+        marker
+
+      value ->
+        value
     end
   end
 
