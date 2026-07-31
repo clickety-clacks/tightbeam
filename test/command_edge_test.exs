@@ -67,6 +67,29 @@ defmodule Tightbeam.CommandEdgeTest do
     end
   end
 
+  defmodule BlockingVia do
+    import Kernel, except: [send: 2]
+
+    def send({owner, release}, _message) do
+      Kernel.send(owner, {:via_send_entered, self()})
+
+      receive do
+        {:release, ^release} -> :ok
+      end
+    end
+  end
+
+  defmodule ExecutableReplyReceiver do
+    use GenServer
+
+    def start_link(_opts), do: GenServer.start_link(__MODULE__, nil)
+    def init(nil), do: {:ok, nil}
+
+    def handle_call({:tightbeam_command, _command}, _from, nil) do
+      {:reply, fn -> :escaped end, nil}
+    end
+  end
+
   test "a bare function cannot be injected as any edge representation" do
     callback = fn -> :old_callback end
 
@@ -111,6 +134,22 @@ defmodule Tightbeam.CommandEdgeTest do
     assert_executable_data_rejected(fn ->
       apply(CommandEdge, :validate_request!, [struct(Request, target: callback)])
     end)
+  end
+
+  test "edge targets are limited to pids and locally registered atoms" do
+    assert Process.register(self(), :command_edge_test_receiver)
+    assert %Signal{} = CommandEdge.signal_to(self())
+    assert %Signal{} = CommandEdge.signal_to(:command_edge_test_receiver)
+
+    via_target = {:via, BlockingVia, {self(), make_ref()}}
+
+    assert_local_target_required(fn -> CommandEdge.signal_to(via_target) end)
+
+    assert_local_target_required(fn ->
+      CommandEdge.job_via(via_target, {Worker, :perform, [self()]})
+    end)
+
+    assert_local_target_required(fn -> CommandEdge.request_to(via_target) end)
   end
 
   test "functions nested in worker args, via targets, labels, and struct-shaped maps are rejected" do
@@ -190,6 +229,46 @@ defmodule Tightbeam.CommandEdgeTest do
     assert Process.alive?(dispatcher)
   end
 
+  test "job rejects a via dispatcher before its blocking send/2 runs" do
+    parent = self()
+    release = make_ref()
+
+    edge =
+      struct(Job,
+        dispatcher: {:via, BlockingVia, {parent, release}},
+        worker: {Worker, :perform, [parent]}
+      )
+
+    caller =
+      spawn(fn ->
+        result =
+          try do
+            CommandEdge.job(edge, adapter_ready())
+          rescue
+            error -> {:raised, error}
+          end
+
+        send(parent, {:job_result, self(), result})
+      end)
+
+    on_exit(fn ->
+      send(caller, {:release, release})
+
+      if Process.alive?(caller) do
+        Process.exit(caller, :kill)
+      end
+    end)
+
+    assert_receive {:job_result, ^caller,
+                    {:raised,
+                     %ArgumentError{
+                       message: "command edge target must be a pid or locally registered atom"
+                     }}},
+                   100
+
+    refute_receive {:via_send_entered, ^caller}, 20
+  end
+
   test "concurrent requests stay labelled while unmatched messages are ignored" do
     receiver = start_supervised!({Receiver, self()})
     command = adapter_ready()
@@ -250,6 +329,55 @@ defmodule Tightbeam.CommandEdgeTest do
              CommandEdge.check_response(response, request_ids)
 
     assert :gen_server.reqids_size(request_ids) == 0
+  end
+
+  test "matched request replies cannot return a function through the seam" do
+    receiver = start_supervised!(ExecutableReplyReceiver)
+
+    assert {:pending, request_ids} =
+             CommandEdge.request(
+               CommandEdge.request_to(receiver),
+               adapter_ready(),
+               :safe_label,
+               :gen_server.reqids_new()
+             )
+
+    response = receive_request_message()
+
+    assert_executable_data_rejected(fn ->
+      CommandEdge.check_response(response, request_ids)
+    end)
+  end
+
+  test "request rejects a collection carrying a function label before dispatch" do
+    receiver = start_supervised!({Receiver, self()})
+    callback = fn -> :escaped end
+
+    request_ids =
+      :gen_server.reqids_add(make_ref(), callback, :gen_server.reqids_new())
+
+    assert_executable_data_rejected(fn ->
+      CommandEdge.request(
+        CommandEdge.request_to(receiver),
+        adapter_ready(),
+        :safe_label,
+        request_ids
+      )
+    end)
+  end
+
+  test "matched request failures cannot return a function through the seam" do
+    request_id = make_ref()
+    callback = fn -> :escaped end
+
+    request_ids =
+      :gen_server.reqids_add(request_id, :safe_label, :gen_server.reqids_new())
+
+    response = {:DOWN, request_id, :process, self(), callback}
+
+    assert_executable_data_rejected(fn ->
+      CommandEdge.check_response(response, request_ids)
+    end)
   end
 
   test "abandoning a request prevents its late reply from reaching the mailbox" do
@@ -382,6 +510,12 @@ defmodule Tightbeam.CommandEdgeTest do
 
   defp assert_executable_data_rejected(fun) do
     assert_raise ArgumentError, "command edge data cannot contain functions", fun
+  end
+
+  defp assert_local_target_required(fun) do
+    assert_raise ArgumentError,
+                 "command edge target must be a pid or locally registered atom",
+                 fun
   end
 
   defp receive_request_message do

@@ -1,14 +1,12 @@
 defmodule Tightbeam.CommandEdge do
   @moduledoc """
-  Non-blocking process-edge representations.
+  Closed-target asynchronous process-edge representations.
 
   This module provides a seam where a process can store an edge descriptor
-  instead of a callback. Within the seam, dispatch accepts only that descriptor
-  and a command struct, and recursively rejects executable functions anywhere
-  in their data.
-
-  No production caller currently uses this module, so these boundaries are not
-  yet enforced repository-wide. Caller migration is staged separately.
+  instead of a callback. Dispatch targets are limited to local process
+  identifiers and locally registered atoms, so target resolution cannot invoke
+  caller-selected code in the dispatching process. Commands, worker arguments,
+  request labels, and matched response data recursively reject functions.
 
   The three delivery shapes deliberately have different results:
 
@@ -190,7 +188,7 @@ defmodule Tightbeam.CommandEdge do
     @enforce_keys [:target]
     defstruct [:target]
 
-    @opaque t :: %__MODULE__{target: GenServer.server()}
+    @opaque t :: %__MODULE__{target: Tightbeam.CommandEdge.target()}
   end
 
   defmodule Job do
@@ -199,7 +197,7 @@ defmodule Tightbeam.CommandEdge do
     defstruct [:dispatcher, :worker]
 
     @opaque t :: %__MODULE__{
-              dispatcher: GenServer.server(),
+              dispatcher: Tightbeam.CommandEdge.target(),
               worker: {module(), atom(), [term()]}
             }
   end
@@ -209,7 +207,7 @@ defmodule Tightbeam.CommandEdge do
     @enforce_keys [:target]
     defstruct [:target]
 
-    @opaque t :: %__MODULE__{target: GenServer.server()}
+    @opaque t :: %__MODULE__{target: Tightbeam.CommandEdge.target()}
   end
 
   defmodule JobDispatcher do
@@ -247,24 +245,27 @@ defmodule Tightbeam.CommandEdge do
   @typedoc "Immutable data accepted by a tier edge."
   @type command :: AdapterReady.t() | TerminalPublication.t() | AuthEvent.t()
 
+  @typedoc "A local process identifier or locally registered process name."
+  @type target :: pid() | atom()
+
   @typedoc "Worker invoked by a job; the command is appended to these arguments."
   @type worker :: {module(), atom(), [term()]}
 
   @typedoc "A labelled asynchronous request has been sent, not completed."
   @type pending :: {:pending, :gen_server.request_id_collection()}
 
-  @doc "Construct a fire-and-forget signal edge."
-  @spec signal_to(GenServer.server()) :: Signal.t()
+  @doc "Construct a fire-and-forget signal edge to a local target."
+  @spec signal_to(target()) :: Signal.t()
   def signal_to(target), do: validate_signal!(%Signal{target: target})
 
-  @doc "Construct a no-reply job edge through a pre-started `JobDispatcher`."
-  @spec job_via(GenServer.server(), worker()) :: Job.t()
+  @doc "Construct a no-reply job edge through a local pre-started `JobDispatcher`."
+  @spec job_via(target(), worker()) :: Job.t()
   def job_via(dispatcher, {module, function, args} = worker)
       when is_atom(module) and is_atom(function) and is_list(args),
       do: validate_job!(%Job{dispatcher: dispatcher, worker: worker})
 
-  @doc "Construct a labelled asynchronous request edge."
-  @spec request_to(GenServer.server()) :: Request.t()
+  @doc "Construct a labelled asynchronous request edge to a local target."
+  @spec request_to(target()) :: Request.t()
   def request_to(target), do: validate_request!(%Request{target: target})
 
   @doc "Receiver-side validation for an injected signal edge."
@@ -369,6 +370,7 @@ defmodule Tightbeam.CommandEdge do
     %Request{target: target} = validate_request!(edge)
     command = validate_command!(command)
     label = validate_data!(label)
+    request_ids = validate_request_ids!(request_ids)
 
     request_ids =
       :gen_server.send_request(
@@ -388,11 +390,20 @@ defmodule Tightbeam.CommandEdge do
           | :no_request
           | :no_reply
   def check_response(message, request_ids) do
+    request_ids = validate_request_ids!(request_ids)
+
     case :gen_server.check_response(message, request_ids, true) do
-      {{:reply, reply}, label, request_ids} -> {:answered, label, reply, request_ids}
-      {{:error, reason}, label, request_ids} -> {:failed, label, reason, request_ids}
-      :no_request -> :no_request
-      :no_reply -> :no_reply
+      {{:reply, reply}, label, request_ids} ->
+        {:answered, validate_data!(label), validate_data!(reply), request_ids}
+
+      {{:error, reason}, label, request_ids} ->
+        {:failed, validate_data!(label), validate_data!(reason), request_ids}
+
+      :no_request ->
+        :no_request
+
+      :no_reply ->
+        :no_reply
     end
   end
 
@@ -414,18 +425,33 @@ defmodule Tightbeam.CommandEdge do
     end
   end
 
-  defp validate_signal_shape!(%Signal{} = edge), do: edge
+  defp validate_signal_shape!(%Signal{target: target} = edge) do
+    validate_target!(target)
+    edge
+  end
+
   defp validate_signal_shape!(_edge), do: raise(ArgumentError, "invalid signal edge")
 
-  defp validate_job_shape!(%Job{worker: worker} = edge) do
+  defp validate_job_shape!(%Job{dispatcher: dispatcher, worker: worker} = edge) do
+    validate_target!(dispatcher)
     validate_worker!(worker)
     edge
   end
 
   defp validate_job_shape!(_edge), do: raise(ArgumentError, "invalid job edge")
 
-  defp validate_request_shape!(%Request{} = edge), do: edge
+  defp validate_request_shape!(%Request{target: target} = edge) do
+    validate_target!(target)
+    edge
+  end
+
   defp validate_request_shape!(_edge), do: raise(ArgumentError, "invalid request edge")
+
+  defp validate_target!(target) when is_pid(target) or is_atom(target), do: target
+
+  defp validate_target!(_target) do
+    raise ArgumentError, "command edge target must be a pid or locally registered atom"
+  end
 
   defp validate_worker!({module, function, args} = worker)
        when is_atom(module) and is_atom(function) and is_list(args) do
@@ -434,6 +460,14 @@ defmodule Tightbeam.CommandEdge do
   end
 
   defp validate_worker!(_worker), do: raise(ArgumentError, "invalid command job worker")
+
+  defp validate_request_ids!(request_ids) do
+    request_ids
+    |> :gen_server.reqids_to_list()
+    |> Enum.each(fn {_request_id, label} -> validate_data!(label) end)
+
+    request_ids
+  end
 
   defp validate_data!(term) when is_function(term) do
     raise ArgumentError, "command edge data cannot contain functions"
