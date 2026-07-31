@@ -249,18 +249,30 @@ defmodule Tightbeam.AdapterCoordinator do
        on_adapter_ready: Keyword.get(opts, :on_adapter_ready, fn _key_name, _token -> :ok end),
        adapters: %{},
        monitors: %{},
+       context_requests: %{},
        load_active: %{},
        load_queue: %{}
      }}
   end
 
   @impl true
-  def handle_call({:adapter_for, key}, _from, state) do
-    adapter_for_reply(key, :capture, state)
+  def handle_call({:adapter_for, key}, from, state) do
+    entry = Map.get(state.adapters, key, fresh_entry())
+
+    cond do
+      entry.circuit == :open ->
+        {:reply, {:error, :degraded}, state}
+
+      live_entry?(entry) ->
+        {:reply, checkout(entry), state}
+
+      true ->
+        {:noreply, capture_adapter_context(key, {:checkout, from}, state)}
+    end
   end
 
   def handle_call({:adapter_for, key, context}, _from, state) do
-    adapter_for_reply(key, context, state)
+    adapter_for_reply(key, context, state, true)
   end
 
   def handle_call({:last_failure, key, generation}, _from, state) do
@@ -315,15 +327,20 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, :ok, do_close_adapter(key, state)}
   end
 
-  defp adapter_for_reply(key, context, state) do
+  defp adapter_for_reply(key, context, state, authoritative? \\ false) do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
       entry.circuit == :open ->
         {:reply, {:error, :degraded}, state}
 
-      is_pid(entry.pid) and Process.alive?(entry.pid) ->
-        {:reply, {:ok, entry.pid, entry.generation}, state}
+      live_entry?(entry) and authoritative? and entry.context != normalize_context(context) ->
+        state = do_close_adapter(key, state)
+        {reply, state} = start_adapter(key, state.adapters[key], state, context)
+        {:reply, reply, state}
+
+      live_entry?(entry) ->
+        {:reply, checkout(entry), state}
 
       true ->
         {reply, state} = start_adapter(key, entry, state, context)
@@ -358,7 +375,14 @@ defmodule Tightbeam.AdapterCoordinator do
         # the successor's ready re-mints the SAME {epoch, generation} token, and
         # a session re-held on that token (a credential stop/start landing in
         # its retry window) would never be swept (spec s4-operability-v1 §2).
-        entry = %{entry | pid: nil, monitor: nil, ready: false, generation: entry.generation + 1}
+        entry = %{
+          entry
+          | pid: nil,
+            monitor: nil,
+            ready: false,
+            generation: entry.generation + 1,
+            context: nil
+        }
 
         %{
           state
@@ -373,7 +397,17 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    context_request = context_request_for_monitor(state.context_requests, ref)
+
     cond do
+      match?({_request_ref, _request}, context_request) ->
+        {request_ref, request} = context_request
+        requests = Map.delete(state.context_requests, request_ref)
+        state = %{state | context_requests: requests}
+
+        {:noreply,
+         finish_context_request(request, {:error, {:context_worker_exit, reason}}, state)}
+
       key = state.monitors[ref] ->
         state = %{state | monitors: Map.delete(state.monitors, ref)}
         entry = Map.fetch!(state.adapters, key)
@@ -407,6 +441,7 @@ defmodule Tightbeam.AdapterCoordinator do
               circuit: circuit,
               timer: timer,
               ready: false,
+              context: nil,
               last_failure: {died_at, reason}
           }
 
@@ -442,22 +477,30 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_info({:restart_adapter, key, generation}, state) do
     case state.adapters[key] do
       %{generation: ^generation, pid: nil} = entry ->
-        {_reply, state} = start_adapter(key, %{entry | timer: nil}, state, :capture)
-        {:noreply, state}
+        state = put_in(state.adapters[key], %{entry | timer: nil})
+        {:noreply, capture_adapter_context(key, {:restart, generation}, state)}
 
       _ ->
         {:noreply, state}
     end
   end
 
+  def handle_info({:adapter_context_captured, request_ref, result}, state) do
+    case Map.pop(state.context_requests, request_ref) do
+      {nil, requests} ->
+        {:noreply, %{state | context_requests: requests}}
+
+      {%{monitor: monitor} = request, requests} ->
+        Process.demonitor(monitor, [:flush])
+        state = %{state | context_requests: requests}
+        {:noreply, finish_context_request(request, result, state)}
+    end
+  end
+
   defp start_adapter(key, entry, state, context) do
-    # Context capture runs in the higher-tier coordinator, so lazy Adapter boot
-    # never synchronously enters a same-tier lifecycle owner.
-    adapter_context =
-      case context do
-        :capture -> state.adapter_context.(key)
-        captured -> captured
-      end
+    # Context is resolved before Adapter boot. Generic reads arrive from a
+    # monitored worker; credential-lifecycle starts supply their known context.
+    adapter_context = context
 
     # Opts building (incl. remote home delivery) is potentially expensive or
     # hangable — a fn defers it into the adapter's own process (lazy boot via
@@ -491,7 +534,8 @@ defmodule Tightbeam.AdapterCoordinator do
             monitor: ref,
             generation: generation,
             timer: nil,
-            ready: false
+            ready: false,
+            context: normalize_context(adapter_context)
         }
 
         state = %{
@@ -537,8 +581,88 @@ defmodule Tightbeam.AdapterCoordinator do
       circuit: :closed,
       timer: nil,
       ready: false,
-      last_failure: nil
+      last_failure: nil,
+      context: nil
     }
+  end
+
+  defp capture_adapter_context(key, purpose, state) do
+    owner = self()
+    request_ref = make_ref()
+    adapter_context = state.adapter_context
+
+    {_pid, monitor} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            {:ok, adapter_context.(key)}
+          rescue
+            error -> {:error, {:error, error, __STACKTRACE__}}
+          catch
+            kind, reason -> {:error, {kind, reason, __STACKTRACE__}}
+          end
+
+        send(owner, {:adapter_context_captured, request_ref, result})
+      end)
+
+    request = %{key: key, purpose: purpose, monitor: monitor}
+    %{state | context_requests: Map.put(state.context_requests, request_ref, request)}
+  end
+
+  defp finish_context_request(%{key: key, purpose: {:checkout, from}}, {:ok, context}, state) do
+    {:reply, reply, state} = adapter_for_reply(key, context, state)
+    GenServer.reply(from, reply)
+    state
+  end
+
+  defp finish_context_request(%{purpose: {:checkout, from}}, {:error, reason}, state) do
+    GenServer.reply(from, {:error, {:adapter_context_failed, reason}})
+    state
+  end
+
+  defp finish_context_request(
+         %{key: key, purpose: {:restart, generation}},
+         {:ok, context},
+         state
+       ) do
+    case state.adapters[key] do
+      %{generation: ^generation, pid: nil} = entry ->
+        {_reply, state} = start_adapter(key, entry, state, context)
+        state
+
+      _ ->
+        state
+    end
+  end
+
+  defp finish_context_request(
+         %{key: key, purpose: {:restart, generation}},
+         {:error, reason},
+         state
+       ) do
+    case state.adapters[key] do
+      %{generation: ^generation, pid: nil} = entry ->
+        timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(state, 1))
+
+        entry = %{
+          entry
+          | timer: timer,
+            last_failure: {generation, {:adapter_context_failed, reason}}
+        }
+
+        put_in(state.adapters[key], entry)
+
+      _ ->
+        state
+    end
+  end
+
+  defp live_entry?(entry), do: is_pid(entry.pid) and Process.alive?(entry.pid)
+  defp checkout(entry), do: {:ok, entry.pid, entry.generation}
+  defp normalize_context(context), do: context |> Map.new() |> Enum.sort()
+
+  defp context_request_for_monitor(requests, monitor) do
+    Enum.find(requests, fn {_request_ref, request} -> request.monitor == monitor end)
   end
 
   defp backoff(state, failures),
