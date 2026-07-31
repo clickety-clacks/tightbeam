@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
@@ -30,12 +30,19 @@ enum CommandFailure {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessStartTime {
+    seconds: libc::time_t,
+    microseconds: libc::suseconds_t,
+}
+
 trait ProbeIo {
     fn proc_pids(&self) -> io::Result<Vec<u32>>;
     fn proc_read(&self, pid: u32, name: &str) -> io::Result<Vec<u8>>;
     fn proc_read_link(&self, pid: u32, name: &str) -> io::Result<Vec<u8>>;
     fn path_metadata(&self, path: &Path) -> io::Result<()>;
     fn directory_names(&self, path: &Path) -> io::Result<Vec<OsString>>;
+    fn process_start_time(&self, pid: u32) -> io::Result<ProcessStartTime>;
     fn command(
         &self,
         program: &str,
@@ -76,6 +83,10 @@ impl ProbeIo for SystemIo {
         fs::read_dir(path)?
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect()
+    }
+
+    fn process_start_time(&self, pid: u32) -> io::Result<ProcessStartTime> {
+        darwin_process_start_time(pid)
     }
 
     fn command(
@@ -145,10 +156,79 @@ impl ProbeIo for SystemIo {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn darwin_process_start_time(pid: u32) -> io::Result<ProcessStartTime> {
+    let pid = libc::c_int::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid exceeds c_int"))?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut size = 0;
+    // SAFETY: `mib` names one KERN_PROC_PID query, and a null output pointer asks
+    // the kernel for the required kinfo_proc buffer size.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if size < std::mem::size_of::<libc::timeval>() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "KERN_PROC_PID returned no kinfo_proc",
+        ));
+    }
+
+    let mut buffer = vec![0u8; size];
+    let mut written = buffer.len();
+    // SAFETY: `buffer` is writable for `written` bytes. The kernel writes one
+    // kinfo_proc, whose first field is extern_proc.p_un.__p_starttime.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr().cast(),
+            &mut written,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if written < std::mem::size_of::<libc::timeval>() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "KERN_PROC_PID returned truncated kinfo_proc",
+        ));
+    }
+
+    // SAFETY: the successful sysctl wrote at least one timeval. `read_unaligned`
+    // avoids imposing Rust alignment on the byte buffer.
+    let start = unsafe { buffer.as_ptr().cast::<libc::timeval>().read_unaligned() };
+    Ok(ProcessStartTime {
+        seconds: start.tv_sec,
+        microseconds: start.tv_usec,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn darwin_process_start_time(_pid: u32) -> io::Result<ProcessStartTime> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "KERN_PROC_PID is only available on macOS",
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawProcess {
     pid: u32,
-    lstart: Option<Vec<u8>>,
+    start_time: Option<ProcessStartTime>,
     ppid: Option<u32>,
     pgid: Option<u32>,
     token: Option<Vec<u8>>,
@@ -440,7 +520,7 @@ fn collect_linux(
         }
         processes.push(RawProcess {
             pid,
-            lstart: None,
+            start_time: None,
             ppid: Some(first.0),
             pgid: Some(first.1),
             token,
@@ -502,7 +582,7 @@ fn parse_darwin_pass1(
         if line.iter().all(|byte| byte.is_ascii_whitespace()) {
             continue;
         }
-        let Some((pid, lstart, command)) = parse_pid_lstart_line(line) else {
+        let Some((pid, command)) = parse_pid_command_line(line) else {
             unparseable_rows += 1;
             continue;
         };
@@ -521,7 +601,7 @@ fn parse_darwin_pass1(
         };
         processes.push(RawProcess {
             pid,
-            lstart: Some(lstart.to_vec()),
+            start_time: None,
             ppid: None,
             pgid: None,
             token,
@@ -535,7 +615,7 @@ fn parse_darwin_pass1(
     (processes, unparseable_rows)
 }
 
-fn parse_pid_lstart_line(line: &[u8]) -> Option<(u32, &[u8], &[u8])> {
+fn parse_pid_command_line(line: &[u8]) -> Option<(u32, &[u8])> {
     let mut cursor = 0usize;
     while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
         cursor += 1;
@@ -554,76 +634,7 @@ fn parse_pid_lstart_line(line: &[u8]) -> Option<(u32, &[u8], &[u8])> {
     while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
         cursor += 1;
     }
-    let lstart_start = cursor;
-    let mut lstart_end = cursor;
-    let mut fields = Vec::new();
-    for _ in 0..5 {
-        let field_start = cursor;
-        while line
-            .get(cursor)
-            .is_some_and(|byte| !byte.is_ascii_whitespace())
-        {
-            cursor += 1;
-        }
-        if cursor == field_start {
-            return None;
-        }
-        fields.push(&line[field_start..cursor]);
-        lstart_end = cursor;
-        while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
-        }
-    }
-    let [weekday, month, day, time, year] = fields.as_slice() else {
-        return None;
-    };
-    let valid_weekday = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"]
-        .iter()
-        .any(|value| *weekday == value.as_slice());
-    let valid_month = [
-        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
-        b"Dec",
-    ]
-    .iter()
-    .any(|value| *month == value.as_slice());
-    let valid_day = (1..=2).contains(&day.len()) && day.iter().all(u8::is_ascii_digit);
-    let valid_time = time.len() == 8
-        && time[2] == b':'
-        && time[5] == b':'
-        && time
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit());
-    let valid_year = year.len() == 4 && year.iter().all(u8::is_ascii_digit);
-    if !(valid_weekday && valid_month && valid_day && valid_time && valid_year) {
-        return None;
-    }
-    Some((pid, &line[lstart_start..lstart_end], &line[cursor..]))
-}
-
-fn parse_pid_lstart(bytes: &[u8]) -> (BTreeMap<u32, Vec<u8>>, BTreeSet<u32>, usize) {
-    let mut identities = BTreeMap::new();
-    let mut malformed_pids = BTreeSet::new();
-    let mut unparseable_rows = 0;
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-            continue;
-        }
-        if let Some((pid, lstart, _)) = parse_pid_lstart_line(line) {
-            identities.insert(pid, lstart.to_vec());
-        } else {
-            unparseable_rows += 1;
-            if let Some(pid) = line
-                .split(|byte| byte.is_ascii_whitespace())
-                .find(|field| !field.is_empty())
-                .and_then(|field| std::str::from_utf8(field).ok())
-                .and_then(|field| field.parse::<u32>().ok())
-            {
-                malformed_pids.insert(pid);
-            }
-        }
-    }
-    (identities, malformed_pids, unparseable_rows)
+    Some((pid, &line[cursor..]))
 }
 
 fn pid_list(processes: &[RawProcess]) -> OsString {
@@ -751,6 +762,10 @@ fn note_unparseable_rows(notes: &mut Vec<String>, command: &str, count: usize) {
     }
 }
 
+fn note_identity_failure(notes: &mut Vec<String>, pid: u32) {
+    notes.push(format!("sysctl identity failed for pid {pid}"));
+}
+
 fn collect_darwin(
     io: &impl ProbeIo,
     own_pid: u32,
@@ -759,7 +774,7 @@ fn collect_darwin(
     let pass1 = io
         .command(
             "ps",
-            &["-axEww".into(), "-o".into(), "pid=,lstart=,command=".into()],
+            &["-axEww".into(), "-o".into(), "pid=,command=".into()],
             Duration::from_millis(1500),
         )
         .map_err(|failure| match failure {
@@ -773,6 +788,12 @@ fn collect_darwin(
     let mut notes = Vec::new();
     let (mut processes, unparseable_rows) = parse_darwin_pass1(&pass1, own_pid, catalog);
     note_unparseable_rows(&mut notes, "ps enumeration", unparseable_rows);
+    for process in &mut processes {
+        match io.process_start_time(process.pid) {
+            Ok(start_time) => process.start_time = Some(start_time),
+            Err(_) => note_identity_failure(&mut notes, process.pid),
+        }
+    }
     if !processes.is_empty() {
         let list = pid_list(&processes);
         match io.command(
@@ -854,30 +875,16 @@ fn add_elapsed(io: &impl ProbeIo, raw: &mut RawFacts) {
         Err(failure) => note_failure(&mut raw.notes, "ps etime", failure),
     }
     if raw.platform == "macos" {
-        match io.command(
-            "ps",
-            &[
-                "-o".into(),
-                "pid=,lstart=".into(),
-                "-p".into(),
-                pid_list(&raw.processes),
-            ],
-            Duration::from_millis(1000),
-        ) {
-            Ok(bytes) => {
-                let (identities, malformed_pids, unparseable_rows) = parse_pid_lstart(&bytes);
-                note_unparseable_rows(&mut raw.notes, "ps identity", unparseable_rows);
-                raw.processes.retain(|process| {
-                    malformed_pids.contains(&process.pid)
-                        || identities
-                            .get(&process.pid)
-                            .is_some_and(|lstart| process.lstart.as_ref() == Some(lstart))
-                });
-            }
-            Err(failure) => {
-                note_failure(&mut raw.notes, "ps identity", failure);
-            }
-        }
+        raw.processes
+            .retain(|process| match io.process_start_time(process.pid) {
+                Ok(start_time) => process
+                    .start_time
+                    .is_none_or(|initial| initial == start_time),
+                Err(_) => {
+                    note_identity_failure(&mut raw.notes, process.pid);
+                    true
+                }
+            });
     }
 }
 
@@ -1506,6 +1513,13 @@ mod tests {
         format!("1 (odd ) ( comm) {}", fields.join(" ")).into_bytes()
     }
 
+    fn process_start_time(seconds: libc::time_t) -> ProcessStartTime {
+        ProcessStartTime {
+            seconds,
+            microseconds: 123,
+        }
+    }
+
     #[derive(Default)]
     struct FakeIo {
         pids: Vec<u32>,
@@ -1513,6 +1527,8 @@ mod tests {
         read_sequences:
             std::cell::RefCell<BTreeMap<(u32, String), Vec<Result<Vec<u8>, io::ErrorKind>>>>,
         links: BTreeMap<(u32, String), Result<Vec<u8>, io::ErrorKind>>,
+        start_time_sequences:
+            std::cell::RefCell<BTreeMap<u32, Vec<Result<ProcessStartTime, io::ErrorKind>>>>,
         commands: std::cell::RefCell<Vec<Result<Vec<u8>, CommandFailure>>>,
         metadata_error: Option<io::ErrorKind>,
         directory_error: Option<io::ErrorKind>,
@@ -1550,6 +1566,14 @@ mod tests {
         fn directory_names(&self, _path: &Path) -> io::Result<Vec<OsString>> {
             self.directory_error
                 .map_or_else(|| Ok(Vec::new()), |kind| Err(kind.into()))
+        }
+        fn process_start_time(&self, pid: u32) -> io::Result<ProcessStartTime> {
+            self.start_time_sequences
+                .borrow_mut()
+                .get_mut(&pid)
+                .and_then(|sequence| (!sequence.is_empty()).then(|| sequence.remove(0)))
+                .unwrap_or(Ok(process_start_time(1)))
+                .map_err(io::Error::from)
         }
         fn command(
             &self,
@@ -1619,8 +1643,8 @@ mod tests {
     #[test]
     fn darwin_rows_distinguish_spoofable_marker_and_unmarked_adapter_evidence() {
         let (rows, unparseable_rows) = parse_darwin_pass1(
-            b"7 Thu Jul 30 12:34:56 2026 node TIGHTBEAM_LINEAGE=tb1-YUBi\n\
-              8 Thu Jul 30 12:34:56 2026 codex-acp\n",
+            b"7 node TIGHTBEAM_LINEAGE=tb1-YUBi\n\
+              8 codex-acp\n",
             999,
             Some(&crate::harnesses::catalog().unwrap()),
         );
@@ -1628,6 +1652,26 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].evidence, "argv_or_env_indistinguishable");
         assert_eq!(rows[1].evidence, "none_observed");
+    }
+
+    #[test]
+    fn darwin_enumeration_does_not_require_formatted_start_time() {
+        let (rows, unparseable_rows) = parse_darwin_pass1(
+            b"7 node codex-acp\n",
+            999,
+            Some(&crate::harnesses::catalog().unwrap()),
+        );
+        assert_eq!(unparseable_rows, 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pid, 7);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_sysctl_reads_numeric_start_time_for_current_process() {
+        let start = darwin_process_start_time(std::process::id()).unwrap();
+        assert!(start.seconds > 0);
+        assert!((0..1_000_000).contains(&start.microseconds));
     }
 
     #[test]
@@ -1784,8 +1828,7 @@ mod tests {
 
     #[test]
     fn darwin_deadline_degradation_retains_rows_and_successful_absence_drops() {
-        let pass1 =
-            b"7 Thu Jul 30 12:34:56 2026 node codex-acp TIGHTBEAM_LINEAGE=tb1-YUBi\n".to_vec();
+        let pass1 = b"7 node codex-acp TIGHTBEAM_LINEAGE=tb1-YUBi\n".to_vec();
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![
                 Ok(pass1.clone()),
@@ -1814,15 +1857,18 @@ mod tests {
     }
 
     #[test]
-    fn darwin_drops_candidate_when_final_lstart_changes() {
+    fn darwin_drops_candidate_when_final_kernel_start_time_changes() {
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![
-                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp\n".to_vec()),
+                Ok(b"7 node codex-acp\n".to_vec()),
                 Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
                 Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
                 Ok(b"7 00:03\n".to_vec()),
-                Ok(b"7 Fri Jul 31 12:34:56 2026\n".to_vec()),
             ]),
+            start_time_sequences: std::cell::RefCell::new(BTreeMap::from([(
+                7,
+                vec![Ok(process_start_time(1)), Ok(process_start_time(2))],
+            )])),
             ..FakeIo::default()
         };
         let mut raw =
@@ -1835,12 +1881,18 @@ mod tests {
     fn darwin_retains_candidate_with_failure_note_when_identity_check_fails() {
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![
-                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp\n".to_vec()),
+                Ok(b"7 node codex-acp\n".to_vec()),
                 Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
                 Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
                 Ok(b"7 00:03\n".to_vec()),
-                Err(CommandFailure::Timeout),
             ]),
+            start_time_sequences: std::cell::RefCell::new(BTreeMap::from([(
+                7,
+                vec![
+                    Ok(process_start_time(1)),
+                    Err(io::ErrorKind::PermissionDenied),
+                ],
+            )])),
             ..FakeIo::default()
         };
         let mut raw =
@@ -1848,7 +1900,7 @@ mod tests {
         add_elapsed(&io, &mut raw);
         assert_eq!(raw.processes.len(), 1);
         assert_eq!(raw.processes[0].pid, 7);
-        assert_eq!(raw.notes, vec!["ps identity timed out"]);
+        assert_eq!(raw.notes, vec!["sysctl identity failed for pid 7"]);
         let report = assemble(
             raw,
             1,
@@ -1861,19 +1913,22 @@ mod tests {
                 adapter_stderr_log_count: None,
             },
         );
-        assert!(human(&report).contains("note: ps identity timed out"));
+        assert!(human(&report).contains("note: sysctl identity failed for pid 7"));
     }
 
     #[test]
-    fn darwin_retains_candidate_and_notes_unparseable_identity_lstart() {
+    fn darwin_retains_candidate_and_notes_initial_sysctl_failure() {
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![
-                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp\n".to_vec()),
+                Ok(b"7 node codex-acp\n".to_vec()),
                 Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
                 Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
                 Ok(b"7 00:03\n".to_vec()),
-                Ok(b"7 7\xe6\x9c\x88 30 12:34:56 2026\n".to_vec()),
             ]),
+            start_time_sequences: std::cell::RefCell::new(BTreeMap::from([(
+                7,
+                vec![Err(io::ErrorKind::PermissionDenied)],
+            )])),
             ..FakeIo::default()
         };
         let mut raw =
@@ -1881,15 +1936,13 @@ mod tests {
         add_elapsed(&io, &mut raw);
         assert_eq!(raw.processes.len(), 1);
         assert_eq!(raw.processes[0].pid, 7);
-        assert_eq!(raw.notes, vec!["ps identity contained 1 unparseable row"]);
+        assert_eq!(raw.notes, vec!["sysctl identity failed for pid 7"]);
     }
 
     #[test]
-    fn darwin_notes_unparseable_non_c_lstart_instead_of_treating_it_as_command() {
+    fn darwin_notes_unparseable_enumeration_rows() {
         let io = FakeIo {
-            commands: std::cell::RefCell::new(vec![Ok(
-                b"7 7\xe6\x9c\x88 30 12:34:56 2026 node harmless\n".to_vec(),
-            )]),
+            commands: std::cell::RefCell::new(vec![Ok(b"not-a-pid node harmless\n".to_vec())]),
             ..FakeIo::default()
         };
         let raw = collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap();
@@ -1921,7 +1974,7 @@ mod tests {
     fn privacy_discards_full_command_buffers() {
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![
-                Ok(b"7 Thu Jul 30 12:34:56 2026 node codex-acp --token SECRETXYZ\n".to_vec()),
+                Ok(b"7 node codex-acp --token SECRETXYZ\n".to_vec()),
                 Ok(b"7 1 7 /usr/local/bin/node\n".to_vec()),
                 Ok(b"p7\nfcwd\nn/tmp/work\n".to_vec()),
             ]),
@@ -1952,7 +2005,7 @@ mod tests {
             pids_env_unreadable: Some(0),
             processes: vec![RawProcess {
                 pid: 4,
-                lstart: None,
+                start_time: None,
                 ppid: Some(1),
                 pgid: Some(4),
                 token: Some(b"tb2-raw".to_vec()),
@@ -2120,7 +2173,7 @@ mod tests {
             processes: vec![
                 RawProcess {
                     pid: 9,
-                    lstart: None,
+                    start_time: None,
                     ppid: Some(2),
                     pgid: Some(9),
                     token: Some(b"raw\xff".to_vec()),
@@ -2132,7 +2185,7 @@ mod tests {
                 },
                 RawProcess {
                     pid: 4,
-                    lstart: None,
+                    start_time: None,
                     ppid: Some(1),
                     pgid: Some(4),
                     token: Some(b"tb1-YUBi".to_vec()),
