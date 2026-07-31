@@ -1789,7 +1789,16 @@ defmodule Tightbeam.Gateway do
           # generations reset across boots and can spuriously match.
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
             true ->
-              {:ok, pointer.harness_session_id}
+              with {:ok, owner_model} <-
+                     Adapter.current_model(adapter, pointer.harness_session_id),
+                   :ok <-
+                     reconcile_model_projection(
+                       db,
+                       session.session_key,
+                       owner_model
+                     ) do
+                {:ok, pointer.harness_session_id}
+              end
 
             false ->
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
@@ -1805,7 +1814,14 @@ defmodule Tightbeam.Gateway do
                        mcp_servers,
                        snapshot.guidance
                      ) do
-                  :ok ->
+                  {:ok, owner_model} ->
+                    :ok =
+                      reconcile_model_projection(
+                        db,
+                        session.session_key,
+                        owner_model
+                      )
+
                     Org.append_pointer(
                       db,
                       session.session_key,
@@ -1817,6 +1833,9 @@ defmodule Tightbeam.Gateway do
                     {:ok, pointer.harness_session_id}
 
                   {:error, {:model_apply_failed, _reason}} = error ->
+                    error
+
+                  {:error, :model_readback_unavailable} = error ->
                     error
 
                   # An adapter that could not answer has NOT told us the harness
@@ -2163,7 +2182,7 @@ defmodule Tightbeam.Gateway do
          # something it has never heard of.
          true <- Adapter.knows_session?(adapter, pointer.harness_session_id),
          :ok <- Adapter.close_session(adapter, pointer.harness_session_id),
-         :ok <-
+         {:ok, owner_model} <-
            Adapter.load_session(
              adapter,
              pointer.harness_session_id,
@@ -2171,7 +2190,8 @@ defmodule Tightbeam.Gateway do
              cwd,
              mcp_servers,
              snapshot.guidance
-           ) do
+           ),
+         :ok <- reconcile_model_projection(db, session.session_key, owner_model) do
       Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
       Org.set_identity_revision(db, session.session_key, snapshot.revision)
       :applied
@@ -3259,16 +3279,25 @@ defmodule Tightbeam.Gateway do
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
               snapshot = served_snapshot(config, session, harness, revision)
 
-              AdapterCoordinator.with_load_slot(coordinator, fn ->
-                Adapter.load_session(
-                  adapter,
-                  pointer.harness_session_id,
-                  new_ref,
-                  cwd,
-                  session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers(),
-                  snapshot.guidance
-                )
-              end)
+              with {:ok, owner_model} <-
+                     AdapterCoordinator.with_load_slot(coordinator, fn ->
+                       Adapter.load_session(
+                         adapter,
+                         pointer.harness_session_id,
+                         new_ref,
+                         cwd,
+                         session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers(),
+                         snapshot.guidance
+                       )
+                     end),
+                   :ok <-
+                     reconcile_model_projection(
+                       db,
+                       session.session_key,
+                       owner_model
+                     ) do
+                Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
+              end
 
             {:error, _reason} = error ->
               error
@@ -3905,15 +3934,17 @@ defmodule Tightbeam.Gateway do
     # its action transaction commits (the inverse TOCTOU of the heal's own CAS).
     # That is an acknowledged no-op, not a crash: the transaction rolled back, so
     # nothing the RULING decides survives, and the caller gets the same denial it
-    # would have got a millisecond earlier. What it does NOT undo is a live
-    # harness mutation the ruling already made — `swap` is the one action that
-    # makes one, and it survives on purpose, because the harness owns which model
-    # is loaded and `project_applied_model/6` commits that fact separately (F3).
+    # would have got a millisecond earlier. Swap closes this window separately by
+    # rechecking the episode before touching the harness inside its one ruling
+    # transaction.
     try do
       action.()
     rescue
       AdjudicationSuperseded ->
-        log_superseded(db, episode, call.params[:action])
+        current =
+          Adjudication.get_by_correlation(db, episode.correlation_key) || episode
+
+        log_superseded(db, current, call.params[:action])
         %{code: "denied", message: "stale or unknown adjudication episode"}
     end
   end
@@ -4089,50 +4120,20 @@ defmodule Tightbeam.Gateway do
           message: "use --action respawn for a cross-harness model"
         }
       else
-        case strict_apply_current_model(db, session, call.params.model) do
-          :ok ->
-            project_applied_model(db, session, call, episode, harness, provider)
-
-            {:ok, {delivery, wake_id}} =
-              ruling_transaction(db, fn txn ->
-                current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
-
-                recovery_prompt =
-                  "Your previous turn failed: #{current.condition}. You now run on #{call.params.model}. Re-derive state from the facts and continue."
-
-                wake_id =
-                  Adjudication.deterministic_wake_in_txn(
-                    txn,
-                    current,
-                    "recovery",
-                    current.session_key,
-                    recovery_prompt
-                  )
-
-                unless Adjudication.resolve_in_txn(txn, current, wake_id),
-                  do: raise(superseded_or_stale(current))
-
-                delivery =
-                  deliver_prompt_in_txn(
-                    txn,
-                    current.session_key,
-                    "process:tightbeam",
-                    recovery_prompt,
-                    wake_id: wake_id,
-                    sender: "process:tightbeam",
-                    fire_wake_in_txn: true
-                  )
-
-                arm_hold_in_txn(txn, current.session_key, wake_id)
-
-                {delivery, wake_id}
-              end)
-
-            complete_delivery(db, delivery)
-            %{ok: true, action: "swap", model: call.params.model, recovery_wake_id: wake_id}
+        case strict_model_adapter(db, session) do
+          {:ok, adapter, sid} ->
+            adjudicate_model_swap(
+              db,
+              call,
+              episode,
+              harness,
+              provider,
+              adapter,
+              sid
+            )
 
           {:error, reason} ->
-            %{code: to_string(reason), message: "strict model apply failed: #{reason}"}
+            strict_apply_error(reason)
         end
       end
     else
@@ -4140,49 +4141,140 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # `apply_model_strict` has already set the value AND read it back, reverting on
-  # mismatch, so an `:ok` here is the harness saying it holds the new model —
-  # T2/T-SOURCE: the harness OWNS which model is loaded, and `sessions.model` is
-  # its projection. That is why this write cannot ride on the ruling
-  # transaction, which compare-and-swaps a DIFFERENT fact (the adjudication
-  # episode) and rolls back whole when a heal wins that CAS. Riding on it was
-  # F3: the harness kept the new model while the record reverted to the old one,
-  # with nothing anywhere that re-reads the harness to break the tie — and
-  # `sessions.model` is what the next residency reload pushes AT the harness, so
-  # a record left behind the owner is not merely stale, it is a queued overwrite
-  # of the owner's truth. The projection follows the owner unconditionally; what
-  # the RULING gets to decide (recovery wake, hold, prompt) is decided after.
-  defp project_applied_model(db, session, call, episode, harness, provider) do
-    {:ok, _} =
+  # The DB owner executes the callback, so this whole apply→projection→ruling
+  # boundary survives the wire caller dying and excludes every competing ruling
+  # or heal transaction. The adapter independently fences the harness mutation
+  # against the model this transaction just read. The harness remains the owner:
+  # a stale adapter CAS projects the owner value into the row and never writes the
+  # request over it.
+  defp adjudicate_model_swap(db, call, episode, harness, provider, adapter, sid) do
+    result =
       DB.transaction(db, fn txn ->
-        case Org.swap_model_in_txn(
-               txn,
-               session.session_key,
-               {session.model, session.harness},
-               {call.params.model, harness, provider}
-             ) do
-          {:ok, _} -> :ok
-          {:duplicate, _} -> :ok
-          :stale -> raise("model mutation race")
-        end
+        current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
-        EventLog.lifecycle_in_txn(
-          txn,
-          "model_adjudication",
-          session.session_key,
-          JSON.encode!(%{
-            from_model: session.model,
-            to_model: call.params.model,
-            from_harness: session.harness,
-            to_harness: harness,
-            trigger: episode.condition,
-            adjudicated_by: episode.owner_target,
-            correlationKey: episode.correlation_key,
-            harness_crossed: false,
-            context_discarded: false
-          })
-        )
+        if is_nil(current) or current.status != "notified" do
+          {:denied, current}
+        else
+          [[record_model, record_harness, record_provider]] =
+            Txn.q(
+              txn,
+              "SELECT model, harness, provider FROM sessions WHERE sessionKey=?1",
+              [current.session_key]
+            )
+
+          case Adapter.apply_model_strict(
+                 adapter,
+                 sid,
+                 call.params.model,
+                 record_model
+               ) do
+            {:ok, applied_model} ->
+              case Org.swap_model_in_txn(
+                     txn,
+                     current.session_key,
+                     {record_model, record_harness},
+                     {applied_model, harness, provider}
+                   ) do
+                {:ok, _} -> :ok
+                {:duplicate, _} -> :ok
+                :stale -> raise("model mutation race inside serialized ruling")
+              end
+
+              recovery_prompt =
+                "Your previous turn failed: #{current.condition}. You now run on #{applied_model}. Re-derive state from the facts and continue."
+
+              wake_id =
+                Adjudication.deterministic_wake_in_txn(
+                  txn,
+                  current,
+                  "recovery",
+                  current.session_key,
+                  recovery_prompt
+                )
+
+              unless Adjudication.resolve_in_txn(txn, current, wake_id),
+                do: raise("adjudication changed inside serialized ruling")
+
+              delivery =
+                deliver_prompt_in_txn(
+                  txn,
+                  current.session_key,
+                  "process:tightbeam",
+                  recovery_prompt,
+                  wake_id: wake_id,
+                  sender: "process:tightbeam",
+                  fire_wake_in_txn: true
+                )
+
+              arm_hold_in_txn(txn, current.session_key, wake_id)
+
+              EventLog.lifecycle_in_txn(
+                txn,
+                "model_adjudication",
+                current.session_key,
+                JSON.encode!(%{
+                  from_model: record_model,
+                  to_model: applied_model,
+                  from_harness: record_harness,
+                  to_harness: harness,
+                  trigger: current.condition,
+                  adjudicated_by: current.owner_target,
+                  correlationKey: current.correlation_key,
+                  harness_crossed: false,
+                  context_discarded: false
+                })
+              )
+
+              {:applied, delivery, wake_id, applied_model}
+
+            {:error, {:stale_model, owner_model}} ->
+              case Org.swap_model_in_txn(
+                     txn,
+                     current.session_key,
+                     {record_model, record_harness},
+                     {owner_model, record_harness, record_provider}
+                   ) do
+                {:ok, _} -> :ok
+                {:duplicate, _} -> :ok
+                :stale -> raise("model reconciliation race inside serialized ruling")
+              end
+
+              {:not_applied, {:stale_model, owner_model}}
+
+            {:error, reason} ->
+              {:not_applied, reason}
+          end
+        end
       end)
+
+    case result do
+      {:ok, {:applied, delivery, wake_id, applied_model}} ->
+        complete_delivery(db, delivery)
+        %{ok: true, action: "swap", model: applied_model, recovery_wake_id: wake_id}
+
+      {:ok, {:denied, current}} ->
+        if current && current.heal_token,
+          do: log_superseded(db, current, call.params[:action])
+
+        %{code: "denied", message: "stale or unknown adjudication episode"}
+
+      {:ok, {:not_applied, reason}} ->
+        strict_apply_error(reason)
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  defp strict_apply_error(reason) do
+    code =
+      case reason do
+        {:stale_model, _owner_model} -> "stale_model"
+        atom when is_atom(atom) -> Atom.to_string(atom)
+        _ -> "model_apply_failed"
+      end
+
+    %{code: code, message: "strict model apply failed: #{inspect(reason)}"}
   end
 
   defp adjudicate_respawn(config, db, call, episode),
@@ -4868,7 +4960,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp strict_apply_current_model(db, session, model) do
+  defp strict_model_adapter(db, session) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
          coordinator when is_pid(coordinator) <- Process.whereis(Tightbeam.AdapterCoordinator),
          {:ok, adapter, _generation} <-
@@ -4876,9 +4968,37 @@ defmodule Tightbeam.Gateway do
              coordinator,
              {Harness.parse!(session.harness).id(), "shared", session.host}
            ) do
-      Adapter.apply_model_strict(adapter, sid, model, session.model)
+      {:ok, adapter, sid}
     else
-      _ -> :ok
+      _ -> {:error, :adapter_unavailable}
+    end
+  end
+
+  defp reconcile_model_projection(db, session_key, owner_model) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  "SELECT model, harness, provider FROM sessions WHERE sessionKey=?1",
+                  [session_key]
+                ) do
+             [[^owner_model, _harness, _provider]] ->
+               :ok
+
+             [[record_model, harness, provider]] ->
+               case Org.swap_model_in_txn(
+                      txn,
+                      session_key,
+                      {record_model, harness},
+                      {owner_model, harness, provider}
+                    ) do
+                 {:ok, _} -> :ok
+                 {:duplicate, _} -> :ok
+                 :stale -> raise("model reconciliation race inside serialized projection")
+               end
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> {:error, error}
     end
   end
 

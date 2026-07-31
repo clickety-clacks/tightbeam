@@ -6,8 +6,9 @@ defmodule Tightbeam.Acp.Adapter do
 
   Adapter rules (spec §Adapter selection; the SOURCE OF TRUTH mirrored from the
   TS reference harness.ts):
-  1. Apply the model immediately after session/new AND session/load — never
-     trust the advertised current model (the fable trap).
+  1. Apply the selected model immediately after session/new. After session/load,
+     read the harness's current model and return it to the caller; a stored record
+     is a projection and must never be pushed over the loaded owner's value.
   2. Model via session/set_config_option {configId:"model"} with a BARE name;
      effort rides as "model[effort]" split and applied via the harness's effort
      config id.
@@ -41,7 +42,8 @@ defmodule Tightbeam.Acp.Adapter do
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
-    known: MapSet.new()
+    known: MapSet.new(),
+    models: %{}
   ]
 
   ## Client
@@ -80,9 +82,9 @@ defmodule Tightbeam.Acp.Adapter do
   def new_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
 
-  @doc "Adopt an existing harness session at its workdir — re-applies the model; never trusts the advertised one."
+  @doc "Adopt an existing harness session and return the model the harness reports as current."
   @spec load_session(adapter(), String.t(), model_ref(), String.t(), [map()], String.t()) ::
-          :ok | {:error, term()}
+          {:ok, model_ref()} | {:error, term()}
   def load_session(adapter, session_id, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:load_session, session_id, model, cwd, mcp_servers, guidance}, 30_000)
 
@@ -128,11 +130,23 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp one_line(text), do: text |> String.replace(~r/\s*\n\s*/, " ") |> String.trim()
 
-  @doc "Strict adjudication-only model apply: base, effort, then response read-back."
+  @doc "Strict adjudication-only model CAS: compare the confirmed owner, then set and read back."
   @spec apply_model_strict(adapter(), String.t(), model_ref(), model_ref()) ::
-          :ok | {:error, :model_unavailable | :partial_apply}
+          {:ok, model_ref()}
+          | {:error,
+             :model_unavailable
+             | :partial_apply
+             | :model_readback_unavailable
+             | {:stale_model, model_ref()}}
   def apply_model_strict(adapter, session_id, model, prior_model),
     do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
+
+  @doc "The last model value confirmed by this serialized harness adapter."
+  @spec current_model(adapter(), String.t()) ::
+          {:ok, model_ref()}
+          | {:error, :model_readback_unavailable | {:adapter_unavailable, term()}}
+  def current_model(adapter, session_id),
+    do: call(adapter, {:current_model, session_id}, @boot_boundary_timeout)
 
   @doc "Apply a model selection and surface any explicit harness refusal."
   @spec apply_model(adapter(), String.t(), model_ref()) :: :ok | {:error, term()}
@@ -332,9 +346,13 @@ defmodule Tightbeam.Acp.Adapter do
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            }),
          sid = result["sessionId"],
-         :ok <- apply_model_to_session(state, sid, model),
+         {:ok, applied_model} <- apply_model_to_session(state, sid, model),
          :ok <- set_mode(state, sid) do
-      state = %{state | known: MapSet.put(state.known, sid)}
+      state =
+        state
+        |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+        |> put_in([Access.key(:models), sid], applied_model)
+
       {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
     else
       # Refused config (e.g. an unavailable model) is a turn failure with a
@@ -343,22 +361,31 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
+  def handle_call({:load_session, sid, _model, cwd, mcp_servers, guidance}, _from, state) do
     case Conn.request(state.conn, "session/load", %{
            sessionId: sid,
            cwd: cwd,
            mcpServers: mcp_servers,
            _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
          }) do
-      {:ok, _result} ->
-        case apply_model_to_session(state, sid, model) do
-          :ok ->
-            state = %{state | known: MapSet.put(state.known, sid)}
-            {:reply, :ok, put_in(state.chunks[sid], [])}
+      {:ok, result} ->
+        case model_ref_from_config(result, state.preset.effort_config) do
+          {:ok, owner_model} ->
+            state =
+              state
+              |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+              |> put_in([Access.key(:models), sid], owner_model)
 
-          {:error, reason} ->
-            state = %{state | known: MapSet.delete(state.known, sid)}
-            {:reply, {:error, {:model_apply_failed, reason}}, state}
+            {:reply, {:ok, owner_model}, put_in(state.chunks[sid], [])}
+
+          :error ->
+            state = %{
+              state
+              | known: MapSet.delete(state.known, sid),
+                models: Map.delete(state.models, sid)
+            }
+
+            {:reply, {:error, :model_readback_unavailable}, state}
         end
 
       {:error, error} ->
@@ -375,6 +402,7 @@ defmodule Tightbeam.Acp.Adapter do
         state = %{
           state
           | known: MapSet.delete(state.known, sid),
+            models: Map.delete(state.models, sid),
             chunks: Map.delete(state.chunks, sid),
             progress: Map.delete(state.progress, sid)
         }
@@ -387,15 +415,37 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_call({:apply_model_strict, sid, model, prior_model}, _from, state) do
-    {:reply, strict_apply_with_retry(state, sid, model, prior_model, 3), state}
+    case Map.fetch(state.models, sid) do
+      {:ok, ^prior_model} ->
+        case strict_apply_with_retry(state, sid, model, prior_model, 3) do
+          :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
+          error -> {:reply, error, state}
+        end
+
+      {:ok, current_model} ->
+        {:reply, {:error, {:stale_model, current_model}}, state}
+
+      :error ->
+        {:reply, {:error, :model_readback_unavailable}, state}
+    end
   end
 
   def handle_call({:apply_model, sid, model}, _from, state) do
-    {:reply, apply_model_to_session(state, sid, model), state}
+    case apply_model_to_session(state, sid, model) do
+      {:ok, applied_model} -> {:reply, :ok, put_in(state.models[sid], applied_model)}
+      error -> {:reply, error, state}
+    end
   end
 
   def handle_call({:knows_session?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
+
+  def handle_call({:current_model, sid}, _from, state) do
+    case Map.fetch(state.models, sid) do
+      {:ok, model} -> {:reply, {:ok, model}, state}
+      :error -> {:reply, {:error, :model_readback_unavailable}, state}
+    end
+  end
 
   def handle_call({:prompt, sid, text, opts}, from, state) do
     start_prompt(state, sid, text, opts, from)
@@ -461,6 +511,7 @@ defmodule Tightbeam.Acp.Adapter do
     maybe_emit_account_update(state, update)
     maybe_emit_subagent_event(state, sid, update)
     state = emit_progress(state, sid, update)
+    state = remember_config_model(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
       text = get_in(update, ["content", "text"])
@@ -562,7 +613,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp apply_model_to_session(state, sid, model_ref, request) do
     {model, effort} = parse_model_ref(model_ref)
 
-    with {:ok, _} <-
+    with {:ok, base_result} <-
            map_model_refusal(
              request.("session/set_config_option", %{
                sessionId: sid,
@@ -570,7 +621,7 @@ defmodule Tightbeam.Acp.Adapter do
                value: model
              })
            ),
-         {:ok, _} <-
+         {:ok, effort_result} <-
            (if effort do
               request.("session/set_config_option", %{
                 sessionId: sid,
@@ -578,9 +629,12 @@ defmodule Tightbeam.Acp.Adapter do
                 value: effort
               })
             else
-              {:ok, nil}
+              {:ok, base_result}
             end) do
-      :ok
+      case model_ref_from_config(effort_result, state.preset.effort_config) do
+        {:ok, applied_model} -> {:ok, applied_model}
+        :error -> {:ok, model_ref}
+      end
     end
   end
 
@@ -657,6 +711,45 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp read_back?(_, _id, _expected), do: false
 
+  defp remember_config_model(
+         state,
+         sid,
+         %{"sessionUpdate" => "config_option_update", "configOptions" => options}
+       ) do
+    case model_ref_from_config(%{"configOptions" => options}, state.preset.effort_config) do
+      {:ok, model} -> put_in(state.models[sid], model)
+      :error -> state
+    end
+  end
+
+  defp remember_config_model(state, _sid, _update), do: state
+
+  defp model_ref_from_config(%{"configOptions" => options}, effort_id)
+       when is_list(options) do
+    model = config_value(options, "model")
+    effort = config_value(options, effort_id)
+
+    cond do
+      not is_binary(model) ->
+        :error
+
+      effort in [nil, "", "default"] ->
+        {:ok, model}
+
+      true ->
+        {:ok, "#{model}[#{effort}]"}
+    end
+  end
+
+  defp model_ref_from_config(_, _effort_id), do: :error
+
+  defp config_value(options, id) do
+    case Enum.find(options, &((&1["id"] || &1["configId"]) == id)) do
+      nil -> nil
+      option -> option["currentValue"] || option["value"]
+    end
+  end
+
   defp set_mode(state, sid) do
     _ =
       Conn.request(state.conn, "session/set_mode", %{
@@ -678,7 +771,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     with {:ok, result} <- request.("session/new", %{cwd: probe_cwd, mcpServers: []}),
          sid = result["sessionId"],
-         :ok <- apply_model_to_session(state, sid, probe_model, request),
+         {:ok, _applied_model} <- apply_model_to_session(state, sid, probe_model, request),
          {:ok, _} <-
            request.("session/set_mode", %{
              sessionId: sid,

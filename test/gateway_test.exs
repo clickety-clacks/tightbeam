@@ -238,7 +238,7 @@ defmodule Tightbeam.GatewayTest do
           parent
         ) do
       send(parent, {:identity_apply_load, sid, model, cwd, mcp_servers, guidance})
-      {:reply, :ok, parent}
+      {:reply, {:ok, model}, parent}
     end
   end
 
@@ -262,9 +262,9 @@ defmodule Tightbeam.GatewayTest do
       {:reply, :ok, parent}
     end
 
-    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
+    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
       send(parent, {:holding_load, sid})
-      {:reply, :ok, parent}
+      {:reply, {:ok, model}, parent}
     end
   end
 
@@ -287,9 +287,9 @@ defmodule Tightbeam.GatewayTest do
       {:reply, {:error, %{"code" => -32603, "message" => "Session not found"}}, parent}
     end
 
-    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
+    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
       send(parent, {:gone_load_attempted, sid})
-      {:reply, :ok, parent}
+      {:reply, {:ok, model}, parent}
     end
   end
 
@@ -308,9 +308,9 @@ defmodule Tightbeam.GatewayTest do
       {:reply, :ok, parent}
     end
 
-    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
+    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
       send(parent, {:mixed_load, sid})
-      {:reply, :ok, parent}
+      {:reply, {:ok, model}, parent}
     end
   end
 
@@ -329,7 +329,7 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  defmodule LoadApplyFailureAdapterStub do
+  defmodule LoadReadbackFailureAdapterStub do
     use GenServer
 
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
@@ -341,8 +341,8 @@ defmodule Tightbeam.GatewayTest do
     end
 
     def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
-      send(parent, {:load_apply_failed, sid})
-      {:reply, {:error, {:model_apply_failed, :model_unavailable}}, parent}
+      send(parent, {:load_readback_failed, sid})
+      {:reply, {:error, :model_readback_unavailable}, parent}
     end
 
     def handle_call({:new_session, _model, _cwd, _mcp, _guidance}, _from, parent) do
@@ -3581,7 +3581,13 @@ defmodule Tightbeam.GatewayTest do
       }
 
       if action == "swap" do
-        catch_exit(handlers["adjudicate"].(call))
+        assert %{code: "adapter_unavailable"} = handlers["adjudicate"].(call)
+
+        assert {:ok, true} =
+                 DB.transaction(ctx.db, fn txn ->
+                   current = Adjudication.get_in_txn(txn, "k1", "other")
+                   Adjudication.resolve_in_txn(txn, current)
+                 end)
       else
         assert %{ok: true, action: "park"} = handlers["adjudicate"].(call)
       end
@@ -4350,14 +4356,14 @@ defmodule Tightbeam.GatewayTest do
              EventLog.lifecycle_events(ctx.db) |> Enum.filter(&(&1.kind == "pointer_fallback"))
   end
 
-  test "load model-apply failure fails the turn without forfeiting session context", ctx do
+  test "load model read-back failure fails the turn without forfeiting session context", ctx do
     exact_registry =
       start_supervised!(%{
         id: :load_apply_failure_conn_registry,
         start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
       })
 
-    adapter = start_supervised!({LoadApplyFailureAdapterStub, self()})
+    adapter = start_supervised!({LoadReadbackFailureAdapterStub, self()})
     start_supervised!({CoordinatorStub, adapter})
 
     {:ok, _ref, nil} =
@@ -4404,13 +4410,13 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:error,
             %{
-              reason: {:model_apply_failed, :model_unavailable},
+              reason: :model_readback_unavailable,
               terminal_publish: failure_publish
             }} = runner.(Map.put(turn, :session_key, "k1"))
 
     failure_publish.("failed")
     assert_receive {:load_apply_residency, "load-apply-session"}
-    assert_receive {:load_apply_failed, "load-apply-session"}
+    assert_receive {:load_readback_failed, "load-apply-session"}
     refute_receive :unexpected_load_apply_new_session
     refute_receive :unexpected_load_apply_prompt
     assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created"]

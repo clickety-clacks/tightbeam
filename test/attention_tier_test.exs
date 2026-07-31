@@ -74,8 +74,11 @@ defmodule Tightbeam.AttentionTierTest do
 
     def handle_call({:knows_session?, _sid}, _from, state), do: {:reply, true, state}
 
-    def handle_call({:load_session, _sid, _model, _cwd, _mcp, _guidance}, _from, state),
-      do: {:reply, {:ok, "harness-session"}, state}
+    def handle_call({:current_model, _sid}, _from, state),
+      do: {:reply, {:ok, "claude-fable-5"}, state}
+
+    def handle_call({:load_session, _sid, model, _cwd, _mcp, _guidance}, _from, state),
+      do: {:reply, {:ok, model}, state}
 
     def handle_call({:new_session, _model, _cwd, _mcp, _guidance}, _from, state),
       do: {:reply, {:ok, "harness-session"}, state}
