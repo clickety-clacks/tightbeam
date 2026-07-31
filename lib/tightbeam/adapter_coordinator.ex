@@ -58,8 +58,10 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @doc """
   Start the coordinator. Opts: `:adapter_sup` (the DynamicSupervisor),
-  `:adapter_opts` fun (`adapter_key -> keyword` — cmd/home/cwd/env assembled
-  by the composition root, incl. TIGHTBEAM_HOME + PATH with the CLI bin),
+  `:adapter_context` fun (`adapter_key -> keyword`) capturing lower-tier state
+  before the Adapter starts; `:adapter_opts` fun
+  (`(adapter_key, context) -> keyword` — cmd/home/cwd/env assembled lazily by
+  the Adapter, incl. TIGHTBEAM_HOME + PATH with the CLI bin),
   `:db`, `:name`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -75,6 +77,18 @@ defmodule Tightbeam.AdapterCoordinator do
   @spec adapter_for(GenServer.server(), adapter_key()) :: checkout()
   def adapter_for(server \\ __MODULE__, key) do
     GenServer.call(server, {:adapter_for, key}, 30_000)
+  end
+
+  @doc """
+  Start or return an adapter using context already captured by the caller.
+
+  Credential lifecycle transitions use this form because the lifecycle owner
+  already knows the kind being installed and cannot synchronously answer a
+  coordinator callback while it is waiting for the start result.
+  """
+  @spec adapter_for(GenServer.server(), adapter_key(), keyword()) :: checkout()
+  def adapter_for(server, key, context) do
+    GenServer.call(server, {:adapter_for, key, context}, 30_000)
   end
 
   @doc """
@@ -209,11 +223,23 @@ defmodule Tightbeam.AdapterCoordinator do
     :exit, _reason -> :ok
   end
 
+  @doc """
+  Request planned teardown without synchronously entering the coordinator.
+
+  Used by lower-tier lifecycle owners whose notification must not wait on the
+  coordinator or on the Adapter it is closing.
+  """
+  @spec request_close_adapter(GenServer.server(), adapter_key()) :: :ok
+  def request_close_adapter(server \\ __MODULE__, key) do
+    GenServer.cast(server, {:close_adapter, key})
+  end
+
   @impl true
   def init(opts) do
     {:ok,
      %{
        adapter_sup: Keyword.fetch!(opts, :adapter_sup),
+       adapter_context: Keyword.fetch!(opts, :adapter_context),
        adapter_opts: Keyword.fetch!(opts, :adapter_opts),
        db: Keyword.get(opts, :db, Tightbeam.DB),
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
@@ -230,19 +256,11 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def handle_call({:adapter_for, key}, _from, state) do
-    entry = Map.get(state.adapters, key, fresh_entry())
+    adapter_for_reply(key, :capture, state)
+  end
 
-    cond do
-      entry.circuit == :open ->
-        {:reply, {:error, :degraded}, state}
-
-      is_pid(entry.pid) and Process.alive?(entry.pid) ->
-        {:reply, {:ok, entry.pid, entry.generation}, state}
-
-      true ->
-        {reply, state} = start_adapter(key, entry, state)
-        {:reply, reply, state}
-    end
+  def handle_call({:adapter_for, key, context}, _from, state) do
+    adapter_for_reply(key, context, state)
   end
 
   def handle_call({:last_failure, key, generation}, _from, state) do
@@ -294,6 +312,35 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   def handle_call({:close_adapter, key}, _from, state) do
+    {:reply, :ok, do_close_adapter(key, state)}
+  end
+
+  defp adapter_for_reply(key, context, state) do
+    entry = Map.get(state.adapters, key, fresh_entry())
+
+    cond do
+      entry.circuit == :open ->
+        {:reply, {:error, :degraded}, state}
+
+      is_pid(entry.pid) and Process.alive?(entry.pid) ->
+        {:reply, {:ok, entry.pid, entry.generation}, state}
+
+      true ->
+        {reply, state} = start_adapter(key, entry, state, context)
+        {:reply, reply, state}
+    end
+  end
+
+  @impl true
+  def handle_cast({:close_adapter, key}, state) do
+    {:noreply, do_close_adapter(key, state)}
+  end
+
+  def handle_cast({:release_load_slot, machine, slot}, state) do
+    {:noreply, release_slot(machine, slot, state)}
+  end
+
+  defp do_close_adapter(key, state) do
     case state.adapters[key] do
       %{pid: pid, monitor: ref} = entry when is_pid(pid) ->
         Process.demonitor(ref, [:flush])
@@ -313,21 +360,15 @@ defmodule Tightbeam.AdapterCoordinator do
         # its retry window) would never be swept (spec s4-operability-v1 §2).
         entry = %{entry | pid: nil, monitor: nil, ready: false, generation: entry.generation + 1}
 
-        {:reply, :ok,
-         %{
-           state
-           | adapters: Map.put(state.adapters, key, entry),
-             monitors: Map.delete(state.monitors, ref)
-         }}
+        %{
+          state
+          | adapters: Map.put(state.adapters, key, entry),
+            monitors: Map.delete(state.monitors, ref)
+        }
 
       _ ->
-        {:reply, :ok, state}
+        state
     end
-  end
-
-  @impl true
-  def handle_cast({:release_load_slot, machine, slot}, state) do
-    {:noreply, release_slot(machine, slot, state)}
   end
 
   @impl true
@@ -401,7 +442,7 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_info({:restart_adapter, key, generation}, state) do
     case state.adapters[key] do
       %{generation: ^generation, pid: nil} = entry ->
-        {_reply, state} = start_adapter(key, %{entry | timer: nil}, state)
+        {_reply, state} = start_adapter(key, %{entry | timer: nil}, state, :capture)
         {:noreply, state}
 
       _ ->
@@ -409,7 +450,15 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp start_adapter(key, entry, state) do
+  defp start_adapter(key, entry, state, context) do
+    # Context capture runs in the higher-tier coordinator, so lazy Adapter boot
+    # never synchronously enters a same-tier lifecycle owner.
+    adapter_context =
+      case context do
+        :capture -> state.adapter_context.(key)
+        captured -> captured
+      end
+
     # Opts building (incl. remote home delivery) is potentially expensive or
     # hangable — a fn defers it into the adapter's own process (lazy boot via
     # its handle_continue), so this coordinator NEVER blocks on a slow or
@@ -418,7 +467,8 @@ defmodule Tightbeam.AdapterCoordinator do
     coordinator = self()
 
     boot = fn ->
-      adapter_opts.(key) ++ [on_ready: fn -> send(coordinator, {:adapter_ready, key}) end]
+      adapter_opts.(key, adapter_context) ++
+        [on_ready: fn -> send(coordinator, {:adapter_ready, key}) end]
     end
 
     child = %{

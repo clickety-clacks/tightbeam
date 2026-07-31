@@ -874,6 +874,19 @@ defmodule Tightbeam.Acp.AdapterTest do
       })
 
     Tightbeam.Org.append_pointer(db, session.session_key, "sess-1", "created")
+
+    {:ok, turn_seq} =
+      Tightbeam.Ledger.enqueue(db, %{
+        session_key: session.session_key,
+        message_id: "message-running",
+        origin: "user:flynn",
+        prompt: "run",
+        assignment_id: "assignment-running"
+      })
+
+    assert {:ok, %{seq: ^turn_seq}} =
+             Tightbeam.Ledger.claim_next(db, session.session_key, "test-owner")
+
     {:ok, adapter_slot} = Agent.start_link(fn -> nil end)
     start_supervised!({AdapterCallingWakeScheduler, {adapter_slot, self()}})
 
@@ -889,10 +902,16 @@ defmodule Tightbeam.Acp.AdapterTest do
         {:codex, "default", "testhost"}
       )
 
+    placement_handler = placement_opts[:on_subagent_event]
+
     {adapter, _capture_path} =
       start_adapter(
         harness: :codex,
-        on_subagent_event: placement_opts[:on_subagent_event],
+        on_subagent_event: fn sid, update ->
+          result = placement_handler.(sid, update)
+          send(owner, :subagent_event_captured)
+          result
+        end,
         on_ready: fn -> send(owner, :booted) end
       )
 
@@ -918,8 +937,121 @@ defmodule Tightbeam.Acp.AdapterTest do
       {:acp_notification, "session/update", %{"sessionId" => "sess-1", "update" => update}}
     )
 
+    assert_receive :subagent_event_captured
+    :ok = Tightbeam.Ledger.finish(db, turn_seq, "delivered")
     assert_receive {:matching_fired, fact_id, false}, 2_000
     assert is_integer(fact_id)
+    assert [%{assignment_id: "assignment-running"}] = Tightbeam.SubagentMarkers.list(db)
+    assert Process.alive?(adapter)
+  end
+
+  test "placement reports a failed durable subagent ingestion without retrying" do
+    owner = self()
+
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tb-subagent-failure-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    File.mkdir_p!(base)
+
+    db = :"subagent_failure_db_#{System.unique_integer([:positive])}"
+    db_pid = start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Placement.ensure_schema(db)
+
+    for module <- [
+          Tightbeam.EventLog,
+          Tightbeam.Idempotency,
+          Tightbeam.Ledger,
+          Tightbeam.Projection,
+          Tightbeam.Org,
+          Tightbeam.Roles,
+          Tightbeam.ConditionFacts,
+          Tightbeam.Wakes,
+          Tightbeam.SubagentMarkers
+        ],
+        do: :ok = module.ensure_schema(db)
+
+    Tightbeam.Archetypes.load!(base)
+    Tightbeam.Rails.load!(base)
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+
+    session =
+      Tightbeam.Org.create(db, %{
+        session_key: "parent",
+        display_name: "parent",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: "fixture"
+      })
+
+    Tightbeam.Org.append_pointer(db, session.session_key, "sess-1", "created")
+
+    placement_opts =
+      Tightbeam.Placement.adapter_opts(
+        %{
+          base_dir: base,
+          db: db,
+          cwd: "/tmp",
+          cli_bin: Path.join(base, "bin"),
+          credential_kind: :subscription
+        },
+        {:codex, "default", "testhost"}
+      )
+
+    placement_handler = placement_opts[:on_subagent_event]
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        on_subagent_event: fn sid, update ->
+          result = placement_handler.(sid, update)
+          send(owner, {:subagent_task_captured, self()})
+
+          receive do
+            :release_subagent_task -> result
+          end
+        end,
+        on_ready: fn -> send(owner, :booted) end
+      )
+
+    assert_ready(adapter, :booted)
+
+    update = %{
+      "sessionUpdate" => "tool_call_update",
+      "toolCallId" => "call-codex-failure",
+      "status" => "completed",
+      "_meta" => %{
+        "codex" => %{
+          "subagentTerminated" => %{
+            "agentThreadId" => "thread-child-failure",
+            "threadStatus" => %{"type" => "idle"}
+          }
+        }
+      }
+    }
+
+    log =
+      capture_log(fn ->
+        send(
+          adapter,
+          {:acp_notification, "session/update", %{"sessionId" => "sess-1", "update" => update}}
+        )
+
+        assert_receive {:subagent_task_captured, ^adapter}
+        GenServer.stop(db_pid)
+        send(adapter, :release_subagent_task)
+        Process.sleep(100)
+      end)
+
+    assert log =~ "subagent event ingestion failed"
+    assert log =~ "retry=false"
     assert Process.alive?(adapter)
   end
 

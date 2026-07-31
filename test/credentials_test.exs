@@ -31,7 +31,7 @@ defmodule Tightbeam.CredentialsTest do
           send(owner, :stop)
           :ok
         end,
-        start: fn _ ->
+        start: fn _, _ ->
           assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
                    ~S({"token":"new"})
 
@@ -77,7 +77,7 @@ defmodule Tightbeam.CredentialsTest do
           send(owner, :stop)
           :ok
         end,
-        start: fn _ ->
+        start: fn _, _ ->
           send(owner, :forbidden_start)
           :ok
         end,
@@ -194,7 +194,7 @@ defmodule Tightbeam.CredentialsTest do
           send(owner, :stop)
           :ok
         end,
-        start: fn _ ->
+        start: fn _, _ ->
           send(owner, {:start, File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"]))})
           :ok
         end,
@@ -319,7 +319,7 @@ defmodule Tightbeam.CredentialsTest do
           send(owner, :stop)
           :ok
         end,
-        start: fn _ ->
+        start: fn _, _ ->
           send(owner, :start)
           :ok
         end,
