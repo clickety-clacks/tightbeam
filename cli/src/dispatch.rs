@@ -1,4 +1,3 @@
-use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -845,11 +844,27 @@ pub(crate) fn send_to_with_deadline(
     request: &RequestSpec,
     deadline: Option<Instant>,
 ) -> Result<Option<Value>, String> {
+    if let Some(deadline) = deadline {
+        let endpoint = endpoint.clone();
+        let request = request.clone();
+        return crate::lease::until(deadline, move |remaining| {
+            send_to_with_timeout(&endpoint, &request, Some(remaining))
+        })
+        .map_err(|()| ceremony_expired())?;
+    }
+
+    send_to_with_timeout(endpoint, request, None)
+}
+
+fn send_to_with_timeout(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+    timeout: Option<Duration>,
+) -> Result<Option<Value>, String> {
     let url = format!("{}{}", endpoint.base, request.path);
     let mut builder = ureq::AgentBuilder::new();
-    if let Some(deadline) = deadline {
-        let remaining = ceremony_remaining(deadline)?;
-        builder = builder.timeout(remaining).timeout_connect(remaining);
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout).timeout_connect(timeout);
     }
     let call = builder
         .build()
@@ -861,50 +876,14 @@ pub(crate) fn send_to_with_deadline(
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
-        Err(ureq::Error::Transport(error))
-            if deadline.is_some()
-                && (transport_timed_out(&error)
-                    || Instant::now() >= deadline.expect("checked above")) =>
-        {
-            return Err(ceremony_expired());
-        }
         Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
     };
-    let encoded = response.into_string().map_err(|error| {
-        if deadline.is_some() && error.kind() == std::io::ErrorKind::TimedOut {
-            ceremony_expired()
-        } else {
-            error.to_string()
-        }
-    })?;
+    let encoded = response.into_string().map_err(|error| error.to_string())?;
     parse_response(status, &encoded)
-}
-
-fn ceremony_remaining(deadline: Instant) -> Result<Duration, String> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        Err(ceremony_expired())
-    } else {
-        Ok(remaining)
-    }
 }
 
 fn ceremony_expired() -> String {
     "gateway request refused because the onboarding lease expired".to_owned()
-}
-
-fn transport_timed_out(error: &ureq::Transport) -> bool {
-    let mut source = error.source();
-    while let Some(cause) = source {
-        if cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
-        {
-            return true;
-        }
-        source = cause.source();
-    }
-    false
 }
 
 fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {

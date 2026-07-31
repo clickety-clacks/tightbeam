@@ -164,9 +164,11 @@ defmodule Tightbeam.Supervision do
       db: Keyword.fetch!(opts, :db),
       handlers: Keyword.fetch!(opts, :handlers),
       n: Keyword.fetch!(opts, :prod_limit),
+      sweep_ms: Keyword.get(opts, :sweep_ms),
       delivery_opts: Keyword.take(opts, [:conn_registry, :lane_manager])
     }
 
+    schedule_sweep(state.sweep_ms)
     {:ok, state, {:continue, :recovery_sweep}}
   end
 
@@ -197,6 +199,13 @@ defmodule Tightbeam.Supervision do
 
   def handle_cast(:sweep, state) do
     sweep(state)
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:scheduled_sweep, state) do
+    sweep(state)
+    schedule_sweep(state.sweep_ms)
     {:noreply, state}
   end
 
@@ -919,6 +928,11 @@ defmodule Tightbeam.Supervision do
         inspect({kind, reason})
       )
   end
+
+  defp schedule_sweep(sweep_ms) when is_integer(sweep_ms) and sweep_ms > 0,
+    do: Process.send_after(self(), :scheduled_sweep, sweep_ms)
+
+  defp schedule_sweep(_sweep_ms), do: :ok
 
   defp safe_evaluate(state, session_key, fun) do
     fun.()

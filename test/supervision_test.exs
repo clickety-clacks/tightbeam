@@ -43,36 +43,60 @@ defmodule Tightbeam.SupervisionTest do
     end
   end
 
-  defmodule RulingRaceDB do
+  defmodule ParkRaceDB do
     use GenServer
 
-    def start_link({name, db, parent}),
-      do: GenServer.start_link(__MODULE__, {db, parent}, name: name)
+    def start_link({name, db, parent, transition}),
+      do: GenServer.start_link(__MODULE__, {db, parent, transition}, name: name)
 
-    def init({db, parent}), do: {:ok, %{db: db, parent: parent}}
+    def init({db, parent, transition}),
+      do: {:ok, %{db: db, parent: parent, transition: transition, request_reads: 0}}
 
     def handle_call({:query, sql, _params} = request, _from, state) do
       result = GenServer.call(state.db, request)
 
-      if String.contains?(sql, "FROM decision_requests WHERE raiserId") and
-           String.contains?(sql, "ORDER BY rowid DESC LIMIT 1") do
+      if current_request_query?(sql) do
+        request_reads = state.request_reads + 1
         {:ok, [[id | _]]} = result
 
-        {:ok, _} =
-          DB.query(
-            state.db,
-            "UPDATE decision_requests SET status = 'ruled', decision = 'allow', ruledAt = 1 WHERE id = ?1",
-            [id]
-          )
+        if request_reads == 1 do
+          transition_request(state.db, id, state.transition)
+          send(state.parent, {:request_changed_before_park, state.transition, id})
+        else
+          send(state.parent, {:request_rechecked, state.transition, request_reads})
+        end
 
-        send(state.parent, {:ruled_before_park, id})
+        {:reply, result, %{state | request_reads: request_reads}}
+      else
+        {:reply, result, state}
       end
-
-      {:reply, result, state}
     end
 
     def handle_call(request, _from, state),
       do: {:reply, GenServer.call(state.db, request), state}
+
+    defp current_request_query?(sql) do
+      String.contains?(sql, "FROM decision_requests WHERE raiserId") and
+        String.contains?(sql, "ORDER BY rowid DESC LIMIT 1")
+    end
+
+    defp transition_request(db, id, :rule_allow) do
+      {:ok, _} =
+        DB.query(
+          db,
+          "UPDATE decision_requests SET status = 'ruled', decision = 'allow', ruledAt = 1 WHERE id = ?1 AND status = 'open'",
+          [id]
+        )
+    end
+
+    defp transition_request(db, id, :withdraw) do
+      {:ok, _} =
+        DB.query(
+          db,
+          "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'session:holder', withdrawnReason = 'race', withdrawnAt = 1 WHERE id = ?1 AND status = 'open'",
+          [id]
+        )
+    end
   end
 
   setup do
@@ -355,7 +379,7 @@ defmodule Tightbeam.SupervisionTest do
            ] = rail_sweep_details(ctx.db, "holder")
   end
 
-  test "turn-end escalation rechecks openness before parking a stale request", ctx do
+  test "a permanently skipped park does not re-evaluate inline or starve the server", ctx do
     write_rules(
       ctx,
       """
@@ -377,40 +401,98 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, [[id, park_wake_id]]} =
       DB.query(ctx.db, "SELECT id, parkWakeId FROM decision_requests")
 
+    proxy = :"park_rule_race_db_#{System.unique_integer([:positive])}"
+    start_supervised!({ParkRaceDB, {proxy, ctx.db, self(), :rule_allow}})
+    name = :"park_no_spin_supervision_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Supervision,
+       db: proxy, handlers: ctx.handlers, prod_limit: 3, sweep_ms: 60_000, name: name}
+    )
+
+    :sys.get_state(name)
     assert Wakes.cancel(ctx.db, park_wake_id, "process:tightbeam")
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE decision_requests SET parkWakeId = NULL WHERE id = ?1", [id])
 
-    proxy = :"ruling_race_db_#{System.unique_integer([:positive])}"
-    start_supervised!({RulingRaceDB, {proxy, ctx.db, self()}})
     retry_seq = terminal!(ctx.db, "holder")
+    Supervision.notify_terminal(name, "holder", retry_seq)
 
-    assert {:retry, :rail_escalate} =
-             Supervision.evaluate(proxy, ctx.handlers, 3, "holder", retry_seq)
+    assert_receive {:request_changed_before_park, :rule_allow, ^id}
 
-    assert_receive {:ruled_before_park, ^id}
+    # The first barrier proves the terminal handler returned. If that handler self-cast a
+    # retry, the cast may sit just behind this already-queued call; the second barrier is
+    # necessarily behind it and therefore proves that no inline retry was left to run.
+    :sys.get_state(name)
+    :sys.get_state(name)
+    refute_receive {:request_rechecked, :rule_allow, _}
 
     assert {:ok, [["ruled", nil]]} =
              DB.query(ctx.db, "SELECT status, parkWakeId FROM decision_requests WHERE id = ?1", [
                id
              ])
 
-    assert [
-             %{
-               "decision" => "escalate-park",
-               "ref" => "asg_1",
-               "statute" => "completion-needs-owner"
-             }
-           ] = rail_sweep_details(ctx.db, "holder")
-
     refute match?(
              %{lastEvaluatedTerminal: ^retry_seq},
              Supervision.watermark(ctx.db, "holder")
            )
+  end
 
-    assert {:prodded, 1} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", retry_seq)
+  test "the production sweep re-drives a permanent skip and parks a still-live obligation",
+       ctx do
+    write_rules(
+      ctx,
+      """
+      [[rule]]
+      name = "completion-needs-owner"
+      verb = "attest"
+      text = "owner approval required"
+      edges = ["verb", "turn-end"]
+      effect = "escalate"
+      deny_when = [
+        { fact = "attest.kind", op = "eq", value = "completion" }
+      ]
+      """
+    )
+
+    assert {:acted, :rail_escalate} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal!(ctx.db, "holder"))
+
+    {:ok, [[stale_id, park_wake_id]]} =
+      DB.query(ctx.db, "SELECT id, parkWakeId FROM decision_requests")
+
+    proxy = :"park_withdraw_race_db_#{System.unique_integer([:positive])}"
+    start_supervised!({ParkRaceDB, {proxy, ctx.db, self(), :withdraw}})
+    name = :"park_sweep_supervision_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Supervision, db: proxy, handlers: ctx.handlers, prod_limit: 3, sweep_ms: 10, name: name}
+    )
+
+    :sys.get_state(name)
+    assert Wakes.cancel(ctx.db, park_wake_id, "process:tightbeam")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE decision_requests SET parkWakeId = NULL WHERE id = ?1", [stale_id])
+
+    retry_seq = terminal!(ctx.db, "holder")
+    Supervision.notify_terminal(name, "holder", retry_seq)
+
+    assert_receive {:request_changed_before_park, :withdraw, ^stale_id}
+    assert_receive {:request_rechecked, :withdraw, 2}
+
+    assert eventually(fn ->
+             match?(
+               {:ok, [[^stale_id, "withdrawn", nil], [new_id, "open", park_wake_id]]}
+               when new_id != stale_id and is_binary(park_wake_id),
+               DB.query(
+                 ctx.db,
+                 "SELECT id, status, parkWakeId FROM decision_requests ORDER BY rowid"
+               )
+             )
+           end),
+           "the scheduled supervision sweep never parked the replacement request"
 
     assert %{lastEvaluatedTerminal: ^retry_seq} = Supervision.watermark(ctx.db, "holder")
   end

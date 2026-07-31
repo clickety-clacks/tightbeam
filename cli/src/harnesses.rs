@@ -1,7 +1,6 @@
-use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -121,37 +120,35 @@ fn load_endpoint_with_deadline(
     endpoint: &dispatch::Endpoint,
     deadline: Option<Instant>,
 ) -> Result<HarnessCatalog, String> {
+    if let Some(deadline) = deadline {
+        let endpoint = endpoint.clone();
+        return crate::lease::until(deadline, move |remaining| {
+            load_endpoint_with_timeout(&endpoint, Some(remaining))
+        })
+        .map_err(|()| harness_lease_expired())?;
+    }
+
+    load_endpoint_with_timeout(endpoint, None)
+}
+
+fn load_endpoint_with_timeout(
+    endpoint: &dispatch::Endpoint,
+    timeout: Option<Duration>,
+) -> Result<HarnessCatalog, String> {
     let url = format!("{}/harnesses", endpoint.base);
     let mut builder = ureq::AgentBuilder::new();
-    if let Some(deadline) = deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(harness_lease_expired());
-        }
-        builder = builder.timeout(remaining).timeout_connect(remaining);
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout).timeout_connect(timeout);
     }
     let response = builder
         .build()
         .get(&url)
         .set("authorization", &format!("Bearer {}", endpoint.token))
         .call()
-        .map_err(|error| {
-            if deadline.is_some() && (Instant::now() >= deadline.unwrap() || ureq_timed_out(&error))
-            {
-                harness_lease_expired()
-            } else {
-                unavailable(&error.to_string())
-            }
-        })?;
-    let encoded = response.into_string().map_err(|error| {
-        if deadline.is_some()
-            && (Instant::now() >= deadline.unwrap() || error.kind() == std::io::ErrorKind::TimedOut)
-        {
-            harness_lease_expired()
-        } else {
-            unavailable(&error.to_string())
-        }
-    })?;
+        .map_err(|error| unavailable(&error.to_string()))?;
+    let encoded = response
+        .into_string()
+        .map_err(|error| unavailable(&error.to_string()))?;
     parse(&encoded).map_err(|reason| unavailable(&reason))
 }
 
@@ -174,23 +171,6 @@ pub(crate) fn load_optional_from(
 
 fn harness_lease_expired() -> String {
     "harness catalog lookup refused because the onboarding lease expired".to_owned()
-}
-
-fn ureq_timed_out(error: &ureq::Error) -> bool {
-    let ureq::Error::Transport(error) = error else {
-        return false;
-    };
-    let mut source = error.source();
-    while let Some(cause) = source {
-        if cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
-        {
-            return true;
-        }
-        source = cause.source();
-    }
-    false
 }
 
 #[cfg(not(test))]

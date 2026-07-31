@@ -391,7 +391,8 @@ defmodule Tightbeam.AdapterHealTest do
       {AdapterCoordinator,
        adapter_sup: sup,
        db: ctx.db,
-       adapter_opts: fn _key ->
+       adapter_context: fn _ -> [] end,
+       adapter_opts: fn _key, _context ->
          [
            harness: :claude,
            cmd: [binary],
@@ -1804,7 +1805,8 @@ defmodule Tightbeam.AdapterHealTest do
         {AdapterCoordinator,
          adapter_sup: sup,
          db: ctx.db,
-         adapter_opts: fn _key ->
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _key, _context ->
            [harness: :claude, cmd: ["/nonexistent/adapter"], home: "/tmp", cwd: "/tmp"]
          end,
          name: :"f4_coord_#{:erlang.unique_integer([:positive])}"}

@@ -30,7 +30,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
          backoff_base_ms: 1,
-         adapter_opts: fn _ ->
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
            [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
          end,
          db: ctx.db,
@@ -70,6 +71,111 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert failures >= 5
   end
 
+  test "adapter boot context is captured in the coordinator before lazy adapter opts", ctx do
+    owner = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn key ->
+           send(owner, {:adapter_context, self(), key})
+           [credential_kind: :subscription]
+         end,
+         adapter_opts: fn key, context ->
+           send(owner, {:adapter_opts, self(), key, context})
+
+           [
+             harness: :claude,
+             cmd: [System.find_executable("false")],
+             home: "/tmp",
+             cwd: "/tmp"
+           ]
+         end,
+         db: ctx.db,
+         name: :"coord_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, adapter, _generation} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert_receive {:adapter_context, context_worker, ^key}
+    refute context_worker == coordinator
+    assert_receive {:adapter_opts, ^adapter, ^key, [credential_kind: :subscription]}
+  end
+
+  test "context capture frees the coordinator mailbox for a lifecycle callback", ctx do
+    owner = self()
+    coordinator_slot = :atomics.new(1, signed: false)
+
+    lifecycle = start_supervised!({Agent, fn -> nil end})
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn key ->
+           coordinator = :persistent_term.get({__MODULE__, coordinator_slot})
+
+           Agent.get(lifecycle, fn _ ->
+             send(owner, {:capture_entered, self(), key})
+             :ok = AdapterCoordinator.close_adapter(coordinator, key)
+             [credential_kind: :subscription]
+           end)
+         end,
+         adapter_opts: fn _, _ ->
+           [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+         end,
+         db: ctx.db,
+         name: :"coord_#{System.unique_integer([:positive])}"}
+      )
+
+    :persistent_term.put({__MODULE__, coordinator_slot}, coordinator)
+    on_exit(fn -> :persistent_term.erase({__MODULE__, coordinator_slot}) end)
+
+    key = {:claude, "default", "testhost"}
+    checkout = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:capture_entered, worker, ^key}
+    refute worker == coordinator
+    assert {:ok, {:ok, _adapter, _generation}} = Task.yield(checkout, 500)
+  end
+
+  test "authoritative credential context replaces a live adapter with a different kind", ctx do
+    path = Path.join(ctx.test_dir, "context_fake.js")
+    File.write!(path, @fake)
+    owner = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [credential_kind: :subscription] end,
+         adapter_opts: fn _, context ->
+           send(owner, {:boot_context, self(), context})
+
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :"coord_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, first, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert_receive {:boot_context, ^first, [credential_kind: :subscription]}
+    first_ref = Process.monitor(first)
+
+    assert {:ok, second, 2} =
+             AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :api_key)
+
+    refute second == first
+    assert_receive {:DOWN, ^first_ref, :process, ^first, _reason}
+    assert_receive {:boot_context, ^second, [credential_kind: :api_key]}
+  end
+
   test "failure circuit threshold uses application config", ctx do
     old_value = Application.get_env(:tightbeam, :adapter_failure_circuit)
 
@@ -86,7 +192,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
          backoff_base_ms: 1_000,
-         adapter_opts: fn _ ->
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
            [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
          end,
          db: ctx.db,
@@ -150,7 +257,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         adapter_opts: fn _ ->
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
            [
              harness: :claude,
              cmd: [System.find_executable("node"), path],
@@ -202,7 +310,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         adapter_opts: fn _ ->
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
            [
              harness: :claude,
              cmd: [System.find_executable("node"), path],
@@ -246,7 +355,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         adapter_opts: fn _ ->
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
            [
              harness: :claude,
              cmd: [System.find_executable("node"), path],
@@ -279,7 +389,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         adapter_opts: fn _ ->
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
            [
              harness: :claude,
              cmd: [System.find_executable("node"), path],
@@ -331,7 +442,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         adapter_opts: fn _ -> [] end,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ -> [] end,
          db: ctx.db,
          name: :"coordinator_#{System.unique_integer([:positive])}"}
       )
@@ -396,7 +508,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         adapter_opts: fn _ -> [] end,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ -> [] end,
          db: ctx.db,
          name: :per_machine_load_cap}
       )
@@ -441,7 +554,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         adapter_opts: fn _ -> [] end,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ -> [] end,
          db: ctx.db,
          name: :configured_load_cap}
       )
