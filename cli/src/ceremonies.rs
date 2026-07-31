@@ -346,13 +346,15 @@ fn run_bounded(
         }
 
         if Instant::now() >= deadline {
-            // The lease is already gone, so there is no second cleanup allowance to spend:
-            // TERM and then KILL the group without waiting past the gateway's deadline.
+            // TERM the group, give it a moment to clean up, then KILL what ignored it.
             // These children are RUNNING, so TERM is delivered at once -- the
             // TERM-before-CONT ordering would matter only for an already-STOPped
             // process, which none of these are.
             unsafe {
                 libc::killpg(pgid, libc::SIGTERM);
+            }
+            thread::sleep(Duration::from_secs(2));
+            unsafe {
                 libc::killpg(pgid, libc::SIGKILL);
             }
             let _ = child.wait();
@@ -403,7 +405,7 @@ fn run_api_key_onboarding(
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
-    let key = read_api_key(ceremony.deadline)?;
+    let key = read_api_key()?;
     validate_api_key(provider, &key, machine, ceremony.deadline)?;
     match provider {
         "openai" => bank_openai_api_key(staging, &key, ceremony),
@@ -423,75 +425,17 @@ fn run_api_key_onboarding(
 /// the echo is possible but is a second, subtler thing to get right, and this
 /// path is non-interactive by design anyway. So the terminal case is refused
 /// with the exact command that works, which is also the form codex's own
-/// `login --with-api-key` documents. The accepted pipe is deadline-bounded: its
-/// producer is not a human prompt, and it cannot hold a gateway lease indefinitely.
-fn read_api_key(deadline: Instant) -> Result<String, String> {
+/// `login --with-api-key` documents.
+fn read_api_key() -> Result<String, String> {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
         return Err(api_key_needs_a_pipe());
     }
-    read_api_key_from(&mut io::stdin(), libc::STDIN_FILENO, deadline)
+    read_api_key_from(&mut io::stdin())
 }
 
-fn read_api_key_from(
-    reader: &mut impl io::Read,
-    fd: libc::c_int,
-    deadline: Instant,
-) -> Result<String, String> {
-    let mut raw = Vec::new();
-    let mut chunk = [0_u8; 8_192];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(
-                "API-key stdin read refused because the onboarding lease expired".to_owned(),
-            );
-        }
-        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        if timeout_ms == 0 {
-            return Err(
-                "API-key stdin read refused because the onboarding lease expired".to_owned(),
-            );
-        }
-        let mut poll_fd = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLHUP,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-        if ready == 0 {
-            return Err(
-                "API-key stdin read refused because the onboarding lease expired".to_owned(),
-            );
-        }
-        if ready < 0 {
-            return Err(format!(
-                "could not read the API key from stdin: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        if poll_fd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
-            return Err(format!(
-                "could not read the API key from stdin: poll returned {}",
-                poll_fd.revents
-            ));
-        }
-        if Instant::now() >= deadline {
-            return Err(
-                "API-key stdin read refused because the onboarding lease expired".to_owned(),
-            );
-        }
-        match reader.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(count) => raw.extend_from_slice(&chunk[..count]),
-            Err(error) => {
-                return Err(format!("could not read the API key from stdin: {error}"));
-            }
-        }
-    }
-    if Instant::now() >= deadline {
-        return Err("API-key stdin read refused because the onboarding lease expired".to_owned());
-    }
-    let raw = String::from_utf8(raw)
+fn read_api_key_from(reader: &mut impl io::Read) -> Result<String, String> {
+    let mut raw = String::new();
+    io::Read::read_to_string(reader, &mut raw)
         .map_err(|error| format!("could not read the API key from stdin: {error}"))?;
     let key = raw.trim().to_owned();
     if key.is_empty() {
@@ -531,7 +475,20 @@ fn validate_api_key(
     deadline: Instant,
 ) -> Result<(), String> {
     let host = machine.map(str::to_owned).unwrap_or_else(this_host);
-    let agent = validation_agent(deadline, "API-key validation")?;
+    let provider = provider.to_owned();
+    let key = key.to_owned();
+    validation_before_deadline(deadline, "API-key validation", move |remaining| {
+        validate_api_key_with_timeout(&provider, &key, &host, remaining)
+    })
+}
+
+fn validate_api_key_with_timeout(
+    provider: &str,
+    key: &str,
+    host: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let agent = validation_agent(timeout);
     let request = match provider {
         "anthropic" => agent
             .get("https://api.anthropic.com/v1/models?limit=1")
@@ -548,9 +505,13 @@ fn validate_api_key(
     match request.call() {
         Ok(_response) => Ok(()),
         Err(ureq::Error::Status(status, response)) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            let body = match response.into_string() {
+                Ok(body) => body,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    return Err(validation_expired("API-key validation"));
+                }
+                Err(_) => "<unreadable response body>".to_owned(),
+            };
             Err(format!(
                 "the {provider} API key was rejected on {host}: HTTP {status} {}. Nothing was \
                  banked -- the {provider} credential on {host} is unchanged.",
@@ -558,7 +519,7 @@ fn validate_api_key(
             ))
         }
         Err(ureq::Error::Transport(error)) => {
-            if Instant::now() >= deadline || transport_timed_out(&error) {
+            if transport_timed_out(&error) {
                 Err(validation_expired("API-key validation"))
             } else {
                 Err(format!(
@@ -681,16 +642,12 @@ fn search_path() -> String {
 /// refusal is about a PATH on the box in front of them, so its own idea of its name is
 /// the useful one.
 fn this_host() -> String {
-    let mut buffer = [0_u8; 256];
-    let found = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
-    found
-        .then(|| {
-            let end = buffer
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(buffer.len());
-            String::from_utf8_lossy(&buffer[..end]).trim().to_owned()
-        })
+    ProcessCommand::new("uname")
+        .arg("-n")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "this machine".to_owned())
 }
@@ -925,8 +882,19 @@ fn validate_setup_token(
     deadline: Instant,
 ) -> Result<(), String> {
     let host = machine.map(str::to_owned).unwrap_or_else(this_host);
+    let token = token.to_owned();
+    validation_before_deadline(deadline, "setup-token validation", move |remaining| {
+        validate_setup_token_with_timeout(&token, &host, remaining)
+    })
+}
+
+fn validate_setup_token_with_timeout(
+    token: &str,
+    host: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let (url, headers) = subscription_probe(token);
-    let agent = validation_agent(deadline, "setup-token validation")?;
+    let agent = validation_agent(timeout);
     let mut request = agent.get(url);
     for (name, value) in &headers {
         request = request.set(name, value);
@@ -935,37 +903,33 @@ fn validate_setup_token(
     match request.call() {
         Ok(_response) => Ok(()),
         Err(ureq::Error::Status(status, response)) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
-            Err(rejected_setup_token(status, body.trim(), &host))
+            let body = match response.into_string() {
+                Ok(body) => body,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    return Err(validation_expired("setup-token validation"));
+                }
+                Err(_) => "<unreadable response body>".to_owned(),
+            };
+            Err(rejected_setup_token(status, body.trim(), host))
         }
-        Err(ureq::Error::Transport(error))
-            if Instant::now() >= deadline || transport_timed_out(&error) =>
-        {
+        Err(ureq::Error::Transport(error)) if transport_timed_out(&error) => {
             Err(validation_expired("setup-token validation"))
         }
         Err(ureq::Error::Transport(error)) => {
-            Err(unvalidated_setup_token(&error.to_string(), &host))
+            Err(unvalidated_setup_token(&error.to_string(), host))
         }
     }
 }
 
-fn validation_remaining(deadline: Instant, what: &str) -> Result<Duration, String> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        Err(validation_expired(what))
-    } else {
-        Ok(remaining)
-    }
+fn validation_agent(timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(timeout).build()
 }
 
-fn validation_agent(deadline: Instant, what: &str) -> Result<ureq::Agent, String> {
-    let remaining = validation_remaining(deadline, what)?;
-    Ok(ureq::AgentBuilder::new()
-        .timeout(remaining)
-        .timeout_connect(remaining)
-        .build())
+fn validation_before_deadline<F>(deadline: Instant, what: &str, work: F) -> Result<(), String>
+where
+    F: FnOnce(Duration) -> Result<(), String> + Send + 'static,
+{
+    crate::lease::until(deadline, work).map_err(|()| validation_expired(what))?
 }
 
 fn transport_timed_out(error: &ureq::Transport) -> bool {
@@ -1652,6 +1616,45 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_ceremony_gets_term_grace_before_kill() {
+        let marker = std::env::temp_dir().join(format!(
+            "tightbeam-ceremony-term-grace-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = ProcessCommand::new("sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    "trap 'printf term > \"{}\"; exit 0' TERM; while :; do sleep 1; done",
+                    marker.display()
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let error = run_bounded(
+            command,
+            "a TERM-aware stub ceremony",
+            Instant::now() + Duration::from_millis(500),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
+        let handled = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(
+            handled, "term",
+            "SIGKILL arrived before the contained process handled SIGTERM"
+        );
+    }
+
+    #[test]
     fn lease_deadline_starts_from_the_begin_reply() {
         let ready = serde_json::json!({"leaseTtlMs": 12_345});
         let now = Instant::now();
@@ -1694,27 +1697,39 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_api_key_pipe_expires_as_lease_expiry() {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::net::UnixStream;
-
-        let (mut reader, _writer) = UnixStream::pair().unwrap();
-        let deadline = Instant::now() + Duration::from_millis(20);
-        let fd = reader.as_raw_fd();
-        let error = read_api_key_from(&mut reader, fd, deadline).unwrap_err();
-
-        assert!(error.contains("onboarding lease expired"), "{error}");
+    fn an_api_key_pipe_is_read_to_eof() {
+        let mut reader = io::Cursor::new(b"  sk-test\n".to_vec());
+        assert_eq!(read_api_key_from(&mut reader), Ok("sk-test".to_owned()));
     }
 
     #[test]
     fn validation_refuses_an_expired_lease_before_network_io() {
         for what in ["API-key validation", "setup-token validation"] {
             let error =
-                validation_agent(Instant::now() - Duration::from_millis(1), what).unwrap_err();
+                validation_before_deadline(Instant::now() - Duration::from_millis(1), what, |_| {
+                    panic!("expired validation performed network work")
+                })
+                .unwrap_err();
             assert!(error.contains(what), "{error}");
             assert!(error.contains("onboarding lease expired"), "{error}");
             assert!(error.contains("nothing was banked"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_rejection_body_that_finishes_after_the_deadline_is_reported_as_expiry() {
+        let error = validation_before_deadline(
+            Instant::now() + Duration::from_millis(20),
+            "API-key validation",
+            |_| {
+                thread::sleep(Duration::from_millis(100));
+                Err("the API key was rejected".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
+        assert!(!error.contains("rejected"), "{error}");
     }
 
     #[derive(Default)]
