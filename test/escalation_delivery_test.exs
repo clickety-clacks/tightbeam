@@ -530,8 +530,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
                1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "adjudicate_park/4"} =>
                1,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "adjudicate_swap/4"} =>
-               1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5",
+              "adjudicate_model_swap/7"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5",
               "adjudicate_respawn/5"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "release_hold/6"} =>
