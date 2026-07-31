@@ -426,7 +426,7 @@ defmodule Tightbeam.Gateway do
         ssh: host.ssh,
         gate: fn _provider -> :ok end,
         stop: fn provider -> stop_provider_runtime(provider, machine) end,
-        park: fn provider -> park_provider_runtime(provider, machine) end,
+        park_edge: Tightbeam.CommandEdge.request_to(Tightbeam.AdapterCoordinator),
         start: fn provider, kind -> start_provider_runtime(provider, kind, machine) end,
         resume: fn _provider -> :ok end,
         capture_sessions: fn provider ->
@@ -760,6 +760,29 @@ defmodule Tightbeam.Gateway do
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
       "config" => admin_handler(db, fn p -> config_result(db, p) end),
+      "harness-processes" =>
+        admin_handler(db, fn _params ->
+          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+          %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
+        end),
+      "harness-process-retry" =>
+        admin_handler(db, fn p ->
+          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+
+          case AdapterCoordinator.retry_harness_park(coordinator, p.launch_id) do
+            :ok -> %{retried: p.launch_id}
+            {:error, reason} -> %{code: "harness_park_retry_failed", message: inspect(reason)}
+          end
+        end),
+      "harness-process-release" =>
+        admin_handler(db, fn p ->
+          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+
+          case AdapterCoordinator.release_harness_park(coordinator, p.launch_id, p.reason) do
+            :ok -> %{released: p.launch_id}
+            {:error, reason} -> %{code: "harness_park_release_failed", message: inspect(reason)}
+          end
+        end),
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -3471,20 +3494,6 @@ defmodule Tightbeam.Gateway do
         {:ok, :ok} -> :ok
         {:ok, {:error, _reason} = error} -> error
         {{:error, _reason} = error, _later_result} -> error
-      end
-    end)
-  end
-
-  defp park_provider_runtime(provider, machine) do
-    provider
-    |> harnesses_for_provider()
-    |> Enum.reduce_while(:ok, fn module, :ok ->
-      case AdapterCoordinator.close_adapter(
-             Tightbeam.AdapterCoordinator,
-             {module.id(), "shared", machine}
-           ) do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end

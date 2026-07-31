@@ -173,6 +173,18 @@ end
 # test/support/test_case.ex documents the sanctioned ones.
 ExUnit.start(assert_receive_timeout: 1_000)
 
+defmodule Tightbeam.CredentialParkTestReceiver do
+  use GenServer
+
+  def start_link(fun), do: GenServer.start_link(__MODULE__, fun)
+  def init(fun), do: {:ok, fun}
+
+  def handle_call({:tightbeam_command, command}, _from, fun) do
+    command = Tightbeam.CommandEdge.validate_command!(command)
+    {:reply, fun.(command.provider), fun}
+  end
+end
+
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 
 # Remove the suite scratch root when the VM exits, NOT after each suite run:

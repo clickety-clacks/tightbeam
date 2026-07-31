@@ -183,6 +183,56 @@ defmodule Tightbeam.CommandEdge do
     end
   end
 
+  defmodule CredentialPark do
+    @moduledoc "A credential lifecycle request to park the captured adapter keys."
+
+    @missing {:tightbeam_command_edge, :missing}
+    @enforce_keys [:provider, :machine, :adapter_keys, :observed_at]
+    defstruct provider: @missing,
+              machine: @missing,
+              adapter_keys: @missing,
+              observed_at: @missing
+
+    @type t :: %__MODULE__{
+            provider: atom(),
+            machine: String.t(),
+            adapter_keys: [Tightbeam.Placement.adapter_key()],
+            observed_at: integer()
+          }
+
+    @doc false
+    @spec validate!(t()) :: t()
+    def validate!(
+          %__MODULE__{
+            provider: provider,
+            machine: machine,
+            adapter_keys: adapter_keys,
+            observed_at: observed_at
+          } = command
+        )
+        when is_atom(provider) and is_binary(machine) and is_list(adapter_keys) and
+               adapter_keys != [] and is_integer(observed_at) do
+      if Enum.all?(adapter_keys, fn
+           {harness, preset, host} ->
+             is_atom(harness) and is_binary(preset) and host == machine
+
+           _ ->
+             false
+         end) do
+        command
+      else
+        invalid!()
+      end
+    end
+
+    def validate!(_command), do: invalid!()
+
+    defp invalid! do
+      raise ArgumentError,
+            "invalid CredentialPark: expected provider, machine, adapter keys, and observation time"
+    end
+  end
+
   defmodule Signal do
     @moduledoc false
     @enforce_keys [:target]
@@ -243,7 +293,8 @@ defmodule Tightbeam.CommandEdge do
   end
 
   @typedoc "Immutable data accepted by a tier edge."
-  @type command :: AdapterReady.t() | TerminalPublication.t() | AuthEvent.t()
+  @type command ::
+          AdapterReady.t() | TerminalPublication.t() | AuthEvent.t() | CredentialPark.t()
 
   @typedoc "A local process identifier or locally registered process name."
   @type target :: pid() | atom()
@@ -312,6 +363,8 @@ defmodule Tightbeam.CommandEdge do
     TurnContext.validate!(context)
     command
   end
+
+  defp validate_command_shape!(%CredentialPark{} = command), do: CredentialPark.validate!(command)
 
   defp validate_command_shape!(_command) do
     raise ArgumentError, "unsupported command edge command"

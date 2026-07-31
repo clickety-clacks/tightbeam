@@ -6,6 +6,7 @@ defmodule Tightbeam.CommandEdgeTest do
   alias Tightbeam.CommandEdge.{
     AdapterReady,
     AuthEvent,
+    CredentialPark,
     Job,
     JobDispatcher,
     Request,
@@ -506,6 +507,21 @@ defmodule Tightbeam.CommandEdgeTest do
     omitted_context = struct(AuthEvent, Map.from_struct(turn_scoped) |> Map.delete(:context))
 
     assert_raise ArgumentError, fn -> CommandEdge.validate_command!(omitted_context) end
+  end
+
+  test "credential parks carry inert adapter keys for one captured machine" do
+    command = %CredentialPark{
+      provider: :openai,
+      machine: "eezo",
+      adapter_keys: [{:codex, "shared", "eezo"}],
+      observed_at: 123
+    }
+
+    assert CommandEdge.validate_command!(command) == command
+
+    assert_raise ArgumentError, ~r/invalid CredentialPark/, fn ->
+      CommandEdge.validate_command!(%{command | adapter_keys: [{:codex, "shared", "tars"}]})
+    end
   end
 
   defp adapter_ready do

@@ -55,6 +55,38 @@ defmodule Tightbeam.HarnessProcessTest do
     assert eventually(fn -> File.exists?(marker) and File.stat!(marker).size > 0 end)
 
     assert row.os_pid == row.process_group_id
+    assert is_binary(row.boot_identity)
+    assert is_binary(row.identity_token)
+
+    assert {_, 3} =
+             System.cmd(
+               @helper,
+               [
+                 "harness-group",
+                 "kill",
+                 Integer.to_string(row.process_group_id),
+                 row.identity_path,
+                 row.boot_identity <> "-rebooted",
+                 row.identity_token
+               ],
+               stderr_to_stdout: true
+             )
+
+    assert {_, 3} =
+             System.cmd(
+               @helper,
+               [
+                 "harness-group",
+                 "kill",
+                 Integer.to_string(row.process_group_id),
+                 row.identity_path,
+                 row.boot_identity,
+                 row.identity_token <> "-recycled"
+               ],
+               stderr_to_stdout: true
+             )
+
+    assert {_, 0} = System.cmd(@helper, group_args(row, "status"), stderr_to_stdout: true)
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
     assert :ok = HarnessProcess.park(ctx.db, fenced, 50)
     assert :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "testhost"})
@@ -124,7 +156,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert [%{state: "killed"}] = HarnessProcess.list(ctx.db)
   end
 
-  test "the stacked schema upgrade adds group and kill-attempt identity columns", ctx do
+  test "the stacked schema upgrade adds ordered boot and process identity columns", ctx do
     old_db = :"old_harness_process_db_#{System.unique_integer([:positive])}"
 
     start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: old_db}, id: old_db))
@@ -140,7 +172,7 @@ defmodule Tightbeam.HarnessProcessTest do
         ssh TEXT,
         identityPath TEXT NOT NULL,
         osPid INTEGER,
-        processStartedAt TEXT,
+        identityToken TEXT,
         state TEXT NOT NULL,
         createdAt INTEGER NOT NULL,
         parkRequestedAt INTEGER,
@@ -153,7 +185,14 @@ defmodule Tightbeam.HarnessProcessTest do
     assert :ok = HarnessProcess.ensure_schema(old_db)
     {:ok, columns} = DB.query(old_db, "PRAGMA table_info(harness_processes)")
     names = MapSet.new(columns, &Enum.at(&1, 1))
-    assert MapSet.subset?(MapSet.new(~w(helperPath processGroupId killAttemptedAt)), names)
+
+    assert MapSet.subset?(
+             MapSet.new(
+               ~w(helperPath processGroupId launchSequence bootIdentity identityToken killAttemptedAt)
+             ),
+             names
+           )
+
     assert ctx.db != old_db
   end
 
@@ -179,6 +218,7 @@ defmodule Tightbeam.HarnessProcessTest do
              "/srv/tightbeam/bin/tightbeam",
              "harness-exec",
              identity_path,
+             launch_id,
              "--",
              "env",
              "A=B",
@@ -186,6 +226,7 @@ defmodule Tightbeam.HarnessProcessTest do
            ] = Keyword.fetch!(opts, :cmd)
 
     assert identity_path =~ "/harness-processes/"
+    assert is_binary(launch_id)
   end
 
   test "inspection failure is unconfirmed and retry uses the durable group", ctx do
@@ -255,7 +296,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert {_, 0} =
              System.cmd(
                @helper,
-               ["harness-group", "kill", Integer.to_string(row.process_group_id)],
+               group_args(row, "kill"),
                stderr_to_stdout: true
              )
 
@@ -264,7 +305,7 @@ defmodule Tightbeam.HarnessProcessTest do
                {_, 3},
                System.cmd(
                  @helper,
-                 ["harness-group", "status", Integer.to_string(row.process_group_id)],
+                 group_args(row, "status"),
                  stderr_to_stdout: true
                )
              )
@@ -286,6 +327,106 @@ defmodule Tightbeam.HarnessProcessTest do
     assert last_error == "operator_release: operator verified externally"
   end
 
+  test "continuous helper output cannot starve the absolute command deadline", ctx do
+    {port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
+    on_exit(fn -> close_port(port) end)
+    noisy = Path.join(ctx.test_dir, "noisy-helper")
+    File.write!(noisy, "#!/bin/sh\nwhile :; do printf x; done\n")
+    File.chmod!(noisy, 0o755)
+    Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 50)
+
+    assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1", [
+        row.launch_id,
+        noisy
+      ])
+
+    started_at = System.monotonic_time(:millisecond)
+
+    assert {:error, {:park_unconfirmed, :process_inspection_timeout}} =
+             HarnessProcess.park(ctx.db, %{fenced | helper_path: noisy}, 100)
+
+    assert System.monotonic_time(:millisecond) - started_at < 1_000
+  end
+
+  test "every unresolved launch fences a replacement before DOWN reconciliation", ctx do
+    {port, _row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
+    on_exit(fn -> close_port(port) end)
+
+    assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
+
+    assert_raise RuntimeError, ~r/adapter park in progress/, fn ->
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("false")],
+          stderr_path: Path.join(ctx.test_dir, "replacement.stderr"),
+          process_helper: @helper
+        ],
+        ctx.db,
+        {:claude, "shared", "testhost"}
+      )
+    end
+  end
+
+  test "park selection follows durable launch sequence, not clock or ULID order", ctx do
+    for {launch_id, sequence} <- [{"zz_old", 1}, {"aa_new", 2}] do
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO harness_processes
+            (launchId, adapterKey, harness, preset, host, helperPath, identityPath,
+             launchSequence, state, createdAt)
+          VALUES (?1, 'claude:shared@testhost', 'claude', 'shared', 'testhost',
+                  ?2, ?3, ?4, 'launching', 100)
+          """,
+          [launch_id, @helper, Path.join(ctx.test_dir, launch_id <> ".identity"), sequence]
+        )
+    end
+
+    assert {:ok, %{launch_id: "aa_new", state: "park_requested"}} =
+             HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+  end
+
+  test "boot reconciliation waits for a launcher identity that appears after row insertion",
+       ctx do
+    key = {:codex, "shared", "testhost"}
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["sh", "-c", "trap '' HUP TERM; while :; do sleep 1; done"],
+          stderr_path: Path.join(ctx.test_dir, "delayed.stderr"),
+          process_helper: @helper
+        ],
+        ctx.db,
+        key
+      )
+
+    owner = self()
+
+    launcher =
+      Task.async(fn ->
+        Process.sleep(100)
+        [executable | args] = Keyword.fetch!(opts, :cmd)
+        port = Port.open({:spawn_executable, executable}, [:binary, :exit_status, {:args, args}])
+        send(owner, {:delayed_port, port})
+
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    assert :ok = HarnessProcess.reconcile(ctx.db)
+    assert_receive {:delayed_port, port}
+    assert [%{state: "killed"}] = HarnessProcess.list(ctx.db)
+    send(launcher.pid, :done)
+    assert Task.await(launcher) == :ok
+    close_port(port)
+  end
+
   test "a crash window after kill attempt is never labelled graceful", ctx do
     {port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     on_exit(fn -> close_port(port) end)
@@ -300,7 +441,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert {_, 0} =
              System.cmd(
                @helper,
-               ["harness-group", "kill", Integer.to_string(row.process_group_id)],
+               group_args(row, "kill"),
                stderr_to_stdout: true
              )
 
@@ -309,7 +450,7 @@ defmodule Tightbeam.HarnessProcessTest do
                {_, 3},
                System.cmd(
                  @helper,
-                 ["harness-group", "status", Integer.to_string(row.process_group_id)],
+                 group_args(row, "status"),
                  stderr_to_stdout: true
                )
              )
@@ -436,6 +577,17 @@ defmodule Tightbeam.HarnessProcessTest do
     if Port.info(port), do: Port.close(port)
   catch
     :error, :badarg -> :ok
+  end
+
+  defp group_args(row, action) do
+    [
+      "harness-group",
+      action,
+      Integer.to_string(row.process_group_id),
+      row.identity_path,
+      row.boot_identity,
+      row.identity_token
+    ]
   end
 
   defp eventually(fun, attempts \\ 200)

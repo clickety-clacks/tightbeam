@@ -174,6 +174,12 @@ defmodule Tightbeam.CredentialsTest do
        ctx do
     owner = self()
 
+    {:ok, park_receiver} =
+      Tightbeam.CredentialParkTestReceiver.start_link(fn _provider ->
+        send(owner, :park)
+        :ok
+      end)
+
     {:ok, server} =
       Credentials.start_link(
         name: nil,
@@ -186,10 +192,7 @@ defmodule Tightbeam.CredentialsTest do
           send(owner, :gate)
           :ok
         end,
-        park: fn _ ->
-          send(owner, :park)
-          :ok
-        end,
+        park_edge: Tightbeam.CommandEdge.request_to(park_receiver),
         stop: fn _ ->
           send(owner, :stop)
           :ok
@@ -242,17 +245,20 @@ defmodule Tightbeam.CredentialsTest do
     owner = self()
     {:ok, attempts} = Agent.start_link(fn -> 0 end)
 
+    {:ok, park_receiver} =
+      Tightbeam.CredentialParkTestReceiver.start_link(fn :openai ->
+        case Agent.get_and_update(attempts, &{&1, &1 + 1}) do
+          0 -> {:error, {:park_unconfirmed, :identity_unavailable}}
+          1 -> :ok
+        end
+      end)
+
     {:ok, server} =
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
         machine: "eezo",
-        park: fn :openai ->
-          case Agent.get_and_update(attempts, &{&1, &1 + 1}) do
-            0 -> {:error, {:park_unconfirmed, :identity_unavailable}}
-            1 -> :ok
-          end
-        end,
+        park_edge: Tightbeam.CommandEdge.request_to(park_receiver),
         capture_sessions: fn :openai -> [:captured_session] end,
         publish_sessions: fn captured, transition ->
           send(owner, {:publish, captured, transition})
@@ -280,9 +286,52 @@ defmodule Tightbeam.CredentialsTest do
     assert Agent.get(attempts, & &1) == 2
   end
 
+  test "terminal parking leaves Credentials responsive while the coordinator edge is pending",
+       ctx do
+    owner = self()
+
+    {:ok, park_receiver} =
+      Tightbeam.CredentialParkTestReceiver.start_link(fn :openai ->
+        send(owner, {:park_edge_entered, self()})
+
+        receive do
+          :release_park -> :ok
+        end
+      end)
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        onboarders: %{openai: fn _ -> {:ok, %{bytes: "replacement", expires_at: nil}} end},
+        park_edge: Tightbeam.CommandEdge.request_to(park_receiver)
+      )
+
+    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")["params"]
+    terminal = Task.async(fn -> Credentials.mark_terminal(:openai, evidence, server) end)
+    assert_receive {:park_edge_entered, ^park_receiver}
+
+    onboard = Task.async(fn -> Credentials.onboard(:openai, server) end)
+
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :revoked}
+    assert Process.alive?(server)
+    assert Task.yield(onboard, 20) == nil
+
+    send(park_receiver, :release_park)
+    assert Task.await(terminal) == :ok
+    assert Task.await(onboard) == :ok
+  end
+
   test "terminal capture remains immutable while the park mutates membership", ctx do
     owner = self()
     {:ok, membership} = Agent.start_link(fn -> [:before_one, :before_two] end)
+
+    {:ok, park_receiver} =
+      Tightbeam.CredentialParkTestReceiver.start_link(fn :openai ->
+        Agent.update(membership, fn _ -> [:after] end)
+        :ok
+      end)
 
     {:ok, server} =
       Credentials.start_link(
@@ -290,10 +339,7 @@ defmodule Tightbeam.CredentialsTest do
         base_dir: ctx.base,
         machine: "eezo",
         capture_sessions: fn :openai -> Agent.get(membership, & &1) end,
-        park: fn :openai ->
-          Agent.update(membership, fn _ -> [:after] end)
-          :ok
-        end,
+        park_edge: Tightbeam.CommandEdge.request_to(park_receiver),
         publish_sessions: fn captured, transition ->
           send(owner, {:immutable_publish, captured, transition})
           :ok
@@ -307,6 +353,9 @@ defmodule Tightbeam.CredentialsTest do
   end
 
   test "raising and exiting publishers do not change terminal or onboarding results", ctx do
+    {:ok, park_receiver} =
+      Tightbeam.CredentialParkTestReceiver.start_link(fn :openai -> :ok end)
+
     {:ok, server} =
       Credentials.start_link(
         name: nil,
@@ -315,6 +364,7 @@ defmodule Tightbeam.CredentialsTest do
         onboarders: %{
           openai: fn _state -> {:ok, %{bytes: "replacement", expires_at: nil}} end
         },
+        park_edge: Tightbeam.CommandEdge.request_to(park_receiver),
         capture_sessions: fn :openai -> [:session] end,
         publish_sessions: fn
           [:session], :terminal -> raise "publisher failed"

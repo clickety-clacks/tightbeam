@@ -220,6 +220,18 @@ pub enum Command {
         setting: String,
         value: String,
     },
+    HarnessProcesses {
+        identity: Identity,
+    },
+    HarnessProcessRetry {
+        identity: Identity,
+        launch_id: String,
+    },
+    HarnessProcessRelease {
+        identity: Identity,
+        launch_id: String,
+        reason: String,
+    },
     Assimilate(AssimilateArgs),
 }
 
@@ -425,6 +437,12 @@ COMMANDS:
       never leaves this machine.
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
+  harness-process list
+      List the durable harness launch ledger, newest launch first.
+  harness-process retry <launchId>
+      Retry identity observation and termination for an unconfirmed launch.
+  harness-process release <launchId> --reason <text>
+      Release an unconfirmed fence after external operator verification.
 
   doctor [--json] [--base-dir p]
       Check the local Tightbeam installation and report its health.
@@ -786,6 +804,7 @@ fn parse_with_optional_catalog(
                 base_dir,
             })
         }
+        "harness-process" => parse_harness_process(&parsed, flags),
         "wake" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -1268,8 +1287,33 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, harness-process, doctor, assimilate"
         )),
+    }
+}
+
+fn parse_harness_process(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    match (
+        parsed.positional.get(1).map(String::as_str),
+        parsed.positional.get(2),
+        parsed.positional.get(3),
+    ) {
+        (Some("list"), None, None) => Ok(Command::HarnessProcesses {
+            identity: identity(flags)?,
+        }),
+        (Some("retry"), Some(launch_id), None) => Ok(Command::HarnessProcessRetry {
+            identity: identity(flags)?,
+            launch_id: launch_id.clone(),
+        }),
+        (Some("release"), Some(launch_id), None) => Ok(Command::HarnessProcessRelease {
+            identity: identity(flags)?,
+            launch_id: launch_id.clone(),
+            reason: nonempty(flags, "reason").ok_or_else(|| "--reason is required".to_owned())?,
+        }),
+        _ => Err("usage: tightbeam harness-process list | retry <launchId> | release <launchId> --reason <text>".to_owned()),
     }
 }
 
@@ -1418,6 +1462,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn harness_process_operator_commands_name_the_launch_and_release_reason() {
+        assert_eq!(
+            parse(strings(&["harness-process", "list", "--as-user", "flynn"])),
+            Ok(Command::HarnessProcesses {
+                identity: Identity::User("flynn".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "harness-process",
+                "retry",
+                "launch-1",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::HarnessProcessRetry {
+                identity: Identity::User("flynn".to_owned()),
+                launch_id: "launch-1".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "harness-process",
+                "release",
+                "launch-1",
+                "--reason",
+                "verified absent",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::HarnessProcessRelease {
+                identity: Identity::User("flynn".to_owned()),
+                launch_id: "launch-1".to_owned(),
+                reason: "verified absent".to_owned(),
+            })
+        );
+    }
+
     /// `--help` was consumed before the command was ever looked at, so every
     /// subcommand answered with the whole manual — the operator asking about one
     /// command got 150 lines and had to find the answer themselves.
@@ -1520,6 +1603,7 @@ mod tests {
                 "dispatch",
                 "doctor",
                 "effort-rule",
+                "harness-process",
                 "identity",
                 "list",
                 "onboard",
@@ -1550,6 +1634,9 @@ mod tests {
             "onboard openai|anthropic [--api-key]",
             "config get default-archetype",
             "config set default-archetype <name>",
+            "harness-process list",
+            "harness-process retry <launchId>",
+            "harness-process release <launchId> --reason <text>",
         ] {
             assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
         }
@@ -1837,7 +1924,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, doctor, assimilate".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, harness-process, doctor, assimilate".to_owned())
         );
     }
 

@@ -608,6 +608,31 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("value", value),
             ],
         )),
+        Command::HarnessProcesses { identity } => {
+            Ok(request(identity, "harness-processes", vec![], vec![]))
+        }
+        Command::HarnessProcessRetry {
+            identity,
+            launch_id,
+        } => Ok(request(
+            identity,
+            "harness-process-retry",
+            vec![],
+            vec![string_field("launchId", launch_id)],
+        )),
+        Command::HarnessProcessRelease {
+            identity,
+            launch_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "harness-process-release",
+            vec![],
+            vec![
+                string_field("launchId", launch_id),
+                string_field("reason", reason),
+            ],
+        )),
     }
 }
 
@@ -1047,7 +1072,10 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
         | Command::ConfigGet { identity, .. }
-        | Command::ConfigSet { identity, .. } => Some(identity),
+        | Command::ConfigSet { identity, .. }
+        | Command::HarnessProcesses { identity }
+        | Command::HarnessProcessRetry { identity, .. }
+        | Command::HarnessProcessRelease { identity, .. } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
@@ -1069,6 +1097,26 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn builds_harness_process_operator_requests() {
+        assert_eq!(
+            body(&["harness-process", "list", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"harness-processes","params":{}}"#
+        );
+        assert_eq!(
+            body(&[
+                "harness-process",
+                "release",
+                "launch-1",
+                "--reason",
+                "verified absent",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"harness-process-release","params":{"launchId":"launch-1","reason":"verified absent"}}"#
+        );
     }
 
     #[test]

@@ -364,6 +364,24 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, result, state}
   end
 
+  def handle_call(
+        {:tightbeam_command, %Tightbeam.CommandEdge.CredentialPark{} = command},
+        _from,
+        state
+      ) do
+    command = Tightbeam.CommandEdge.validate_command!(command)
+
+    {result, state} =
+      Enum.reduce_while(command.adapter_keys, {:ok, state}, fn key, {:ok, state} ->
+        case do_close_adapter(key, state) do
+          {:ok, state} -> {:cont, {:ok, state}}
+          {{:error, _reason} = error, state} -> {:halt, {error, state}}
+        end
+      end)
+
+    {:reply, result, state}
+  end
+
   def handle_call({:close_adapter, key}, _from, state) do
     {result, state} = do_close_adapter(key, state)
     {:reply, result, state}

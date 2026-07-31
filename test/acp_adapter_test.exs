@@ -665,6 +665,12 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "codex account updates preserve terminal parity through the credential path" do
     owner = self()
 
+    {:ok, park_receiver} =
+      Tightbeam.CredentialParkTestReceiver.start_link(fn :openai ->
+        send(owner, :parked)
+        :ok
+      end)
+
     base =
       Path.join(
         System.tmp_dir!(),
@@ -678,10 +684,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         name: nil,
         base_dir: base,
         machine: "testhost",
-        park: fn :openai ->
-          send(owner, :parked)
-          :ok
-        end
+        park_edge: Tightbeam.CommandEdge.request_to(park_receiver)
       )
 
     on_auth_event = fn
@@ -746,17 +749,20 @@ defmodule Tightbeam.Acp.AdapterTest do
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
     {:ok, adapter_slot} = Agent.start_link(fn -> nil end)
 
+    {:ok, park_receiver} =
+      Tightbeam.CredentialParkTestReceiver.start_link(fn :openai ->
+        adapter = Agent.get(adapter_slot, & &1)
+        _ = Adapter.knows_session?(adapter, "missing")
+        send(owner, :parked)
+        :ok
+      end)
+
     start_supervised!(
       {Tightbeam.Credentials,
        name: Tightbeam.Credentials,
        base_dir: base,
        machine: "testhost",
-       park: fn :openai ->
-         adapter = Agent.get(adapter_slot, & &1)
-         _ = Adapter.knows_session?(adapter, "missing")
-         send(owner, :parked)
-         :ok
-       end}
+       park_edge: Tightbeam.CommandEdge.request_to(park_receiver)}
     )
 
     placement_opts =
