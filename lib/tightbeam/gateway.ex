@@ -1539,7 +1539,7 @@ defmodule Tightbeam.Gateway do
   # `cause` is the precise reason the record already carries. The human reading
   # this decides from the cause, so it is the line that must be here — a brief
   # that only says `condition=other` tells them nothing they can act on.
-  defp adjudication_brief(session, condition, cause, owner_model, inventories) do
+  defp adjudication_brief(session, condition, cause, current_model, inventories) do
     archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
     """
@@ -1547,7 +1547,7 @@ defmodule Tightbeam.Gateway do
     affected_session=#{session.session_key}
     condition=#{condition}
     cause=#{cause || "unclassified"}
-    current_model=#{owner_model}
+    current_model=#{current_model}
     current_harness=#{session.harness}
     model_preferences=#{JSON.encode!(archetype.model_preferences)}
     live_catalog_host=#{session.host}
@@ -1808,10 +1808,10 @@ defmodule Tightbeam.Gateway do
           # generations reset across boots and can spuriously match.
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
             true ->
-              # Residency proves only that this adapter process knows the
-              # session. Its model map is a cache, not an owner read, so it may
-              # never overwrite the record.
-              {:ok, pointer.harness_session_id}
+              case push_known_model(adapter, pointer.harness_session_id, session.model) do
+                :ok -> {:ok, pointer.harness_session_id}
+                {:error, _reason} = error -> error
+              end
 
             false ->
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
@@ -1827,33 +1827,18 @@ defmodule Tightbeam.Gateway do
                        mcp_servers,
                        snapshot.guidance
                      ) do
-                  {:ok, owner_model} ->
-                    case reconcile_loaded_model(
-                           db,
-                           adapter,
-                           pointer.harness_session_id,
-                           session.session_key,
-                           owner_model
-                         ) do
-                      :ok ->
-                        Org.append_pointer(
-                          db,
-                          session.session_key,
-                          pointer.harness_session_id,
-                          "loaded"
-                        )
+                  {:ok, _pushed_or_unknown} ->
+                    Org.append_pointer(
+                      db,
+                      session.session_key,
+                      pointer.harness_session_id,
+                      "loaded"
+                    )
 
-                        Org.set_identity_revision(db, session.session_key, snapshot.revision)
-                        {:ok, pointer.harness_session_id}
-
-                      {:error, _reason} = error ->
-                        error
-                    end
+                    Org.set_identity_revision(db, session.session_key, snapshot.revision)
+                    {:ok, pointer.harness_session_id}
 
                   {:error, {:model_apply_failed, _reason}} = error ->
-                    error
-
-                  {:error, :model_readback_unavailable} = error ->
                     error
 
                   # An adapter that could not answer has NOT told us the harness
@@ -2200,7 +2185,7 @@ defmodule Tightbeam.Gateway do
          # something it has never heard of.
          true <- Adapter.knows_session?(adapter, pointer.harness_session_id),
          :ok <- Adapter.close_session(adapter, pointer.harness_session_id),
-         {:ok, owner_model} <-
+         {:ok, _pushed_or_unknown} <-
            Adapter.load_session(
              adapter,
              pointer.harness_session_id,
@@ -2208,14 +2193,6 @@ defmodule Tightbeam.Gateway do
              cwd,
              mcp_servers,
              snapshot.guidance
-           ),
-         :ok <-
-           reconcile_loaded_model(
-             db,
-             adapter,
-             pointer.harness_session_id,
-             session.session_key,
-             owner_model
            ) do
       Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
       Org.set_identity_revision(db, session.session_key, snapshot.revision)
@@ -3347,7 +3324,7 @@ defmodule Tightbeam.Gateway do
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
               snapshot = served_snapshot(config, session, harness, revision)
 
-              with {:ok, owner_model} <-
+              with {:ok, ^new_ref} <-
                      AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
                        Adapter.load_session(
                          adapter,
@@ -3357,16 +3334,8 @@ defmodule Tightbeam.Gateway do
                          mcp_servers_for_archetype(session.archetype),
                          snapshot.guidance
                        )
-                     end),
-                   :ok <-
-                     reconcile_loaded_model(
-                       db,
-                       adapter,
-                       pointer.harness_session_id,
-                       session.session_key,
-                       owner_model
-                     ) do
-                apply_and_project_tuned_model(
+                     end) do
+                project_tuned_model(
                   db,
                   session,
                   adapter,
@@ -3391,38 +3360,42 @@ defmodule Tightbeam.Gateway do
     # before the DB transaction begins; the DB owner never calls upward.
     case Adapter.apply_model(adapter, sid, new_ref) do
       :ok ->
-        result =
-          DB.transaction(db, fn txn ->
-            [[record_model, record_harness]] =
-              Txn.q(
-                txn,
-                "SELECT model, harness FROM sessions WHERE sessionKey=?1",
-                [session.session_key]
-              )
-
-            case Org.swap_model_in_txn(
-                   txn,
-                   session.session_key,
-                   {record_model, record_harness},
-                   {new_ref, record_harness, provider}
-                 ) do
-              {:ok, _} -> :ok
-              {:duplicate, _} -> :ok
-              :stale -> raise("model mutation race inside serialized tune")
-            end
-          end)
-
-        case result do
-          {:ok, :ok} ->
-            :ok
-
-          {:error, error} ->
-            :ok = Adapter.forget_model_residency(adapter, sid)
-            raise error
-        end
+        project_tuned_model(db, session, adapter, sid, new_ref, provider)
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp project_tuned_model(db, session, adapter, sid, new_ref, provider) do
+    result =
+      DB.transaction(db, fn txn ->
+        [[record_model, record_harness]] =
+          Txn.q(
+            txn,
+            "SELECT model, harness FROM sessions WHERE sessionKey=?1",
+            [session.session_key]
+          )
+
+        case Org.swap_model_in_txn(
+               txn,
+               session.session_key,
+               {record_model, record_harness},
+               {new_ref, record_harness, provider}
+             ) do
+          {:ok, _} -> :ok
+          {:duplicate, _} -> :ok
+          :stale -> raise("model mutation race inside serialized tune")
+        end
+      end)
+
+    case result do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        :ok = Adapter.forget_model_residency(adapter, sid)
+        raise error
     end
   end
 
@@ -5137,44 +5110,8 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp reconcile_loaded_model(db, adapter, sid, session_key, owner_model) do
-    case reconcile_model_projection(db, session_key, owner_model) do
-      :ok ->
-        :ok
-
-      {:error, _reason} = error ->
-        :ok = Adapter.forget_model_residency(adapter, sid)
-        error
-    end
-  end
-
-  defp reconcile_model_projection(db, session_key, owner_model) do
-    case DB.transaction(db, fn txn ->
-           case Txn.q(
-                  txn,
-                  "SELECT model, harness, provider FROM sessions WHERE sessionKey=?1",
-                  [session_key]
-                ) do
-             [[^owner_model, _harness, _provider]] ->
-               :ok
-
-             [[record_model, harness, provider]] ->
-               case Org.swap_model_in_txn(
-                      txn,
-                      session_key,
-                      {record_model, harness},
-                      {owner_model, harness, provider}
-                    ) do
-                 {:ok, _} -> :ok
-                 {:duplicate, _} -> :ok
-                 :stale -> raise("model reconciliation race inside serialized projection")
-               end
-           end
-         end) do
-      {:ok, :ok} -> :ok
-      {:error, error} -> {:error, error}
-    end
-  end
+  defp push_known_model(_adapter, _sid, model) when not is_binary(model), do: :ok
+  defp push_known_model(adapter, sid, model), do: Adapter.apply_model(adapter, sid, model)
 
   # A fallback is a substrate event a reader of the CHAT must see: the
   # model's working memory ended here while the visible history did not —

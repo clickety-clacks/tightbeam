@@ -425,13 +425,28 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.prompt(a, "sess-1", "say pong")
   end
 
-  test "load_session reads the harness owner without pushing the record model" do
+  test "load_session pushes the known canonical record model" do
     {a, capture_path} = start_adapter(fail_mode: "load-owner")
 
-    assert {:ok, "owner-model"} =
+    assert {:ok, "stale-record"} =
              Adapter.load_session(a, "sess-1", "stale-record", "/tmp", [], "guidance")
 
-    assert {:ok, "owner-model"} = Adapter.current_model(a, "sess-1")
+    assert {:ok, "stale-record"} = Adapter.current_model(a, "sess-1")
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "stale-record"
+           end)
+  end
+
+  test "load_session leaves the harness untouched when the record model is unknown" do
+    {a, capture_path} = start_adapter(fail_mode: "load-owner")
+
+    assert {:ok, :unknown} =
+             Adapter.load_session(a, "sess-1", nil, "/tmp", [], "guidance")
+
+    assert Adapter.knows_session?(a, "sess-1")
+    assert {:error, :model_readback_unavailable} = Adapter.current_model(a, "sess-1")
 
     refute Enum.any?(
              captured_requests(capture_path),
@@ -439,7 +454,7 @@ defmodule Tightbeam.Acp.AdapterTest do
            )
   end
 
-  test "load_session then prompt (owner read path)" do
+  test "load_session then prompt (canonical push path)" do
     {a, capture_path} = start_adapter()
 
     mcp_servers = [
@@ -538,7 +553,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert {:ok, "sess-1"} =
                Adapter.new_session(adapter, "haiku", "/tmp", [], "served guidance")
 
-      assert {:ok, _owner_model} =
+      assert {:ok, _pushed_model} =
                Adapter.load_session(
                  adapter,
                  "sess-1",
@@ -591,35 +606,35 @@ defmodule Tightbeam.Acp.AdapterTest do
                     }}
   end
 
-  # FAIL-BEFORE: against the tree preceding #99 both calls returned the raw
-  # JSON-RPC envelope, which the gateway could only record as an unclassifiable
-  # harness error.
-  test "the adapter's -32602 model refusal surfaces on new while load adopts the owner" do
+  # FAIL-BEFORE: against the tree preceding #99 new returned the raw JSON-RPC
+  # envelope, which the gateway could only record as an unclassifiable error.
+  test "the adapter's -32602 model refusal surfaces on new and canonical reattach" do
     {adapter, _capture} = start_adapter(harness: :codex, fail_mode: "model-invalid-params")
 
     assert {:error, :model_unavailable} =
              Adapter.new_session(adapter, "gpt-5.1-codex", "/tmp", [], "guidance")
 
-    assert {:ok, "haiku[medium]"} =
+    assert {:error, {:model_apply_failed, :model_unavailable}} =
              Adapter.load_session(adapter, "sess-1", "gpt-5.1-codex", "/tmp", [], "guidance")
 
-    assert Adapter.knows_session?(adapter, "sess-1")
+    refute Adapter.knows_session?(adapter, "sess-1")
   end
 
-  test "new surfaces model apply failures while load reads the resident owner" do
+  test "new and canonical reattach surface model apply failures" do
     {adapter, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
 
     assert {:error, %{"message" => "Invalid value for config option model"}} =
              Adapter.new_session(adapter, "fable", "/tmp", [], "guidance")
 
-    assert {:ok, "haiku"} =
+    assert {:error,
+            {:model_apply_failed, %{"message" => "Invalid value for config option model"}}} =
              Adapter.load_session(adapter, "sess-1", "fable", "/tmp", [], "guidance")
 
-    assert Adapter.knows_session?(adapter, "sess-1")
+    refute Adapter.knows_session?(adapter, "sess-1")
 
     {codex, _capture} = start_adapter(harness: :codex)
 
-    assert {:ok, "haiku[medium]"} =
+    assert {:ok, "gpt-old[medium]"} =
              Adapter.load_session(codex, "sess-1", "gpt-old[medium]", "/tmp", [], "guidance")
 
     assert :ok = Adapter.apply_model(codex, "sess-1", "gpt-old[medium]")
@@ -628,7 +643,7 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.apply_model_strict(codex, "sess-1", "gpt-new[high]", "gpt-old[medium]")
   end
 
-  test "strict apply treats cache disagreement as unknown and forces an owner reload" do
+  test "strict apply treats cache disagreement as unknown and forces a canonical reload" do
     {adapter, capture_path} = start_adapter(harness: :codex)
 
     assert {:ok, "sess-1"} =
@@ -643,7 +658,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:ok, "gpt-new[high]"} =
+    assert {:ok, "gpt-old[medium]"} =
              Adapter.load_session(
                adapter,
                "sess-1",
@@ -658,7 +673,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
       |> Enum.map(& &1["value"])
 
-    assert model_writes == ["gpt-old", "gpt-new"]
+    assert model_writes == ["gpt-old", "gpt-new", "gpt-old"]
   end
 
   test "a failed strict apply cannot leave its pre-apply cache authoritative" do
@@ -679,7 +694,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:ok, "gpt-new[medium]"} =
+    assert {:error, {:model_apply_failed, %{"message" => "rollback refused"}}} =
              Adapter.load_session(
                adapter,
                "sess-1",
@@ -688,6 +703,8 @@ defmodule Tightbeam.Acp.AdapterTest do
                [],
                "guidance"
              )
+
+    refute Adapter.knows_session?(adapter, "sess-1")
   end
 
   test "a failed ordinary apply also forfeits cached residency" do
@@ -703,7 +720,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:ok, "gpt-new[medium]"} =
+    assert {:ok, "gpt-old[medium]"} =
              Adapter.load_session(
                adapter,
                "sess-1",

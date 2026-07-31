@@ -67,11 +67,10 @@ defmodule Tightbeam.AdapterHealTest do
       do: {:reply, Map.get(state, :current_model, {:error, :model_readback_unavailable}), state}
   end
 
-  # The HARNESS side of a model swap, and the only authority on which model is
-  # loaded: `held/1` is a read of the running agent, never of the substrate's
-  # record. `on_applied` fires INSIDE the accepted swap, which is the seam F3
-  # needs — the live harness has already moved, and nothing the ruling does has
-  # run yet.
+  # The HARNESS side of a model swap. `held/1` is a read of the running agent,
+  # while the record is the canonical value each reattach pushes. `on_applied`
+  # fires INSIDE the accepted swap, which is the seam F3 needs — the live
+  # harness has already moved, and nothing the ruling does has run yet.
   defmodule SwapAdapterStub do
     @moduledoc false
     use GenServer
@@ -126,15 +125,23 @@ defmodule Tightbeam.AdapterHealTest do
     def handle_call({:knows_session?, _sid}, _from, state),
       do: {:reply, state.known, state}
 
-    def handle_call({:load_session, _sid, _model, _cwd, _mcp, _guidance}, _from, state) do
-      state = %{
-        state
-        | known: true,
-          cached_model: state.model,
-          load_count: state.load_count + 1
-      }
+    def handle_call({:load_session, _sid, model, _cwd, _mcp, _guidance}, _from, state) do
+      case model do
+        model when is_binary(model) ->
+          state = %{
+            state
+            | model: model,
+              known: true,
+              cached_model: model,
+              load_count: state.load_count + 1
+          }
 
-      {:reply, {:ok, state.model}, state}
+          {:reply, {:ok, model}, state}
+
+        _unknown ->
+          state = %{state | known: true, cached_model: nil, load_count: state.load_count + 1}
+          {:reply, {:ok, :unknown}, state}
+      end
     end
 
     def handle_call({:apply_model, _sid, model}, _from, state) do
@@ -178,6 +185,8 @@ defmodule Tightbeam.AdapterHealTest do
 
     def handle_call({:current_model, _sid}, _from, state),
       do: {:reply, {:ok, "claude-fable-5"}, state}
+
+    def handle_call({:apply_model, _sid, _model}, _from, state), do: {:reply, :ok, state}
 
     # What Acp.Adapter's own {:acp_exit, status} handler produces when the harness
     # process dies mid-turn: the adapter stops before it can reply.
@@ -449,7 +458,7 @@ defmodule Tightbeam.AdapterHealTest do
     refute prompt =~ "current_model=claude-fable-5"
   end
 
-  test "the owner's brief reports unknown instead of asserting the adapter cache", ctx do
+  test "the owner's brief stays unknown after the canonical record is pushed", ctx do
     adapter =
       swap_harness(ctx,
         checkout: {:error, :degraded},
@@ -462,7 +471,7 @@ defmodule Tightbeam.AdapterHealTest do
     run_failing_turn(ctx, "the turn whose brief must name the owner")
 
     assert Org.get(ctx.db, "k1").model == "claude-fable-5"
-    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    assert SwapAdapterStub.held(adapter) == "claude-fable-5"
     assert SwapAdapterStub.cached(adapter) == "claude-fable-5"
 
     prompt = Wakes.get(ctx.db, episode(ctx.db).owner_wake_id).prompt
@@ -471,7 +480,7 @@ defmodule Tightbeam.AdapterHealTest do
     refute prompt =~ "current_model=claude-fable-5"
   end
 
-  test "resident stale adapter cache cannot overwrite the correct model record", ctx do
+  test "resident stale adapter cache is replaced by the canonical record", ctx do
     adapter =
       swap_harness(ctx,
         checkout: {:error, :degraded},
@@ -486,7 +495,7 @@ defmodule Tightbeam.AdapterHealTest do
 
     assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
     assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
-    assert SwapAdapterStub.cached(adapter) == "claude-fable-5"
+    assert SwapAdapterStub.cached(adapter) == "claude-sonnet-4-6"
     assert SwapAdapterStub.load_count(adapter) == 0
   end
 
@@ -1482,12 +1491,12 @@ defmodule Tightbeam.AdapterHealTest do
     refute match?({:raised, _}, first_result)
     refute match?({:raised, _}, second_result)
 
-    owner_model = SwapAdapterStub.held(adapter)
-    assert Org.get(ctx.db, "k1").model == owner_model
+    applied_model = SwapAdapterStub.held(adapter)
+    assert Org.get(ctx.db, "k1").model == applied_model
 
     resolved = Adjudication.get(ctx.db, "k1", "other")
     prompt = Wakes.get(ctx.db, resolved.recovery_wake_id).prompt
-    assert prompt =~ "You now run on #{owner_model}"
+    assert prompt =~ "You now run on #{applied_model}"
   end
 
   test "F3: a concurrent tune cannot invalidate the model before its ruling commits", ctx do
@@ -1634,7 +1643,8 @@ defmodule Tightbeam.AdapterHealTest do
              "You now run on claude-sonnet-4-6"
   end
 
-  test "F3: a failed projection heals from the owner on the next residency pass", ctx do
+  test "F3: a failed projection reasserts the canonical record on the next residency pass",
+       ctx do
     adapter = swap_harness(ctx, checkout: {:error, :degraded})
     run_failing_turn(ctx, "fault")
     episode = episode(ctx.db)
@@ -1672,13 +1682,13 @@ defmodule Tightbeam.AdapterHealTest do
     :ok = DB.execute(ctx.db, "DROP TRIGGER fail_model_projection")
 
     run_residency_pass(ctx)
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
     assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter)
     assert SwapAdapterStub.apply_count(adapter) == 1
     assert episode(ctx.db).status == "notified"
   end
 
-  test "F3: an uncertain strict apply rereads the owner on the next residency pass", ctx do
+  test "F3: an uncertain strict apply reasserts the record on the next residency pass", ctx do
     adapter =
       swap_harness(ctx,
         checkout: {:error, :degraded},
@@ -1707,7 +1717,7 @@ defmodule Tightbeam.AdapterHealTest do
     run_residency_pass(ctx)
 
     assert SwapAdapterStub.load_count(adapter) == 1
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
     assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter)
   end
 

@@ -82,9 +82,9 @@ defmodule Tightbeam.Acp.Adapter do
   def new_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
 
-  @doc "Adopt an existing harness session and return the model the harness reports as current."
-  @spec load_session(adapter(), String.t(), model_ref(), String.t(), [map()], String.t()) ::
-          {:ok, model_ref()} | {:error, term()}
+  @doc "Adopt an existing harness session and push the canonical model when it is known."
+  @spec load_session(adapter(), String.t(), model_ref() | nil, String.t(), [map()], String.t()) ::
+          {:ok, model_ref() | :unknown} | {:error, term()}
   def load_session(adapter, session_id, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:load_session, session_id, model, cwd, mcp_servers, guidance}, 30_000)
 
@@ -366,31 +366,35 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:load_session, sid, _model, cwd, mcp_servers, guidance}, _from, state) do
+  def handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
     case Conn.request(state.conn, "session/load", %{
            sessionId: sid,
            cwd: cwd,
            mcpServers: mcp_servers,
            _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
          }) do
-      {:ok, result} ->
-        case model_ref_from_config(result, state.preset.effort_config) do
-          {:ok, owner_model} ->
-            state =
-              state
-              |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-              |> put_in([Access.key(:models), sid], owner_model)
+      {:ok, _result} ->
+        state =
+          state
+          |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+          |> put_in([Access.key(:models)], Map.delete(state.models, sid))
+          |> put_in([Access.key(:chunks), sid], [])
 
-            {:reply, {:ok, owner_model}, put_in(state.chunks[sid], [])}
+        case model do
+          model when is_binary(model) ->
+            case apply_model_to_session(state, sid, model) do
+              {:ok, applied_model} ->
+                {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
 
-          :error ->
-            state = %{
-              state
-              | known: MapSet.delete(state.known, sid),
-                models: Map.delete(state.models, sid)
-            }
+              {:error, reason} ->
+                {:reply, {:error, {:model_apply_failed, reason}},
+                 drop_model_residency(state, sid)}
+            end
 
-            {:reply, {:error, :model_readback_unavailable}, state}
+          _unknown ->
+            # No canonical value means no push. The session is resident, but
+            # its model remains deliberately absent from the adapter cache.
+            {:reply, {:ok, :unknown}, state}
         end
 
       {:error, error} ->

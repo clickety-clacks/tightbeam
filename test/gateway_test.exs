@@ -354,7 +354,7 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  defmodule LoadReadbackFailureAdapterStub do
+  defmodule LoadWithoutOwnerReadAdapterStub do
     use GenServer
 
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
@@ -365,9 +365,9 @@ defmodule Tightbeam.GatewayTest do
       {:reply, false, parent}
     end
 
-    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance}, _from, parent) do
-      send(parent, {:load_readback_failed, sid})
-      {:reply, {:error, :model_readback_unavailable}, parent}
+    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:canonical_model_pushed_on_load, sid, model})
+      {:reply, {:ok, model}, parent}
     end
 
     def handle_call({:new_session, _model, _cwd, _mcp, _guidance}, _from, parent) do
@@ -376,8 +376,8 @@ defmodule Tightbeam.GatewayTest do
     end
 
     def handle_call({:prompt, _sid, _prompt, _opts}, _from, parent) do
-      send(parent, :unexpected_load_apply_prompt)
-      {:reply, {:ok, %{text: "unexpected", stop_reason: "end_turn"}}, parent}
+      send(parent, :load_without_owner_read_prompted)
+      {:reply, {:ok, %{text: "continued", stop_reason: "end_turn"}}, parent}
     end
   end
 
@@ -4382,14 +4382,14 @@ defmodule Tightbeam.GatewayTest do
              EventLog.lifecycle_events(ctx.db) |> Enum.filter(&(&1.kind == "pointer_fallback"))
   end
 
-  test "load model read-back failure fails the turn without forfeiting session context", ctx do
+  test "reattach pushes the canonical record without requiring an owner read", ctx do
     exact_registry =
       start_supervised!(%{
         id: :load_apply_failure_conn_registry,
         start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
       })
 
-    adapter = start_supervised!({LoadReadbackFailureAdapterStub, self()})
+    adapter = start_supervised!({LoadWithoutOwnerReadAdapterStub, self()})
     start_supervised!({CoordinatorStub, adapter})
 
     {:ok, _ref, nil} =
@@ -4434,18 +4434,16 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
-    assert {:error,
-            %{
-              reason: :model_readback_unavailable,
-              terminal_publish: failure_publish
-            }} = runner.(Map.put(turn, :session_key, "k1"))
+    assert {:ok, %{terminal_publish: publish}} =
+             runner.(Map.put(turn, :session_key, "k1"))
 
-    failure_publish.("failed")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    publish.("delivered")
     assert_receive {:load_apply_residency, "load-apply-session"}
-    assert_receive {:load_readback_failed, "load-apply-session"}
+    assert_receive {:canonical_model_pushed_on_load, "load-apply-session", "fable"}
+    assert_receive :load_without_owner_read_prompted
     refute_receive :unexpected_load_apply_new_session
-    refute_receive :unexpected_load_apply_prompt
-    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created"]
+    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "loaded"]
     refute Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "pointer_fallback"))
 
     refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
