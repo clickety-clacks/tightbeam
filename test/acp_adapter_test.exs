@@ -164,6 +164,18 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/prompt": {
         const sid = m.params.sessionId;
         capture(m);
+        if (failMode === "subagent-order") {
+          send({ method: "session/update", params: { sessionId: sid, update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call-codex-1",
+            status: "completed",
+            _meta: { codex: { subagentTerminated: {
+              agentThreadId: "thread-child-1",
+              threadStatus: { type: "idle" }
+            } } }
+          } } });
+          return send({ id: m.id, result: { stopReason: "end_turn" } });
+        }
         if (gateMode === "stall-turn") return;
         if (sid === "probe-sess") {
           if (gateMode === "pass-message") {
@@ -827,7 +839,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert_receive {:subagent, "sess-1", ^update}
   end
 
-  test "placement subagent callback does not block the adapter on matching wake delivery" do
+  test "real prompt captures subagent attribution before prompt_done terminals the turn" do
     owner = self()
 
     base =
@@ -902,43 +914,25 @@ defmodule Tightbeam.Acp.AdapterTest do
         {:codex, "default", "testhost"}
       )
 
-    placement_handler = placement_opts[:on_subagent_event]
-
     {adapter, _capture_path} =
       start_adapter(
         harness: :codex,
-        on_subagent_event: fn sid, update ->
-          result = placement_handler.(sid, update)
-          send(owner, :subagent_event_captured)
-          result
-        end,
+        fail_mode: "subagent-order",
+        on_subagent_event: placement_opts[:on_subagent_event],
         on_ready: fn -> send(owner, :booted) end
       )
 
     Agent.update(adapter_slot, fn nil -> adapter end)
     assert_ready(adapter, :booted)
 
-    update = %{
-      "sessionUpdate" => "tool_call_update",
-      "toolCallId" => "call-codex-1",
-      "status" => "completed",
-      "_meta" => %{
-        "codex" => %{
-          "subagentTerminated" => %{
-            "agentThreadId" => "thread-child-1",
-            "threadStatus" => %{"type" => "idle"}
-          }
-        }
-      }
-    }
+    prompt =
+      Task.async(fn ->
+        result = Adapter.prompt(adapter, "sess-1", "run")
+        :ok = Tightbeam.Ledger.finish(db, turn_seq, "delivered")
+        result
+      end)
 
-    send(
-      adapter,
-      {:acp_notification, "session/update", %{"sessionId" => "sess-1", "update" => update}}
-    )
-
-    assert_receive :subagent_event_captured
-    :ok = Tightbeam.Ledger.finish(db, turn_seq, "delivered")
+    assert {:ok, %{stop_reason: "end_turn"}} = Task.await(prompt)
     assert_receive {:matching_fired, fact_id, false}, 2_000
     assert is_integer(fact_id)
     assert [%{assignment_id: "assignment-running"}] = Tightbeam.SubagentMarkers.list(db)
