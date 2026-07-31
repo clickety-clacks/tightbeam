@@ -62,6 +62,9 @@ defmodule Tightbeam.AdapterHealTest do
 
     def handle_call({:load_session, _sid, _model, _cwd, _mcp, _guidance}, _from, state),
       do: {:reply, Map.fetch!(state, :load_session), state}
+
+    def handle_call({:current_model, _sid}, _from, state),
+      do: {:reply, Map.get(state, :current_model, {:error, :model_readback_unavailable}), state}
   end
 
   # The HARNESS side of a model swap, and the only authority on which model is
@@ -137,8 +140,12 @@ defmodule Tightbeam.AdapterHealTest do
       {:reply, :ok, %{state | model: model}}
     end
 
-    def handle_call({:prompt, _sid, _text, _opts}, _from, state),
-      do: {:reply, {:ok, %{stop_reason: "end_turn", text: "continued"}}, state}
+    def handle_call({:prompt, _sid, _text, _opts}, _from, state) do
+      case state[:prompt_error] do
+        nil -> {:reply, {:ok, %{stop_reason: "end_turn", text: "continued"}}, state}
+        reason -> {:reply, {:error, reason}, state}
+      end
+    end
 
     def handle_call({:current_model, _sid}, _from, state),
       do: {:reply, {:ok, state.model}, state}
@@ -426,6 +433,27 @@ defmodule Tightbeam.AdapterHealTest do
     # no longer the only classification the human gets.
     assert prompt =~ "condition="
     refute prompt =~ "cause=unclassified"
+    assert prompt =~ "current_model=unknown (harness unreachable)"
+    refute prompt =~ "current_model=claude-fable-5"
+  end
+
+  test "the owner's brief reads the loaded model after residency reconciles a stale record",
+       ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        model: "claude-sonnet-4-6",
+        prompt_error: :prompt_dispatch_failed
+      )
+
+    swap_ready(adapter, nil)
+    run_failing_turn(ctx, "the turn whose brief must name the owner")
+
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+
+    prompt = Wakes.get(ctx.db, episode(ctx.db).owner_wake_id).prompt
+    assert prompt =~ "current_model=claude-sonnet-4-6"
+    refute prompt =~ "current_model=claude-fable-5"
   end
 
   ## Proof 2 — fault → hold → heal → auto-release, probe FIRST
@@ -1770,8 +1798,8 @@ defmodule Tightbeam.AdapterHealTest do
 
     adapter_opts =
       opts
-      |> Keyword.take([:strict_error])
-      |> Keyword.put(:model, "claude-fable-5")
+      |> Keyword.take([:strict_error, :prompt_error, :model])
+      |> Keyword.put_new(:model, "claude-fable-5")
       |> Keyword.put(:parent, self())
 
     adapter = start_supervised!({SwapAdapterStub, adapter_opts}, id: :swap_adapter)

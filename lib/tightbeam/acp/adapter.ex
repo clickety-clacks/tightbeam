@@ -142,11 +142,11 @@ defmodule Tightbeam.Acp.Adapter do
     do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
 
   @doc "The last model value confirmed by this serialized harness adapter."
-  @spec current_model(adapter(), String.t()) ::
+  @spec current_model(adapter(), String.t(), timeout()) ::
           {:ok, model_ref()}
           | {:error, :model_readback_unavailable | {:adapter_unavailable, term()}}
-  def current_model(adapter, session_id),
-    do: call(adapter, {:current_model, session_id}, @boot_boundary_timeout)
+  def current_model(adapter, session_id, timeout \\ @boot_boundary_timeout),
+    do: call(adapter, {:current_model, session_id}, timeout)
 
   @doc "Apply a model selection and surface any explicit harness refusal."
   @spec apply_model(adapter(), String.t(), model_ref()) :: :ok | {:error, term()}

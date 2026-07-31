@@ -1404,7 +1404,12 @@ defmodule Tightbeam.Gateway do
           {:error, {failed_stage, reason}} ->
             condition = Adjudication.classify(reason)
             cause = adjudication_cause(failed_stage, reason, adapter_key)
-            adjudication_prompt = adjudication_brief(session, condition, cause)
+            # Resolve the adapter outside the DB owner, then read its confirmed
+            # owner value inside the ruling transaction. Ordinary tune uses the
+            # same serializer, so the brief cannot commit a model claim that a
+            # concurrent tune already invalidated.
+            brief_owner = strict_model_adapter(db, session)
+            brief_inventories = adjudication_model_inventories(session)
 
             failure_publish = fn _terminal ->
               # No assistant final will arrive to clear the indicator label —
@@ -1469,6 +1474,15 @@ defmodule Tightbeam.Gateway do
                   )
 
               if episode do
+                adjudication_prompt =
+                  adjudication_brief(
+                    session,
+                    condition,
+                    cause,
+                    adjudication_owner_model(brief_owner),
+                    brief_inventories
+                  )
+
                 Adjudication.notify_in_txn(
                   txn,
                   episode,
@@ -1530,23 +1544,15 @@ defmodule Tightbeam.Gateway do
   # `cause` is the precise reason the record already carries. The human reading
   # this decides from the cause, so it is the line that must be here — a brief
   # that only says `condition=other` tells them nothing they can act on.
-  defp adjudication_brief(session, condition, cause) do
+  defp adjudication_brief(session, condition, cause, owner_model, inventories) do
     archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
-
-    # The affected session's OWN host: an adjudicator choosing a replacement model
-    # needs what that host can run, not what the gateway can.
-    inventories =
-      Map.new(Harness.all(), fn module ->
-        {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
-        {module.wire_name(), %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
-      end)
 
     """
     Model adjudication required.
     affected_session=#{session.session_key}
     condition=#{condition}
     cause=#{cause || "unclassified"}
-    current_model=#{session.model}
+    current_model=#{owner_model}
     current_harness=#{session.harness}
     model_preferences=#{JSON.encode!(archetype.model_preferences)}
     live_catalog_host=#{session.host}
@@ -1555,6 +1561,25 @@ defmodule Tightbeam.Gateway do
     Reply with: tightbeam adjudicate --episode <correlationKey> --action park|swap|respawn|stop [--model <ref>] [--reason <text>]
     """
   end
+
+  # The affected session's OWN host: an adjudicator choosing a replacement model
+  # needs what that host can run, not what the gateway can. Read this outside the
+  # ruling transaction; catalog refresh may consult the DB owner.
+  defp adjudication_model_inventories(session) do
+    Map.new(Harness.all(), fn module ->
+      {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
+      {module.wire_name(), %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
+    end)
+  end
+
+  defp adjudication_owner_model({:ok, adapter, sid}) do
+    case Adapter.current_model(adapter, sid, 1_000) do
+      {:ok, owner_model} -> owner_model
+      _ -> "unknown (harness unreachable)"
+    end
+  end
+
+  defp adjudication_owner_model({:error, _reason}), do: "unknown (harness unreachable)"
 
   # Wire publication for terminals that lost their runner closure: turns
   # recovered at boot (failed_unknown), task crashes, republished rows. The
