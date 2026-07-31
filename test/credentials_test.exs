@@ -238,6 +238,24 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == :onboarded
   end
 
+  test "an unconfirmed park is returned as data and Credentials keeps the durable gate", ctx do
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        park: fn :openai -> {:error, {:park_unconfirmed, :identity_unavailable}} end
+      )
+
+    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")["params"]
+
+    assert {:error, {:park_unconfirmed, :identity_unavailable}} =
+             Credentials.mark_terminal(:openai, evidence, server)
+
+    assert Process.alive?(server)
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :revoked}
+  end
+
   test "terminal capture remains immutable while the park mutates membership", ctx do
     owner = self()
     {:ok, membership} = Agent.start_link(fn -> [:before_one, :before_two] end)

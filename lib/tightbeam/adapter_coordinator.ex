@@ -54,7 +54,9 @@ defmodule Tightbeam.AdapterCoordinator do
   @type adapter_key :: Tightbeam.Placement.adapter_key()
 
   @typedoc "What a lane needs to run a turn: the adapter pid and the generation it belongs to."
-  @type checkout :: {:ok, pid(), generation :: pos_integer()} | {:error, :degraded}
+  @type checkout ::
+          {:ok, pid(), generation :: pos_integer()}
+          | {:error, :degraded | {:park_unconfirmed, term()}}
 
   @doc """
   Start the coordinator. Opts: `:adapter_sup` (the DynamicSupervisor),
@@ -111,6 +113,10 @@ defmodule Tightbeam.AdapterCoordinator do
   def health(server \\ __MODULE__) do
     GenServer.call(server, :health)
   end
+
+  @doc "Durable launch ledger for operator diagnosis, newest launch first."
+  @spec harness_processes(GenServer.server()) :: [Tightbeam.HarnessProcess.row()]
+  def harness_processes(server \\ __MODULE__), do: GenServer.call(server, :harness_processes)
 
   @typedoc "Heal token: epoch-first, then generation (see the moduledoc)."
   @type heal_token :: {pos_integer(), non_neg_integer()}
@@ -214,13 +220,11 @@ defmodule Tightbeam.AdapterCoordinator do
   Bumps the generation: the successor's ready token must outrank every token
   stamped against the closed process, exactly as after a crash.
   """
-  @spec close_adapter(GenServer.server(), adapter_key()) :: :ok
+  @spec close_adapter(GenServer.server(), adapter_key()) :: :ok | {:error, term()}
   def close_adapter(server \\ __MODULE__, key) do
-    GenServer.call(server, {:close_adapter, key})
-  rescue
-    _reason -> :ok
+    GenServer.call(server, {:close_adapter, key}, 30_000)
   catch
-    :exit, _reason -> :ok
+    :exit, reason -> {:error, {:coordinator_unavailable, reason}}
   end
 
   @doc """
@@ -236,16 +240,21 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def init(opts) do
+    db = Keyword.get(opts, :db, Tightbeam.DB)
+    :ok = Tightbeam.HarnessProcess.ensure_schema(db)
+    :ok = Tightbeam.HarnessProcess.reconcile(db)
+
     {:ok,
      %{
        adapter_sup: Keyword.fetch!(opts, :adapter_sup),
        adapter_context: Keyword.fetch!(opts, :adapter_context),
        adapter_opts: Keyword.fetch!(opts, :adapter_opts),
-       db: Keyword.get(opts, :db, Tightbeam.DB),
+       db: db,
+       park_grace_ms: Keyword.get(opts, :park_grace_ms, 10_000),
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
        load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
        failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
-       epoch: mint_epoch(Keyword.get(opts, :db, Tightbeam.DB)),
+       epoch: mint_epoch(db),
        on_adapter_ready: Keyword.get(opts, :on_adapter_ready, fn _key_name, _token -> :ok end),
        adapters: %{},
        monitors: %{},
@@ -265,6 +274,9 @@ defmodule Tightbeam.AdapterCoordinator do
 
       live_entry?(entry) ->
         {:reply, checkout(entry), state}
+
+      Tightbeam.HarnessProcess.fenced?(state.db, key) ->
+        {:reply, {:error, {:park_unconfirmed, key_name(key)}}, state}
 
       true ->
         {:noreply, capture_adapter_context(key, {:checkout, from}, state)}
@@ -323,8 +335,13 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, health, state}
   end
 
+  def handle_call(:harness_processes, _from, state) do
+    {:reply, Tightbeam.HarnessProcess.list(state.db), state}
+  end
+
   def handle_call({:close_adapter, key}, _from, state) do
-    {:reply, :ok, do_close_adapter(key, state)}
+    {result, state} = do_close_adapter(key, state)
+    {:reply, result, state}
   end
 
   defp adapter_for_reply(key, context, state, authoritative? \\ false) do
@@ -335,12 +352,20 @@ defmodule Tightbeam.AdapterCoordinator do
         {:reply, {:error, :degraded}, state}
 
       live_entry?(entry) and authoritative? and entry.context != normalize_context(context) ->
-        state = do_close_adapter(key, state)
-        {reply, state} = start_adapter(key, state.adapters[key], state, context)
-        {:reply, reply, state}
+        case do_close_adapter(key, state) do
+          {:ok, state} ->
+            {reply, state} = start_adapter(key, state.adapters[key], state, context)
+            {:reply, reply, state}
+
+          {{:error, _reason} = error, state} ->
+            {:reply, error, state}
+        end
 
       live_entry?(entry) ->
         {:reply, checkout(entry), state}
+
+      Tightbeam.HarnessProcess.fenced?(state.db, key) ->
+        {:reply, {:error, {:park_unconfirmed, key_name(key)}}, state}
 
       true ->
         {reply, state} = start_adapter(key, entry, state, context)
@@ -350,7 +375,8 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def handle_cast({:close_adapter, key}, state) do
-    {:noreply, do_close_adapter(key, state)}
+    {_result, state} = do_close_adapter(key, state)
+    {:noreply, state}
   end
 
   def handle_cast({:release_load_slot, machine, slot}, state) do
@@ -358,41 +384,61 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp do_close_adapter(key, state) do
-    case state.adapters[key] do
-      %{pid: pid, monitor: ref} = entry when is_pid(pid) ->
-        Process.demonitor(ref, [:flush])
+    {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
 
+    case state.adapters[key] do
+      %{pid: pid} when is_pid(pid) ->
         try do
-          conn = Tightbeam.Acp.Adapter.conn(pid)
-          Tightbeam.Acp.Conn.close(conn)
-          GenServer.stop(conn)
-          GenServer.stop(pid)
+          pid |> Tightbeam.Acp.Adapter.conn() |> Tightbeam.Acp.Conn.close()
         catch
           :exit, _reason -> :ok
         end
 
-        # A planned teardown IS a death in the token algebra: without the bump,
-        # the successor's ready re-mints the SAME {epoch, generation} token, and
-        # a session re-held on that token (a credential stop/start landing in
-        # its retry window) would never be swept (spec s4-operability-v1 §2).
-        entry = %{
-          entry
-          | pid: nil,
-            monitor: nil,
-            ready: false,
-            generation: entry.generation + 1,
-            context: nil
-        }
-
-        %{
-          state
-          | adapters: Map.put(state.adapters, key, entry),
-            monitors: Map.delete(state.monitors, ref)
-        }
-
       _ ->
-        state
+        :ok
     end
+
+    result =
+      case process_row do
+        nil -> :ok
+        row -> Tightbeam.HarnessProcess.park(state.db, row, state.park_grace_ms)
+      end
+
+    state =
+      case state.adapters[key] do
+        %{pid: pid, monitor: ref} = entry when is_pid(pid) ->
+          Process.demonitor(ref, [:flush])
+
+          try do
+            GenServer.stop(pid)
+          catch
+            :exit, _reason -> :ok
+          end
+
+          # A planned teardown IS a death in the token algebra: without the bump,
+          # the successor's ready re-mints the SAME {epoch, generation} token, and
+          # a session re-held on that token (a credential stop/start landing in
+          # its retry window) would never be swept (spec s4-operability-v1 §2).
+          entry = %{
+            entry
+            | pid: nil,
+              monitor: nil,
+              ready: false,
+              generation: entry.generation + 1,
+              context: nil
+          }
+
+          %{
+            state
+            | adapters: Map.put(state.adapters, key, entry),
+              monitors: Map.delete(state.monitors, ref)
+          }
+
+        _ ->
+          state
+      end
+
+    {result, state}
   end
 
   @impl true
@@ -422,15 +468,25 @@ defmodule Tightbeam.AdapterCoordinator do
           :ok =
             Tightbeam.EventLog.lifecycle(state.db, "adapter_down", key_name(key), inspect(reason))
 
+          process_result = Tightbeam.HarnessProcess.reconcile_key(state.db, key)
           failures = entry.failures + 1
-          circuit = if failures >= state.failure_circuit, do: :open, else: :closed
+
+          circuit =
+            if failures >= state.failure_circuit or match?({:error, _}, process_result),
+              do: :open,
+              else: :closed
+
           # The death belongs to the generation that DIED, not to the bumped one
           # the replacement will carry — that is the generation a turn holding
           # this adapter checked out, and the only one it can ask about.
           died_at = entry.generation
           generation = entry.generation + 1
           delay = backoff(state, failures)
-          timer = Process.send_after(self(), {:restart_adapter, key, generation}, delay)
+
+          timer =
+            if process_result == :ok,
+              do: Process.send_after(self(), {:restart_adapter, key, generation}, delay),
+              else: nil
 
           entry = %{
             entry
@@ -510,8 +566,16 @@ defmodule Tightbeam.AdapterCoordinator do
     coordinator = self()
 
     boot = fn ->
-      adapter_opts.(key, adapter_context) ++
-        [on_ready: fn -> send(coordinator, {:adapter_ready, key}) end]
+      opts = adapter_opts.(key, adapter_context) |> Keyword.put(:db, state.db)
+
+      opts =
+        if Keyword.has_key?(opts, :process_identity_dir) do
+          Tightbeam.HarnessProcess.prepare_launch(opts, state.db, key)
+        else
+          opts
+        end
+
+      Keyword.put(opts, :on_ready, fn -> send(coordinator, {:adapter_ready, key}) end)
     end
 
     child = %{

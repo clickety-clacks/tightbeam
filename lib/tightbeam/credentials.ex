@@ -98,7 +98,7 @@ defmodule Tightbeam.Credentials do
   @doc "Begin an interactive CLI onboarding lease after gate + runtime stop."
   @spec begin_onboard(provider(), GenServer.server()) :: {:ok, String.t()} | {:error, term()}
   def begin_onboard(provider, server \\ __MODULE__),
-    do: GenServer.call(server, {:begin_onboard, provider})
+    do: GenServer.call(server, {:begin_onboard, provider}, :infinity)
 
   @doc """
   Install the credential produced in the active onboarding lease, as `kind`.
@@ -123,9 +123,9 @@ defmodule Tightbeam.Credentials do
     do: GenServer.call(server, {:cancel_onboard, provider, reason})
 
   @doc "Record terminal evidence, gate new sessions, and park running sessions."
-  @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok
+  @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok | {:error, term()}
   def mark_terminal(provider, evidence, server \\ __MODULE__),
-    do: GenServer.call(server, {:mark_terminal, provider, evidence})
+    do: GenServer.call(server, {:mark_terminal, provider, evidence}, :infinity)
 
   @doc "Classify only pinned terminal evidence. Unknown is always non-terminal."
   @spec terminal_evidence?(provider(), term()) :: boolean()
@@ -189,32 +189,39 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call({:mark_terminal, provider, evidence}, _from, state) do
-    if terminal_evidence?(provider, evidence) do
-      metadata = read_metadata(state, provider)
+    result =
+      if terminal_evidence?(provider, evidence) do
+        metadata = read_metadata(state, provider)
 
-      if metadata["terminal"] != true do
-        state.gate.(provider)
-        captured = capture_sessions(state, provider)
-        park_result = state.park.(provider)
+        if metadata["terminal"] != true do
+          state.gate.(provider)
+          captured = capture_sessions(state, provider)
+          park_result = state.park.(provider)
 
-        write_metadata!(
-          state,
-          provider,
-          Map.merge(metadata, %{
-            "provider" => Atom.to_string(provider),
-            "onboarded" => true,
-            "terminal" => true,
-            "last_health" => "revoked"
-          })
-        )
+          write_metadata!(
+            state,
+            provider,
+            Map.merge(metadata, %{
+              "provider" => Atom.to_string(provider),
+              "onboarded" => true,
+              "terminal" => true,
+              "last_health" => "revoked"
+            })
+          )
 
-        if park_result == :ok do
-          publish_sessions(state, captured, :terminal)
+          if park_result == :ok do
+            publish_sessions(state, captured, :terminal)
+          end
+
+          park_result
+        else
+          :ok
         end
+      else
+        :ok
       end
-    end
 
-    {:reply, :ok, state}
+    {:reply, result, state}
   end
 
   def handle_call({:onboard, provider}, _from, state) do

@@ -268,6 +268,20 @@ defmodule Tightbeam.Acp.Adapter do
         subscriber: self()
       )
 
+    case Keyword.fetch(opts, :harness_process_launch_id) do
+      {:ok, launch_id} ->
+        case Tightbeam.HarnessProcess.capture_identity(
+               Keyword.get(opts, :db, Tightbeam.DB),
+               launch_id
+             ) do
+          :ok -> :ok
+          {:error, reason} -> raise "harness process identity unavailable: #{inspect(reason)}"
+        end
+
+      :error ->
+        :ok
+    end
+
     state = %__MODULE__{
       conn: conn,
       preset: preset,

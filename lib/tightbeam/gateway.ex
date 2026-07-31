@@ -3461,14 +3461,15 @@ defmodule Tightbeam.Gateway do
   defp park_provider_runtime(provider, machine) do
     provider
     |> harnesses_for_provider()
-    |> Enum.each(fn module ->
-      AdapterCoordinator.request_close_adapter(
-        Tightbeam.AdapterCoordinator,
-        {module.id(), "shared", machine}
-      )
+    |> Enum.reduce_while(:ok, fn module, :ok ->
+      case AdapterCoordinator.close_adapter(
+             Tightbeam.AdapterCoordinator,
+             {module.id(), "shared", machine}
+           ) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
     end)
-
-    :ok
   end
 
   defp capture_credential_sessions(db, provider, machine) do

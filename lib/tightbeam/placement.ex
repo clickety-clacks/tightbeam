@@ -985,6 +985,8 @@ defmodule Tightbeam.Placement do
       home: home,
       cwd: config.cwd,
       stderr_path: stderr_path,
+      process_ssh: host_config.ssh,
+      process_identity_dir: host_config.base_dir,
       on_auth_event: auth_event_handler(host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
