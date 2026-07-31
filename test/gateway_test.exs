@@ -68,31 +68,6 @@ defmodule Tightbeam.GatewayTest do
     WorkState
   }
 
-  defmodule McpArchetypes do
-    def get("unknown"), do: nil
-
-    def builtin_default do
-      %{Archetypes.builtin_default() | mcp: [server()]}
-    end
-
-    def acp_mcp_servers(archetype), do: Archetypes.acp_mcp_servers(archetype)
-
-    defp server do
-      %{name: "builtin", command: "builtin-mcp", args: ["--default"], env: %{"MODE" => "test"}}
-    end
-  end
-
-  test "an unknown archetype projects the builtin default MCP servers" do
-    assert Gateway.mcp_servers_for_archetype("unknown", McpArchetypes) == [
-             %{
-               "name" => "builtin",
-               "command" => "builtin-mcp",
-               "args" => ["--default"],
-               "env" => [%{"name" => "MODE", "value" => "test"}]
-             }
-           ]
-  end
-
   alias Tightbeam.Wire.Payloads
 
   defmodule LaneDoorbell do
@@ -3920,7 +3895,7 @@ defmodule Tightbeam.GatewayTest do
   # as "test timed out" rather than naming the wait that actually ran out. Raise the
   # ceiling above the budget it contains.
   @tag timeout: 180_000
-  test "one fake-adapter turn publishes the golden frame order", ctx do
+  test "one fake-adapter turn uses the MCP fallback and publishes the golden frame order", ctx do
     exact_registry =
       start_supervised!(%{
         id: :exact_conn_registry,
@@ -3979,6 +3954,12 @@ defmodule Tightbeam.GatewayTest do
     identity_name = Placement.identity_name(config, archetype, overrides, :claude)
     Org.set_identity(ctx.db, "k1", overrides, identity_name)
 
+    {_archetypes, fragments} = :persistent_term.get(Archetypes)
+    :persistent_term.put(Archetypes, {%{}, fragments})
+    refute Archetypes.get("default")
+    assert archetype.mcp != []
+    assert Archetypes.builtin_default().mcp == []
+
     {Tightbeam.LaneManager, lane_opts} =
       Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
 
@@ -3999,18 +3980,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
 
-    assert_receive {:new_session_mcp_servers,
-                    [
-                      %{
-                        "name" => "xcodebuild",
-                        "command" => "xcodebuildmcp",
-                        "args" => ["--daemon"],
-                        "env" => [
-                          %{"name" => "XCODEBUILD_MCP_MODE", "value" => "cli"}
-                        ]
-                      }
-                    ]},
-                   @cold_runner_prompt_timeout
+    assert_receive {:new_session_mcp_servers, []}, @cold_runner_prompt_timeout
 
     # Four ms behind the wait above in every sample: the forks are already paid.
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
