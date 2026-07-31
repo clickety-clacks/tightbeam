@@ -1,5 +1,7 @@
+use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -112,14 +114,44 @@ fn load_from_default_route() -> Result<HarnessCatalog, String> {
 }
 
 fn load_endpoint(endpoint: &dispatch::Endpoint) -> Result<HarnessCatalog, String> {
+    load_endpoint_with_deadline(endpoint, None)
+}
+
+fn load_endpoint_with_deadline(
+    endpoint: &dispatch::Endpoint,
+    deadline: Option<Instant>,
+) -> Result<HarnessCatalog, String> {
     let url = format!("{}/harnesses", endpoint.base);
-    let response = ureq::get(&url)
+    let mut builder = ureq::AgentBuilder::new();
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(harness_lease_expired());
+        }
+        builder = builder.timeout(remaining).timeout_connect(remaining);
+    }
+    let response = builder
+        .build()
+        .get(&url)
         .set("authorization", &format!("Bearer {}", endpoint.token))
         .call()
-        .map_err(|error| unavailable(&error.to_string()))?;
-    let encoded = response
-        .into_string()
-        .map_err(|error| unavailable(&error.to_string()))?;
+        .map_err(|error| {
+            if deadline.is_some() && (Instant::now() >= deadline.unwrap() || ureq_timed_out(&error))
+            {
+                harness_lease_expired()
+            } else {
+                unavailable(&error.to_string())
+            }
+        })?;
+    let encoded = response.into_string().map_err(|error| {
+        if deadline.is_some()
+            && (Instant::now() >= deadline.unwrap() || error.kind() == std::io::ErrorKind::TimedOut)
+        {
+            harness_lease_expired()
+        } else {
+            unavailable(&error.to_string())
+        }
+    })?;
     parse(&encoded).map_err(|reason| unavailable(&reason))
 }
 
@@ -127,8 +159,38 @@ pub fn load_optional() -> Option<HarnessCatalog> {
     load().ok()
 }
 
-pub(crate) fn load_optional_from(endpoint: &dispatch::Endpoint) -> Option<HarnessCatalog> {
-    load_from_with(&home_dir(), || load_endpoint(endpoint)).ok()
+pub(crate) fn load_optional_from(
+    endpoint: &dispatch::Endpoint,
+    deadline: Instant,
+) -> Result<Option<HarnessCatalog>, String> {
+    match load_from_with(&home_dir(), || {
+        load_endpoint_with_deadline(endpoint, Some(deadline))
+    }) {
+        Ok(catalog) => Ok(Some(catalog)),
+        Err(reason) if reason == harness_lease_expired() => Err(reason),
+        Err(_) => Ok(None),
+    }
+}
+
+fn harness_lease_expired() -> String {
+    "harness catalog lookup refused because the onboarding lease expired".to_owned()
+}
+
+fn ureq_timed_out(error: &ureq::Error) -> bool {
+    let ureq::Error::Transport(error) = error else {
+        return false;
+    };
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 #[cfg(not(test))]
@@ -163,6 +225,7 @@ fn unavailable(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -249,5 +312,19 @@ mod tests {
                 .unwrap_err()
                 .contains("missing process_markers")
         );
+    }
+
+    #[test]
+    fn expired_ceremony_harness_lookup_refuses_before_network_io() {
+        let endpoint = dispatch::Endpoint {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: None,
+        };
+        let error =
+            load_endpoint_with_deadline(&endpoint, Some(Instant::now() - Duration::from_millis(1)))
+                .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
     }
 }
