@@ -838,6 +838,7 @@ pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Opti
     let url = format!("{}{}", endpoint.base, request.path);
     let call = ureq::post(&url)
         .set("authorization", &format!("Bearer {}", endpoint.token))
+        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
         .set("content-type", "application/json")
         .send_string(&request.body_json);
 

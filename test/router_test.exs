@@ -168,6 +168,35 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.resp_body == expected
   end
 
+  test "CLI compatibility refusal is loud and precedes bearer authentication", ctx do
+    body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
+
+    incompatible =
+      conn(:post, "/agent/dispatch", body)
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", "0.1.0")
+      |> Router.call(Router.init(Keyword.put(ctx.opts, :minimum_cli_version, "0.2.0")))
+
+    assert incompatible.status == 426
+
+    assert JSON.decode!(incompatible.resp_body) == %{
+             "error" => %{
+               "code" => "incompatible_cli",
+               "message" =>
+                 "your CLI is too old, it says 0.1.0; this gateway needs 0.2.0 or newer"
+             }
+           }
+
+    auth_failure =
+      conn(:post, "/agent/dispatch", body)
+      |> put_req_header("authorization", "Bearer wrong")
+      |> put_req_header("x-tightbeam-cli-version", "0.2.0")
+      |> Router.call(Router.init(Keyword.put(ctx.opts, :minimum_cli_version, "0.2.0")))
+
+    assert auth_failure.status == 401
+    assert JSON.decode!(auth_failure.resp_body) == %{"error" => %{"code" => "auth_failed"}}
+  end
+
   test "kungfu scaffold crosses the closed CLI verb router with its attributed name", ctx do
     response =
       dispatch_cli(ctx, "tbc_test", %{

@@ -113,10 +113,31 @@ fn load_from_default_route() -> Result<HarnessCatalog, String> {
 
 fn load_endpoint(endpoint: &dispatch::Endpoint) -> Result<HarnessCatalog, String> {
     let url = format!("{}/harnesses", endpoint.base);
-    let response = ureq::get(&url)
+    let response = match ureq::get(&url)
         .set("authorization", &format!("Bearer {}", endpoint.token))
+        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
         .call()
-        .map_err(|error| unavailable(&error.to_string()))?;
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let encoded = response
+                .into_string()
+                .unwrap_or_else(|_| format!("HTTP {status}"));
+            let detail = serde_json::from_str::<Value>(&encoded)
+                .ok()
+                .and_then(|json| {
+                    let code = json.pointer("/error/code")?.as_str()?;
+                    let message = json.pointer("/error/message").and_then(Value::as_str);
+                    Some(match message {
+                        Some(message) if !message.is_empty() => format!("{code}: {message}"),
+                        _ => code.to_owned(),
+                    })
+                })
+                .unwrap_or(encoded);
+            return Err(unavailable(&detail));
+        }
+        Err(ureq::Error::Transport(error)) => return Err(unavailable(&error.to_string())),
+    };
     let encoded = response
         .into_string()
         .map_err(|error| unavailable(&error.to_string()))?;

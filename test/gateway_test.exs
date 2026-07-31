@@ -1163,16 +1163,6 @@ defmodule Tightbeam.GatewayTest do
     end)
   end
 
-  test "unknown local CLI target records a warning and returns without blocking boot", ctx do
-    assert Gateway.local_target_triple({:unix, :freebsd}, "riscv64") == nil
-    assert :ok = Gateway.warn_cli_target_mismatches(ctx.db, "/unused", nil)
-
-    assert %{kind: "cli_target_mismatch", detail: detail} =
-             ctx.db |> EventLog.lifecycle_events() |> List.last()
-
-    assert detail == "gateway target unknown; remote CLI compatibility not checked"
-  end
-
   test "children sweeps newer credentials from abandoned identity homes before adapters", ctx do
     base_dir = Path.join(System.tmp_dir!(), "gateway_sweep_#{System.unique_integer([:positive])}")
     auth_dir = Path.join([base_dir, "auth", "codex"])

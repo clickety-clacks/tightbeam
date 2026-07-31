@@ -219,8 +219,6 @@ defmodule Tightbeam.Gateway do
         ])
     end)
 
-    warn_cli_target_mismatches(db, config.base_dir)
-
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
     cli_token =
@@ -265,7 +263,8 @@ defmodule Tightbeam.Gateway do
       db: db,
       handlers: handler_table,
       conn_registry: Tightbeam.ConnRegistry,
-      defaults: defaults
+      defaults: defaults,
+      minimum_cli_version: Tightbeam.CliCompatibility.minimum_supported_version()
     }
 
     router_deps =
@@ -1683,80 +1682,6 @@ defmodule Tightbeam.Gateway do
         {:error,
          "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
            "(host unreachable or adapter failing); see /version"}
-    end
-  end
-
-  defp warn_cli_target_mismatches(db, base_dir) do
-    warn_cli_target_mismatches(db, base_dir, local_target_triple())
-  end
-
-  @doc false
-  def warn_cli_target_mismatches(db, _base_dir, nil) do
-    EventLog.lifecycle(
-      db,
-      "cli_target_mismatch",
-      Placement.local_host_name(),
-      "gateway target unknown; remote CLI compatibility not checked"
-    )
-
-    :ok
-  end
-
-  def warn_cli_target_mismatches(db, base_dir, local) do
-    base_dir
-    |> Placement.hosts(db)
-    |> Enum.each(fn
-      {_name, %{ssh: nil}} ->
-        :ok
-
-      {name, %{ssh: dest}} ->
-        case System.cmd(
-               "ssh",
-               ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", dest, "uname", "-sm"],
-               stderr_to_stdout: true
-             ) do
-          {output, 0} ->
-            case target_from_probe(output) do
-              target when is_binary(target) and target != local ->
-                EventLog.lifecycle(
-                  db,
-                  "cli_target_mismatch",
-                  name,
-                  "gateway #{local}; host #{target}"
-                )
-
-              _ ->
-                :ok
-            end
-
-          _ ->
-            :ok
-        end
-    end)
-  end
-
-  defp local_target_triple do
-    local_target_triple(:os.type(), :erlang.system_info(:system_architecture) |> to_string())
-  end
-
-  @doc false
-  def local_target_triple(os_type, architecture) do
-    case {os_type, architecture} do
-      {{:unix, :darwin}, "aarch64" <> _} -> "aarch64-apple-darwin"
-      {{:unix, :darwin}, "x86_64" <> _} -> "x86_64-apple-darwin"
-      {{:unix, :linux}, "aarch64" <> _} -> "aarch64-unknown-linux-gnu"
-      {{:unix, :linux}, "x86_64" <> _} -> "x86_64-unknown-linux-gnu"
-      _ -> nil
-    end
-  end
-
-  defp target_from_probe(output) do
-    case String.split(String.trim(output)) do
-      ["Darwin", arch] when arch in ["arm64", "aarch64"] -> "aarch64-apple-darwin"
-      ["Darwin", "x86_64"] -> "x86_64-apple-darwin"
-      ["Linux", arch] when arch in ["arm64", "aarch64"] -> "aarch64-unknown-linux-gnu"
-      ["Linux", arch] when arch in ["x86_64", "amd64"] -> "x86_64-unknown-linux-gnu"
-      _ -> nil
     end
   end
 

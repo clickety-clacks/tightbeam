@@ -49,7 +49,7 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
-  alias Tightbeam.{Assets, Devices, Dispatch, Org, Roles, WorkState}
+  alias Tightbeam.{Assets, CliCompatibility, Devices, Dispatch, Org, Roles, WorkState}
   alias Tightbeam.Wire.{Payloads, Socket}
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
@@ -389,6 +389,31 @@ defmodule Tightbeam.Wire.Router do
     do: deps(conn)[:session_status] || (&Tightbeam.Gateway.session_status/1)
 
   defp cli_auth(conn) do
+    with :ok <- cli_version_compatible(conn) do
+      cli_token_auth(conn)
+    end
+  end
+
+  defp cli_version_compatible(conn) do
+    case deps(conn)[:minimum_cli_version] do
+      nil ->
+        :ok
+
+      minimum ->
+        version =
+          case Plug.Conn.get_req_header(conn, "x-tightbeam-cli-version") do
+            [version] -> version
+            _ -> nil
+          end
+
+        case CliCompatibility.check(version, minimum) do
+          :ok -> :ok
+          {:error, message} -> {:error, 426, "incompatible_cli", message}
+        end
+    end
+  end
+
+  defp cli_token_auth(conn) do
     token =
       case Plug.Conn.get_req_header(conn, "authorization") do
         ["Bearer " <> token] -> token

@@ -453,7 +453,8 @@ DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
 
 DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
 
-  tightbeam help | --help | -h    show this text."#;
+  tightbeam help | --help | -h   show this text.
+  tightbeam version | --version  print this CLI's version."#;
 
 pub fn render_help(catalog: Option<&HarnessCatalog>) -> String {
     let names = catalog.map(HarnessCatalog::names).unwrap_or_default();

@@ -7,6 +7,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Assets,
     Archetypes,
     Assignments,
+    CliCompatibility,
     ConditionFacts,
     DB,
     Devices,
@@ -28,7 +29,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   alias Tightbeam.Wire.Router
 
-  setup do
+  setup context do
     binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
 
     unless File.exists?(binary) do
@@ -134,6 +135,8 @@ defmodule Tightbeam.CliIntegrationTest do
         base_dir: base_dir,
         handlers: handlers,
         cli_token: "tbc_cli_integration",
+        minimum_cli_version:
+          Map.get(context, :minimum_cli_version, CliCompatibility.minimum_supported_version()),
         session_status: fn _ -> nil end
       )
 
@@ -164,6 +167,66 @@ defmodule Tightbeam.CliIntegrationTest do
       workdir: workdir,
       outside: outside
     }
+  end
+
+  test "real CLI states its built version when it connects", ctx do
+    {version, 0} = System.cmd(ctx.binary, ["version"])
+    version = String.trim(version)
+
+    {listed, 0} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
+    assert version != ""
+    assert listed =~ "cli-holder"
+    assert_receive {:cli_call, %{verb: "inspect"}}
+  end
+
+  @tag minimum_cli_version: "999.0.0"
+  test "real incompatible CLI is refused with its own version and the gateway minimum", ctx do
+    {version, 0} = System.cmd(ctx.binary, ["version"])
+    version = String.trim(version)
+
+    {refused, 1} =
+      System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
+    assert refused =~ "incompatible_cli"
+    assert refused =~ "your CLI is too old, it says #{version}"
+    assert refused =~ "this gateway needs 999.0.0 or newer"
+    refute_received {:cli_call, _}
+  end
+
+  test "version refusal is distinguishable from auth and network failures", ctx do
+    session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
+
+    File.write!(
+      session_file,
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{ctx.port}",
+        token: "wrong-token",
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    {auth, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    assert auth =~ "auth_failed"
+    refute auth =~ "incompatible_cli"
+
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+    {:ok, {_address, unused_port}} = :inet.sockname(listener)
+    :ok = :gen_tcp.close(listener)
+
+    File.write!(
+      session_file,
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{unused_port}",
+        token: ctx.session.cli_token,
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    {network, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    refute network =~ "auth_failed"
+    refute network =~ "incompatible_cli"
+    assert network =~ "Connection refused" or network =~ "connection refused"
   end
 
   test "real CLI discovers a session token, dispatches, and loses access at retire", ctx do
