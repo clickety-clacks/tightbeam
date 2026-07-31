@@ -381,6 +381,35 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule UnknownDefaultAdapterStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:new_session, model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:unknown_new_session, model})
+      {:reply, {:ok, "default-session"}, parent}
+    end
+
+    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
+
+    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:unknown_load_lost, sid, model})
+      {:reply, {:error, :session_lost}, parent}
+    end
+
+    def handle_call({:current_model, "default-session"}, _from, parent) do
+      send(parent, :default_model_captured)
+      {:reply, {:ok, "harness-default"}, parent}
+    end
+
+    def handle_call({:prompt, "default-session", _prompt, _opts}, _from, parent) do
+      send(parent, :default_session_prompted)
+      {:reply, {:ok, %{text: "continued", stop_reason: "end_turn"}}, parent}
+    end
+  end
+
   setup do
     db = :"gateway_db_#{System.unique_integer([:positive])}"
     registry = :"gateway_registry_#{System.unique_integer([:positive])}"
@@ -2925,6 +2954,40 @@ defmodule Tightbeam.GatewayTest do
     assert status.capabilities.canChangeReasoning == false
   end
 
+  test "unknown model status degrades and tune never composes it as a model ref", ctx do
+    base_dir = role_test_base("unknown-model-status")
+    Archetypes.load!(base_dir)
+    make_model_unknown(ctx.db, "k1")
+
+    status = Gateway.session_status("k1", ctx.db)
+
+    assert status.display.model == "unknown"
+    assert status.display.reasoningLevel == nil
+
+    assert %{supported: false, reason: "current model is unknown"} =
+             status.capabilities.setReasoning
+
+    refute status.capabilities.canChangeReasoning
+
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
+
+    assert %{ok: false, code: "model_unknown"} =
+             tune.(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_reasoning", reasoningLevel: "high"}
+             })
+
+    assert %{ok: true} =
+             tune.(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+  end
+
   test "a ref emitted by modelCatalog.models round-trips through set_model", ctx do
     base_dir = role_test_base("catalog-ref-round-trip")
     Archetypes.load!(base_dir)
@@ -4451,6 +4514,91 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
+  test "unknown new-session paths keep and capture the harness default", ctx do
+    adapter = start_supervised!({UnknownDefaultAdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    start_supervised!(%{
+      id: :unknown_default_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "unknown-default",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    make_model_unknown(ctx.db, "k1")
+
+    config = %{
+      base_dir: gateway_children_base!(),
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: "claude-fable-5",
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    {Tightbeam.LaneManager, lane_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "use the default",
+               db: ctx.db,
+               conn_registry: Tightbeam.ConnRegistry,
+               lane_manager: ctx.lane,
+               client_message_id: "c_unknown_default"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+    assert {:ok, %{terminal_publish: publish}} = runner.(Map.put(turn, :session_key, "k1"))
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    publish.("delivered")
+
+    assert_receive {:unknown_new_session, nil}
+    assert_receive :default_model_captured
+    assert_receive :default_session_prompted
+    assert Org.get(ctx.db, "k1").model == "harness-default"
+
+    # The session/load-lost fallback consumes the same unknown value: it must
+    # create without seeding, then capture the new harness default too.
+    make_model_unknown(ctx.db, "k1")
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "fall back to the default",
+               db: ctx.db,
+               conn_registry: Tightbeam.ConnRegistry,
+               lane_manager: ctx.lane,
+               client_message_id: "c_unknown_fallback"
+             )
+
+    assert {:ok, fallback_turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:ok, %{terminal_publish: fallback_publish}} =
+             runner.(Map.put(fallback_turn, :session_key, "k1"))
+
+    assert :ok = Ledger.finish(ctx.db, fallback_turn.seq, "delivered")
+    fallback_publish.("delivered")
+
+    assert_receive {:unknown_load_lost, "default-session", nil}
+    assert_receive {:unknown_new_session, nil}
+    assert_receive :default_model_captured
+    assert_receive :default_session_prompted
+    assert Org.get(ctx.db, "k1").model == "harness-default"
+    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
+  end
+
   test "an adjudication-routed failed turn suppresses the generic failure marker", ctx do
     exact_registry =
       start_supervised!(%{
@@ -5860,6 +6008,26 @@ defmodule Tightbeam.GatewayTest do
       credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end
     }
+  end
+
+  defp make_model_unknown(db, session_key) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    try do
+      :ok =
+        DB.execute(
+          db,
+          """
+          CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
+          DROP TABLE sessions;
+          ALTER TABLE sessions_with_unknown RENAME TO sessions;
+          CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
+          UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
+          """
+        )
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+    end
   end
 
   defp notify_adjudication(db, session_key, expected_owner) do

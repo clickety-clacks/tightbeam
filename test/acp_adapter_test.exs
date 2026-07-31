@@ -425,6 +425,18 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.prompt(a, "sess-1", "say pong")
   end
 
+  test "new_session with an unknown record keeps and captures the harness default" do
+    {adapter, capture_path} = start_adapter()
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+    assert {:ok, "haiku"} = Adapter.current_model(adapter, "sess-1")
+
+    refute Enum.any?(
+             captured_requests(capture_path),
+             &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+           )
+  end
+
   test "load_session pushes the known canonical record model" do
     {a, capture_path} = start_adapter(fail_mode: "load-owner")
 

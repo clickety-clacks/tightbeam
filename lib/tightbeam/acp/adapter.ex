@@ -4,11 +4,11 @@ defmodule Tightbeam.Acp.Adapter do
   it owns a Conn and routes session/update chunks by sessionId to the turn
   currently prompting each session.
 
-  Adapter rules (spec §Adapter selection; the SOURCE OF TRUTH mirrored from the
-  TS reference harness.ts):
-  1. Apply the selected model immediately after session/new. After session/load,
-     read the harness's current model and return it to the caller; a stored record
-     is a projection and must never be pushed over the loaded owner's value.
+  Adapter rules (spec §Adapter selection and the superseding model ruling):
+  1. The user's known canonical selection is pushed after session/new,
+     session/load, and immediately before each turn. An unknown selection is
+     never pushed: a fresh session keeps the harness default and captures it
+     when reported, while a loaded session is left unchanged.
   2. Model via session/set_config_option {configId:"model"} with a BARE name;
      effort rides as "model[effort]" split and applied via the harness's effort
      config id.
@@ -77,7 +77,7 @@ defmodule Tightbeam.Acp.Adapter do
   un-isolated cwd leaks the operator's own guidance and files into the
   agent). Returns {:ok, session_id}.
   """
-  @spec new_session(adapter(), model_ref(), String.t(), [map()], String.t()) ::
+  @spec new_session(adapter(), model_ref() | nil, String.t(), [map()], String.t()) ::
           {:ok, String.t()} | {:error, term()}
   def new_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
@@ -351,12 +351,12 @@ defmodule Tightbeam.Acp.Adapter do
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            }),
          sid = result["sessionId"],
-         {:ok, applied_model} <- apply_model_to_session(state, sid, model),
+         {:ok, applied_model} <- establish_new_session_model(state, sid, model, result),
          :ok <- set_mode(state, sid) do
       state =
         state
         |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-        |> put_in([Access.key(:models), sid], applied_model)
+        |> remember_model(sid, applied_model)
 
       {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
     else
@@ -617,6 +617,22 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   ## Model application (the fable-trap rule)
+
+  defp establish_new_session_model(state, sid, model, _result) when is_binary(model),
+    do: apply_model_to_session(state, sid, model)
+
+  defp establish_new_session_model(state, _sid, _unknown, result) do
+    case model_ref_from_config(result, state.preset.effort_config) do
+      {:ok, reported_model} -> {:ok, reported_model}
+      :error -> {:ok, :unknown}
+    end
+  end
+
+  defp remember_model(state, sid, model) when is_binary(model),
+    do: put_in(state.models[sid], model)
+
+  defp remember_model(state, sid, _unknown),
+    do: put_in(state.models, Map.delete(state.models, sid))
 
   defp apply_model_to_session(state, sid, model_ref) do
     apply_model_to_session(state, sid, model_ref, fn method, params ->

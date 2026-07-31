@@ -155,7 +155,10 @@ defmodule Tightbeam.AdapterHealTest do
 
       if parent = state[:parent], do: send(parent, {:tune_model_applied, model})
 
-      {:reply, :ok, %{state | model: model, cached_model: model}}
+      case state[:apply_error] do
+        nil -> {:reply, :ok, %{state | model: model, cached_model: model}}
+        reason -> {:reply, {:error, reason}, state}
+      end
     end
 
     def handle_call({:prompt, _sid, _text, _opts}, _from, state) do
@@ -437,7 +440,7 @@ defmodule Tightbeam.AdapterHealTest do
     assert episode(ctx.db).cause == @cause
   end
 
-  test "the owner's brief names the precise cause the episode carries", ctx do
+  test "the owner's brief names the precise cause and known canonical model", ctx do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "the turn whose brief must be legible")
 
@@ -454,11 +457,10 @@ defmodule Tightbeam.AdapterHealTest do
     # no longer the only classification the human gets.
     assert prompt =~ "condition="
     refute prompt =~ "cause=unclassified"
-    assert prompt =~ "current_model=unknown"
-    refute prompt =~ "current_model=claude-fable-5"
+    assert prompt =~ "current_model=claude-fable-5"
   end
 
-  test "the owner's brief stays unknown after the canonical record is pushed", ctx do
+  test "the owner's brief reports the known canonical record after it is pushed", ctx do
     adapter =
       swap_harness(ctx,
         checkout: {:error, :degraded},
@@ -475,9 +477,18 @@ defmodule Tightbeam.AdapterHealTest do
     assert SwapAdapterStub.cached(adapter) == "claude-fable-5"
 
     prompt = Wakes.get(ctx.db, episode(ctx.db).owner_wake_id).prompt
-    assert prompt =~ "current_model=unknown"
+    assert prompt =~ "current_model=claude-fable-5"
     refute prompt =~ "current_model=claude-sonnet-4-6"
-    refute prompt =~ "current_model=claude-fable-5"
+  end
+
+  test "the owner's brief reports unknown when the canonical record is unknown", ctx do
+    make_model_unknown(ctx.db, "k1")
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+
+    run_failing_turn(ctx, "the turn whose model is genuinely unknown")
+
+    prompt = Wakes.get(ctx.db, episode(ctx.db).owner_wake_id).prompt
+    assert prompt =~ "current_model=unknown"
   end
 
   test "resident stale adapter cache is replaced by the canonical record", ctx do
@@ -1564,6 +1575,66 @@ defmodule Tightbeam.AdapterHealTest do
     assert Org.get(ctx.db, "k1").model == "claude-opus-4-6"
   end
 
+  test "before-turn push waits for tune commit and reads the new canonical model", ctx do
+    adapter = swap_harness(ctx, checkout: {:error, :degraded})
+    swap_ready(adapter, nil)
+    parent = self()
+
+    proxy =
+      start_supervised!(
+        {RaceDB,
+         real: ctx.db,
+         at: 1,
+         before_txn: fn ->
+           send(parent, {:tune_waiting_to_commit, self()})
+
+           receive do
+             :release_tune_commit -> :ok
+           end
+         end}
+      )
+
+    tune =
+      Task.async(fn ->
+        Gateway.handlers(Map.put(ctx.config, :db, proxy))["tune"].(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+        })
+      end)
+
+    assert_receive {:tune_model_applied, "claude-sonnet-4-6"}
+    assert_receive {:tune_waiting_to_commit, db_proxy}
+
+    turn = Task.async(fn -> run_residency_pass(ctx) end)
+
+    try do
+      refute_receive {:tune_model_applied, "claude-fable-5"}, 100
+      assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    after
+      send(db_proxy, :release_tune_commit)
+    end
+
+    assert %{ok: true} = Task.await(tune)
+    assert :ok = Task.await(turn)
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+  end
+
+  test "resident before-turn refusal has the same model-decision cause as reattach", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        apply_error: :model_unavailable
+      )
+
+    swap_ready(adapter, nil)
+    {_seq, reason} = run_failing_turn(ctx, "refuse the canonical model")
+
+    assert reason == {:model_apply_failed, :model_unavailable}
+    assert episode(ctx.db).cause == "model_decision"
+  end
+
   test "F3: a non-replying adapter apply never occupies the DB owner", ctx do
     adapter =
       swap_harness(ctx,
@@ -1891,7 +1962,14 @@ defmodule Tightbeam.AdapterHealTest do
 
     adapter_opts =
       opts
-      |> Keyword.take([:strict_error, :prompt_error, :model, :cached_model, :block_apply])
+      |> Keyword.take([
+        :strict_error,
+        :prompt_error,
+        :model,
+        :cached_model,
+        :block_apply,
+        :apply_error
+      ])
       |> Keyword.put_new(:model, "claude-fable-5")
       |> Keyword.put(:parent, self())
 
@@ -1949,6 +2027,26 @@ defmodule Tightbeam.AdapterHealTest do
         refreshing: false
       })
     end)
+  end
+
+  defp make_model_unknown(db, session_key) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    try do
+      :ok =
+        DB.execute(
+          db,
+          """
+          CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
+          DROP TABLE sessions;
+          ALTER TABLE sessions_with_unknown RENAME TO sessions;
+          CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
+          UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
+          """
+        )
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+    end
   end
 
   # Collapse the retry backoff so the next scheduler fire delivers it; the app

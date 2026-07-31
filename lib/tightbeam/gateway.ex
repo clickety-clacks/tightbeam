@@ -1137,14 +1137,14 @@ defmodule Tightbeam.Gateway do
             preferences -> preferences
           end
 
-        {base_model, effort} = Adapter.parse_model_ref(session.model)
+        {base_model, effort} = current_model_parts(session.model)
         {catalog, _health} = ModelCatalog.get(session.host, session.harness, ModelCatalog)
         unsupported = fn reason -> %{supported: false, reason: reason} end
 
         models_once = Enum.uniq_by(catalog, &base_ref(&1.ref))
 
         current_efforts =
-          case Enum.find(catalog, &(base_ref(&1.ref) == base_model)) do
+          case Enum.find(catalog, &(not is_nil(base_model) and base_ref(&1.ref) == base_model)) do
             nil -> []
             entry -> entry.efforts
           end
@@ -1152,7 +1152,12 @@ defmodule Tightbeam.Gateway do
         reasoning_capability =
           case current_efforts do
             [] ->
-              unsupported.("current model has no effort tiers")
+              reason =
+                if is_nil(base_model),
+                  do: "current model is unknown",
+                  else: "current model has no effort tiers"
+
+              unsupported.(reason)
 
             efforts ->
               %{
@@ -1171,7 +1176,7 @@ defmodule Tightbeam.Gateway do
             # it can't match a catalog row and matches it against the (now
             # base-ref) catalog rows for the current-model checkmark. The
             # effort qualifier is carried separately in reasoningLevel.
-            model: base_model,
+            model: base_model || "unknown",
             modelPreferences: model_preferences,
             provider: session.provider,
             harness: session.harness,
@@ -1235,6 +1240,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp current_model_parts(ref) when is_binary(ref), do: Adapter.parse_model_ref(ref)
+  defp current_model_parts(_unknown), do: {nil, nil}
+
+  defp base_ref(nil), do: nil
   defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
 
   # Which KIND of credential this session's turns actually run on — an API key or
@@ -1368,7 +1377,21 @@ defmodule Tightbeam.Gateway do
              {:ok, harness_session_id} <-
                stage(
                  :session,
-                 harness_session(config, db, adapter, generation, session, turn.seq)
+                 with_session_mutation_lock(turn.session_key, fn ->
+                   # Tune holds this same lock across adapter apply and record
+                   # commit. Re-read inside it so the push cannot use the
+                   # pre-checkout snapshot or interleave with that sequence.
+                   current = Org.get(db, turn.session_key)
+
+                   harness_session(
+                     config,
+                     db,
+                     adapter,
+                     generation,
+                     %{session | model: current.model},
+                     turn.seq
+                   )
+                 end)
                ),
              {:ok, result} <-
                stage(
@@ -1405,6 +1428,7 @@ defmodule Tightbeam.Gateway do
             condition = Adjudication.classify(reason)
             cause = adjudication_cause(failed_stage, reason, adapter_key)
             brief_inventories = adjudication_model_inventories(session)
+            current_model = session_model_display(Org.get(db, turn.session_key).model)
 
             failure_publish = fn _terminal ->
               # No assistant final will arrive to clear the indicator label —
@@ -1474,7 +1498,7 @@ defmodule Tightbeam.Gateway do
                     session,
                     condition,
                     cause,
-                    "unknown",
+                    current_model,
                     brief_inventories
                   )
 
@@ -1532,6 +1556,9 @@ defmodule Tightbeam.Gateway do
     do: Adjudication.adapter_fault_cause(key)
 
   defp adjudication_cause(_stage, _reason, _key), do: nil
+
+  defp session_model_display(model) when is_binary(model), do: model
+  defp session_model_display(_unknown), do: "unknown"
 
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
@@ -1791,9 +1818,10 @@ defmodule Tightbeam.Gateway do
           snapshot = served_snapshot(config, session, harness, revision)
 
           with {:ok, sid} <-
-                 Adapter.new_session(
+                 new_harness_session(
+                   db,
                    adapter,
-                   session.model,
+                   session,
                    cwd,
                    mcp_servers,
                    snapshot.guidance
@@ -1861,9 +1889,10 @@ defmodule Tightbeam.Gateway do
                     )
 
                     with {:ok, sid} <-
-                           Adapter.new_session(
+                           new_harness_session(
+                             db,
                              adapter,
-                             session.model,
+                             session,
                              cwd,
                              mcp_servers,
                              snapshot.guidance
@@ -1923,6 +1952,31 @@ defmodule Tightbeam.Gateway do
   end
 
   defp enrich_adapter_unavailable(_config, result, _key, _generation), do: result
+
+  defp new_harness_session(db, adapter, session, cwd, mcp_servers, guidance) do
+    with {:ok, sid} <-
+           Adapter.new_session(adapter, session.model, cwd, mcp_servers, guidance),
+         :ok <- capture_created_model(db, adapter, session, sid) do
+      {:ok, sid}
+    end
+  end
+
+  defp capture_created_model(_db, _adapter, %{model: model}, _sid) when is_binary(model),
+    do: :ok
+
+  defp capture_created_model(db, adapter, session, sid) do
+    case Adapter.current_model(adapter, sid) do
+      {:ok, reported_model} when is_binary(reported_model) ->
+        _ = Org.set_model(db, session.session_key, reported_model, session.provider)
+        :ok
+
+      {:error, :model_readback_unavailable} ->
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   defp served_snapshot(config, session, harness, revision) do
     snapshot =
@@ -3183,6 +3237,13 @@ defmodule Tightbeam.Gateway do
           nil ->
             %{ok: false, code: "not_found"}
 
+          %{model: model} when not is_binary(model) ->
+            %{
+              ok: false,
+              code: "model_unknown",
+              message: "reasoning cannot be changed while the current model is unknown"
+            }
+
           session ->
             new_ref = "#{base_ref(session.model)}[#{p.reasoningLevel}]"
             apply_model_change(config, db, call, session, new_ref)
@@ -3202,7 +3263,7 @@ defmodule Tightbeam.Gateway do
     if String.contains?(selected, "[") do
       selected
     else
-      {_current_base, current_effort} = Adapter.parse_model_ref(current_ref)
+      {_current_base, current_effort} = current_model_parts(current_ref)
 
       case efforts_for(host, harness, selected) do
         [] ->
@@ -5111,7 +5172,13 @@ defmodule Tightbeam.Gateway do
   end
 
   defp push_known_model(_adapter, _sid, model) when not is_binary(model), do: :ok
-  defp push_known_model(adapter, sid, model), do: Adapter.apply_model(adapter, sid, model)
+
+  defp push_known_model(adapter, sid, model) do
+    case Adapter.apply_model(adapter, sid, model) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:model_apply_failed, reason}}
+    end
+  end
 
   # A fallback is a substrate event a reader of the CHAT must see: the
   # model's working memory ended here while the visible history did not —
