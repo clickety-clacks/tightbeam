@@ -1012,7 +1012,14 @@ defmodule Tightbeam.Acp.AdapterTest do
         harness: :codex,
         on_subagent_event: fn sid, update ->
           result = placement_handler.(sid, update)
-          send(owner, {:subagent_task_captured, self()})
+
+          task =
+            case result do
+              {:async, _event_ref, pid, _context} -> pid
+              _ -> nil
+            end
+
+          send(owner, {:subagent_task_captured, self(), task})
 
           receive do
             :release_subagent_task -> result
@@ -1044,14 +1051,18 @@ defmodule Tightbeam.Acp.AdapterTest do
           {:acp_notification, "session/update", %{"sessionId" => "sess-1", "update" => update}}
         )
 
-        assert_receive {:subagent_task_captured, ^adapter}
+        assert_receive {:subagent_task_captured, ^adapter, task}
+        task_ref = Process.monitor(task)
         GenServer.stop(db_pid)
         send(adapter, :release_subagent_task)
-        Process.sleep(100)
+        assert_receive {:DOWN, ^task_ref, :process, ^task, _reason}
+        assert wait_for_subagent_tasks(adapter)
       end)
 
     assert log =~ "subagent event ingestion failed"
-    assert log =~ "retry=false"
+    assert log =~ "source_event_ref"
+    assert log =~ "subagent_ref"
+    assert log =~ "classification: :permanent"
     assert Process.alive?(adapter)
   end
 
@@ -1060,6 +1071,17 @@ defmodule Tightbeam.Acp.AdapterTest do
     {:ok, _} = Adapter.new_session(a, "haiku", "/tmp", [], "guidance")
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "one")
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "two")
+  end
+
+  defp wait_for_subagent_tasks(adapter, attempts \\ 100)
+  defp wait_for_subagent_tasks(_adapter, 0), do: false
+
+  defp wait_for_subagent_tasks(adapter, attempts) do
+    if map_size(:sys.get_state(adapter).subagent_tasks) == 0 do
+      true
+    else
+      receive after: (10 -> wait_for_subagent_tasks(adapter, attempts - 1))
+    end
   end
 
   test "turn timeout config reaches the session prompt request" do

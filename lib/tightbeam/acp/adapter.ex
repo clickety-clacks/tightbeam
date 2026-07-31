@@ -549,7 +549,7 @@ defmodule Tightbeam.Acp.Adapter do
     {context, state} = pop_subagent_task(state, event_ref)
 
     Logger.error(
-      "subagent event ingestion failed retry=false context=#{inspect(context)} reason=#{inspect(reason)}"
+      "subagent event ingestion failed context=#{inspect(context)} reason=#{inspect(reason)}"
     )
 
     {:noreply, state}
@@ -559,7 +559,7 @@ defmodule Tightbeam.Acp.Adapter do
     case Enum.find(state.subagent_tasks, fn {_event_ref, task} -> task.monitor == monitor end) do
       {event_ref, task} ->
         Logger.error(
-          "subagent event ingestion failed retry=false context=#{inspect(task.context)} " <>
+          "subagent event ingestion failed context=#{inspect(task.context)} " <>
             "reason=#{inspect({:task_exit, reason})}"
         )
 
@@ -631,7 +631,7 @@ defmodule Tightbeam.Acp.Adapter do
 
           {:error, context, reason} ->
             Logger.error(
-              "subagent event ingestion failed retry=false context=#{inspect(context)} " <>
+              "subagent event ingestion failed context=#{inspect(context)} " <>
                 "reason=#{inspect(reason)}"
             )
 

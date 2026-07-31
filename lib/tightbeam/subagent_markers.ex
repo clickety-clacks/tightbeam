@@ -4,7 +4,7 @@ defmodule Tightbeam.SubagentMarkers do
   and stops.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, Org, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @type marker :: %{
@@ -163,7 +163,9 @@ defmodule Tightbeam.SubagentMarkers do
               {:error,
                %{
                  code: "unknown_source_session",
-                 message: "no parent mapping for harness session"
+                 message: "no parent mapping for harness session",
+                 source_event_ref: source_event_ref(source_session_ref, tool_call_id),
+                 subagent_ref: subagent_ref(source_session_ref, child_id)
                }}
 
             principal ->
@@ -198,6 +200,104 @@ defmodule Tightbeam.SubagentMarkers do
 
       value ->
         value
+    end
+  end
+
+  @doc "Consume an idempotent captured marker with classified SQLite retry and redrive reporting."
+  @spec consume_captured_with_retry(
+          :skip | {:ok, map()} | {:error, map()},
+          DB.server(),
+          GenServer.server(),
+          keyword()
+        ) :: {:ok, map() | :skip} | {:error, map()}
+  def consume_captured_with_retry(captured, db, scheduler, opts \\ []) do
+    attempts = Keyword.get(opts, :attempts, 3)
+    retry_delay_ms = Keyword.get(opts, :retry_delay_ms, 25)
+    consume = Keyword.get(opts, :consume, fn -> consume_captured(captured, db, scheduler) end)
+
+    retry_captured(captured, db, consume, attempts, attempts, retry_delay_ms)
+  end
+
+  defp retry_captured(captured, db, consume, remaining, limit, retry_delay_ms) do
+    attempt = limit - remaining + 1
+
+    result =
+      try do
+        case consume.() do
+          {:error, reason} -> {:error, reason}
+          value -> {:ok, value}
+        end
+      rescue
+        error -> {:error, {:error, error, __STACKTRACE__}}
+      catch
+        kind, reason -> {:error, {kind, reason, __STACKTRACE__}}
+      end
+
+    case result do
+      {:ok, value} ->
+        {:ok, value}
+
+      {:error, reason} ->
+        classification = failure_classification(reason)
+
+        if classification == :transient and remaining > 1 do
+          Process.sleep(retry_delay_ms)
+          retry_captured(captured, db, consume, remaining - 1, limit, retry_delay_ms)
+        else
+          report = failure_report(captured, classification, attempt, reason)
+          record_failure(db, report)
+          {:error, report}
+        end
+    end
+  end
+
+  defp failure_classification(reason) do
+    text = reason |> inspect() |> String.downcase()
+
+    if String.contains?(text, "database is locked") or
+         String.contains?(text, "database is busy") or
+         String.contains?(text, "sqlite_busy") or
+         String.contains?(text, "sqlite_locked") do
+      :transient
+    else
+      :permanent
+    end
+  end
+
+  defp failure_report(captured, classification, attempts, reason) do
+    identity = captured_identity(captured)
+
+    Map.merge(identity, %{
+      classification: classification,
+      attempts: attempts,
+      reason: reason
+    })
+  end
+
+  defp captured_identity({:ok, input}) do
+    Map.take(input, [:source_event_ref, :subagent_ref])
+  end
+
+  defp captured_identity({:error, error}) when is_map(error) do
+    Map.take(error, [:source_event_ref, :subagent_ref])
+  end
+
+  defp captured_identity(_captured), do: %{}
+
+  defp record_failure(db, report) do
+    source_event_ref = Map.get(report, :source_event_ref, "unknown")
+
+    detail =
+      "classification=#{report.classification} attempts=#{report.attempts} " <>
+        "subagent_ref=#{Map.get(report, :subagent_ref, "unknown")} " <>
+        "reason=#{inspect(report.reason)}"
+
+    try do
+      EventLog.lifecycle(db, "subagent_event_ingestion_failed", source_event_ref, detail)
+    rescue
+      _error -> :ok
+    catch
+      _, _ -> :ok
     end
   end
 

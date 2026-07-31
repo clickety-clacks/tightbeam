@@ -1136,6 +1136,7 @@ defmodule Tightbeam.Placement do
           {:error, context, failure}
 
         captured ->
+          context = subagent_event_context(context, captured)
           event_ref = make_ref()
 
           case Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
@@ -1143,13 +1144,13 @@ defmodule Tightbeam.Placement do
                    {:consume_subagent_event, ^event_ref, adapter} ->
                      result =
                        try do
-                         case Tightbeam.SubagentMarkers.consume_captured(
+                         case Tightbeam.SubagentMarkers.consume_captured_with_retry(
                                 captured,
                                 db,
                                 Tightbeam.WakeScheduler
                               ) do
-                           {:error, reason} -> {:error, {:refused, reason}}
-                           marker -> {:ok, marker}
+                           {:error, report} -> {:error, report}
+                           {:ok, marker} -> {:ok, marker}
                          end
                        rescue
                          error -> {:error, {:error, error, __STACKTRACE__}}
@@ -1166,6 +1167,16 @@ defmodule Tightbeam.Placement do
       end
     end
   end
+
+  defp subagent_event_context(context, {:ok, input}) do
+    Map.merge(context, Map.take(input, [:source_event_ref, :subagent_ref]))
+  end
+
+  defp subagent_event_context(context, {:error, error}) when is_map(error) do
+    Map.merge(context, Map.take(error, [:source_event_ref, :subagent_ref]))
+  end
+
+  defp subagent_event_context(context, _captured), do: context
 
   @doc """
   Materialize the home for an adapter key on its host per the moduledoc.
