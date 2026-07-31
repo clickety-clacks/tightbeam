@@ -189,6 +189,23 @@ defmodule Tightbeam.CommandEdgeTest do
     end)
   end
 
+  test "functions used as map keys are rejected" do
+    callback = fn -> :escaped end
+
+    command = %AuthEvent{
+      adapter_key: {:codex, "shared", "host"},
+      provider: :openai,
+      classification: :terminal,
+      evidence: %{callback => :value},
+      context: :not_turn_scoped,
+      observed_at: 123
+    }
+
+    assert_executable_data_rejected(fn ->
+      CommandEdge.validate_command!(command)
+    end)
+  end
+
   test "a bare function cannot be sent as a command" do
     receiver = start_supervised!({Receiver, self()})
     signal = CommandEdge.signal_to(receiver)
