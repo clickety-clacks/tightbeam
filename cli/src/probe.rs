@@ -97,9 +97,6 @@ impl ProbeIo for SystemIo {
     ) -> Result<Vec<u8>, CommandFailure> {
         let mut command = Command::new(program);
         command.args(args);
-        if program == "ps" {
-            command.env("LC_ALL", "C");
-        }
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

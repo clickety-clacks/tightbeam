@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -112,7 +113,29 @@ fn load_from_default_route() -> Result<HarnessCatalog, String> {
 }
 
 fn load_endpoint(endpoint: &dispatch::Endpoint) -> Result<HarnessCatalog, String> {
-    let response = match dispatch::gateway_request("GET", endpoint, "/harnesses").call() {
+    load_endpoint_with_deadline(endpoint, None)
+}
+
+fn load_endpoint_with_deadline(
+    endpoint: &dispatch::Endpoint,
+    deadline: Option<Instant>,
+) -> Result<HarnessCatalog, String> {
+    if let Some(deadline) = deadline {
+        let endpoint = endpoint.clone();
+        return crate::lease::until(deadline, move |remaining| {
+            load_endpoint_with_timeout(&endpoint, Some(remaining))
+        })
+        .map_err(|()| harness_lease_expired())?;
+    }
+
+    load_endpoint_with_timeout(endpoint, None)
+}
+
+fn load_endpoint_with_timeout(
+    endpoint: &dispatch::Endpoint,
+    timeout: Option<Duration>,
+) -> Result<HarnessCatalog, String> {
+    let response = match dispatch::gateway_request("GET", endpoint, "/harnesses", timeout).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(status, response)) => {
             let encoded = response
@@ -143,8 +166,21 @@ pub fn load_optional() -> Option<HarnessCatalog> {
     load().ok()
 }
 
-pub(crate) fn load_optional_from(endpoint: &dispatch::Endpoint) -> Option<HarnessCatalog> {
-    load_from_with(&home_dir(), || load_endpoint(endpoint)).ok()
+pub(crate) fn load_optional_from(
+    endpoint: &dispatch::Endpoint,
+    deadline: Instant,
+) -> Result<Option<HarnessCatalog>, String> {
+    match load_from_with(&home_dir(), || {
+        load_endpoint_with_deadline(endpoint, Some(deadline))
+    }) {
+        Ok(catalog) => Ok(Some(catalog)),
+        Err(reason) if reason == harness_lease_expired() => Err(reason),
+        Err(_) => Ok(None),
+    }
+}
+
+fn harness_lease_expired() -> String {
+    "harness catalog lookup refused because the onboarding lease expired".to_owned()
 }
 
 #[cfg(not(test))]
@@ -179,6 +215,7 @@ fn unavailable(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -265,5 +302,19 @@ mod tests {
                 .unwrap_err()
                 .contains("missing process_markers")
         );
+    }
+
+    #[test]
+    fn expired_ceremony_harness_lookup_refuses_before_network_io() {
+        let endpoint = dispatch::Endpoint {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: None,
+        };
+        let error =
+            load_endpoint_with_deadline(&endpoint, Some(Instant::now() - Duration::from_millis(1)))
+                .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
     }
 }

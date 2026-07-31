@@ -49,20 +49,25 @@ fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
     now + lease_timeout(ready)
 }
 
+type HarnessLoader<'a> = dyn Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String> + 'a;
+
 struct Ceremony<'a> {
     endpoint: &'a Endpoint,
     deadline: Instant,
+    load_harnesses: &'a HarnessLoader<'a>,
 }
 
-pub fn onboard<S>(
+pub fn onboard<S, H>(
     identity: &Identity,
     provider: &str,
     api_key: bool,
     endpoint: &Endpoint,
     send_request: S,
+    load_harnesses: H,
 ) -> Result<(), String>
 where
-    S: Fn(&Endpoint, &RequestSpec) -> Result<Option<serde_json::Value>, String>,
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
     let kind = if api_key { "apiKey" } else { "subscription" };
     let machine = onboard_machine(
@@ -79,11 +84,15 @@ where
         machine.as_deref(),
         None,
     );
-    let ready = send_request(endpoint, &begin)?
+    let ready = send_request(endpoint, &begin, None)?
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
     let deadline = lease_deadline(&ready, Instant::now());
     let staging = staging_path(&ready)?;
-    let ceremony = Ceremony { endpoint, deadline };
+    let ceremony = Ceremony {
+        endpoint,
+        deadline,
+        load_harnesses: &load_harnesses,
+    };
 
     let staged = if api_key {
         run_api_key_onboarding(provider, staging, machine.as_deref(), &ceremony)
@@ -106,7 +115,13 @@ where
             machine.as_deref(),
             classified,
         );
-        let _ = send_request(ceremony.endpoint, &cancel);
+        if let Err(cancel_reason) =
+            send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline))
+        {
+            if cancel_reason.contains("onboarding lease expired") {
+                return Err(format!("{reason}; {cancel_reason}"));
+            }
+        }
         return Err(reason);
     }
 
@@ -118,7 +133,7 @@ where
         machine.as_deref(),
         None,
     );
-    match send_request(ceremony.endpoint, &finish) {
+    match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
         Ok(Some(result)) => {
             println!(
                 "{}",
@@ -136,7 +151,13 @@ where
                 machine.as_deref(),
                 None,
             );
-            let _ = send_request(ceremony.endpoint, &cancel);
+            if let Err(cancel_reason) =
+                send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline))
+            {
+                if cancel_reason.contains("onboarding lease expired") {
+                    return Err(format!("{reason}; {cancel_reason}"));
+                }
+            }
             return Err(reason);
         }
     }
@@ -343,7 +364,11 @@ fn run_bounded(
             ));
         }
 
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        );
     }
 }
 
@@ -404,8 +429,12 @@ fn read_api_key() -> Result<String, String> {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
         return Err(api_key_needs_a_pipe());
     }
+    read_api_key_from(&mut io::stdin())
+}
+
+fn read_api_key_from(reader: &mut impl io::Read) -> Result<String, String> {
     let mut raw = String::new();
-    io::Read::read_to_string(&mut io::stdin(), &mut raw)
+    io::Read::read_to_string(reader, &mut raw)
         .map_err(|error| format!("could not read the API key from stdin: {error}"))?;
     let key = raw.trim().to_owned();
     if key.is_empty() {
@@ -445,9 +474,20 @@ fn validate_api_key(
     deadline: Instant,
 ) -> Result<(), String> {
     let host = machine.map(str::to_owned).unwrap_or_else(this_host);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(deadline.saturating_duration_since(Instant::now()))
-        .build();
+    let provider = provider.to_owned();
+    let key = key.to_owned();
+    validation_before_deadline(deadline, "API-key validation", move |remaining| {
+        validate_api_key_with_timeout(&provider, &key, &host, remaining)
+    })
+}
+
+fn validate_api_key_with_timeout(
+    provider: &str,
+    key: &str,
+    host: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let agent = validation_agent(timeout);
     let request = match provider {
         "anthropic" => agent
             .get("https://api.anthropic.com/v1/models?limit=1")
@@ -464,19 +504,22 @@ fn validate_api_key(
     match request.call() {
         Ok(_response) => Ok(()),
         Err(ureq::Error::Status(status, response)) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            let body = match response.into_string() {
+                Ok(body) => body,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    return Err(unvalidated_api_key(provider, &error.to_string(), host));
+                }
+                Err(_) => "<unreadable response body>".to_owned(),
+            };
             Err(format!(
                 "the {provider} API key was rejected on {host}: HTTP {status} {}. Nothing was \
                  banked -- the {provider} credential on {host} is unchanged.",
                 body.trim()
             ))
         }
-        Err(ureq::Error::Transport(error)) => Err(format!(
-            "could not reach {provider} from {host} to validate the API key: {error}. Nothing \
-             was banked -- the {provider} credential on {host} is unchanged."
-        )),
+        Err(ureq::Error::Transport(error)) => {
+            Err(unvalidated_api_key(provider, &error.to_string(), host))
+        }
     }
 }
 
@@ -492,7 +535,7 @@ fn validate_api_key(
 /// Bounded by the same watchdog as every other ceremony child: a new path that
 /// spawned an unbounded child would reopen the orphan leak the watchdog closed.
 fn bank_openai_api_key(staging: &str, key: &str, ceremony: &Ceremony<'_>) -> Result<(), String> {
-    let codex = harness_cli("openai", ceremony.endpoint)?;
+    let codex = harness_cli("openai", ceremony)?;
     let mut command = ProcessCommand::new(&codex);
     command
         .args(["login", "--with-api-key"])
@@ -548,13 +591,13 @@ fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
 /// here; it is the pairing `Harness.credential_provider/0` states on the Elixir side.
 /// When the catalog cannot be reached the harness's own name is used, which is what both
 /// binaries are called today.
-fn harness_cli(provider: &str, endpoint: &Endpoint) -> Result<String, String> {
+fn harness_cli(provider: &str, ceremony: &Ceremony<'_>) -> Result<String, String> {
     let harness = match provider {
         "openai" => "codex",
         "anthropic" => "claude",
         _ => return Err(format!("unsupported provider: {provider}")),
     };
-    let binary = crate::harnesses::load_optional_from(endpoint)
+    let binary = (ceremony.load_harnesses)(ceremony.endpoint, ceremony.deadline)?
         .and_then(|catalog| {
             catalog
                 .harnesses
@@ -602,7 +645,7 @@ fn this_host() -> String {
 }
 
 fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), String> {
-    let codex = harness_cli("openai", ceremony.endpoint)?;
+    let codex = harness_cli("openai", ceremony)?;
     let mut command = ProcessCommand::new(&codex);
     command
         .args(["login", "--device-auth"])
@@ -713,7 +756,7 @@ fn run_anthropic_onboarding(
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
-    let claude = harness_cli("anthropic", ceremony.endpoint)?;
+    let claude = harness_cli("anthropic", ceremony)?;
     require_on_path(
         "script",
         &search_path(),
@@ -831,10 +874,19 @@ fn validate_setup_token(
     deadline: Instant,
 ) -> Result<(), String> {
     let host = machine.map(str::to_owned).unwrap_or_else(this_host);
+    let token = token.to_owned();
+    validation_before_deadline(deadline, "setup-token validation", move |remaining| {
+        validate_setup_token_with_timeout(&token, &host, remaining)
+    })
+}
+
+fn validate_setup_token_with_timeout(
+    token: &str,
+    host: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let (url, headers) = subscription_probe(token);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(deadline.saturating_duration_since(Instant::now()))
-        .build();
+    let agent = validation_agent(timeout);
     let mut request = agent.get(url);
     for (name, value) in &headers {
         request = request.set(name, value);
@@ -843,15 +895,44 @@ fn validate_setup_token(
     match request.call() {
         Ok(_response) => Ok(()),
         Err(ureq::Error::Status(status, response)) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
-            Err(rejected_setup_token(status, body.trim(), &host))
+            let body = match response.into_string() {
+                Ok(body) => body,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    return Err(unvalidated_setup_token(&error.to_string(), host));
+                }
+                Err(_) => "<unreadable response body>".to_owned(),
+            };
+            Err(rejected_setup_token(status, body.trim(), host))
         }
         Err(ureq::Error::Transport(error)) => {
-            Err(unvalidated_setup_token(&error.to_string(), &host))
+            Err(unvalidated_setup_token(&error.to_string(), host))
         }
     }
+}
+
+fn validation_agent(timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .timeout_connect(timeout)
+        .build()
+}
+
+fn validation_before_deadline<F>(deadline: Instant, what: &str, work: F) -> Result<(), String>
+where
+    F: FnOnce(Duration) -> Result<(), String> + Send + 'static,
+{
+    crate::lease::until(deadline, work).map_err(|()| validation_expired(what))?
+}
+
+fn validation_expired(what: &str) -> String {
+    format!("{what} refused because the onboarding lease expired; nothing was banked")
+}
+
+fn unvalidated_api_key(provider: &str, error: &str, host: &str) -> String {
+    format!(
+        "could not reach {provider} from {host} to validate the API key: {error}. Nothing \
+         was banked -- the {provider} credential on {host} is unchanged."
+    )
 }
 
 /// The captured token does not work, and CAPTURE is the suspect.
@@ -1398,6 +1479,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_api_key_network_timeout_is_not_reported_as_lease_expiry_or_rejection() {
+        let message = unvalidated_api_key("openai", "network operation timed out", "shrdlu");
+
+        assert!(message.contains("could not reach openai"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("Nothing was banked"), "{message}");
+        assert!(!message.contains("lease expired"), "{message}");
+        assert!(!message.contains("rejected"), "{message}");
+    }
+
     /// An API key is staged under the SAME filename the subscription ceremony
     /// stages, at the same 0600, so everything downstream is identical between
     /// the two kinds and only the recorded kind differs.
@@ -1437,6 +1529,7 @@ mod tests {
         let ceremony = Ceremony {
             endpoint: &endpoint,
             deadline: Instant::now() + CEREMONY_FALLBACK_TIMEOUT,
+            load_harnesses: &|_, _| Ok(None),
         };
 
         assert_eq!(
@@ -1519,6 +1612,45 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_ceremony_gets_term_grace_before_kill() {
+        let marker = std::env::temp_dir().join(format!(
+            "tightbeam-ceremony-term-grace-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = ProcessCommand::new("sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    "trap 'printf term > \"{}\"; exit 0' TERM; while :; do sleep 1; done",
+                    marker.display()
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let error = run_bounded(
+            command,
+            "a TERM-aware stub ceremony",
+            Instant::now() + Duration::from_millis(500),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
+        let handled = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(
+            handled, "term",
+            "SIGKILL arrived before the contained process handled SIGTERM"
+        );
+    }
+
+    #[test]
     fn lease_deadline_starts_from_the_begin_reply() {
         let ready = serde_json::json!({"leaseTtlMs": 12_345});
         let now = Instant::now();
@@ -1558,6 +1690,54 @@ mod tests {
             !marker.exists(),
             "the child ran even though the lease was already expired"
         );
+    }
+
+    #[test]
+    fn an_api_key_pipe_is_read_to_eof() {
+        let mut reader = io::Cursor::new(b"  sk-test\n".to_vec());
+        assert_eq!(read_api_key_from(&mut reader), Ok("sk-test".to_owned()));
+    }
+
+    #[test]
+    fn validation_refuses_an_expired_lease_before_network_io() {
+        for what in ["API-key validation", "setup-token validation"] {
+            let error =
+                validation_before_deadline(Instant::now() - Duration::from_millis(1), what, |_| {
+                    panic!("expired validation performed network work")
+                })
+                .unwrap_err();
+            assert!(error.contains(what), "{error}");
+            assert!(error.contains("onboarding lease expired"), "{error}");
+            assert!(error.contains("nothing was banked"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_network_failure_before_the_deadline_survives_the_lease_waiter() {
+        let error = validation_before_deadline(
+            Instant::now() + Duration::from_secs(1),
+            "API-key validation",
+            |_| Err("network operation timed out".to_owned()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "network operation timed out");
+    }
+
+    #[test]
+    fn a_rejection_body_that_finishes_after_the_deadline_is_reported_as_expiry() {
+        let error = validation_before_deadline(
+            Instant::now() + Duration::from_millis(20),
+            "API-key validation",
+            |_| {
+                thread::sleep(Duration::from_millis(100));
+                Err("the API key was rejected".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
+        assert!(!error.contains("rejected"), "{error}");
     }
 
     #[derive(Default)]
@@ -2169,8 +2349,13 @@ mod tests {
             token: "tbc_test".to_owned(),
             session_file: None,
         };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + CEREMONY_FALLBACK_TIMEOUT,
+            load_harnesses: &|_, _| Ok(None),
+        };
         assert_eq!(
-            harness_cli("nonesuch", &endpoint),
+            harness_cli("nonesuch", &ceremony),
             Err("unsupported provider: nonesuch".to_owned())
         );
     }

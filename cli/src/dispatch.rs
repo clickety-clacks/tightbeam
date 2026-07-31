@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -834,14 +835,33 @@ pub fn send(request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to(&endpoint, request)
 }
 
-pub(crate) fn gateway_request(method: &str, endpoint: &Endpoint, path: &str) -> ureq::Request {
-    ureq::request(method, &format!("{}{path}", endpoint.base))
-        .set("authorization", &format!("Bearer {}", endpoint.token))
-        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
+pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
+    send_to_with_deadline(endpoint, request, None)
 }
 
-pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
-    let call = gateway_request("POST", endpoint, request.path)
+pub(crate) fn send_to_with_deadline(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+    deadline: Option<Instant>,
+) -> Result<Option<Value>, String> {
+    if let Some(deadline) = deadline {
+        let endpoint = endpoint.clone();
+        let request = request.clone();
+        return crate::lease::until(deadline, move |remaining| {
+            send_to_with_timeout(&endpoint, &request, Some(remaining))
+        })
+        .map_err(|()| ceremony_expired())?;
+    }
+
+    send_to_with_timeout(endpoint, request, None)
+}
+
+fn send_to_with_timeout(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+    timeout: Option<Duration>,
+) -> Result<Option<Value>, String> {
+    let call = gateway_request("POST", endpoint, request.path, timeout)
         .set("content-type", "application/json")
         .send_string(&request.body_json);
 
@@ -852,6 +872,27 @@ pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Opti
     };
     let encoded = response.into_string().map_err(|error| error.to_string())?;
     parse_response(status, &encoded)
+}
+
+pub(crate) fn gateway_request(
+    method: &str,
+    endpoint: &Endpoint,
+    path: &str,
+    timeout: Option<Duration>,
+) -> ureq::Request {
+    let mut builder = ureq::AgentBuilder::new();
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout).timeout_connect(timeout);
+    }
+    builder
+        .build()
+        .request(method, &format!("{}{path}", endpoint.base))
+        .set("authorization", &format!("Bearer {}", endpoint.token))
+        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
+}
+
+fn ceremony_expired() -> String {
+    "gateway request refused because the onboarding lease expired".to_owned()
 }
 
 fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
@@ -911,14 +952,21 @@ pub fn run(command: Command) -> Result<(), String> {
                 discover()
             }
         },
-        send_to,
+        send_to_with_deadline,
+        crate::harnesses::load_optional_from,
     )
 }
 
-fn run_with<D, S>(command: Command, discover_endpoint: D, send_request: S) -> Result<(), String>
+fn run_with<D, S, H>(
+    command: Command,
+    discover_endpoint: D,
+    send_request: S,
+    load_harnesses: H,
+) -> Result<(), String>
 where
     D: FnOnce() -> Result<Endpoint, String>,
-    S: Fn(&Endpoint, &RequestSpec) -> Result<Option<Value>, String>,
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<crate::harnesses::HarnessCatalog>, String>,
 {
     match command {
         Command::Help | Command::CommandHelp(_) => {
@@ -933,7 +981,14 @@ where
         } => {
             let endpoint = discover_endpoint()?;
             require_session_endpoint(&identity, &endpoint)?;
-            crate::ceremonies::onboard(&identity, &provider, api_key, &endpoint, send_request)
+            crate::ceremonies::onboard(
+                &identity,
+                &provider,
+                api_key,
+                &endpoint,
+                send_request,
+                load_harnesses,
+            )
         }
         command => {
             let endpoint = discover_endpoint()?;
@@ -941,7 +996,7 @@ where
                 require_session_endpoint(identity, &endpoint)?;
             }
             let request = build_request(&command)?;
-            if let Some(result) = send_request(&endpoint, &request)? {
+            if let Some(result) = send_request(&endpoint, &request, None)? {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
@@ -1038,7 +1093,7 @@ mod tests {
             ("POST", "/agent/tool-call-observed"),
             ("GET", "/harnesses"),
         ] {
-            let request = gateway_request(method, &endpoint, path);
+            let request = gateway_request(method, &endpoint, path, None);
             assert_eq!(request.method(), method);
             assert_eq!(request.url(), format!("http://gateway.example:11373{path}"));
             assert_eq!(request.header("authorization"), Some("Bearer tbc_org"));
@@ -1788,11 +1843,13 @@ mod tests {
                     session_file: Some(PathBuf::from("/work/.tightbeam-session")),
                 })
             },
-            |endpoint, request| {
+            |endpoint, request, deadline| {
+                assert_eq!(deadline, None);
                 assert_eq!(endpoint.token, "tbs_discovered");
                 assert_eq!(request.body_json, r#"{"verb":"inspect","params":{}}"#);
                 Ok(None)
             },
+            |_, _| panic!("harness loader must not be called"),
         )
         .unwrap();
 
@@ -1807,7 +1864,8 @@ mod tests {
                 identity: Identity::Session,
             },
             || Ok(endpoint),
-            |_, _| panic!("network sender must not be called"),
+            |_, _, _| panic!("network sender must not be called"),
+            |_, _| panic!("harness loader must not be called"),
         )
         .unwrap_err();
 
@@ -1833,23 +1891,25 @@ mod tests {
             std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
         }
 
+        let gateway = "https://one-gateway.test".to_owned();
         let discoveries = Cell::new(0);
         let calls = RefCell::new(Vec::new());
+        let catalog_calls = RefCell::new(Vec::new());
         let result = run_with(
             Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
-                provider: "fixture-provider".to_owned(),
+                provider: "openai".to_owned(),
                 api_key: false,
             },
             || {
                 discoveries.set(discoveries.get() + 1);
                 Ok(Endpoint {
-                    base: "https://one-gateway.test".to_owned(),
+                    base: gateway.clone(),
                     token: "tbc_one".to_owned(),
                     session_file: None,
                 })
             },
-            |endpoint, request| {
+            |endpoint, request, deadline| {
                 let phase = if request.body_json.contains(r#""phase":"begin""#) {
                     "begin"
                 } else if request.body_json.contains(r#""phase":"finish""#) {
@@ -1857,7 +1917,9 @@ mod tests {
                 } else {
                     panic!("unexpected onboarding request: {}", request.body_json);
                 };
-                calls.borrow_mut().push((endpoint.base.clone(), phase));
+                calls
+                    .borrow_mut()
+                    .push((endpoint.base.clone(), phase, deadline.is_some()));
                 if phase == "begin" {
                     Ok(Some(serde_json::json!({
                         "stagingPath": staging,
@@ -1866,6 +1928,20 @@ mod tests {
                 } else {
                     Ok(None)
                 }
+            },
+            |endpoint, deadline| {
+                catalog_calls
+                    .borrow_mut()
+                    .push((endpoint.base.clone(), deadline));
+                Ok(Some(crate::harnesses::HarnessCatalog {
+                    harnesses: vec![crate::harnesses::HarnessProjection {
+                        id: "codex".to_owned(),
+                        wire_name: "codex".to_owned(),
+                        install_package: "codex-acp".to_owned(),
+                        cli_binary: "true".to_owned(),
+                        process_markers: vec!["codex".to_owned()],
+                    }],
+                }))
             },
         );
 
@@ -1877,13 +1953,40 @@ mod tests {
 
         result.unwrap();
         assert_eq!(discoveries.get(), 1);
+        let catalog_calls = catalog_calls.into_inner();
+        assert_eq!(catalog_calls.len(), 1);
+        assert_eq!(catalog_calls[0].0, gateway);
         assert_eq!(
             calls.into_inner(),
-            vec![
-                ("https://one-gateway.test".to_owned(), "begin"),
-                ("https://one-gateway.test".to_owned(), "finish"),
-            ]
+            vec![(gateway.clone(), "begin", false), (gateway, "finish", true),]
         );
+    }
+
+    #[test]
+    fn an_expired_deadline_refuses_gateway_io_as_lease_expiry() {
+        use std::time::{Duration, Instant};
+
+        let endpoint = Endpoint {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: None,
+        };
+        let request = build_onboard_phase_request(
+            &Identity::User("flynn".to_owned()),
+            "openai",
+            "finish",
+            "subscription",
+            Some("work-1"),
+            None,
+        );
+        let error = send_to_with_deadline(
+            &endpoint,
+            &request,
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
     }
 
     #[test]

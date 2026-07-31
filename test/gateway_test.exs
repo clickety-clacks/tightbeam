@@ -68,31 +68,6 @@ defmodule Tightbeam.GatewayTest do
     WorkState
   }
 
-  defmodule McpArchetypes do
-    def get("unknown"), do: nil
-
-    def builtin_default do
-      %{Archetypes.builtin_default() | mcp: [server()]}
-    end
-
-    def acp_mcp_servers(archetype), do: Archetypes.acp_mcp_servers(archetype)
-
-    defp server do
-      %{name: "builtin", command: "builtin-mcp", args: ["--default"], env: %{"MODE" => "test"}}
-    end
-  end
-
-  test "an unknown archetype projects the builtin default MCP servers" do
-    assert Gateway.mcp_servers_for_archetype("unknown", McpArchetypes) == [
-             %{
-               "name" => "builtin",
-               "command" => "builtin-mcp",
-               "args" => ["--default"],
-               "env" => [%{"name" => "MODE", "value" => "test"}]
-             }
-           ]
-  end
-
   alias Tightbeam.Wire.Payloads
 
   defmodule LaneDoorbell do
@@ -132,6 +107,9 @@ defmodule Tightbeam.GatewayTest do
       {:reply, reply, state}
     end
 
+    def handle_call({:adapter_for, key, _context}, from, state),
+      do: handle_call({:adapter_for, key}, from, state)
+
     def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
@@ -142,6 +120,12 @@ defmodule Tightbeam.GatewayTest do
     end
 
     def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
+
+    def handle_cast({:close_adapter, key}, {adapter, parent} = state) do
+      if is_pid(parent), do: send(parent, {:close_adapter, key})
+      GenServer.stop(adapter)
+      {:noreply, state}
+    end
   end
 
   defmodule AdapterStub do
@@ -3910,7 +3894,7 @@ defmodule Tightbeam.GatewayTest do
   # as "test timed out" rather than naming the wait that actually ran out. Raise the
   # ceiling above the budget it contains.
   @tag timeout: 180_000
-  test "one fake-adapter turn publishes the golden frame order", ctx do
+  test "one fake-adapter turn uses the MCP fallback and publishes the golden frame order", ctx do
     exact_registry =
       start_supervised!(%{
         id: :exact_conn_registry,
@@ -3969,6 +3953,12 @@ defmodule Tightbeam.GatewayTest do
     identity_name = Placement.identity_name(config, archetype, overrides, :claude)
     Org.set_identity(ctx.db, "k1", overrides, identity_name)
 
+    {_archetypes, fragments} = :persistent_term.get(Archetypes)
+    :persistent_term.put(Archetypes, {%{}, fragments})
+    refute Archetypes.get("default")
+    assert archetype.mcp != []
+    assert Archetypes.builtin_default().mcp == []
+
     {Tightbeam.LaneManager, lane_opts} =
       Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
 
@@ -3989,18 +3979,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
 
-    assert_receive {:new_session_mcp_servers,
-                    [
-                      %{
-                        "name" => "xcodebuild",
-                        "command" => "xcodebuildmcp",
-                        "args" => ["--daemon"],
-                        "env" => [
-                          %{"name" => "XCODEBUILD_MCP_MODE", "value" => "cli"}
-                        ]
-                      }
-                    ]},
-                   @cold_runner_prompt_timeout
+    assert_receive {:new_session_mcp_servers, []}, @cold_runner_prompt_timeout
 
     # Four ms behind the wait above in every sample: the forks are already paid.
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
@@ -5599,7 +5578,7 @@ defmodule Tightbeam.GatewayTest do
       |> Keyword.put(:name, nil)
       |> Keyword.put(:park, park)
       |> Keyword.put(:stop, fn _provider -> :ok end)
-      |> Keyword.put(:start, fn _provider -> :ok end)
+      |> Keyword.put(:start, fn _provider, _kind -> :ok end)
       |> Keyword.put(:resume, fn _provider -> :ok end)
       |> Keyword.put(:onboarders, %{
         openai: fn _state -> {:ok, %{bytes: ~S({"token":"replacement"}), expires_at: nil}} end

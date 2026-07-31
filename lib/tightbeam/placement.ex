@@ -992,6 +992,18 @@ defmodule Tightbeam.Placement do
     |> Keyword.merge(plan)
   end
 
+  @doc """
+  Capture same-tier adapter boot inputs in the higher-tier coordinator.
+
+  Adapter opts remain lazy because host delivery may block, but the credential
+  lifecycle read must complete before the Adapter process is started.
+  """
+  @spec adapter_context(map(), adapter_key()) :: keyword()
+  def adapter_context(config, {harness, _identity_name, host}) do
+    provider = Harness.module!(harness).credential_provider()
+    [credential_kind: credential_kind(config, provider, host)]
+  end
+
   @doc "Derive the stored name for a normalized overridden identity."
   @spec identity_name(map(), Archetypes.t(), map() | nil, atom()) :: String.t()
   def identity_name(_config, archetype, nil, _harness), do: archetype.name
@@ -1095,18 +1107,63 @@ defmodule Tightbeam.Placement do
     db = Map.get(config, :db, Tightbeam.DB)
 
     fn harness_session_id, update ->
-      Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-        Tightbeam.SubagentMarkers.consume_update(
-          db,
-          Tightbeam.WakeScheduler,
-          module.id(),
-          host,
-          harness_session_id,
-          update
-        )
-      end)
+      context = %{
+        harness: module.id(),
+        machine: host,
+        harness_session_id: harness_session_id
+      }
 
-      :ok
+      captured =
+        try do
+          Tightbeam.SubagentMarkers.capture_update(
+            db,
+            module.id(),
+            host,
+            harness_session_id,
+            update
+          )
+        rescue
+          error -> {:capture_failed, {:error, error, __STACKTRACE__}}
+        catch
+          kind, reason -> {:capture_failed, {kind, reason, __STACKTRACE__}}
+        end
+
+      case captured do
+        :skip ->
+          :ok
+
+        {:capture_failed, failure} ->
+          {:error, context, failure}
+
+        captured ->
+          event_ref = make_ref()
+
+          case Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+                 receive do
+                   {:consume_subagent_event, ^event_ref, adapter} ->
+                     result =
+                       try do
+                         case Tightbeam.SubagentMarkers.consume_captured(
+                                captured,
+                                db,
+                                Tightbeam.WakeScheduler
+                              ) do
+                           {:error, reason} -> {:error, {:refused, reason}}
+                           marker -> {:ok, marker}
+                         end
+                       rescue
+                         error -> {:error, {:error, error, __STACKTRACE__}}
+                       catch
+                         kind, reason -> {:error, {kind, reason, __STACKTRACE__}}
+                       end
+
+                     send(adapter, {:subagent_event_ingested, event_ref, result})
+                 end
+               end) do
+            {:ok, pid} -> {:async, event_ref, pid, context}
+            {:error, reason} -> {:error, context, {:task_start_failed, reason}}
+          end
+      end
     end
   end
 

@@ -166,7 +166,7 @@ defmodule Tightbeam.Credentials do
        gate: Keyword.get(opts, :gate, fn _provider -> :ok end),
        stop: Keyword.get(opts, :stop, fn _provider -> :ok end),
        park: Keyword.get(opts, :park, fn _provider -> :ok end),
-       start: Keyword.get(opts, :start, fn _provider -> :ok end),
+       start: Keyword.get(opts, :start, fn _provider, _kind -> :ok end),
        resume: Keyword.get(opts, :resume, fn _provider -> :ok end),
        capture_sessions: Keyword.get(opts, :capture_sessions, fn _provider -> [] end),
        publish_sessions:
@@ -253,7 +253,7 @@ defmodule Tightbeam.Credentials do
       {:ok, %{path: path}} ->
         result =
           with {:ok, credential} <- install_staged!(state, provider, kind, path),
-               :ok <- state.start.(provider),
+               :ok <- state.start.(provider, kind),
                :ok <- mark_onboarded!(state, provider, kind, credential),
                captured <- capture_sessions(state, provider),
                :ok <- state.resume.(provider) do
@@ -308,7 +308,7 @@ defmodule Tightbeam.Credentials do
            :ok <- state.stop.(provider),
            {:ok, credential} <- Map.fetch!(state.onboarders, provider).(state),
            :ok <- write_credential!(state, provider, credential),
-           :ok <- state.start.(provider),
+           :ok <- state.start.(provider, :subscription),
            :ok <- mark_onboarded!(state, provider, :subscription, credential),
            captured <- capture_sessions(state, provider),
            :ok <- state.resume.(provider) do

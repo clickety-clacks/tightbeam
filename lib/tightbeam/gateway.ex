@@ -257,7 +257,13 @@ defmodule Tightbeam.Gateway do
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
-    adapter_opts = fn key -> Placement.adapter_opts(adapter_config, key) end
+    adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
+
+    adapter_opts = fn key, context ->
+      adapter_config
+      |> Map.merge(Map.new(context))
+      |> Placement.adapter_opts(key)
+    end
 
     socket_deps = %{
       db: db,
@@ -369,10 +375,15 @@ defmodule Tightbeam.Gateway do
          tick_ms: config.wake_tick_ms,
          name: Tightbeam.WakeScheduler},
         {Tightbeam.Supervision,
-         db: db, handlers: handler_table, prod_limit: prod_limit, name: Tightbeam.Supervision},
+         db: db,
+         handlers: handler_table,
+         prod_limit: prod_limit,
+         sweep_ms: config.wake_tick_ms,
+         name: Tightbeam.Supervision},
         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
         {Tightbeam.AdapterCoordinator,
          adapter_sup: Tightbeam.AdapterSupervisor,
+         adapter_context: adapter_context,
          adapter_opts: adapter_opts,
          db: db,
          on_adapter_ready: on_adapter_ready,
@@ -413,8 +424,8 @@ defmodule Tightbeam.Gateway do
         ssh: host.ssh,
         gate: fn _provider -> :ok end,
         stop: fn provider -> stop_provider_runtime(provider, machine) end,
-        park: fn provider -> stop_provider_runtime(provider, machine) end,
-        start: fn provider -> start_provider_runtime(provider, machine) end,
+        park: fn provider -> park_provider_runtime(provider, machine) end,
+        start: fn provider, kind -> start_provider_runtime(provider, kind, machine) end,
         resume: fn _provider -> :ok end,
         capture_sessions: fn provider ->
           capture_credential_sessions(db, provider, machine)
@@ -3372,6 +3383,19 @@ defmodule Tightbeam.Gateway do
     :ok
   end
 
+  defp park_provider_runtime(provider, machine) do
+    provider
+    |> harnesses_for_provider()
+    |> Enum.each(fn module ->
+      AdapterCoordinator.request_close_adapter(
+        Tightbeam.AdapterCoordinator,
+        {module.id(), "shared", machine}
+      )
+    end)
+
+    :ok
+  end
+
   defp capture_credential_sessions(db, provider, machine) do
     harnesses = provider |> harnesses_for_provider() |> MapSet.new(& &1.wire_name())
 
@@ -3418,12 +3442,16 @@ defmodule Tightbeam.Gateway do
     "#{provider} credential on #{machine} was re-onboarded; this session may resume."
   end
 
-  defp start_provider_runtime(provider, machine) do
+  defp start_provider_runtime(provider, kind, machine) do
     {started, failed} =
       Enum.reduce(harnesses_for_provider(provider), {[], []}, fn module, {started, failed} ->
         key = {module.id(), "shared", machine}
 
-        case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
+        case AdapterCoordinator.adapter_for(
+               Tightbeam.AdapterCoordinator,
+               key,
+               credential_kind: kind
+             ) do
           {:ok, _pid, _generation} ->
             {[module.wire_name() | started], failed}
 

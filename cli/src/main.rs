@@ -4,6 +4,7 @@ mod ceremonies;
 mod contain;
 mod dispatch;
 mod harnesses;
+mod lease;
 mod preflight;
 mod probe;
 mod screen;
