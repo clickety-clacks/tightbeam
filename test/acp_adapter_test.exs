@@ -628,7 +628,7 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.apply_model_strict(codex, "sess-1", "gpt-new[high]", "gpt-old[medium]")
   end
 
-  test "strict apply fences a stale requester against the harness-confirmed model" do
+  test "strict apply treats cache disagreement as unknown and forces an owner reload" do
     {adapter, capture_path} = start_adapter(harness: :codex)
 
     assert {:ok, "sess-1"} =
@@ -637,10 +637,21 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, "gpt-new[high]"} =
              Adapter.apply_model_strict(adapter, "sess-1", "gpt-new[high]", "gpt-old[medium]")
 
-    assert {:error, {:stale_model, "gpt-new[high]"}} =
+    assert {:error, :model_readback_unavailable} =
              Adapter.apply_model_strict(adapter, "sess-1", "gpt-late", "gpt-old[medium]")
 
-    assert {:ok, "gpt-new[high]"} = Adapter.current_model(adapter, "sess-1")
+    refute Adapter.knows_session?(adapter, "sess-1")
+    assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, "gpt-new[high]"} =
+             Adapter.load_session(
+               adapter,
+               "sess-1",
+               "gpt-old[medium]",
+               "/tmp",
+               [],
+               "guidance"
+             )
 
     model_writes =
       captured_requests(capture_path)

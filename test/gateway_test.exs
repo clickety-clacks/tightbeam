@@ -384,6 +384,7 @@ defmodule Tightbeam.GatewayTest do
   setup do
     db = :"gateway_db_#{System.unique_integer([:positive])}"
     registry = :"gateway_registry_#{System.unique_integer([:positive])}"
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Placement.ensure_schema(db)
     start_supervised!({ConnRegistry, name: registry})

@@ -136,17 +136,22 @@ defmodule Tightbeam.Acp.Adapter do
           | {:error,
              :model_unavailable
              | :partial_apply
-             | :model_readback_unavailable
-             | {:stale_model, model_ref()}}
+             | :model_readback_unavailable}
   def apply_model_strict(adapter, session_id, model, prior_model),
     do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
 
-  @doc "The last model value confirmed by this serialized harness adapter."
+  @doc "The adapter's cached model value. This does not query the harness owner."
   @spec current_model(adapter(), String.t(), timeout()) ::
           {:ok, model_ref()}
           | {:error, :model_readback_unavailable | {:adapter_unavailable, term()}}
   def current_model(adapter, session_id, timeout \\ @boot_boundary_timeout),
     do: call(adapter, {:current_model, session_id}, timeout)
+
+  @doc "Forget cached residency so the next session use must reload from the harness owner."
+  @spec forget_model_residency(adapter(), String.t()) ::
+          :ok | {:error, {:adapter_unavailable, term()}}
+  def forget_model_residency(adapter, session_id),
+    do: call(adapter, {:forget_model_residency, session_id}, @boot_boundary_timeout)
 
   @doc "Apply a model selection and surface any explicit harness refusal."
   @spec apply_model(adapter(), String.t(), model_ref()) :: :ok | {:error, term()}
@@ -419,11 +424,13 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, ^prior_model} ->
         case strict_apply_with_retry(state, sid, model, prior_model, 3) do
           :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
-          error -> {:reply, error, forget_model_residency(state, sid)}
+          error -> {:reply, error, drop_model_residency(state, sid)}
         end
 
-      {:ok, current_model} ->
-        {:reply, {:error, {:stale_model, current_model}}, state}
+      {:ok, _cached_model} ->
+        # Cache disagreement proves only that the cache cannot justify this
+        # mutation. It does not reveal the harness owner's current value.
+        {:reply, {:error, :model_readback_unavailable}, drop_model_residency(state, sid)}
 
       :error ->
         {:reply, {:error, :model_readback_unavailable}, state}
@@ -433,7 +440,7 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_call({:apply_model, sid, model}, _from, state) do
     case apply_model_to_session(state, sid, model) do
       {:ok, applied_model} -> {:reply, :ok, put_in(state.models[sid], applied_model)}
-      error -> {:reply, error, forget_model_residency(state, sid)}
+      error -> {:reply, error, drop_model_residency(state, sid)}
     end
   end
 
@@ -446,6 +453,9 @@ defmodule Tightbeam.Acp.Adapter do
       :error -> {:reply, {:error, :model_readback_unavailable}, state}
     end
   end
+
+  def handle_call({:forget_model_residency, sid}, _from, state),
+    do: {:reply, :ok, drop_model_residency(state, sid)}
 
   def handle_call({:prompt, sid, text, opts}, from, state) do
     start_prompt(state, sid, text, opts, from)
@@ -724,7 +734,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp remember_config_model(state, _sid, _update), do: state
 
-  defp forget_model_residency(state, sid) do
+  defp drop_model_residency(state, sid) do
     # A failed set/read-back/rollback leaves the harness value unknown. Keeping
     # either cache entry would let the next residency pass project memory over
     # the owner; forgetting residency forces that pass through session/load.
