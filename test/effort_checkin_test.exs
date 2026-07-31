@@ -41,6 +41,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
   setup do
     db = :"effort_#{System.unique_integer([:positive])}"
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-effort-#{System.unique_integer([:positive])}")

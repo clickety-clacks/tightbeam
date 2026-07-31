@@ -4,11 +4,11 @@ defmodule Tightbeam.Acp.Adapter do
   it owns a Conn and routes session/update chunks by sessionId to the turn
   currently prompting each session.
 
-  Adapter rules (spec §Adapter selection; the SOURCE OF TRUTH mirrored from the
-  TS reference harness.ts):
-  1. Apply the selected model immediately after session/new. After session/load,
-     read the harness's current model and return it to the caller; a stored record
-     is a projection and must never be pushed over the loaded owner's value.
+  Adapter rules (spec §Adapter selection and the superseding model ruling):
+  1. The user's known canonical selection is pushed after session/new,
+     session/load, and immediately before each turn. An unknown selection is
+     never pushed: a fresh session keeps the harness default and captures it
+     when reported, while a loaded session is left unchanged.
   2. Model via session/set_config_option {configId:"model"} with a BARE name;
      effort rides as "model[effort]" split and applied via the harness's effort
      config id.
@@ -78,14 +78,14 @@ defmodule Tightbeam.Acp.Adapter do
   un-isolated cwd leaks the operator's own guidance and files into the
   agent). Returns {:ok, session_id}.
   """
-  @spec new_session(adapter(), model_ref(), String.t(), [map()], String.t()) ::
+  @spec new_session(adapter(), model_ref() | nil, String.t(), [map()], String.t()) ::
           {:ok, String.t()} | {:error, term()}
   def new_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
 
-  @doc "Adopt an existing harness session and return the model the harness reports as current."
-  @spec load_session(adapter(), String.t(), model_ref(), String.t(), [map()], String.t()) ::
-          {:ok, model_ref()} | {:error, term()}
+  @doc "Adopt an existing harness session and push the canonical model when it is known."
+  @spec load_session(adapter(), String.t(), model_ref() | nil, String.t(), [map()], String.t()) ::
+          {:ok, model_ref() | :unknown} | {:error, term()}
   def load_session(adapter, session_id, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:load_session, session_id, model, cwd, mcp_servers, guidance}, 30_000)
 
@@ -137,17 +137,22 @@ defmodule Tightbeam.Acp.Adapter do
           | {:error,
              :model_unavailable
              | :partial_apply
-             | :model_readback_unavailable
-             | {:stale_model, model_ref()}}
+             | :model_readback_unavailable}
   def apply_model_strict(adapter, session_id, model, prior_model),
     do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
 
-  @doc "The last model value confirmed by this serialized harness adapter."
-  @spec current_model(adapter(), String.t()) ::
+  @doc "The adapter's cached model value. This does not query the harness owner."
+  @spec current_model(adapter(), String.t(), timeout()) ::
           {:ok, model_ref()}
           | {:error, :model_readback_unavailable | {:adapter_unavailable, term()}}
-  def current_model(adapter, session_id),
-    do: call(adapter, {:current_model, session_id}, @boot_boundary_timeout)
+  def current_model(adapter, session_id, timeout \\ @boot_boundary_timeout),
+    do: call(adapter, {:current_model, session_id}, timeout)
+
+  @doc "Forget cached residency so the next session use must reload from the harness owner."
+  @spec forget_model_residency(adapter(), String.t()) ::
+          :ok | {:error, {:adapter_unavailable, term()}}
+  def forget_model_residency(adapter, session_id),
+    do: call(adapter, {:forget_model_residency, session_id}, @boot_boundary_timeout)
 
   @doc "Apply a model selection and surface any explicit harness refusal."
   @spec apply_model(adapter(), String.t(), model_ref()) :: :ok | {:error, term()}
@@ -347,12 +352,12 @@ defmodule Tightbeam.Acp.Adapter do
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            }),
          sid = result["sessionId"],
-         {:ok, applied_model} <- apply_model_to_session(state, sid, model),
+         {:ok, applied_model} <- establish_new_session_model(state, sid, model, result),
          :ok <- set_mode(state, sid) do
       state =
         state
         |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-        |> put_in([Access.key(:models), sid], applied_model)
+        |> remember_model(sid, applied_model)
 
       {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
     else
@@ -362,31 +367,35 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:load_session, sid, _model, cwd, mcp_servers, guidance}, _from, state) do
+  def handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
     case Conn.request(state.conn, "session/load", %{
            sessionId: sid,
            cwd: cwd,
            mcpServers: mcp_servers,
            _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
          }) do
-      {:ok, result} ->
-        case model_ref_from_config(result, state.preset.effort_config) do
-          {:ok, owner_model} ->
-            state =
-              state
-              |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-              |> put_in([Access.key(:models), sid], owner_model)
+      {:ok, _result} ->
+        state =
+          state
+          |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+          |> put_in([Access.key(:models)], Map.delete(state.models, sid))
+          |> put_in([Access.key(:chunks), sid], [])
 
-            {:reply, {:ok, owner_model}, put_in(state.chunks[sid], [])}
+        case model do
+          model when is_binary(model) ->
+            case apply_model_to_session(state, sid, model) do
+              {:ok, applied_model} ->
+                {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
 
-          :error ->
-            state = %{
-              state
-              | known: MapSet.delete(state.known, sid),
-                models: Map.delete(state.models, sid)
-            }
+              {:error, reason} ->
+                {:reply, {:error, {:model_apply_failed, reason}},
+                 drop_model_residency(state, sid)}
+            end
 
-            {:reply, {:error, :model_readback_unavailable}, state}
+          _unknown ->
+            # No canonical value means no push. The session is resident, but
+            # its model remains deliberately absent from the adapter cache.
+            {:reply, {:ok, :unknown}, state}
         end
 
       {:error, error} ->
@@ -420,11 +429,13 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, ^prior_model} ->
         case strict_apply_with_retry(state, sid, model, prior_model, 3) do
           :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
-          error -> {:reply, error, state}
+          error -> {:reply, error, drop_model_residency(state, sid)}
         end
 
-      {:ok, current_model} ->
-        {:reply, {:error, {:stale_model, current_model}}, state}
+      {:ok, _cached_model} ->
+        # Cache disagreement proves only that the cache cannot justify this
+        # mutation. It does not reveal the harness owner's current value.
+        {:reply, {:error, :model_readback_unavailable}, drop_model_residency(state, sid)}
 
       :error ->
         {:reply, {:error, :model_readback_unavailable}, state}
@@ -434,7 +445,7 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_call({:apply_model, sid, model}, _from, state) do
     case apply_model_to_session(state, sid, model) do
       {:ok, applied_model} -> {:reply, :ok, put_in(state.models[sid], applied_model)}
-      error -> {:reply, error, state}
+      error -> {:reply, error, drop_model_residency(state, sid)}
     end
   end
 
@@ -447,6 +458,9 @@ defmodule Tightbeam.Acp.Adapter do
       :error -> {:reply, {:error, :model_readback_unavailable}, state}
     end
   end
+
+  def handle_call({:forget_model_residency, sid}, _from, state),
+    do: {:reply, :ok, drop_model_residency(state, sid)}
 
   def handle_call({:prompt, sid, text, opts}, from, state) do
     start_prompt(state, sid, text, opts, from)
@@ -677,6 +691,22 @@ defmodule Tightbeam.Acp.Adapter do
 
   ## Model application (the fable-trap rule)
 
+  defp establish_new_session_model(state, sid, model, _result) when is_binary(model),
+    do: apply_model_to_session(state, sid, model)
+
+  defp establish_new_session_model(state, _sid, _unknown, result) do
+    case model_ref_from_config(result, state.preset.effort_config) do
+      {:ok, reported_model} -> {:ok, reported_model}
+      :error -> {:ok, :unknown}
+    end
+  end
+
+  defp remember_model(state, sid, model) when is_binary(model),
+    do: put_in(state.models[sid], model)
+
+  defp remember_model(state, sid, _unknown),
+    do: put_in(state.models, Map.delete(state.models, sid))
+
   defp apply_model_to_session(state, sid, model_ref) do
     apply_model_to_session(state, sid, model_ref, fn method, params ->
       Conn.request(state.conn, method, params)
@@ -796,6 +826,17 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp remember_config_model(state, _sid, _update), do: state
+
+  defp drop_model_residency(state, sid) do
+    # A failed set/read-back/rollback leaves the harness value unknown. Keeping
+    # either cache entry would let the next residency pass project memory over
+    # the owner; forgetting residency forces that pass through session/load.
+    %{
+      state
+      | known: MapSet.delete(state.known, sid),
+        models: Map.delete(state.models, sid)
+    }
+  end
 
   defp model_ref_from_config(%{"configOptions" => options}, effort_id)
        when is_list(options) do
