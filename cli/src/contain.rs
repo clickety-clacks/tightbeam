@@ -126,6 +126,46 @@ fn spawn_contained(command: &mut std::process::Command) -> io::Result<std::proce
     unreachable!("the loop returns on the final attempt")
 }
 
+/// Has the leader exited? Asked WITHOUT reaping it.
+///
+/// A pid is a valid signal target only until it is reaped — that is a state transition,
+/// not a window, and no delay makes signalling a reaped pid safer. `try_wait` here would
+/// reap: `waitpid(WNOHANG)` returns the status and frees the pid in the same call. The
+/// wait loop below deliberately stays armed past the leader's exit, because a descendant
+/// may still hold stdout, so the pid it eventually hands to `killpg` would by then be a
+/// number the kernel was free to reissue — on a busy linux host, with `pid_max` at 32768,
+/// to an unrelated process group that then takes an unhandleable SIGKILL.
+///
+/// `WNOWAIT` is the one flag that separates the two things `waitpid` does at once: it
+/// reports the exit and leaves the child a zombie. A zombie still occupies its pid, and
+/// the pid is the group id, so the group the wrapper is holding a claim on cannot be
+/// reissued underneath it. The reap moves to after the signal.
+///
+/// `waitid` rather than `waitpid` because `WNOWAIT` is documented as a `waitid`-only
+/// option on both platforms — it is not in `waitpid`'s option set. The struct is zeroed
+/// first and read back through `si_signo`, which POSIX.1-2008 TC1 requires to be cleared
+/// when `WNOHANG` finds nothing, and which is a plain field on both linux and darwin (the
+/// `si_pid` the same paragraph names is behind an accessor on linux and a field on
+/// darwin, and would have cost a `cfg` to read for no additional guarantee).
+fn exited_without_reaping(child: &std::process::Child) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(info.si_signo != 0)
+}
+
 fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     // Staging happens before the fork so a containment that cannot be built is a fact
     // this process observes directly, rather than an exit code to be inferred from a
@@ -176,6 +216,21 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         });
     }
 
+    // Whether a dead child becomes a zombie is decided by THIS process's SIGCHLD
+    // disposition, not the child's: with SIGCHLD ignored, the kernel reaps on our behalf
+    // the instant the child dies, there is nothing left to wait for, and the pid is
+    // released with no wait of ours involved. Everything below depends on the opposite —
+    // the leader's pid stays ours until we reap it, which is what makes the group id safe
+    // to signal at the deadline. `SIG_IGN` is inherited across `exec`, so the wrapper can
+    // arrive here already holding a disposition some ancestor chose, and the mechanism
+    // would be defeated by an environment rather than by anything in this file. Reset it
+    // before the fork, so what we inherit cannot decide it. Measured on both platforms —
+    // linux auto-reaps under the inherited ignore, darwin does not — in
+    // `tests/rail_exec_sigchld_ignored.rs`, which is red on linux without this line.
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+    }
+
     // A failed spawn is read as a refusal on both platforms. On macOS that is exactly what
     // it means; on linux the script is the command, so an unexecutable script would land
     // here too — `rules.ex` refuses a statute whose check script is not an existing
@@ -222,25 +277,33 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     });
 
     let started = Instant::now();
-    let mut status = None;
+    let mut leader_exited = false;
     let timed_out = loop {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(child_status)) => status = Some(child_status),
-                Ok(None) => {}
+        if !leader_exited {
+            match exited_without_reaping(&child) {
+                Ok(exited) => leader_exited = exited,
                 Err(error) => {
-                    eprintln!("rail-exec wait failed: {error}");
-                    let pgid = child.id() as libc::pid_t;
-                    unsafe {
-                        libc::killpg(pgid, libc::SIGKILL);
-                    }
-                    let _ = child.wait();
+                    // This used to kill the group on the way out, and that was the same
+                    // defect in its smaller form: an error here says the identity could
+                    // not be confirmed — `ECHILD` says outright that the child is no
+                    // longer ours — and an unconfirmed identity is not permission to
+                    // SIGKILL the number it used to have. So nothing is signalled, and
+                    // nothing is waited for either: the child may still be running, and
+                    // `wait` on a live child would hang here rather than return.
+                    //
+                    // The consequence, stated rather than hidden: a contained script can
+                    // outlive this return. That is the trade — a still-contained script
+                    // running on, against a SIGKILL delivered to whoever now holds a
+                    // recycled pid. The reset above is what makes this unreachable in the
+                    // first place; this is what the failure looks like if it is ever
+                    // reachable again.
+                    eprintln!("rail-exec wait failed: {error}; group left unsignalled");
                     return SCRIPT_ERROR;
                 }
             }
         }
 
-        if status.is_some()
+        if leader_exited
             && stdin_writer
                 .as_ref()
                 .is_none_or(thread::JoinHandle::is_finished)
@@ -257,9 +320,10 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
                 libc::killpg(pgid, libc::SIGKILL);
             }
 
-            if status.is_none() {
-                let _ = child.wait();
-            }
+            // Reaped only here, after the signal has gone out. Nothing above this line
+            // has ever waited the leader, so the pgid just named was still this
+            // wrapper's own — and the kernel could not have handed it to anyone else.
+            let _ = child.wait();
 
             break true;
         }
@@ -273,6 +337,17 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         drop(stderr_reader);
         return SCRIPT_TIMEOUT;
     }
+
+    // The leader's exit was observed without reaping it, so this is the first and only
+    // `waitpid` on the clean path — it returns at once against the zombie the loop left
+    // standing, and it is what finally releases the pid.
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("rail-exec wait failed: {error}");
+            return SCRIPT_ERROR;
+        }
+    };
 
     let stdin_delivered = match stdin_writer {
         None => true,
@@ -301,8 +376,6 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         eprintln!("rail-exec: script input undelivered; no child verdict");
         return SCRIPT_ERROR;
     }
-
-    let status = status.expect("child status present when pipe workers finish");
 
     if status.success() {
         let _ = io::stdout().write_all(&stdout);
@@ -1470,6 +1543,69 @@ mod tests {
         // on a loaded runner, and lost (#51).
         assert_never_written(&marker, &gate, &forked);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The poll the wait loop uses must REPORT the leader's exit without CONSUMING the
+    /// leader — and this reads that property directly, at the poll, rather than inferring
+    /// it from a script.
+    ///
+    /// The instrument is `waitpid` on the raw pid, and it is chosen because it is the one
+    /// question with no ambiguity in it: it answers for THIS child of THIS process, so a
+    /// recycled pid cannot answer in its place. `kill -0` cannot do that — it reports that
+    /// some process holds the number, which is exactly what a recycled pid also reports,
+    /// and a test built on it passes hardest in the state it exists to catch.
+    ///
+    /// Note what the second poll pins that the third assertion alone would not: the
+    /// wrapper asks this question repeatedly, and `Child::try_wait` — the call this
+    /// replaced — would have answered the second one from a CACHED status while the pid it
+    /// stands for was already back in the kernel's pool. The `waitpid` is what sees
+    /// through that cache to the identity itself.
+    ///
+    /// No budget appears here: `exit 0` is an event, the loop below waits for it rather
+    /// than assuming a duration, and everything after it is a state that does not change
+    /// again until this test acts on it.
+    #[test]
+    fn the_exit_poll_reports_the_leader_without_consuming_it() {
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("/bin/sh is spawnable");
+        let pid = child.id() as libc::pid_t;
+
+        let mut reported = false;
+        for _ in 0..2_000 {
+            if exited_without_reaping(&child).expect("the child is still this process's") {
+                reported = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            reported,
+            "the poll never reported an exit that had happened"
+        );
+
+        assert!(
+            exited_without_reaping(&child)
+                .expect("asked twice: the first answer must not have cost us the child"),
+            "the second poll lost the exit the first one reported"
+        );
+
+        // The wrapper — never the poll — is what releases the pid. `WNOHANG` is deliberate:
+        // the child has exited, so a zombie answers at once and a released pid answers
+        // ECHILD at once. Neither outcome can hang this test.
+        let mut raw = 0;
+        let reaped = unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG) };
+        assert_eq!(
+            reaped,
+            pid,
+            "the poll consumed the child: pid {pid} is no longer ours to reap ({}), so the \
+             timeout path would have signalled a number the kernel had already reissued",
+            io::Error::last_os_error()
+        );
+
+        drop(child);
     }
 
     #[test]
