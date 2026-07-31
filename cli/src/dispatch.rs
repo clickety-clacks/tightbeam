@@ -834,11 +834,14 @@ pub fn send(request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to(&endpoint, request)
 }
 
-pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
-    let url = format!("{}{}", endpoint.base, request.path);
-    let call = ureq::post(&url)
+pub(crate) fn gateway_request(method: &str, endpoint: &Endpoint, path: &str) -> ureq::Request {
+    ureq::request(method, &format!("{}{path}", endpoint.base))
         .set("authorization", &format!("Bearer {}", endpoint.token))
         .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
+}
+
+pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
+    let call = gateway_request("POST", endpoint, request.path)
         .set("content-type", "application/json")
         .send_string(&request.body_json);
 
@@ -1020,6 +1023,30 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn gateway_request_owns_authentication_and_cli_version_for_every_path() {
+        let endpoint = Endpoint {
+            base: "http://gateway.example:11373".to_owned(),
+            token: "tbc_org".to_owned(),
+            session_file: None,
+        };
+
+        for (method, path) in [
+            ("POST", "/agent/dispatch"),
+            ("POST", "/agent/tool-call-observed"),
+            ("GET", "/harnesses"),
+        ] {
+            let request = gateway_request(method, &endpoint, path);
+            assert_eq!(request.method(), method);
+            assert_eq!(request.url(), format!("http://gateway.example:11373{path}"));
+            assert_eq!(request.header("authorization"), Some("Bearer tbc_org"));
+            assert_eq!(
+                request.header("x-tightbeam-cli-version"),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+        }
     }
 
     #[test]

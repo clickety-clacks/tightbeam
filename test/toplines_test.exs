@@ -908,6 +908,7 @@ defmodule Tightbeam.ToplinesTest do
   defp post_dispatch(opts, body) do
     conn(:post, "/agent/dispatch", JSON.encode!(body))
     |> put_req_header("authorization", "Bearer tbc_toplines")
+    |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Tightbeam.Wire.Router.call(Tightbeam.Wire.Router.init(opts))
   end
 

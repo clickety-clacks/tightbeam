@@ -112,12 +112,7 @@ fn load_from_default_route() -> Result<HarnessCatalog, String> {
 }
 
 fn load_endpoint(endpoint: &dispatch::Endpoint) -> Result<HarnessCatalog, String> {
-    let url = format!("{}/harnesses", endpoint.base);
-    let response = match ureq::get(&url)
-        .set("authorization", &format!("Bearer {}", endpoint.token))
-        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
-        .call()
-    {
+    let response = match dispatch::gateway_request("GET", endpoint, "/harnesses").call() {
         Ok(response) => response,
         Err(ureq::Error::Status(status, response)) => {
             let encoded = response

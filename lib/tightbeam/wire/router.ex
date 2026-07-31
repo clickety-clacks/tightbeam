@@ -395,21 +395,15 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp cli_version_compatible(conn) do
-    case deps(conn)[:minimum_cli_version] do
-      nil ->
-        :ok
+    version =
+      case Plug.Conn.get_req_header(conn, "x-tightbeam-cli-version") do
+        [version] -> version
+        _ -> nil
+      end
 
-      minimum ->
-        version =
-          case Plug.Conn.get_req_header(conn, "x-tightbeam-cli-version") do
-            [version] -> version
-            _ -> nil
-          end
-
-        case CliCompatibility.check(version, minimum) do
-          :ok -> :ok
-          {:error, message} -> {:error, 426, "incompatible_cli", message}
-        end
+    case CliCompatibility.check(version) do
+      :ok -> :ok
+      {:error, message} -> {:error, 426, "incompatible_cli", message}
     end
   end
 

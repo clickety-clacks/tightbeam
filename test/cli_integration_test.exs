@@ -29,7 +29,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   alias Tightbeam.Wire.Router
 
-  setup context do
+  setup do
     binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
 
     unless File.exists?(binary) do
@@ -135,8 +135,6 @@ defmodule Tightbeam.CliIntegrationTest do
         base_dir: base_dir,
         handlers: handlers,
         cli_token: "tbc_cli_integration",
-        minimum_cli_version:
-          Map.get(context, :minimum_cli_version, CliCompatibility.minimum_supported_version()),
         session_status: fn _ -> nil end
       )
 
@@ -180,18 +178,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "inspect"}}
   end
 
-  @tag minimum_cli_version: "999.0.0"
-  test "real incompatible CLI is refused with its own version and the gateway minimum", ctx do
+  test "real CLI build is the exact gateway-required version", ctx do
     {version, 0} = System.cmd(ctx.binary, ["version"])
     version = String.trim(version)
 
-    {refused, 1} =
-      System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
-
-    assert refused =~ "incompatible_cli"
-    assert refused =~ "your CLI is too old, it says #{version}"
-    assert refused =~ "this gateway needs 999.0.0 or newer"
-    refute_received {:cli_call, _}
+    assert version == CliCompatibility.required_version()
   end
 
   test "version refusal is distinguishable from auth and network failures", ctx do
@@ -839,6 +830,9 @@ defmodule Tightbeam.CliIntegrationTest do
   # the DB stayed green while every real caller of an escalating verb hard-failed.
   # That is why this one runs the REAL binary and asserts on what it PRINTS.
   test "real CLI renders an escalated verb as decision_pending instead of dying on EOF", ctx do
+    {cli_version, 0} = System.cmd(ctx.binary, ["version"])
+    cli_version = String.trim(cli_version)
+
     File.mkdir_p!(Path.join([ctx.base_dir, "identity", "rules"]))
 
     File.write!(
@@ -865,7 +859,10 @@ defmodule Tightbeam.CliIntegrationTest do
       :httpc.request(
         :post,
         {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
-         [{~c"authorization", ~c"Bearer #{ctx.session.cli_token}"}], ~c"application/json",
+         [
+           {~c"authorization", ~c"Bearer #{ctx.session.cli_token}"},
+           {~c"x-tightbeam-cli-version", String.to_charlist(cli_version)}
+         ], ~c"application/json",
          JSON.encode!(%{
            "verb" => "assignments",
            "params" => %{"sessionKey" => "cli-holder"}

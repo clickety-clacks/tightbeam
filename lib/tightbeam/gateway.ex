@@ -263,8 +263,7 @@ defmodule Tightbeam.Gateway do
       db: db,
       handlers: handler_table,
       conn_registry: Tightbeam.ConnRegistry,
-      defaults: defaults,
-      minimum_cli_version: Tightbeam.CliCompatibility.minimum_supported_version()
+      defaults: defaults
     }
 
     router_deps =
