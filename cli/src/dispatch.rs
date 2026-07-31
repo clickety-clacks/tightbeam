@@ -1,5 +1,7 @@
+use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -835,8 +837,23 @@ pub fn send(request: &RequestSpec) -> Result<Option<Value>, String> {
 }
 
 pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
+    send_to_with_deadline(endpoint, request, None)
+}
+
+pub(crate) fn send_to_with_deadline(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+    deadline: Option<Instant>,
+) -> Result<Option<Value>, String> {
     let url = format!("{}{}", endpoint.base, request.path);
-    let call = ureq::post(&url)
+    let mut builder = ureq::AgentBuilder::new();
+    if let Some(deadline) = deadline {
+        let remaining = ceremony_remaining(deadline)?;
+        builder = builder.timeout(remaining).timeout_connect(remaining);
+    }
+    let call = builder
+        .build()
+        .post(&url)
         .set("authorization", &format!("Bearer {}", endpoint.token))
         .set("content-type", "application/json")
         .send_string(&request.body_json);
@@ -844,10 +861,50 @@ pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Opti
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
+        Err(ureq::Error::Transport(error))
+            if deadline.is_some()
+                && (transport_timed_out(&error)
+                    || Instant::now() >= deadline.expect("checked above")) =>
+        {
+            return Err(ceremony_expired());
+        }
         Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
     };
-    let encoded = response.into_string().map_err(|error| error.to_string())?;
+    let encoded = response.into_string().map_err(|error| {
+        if deadline.is_some() && error.kind() == std::io::ErrorKind::TimedOut {
+            ceremony_expired()
+        } else {
+            error.to_string()
+        }
+    })?;
     parse_response(status, &encoded)
+}
+
+fn ceremony_remaining(deadline: Instant) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(ceremony_expired())
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn ceremony_expired() -> String {
+    "gateway request refused because the onboarding lease expired".to_owned()
+}
+
+fn transport_timed_out(error: &ureq::Transport) -> bool {
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
@@ -907,14 +964,21 @@ pub fn run(command: Command) -> Result<(), String> {
                 discover()
             }
         },
-        send_to,
+        send_to_with_deadline,
+        crate::harnesses::load_optional_from,
     )
 }
 
-fn run_with<D, S>(command: Command, discover_endpoint: D, send_request: S) -> Result<(), String>
+fn run_with<D, S, H>(
+    command: Command,
+    discover_endpoint: D,
+    send_request: S,
+    load_harnesses: H,
+) -> Result<(), String>
 where
     D: FnOnce() -> Result<Endpoint, String>,
-    S: Fn(&Endpoint, &RequestSpec) -> Result<Option<Value>, String>,
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<crate::harnesses::HarnessCatalog>, String>,
 {
     match command {
         Command::Help | Command::CommandHelp(_) => {
@@ -929,7 +993,14 @@ where
         } => {
             let endpoint = discover_endpoint()?;
             require_session_endpoint(&identity, &endpoint)?;
-            crate::ceremonies::onboard(&identity, &provider, api_key, &endpoint, send_request)
+            crate::ceremonies::onboard(
+                &identity,
+                &provider,
+                api_key,
+                &endpoint,
+                send_request,
+                load_harnesses,
+            )
         }
         command => {
             let endpoint = discover_endpoint()?;
@@ -937,7 +1008,7 @@ where
                 require_session_endpoint(identity, &endpoint)?;
             }
             let request = build_request(&command)?;
-            if let Some(result) = send_request(&endpoint, &request)? {
+            if let Some(result) = send_request(&endpoint, &request, None)? {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
@@ -1760,11 +1831,13 @@ mod tests {
                     session_file: Some(PathBuf::from("/work/.tightbeam-session")),
                 })
             },
-            |endpoint, request| {
+            |endpoint, request, deadline| {
+                assert_eq!(deadline, None);
                 assert_eq!(endpoint.token, "tbs_discovered");
                 assert_eq!(request.body_json, r#"{"verb":"inspect","params":{}}"#);
                 Ok(None)
             },
+            |_, _| panic!("harness loader must not be called"),
         )
         .unwrap();
 
@@ -1779,7 +1852,8 @@ mod tests {
                 identity: Identity::Session,
             },
             || Ok(endpoint),
-            |_, _| panic!("network sender must not be called"),
+            |_, _, _| panic!("network sender must not be called"),
+            |_, _| panic!("harness loader must not be called"),
         )
         .unwrap_err();
 
@@ -1805,23 +1879,25 @@ mod tests {
             std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
         }
 
+        let gateway = "https://one-gateway.test".to_owned();
         let discoveries = Cell::new(0);
         let calls = RefCell::new(Vec::new());
+        let catalog_calls = RefCell::new(Vec::new());
         let result = run_with(
             Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
-                provider: "fixture-provider".to_owned(),
+                provider: "openai".to_owned(),
                 api_key: false,
             },
             || {
                 discoveries.set(discoveries.get() + 1);
                 Ok(Endpoint {
-                    base: "https://one-gateway.test".to_owned(),
+                    base: gateway.clone(),
                     token: "tbc_one".to_owned(),
                     session_file: None,
                 })
             },
-            |endpoint, request| {
+            |endpoint, request, deadline| {
                 let phase = if request.body_json.contains(r#""phase":"begin""#) {
                     "begin"
                 } else if request.body_json.contains(r#""phase":"finish""#) {
@@ -1829,7 +1905,9 @@ mod tests {
                 } else {
                     panic!("unexpected onboarding request: {}", request.body_json);
                 };
-                calls.borrow_mut().push((endpoint.base.clone(), phase));
+                calls
+                    .borrow_mut()
+                    .push((endpoint.base.clone(), phase, deadline.is_some()));
                 if phase == "begin" {
                     Ok(Some(serde_json::json!({
                         "stagingPath": staging,
@@ -1838,6 +1916,20 @@ mod tests {
                 } else {
                     Ok(None)
                 }
+            },
+            |endpoint, deadline| {
+                catalog_calls
+                    .borrow_mut()
+                    .push((endpoint.base.clone(), deadline));
+                Ok(Some(crate::harnesses::HarnessCatalog {
+                    harnesses: vec![crate::harnesses::HarnessProjection {
+                        id: "codex".to_owned(),
+                        wire_name: "codex".to_owned(),
+                        install_package: "codex-acp".to_owned(),
+                        cli_binary: "true".to_owned(),
+                        process_markers: vec!["codex".to_owned()],
+                    }],
+                }))
             },
         );
 
@@ -1849,13 +1941,40 @@ mod tests {
 
         result.unwrap();
         assert_eq!(discoveries.get(), 1);
+        let catalog_calls = catalog_calls.into_inner();
+        assert_eq!(catalog_calls.len(), 1);
+        assert_eq!(catalog_calls[0].0, gateway);
         assert_eq!(
             calls.into_inner(),
-            vec![
-                ("https://one-gateway.test".to_owned(), "begin"),
-                ("https://one-gateway.test".to_owned(), "finish"),
-            ]
+            vec![(gateway.clone(), "begin", false), (gateway, "finish", true),]
         );
+    }
+
+    #[test]
+    fn an_expired_deadline_refuses_gateway_io_as_lease_expiry() {
+        use std::time::{Duration, Instant};
+
+        let endpoint = Endpoint {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: None,
+        };
+        let request = build_onboard_phase_request(
+            &Identity::User("flynn".to_owned()),
+            "openai",
+            "finish",
+            "subscription",
+            Some("work-1"),
+            None,
+        );
+        let error = send_to_with_deadline(
+            &endpoint,
+            &request,
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
     }
 
     #[test]
