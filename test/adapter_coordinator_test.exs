@@ -463,8 +463,19 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     ref = Process.monitor(adapter)
 
+    assert wait_until(fn ->
+             match?({:ok, _token}, AdapterCoordinator.ready_token(coordinator, key))
+           end)
+
+    assert wait_until(fn ->
+             not is_nil(:sys.get_state(coordinator).adapters[key].harness_identity)
+           end)
+
+    identity = :sys.get_state(coordinator).adapters[key].harness_identity
+
     assert {:ok, :closed} = AdapterCoordinator.park_adapter(coordinator, key)
     assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}
+    refute Tightbeam.Acp.Conn.identity_alive?(identity)
 
     assert [
              %{kind: "adapter_park_requested"},
@@ -505,14 +516,171 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     ref = Process.monitor(adapter)
 
+    assert wait_until(fn ->
+             match?({:ok, _token}, AdapterCoordinator.ready_token(coordinator, key))
+           end)
+
+    assert wait_until(fn ->
+             not is_nil(:sys.get_state(coordinator).adapters[key].harness_identity)
+           end)
+
+    identity = :sys.get_state(coordinator).adapters[key].harness_identity
+
     assert {:ok, :killed} = AdapterCoordinator.park_adapter(coordinator, key)
     assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}
+    refute Tightbeam.Acp.Conn.identity_alive?(identity)
 
     assert [
              %{kind: "adapter_park_requested"},
              %{kind: "adapter_park_grace_expired", detail: "grace_ms=50"},
              %{kind: "adapter_park_killed", detail: "outcome=kill_verified"}
            ] = EventLog.lifecycle_events(ctx.db)
+  end
+
+  test "park fences both checkout paths until the targeted incarnation is dead", ctx do
+    path = Path.join(ctx.test_dir, "park_fence.js")
+
+    File.write!(path, "process.on('SIGTERM', () => {});\n" <> @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         park_grace_ms: 100,
+         name: :park_fence_coordinator}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(fn ->
+             match?({:ok, _token}, AdapterCoordinator.ready_token(coordinator, key))
+           end)
+
+    assert wait_until(fn ->
+             not is_nil(:sys.get_state(coordinator).adapters[key].harness_identity)
+           end)
+
+    park = Task.async(fn -> AdapterCoordinator.park_adapter(coordinator, key) end)
+    assert wait_until(fn -> Map.has_key?(:sys.get_state(coordinator).parks, key) end)
+
+    assert {:error, :parked} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert {:error, :parked} = AdapterCoordinator.adapter_for(coordinator, key, [])
+    assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
+    assert Process.alive?(adapter)
+
+    assert {:ok, :killed} = Task.await(park, 2_000)
+    refute Process.alive?(adapter)
+    assert :sys.get_state(coordinator).adapters[key].pid == nil
+  end
+
+  test "ordinary close during parking converges without discarding park death proof", ctx do
+    path = Path.join(ctx.test_dir, "park_close_race.js")
+    File.write!(path, "process.on('SIGTERM', () => {});\n" <> @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         park_grace_ms: 50,
+         name: :park_close_race_coordinator}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(fn ->
+             match?({:ok, _token}, AdapterCoordinator.ready_token(coordinator, key))
+           end)
+
+    assert wait_until(fn ->
+             not is_nil(:sys.get_state(coordinator).adapters[key].harness_identity)
+           end)
+
+    park = Task.async(fn -> AdapterCoordinator.park_adapter(coordinator, key) end)
+    assert wait_until(fn -> Map.has_key?(:sys.get_state(coordinator).parks, key) end)
+    assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
+    assert {:ok, :killed} = Task.await(park, 2_000)
+    refute Map.has_key?(:sys.get_state(coordinator).parks, key)
+  end
+
+  test "a failed force attempt records unconfirmed death and keeps checkout fenced", ctx do
+    path = Path.join(ctx.test_dir, "park_force_failure.js")
+    File.write!(path, "process.on('SIGTERM', () => {});\n" <> @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         park_grace_ms: 100,
+         name: :park_force_failure_coordinator}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(fn ->
+             match?({:ok, _token}, AdapterCoordinator.ready_token(coordinator, key))
+           end)
+
+    park = Task.async(fn -> AdapterCoordinator.park_adapter(coordinator, key) end)
+
+    assert wait_until(fn ->
+             case :sys.get_state(coordinator).parks[key] do
+               %{identity: identity, conn: conn} -> not is_nil(identity) and is_pid(conn)
+               _ -> false
+             end
+           end)
+
+    dead_conn = spawn(fn -> :ok end)
+    dead_ref = Process.monitor(dead_conn)
+    assert_receive {:DOWN, ^dead_ref, :process, ^dead_conn, _reason}
+
+    :sys.replace_state(coordinator, fn state ->
+      put_in(state.parks[key].conn, dead_conn)
+    end)
+
+    assert {:error, :death_unconfirmed} = Task.await(park, 2_000)
+    assert {:error, :parked} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert [
+             %{kind: "adapter_park_requested"},
+             %{kind: "adapter_park_grace_expired"},
+             %{kind: "adapter_park_death_unconfirmed", detail: detail}
+           ] = EventLog.lifecycle_events(ctx.db)
+
+    assert detail =~ "outcome=unconfirmed"
+    refute detail =~ "kill_verified"
   end
 
   test "load-slot queue caps concurrency at three and releases on borrower exit", ctx do

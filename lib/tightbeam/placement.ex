@@ -1115,7 +1115,7 @@ defmodule Tightbeam.Placement do
 
       captured =
         try do
-          Tightbeam.SubagentMarkers.capture_update(
+          Tightbeam.SubagentMarkers.capture_update_with_retry(
             db,
             module.id(),
             host,
@@ -1169,12 +1169,26 @@ defmodule Tightbeam.Placement do
   end
 
   defp subagent_event_context(context, {:ok, input}) do
-    Map.merge(context, Map.take(input, [:source_event_ref, :subagent_ref]))
+    Map.merge(
+      context,
+      Map.take(input, [
+        :kind,
+        :principal,
+        :source_event_ref,
+        :subagent_ref,
+        :harness,
+        :at,
+        :assignment_id
+      ])
+    )
   end
 
   defp subagent_event_context(context, {:error, error}) when is_map(error) do
-    Map.merge(context, Map.take(error, [:source_event_ref, :subagent_ref]))
+    Map.merge(context, Map.drop(error, [:reason]))
   end
+
+  defp subagent_event_context(context, {:capture_failed, error}),
+    do: Map.merge(context, Map.drop(error, [:reason]))
 
   defp subagent_event_context(context, _captured), do: context
 

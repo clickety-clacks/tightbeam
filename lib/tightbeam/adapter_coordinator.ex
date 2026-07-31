@@ -54,7 +54,8 @@ defmodule Tightbeam.AdapterCoordinator do
   @type adapter_key :: Tightbeam.Placement.adapter_key()
 
   @typedoc "What a lane needs to run a turn: the adapter pid and the generation it belongs to."
-  @type checkout :: {:ok, pid(), generation :: pos_integer()} | {:error, :degraded}
+  @type checkout ::
+          {:ok, pid(), generation :: pos_integer()} | {:error, :degraded | :parked}
 
   @doc """
   Start the coordinator. Opts: `:adapter_sup` (the DynamicSupervisor),
@@ -223,8 +224,9 @@ defmodule Tightbeam.AdapterCoordinator do
     :exit, _reason -> :ok
   end
 
-  @doc "Park an adapter and reply only after its monitored process is dead."
-  @spec park_adapter(GenServer.server(), adapter_key()) :: {:ok, :closed | :killed}
+  @doc "Park an adapter and reply only after its exact harness process is confirmed dead."
+  @spec park_adapter(GenServer.server(), adapter_key()) ::
+          {:ok, :closed | :killed} | {:error, :death_unconfirmed}
   def park_adapter(server \\ __MODULE__, key) do
     GenServer.call(server, {:park_adapter, key}, :infinity)
   end
@@ -258,6 +260,9 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      Map.has_key?(state.parks, key) ->
+        {:reply, {:error, :parked}, state}
+
       entry.circuit == :open ->
         {:reply, {:error, :degraded}, state}
 
@@ -329,6 +334,18 @@ defmodule Tightbeam.AdapterCoordinator do
     :ok = Tightbeam.EventLog.lifecycle(state.db, "adapter_park_requested", key_name(key), nil)
 
     case state.parks[key] do
+      %{unconfirmed: true, waiters: waiters} = park ->
+        park = %{
+          park
+          | waiters: [from | waiters],
+            force_state: :pending,
+            verify_state: :none,
+            unconfirmed: false
+        }
+
+        state = put_in(state.parks[key], park)
+        {:noreply, start_park_worker(key, :force, state)}
+
       %{waiters: waiters} = park ->
         park = %{park | waiters: [from | waiters]}
         {:noreply, put_in(state.parks[key], park)}
@@ -341,12 +358,21 @@ defmodule Tightbeam.AdapterCoordinator do
 
             park = %{
               pid: pid,
+              generation: state.adapters[key].generation,
               adapter_monitor: monitor,
               waiters: [from],
               timer: timer,
-              conn: nil,
-              identity: nil,
-              forced: false
+              conn: state.adapters[key].conn,
+              identity: state.adapters[key].harness_identity,
+              harness_dead: false,
+              harness_status: nil,
+              adapter_down: false,
+              adapter_reason: nil,
+              grace_expired: false,
+              force_state: :none,
+              verify_state: :none,
+              close_signal: nil,
+              unconfirmed: false
             }
 
             state = put_in(state.parks[key], park)
@@ -370,6 +396,9 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      Map.has_key?(state.parks, key) ->
+        {:reply, {:error, :parked}, state}
+
       entry.circuit == :open ->
         {:reply, {:error, :degraded}, state}
 
@@ -393,8 +422,14 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp do_close_adapter(key, state) do
-    case state.adapters[key] do
-      %{pid: pid, monitor: ref} = entry when is_pid(pid) ->
+    case {state.parks[key], state.adapters[key]} do
+      {%{}, _entry} ->
+        # Park owns this key's teardown and its proof. A concurrent idle reap or
+        # authoritative context replacement must converge on that transition,
+        # never discard the monitors park still needs.
+        state
+
+      {nil, %{pid: pid, monitor: ref} = entry} when is_pid(pid) ->
         Process.demonitor(ref, [:flush])
 
         try do
@@ -414,6 +449,8 @@ defmodule Tightbeam.AdapterCoordinator do
           entry
           | pid: nil,
             monitor: nil,
+            conn: nil,
+            harness_identity: nil,
             ready: false,
             generation: entry.generation + 1,
             context: nil
@@ -438,7 +475,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     cond do
       is_binary(parked_key) or is_tuple(parked_key) ->
-        {:noreply, finish_park(parked_key, reason, state)}
+        {:noreply, handle_park_adapter_down(parked_key, reason, state)}
 
       match?({_request_ref, _worker}, park_worker) ->
         {request_ref, worker} = park_worker
@@ -481,6 +518,8 @@ defmodule Tightbeam.AdapterCoordinator do
             entry
             | pid: nil,
               monitor: nil,
+              conn: nil,
+              harness_identity: nil,
               generation: generation,
               failures: failures,
               circuit: circuit,
@@ -504,9 +543,47 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
+  def handle_info({:adapter_harness_spawned, key, adapter, conn, identity}, state) do
+    state =
+      case state.adapters[key] do
+        %{pid: ^adapter} = entry ->
+          put_in(state.adapters[key], %{entry | conn: conn, harness_identity: identity})
+
+        _ ->
+          state
+      end
+
+    state =
+      case state.parks[key] do
+        %{pid: ^adapter} = park ->
+          put_in(state.parks[key], %{park | conn: conn, identity: identity})
+
+        _ ->
+          state
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:adapter_harness_exited, key, adapter, identity, status}, state) do
+    case state.parks[key] do
+      %{pid: ^adapter, identity: ^identity} = park ->
+        state =
+          put_in(state.parks[key], %{park | harness_dead: true, harness_status: status})
+
+        {:noreply, maybe_finish_verified_park(key, state)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:adapter_ready, key}, state) do
-    case state.adapters[key] do
-      %{pid: pid} = entry when is_pid(pid) ->
+    case {state.parks[key], state.adapters[key]} do
+      {%{}, _entry} ->
+        {:noreply, state}
+
+      {nil, %{pid: pid} = entry} when is_pid(pid) ->
         entry = %{entry | failures: 0, circuit: :closed, ready: true, last_failure: nil}
         # EDGE half of the heal trigger. The hook is invoked with the FULL token
         # so the sweep can decide replay-vs-new without asking us back (and
@@ -520,8 +597,8 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   def handle_info({:restart_adapter, key, generation}, state) do
-    case state.adapters[key] do
-      %{generation: ^generation, pid: nil} = entry ->
+    case {state.parks[key], state.adapters[key]} do
+      {nil, %{generation: ^generation, pid: nil} = entry} ->
         state = put_in(state.adapters[key], %{entry | timer: nil})
         {:noreply, capture_adapter_context(key, {:restart, generation}, state)}
 
@@ -565,7 +642,14 @@ defmodule Tightbeam.AdapterCoordinator do
             "grace_ms=#{state.park_grace_ms}"
           )
 
-        state = put_in(state.parks[key], %{park | forced: true, timer: nil})
+        state =
+          put_in(state.parks[key], %{
+            park
+            | grace_expired: true,
+              timer: nil,
+              force_state: :pending
+          })
+
         {:noreply, start_park_worker(key, :force, state)}
 
       _ ->
@@ -586,8 +670,18 @@ defmodule Tightbeam.AdapterCoordinator do
     coordinator = self()
 
     boot = fn ->
+      adapter = self()
+
       adapter_opts.(key, adapter_context) ++
-        [on_ready: fn -> send(coordinator, {:adapter_ready, key}) end]
+        [
+          on_ready: fn -> send(coordinator, {:adapter_ready, key}) end,
+          on_harness_spawn: fn conn, identity ->
+            send(coordinator, {:adapter_harness_spawned, key, adapter, conn, identity})
+          end,
+          on_harness_exit: fn identity, status ->
+            send(coordinator, {:adapter_harness_exited, key, adapter, identity, status})
+          end
+        ]
     end
 
     child = %{
@@ -608,6 +702,8 @@ defmodule Tightbeam.AdapterCoordinator do
           entry
           | pid: pid,
             monitor: ref,
+            conn: nil,
+            harness_identity: nil,
             generation: generation,
             timer: nil,
             ready: false,
@@ -652,6 +748,8 @@ defmodule Tightbeam.AdapterCoordinator do
     %{
       pid: nil,
       monitor: nil,
+      conn: nil,
+      harness_identity: nil,
       generation: 0,
       failures: 0,
       circuit: :closed,
@@ -701,8 +799,8 @@ defmodule Tightbeam.AdapterCoordinator do
          {:ok, context},
          state
        ) do
-    case state.adapters[key] do
-      %{generation: ^generation, pid: nil} = entry ->
+    case {state.parks[key], state.adapters[key]} do
+      {nil, %{generation: ^generation, pid: nil} = entry} ->
         {_reply, state} = start_adapter(key, entry, state, context)
         state
 
@@ -716,8 +814,8 @@ defmodule Tightbeam.AdapterCoordinator do
          {:error, reason},
          state
        ) do
-    case state.adapters[key] do
-      %{generation: ^generation, pid: nil} = entry ->
+    case {state.parks[key], state.adapters[key]} do
+      {nil, %{generation: ^generation, pid: nil} = entry} ->
         timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(state, 1))
 
         entry = %{
@@ -758,23 +856,67 @@ defmodule Tightbeam.AdapterCoordinator do
 
   defp run_park_worker(:request, park) do
     try do
-      conn = Tightbeam.Acp.Adapter.conn(park.pid)
+      conn = park.conn || Tightbeam.Acp.Adapter.conn(park.pid)
       {:ok, conn, Tightbeam.Acp.Conn.request_close(conn)}
     catch
       :exit, reason -> {:error, {:request_close_exit, reason}}
     end
   end
 
-  defp run_park_worker(:force, %{conn: conn, identity: identity})
-       when is_pid(conn) and not is_nil(identity) do
-    try do
-      {:ok, Tightbeam.Acp.Conn.force_close(conn, identity)}
-    catch
-      :exit, reason -> {:error, {:force_close_exit, reason}}
+  defp run_park_worker(:force, park) do
+    with {:ok, conn, identity} <- park_identity(park) do
+      result =
+        try do
+          Tightbeam.Acp.Conn.force_close(conn, identity)
+        catch
+          :exit, reason -> {:failed, -1, "force_close_exit=#{inspect(reason)}"}
+        end
+
+      {:ok, conn, identity, result}
     end
   end
 
-  defp run_park_worker(:force, _park), do: {:ok, :released}
+  defp run_park_worker(:verify, %{identity: identity}) when not is_nil(identity) do
+    if await_harness_release(identity, 1_000), do: {:ok, :released}, else: {:ok, :alive}
+  end
+
+  defp run_park_worker(:verify, _park), do: {:error, :identity_unavailable}
+
+  defp park_identity(%{conn: conn, identity: identity})
+       when is_pid(conn) and not is_nil(identity),
+       do: {:ok, conn, identity}
+
+  defp park_identity(park) do
+    try do
+      conn = Tightbeam.Acp.Adapter.conn(park.pid)
+
+      case Tightbeam.Acp.Conn.request_close(conn) do
+        {:requested, identity, _term_result} -> {:ok, conn, identity}
+        :released -> {:error, :already_released}
+      end
+    catch
+      :exit, reason -> {:error, {:identity_unavailable, reason}}
+    end
+  end
+
+  defp await_harness_release(identity, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    await_harness_release_until(identity, deadline)
+  end
+
+  defp await_harness_release_until(identity, deadline) do
+    cond do
+      not Tightbeam.Acp.Conn.identity_alive?(identity) ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        Process.sleep(10)
+        await_harness_release_until(identity, deadline)
+    end
+  end
 
   defp apply_park_worker_result(%{key: key, stage: :request}, {:ok, conn, result}, state) do
     case state.parks[key] do
@@ -782,45 +924,165 @@ defmodule Tightbeam.AdapterCoordinator do
         state
 
       park ->
-        identity =
-          case result do
-            {:requested, identity} -> identity
-            :released -> nil
-          end
+        case result do
+          {:requested, identity, term_result} ->
+            put_in(state.parks[key], %{
+              park
+              | conn: conn,
+                identity: identity,
+                close_signal: term_result
+            })
 
-        put_in(state.parks[key], %{park | conn: conn, identity: identity})
+          :released ->
+            state =
+              put_in(state.parks[key], %{
+                park
+                | conn: conn,
+                  harness_dead: true,
+                  harness_status: :released
+              })
+
+            maybe_finish_verified_park(key, state)
+        end
     end
   end
 
-  defp apply_park_worker_result(%{stage: :request}, {:error, _reason}, state),
-    do: state
-
-  defp apply_park_worker_result(%{key: key, stage: :force}, _result, state) do
+  defp apply_park_worker_result(%{key: key, stage: :request}, {:error, reason}, state) do
     case state.parks[key] do
-      %{pid: pid, adapter_monitor: monitor} ->
-        case state.adapters[key] do
-          %{pid: ^pid, monitor: ^monitor} -> Process.exit(pid, :kill)
-          _ -> :ok
-        end
+      %{grace_expired: true} -> record_unconfirmed_park(key, reason, state)
+      _ -> state
+    end
+  end
 
-        state
-
+  defp apply_park_worker_result(
+         %{key: key, stage: :force},
+         {:ok, conn, identity, result},
+         state
+       ) do
+    case state.parks[key] do
       nil ->
         state
+
+      park ->
+        state = put_in(state.parks[key], %{park | conn: conn, identity: identity})
+
+        case result do
+          :signalled ->
+            state = put_in(state.parks[key].force_state, :signalled)
+            state = maybe_finish_verified_park(key, state)
+
+            if Map.has_key?(state.parks, key),
+              do: start_park_verification(key, state),
+              else: state
+
+          :released ->
+            state =
+              update_in(
+                state.parks[key],
+                &%{
+                  &1
+                  | force_state: :released,
+                    harness_dead: true,
+                    harness_status: :released
+                }
+              )
+
+            maybe_finish_verified_park(key, state)
+
+          {:failed, _status, _output} = failure ->
+            state = put_in(state.parks[key].force_state, {:failed, failure})
+            start_park_verification(key, state)
+        end
     end
   end
 
-  defp park_worker_failed(%{key: key, stage: :force}, _reason, state),
-    do: apply_park_worker_result(%{key: key, stage: :force}, {:error, :worker_exit}, state)
+  defp apply_park_worker_result(%{key: key, stage: :force}, {:error, reason}, state),
+    do: record_unconfirmed_park(key, reason, state)
+
+  defp apply_park_worker_result(%{key: key, stage: :verify}, {:ok, :released}, state) do
+    case state.parks[key] do
+      nil ->
+        state
+
+      park ->
+        state =
+          put_in(state.parks[key], %{
+            park
+            | harness_dead: true,
+              harness_status: :identity_released,
+              verify_state: :released
+          })
+
+        maybe_finish_verified_park(key, state)
+    end
+  end
+
+  defp apply_park_worker_result(%{key: key, stage: :verify}, {:ok, :alive}, state) do
+    case state.parks[key] do
+      %{force_state: :signalled} -> record_unconfirmed_park(key, :still_alive_after_kill, state)
+      %{force_state: {:failed, failure}} -> record_unconfirmed_park(key, failure, state)
+      park when is_map(park) -> put_in(state.parks[key].verify_state, :alive)
+      nil -> state
+    end
+  end
+
+  defp apply_park_worker_result(%{key: key, stage: :verify}, {:error, reason}, state),
+    do: record_unconfirmed_park(key, reason, state)
+
+  defp park_worker_failed(%{key: key, stage: stage}, reason, state)
+       when stage in [:force, :verify],
+       do: record_unconfirmed_park(key, {:worker_exit, reason}, state)
 
   defp park_worker_failed(_worker, _reason, state), do: state
 
-  defp finish_park(key, _reason, state) do
+  defp start_park_verification(key, state) do
+    case state.parks[key] do
+      nil ->
+        state
+
+      %{verify_state: :pending} ->
+        state
+
+      park ->
+        state = put_in(state.parks[key], Map.put(park, :verify_state, :pending))
+        start_park_worker(key, :verify, state)
+    end
+  end
+
+  defp handle_park_adapter_down(key, reason, state) do
+    park = Map.fetch!(state.parks, key)
+
+    state =
+      state
+      |> put_in([:parks, key], %{park | adapter_down: true, adapter_reason: reason})
+      |> retire_parked_entry(key, park)
+
+    state = maybe_finish_verified_park(key, state)
+
+    if Map.has_key?(state.parks, key) and not is_nil(state.parks[key].identity) do
+      start_park_verification(key, state)
+    else
+      state
+    end
+  end
+
+  defp maybe_finish_verified_park(key, state) do
+    case state.parks[key] do
+      %{harness_dead: true, adapter_down: true, force_state: force_state}
+      when force_state != :pending ->
+        finish_verified_park(key, state)
+
+      _ ->
+        state
+    end
+  end
+
+  defp finish_verified_park(key, state) do
     park = Map.fetch!(state.parks, key)
     if park.timer, do: Process.cancel_timer(park.timer)
 
     {kind, detail, outcome} =
-      if park.forced do
+      if park.force_state == :signalled do
         {"adapter_park_killed", "outcome=kill_verified", :killed}
       else
         {"adapter_park_close_detected", "outcome=graceful", :closed}
@@ -829,23 +1091,72 @@ defmodule Tightbeam.AdapterCoordinator do
     :ok = Tightbeam.EventLog.lifecycle(state.db, kind, key_name(key), detail)
     Enum.each(park.waiters, &GenServer.reply(&1, {:ok, outcome}))
 
-    entry = Map.fetch!(state.adapters, key)
-
-    entry = %{
-      entry
-      | pid: nil,
-        monitor: nil,
-        ready: false,
-        generation: entry.generation + 1,
-        context: nil
-    }
+    state = retire_parked_entry(state, key, park)
 
     %{
       state
       | parks: Map.delete(state.parks, key),
-        adapters: Map.put(state.adapters, key, entry),
         monitors: Map.delete(state.monitors, park.adapter_monitor)
     }
+  end
+
+  defp retire_parked_entry(state, key, park) do
+    case state.adapters[key] do
+      %{pid: pid, monitor: monitor} = entry
+      when pid == park.pid and monitor == park.adapter_monitor ->
+        entry = %{
+          entry
+          | pid: nil,
+            monitor: nil,
+            conn: nil,
+            harness_identity: nil,
+            ready: false,
+            generation: park.generation + 1,
+            context: nil
+        }
+
+        %{
+          state
+          | adapters: Map.put(state.adapters, key, entry),
+            monitors: Map.delete(state.monitors, park.adapter_monitor)
+        }
+
+      _ ->
+        state
+    end
+  end
+
+  defp record_unconfirmed_park(key, reason, state) do
+    case state.parks[key] do
+      nil ->
+        state
+
+      %{unconfirmed: true} ->
+        state
+
+      park ->
+        if park.timer, do: Process.cancel_timer(park.timer)
+
+        detail = "outcome=unconfirmed reason=#{inspect(reason)}"
+
+        :ok =
+          Tightbeam.EventLog.lifecycle(
+            state.db,
+            "adapter_park_death_unconfirmed",
+            key_name(key),
+            detail
+          )
+
+        Enum.each(park.waiters, &GenServer.reply(&1, {:error, :death_unconfirmed}))
+
+        put_in(state.parks[key], %{
+          park
+          | waiters: [],
+            timer: nil,
+            unconfirmed: true,
+            force_state: {:failed, reason}
+        })
+    end
   end
 
   defp park_key_for_monitor(parks, monitor) do

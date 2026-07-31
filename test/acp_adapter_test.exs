@@ -914,11 +914,19 @@ defmodule Tightbeam.Acp.AdapterTest do
         {:codex, "default", "testhost"}
       )
 
+    placement_handler = placement_opts[:on_subagent_event]
+
     {adapter, _capture_path} =
       start_adapter(
         harness: :codex,
         fail_mode: "subagent-order",
-        on_subagent_event: placement_opts[:on_subagent_event],
+        on_subagent_event: fn sid, update ->
+          send(owner, {:capture_barrier_entered, self()})
+
+          receive do
+            :release_capture -> placement_handler.(sid, update)
+          end
+        end,
         on_ready: fn -> send(owner, :booted) end
       )
 
@@ -932,6 +940,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         result
       end)
 
+    assert_receive {:capture_barrier_entered, ^adapter}
+
+    assert prompt_done_queued?(adapter, "sess-1")
+
+    assert Task.yield(prompt, 0) == nil
+    send(adapter, :release_capture)
     assert {:ok, %{stop_reason: "end_turn"}} = Task.await(prompt)
     assert_receive {:matching_fired, fact_id, false}, 2_000
     assert is_integer(fact_id)
@@ -1075,6 +1089,19 @@ defmodule Tightbeam.Acp.AdapterTest do
       true
     else
       receive after: (10 -> wait_for_subagent_tasks(adapter, attempts - 1))
+    end
+  end
+
+  defp prompt_done_queued?(adapter, sid, attempts \\ 100)
+  defp prompt_done_queued?(_adapter, _sid, 0), do: false
+
+  defp prompt_done_queued?(adapter, sid, attempts) do
+    {:messages, messages} = Process.info(adapter, :messages)
+
+    if Enum.any?(messages, &match?({:prompt_done, ^sid, _, _}, &1)) do
+      true
+    else
+      receive after: (10 -> prompt_done_queued?(adapter, sid, attempts - 1))
     end
   end
 

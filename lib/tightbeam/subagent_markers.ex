@@ -7,6 +7,16 @@ defmodule Tightbeam.SubagentMarkers do
   alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Wakes}
   alias Tightbeam.DB.Txn
 
+  @redrive_fields [
+    :kind,
+    :principal,
+    :subagent_ref,
+    :source_event_ref,
+    :harness,
+    :at,
+    :assignment_id
+  ]
+
   @type marker :: %{
           kind: String.t(),
           principal: String.t(),
@@ -155,32 +165,120 @@ defmodule Tightbeam.SubagentMarkers do
         :skip
 
       {:marker, kind, tool_call_id, child_id} ->
-        source_session_ref = Org.source_session_ref(harness, machine, harness_session_id)
+        seed =
+          capture_seed(harness, machine, harness_session_id, update, kind, tool_call_id, child_id)
 
-        transaction!(db, fn txn ->
-          case parent_for_source_in_txn(txn, source_session_ref) do
-            nil ->
-              {:error,
-               %{
-                 code: "unknown_source_session",
-                 message: "no parent mapping for harness session",
-                 source_event_ref: source_event_ref(source_session_ref, tool_call_id),
-                 subagent_ref: subagent_ref(source_session_ref, child_id)
-               }}
+        capture_seed_in_db(db, seed)
+    end
+  end
 
-            principal ->
-              {:ok,
-               %{
-                 kind: kind,
-                 principal: principal,
-                 subagent_ref: subagent_ref(source_session_ref, child_id),
-                 source_event_ref: source_event_ref(source_session_ref, tool_call_id),
-                 harness: harness,
-                 at: System.system_time(:millisecond),
-                 assignment_id: running_turn_assignment_in_txn(txn, principal)
-               }}
-          end
-        end)
+  @doc "Capture event-time attribution with the same bounded retry used by durable insertion."
+  @spec capture_update_with_retry(
+          DB.server(),
+          atom(),
+          String.t(),
+          String.t(),
+          map(),
+          keyword()
+        ) :: :skip | {:ok, map()} | {:error, map()} | {:capture_failed, map()}
+  def capture_update_with_retry(db, harness, machine, harness_session_id, update, opts \\ []) do
+    case classify(harness, update) do
+      :skip ->
+        :skip
+
+      {:marker, kind, tool_call_id, child_id} ->
+        seed =
+          capture_seed(harness, machine, harness_session_id, update, kind, tool_call_id, child_id)
+
+        attempts = Keyword.get(opts, :attempts, 3)
+        retry_delay_ms = Keyword.get(opts, :retry_delay_ms, 25)
+        capture = Keyword.get(opts, :capture, fn -> capture_seed_in_db(db, seed) end)
+
+        retry_capture(seed, db, capture, attempts, attempts, retry_delay_ms)
+    end
+  end
+
+  defp capture_seed(harness, machine, harness_session_id, update, kind, tool_call_id, child_id) do
+    source_session_ref = Org.source_session_ref(harness, machine, harness_session_id)
+
+    %{
+      kind: kind,
+      harness: harness,
+      machine: machine,
+      harness_session_id: harness_session_id,
+      source_session_ref: source_session_ref,
+      source_event_ref: source_event_ref(source_session_ref, tool_call_id),
+      subagent_ref: subagent_ref(source_session_ref, child_id),
+      update: update,
+      at: System.system_time(:millisecond)
+    }
+  end
+
+  defp capture_seed_in_db(db, seed) do
+    transaction!(db, fn txn ->
+      case parent_for_source_in_txn(txn, seed.source_session_ref) do
+        nil ->
+          {:error,
+           %{
+             code: "unknown_source_session",
+             message: "no parent mapping for harness session",
+             source_event_ref: seed.source_event_ref,
+             subagent_ref: seed.subagent_ref
+           }}
+
+        principal ->
+          {:ok,
+           %{
+             kind: seed.kind,
+             principal: principal,
+             subagent_ref: seed.subagent_ref,
+             source_event_ref: seed.source_event_ref,
+             harness: seed.harness,
+             at: seed.at,
+             assignment_id: running_turn_assignment_in_txn(txn, principal)
+           }}
+      end
+    end)
+  end
+
+  defp retry_capture(seed, db, capture, remaining, limit, retry_delay_ms) do
+    attempt = limit - remaining + 1
+
+    result =
+      try do
+        {:ok, capture.()}
+      rescue
+        error -> {:error, {:error, error, __STACKTRACE__}}
+      catch
+        kind, reason -> {:error, {kind, reason, __STACKTRACE__}}
+      end
+
+    case result do
+      {:ok, captured} ->
+        captured
+
+      {:error, _reason} when remaining > 1 ->
+        Process.sleep(retry_delay_ms)
+        retry_capture(seed, db, capture, remaining - 1, limit, retry_delay_ms)
+
+      {:error, reason} ->
+        report =
+          seed
+          |> Map.take([
+            :kind,
+            :harness,
+            :machine,
+            :harness_session_id,
+            :source_session_ref,
+            :source_event_ref,
+            :subagent_ref,
+            :update,
+            :at
+          ])
+          |> Map.merge(%{attempts: attempt, reason: reason, stage: :capture})
+
+        record_failure(db, report)
+        {:capture_failed, report}
     end
   end
 
@@ -258,11 +356,11 @@ defmodule Tightbeam.SubagentMarkers do
   end
 
   defp captured_identity({:ok, input}) do
-    Map.take(input, [:source_event_ref, :subagent_ref])
+    Map.take(input, @redrive_fields)
   end
 
   defp captured_identity({:error, error}) when is_map(error) do
-    Map.take(error, [:source_event_ref, :subagent_ref])
+    Map.take(error, @redrive_fields)
   end
 
   defp captured_identity(_captured), do: %{}
@@ -271,9 +369,12 @@ defmodule Tightbeam.SubagentMarkers do
     source_event_ref = Map.get(report, :source_event_ref, "unknown")
 
     detail =
-      "attempts=#{report.attempts} " <>
-        "subagent_ref=#{Map.get(report, :subagent_ref, "unknown")} " <>
-        "reason=#{inspect(report.reason)}"
+      JSON.encode!(%{
+        attempts: report.attempts,
+        stage: Map.get(report, :stage, :consume),
+        redrive: Map.drop(report, [:attempts, :reason, :stage]),
+        reason: inspect(report.reason)
+      })
 
     try do
       EventLog.lifecycle(db, "subagent_event_ingestion_failed", source_event_ref, detail)

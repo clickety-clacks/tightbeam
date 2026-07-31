@@ -116,6 +116,29 @@ defmodule Tightbeam.Acp.ConnTest do
     assert {:error, :closed} = Task.await(task)
   end
 
+  test "force close requires the minted identity of the exact harness incarnation" do
+    script_path = Path.join(System.tmp_dir!(), "fake_adapter_identity.js")
+    File.write!(script_path, "process.on('SIGTERM', () => {});\n" <> @fake)
+
+    conn =
+      start_supervised!(
+        {Conn, cmd: [System.find_executable("node"), script_path], subscriber: self()}
+      )
+
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
+    assert {:requested, identity, :signalled} = Conn.request_close(conn)
+    assert is_reference(identity.token)
+    assert is_port(identity.port)
+    assert Conn.identity_alive?(identity)
+
+    recycled_slot = %{identity | token: make_ref()}
+    assert :released = Conn.force_close(conn, recycled_slot)
+    assert Conn.identity_alive?(identity)
+
+    assert :signalled = Conn.force_close(conn, identity)
+    assert eventually(fn -> not Conn.identity_alive?(identity) end)
+  end
+
   defp eventually(fun, tries \\ 40) do
     cond do
       fun.() ->

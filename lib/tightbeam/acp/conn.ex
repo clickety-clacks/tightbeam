@@ -27,11 +27,13 @@ defmodule Tightbeam.Acp.Conn do
   use GenServer
 
   defstruct port: nil,
+            identity: nil,
             buf: "",
             next_id: 1,
             # id => %{from, monitor, session_id, method, orphaned}
             pending: %{},
             subscriber: nil,
+            on_harness_exit: nil,
             closed: false
 
   ## Client
@@ -65,13 +67,30 @@ defmodule Tightbeam.Acp.Conn do
   @spec close(conn()) :: :ok
   def close(conn), do: GenServer.cast(conn, :close)
 
-  @doc "Ask the owned OS process to stop and return its verified identity."
-  @spec request_close(conn()) :: {:requested, {pos_integer(), String.t()}} | :released
+  @typedoc "One exact harness OS-process incarnation."
+  @type process_identity :: %{
+          pid: pos_integer(),
+          port: port(),
+          started_at: String.t(),
+          token: reference()
+        }
+
+  @doc "Ask the owned OS process to stop and return its exact incarnation identity."
+  @spec request_close(conn()) ::
+          {:requested, process_identity(), signal_result()} | :released
   def request_close(conn), do: GenServer.call(conn, :request_close)
 
-  @doc "KILL the process only while the Port still owns the captured identity."
-  @spec force_close(conn(), {pos_integer(), String.t()}) :: :signalled | :released
+  @type signal_result :: :signalled | :released | {:failed, integer(), String.t()}
+
+  @doc "KILL the process only while the Conn still owns the captured incarnation."
+  @spec force_close(conn(), process_identity()) :: signal_result()
   def force_close(conn, identity), do: GenServer.call(conn, {:force_close, identity})
+
+  @doc "Whether the exact captured OS-process incarnation still occupies its PID."
+  @spec identity_alive?(process_identity()) :: boolean()
+  def identity_alive?(%{pid: pid, port: port, started_at: started_at}) do
+    Port.info(port, :os_pid) == {:os_pid, pid} and process_started_at(pid) == started_at
+  end
 
   ## Server
 
@@ -91,20 +110,34 @@ defmodule Tightbeam.Acp.Conn do
         {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)}
       ])
 
-    {:ok, %__MODULE__{port: port, subscriber: Keyword.get(opts, :subscriber)}}
+    identity = port_identity(port)
+
+    if identity && is_function(opts[:on_harness_spawn], 2),
+      do: opts[:on_harness_spawn].(self(), identity)
+
+    {:ok,
+     %__MODULE__{
+       port: port,
+       identity: identity,
+       subscriber: Keyword.get(opts, :subscriber),
+       on_harness_exit: opts[:on_harness_exit]
+     }}
   end
 
   @impl true
   def handle_call(:request_close, _from, state) do
     case current_identity(state) do
-      nil -> {:reply, :released, state}
-      identity -> {:reply, {:requested, identity}, signal_identity(identity, "-TERM", state)}
+      nil ->
+        {:reply, :released, state}
+
+      identity ->
+        {:reply, {:requested, identity, signal_identity(identity, "-TERM", state)}, state}
     end
   end
 
   def handle_call({:force_close, identity}, _from, state) do
     if current_identity(state) == identity do
-      {:reply, :signalled, signal_identity(identity, "-KILL", state)}
+      {:reply, signal_identity(identity, "-KILL", state), state}
     else
       {:reply, :released, state}
     end
@@ -155,6 +188,7 @@ defmodule Tightbeam.Acp.Conn do
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
+    notify_harness_exit(state, status)
     emit(state, {:acp_exit, status})
     {:noreply, fail_all(%{state | closed: true}, {:error, :closed})}
   end
@@ -258,37 +292,58 @@ defmodule Tightbeam.Acp.Conn do
 
   defp current_identity(%{closed: true}), do: nil
 
-  defp current_identity(%{port: port}) do
-    with {:os_pid, pid} <- Port.info(port, :os_pid),
-         command when is_binary(command) <- process_command(pid) do
-      {pid, command}
+  defp current_identity(%{port: port, identity: identity}) do
+    with %{pid: pid} <- identity,
+         {:os_pid, ^pid} <- Port.info(port, :os_pid),
+         true <- identity_alive?(identity) do
+      identity
     else
       _ -> nil
     end
   end
 
-  defp signal_identity({pid, command} = identity, signal, state) do
-    if current_identity(state) == identity and process_command(pid) == command do
-      _ = System.cmd("kill", [signal, Integer.to_string(pid)], stderr_to_stdout: true)
+  defp port_identity(port) do
+    with {:os_pid, pid} <- Port.info(port, :os_pid),
+         started_at when is_binary(started_at) <- process_started_at(pid) do
+      %{pid: pid, port: port, started_at: started_at, token: make_ref()}
+    else
+      _ -> nil
     end
-
-    state
   end
 
-  defp process_command(pid) do
-    case System.cmd("ps", ["-ww", "-o", "command=", "-p", Integer.to_string(pid)],
+  defp signal_identity(identity, signal, state) do
+    if current_identity(state) == identity, do: signal(identity, signal), else: :released
+  end
+
+  defp signal(%{pid: pid}, signal) do
+    case System.cmd("kill", [signal, Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 0} -> :signalled
+      {output, status} -> {:failed, status, String.trim(output)}
+    end
+  rescue
+    error -> {:failed, -1, Exception.message(error)}
+  end
+
+  defp process_started_at(pid) do
+    case System.cmd("ps", ["-ww", "-o", "lstart=", "-p", Integer.to_string(pid)],
            stderr_to_stdout: true
          ) do
       {output, 0} ->
         case String.trim(output) do
           "" -> nil
-          command -> command
+          started_at -> started_at
         end
 
       _ ->
         nil
     end
   end
+
+  defp notify_harness_exit(%{on_harness_exit: callback, identity: identity}, status)
+       when is_function(callback, 2),
+       do: callback.(identity, status)
+
+  defp notify_harness_exit(_state, _status), do: :ok
 
   defp split_lines(buf) do
     parts = String.split(buf, "\n")

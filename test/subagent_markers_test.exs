@@ -281,15 +281,48 @@ defmodule Tightbeam.SubagentMarkersTest do
     assert EventLog.lifecycle_events(ctx.db) == []
   end
 
-  test "exhausted durable-consumption failure records exact redrive identity",
+  test "synchronous event-time capture retries database failures before returning", ctx do
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    capture = fn ->
+      attempt = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
+
+      if attempt < 3 do
+        raise DB.Error, message: "database unavailable"
+      else
+        {:ok, %{captured: true}}
+      end
+    end
+
+    assert {:ok, %{captured: true}} =
+             SubagentMarkers.capture_update_with_retry(
+               ctx.db,
+               :codex,
+               "testhost",
+               "sid-codex",
+               ctx.codex_fixture["live_started"],
+               attempts: 3,
+               retry_delay_ms: 0,
+               capture: capture
+             )
+
+    assert Agent.get(attempts, & &1) == 3
+  end
+
+  test "exhausted durable-consumption failure records the exact marker for redrive",
        ctx do
     {:ok, attempts} = Agent.start_link(fn -> 0 end)
 
     captured =
       {:ok,
        %{
+         kind: "subagent_stop",
+         principal: "parent-codex",
          source_event_ref: "source-event-exhausted",
-         subagent_ref: "subagent-exhausted"
+         subagent_ref: "subagent-exhausted",
+         harness: :codex,
+         at: 1_234_567,
+         assignment_id: "assignment-at-event"
        }}
 
     consume = fn ->
@@ -300,8 +333,13 @@ defmodule Tightbeam.SubagentMarkersTest do
     assert {:error,
             %{
               attempts: 3,
+              kind: "subagent_stop",
+              principal: "parent-codex",
               source_event_ref: "source-event-exhausted",
-              subagent_ref: "subagent-exhausted"
+              subagent_ref: "subagent-exhausted",
+              harness: :codex,
+              at: 1_234_567,
+              assignment_id: "assignment-at-event"
             }} =
              SubagentMarkers.consume_captured_with_retry(captured, ctx.db, ctx.scheduler,
                attempts: 3,
@@ -319,8 +357,19 @@ defmodule Tightbeam.SubagentMarkersTest do
            ] =
              EventLog.lifecycle_events(ctx.db)
 
-    assert detail =~ "subagent-exhausted"
-    assert detail =~ "attempts=3"
+    decoded = JSON.decode!(detail)
+    assert decoded["attempts"] == 3
+    assert decoded["stage"] == "consume"
+
+    assert decoded["redrive"] == %{
+             "assignment_id" => "assignment-at-event",
+             "at" => 1_234_567,
+             "harness" => "codex",
+             "kind" => "subagent_stop",
+             "principal" => "parent-codex",
+             "source_event_ref" => "source-event-exhausted",
+             "subagent_ref" => "subagent-exhausted"
+           }
   end
 
   defp consume(ctx, harness, sid, update) do
