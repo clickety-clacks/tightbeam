@@ -437,6 +437,84 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert AdapterCoordinator.newer_token?(reborn_token, closed_token)
   end
 
+  test "park records request then detected graceful close before replying", ctx do
+    path = Path.join(ctx.test_dir, "park_graceful.js")
+    File.write!(path, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         park_grace_ms: 100,
+         name: :"coordinator_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    ref = Process.monitor(adapter)
+
+    assert {:ok, :closed} = AdapterCoordinator.park_adapter(coordinator, key)
+    assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}
+
+    assert [
+             %{kind: "adapter_park_requested"},
+             %{kind: "adapter_park_close_detected", detail: "outcome=graceful"}
+           ] = EventLog.lifecycle_events(ctx.db)
+  end
+
+  test "park kills a TERM-resistant harness after grace and verifies adapter death", ctx do
+    path = Path.join(ctx.test_dir, "park_stubborn.js")
+
+    File.write!(
+      path,
+      """
+      process.on('SIGTERM', () => {});
+      #{@fake}
+      """
+    )
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         park_grace_ms: 50,
+         name: :"coordinator_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    ref = Process.monitor(adapter)
+
+    assert {:ok, :killed} = AdapterCoordinator.park_adapter(coordinator, key)
+    assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}
+
+    assert [
+             %{kind: "adapter_park_requested"},
+             %{kind: "adapter_park_grace_expired", detail: "grace_ms=50"},
+             %{kind: "adapter_park_killed", detail: "outcome=kill_verified"}
+           ] = EventLog.lifecycle_events(ctx.db)
+  end
+
   test "load-slot queue caps concurrency at three and releases on borrower exit", ctx do
     coordinator =
       start_supervised!(

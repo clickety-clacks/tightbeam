@@ -264,6 +264,38 @@ defmodule Tightbeam.CredentialsTest do
     assert Agent.get(membership, & &1) == [:after]
   end
 
+  test "terminal publication waits for verified park completion", ctx do
+    owner = self()
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        park: fn :openai ->
+          send(owner, {:park_requested, self()})
+
+          receive do
+            :park_close_detected -> :ok
+          end
+        end,
+        capture_sessions: fn :openai -> [:session] end,
+        publish_sessions: fn captured, transition ->
+          send(owner, {:verified_publish, captured, transition})
+          :ok
+        end
+      )
+
+    evidence = fixture("codex-account-updated-logged-out-0.145.0.json")["params"]
+    terminal = Task.async(fn -> Credentials.mark_terminal(:openai, evidence, server) end)
+
+    assert_receive {:park_requested, ^server}
+    refute_receive {:verified_publish, _, :terminal}
+    send(server, :park_close_detected)
+    assert :ok = Task.await(terminal)
+    assert_receive {:verified_publish, [:session], :terminal}
+  end
+
   test "raising and exiting publishers do not change terminal or onboarding results", ctx do
     {:ok, server} =
       Credentials.start_link(

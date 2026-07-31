@@ -3459,10 +3459,11 @@ defmodule Tightbeam.Gateway do
     provider
     |> harnesses_for_provider()
     |> Enum.each(fn module ->
-      AdapterCoordinator.request_close_adapter(
-        Tightbeam.AdapterCoordinator,
-        {module.id(), "shared", machine}
-      )
+      {:ok, _outcome} =
+        AdapterCoordinator.park_adapter(
+          Tightbeam.AdapterCoordinator,
+          {module.id(), "shared", machine}
+        )
     end)
 
     :ok

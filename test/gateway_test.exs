@@ -135,6 +135,12 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:adapter_for, key, _context}, from, state),
       do: handle_call({:adapter_for, key}, from, state)
 
+    def handle_call({:park_adapter, key}, _from, {adapter, parent} = state) do
+      if is_pid(parent), do: send(parent, {:park_adapter, key})
+      GenServer.stop(adapter)
+      {:reply, {:ok, :closed}, state}
+    end
+
     def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
@@ -145,12 +151,6 @@ defmodule Tightbeam.GatewayTest do
     end
 
     def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
-
-    def handle_cast({:close_adapter, key}, {adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:close_adapter, key})
-      GenServer.stop(adapter)
-      {:noreply, state}
-    end
   end
 
   defmodule AdapterStub do

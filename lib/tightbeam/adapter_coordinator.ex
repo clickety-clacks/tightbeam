@@ -223,15 +223,10 @@ defmodule Tightbeam.AdapterCoordinator do
     :exit, _reason -> :ok
   end
 
-  @doc """
-  Request planned teardown without synchronously entering the coordinator.
-
-  Used by lower-tier lifecycle owners whose notification must not wait on the
-  coordinator or on the Adapter it is closing.
-  """
-  @spec request_close_adapter(GenServer.server(), adapter_key()) :: :ok
-  def request_close_adapter(server \\ __MODULE__, key) do
-    GenServer.cast(server, {:close_adapter, key})
+  @doc "Park an adapter and reply only after its monitored process is dead."
+  @spec park_adapter(GenServer.server(), adapter_key()) :: {:ok, :closed | :killed}
+  def park_adapter(server \\ __MODULE__, key) do
+    GenServer.call(server, {:park_adapter, key}, :infinity)
   end
 
   @impl true
@@ -243,6 +238,7 @@ defmodule Tightbeam.AdapterCoordinator do
        adapter_opts: Keyword.fetch!(opts, :adapter_opts),
        db: Keyword.get(opts, :db, Tightbeam.DB),
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
+       park_grace_ms: Keyword.get(opts, :park_grace_ms, 10_000),
        load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
        failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
        epoch: mint_epoch(Keyword.get(opts, :db, Tightbeam.DB)),
@@ -250,6 +246,8 @@ defmodule Tightbeam.AdapterCoordinator do
        adapters: %{},
        monitors: %{},
        context_requests: %{},
+       parks: %{},
+       park_workers: %{},
        load_active: %{},
        load_queue: %{}
      }}
@@ -327,6 +325,47 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, :ok, do_close_adapter(key, state)}
   end
 
+  def handle_call({:park_adapter, key}, from, state) do
+    :ok = Tightbeam.EventLog.lifecycle(state.db, "adapter_park_requested", key_name(key), nil)
+
+    case state.parks[key] do
+      %{waiters: waiters} = park ->
+        park = %{park | waiters: [from | waiters]}
+        {:noreply, put_in(state.parks[key], park)}
+
+      nil ->
+        case state.adapters[key] do
+          %{pid: pid, monitor: monitor} when is_pid(pid) ->
+            timer =
+              Process.send_after(self(), {:park_grace_expired, key, monitor}, state.park_grace_ms)
+
+            park = %{
+              pid: pid,
+              adapter_monitor: monitor,
+              waiters: [from],
+              timer: timer,
+              conn: nil,
+              identity: nil,
+              forced: false
+            }
+
+            state = put_in(state.parks[key], park)
+            {:noreply, start_park_worker(key, :request, state)}
+
+          _ ->
+            :ok =
+              Tightbeam.EventLog.lifecycle(
+                state.db,
+                "adapter_park_close_detected",
+                key_name(key),
+                "outcome=already_closed"
+              )
+
+            {:reply, {:ok, :closed}, state}
+        end
+    end
+  end
+
   defp adapter_for_reply(key, context, state, authoritative? \\ false) do
     entry = Map.get(state.adapters, key, fresh_entry())
 
@@ -349,10 +388,6 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   @impl true
-  def handle_cast({:close_adapter, key}, state) do
-    {:noreply, do_close_adapter(key, state)}
-  end
-
   def handle_cast({:release_load_slot, machine, slot}, state) do
     {:noreply, release_slot(machine, slot, state)}
   end
@@ -398,8 +433,18 @@ defmodule Tightbeam.AdapterCoordinator do
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     context_request = context_request_for_monitor(state.context_requests, ref)
+    park_worker = park_worker_for_monitor(state.park_workers, ref)
+    parked_key = park_key_for_monitor(state.parks, ref)
 
     cond do
+      is_binary(parked_key) or is_tuple(parked_key) ->
+        {:noreply, finish_park(parked_key, reason, state)}
+
+      match?({_request_ref, _worker}, park_worker) ->
+        {request_ref, worker} = park_worker
+        state = %{state | park_workers: Map.delete(state.park_workers, request_ref)}
+        {:noreply, park_worker_failed(worker, reason, state)}
+
       match?({_request_ref, _request}, context_request) ->
         {request_ref, request} = context_request
         requests = Map.delete(state.context_requests, request_ref)
@@ -494,6 +539,37 @@ defmodule Tightbeam.AdapterCoordinator do
         Process.demonitor(monitor, [:flush])
         state = %{state | context_requests: requests}
         {:noreply, finish_context_request(request, result, state)}
+    end
+  end
+
+  def handle_info({:park_worker_result, request_ref, result}, state) do
+    case Map.pop(state.park_workers, request_ref) do
+      {nil, workers} ->
+        {:noreply, %{state | park_workers: workers}}
+
+      {%{monitor: monitor} = worker, workers} ->
+        Process.demonitor(monitor, [:flush])
+        state = %{state | park_workers: workers}
+        {:noreply, apply_park_worker_result(worker, result, state)}
+    end
+  end
+
+  def handle_info({:park_grace_expired, key, monitor}, state) do
+    case state.parks[key] do
+      %{adapter_monitor: ^monitor} = park ->
+        :ok =
+          Tightbeam.EventLog.lifecycle(
+            state.db,
+            "adapter_park_grace_expired",
+            key_name(key),
+            "grace_ms=#{state.park_grace_ms}"
+          )
+
+        state = put_in(state.parks[key], %{park | forced: true, timer: nil})
+        {:noreply, start_park_worker(key, :force, state)}
+
+      _ ->
+        {:noreply, state}
     end
   end
 
@@ -663,6 +739,123 @@ defmodule Tightbeam.AdapterCoordinator do
 
   defp context_request_for_monitor(requests, monitor) do
     Enum.find(requests, fn {_request_ref, request} -> request.monitor == monitor end)
+  end
+
+  defp start_park_worker(key, stage, state) do
+    owner = self()
+    request_ref = make_ref()
+    park = Map.fetch!(state.parks, key)
+
+    {_pid, monitor} =
+      spawn_monitor(fn ->
+        result = run_park_worker(stage, park)
+        send(owner, {:park_worker_result, request_ref, result})
+      end)
+
+    worker = %{key: key, stage: stage, monitor: monitor}
+    %{state | park_workers: Map.put(state.park_workers, request_ref, worker)}
+  end
+
+  defp run_park_worker(:request, park) do
+    try do
+      conn = Tightbeam.Acp.Adapter.conn(park.pid)
+      {:ok, conn, Tightbeam.Acp.Conn.request_close(conn)}
+    catch
+      :exit, reason -> {:error, {:request_close_exit, reason}}
+    end
+  end
+
+  defp run_park_worker(:force, %{conn: conn, identity: identity})
+       when is_pid(conn) and not is_nil(identity) do
+    try do
+      {:ok, Tightbeam.Acp.Conn.force_close(conn, identity)}
+    catch
+      :exit, reason -> {:error, {:force_close_exit, reason}}
+    end
+  end
+
+  defp run_park_worker(:force, _park), do: {:ok, :released}
+
+  defp apply_park_worker_result(%{key: key, stage: :request}, {:ok, conn, result}, state) do
+    case state.parks[key] do
+      nil ->
+        state
+
+      park ->
+        identity =
+          case result do
+            {:requested, identity} -> identity
+            :released -> nil
+          end
+
+        put_in(state.parks[key], %{park | conn: conn, identity: identity})
+    end
+  end
+
+  defp apply_park_worker_result(%{stage: :request}, {:error, _reason}, state),
+    do: state
+
+  defp apply_park_worker_result(%{key: key, stage: :force}, _result, state) do
+    case state.parks[key] do
+      %{pid: pid, adapter_monitor: monitor} ->
+        case state.adapters[key] do
+          %{pid: ^pid, monitor: ^monitor} -> Process.exit(pid, :kill)
+          _ -> :ok
+        end
+
+        state
+
+      nil ->
+        state
+    end
+  end
+
+  defp park_worker_failed(%{key: key, stage: :force}, _reason, state),
+    do: apply_park_worker_result(%{key: key, stage: :force}, {:error, :worker_exit}, state)
+
+  defp park_worker_failed(_worker, _reason, state), do: state
+
+  defp finish_park(key, _reason, state) do
+    park = Map.fetch!(state.parks, key)
+    if park.timer, do: Process.cancel_timer(park.timer)
+
+    {kind, detail, outcome} =
+      if park.forced do
+        {"adapter_park_killed", "outcome=kill_verified", :killed}
+      else
+        {"adapter_park_close_detected", "outcome=graceful", :closed}
+      end
+
+    :ok = Tightbeam.EventLog.lifecycle(state.db, kind, key_name(key), detail)
+    Enum.each(park.waiters, &GenServer.reply(&1, {:ok, outcome}))
+
+    entry = Map.fetch!(state.adapters, key)
+
+    entry = %{
+      entry
+      | pid: nil,
+        monitor: nil,
+        ready: false,
+        generation: entry.generation + 1,
+        context: nil
+    }
+
+    %{
+      state
+      | parks: Map.delete(state.parks, key),
+        adapters: Map.put(state.adapters, key, entry),
+        monitors: Map.delete(state.monitors, park.adapter_monitor)
+    }
+  end
+
+  defp park_key_for_monitor(parks, monitor) do
+    Enum.find_value(parks, fn {key, park} ->
+      if park.adapter_monitor == monitor, do: key
+    end)
+  end
+
+  defp park_worker_for_monitor(workers, monitor) do
+    Enum.find(workers, fn {_request_ref, worker} -> worker.monitor == monitor end)
   end
 
   defp backoff(state, failures),

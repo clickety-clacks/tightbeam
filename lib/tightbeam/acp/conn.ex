@@ -65,6 +65,14 @@ defmodule Tightbeam.Acp.Conn do
   @spec close(conn()) :: :ok
   def close(conn), do: GenServer.cast(conn, :close)
 
+  @doc "Ask the owned OS process to stop and return its verified identity."
+  @spec request_close(conn()) :: {:requested, {pos_integer(), String.t()}} | :released
+  def request_close(conn), do: GenServer.call(conn, :request_close)
+
+  @doc "KILL the process only while the Port still owns the captured identity."
+  @spec force_close(conn(), {pos_integer(), String.t()}) :: :signalled | :released
+  def force_close(conn, identity), do: GenServer.call(conn, {:force_close, identity})
+
   ## Server
 
   @impl true
@@ -84,6 +92,22 @@ defmodule Tightbeam.Acp.Conn do
       ])
 
     {:ok, %__MODULE__{port: port, subscriber: Keyword.get(opts, :subscriber)}}
+  end
+
+  @impl true
+  def handle_call(:request_close, _from, state) do
+    case current_identity(state) do
+      nil -> {:reply, :released, state}
+      identity -> {:reply, {:requested, identity}, signal_identity(identity, "-TERM", state)}
+    end
+  end
+
+  def handle_call({:force_close, identity}, _from, state) do
+    if current_identity(state) == identity do
+      {:reply, :signalled, signal_identity(identity, "-KILL", state)}
+    else
+      {:reply, :released, state}
+    end
   end
 
   @impl true
@@ -231,6 +255,40 @@ defmodule Tightbeam.Acp.Conn do
   end
 
   defp send_json(port, map), do: Port.command(port, JSON.encode!(map) <> "\n")
+
+  defp current_identity(%{closed: true}), do: nil
+
+  defp current_identity(%{port: port}) do
+    with {:os_pid, pid} <- Port.info(port, :os_pid),
+         command when is_binary(command) <- process_command(pid) do
+      {pid, command}
+    else
+      _ -> nil
+    end
+  end
+
+  defp signal_identity({pid, command} = identity, signal, state) do
+    if current_identity(state) == identity and process_command(pid) == command do
+      _ = System.cmd("kill", [signal, Integer.to_string(pid)], stderr_to_stdout: true)
+    end
+
+    state
+  end
+
+  defp process_command(pid) do
+    case System.cmd("ps", ["-ww", "-o", "command=", "-p", Integer.to_string(pid)],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        case String.trim(output) do
+          "" -> nil
+          command -> command
+        end
+
+      _ ->
+        nil
+    end
+  end
 
   defp split_lines(buf) do
     parts = String.split(buf, "\n")
