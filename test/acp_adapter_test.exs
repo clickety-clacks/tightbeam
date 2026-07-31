@@ -939,7 +939,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Process.alive?(adapter)
   end
 
-  test "placement reports a failed durable subagent ingestion without retrying" do
+  test "placement reports a failed durable subagent ingestion after bounded retries" do
     owner = self()
 
     base =
@@ -1056,7 +1056,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert log =~ "subagent event ingestion failed"
     assert log =~ "source_event_ref"
     assert log =~ "subagent_ref"
-    assert log =~ "classification: :permanent"
+    assert log =~ "attempts: 3"
     assert Process.alive?(adapter)
   end
 

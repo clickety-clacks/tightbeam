@@ -250,7 +250,7 @@ defmodule Tightbeam.SubagentMarkersTest do
     assert turn_count(ctx.db) == 0
   end
 
-  test "durable consumption retries locked and busy failures", ctx do
+  test "durable consumption retries every insertion failure", ctx do
     {:ok, attempts} = Agent.start_link(fn -> 0 end)
 
     captured =
@@ -264,8 +264,7 @@ defmodule Tightbeam.SubagentMarkersTest do
       attempt = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
 
       if attempt < 3 do
-        raise DB.Error,
-          message: if(attempt == 1, do: "database is locked", else: "database is busy")
+        raise DB.Error, message: "FOREIGN KEY constraint failed"
       else
         %{appended: true}
       end
@@ -282,15 +281,15 @@ defmodule Tightbeam.SubagentMarkersTest do
     assert EventLog.lifecycle_events(ctx.db) == []
   end
 
-  test "permanent durable-consumption failure records exact redrive identity without retry",
+  test "exhausted durable-consumption failure records exact redrive identity",
        ctx do
     {:ok, attempts} = Agent.start_link(fn -> 0 end)
 
     captured =
       {:ok,
        %{
-         source_event_ref: "source-event-permanent",
-         subagent_ref: "subagent-permanent"
+         source_event_ref: "source-event-exhausted",
+         subagent_ref: "subagent-exhausted"
        }}
 
     consume = fn ->
@@ -300,28 +299,28 @@ defmodule Tightbeam.SubagentMarkersTest do
 
     assert {:error,
             %{
-              classification: :permanent,
-              source_event_ref: "source-event-permanent",
-              subagent_ref: "subagent-permanent"
+              attempts: 3,
+              source_event_ref: "source-event-exhausted",
+              subagent_ref: "subagent-exhausted"
             }} =
              SubagentMarkers.consume_captured_with_retry(captured, ctx.db, ctx.scheduler,
                attempts: 3,
                consume: consume
              )
 
-    assert Agent.get(attempts, & &1) == 1
+    assert Agent.get(attempts, & &1) == 3
 
     assert [
              %{
                kind: "subagent_event_ingestion_failed",
-               subject: "source-event-permanent",
+               subject: "source-event-exhausted",
                detail: detail
              }
            ] =
              EventLog.lifecycle_events(ctx.db)
 
-    assert detail =~ "subagent-permanent"
-    assert detail =~ "classification=permanent"
+    assert detail =~ "subagent-exhausted"
+    assert detail =~ "attempts=3"
   end
 
   defp consume(ctx, harness, sid, update) do

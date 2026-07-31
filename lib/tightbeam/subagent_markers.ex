@@ -203,7 +203,7 @@ defmodule Tightbeam.SubagentMarkers do
     end
   end
 
-  @doc "Consume an idempotent captured marker with classified SQLite retry and redrive reporting."
+  @doc "Consume an idempotent captured marker with bounded retry and redrive reporting."
   @spec consume_captured_with_retry(
           :skip | {:ok, map()} | {:error, map()},
           DB.server(),
@@ -237,38 +237,21 @@ defmodule Tightbeam.SubagentMarkers do
       {:ok, value} ->
         {:ok, value}
 
+      {:error, _reason} when remaining > 1 ->
+        Process.sleep(retry_delay_ms)
+        retry_captured(captured, db, consume, remaining - 1, limit, retry_delay_ms)
+
       {:error, reason} ->
-        classification = failure_classification(reason)
-
-        if classification == :transient and remaining > 1 do
-          Process.sleep(retry_delay_ms)
-          retry_captured(captured, db, consume, remaining - 1, limit, retry_delay_ms)
-        else
-          report = failure_report(captured, classification, attempt, reason)
-          record_failure(db, report)
-          {:error, report}
-        end
+        report = failure_report(captured, attempt, reason)
+        record_failure(db, report)
+        {:error, report}
     end
   end
 
-  defp failure_classification(reason) do
-    text = reason |> inspect() |> String.downcase()
-
-    if String.contains?(text, "database is locked") or
-         String.contains?(text, "database is busy") or
-         String.contains?(text, "sqlite_busy") or
-         String.contains?(text, "sqlite_locked") do
-      :transient
-    else
-      :permanent
-    end
-  end
-
-  defp failure_report(captured, classification, attempts, reason) do
+  defp failure_report(captured, attempts, reason) do
     identity = captured_identity(captured)
 
     Map.merge(identity, %{
-      classification: classification,
       attempts: attempts,
       reason: reason
     })
@@ -288,7 +271,7 @@ defmodule Tightbeam.SubagentMarkers do
     source_event_ref = Map.get(report, :source_event_ref, "unknown")
 
     detail =
-      "classification=#{report.classification} attempts=#{report.attempts} " <>
+      "attempts=#{report.attempts} " <>
         "subagent_ref=#{Map.get(report, :subagent_ref, "unknown")} " <>
         "reason=#{inspect(report.reason)}"
 
