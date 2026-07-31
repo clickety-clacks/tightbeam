@@ -73,16 +73,33 @@ defmodule Tightbeam.AdapterHealTest do
     @moduledoc false
     use GenServer
     def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
-    def init(state), do: {:ok, Map.put_new(state, :apply_count, 0)}
+
+    def init(state) do
+      state =
+        state
+        |> Map.put_new(:apply_count, 0)
+        |> Map.put_new(:load_count, 0)
+        |> Map.put_new(:known, true)
+
+      {:ok, state}
+    end
 
     def held(pid), do: GenServer.call(pid, :held)
     def apply_count(pid), do: GenServer.call(pid, :apply_count)
+    def load_count(pid), do: GenServer.call(pid, :load_count)
 
     def handle_call({:apply_model_strict, _sid, model, prior_model}, _from, state) do
       if state.model == prior_model do
-        state = %{state | model: model, apply_count: state.apply_count + 1}
+        state =
+          %{state | model: model, apply_count: state.apply_count + 1}
+          |> Map.put(:known, is_nil(state[:strict_error]))
+
         if fire = state[:on_applied], do: fire.()
-        {:reply, {:ok, model}, state}
+
+        case state[:strict_error] do
+          nil -> {:reply, {:ok, model}, state}
+          reason -> {:reply, {:error, reason}, state}
+        end
       else
         {:reply, {:error, {:stale_model, state.model}}, state}
       end
@@ -90,12 +107,47 @@ defmodule Tightbeam.AdapterHealTest do
 
     def handle_call(:held, _from, state), do: {:reply, state.model, state}
     def handle_call(:apply_count, _from, state), do: {:reply, state.apply_count, state}
+    def handle_call(:load_count, _from, state), do: {:reply, state.load_count, state}
+
+    def handle_call({:knows_session?, _sid}, _from, state) do
+      case state[:hold_knows_for_strict] do
+        nil ->
+          {:reply, state.known, state}
+
+        parent ->
+          send(parent, :tune_has_pointer)
+
+          receive do
+            {:"$gen_call", strict_from, {:apply_model_strict, _strict_sid, model, prior_model}} ->
+              true = state.model == prior_model
+              state = %{state | model: model, apply_count: state.apply_count + 1}
+              GenServer.reply(strict_from, {:ok, model})
+              {:reply, state.known, Map.delete(state, :hold_knows_for_strict)}
+          end
+      end
+    end
+
+    def handle_call({:load_session, _sid, _model, _cwd, _mcp, _guidance}, _from, state) do
+      state = %{state | known: true, load_count: state.load_count + 1}
+      {:reply, {:ok, state.model}, state}
+    end
+
+    def handle_call({:apply_model, _sid, model}, _from, state) do
+      if parent = state[:parent], do: send(parent, {:tune_model_applied, model})
+      {:reply, :ok, %{state | model: model}}
+    end
+
+    def handle_call({:prompt, _sid, _text, _opts}, _from, state),
+      do: {:reply, {:ok, %{stop_reason: "end_turn", text: "continued"}}, state}
 
     def handle_call({:current_model, _sid}, _from, state),
       do: {:reply, {:ok, state.model}, state}
 
     def handle_call({:on_applied, fun}, _from, state),
       do: {:reply, :ok, Map.put(state, :on_applied, fun)}
+
+    def handle_call({:hold_knows_for_strict, parent}, _from, state),
+      do: {:reply, :ok, Map.put(state, :hold_knows_for_strict, parent)}
   end
 
   defmodule DyingAdapter do
@@ -1204,7 +1256,7 @@ defmodule Tightbeam.AdapterHealTest do
         &(&1.kind == "adjudication_ruling_superseded")
       )
 
-    assert JSON.decode!(superseded.detail)["healToken"] == "7:2"
+    assert is_nil(JSON.decode!(superseded.detail)["healToken"])
   end
 
   test "F3: a heal arriving after the harness moved cannot split the atomic ruling", ctx do
@@ -1365,6 +1417,68 @@ defmodule Tightbeam.AdapterHealTest do
     assert prompt =~ "You now run on #{owner_model}"
   end
 
+  test "F3: a concurrent tune cannot invalidate the model before its ruling commits", ctx do
+    adapter = swap_harness(ctx, checkout: {:error, :degraded})
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    parent = self()
+
+    :ok = GenServer.call(adapter, {:hold_knows_for_strict, parent})
+
+    swap_ready(adapter, nil)
+
+    tune =
+      Task.async(fn ->
+        Gateway.handlers(ctx.config)["tune"].(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{setting: "set_model", model: "claude-opus-4-6"}
+        })
+      end)
+
+    assert_receive :tune_has_pointer
+
+    swap =
+      Task.async(fn ->
+        Gateway.handlers(ctx.config)["adjudicate"].(%{
+          origin: "user:flynn",
+          principal: {:session, episode.owner_target},
+          on_model_apply_interlock: fn ->
+            send(parent, {:swap_confirmed, self()})
+
+            receive do
+              :release_swap_commit -> :ok
+            end
+          end,
+          params: %{
+            episode: episode.correlation_key,
+            action: "swap",
+            model: "claude-sonnet-4-6"
+          }
+        })
+      end)
+
+    assert_receive {:swap_confirmed, db_owner}
+
+    try do
+      refute_receive {:tune_model_applied, "claude-opus-4-6"}, 100
+      assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    after
+      send(db_owner, :release_swap_commit)
+    end
+
+    assert %{ok: true, action: "swap", model: "claude-sonnet-4-6"} = Task.await(swap)
+    assert %{ok: true} = Task.await(tune)
+
+    resolved = Adjudication.get(ctx.db, "k1", "other")
+
+    assert Wakes.get(ctx.db, resolved.recovery_wake_id).prompt =~
+             "You now run on claude-sonnet-4-6"
+
+    assert SwapAdapterStub.held(adapter) == "claude-opus-4-6"
+    assert Org.get(ctx.db, "k1").model == "claude-opus-4-6"
+  end
+
   test "F3: the DB owner finishes projection and ruling after the wire caller dies", ctx do
     adapter = swap_harness(ctx, checkout: {:error, :degraded})
     run_failing_turn(ctx, "fault")
@@ -1409,7 +1523,7 @@ defmodule Tightbeam.AdapterHealTest do
              "You now run on claude-sonnet-4-6"
   end
 
-  test "F3: a failed projection heals from the owner on the next swap opportunity", ctx do
+  test "F3: a failed projection heals from the owner on the next residency pass", ctx do
     adapter = swap_harness(ctx, checkout: {:error, :degraded})
     run_failing_turn(ctx, "fault")
     episode = episode(ctx.db)
@@ -1428,7 +1542,7 @@ defmodule Tightbeam.AdapterHealTest do
         """
       )
 
-    call = fn ->
+    assert_raise DB.Error, ~r/staged projection failure/, fn ->
       Gateway.handlers(ctx.config)["adjudicate"].(%{
         origin: "user:flynn",
         principal: {:session, episode.owner_target},
@@ -1440,18 +1554,50 @@ defmodule Tightbeam.AdapterHealTest do
       })
     end
 
-    assert_raise DB.Error, ~r/staged projection failure/, call
     assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
     assert Org.get(ctx.db, "k1").model == "claude-fable-5"
     assert SwapAdapterStub.apply_count(adapter) == 1
 
     :ok = DB.execute(ctx.db, "DROP TRIGGER fail_model_projection")
 
-    assert %{code: "stale_model"} = call.()
+    run_residency_pass(ctx)
     assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
     assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter)
     assert SwapAdapterStub.apply_count(adapter) == 1
     assert episode(ctx.db).status == "notified"
+  end
+
+  test "F3: an uncertain strict apply rereads the owner on the next residency pass", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        strict_error: :partial_apply
+      )
+
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    assert %{code: "partial_apply"} =
+             Gateway.handlers(ctx.config)["adjudicate"].(%{
+               origin: "user:flynn",
+               principal: {:session, episode.owner_target},
+               params: %{
+                 episode: episode.correlation_key,
+                 action: "swap",
+                 model: "claude-sonnet-4-6"
+               }
+             })
+
+    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert SwapAdapterStub.load_count(adapter) == 0
+
+    run_residency_pass(ctx)
+
+    assert SwapAdapterStub.load_count(adapter) == 1
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter)
   end
 
   test "F4: a remembered death reason is served ONLY to the generation that died", ctx do
@@ -1582,6 +1728,32 @@ defmodule Tightbeam.AdapterHealTest do
     Keyword.fetch!(lane_opts, :runner)
   end
 
+  defp run_residency_pass(ctx) do
+    message_id = "residency_#{System.unique_integer([:positive])}"
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "k1",
+               message_id: message_id,
+               origin: "process:tightbeam",
+               prompt: "continue"
+             })
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE turns SET status='running' WHERE seq=?1", [seq])
+
+    assert {:ok, _} =
+             turn_runner(ctx).(%{
+               session_key: "k1",
+               seq: seq,
+               message_id: message_id,
+               prompt: "continue",
+               wake_id: nil
+             })
+
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+  end
+
   defp heal(ctx, token), do: Gateway.adapter_healed(ctx.config, ctx.db, @cause, token)
 
   # The harness half of a model swap: a coordinator checkout that can be flipped
@@ -1595,7 +1767,14 @@ defmodule Tightbeam.AdapterHealTest do
     })
 
     start_supervised!({CoordinatorStub, checkout: fn -> Agent.get(:swap_checkout, & &1) end})
-    adapter = start_supervised!({SwapAdapterStub, model: "claude-fable-5"}, id: :swap_adapter)
+
+    adapter_opts =
+      opts
+      |> Keyword.take([:strict_error])
+      |> Keyword.put(:model, "claude-fable-5")
+      |> Keyword.put(:parent, self())
+
+    adapter = start_supervised!({SwapAdapterStub, adapter_opts}, id: :swap_adapter)
 
     seed_swap_catalog(ctx)
     Org.append_pointer(ctx.db, "k1", "harness-sid-1", "created")

@@ -3237,13 +3237,18 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp apply_model_change(config, db, call, session, new_ref) do
+  defp apply_model_change(config, db, _call, session, new_ref) do
     with :ok <- validate_catalog_model(session.host, session.harness, new_ref, false),
          {%{provider: provider}, _health} <-
            ModelCatalog.entry(session.host, session.harness, new_ref, ModelCatalog) do
-      case apply_tuned_model(config, db, session, new_ref) do
+      case apply_tuned_model(
+             config,
+             db,
+             session,
+             new_ref,
+             Atom.to_string(provider)
+           ) do
         :ok ->
-          Org.set_model(db, call.session_key, new_ref, Atom.to_string(provider))
           %{ok: true}
 
         {:error, reason} ->
@@ -3263,9 +3268,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp apply_tuned_model(config, db, session, new_ref) do
+  defp apply_tuned_model(config, db, session, new_ref, provider) do
     case Org.current_pointer(db, session.session_key) do
       nil ->
+        Org.set_model(db, session.session_key, new_ref, provider)
         :ok
 
       pointer ->
@@ -3280,7 +3286,14 @@ defmodule Tightbeam.Gateway do
                ) do
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
             true ->
-              Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
+              apply_and_project_tuned_model(
+                db,
+                session,
+                adapter,
+                pointer.harness_session_id,
+                new_ref,
+                provider
+              )
 
             false ->
               cwd = Placement.holder_workdir(config, session)
@@ -3304,7 +3317,14 @@ defmodule Tightbeam.Gateway do
                        session.session_key,
                        owner_model
                      ) do
-                Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
+                apply_and_project_tuned_model(
+                  db,
+                  session,
+                  adapter,
+                  pointer.harness_session_id,
+                  new_ref,
+                  provider
+                )
               end
 
             {:error, _reason} = error ->
@@ -3314,6 +3334,44 @@ defmodule Tightbeam.Gateway do
           false -> {:error, :adapter_unavailable}
           {:error, reason} -> {:error, reason}
         end
+    end
+  end
+
+  defp apply_and_project_tuned_model(db, session, adapter, sid, new_ref, provider) do
+    # The DB owner is the common serializer for ordinary tune and adjudicated
+    # swap. Enter it before touching the harness, so a tune cannot change the
+    # confirmed model while a ruling is still writing its recovery claim.
+    result =
+      DB.transaction(db, fn txn ->
+        [[record_model, record_harness]] =
+          Txn.q(
+            txn,
+            "SELECT model, harness FROM sessions WHERE sessionKey=?1",
+            [session.session_key]
+          )
+
+        case Adapter.apply_model(adapter, sid, new_ref) do
+          :ok ->
+            case Org.swap_model_in_txn(
+                   txn,
+                   session.session_key,
+                   {record_model, record_harness},
+                   {new_ref, record_harness, provider}
+                 ) do
+              {:ok, _} -> :ok
+              {:duplicate, _} -> :ok
+              :stale -> raise("model mutation race inside serialized tune")
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+      end)
+
+    case result do
+      {:ok, :ok} -> :ok
+      {:ok, {:error, _reason} = error} -> error
+      {:error, error} -> raise error
     end
   end
 
@@ -3949,10 +4007,7 @@ defmodule Tightbeam.Gateway do
       action.()
     rescue
       AdjudicationSuperseded ->
-        current =
-          Adjudication.get_by_correlation(db, episode.correlation_key) || episode
-
-        log_superseded(db, current, call.params[:action])
+        log_superseded(db, episode, call.params[:action])
         %{code: "denied", message: "stale or unknown adjudication episode"}
     end
   end
@@ -4177,6 +4232,11 @@ defmodule Tightbeam.Gateway do
                  record_model
                ) do
             {:ok, applied_model} ->
+              case Map.get(call, :on_model_apply_interlock) do
+                fun when is_function(fun, 0) -> fun.()
+                _ -> :ok
+              end
+
               case Org.swap_model_in_txn(
                      txn,
                      current.session_key,

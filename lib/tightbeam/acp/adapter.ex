@@ -419,7 +419,7 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, ^prior_model} ->
         case strict_apply_with_retry(state, sid, model, prior_model, 3) do
           :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
-          error -> {:reply, error, state}
+          error -> {:reply, error, forget_model_residency(state, sid)}
         end
 
       {:ok, current_model} ->
@@ -433,7 +433,7 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_call({:apply_model, sid, model}, _from, state) do
     case apply_model_to_session(state, sid, model) do
       {:ok, applied_model} -> {:reply, :ok, put_in(state.models[sid], applied_model)}
-      error -> {:reply, error, state}
+      error -> {:reply, error, forget_model_residency(state, sid)}
     end
   end
 
@@ -723,6 +723,17 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp remember_config_model(state, _sid, _update), do: state
+
+  defp forget_model_residency(state, sid) do
+    # A failed set/read-back/rollback leaves the harness value unknown. Keeping
+    # either cache entry would let the next residency pass project memory over
+    # the owner; forgetting residency forces that pass through session/load.
+    %{
+      state
+      | known: MapSet.delete(state.known, sid),
+        models: Map.delete(state.models, sid)
+    }
+  end
 
   defp model_ref_from_config(%{"configOptions" => options}, effort_id)
        when is_list(options) do
