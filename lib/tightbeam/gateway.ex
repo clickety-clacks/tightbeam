@@ -1694,6 +1694,18 @@ defmodule Tightbeam.Gateway do
         {:error,
          "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
            "(host unreachable or adapter failing); see /version"}
+
+      {:error, {:parked, detail}} ->
+        {:error,
+         "adapter for #{session.harness} on host #{session.host} is being parked: #{detail}"}
+
+      {:error, {:park_unconfirmed, detail}} ->
+        {:error,
+         "adapter for #{session.harness} on host #{session.host} remains fenced after an unconfirmed park: #{inspect(detail)}"}
+
+      {:error, reason} ->
+        {:error,
+         "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is unavailable: #{inspect(reason)}"}
     end
   end
 
@@ -3448,14 +3460,19 @@ defmodule Tightbeam.Gateway do
   defp stop_provider_runtime(provider, machine) do
     provider
     |> harnesses_for_provider()
-    |> Enum.each(fn module ->
-      AdapterCoordinator.close_adapter(
-        Tightbeam.AdapterCoordinator,
-        {module.id(), "shared", machine}
-      )
-    end)
+    |> Enum.reduce(:ok, fn module, result ->
+      close_result =
+        AdapterCoordinator.close_adapter(
+          Tightbeam.AdapterCoordinator,
+          {module.id(), "shared", machine}
+        )
 
-    :ok
+      case {result, close_result} do
+        {:ok, :ok} -> :ok
+        {:ok, {:error, _reason} = error} -> error
+        {{:error, _reason} = error, _later_result} -> error
+      end
+    end)
   end
 
   defp park_provider_runtime(provider, machine) do
@@ -4857,7 +4874,14 @@ defmodule Tightbeam.Gateway do
           )
         end)
       else
-        AdapterCoordinator.close_adapter(coordinator, key)
+        case AdapterCoordinator.close_adapter(coordinator, key) do
+          :ok ->
+            :ok
+
+          {:error, reason} = error ->
+            EventLog.lifecycle(db, "adapter_park_unconfirmed", inspect(key), inspect(reason))
+            error
+        end
       end
     end
   rescue

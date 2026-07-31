@@ -987,6 +987,7 @@ defmodule Tightbeam.Placement do
       stderr_path: stderr_path,
       process_ssh: host_config.ssh,
       process_identity_dir: host_config.base_dir,
+      process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
       on_auth_event: auth_event_handler(host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []

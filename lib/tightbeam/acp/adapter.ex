@@ -99,6 +99,10 @@ defmodule Tightbeam.Acp.Adapter do
     :exit, reason -> {:error, {:adapter_unavailable, reason}}
   end
 
+  @doc "Queue a close request without blocking the caller behind an in-progress boot."
+  @spec request_close(adapter()) :: :ok
+  def request_close(adapter), do: GenServer.cast(adapter, :close)
+
   # An adapter that cannot BOOT dies in handle_continue, so the turn's first
   # call exits carrying only the death reason — that is how an actionable spawn
   # error ("Permission denied") used to reach the lane as a bare :task_crash
@@ -467,6 +471,12 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
+
+  @impl true
+  def handle_cast(:close, state) do
+    if state.conn, do: Conn.close(state.conn)
+    {:noreply, state}
+  end
 
   defp start_prompt(state, sid, text, opts, from) do
     state = put_in(state.chunks[sid], [])

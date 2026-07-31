@@ -239,12 +239,29 @@ defmodule Tightbeam.CredentialsTest do
   end
 
   test "an unconfirmed park is returned as data and Credentials keeps the durable gate", ctx do
+    owner = self()
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
     {:ok, server} =
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
         machine: "eezo",
-        park: fn :openai -> {:error, {:park_unconfirmed, :identity_unavailable}} end
+        park: fn :openai ->
+          case Agent.get_and_update(attempts, &{&1, &1 + 1}) do
+            0 -> {:error, {:park_unconfirmed, :identity_unavailable}}
+            1 -> :ok
+          end
+        end,
+        capture_sessions: fn :openai -> [:captured_session] end,
+        publish_sessions: fn captured, transition ->
+          send(owner, {:publish, captured, transition})
+          :ok
+        end,
+        log_event: fn kind, subject, detail ->
+          send(owner, {:log_event, kind, subject, detail})
+          :ok
+        end
       )
 
     evidence = fixture("codex-account-updated-logged-out-0.145.0.json")["params"]
@@ -254,6 +271,13 @@ defmodule Tightbeam.CredentialsTest do
 
     assert Process.alive?(server)
     assert Credentials.status(:openai, server) == {:needs_onboarding, :revoked}
+    assert_receive {:log_event, "credential_park_unconfirmed", "openai@eezo", detail}
+    assert detail =~ "park_unconfirmed"
+    refute_receive {:publish, _, _}
+
+    assert :ok = Credentials.mark_terminal(:openai, evidence, server)
+    assert_receive {:publish, [:captured_session], :terminal}
+    assert Agent.get(attempts, & &1) == 2
   end
 
   test "terminal capture remains immutable while the park mutates membership", ctx do

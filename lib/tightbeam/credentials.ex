@@ -192,8 +192,10 @@ defmodule Tightbeam.Credentials do
     result =
       if terminal_evidence?(provider, evidence) do
         metadata = read_metadata(state, provider)
+        first_transition? = metadata["terminal"] != true
+        recovery? = metadata["park_pending"] == true
 
-        if metadata["terminal"] != true do
+        if first_transition? or recovery? do
           state.gate.(provider)
           captured = capture_sessions(state, provider)
           park_result = state.park.(provider)
@@ -205,13 +207,12 @@ defmodule Tightbeam.Credentials do
               "provider" => Atom.to_string(provider),
               "onboarded" => true,
               "terminal" => true,
-              "last_health" => "revoked"
+              "last_health" => "revoked",
+              "park_pending" => park_result != :ok
             })
           )
 
-          if park_result == :ok do
-            publish_sessions(state, captured, :terminal)
-          end
+          if park_result == :ok, do: publish_sessions(state, captured, :terminal)
 
           park_result
         else
@@ -220,6 +221,14 @@ defmodule Tightbeam.Credentials do
       else
         :ok
       end
+
+    if match?({:error, _}, result) do
+      state.log_event.(
+        "credential_park_unconfirmed",
+        "#{provider}@#{state.machine}",
+        inspect(result)
+      )
+    end
 
     {:reply, result, state}
   end

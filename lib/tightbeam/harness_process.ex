@@ -2,15 +2,18 @@ defmodule Tightbeam.HarnessProcess do
   @moduledoc """
   Durable identity and lifecycle for OS harness processes.
 
-  A launch writes its row before opening the process. The launched process then
-  writes its own PID and OS start time before `exec`, so later verification uses
-  event-captured identity rather than a PID or command line reconstructed at
-  teardown time.
+  A launch writes its row before opening the process. A small POSIX launcher
+  creates a new session, records its leader PID and process-group ID, then execs
+  the harness. Parking targets that minted group, not one member of the tree.
+
+  `ps lstart` is deliberately not identity: its one-second granularity permits a
+  PID recycled within the same second to match an unrelated process.
   """
 
   alias Tightbeam.{DB, Id}
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+  @command_timeout_ms 5_000
 
   @ddl """
   CREATE TABLE IF NOT EXISTS harness_processes (
@@ -20,20 +23,26 @@ defmodule Tightbeam.HarnessProcess do
     preset          TEXT NOT NULL,
     host             TEXT NOT NULL,
     ssh              TEXT,
+    helperPath       TEXT NOT NULL,
     identityPath     TEXT NOT NULL,
     osPid            INTEGER,
-    processStartedAt TEXT,
+    processGroupId   INTEGER,
     state            TEXT NOT NULL CHECK (state IN
                      ('launching','running','park_requested','closed_gracefully',
                       'killed','exited','unconfirmed')),
     createdAt        INTEGER NOT NULL,
     parkRequestedAt  INTEGER,
+    killAttemptedAt  INTEGER,
     killSentAt       INTEGER,
     resolvedAt       INTEGER,
     lastError        TEXT
   );
   CREATE INDEX IF NOT EXISTS harness_processes_adapter_state
     ON harness_processes (adapterKey, state, createdAt);
+  CREATE TABLE IF NOT EXISTS harness_park_fences (
+    adapterKey       TEXT PRIMARY KEY,
+    requestedAt      INTEGER NOT NULL
+  );
   """
 
   @type row :: %{
@@ -43,19 +52,41 @@ defmodule Tightbeam.HarnessProcess do
           preset: String.t(),
           host: String.t(),
           ssh: String.t() | nil,
+          helper_path: String.t() | nil,
           identity_path: String.t(),
           os_pid: pos_integer() | nil,
-          process_started_at: String.t() | nil,
+          process_group_id: pos_integer() | nil,
           state: String.t(),
           created_at: integer(),
           park_requested_at: integer() | nil,
+          kill_attempted_at: integer() | nil,
           kill_sent_at: integer() | nil,
           resolved_at: integer() | nil,
           last_error: String.t() | nil
         }
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    :ok = DB.execute(db, @ddl)
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        names = MapSet.new(DB.Txn.q(txn, "PRAGMA table_info(harness_processes)"), &Enum.at(&1, 1))
+
+        for {name, declaration} <- [
+              {"helperPath", "TEXT"},
+              {"processGroupId", "INTEGER"},
+              {"killAttemptedAt", "INTEGER"}
+            ],
+            not MapSet.member?(names, name) do
+          DB.Txn.exec(txn, "ALTER TABLE harness_processes ADD COLUMN #{name} #{declaration}")
+        end
+
+        :ok
+      end)
+
+    :ok
+  end
 
   @doc "Insert the durable launch event and wrap the target command to record its identity."
   @spec prepare_launch(keyword(), DB.server(), tuple()) :: keyword()
@@ -63,7 +94,7 @@ defmodule Tightbeam.HarnessProcess do
     :ok = ensure_schema(db)
     launch_id = Id.ulid()
     ssh = Keyword.get(opts, :process_ssh)
-    ps = Application.get_env(:tightbeam, :harness_process_ps, "ps")
+    helper_path = Keyword.fetch!(opts, :process_helper)
 
     stderr_path = Keyword.get(opts, :stderr_path, "/dev/null")
 
@@ -74,19 +105,55 @@ defmodule Tightbeam.HarnessProcess do
     identity_path = Path.join([root, "harness-processes", launch_id <> ".identity"])
     if is_nil(ssh), do: File.mkdir_p!(Path.dirname(identity_path))
 
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO harness_processes
-          (launchId, adapterKey, harness, preset, host, ssh, identityPath, state, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'launching', ?8)
-        """,
-        [launch_id, key_name(key), to_string(harness), preset, host, ssh, identity_path, now()]
-      )
+    case DB.transaction(db, fn txn ->
+           case DB.Txn.q(
+                  txn,
+                  """
+                  SELECT 1 FROM harness_park_fences WHERE adapterKey = ?1
+                  UNION ALL
+                  SELECT 1 FROM harness_processes
+                   WHERE adapterKey = ?1 AND state = 'unconfirmed' AND resolvedAt IS NULL
+                  LIMIT 1
+                  """,
+                  [key_name(key)]
+                ) do
+             [] ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO harness_processes
+                   (launchId, adapterKey, harness, preset, host, ssh, helperPath,
+                    identityPath, state, createdAt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'launching', ?9)
+                 """,
+                 [
+                   launch_id,
+                   key_name(key),
+                   to_string(harness),
+                   preset,
+                   host,
+                   ssh,
+                   helper_path,
+                   identity_path,
+                   now()
+                 ]
+               )
+
+               :ok
+
+             [[1]] ->
+               :fenced
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:ok, :fenced} -> raise "adapter park in progress for #{key_name(key)}"
+    end
 
     opts
-    |> Keyword.put(:cmd, wrap_command(Keyword.fetch!(opts, :cmd), ssh, identity_path, ps))
+    |> Keyword.put(
+      :cmd,
+      wrap_command(Keyword.fetch!(opts, :cmd), ssh, helper_path, identity_path)
+    )
     |> Keyword.put(:harness_process_launch_id, launch_id)
   end
 
@@ -94,21 +161,10 @@ defmodule Tightbeam.HarnessProcess do
   @spec capture_identity(DB.server(), String.t(), non_neg_integer()) :: :ok | {:error, term()}
   def capture_identity(db, launch_id, timeout_ms \\ 5_000) do
     row = fetch!(db, launch_id)
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
 
-    case await_identity(row, deadline) do
-      {:ok, pid, started_at} ->
-        {:ok, _} =
-          DB.query(
-            db,
-            """
-            UPDATE harness_processes
-               SET osPid = ?2, processStartedAt = ?3, state = 'running', lastError = NULL
-             WHERE launchId = ?1 AND state = 'launching'
-            """,
-            [launch_id, pid, started_at]
-          )
-
+    case await_identity(row, deadline(timeout_ms)) do
+      {:ok, pid, process_group_id} ->
+        :ok = persist_identity(db, row, pid, process_group_id, true)
         :ok
 
       {:error, reason} = error ->
@@ -118,16 +174,22 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   @doc "Atomically establish the durable park fence and return the launch it protects."
-  @spec begin_park(DB.server(), tuple()) :: {:ok, row() | nil}
+  @spec begin_park(DB.server(), tuple()) :: {:ok, row() | :no_launch}
   def begin_park(db, key) do
     :ok = ensure_schema(db)
     at = now()
 
     {:ok, row} =
       DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+          [key_name(key), at]
+        )
+
         case latest_unresolved_in_txn(txn, key_name(key)) do
           nil ->
-            nil
+            :no_launch
 
           row ->
             DB.Txn.q(
@@ -147,7 +209,7 @@ defmodule Tightbeam.HarnessProcess do
     {:ok, row}
   end
 
-  @doc "True only for a durable unresolved park; normal running rows are not fences."
+  @doc "True while a durable park request or unresolved unconfirmed launch fences the key."
   @spec fenced?(DB.server(), tuple()) :: boolean()
   def fenced?(db, key) do
     :ok = ensure_schema(db)
@@ -155,22 +217,40 @@ defmodule Tightbeam.HarnessProcess do
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM harness_processes WHERE adapterKey = ?1 AND state IN ('park_requested','unconfirmed')",
+        """
+        SELECT
+          (SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1) +
+          (SELECT COUNT(*) FROM harness_processes
+            WHERE adapterKey = ?1 AND state = 'unconfirmed' AND resolvedAt IS NULL)
+        """,
         [key_name(key)]
       )
 
     count > 0
   end
 
+  @doc "Release the per-key fence after the park has reached a confirmed terminal state."
+  @spec complete_park(DB.server(), tuple()) :: :ok
+  def complete_park(db, key) do
+    {:ok, _} =
+      DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
+
+    :ok
+  end
+
   @doc "Complete a park: grace, verified SIGKILL if needed, then absence confirmation."
   @spec park(DB.server(), row(), non_neg_integer()) :: :ok | {:error, term()}
   def park(db, row, grace_ms \\ 10_000) do
-    row = recover_identity(db, row)
+    grace_deadline = deadline(grace_ms)
 
-    case await_absence(row, System.monotonic_time(:millisecond) + grace_ms) do
-      :absent -> resolve(db, row, "closed_gracefully")
+    with {:ok, row} <- recover_identity_until(db, row, grace_deadline) do
+      case await_absence(row, grace_deadline) do
+        :absent -> resolve_absence(db, row)
+        {:error, reason} -> unconfirmed(db, row, reason)
+        :live -> kill_and_confirm(db, row)
+      end
+    else
       {:error, reason} -> unconfirmed(db, row, reason)
-      :live -> kill_and_confirm(db, row)
     end
   end
 
@@ -178,7 +258,15 @@ defmodule Tightbeam.HarnessProcess do
   @spec reconcile(DB.server()) :: :ok
   def reconcile(db) do
     :ok = ensure_schema(db)
-    Enum.each(unresolved(db), &reconcile_row(db, &1))
+
+    Enum.each(unresolved(db), fn row ->
+      :ok = ensure_fence(db, row.adapter_key)
+
+      if reconcile_row(db, row) == :ok do
+        :ok = complete_park_name(db, row.adapter_key)
+      end
+    end)
+
     :ok
   end
 
@@ -186,8 +274,56 @@ defmodule Tightbeam.HarnessProcess do
   @spec reconcile_key(DB.server(), tuple()) :: :ok | {:error, term()}
   def reconcile_key(db, key) do
     case latest_unresolved(db, key) do
-      nil -> :ok
-      row -> reconcile_row(db, row)
+      nil ->
+        :ok
+
+      row ->
+        :ok = ensure_fence(db, row.adapter_key)
+        result = reconcile_row(db, row)
+        if result == :ok, do: complete_park(db, key)
+        result
+    end
+  end
+
+  @doc "Retry observation and termination for one unresolved unconfirmed launch."
+  @spec retry(DB.server(), String.t()) :: :ok | {:error, term()}
+  def retry(db, launch_id) do
+    with {:ok, row} <- fetch_unconfirmed(db, launch_id) do
+      :ok = ensure_fence(db, row.adapter_key)
+      result = reconcile_row(db, row)
+      if result == :ok, do: complete_park_name(db, row.adapter_key)
+      result
+    end
+  end
+
+  @doc "Explicitly release an unresolved unconfirmed fence without inventing a terminal outcome."
+  @spec release(DB.server(), String.t(), String.t()) :: :ok | {:error, term()}
+  def release(db, launch_id, reason) when is_binary(reason) do
+    case DB.transaction(db, fn txn ->
+           case fetch_unconfirmed_in_txn(txn, launch_id) do
+             nil ->
+               :not_unconfirmed
+
+             row ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 UPDATE harness_processes
+                    SET resolvedAt = ?2, lastError = ?3
+                  WHERE launchId = ?1 AND state = 'unconfirmed' AND resolvedAt IS NULL
+                 """,
+                 [launch_id, now(), "operator_release: " <> reason]
+               )
+
+               DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [
+                 row.adapter_key
+               ])
+
+               :ok
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:ok, :not_unconfirmed} -> {:error, :not_unconfirmed}
     end
   end
 
@@ -200,9 +336,9 @@ defmodule Tightbeam.HarnessProcess do
       DB.query(
         db,
         """
-        SELECT launchId, adapterKey, harness, preset, host, ssh, identityPath, osPid,
-               processStartedAt, state, createdAt, parkRequestedAt, killSentAt,
-               resolvedAt, lastError
+        SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+               osPid, processGroupId, state, createdAt, parkRequestedAt, killAttemptedAt,
+               killSentAt, resolvedAt, lastError
           FROM harness_processes ORDER BY createdAt DESC, launchId DESC
         """
       )
@@ -211,35 +347,10 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp reconcile_row(db, row) do
-    row = recover_identity(db, row)
-
-    case inspect_process(row) do
-      :absent ->
-        state = resolution_for_absence(row)
-        resolve(db, row, state)
-
-      :live ->
-        kill_and_confirm(db, row)
-
-      :zombie ->
-        unconfirmed(db, row, :zombie)
-
-      {:error, reason} ->
-        unconfirmed(db, row, reason)
-    end
-  end
-
-  defp kill_and_confirm(db, row) do
-    with :ok <- send_sigkill(row) do
-      {:ok, _} =
-        DB.query(db, "UPDATE harness_processes SET killSentAt = ?2 WHERE launchId = ?1", [
-          row.launch_id,
-          now()
-        ])
-
-      case await_absence(row, System.monotonic_time(:millisecond) + 2_000) do
-        :absent -> resolve(db, row, "killed")
-        :live -> unconfirmed(db, row, :still_running_after_sigkill)
+    with {:ok, row} <- recover_identity(db, row) do
+      case inspect_process(row) do
+        :absent -> resolve_absence(db, row)
+        :live -> kill_and_confirm(db, row)
         {:error, reason} -> unconfirmed(db, row, reason)
       end
     else
@@ -247,56 +358,75 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp await_absence(row, deadline) do
-    case inspect_process(row) do
-      :absent ->
-        :absent
+  defp kill_and_confirm(db, row) do
+    previous_attempt = row.kill_attempted_at
+    attempted_at = now()
 
-      :live ->
-        if System.monotonic_time(:millisecond) < deadline do
-          Process.sleep(50)
-          await_absence(row, deadline)
-        else
-          :live
+    {:ok, _} =
+      DB.query(db, "UPDATE harness_processes SET killAttemptedAt = ?2 WHERE launchId = ?1", [
+        row.launch_id,
+        attempted_at
+      ])
+
+    row = %{row | kill_attempted_at: attempted_at}
+
+    case send_sigkill(row) do
+      :absent ->
+        resolve_absence(db, %{row | kill_attempted_at: previous_attempt})
+
+      :ok ->
+        sent_at = now()
+
+        {:ok, _} =
+          DB.query(db, "UPDATE harness_processes SET killSentAt = ?2 WHERE launchId = ?1", [
+            row.launch_id,
+            sent_at
+          ])
+
+        case await_absence(%{row | kill_sent_at: sent_at}, deadline(2_000)) do
+          :absent -> resolve(db, row, "killed")
+          :live -> unconfirmed(db, row, :still_running_after_sigkill)
+          {:error, reason} -> unconfirmed(db, row, reason)
         end
 
-      :zombie ->
-        {:error, :zombie}
-
       {:error, reason} ->
-        {:error, reason}
+        unconfirmed(db, row, reason)
     end
   end
 
-  defp inspect_process(%{os_pid: nil}), do: {:error, :identity_missing}
-  defp inspect_process(%{process_started_at: nil}), do: {:error, :identity_missing}
+  defp await_absence(row, deadline) do
+    remaining_ms = deadline - System.monotonic_time(:millisecond)
 
-  defp inspect_process(row) do
-    ps = Application.get_env(:tightbeam, :harness_process_ps, "ps")
+    if remaining_ms <= 0 do
+      :live
+    else
+      case inspect_process(row, min(command_timeout_ms(), remaining_ms)) do
+        :absent ->
+          :absent
 
-    script = """
-    started=$(#{shell_quote(ps)} -o lstart= -p "$1" 2>/dev/null) || exit 3
-    state=$(#{shell_quote(ps)} -o stat= -p "$1" 2>/dev/null) || exit 3
-    started=$(printf '%s' "$started" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    state=$(printf '%s' "$state" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    printf '%s\n%s\n' "$started" "$state"
-    """
+        :live ->
+          Process.sleep(min(50, max(deadline - System.monotonic_time(:millisecond), 0)))
+          await_absence(row, deadline)
 
-    case run_on_host(row, script, [Integer.to_string(row.os_pid)]) do
-      {output, 0} ->
-        case String.split(output, "\n", trim: true) do
-          [started_at, state | _] when started_at == row.process_started_at ->
-            if String.starts_with?(state, "Z"), do: :zombie, else: :live
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
 
-          [_other_started_at, _state | _] ->
-            :absent
+  defp inspect_process(%{process_group_id: nil}), do: {:error, :identity_missing}
+  defp inspect_process(row), do: inspect_process(row, command_timeout_ms())
 
-          _ ->
-            {:error, :identity_reply_invalid}
-        end
+  defp inspect_process(row, timeout_ms) do
+    case run_group_command(row, "status", timeout_ms) do
+      {_output, 0} ->
+        :live
 
       {_output, 3} ->
         :absent
+
+      {:error, :timeout} ->
+        {:error, :process_inspection_timeout}
 
       {output, status} ->
         {:error, {:process_inspection_failed, status, one_line(output)}}
@@ -304,38 +434,49 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp send_sigkill(row) do
-    script = ~S|kill -9 "$1"|
-
-    case run_on_host(row, script, [Integer.to_string(row.os_pid)]) do
+    case run_group_command(row, "kill", command_timeout_ms()) do
       {_output, 0} -> :ok
+      {_output, 3} -> :absent
+      {:error, :timeout} -> {:error, :sigkill_timeout}
       {output, status} -> {:error, {:sigkill_failed, status, one_line(output)}}
     end
   end
 
-  defp recover_identity(_db, %{os_pid: pid, process_started_at: started_at} = row)
-       when is_integer(pid) and is_binary(started_at),
-       do: row
+  defp recover_identity(_db, %{os_pid: pid, process_group_id: pgid} = row)
+       when is_integer(pid) and is_integer(pgid),
+       do: {:ok, row}
 
   defp recover_identity(db, row) do
     case read_identity(row) do
-      {:ok, pid, started_at} ->
-        {:ok, _} =
-          DB.query(
-            db,
-            "UPDATE harness_processes SET osPid = ?2, processStartedAt = ?3 WHERE launchId = ?1",
-            [row.launch_id, pid, started_at]
-          )
+      {:ok, pid, process_group_id} ->
+        :ok = persist_identity(db, row, pid, process_group_id, false)
+        {:ok, %{row | os_pid: pid, process_group_id: process_group_id}}
 
-        %{row | os_pid: pid, process_started_at: started_at}
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
-      {:error, _reason} ->
-        row
+  defp recover_identity_until(_db, %{os_pid: pid, process_group_id: pgid} = row, _deadline)
+       when is_integer(pid) and is_integer(pgid),
+       do: {:ok, row}
+
+  defp recover_identity_until(db, row, identity_deadline) do
+    case await_identity(row, identity_deadline) do
+      {:ok, pid, process_group_id} ->
+        :ok = persist_identity(db, row, pid, process_group_id, false)
+        {:ok, %{row | os_pid: pid, process_group_id: process_group_id}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   defp await_identity(row, deadline) do
-    case read_identity(row) do
-      {:ok, _pid, _started_at} = identity ->
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    case read_identity(row, min(command_timeout_ms(), remaining_ms)) do
+      {:ok, _pid, _process_group_id} = identity ->
         identity
 
       {:error, reason} ->
@@ -348,56 +489,87 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp read_identity(row) do
-    script = ~S|test -r "$1" && cat "$1"|
+  defp read_identity(row), do: read_identity(row, command_timeout_ms())
 
-    case run_on_host(row, script, [row.identity_path]) do
-      {output, 0} ->
-        case output |> String.trim() |> String.split("\t", parts: 2) do
-          [pid, started_at] ->
-            case Integer.parse(pid) do
-              {pid, ""} when pid > 0 and started_at != "" -> {:ok, pid, started_at}
-              _ -> {:error, :identity_file_invalid}
-            end
-
-          _ ->
-            {:error, :identity_file_invalid}
+  defp read_identity(row, timeout_ms) do
+    case read_identity_file(row, timeout_ms) do
+      {:ok, output} ->
+        with [pid, process_group_id] <- output |> String.trim() |> String.split("\t", parts: 2),
+             {pid, ""} when pid > 0 <- Integer.parse(pid),
+             {process_group_id, ""} when process_group_id > 0 <-
+               Integer.parse(process_group_id),
+             true <- pid == process_group_id do
+          {:ok, pid, process_group_id}
+        else
+          _ -> {:error, :identity_file_invalid}
         end
 
-      {output, status} ->
-        {:error, {:identity_unavailable, status, one_line(output)}}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp run_on_host(%{ssh: nil}, script, args) do
-    System.cmd("sh", ["-c", script, "tightbeam-process" | args], stderr_to_stdout: true)
+  defp read_identity_file(%{ssh: nil, identity_path: path}, _timeout_ms) do
+    case File.read(path) do
+      {:ok, output} -> {:ok, output}
+      {:error, reason} -> {:error, {:identity_unavailable, reason}}
+    end
   end
 
-  defp run_on_host(%{ssh: destination}, script, args) do
-    System.cmd(
-      "ssh",
-      @ssh_opts ++ [destination, "sh", "-c", shell_quote(script), "tightbeam-process" | args],
-      stderr_to_stdout: true
+  defp read_identity_file(%{ssh: destination, identity_path: path}, timeout_ms) do
+    case bounded_command(
+           "ssh",
+           @ssh_opts ++ [destination, "cat", "--", shell_quote(path)],
+           timeout_ms
+         ) do
+      {output, 0} -> {:ok, output}
+      {:error, :timeout} -> {:error, :identity_read_timeout}
+      {output, status} -> {:error, {:identity_unavailable, status, one_line(output)}}
+    end
+  end
+
+  defp run_group_command(%{ssh: nil} = row, action, timeout_ms) do
+    bounded_command(
+      row.helper_path,
+      ["harness-group", action, Integer.to_string(row.process_group_id)],
+      timeout_ms
     )
   end
 
-  defp wrap_command(cmd, nil, identity_path, ps) do
-    ["sh", "-c", launch_script(ps), "tightbeam-process", identity_path | cmd]
+  defp run_group_command(%{ssh: destination} = row, action, timeout_ms) do
+    bounded_command(
+      "ssh",
+      @ssh_opts ++
+        [
+          destination,
+          shell_quote(row.helper_path),
+          "harness-group",
+          action,
+          Integer.to_string(row.process_group_id)
+        ],
+      timeout_ms
+    )
   end
 
-  defp wrap_command(["ssh" | rest], destination, identity_path, ps) do
+  defp wrap_command(cmd, nil, helper_path, identity_path) do
+    [helper_path, "harness-exec", identity_path, "--" | cmd]
+  end
+
+  defp wrap_command(["ssh" | rest], destination, helper_path, identity_path) do
     {prefix, remote} = Enum.split_while(rest, &(&1 != destination))
 
     case remote do
       [^destination | remote_cmd] ->
+        remote_cmd = if List.first(remote_cmd) == "exec", do: tl(remote_cmd), else: remote_cmd
+
         ["ssh" | prefix] ++
           [
             destination,
-            "sh",
-            "-c",
-            shell_quote(launch_script(ps)),
-            "tightbeam-process",
-            identity_path
+            "exec",
+            helper_path,
+            "harness-exec",
+            identity_path,
+            "--"
             | remote_cmd
           ]
 
@@ -406,18 +578,35 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp launch_script(ps) do
-    """
-    identity_path=$1
-    shift
-    started=$(#{shell_quote(ps)} -o lstart= -p "$$" 2>/dev/null) || exit 70
-    started=$(printf '%s' "$started" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    test -n "$started" || exit 70
-    umask 077
-    mkdir -p "$(dirname "$identity_path")" || exit 70
-    printf '%s\t%s\n' "$$" "$started" > "$identity_path" || exit 70
-    exec "$@"
-    """
+  defp bounded_command(executable, args, timeout_ms) do
+    port =
+      Port.open({:spawn_executable, executable}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        :hide,
+        {:args, args}
+      ])
+
+    await_command(port, [], deadline(timeout_ms))
+  rescue
+    error -> {Exception.message(error), 127}
+  end
+
+  defp await_command(port, output, deadline) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, bytes}} ->
+        await_command(port, [bytes | output], deadline)
+
+      {^port, {:exit_status, status}} ->
+        {output |> Enum.reverse() |> IO.iodata_to_binary(), status}
+    after
+      remaining_ms ->
+        Port.close(port)
+        {:error, :timeout}
+    end
   end
 
   defp latest_unresolved(db, key) do
@@ -425,11 +614,12 @@ defmodule Tightbeam.HarnessProcess do
       DB.query(
         db,
         """
-        SELECT launchId, adapterKey, harness, preset, host, ssh, identityPath, osPid,
-               processStartedAt, state, createdAt, parkRequestedAt, killSentAt,
-               resolvedAt, lastError
+        SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+               osPid, processGroupId, state, createdAt, parkRequestedAt, killAttemptedAt,
+               killSentAt, resolvedAt, lastError
           FROM harness_processes
          WHERE adapterKey = ?1 AND state IN ('launching','running','park_requested','unconfirmed')
+           AND resolvedAt IS NULL
          ORDER BY createdAt DESC, launchId DESC LIMIT 1
         """,
         [key_name(key)]
@@ -445,11 +635,12 @@ defmodule Tightbeam.HarnessProcess do
     case DB.Txn.q(
            txn,
            """
-           SELECT launchId, adapterKey, harness, preset, host, ssh, identityPath, osPid,
-                  processStartedAt, state, createdAt, parkRequestedAt, killSentAt,
-                  resolvedAt, lastError
+           SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+                  osPid, processGroupId, state, createdAt, parkRequestedAt, killAttemptedAt,
+                  killSentAt, resolvedAt, lastError
              FROM harness_processes
             WHERE adapterKey = ?1 AND state IN ('launching','running','park_requested','unconfirmed')
+              AND resolvedAt IS NULL
             ORDER BY createdAt DESC, launchId DESC LIMIT 1
            """,
            [adapter_key]
@@ -464,11 +655,12 @@ defmodule Tightbeam.HarnessProcess do
       DB.query(
         db,
         """
-        SELECT launchId, adapterKey, harness, preset, host, ssh, identityPath, osPid,
-               processStartedAt, state, createdAt, parkRequestedAt, killSentAt,
-               resolvedAt, lastError
+        SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+               osPid, processGroupId, state, createdAt, parkRequestedAt, killAttemptedAt,
+               killSentAt, resolvedAt, lastError
           FROM harness_processes
          WHERE state IN ('launching','running','park_requested','unconfirmed')
+           AND resolvedAt IS NULL
          ORDER BY createdAt, launchId
         """
       )
@@ -481,15 +673,70 @@ defmodule Tightbeam.HarnessProcess do
       DB.query(
         db,
         """
-        SELECT launchId, adapterKey, harness, preset, host, ssh, identityPath, osPid,
-               processStartedAt, state, createdAt, parkRequestedAt, killSentAt,
-               resolvedAt, lastError
+        SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+               osPid, processGroupId, state, createdAt, parkRequestedAt, killAttemptedAt,
+               killSentAt, resolvedAt, lastError
           FROM harness_processes WHERE launchId = ?1
         """,
         [launch_id]
       )
 
     decode_row(row)
+  end
+
+  defp fetch_unconfirmed(db, launch_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+               osPid, processGroupId, state, createdAt, parkRequestedAt, killAttemptedAt,
+               killSentAt, resolvedAt, lastError
+          FROM harness_processes
+         WHERE launchId = ?1 AND state = 'unconfirmed' AND resolvedAt IS NULL
+        """,
+        [launch_id]
+      )
+
+    case rows do
+      [row] -> {:ok, decode_row(row)}
+      [] -> {:error, :not_unconfirmed}
+    end
+  end
+
+  defp fetch_unconfirmed_in_txn(txn, launch_id) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+                  osPid, processGroupId, state, createdAt, parkRequestedAt, killAttemptedAt,
+                  killSentAt, resolvedAt, lastError
+             FROM harness_processes
+            WHERE launchId = ?1 AND state = 'unconfirmed' AND resolvedAt IS NULL
+           """,
+           [launch_id]
+         ) do
+      [row] -> decode_row(row)
+      [] -> nil
+    end
+  end
+
+  defp ensure_fence(db, adapter_key) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+        [adapter_key, now()]
+      )
+
+    :ok
+  end
+
+  defp complete_park_name(db, adapter_key) do
+    {:ok, _} =
+      DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [adapter_key])
+
+    :ok
   end
 
   defp resolve(db, row, state) do
@@ -523,10 +770,40 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  defp resolution_for_absence(%{park_requested_at: at, kill_sent_at: nil}) when is_integer(at),
-    do: "closed_gracefully"
+  defp persist_identity(db, row, pid, process_group_id, running?) do
+    state_update =
+      if running? do
+        ", state = CASE WHEN state = 'launching' THEN 'running' ELSE state END, " <>
+          "lastError = CASE WHEN state = 'launching' THEN NULL ELSE lastError END"
+      else
+        ""
+      end
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE harness_processes SET osPid = ?2, processGroupId = ?3#{state_update} WHERE launchId = ?1",
+        [row.launch_id, pid, process_group_id]
+      )
+
+    :ok
+  end
+
+  defp resolve_absence(db, row) do
+    case resolution_for_absence(row) do
+      {:error, reason} -> unconfirmed(db, row, reason)
+      state -> resolve(db, row, state)
+    end
+  end
 
   defp resolution_for_absence(%{kill_sent_at: at}) when is_integer(at), do: "killed"
+
+  defp resolution_for_absence(%{kill_attempted_at: at}) when is_integer(at),
+    do: {:error, :kill_delivery_unknown}
+
+  defp resolution_for_absence(%{park_requested_at: at}) when is_integer(at),
+    do: "closed_gracefully"
+
   defp resolution_for_absence(_row), do: "exited"
 
   defp decode_row([
@@ -536,12 +813,14 @@ defmodule Tightbeam.HarnessProcess do
          preset,
          host,
          ssh,
+         helper_path,
          identity_path,
          os_pid,
-         process_started_at,
+         process_group_id,
          state,
          created_at,
          park_requested_at,
+         kill_attempted_at,
          kill_sent_at,
          resolved_at,
          last_error
@@ -553,12 +832,14 @@ defmodule Tightbeam.HarnessProcess do
       preset: preset,
       host: host,
       ssh: ssh,
+      helper_path: helper_path,
       identity_path: identity_path,
       os_pid: os_pid,
-      process_started_at: process_started_at,
+      process_group_id: process_group_id,
       state: state,
       created_at: created_at,
       park_requested_at: park_requested_at,
+      kill_attempted_at: kill_attempted_at,
       kill_sent_at: kill_sent_at,
       resolved_at: resolved_at,
       last_error: last_error
@@ -566,6 +847,11 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp key_name({harness, preset, host}), do: "#{harness}:#{preset}@#{host}"
+
+  defp command_timeout_ms,
+    do: Application.get_env(:tightbeam, :harness_process_command_timeout_ms, @command_timeout_ms)
+
+  defp deadline(timeout_ms), do: System.monotonic_time(:millisecond) + timeout_ms
   defp now, do: System.system_time(:millisecond)
   defp one_line(value), do: value |> String.trim() |> String.replace(~r/\s+/, " ")
   defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
