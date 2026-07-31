@@ -136,11 +136,6 @@ defmodule Tightbeam.DB do
     end
   end
 
-  def handle_call(:changes, _from, %{conn: conn} = state) do
-    {:ok, n} = Sqlite3.changes(conn)
-    {:reply, n, state}
-  end
-
   @doc false
   def run_query(conn, sql, params) do
     {:ok, stmt} = Sqlite3.prepare(conn, sql)

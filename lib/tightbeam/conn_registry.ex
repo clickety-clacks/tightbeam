@@ -195,8 +195,6 @@ defmodule Tightbeam.ConnRegistry do
     {:reply, :ok, state}
   end
 
-  def handle_call(:count, _from, state), do: {:reply, map_size(state.conns), state}
-
   def handle_call({:within_rate_limit, device_id, kind, limit, window_ms}, _from, state) do
     now = System.monotonic_time(:millisecond)
     key = {device_id, kind}

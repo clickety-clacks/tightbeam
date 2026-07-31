@@ -220,7 +220,7 @@ defmodule Tightbeam.Acp.Adapter do
     :exit, reason -> {:error, {:adapter_unavailable, unavailable_reason(reason)}}
   end
 
-  @doc "The underlying Acp.Conn (for pending_count / quiescence probes)."
+  @doc "The underlying Acp.Conn."
   @spec conn(adapter()) :: pid()
   def conn(adapter), do: GenServer.call(adapter, :conn)
 
