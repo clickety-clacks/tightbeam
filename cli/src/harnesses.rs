@@ -138,7 +138,7 @@ fn load_endpoint_with_timeout(
     let url = format!("{}/harnesses", endpoint.base);
     let mut builder = ureq::AgentBuilder::new();
     if let Some(timeout) = timeout {
-        builder = builder.timeout(timeout);
+        builder = builder.timeout(timeout).timeout_connect(timeout);
     }
     let response = builder
         .build()

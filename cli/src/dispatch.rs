@@ -864,7 +864,7 @@ fn send_to_with_timeout(
     let url = format!("{}{}", endpoint.base, request.path);
     let mut builder = ureq::AgentBuilder::new();
     if let Some(timeout) = timeout {
-        builder = builder.timeout(timeout);
+        builder = builder.timeout(timeout).timeout_connect(timeout);
     }
     let call = builder
         .build()

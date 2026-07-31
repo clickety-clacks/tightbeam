@@ -1,6 +1,5 @@
 //! Interactive `setup` and `assimilate` ceremonies.
 
-use std::error::Error as _;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -508,7 +507,7 @@ fn validate_api_key_with_timeout(
             let body = match response.into_string() {
                 Ok(body) => body,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-                    return Err(validation_expired("API-key validation"));
+                    return Err(unvalidated_api_key(provider, &error.to_string(), host));
                 }
                 Err(_) => "<unreadable response body>".to_owned(),
             };
@@ -519,14 +518,7 @@ fn validate_api_key_with_timeout(
             ))
         }
         Err(ureq::Error::Transport(error)) => {
-            if transport_timed_out(&error) {
-                Err(validation_expired("API-key validation"))
-            } else {
-                Err(format!(
-                    "could not reach {provider} from {host} to validate the API key: {error}. Nothing \
-                     was banked -- the {provider} credential on {host} is unchanged."
-                ))
-            }
+            Err(unvalidated_api_key(provider, &error.to_string(), host))
         }
     }
 }
@@ -906,14 +898,11 @@ fn validate_setup_token_with_timeout(
             let body = match response.into_string() {
                 Ok(body) => body,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-                    return Err(validation_expired("setup-token validation"));
+                    return Err(unvalidated_setup_token(&error.to_string(), host));
                 }
                 Err(_) => "<unreadable response body>".to_owned(),
             };
             Err(rejected_setup_token(status, body.trim(), host))
-        }
-        Err(ureq::Error::Transport(error)) if transport_timed_out(&error) => {
-            Err(validation_expired("setup-token validation"))
         }
         Err(ureq::Error::Transport(error)) => {
             Err(unvalidated_setup_token(&error.to_string(), host))
@@ -922,7 +911,10 @@ fn validate_setup_token_with_timeout(
 }
 
 fn validation_agent(timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(timeout).build()
+    ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .timeout_connect(timeout)
+        .build()
 }
 
 fn validation_before_deadline<F>(deadline: Instant, what: &str, work: F) -> Result<(), String>
@@ -932,22 +924,15 @@ where
     crate::lease::until(deadline, work).map_err(|()| validation_expired(what))?
 }
 
-fn transport_timed_out(error: &ureq::Transport) -> bool {
-    let mut source = error.source();
-    while let Some(cause) = source {
-        if cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|io| io.kind() == io::ErrorKind::TimedOut)
-        {
-            return true;
-        }
-        source = cause.source();
-    }
-    false
-}
-
 fn validation_expired(what: &str) -> String {
     format!("{what} refused because the onboarding lease expired; nothing was banked")
+}
+
+fn unvalidated_api_key(provider: &str, error: &str, host: &str) -> String {
+    format!(
+        "could not reach {provider} from {host} to validate the API key: {error}. Nothing \
+         was banked -- the {provider} credential on {host} is unchanged."
+    )
 }
 
 /// The captured token does not work, and CAPTURE is the suspect.
@@ -1494,6 +1479,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_api_key_network_timeout_is_not_reported_as_lease_expiry_or_rejection() {
+        let message = unvalidated_api_key("openai", "network operation timed out", "shrdlu");
+
+        assert!(message.contains("could not reach openai"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("Nothing was banked"), "{message}");
+        assert!(!message.contains("lease expired"), "{message}");
+        assert!(!message.contains("rejected"), "{message}");
+    }
+
     /// An API key is staged under the SAME filename the subscription ceremony
     /// stages, at the same 0600, so everything downstream is identical between
     /// the two kinds and only the recorded kind differs.
@@ -1714,6 +1710,18 @@ mod tests {
             assert!(error.contains("onboarding lease expired"), "{error}");
             assert!(error.contains("nothing was banked"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_network_failure_before_the_deadline_survives_the_lease_waiter() {
+        let error = validation_before_deadline(
+            Instant::now() + Duration::from_secs(1),
+            "API-key validation",
+            |_| Err("network operation timed out".to_owned()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "network operation timed out");
     }
 
     #[test]
