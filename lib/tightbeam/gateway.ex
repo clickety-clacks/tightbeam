@@ -371,7 +371,11 @@ defmodule Tightbeam.Gateway do
          tick_ms: config.wake_tick_ms,
          name: Tightbeam.WakeScheduler},
         {Tightbeam.Supervision,
-         db: db, handlers: handler_table, prod_limit: prod_limit, name: Tightbeam.Supervision},
+         db: db,
+         handlers: handler_table,
+         prod_limit: prod_limit,
+         sweep_ms: config.wake_tick_ms,
+         name: Tightbeam.Supervision},
         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
         {Tightbeam.AdapterCoordinator,
          adapter_sup: Tightbeam.AdapterSupervisor,
@@ -1760,12 +1764,11 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  @doc false
-  def mcp_servers_for_archetype(archetype_name, archetypes \\ Archetypes) do
+  defp mcp_servers_for_archetype(archetype_name) do
     archetype_name
-    |> archetypes.get()
-    |> Kernel.||(archetypes.builtin_default())
-    |> archetypes.acp_mcp_servers()
+    |> Archetypes.get()
+    |> Kernel.||(Archetypes.builtin_default())
+    |> Archetypes.acp_mcp_servers()
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
