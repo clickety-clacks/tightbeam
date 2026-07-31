@@ -146,6 +146,27 @@ defmodule Tightbeam.WorkStateTest do
     assert item_cursor(ctx.db) == second.cursor
   end
 
+  test "emit gates and reads its payload in the transaction that inserts the edge", ctx do
+    assignment = assign(ctx, "holder", "atomic edge")
+    db = Process.whereis(ctx.db)
+    :sys.suspend(ctx.db)
+    :erlang.trace(db, true, [:receive])
+    on_exit(fn -> if Process.alive?(db), do: :erlang.trace(db, false, [:receive]) end)
+
+    task = Task.async(fn -> WorkState.emit(ctx.db, assignment.id, nil) end)
+    :sys.resume(ctx.db)
+
+    assert %{assignmentId: id, sessionKey: "holder", toState: "open"} = Task.await(task)
+    assert id == assignment.id
+
+    delivered = :erlang.trace_delivered(db)
+    assert_receive {:trace_delivered, ^db, ^delivered}
+
+    requests = received_db_requests(db, [])
+    assert [{:transaction, transaction}] = requests
+    assert is_function(transaction, 1)
+  end
+
   test "filters, ordering, item composition, and detail shapes are mechanical", ctx do
     item = create_item(ctx, "Concurrent")
     one = assign(ctx, "holder", "one", item.id)
@@ -501,6 +522,18 @@ defmodule Tightbeam.WorkStateTest do
   defp item_cursor(db) do
     {:ok, [[cursor]]} = DB.query(db, "SELECT COALESCE(MAX(id), 0) FROM work_item_events")
     cursor
+  end
+
+  defp received_db_requests(db, acc) do
+    receive do
+      {:trace, ^db, :receive, {:"$gen_call", _from, request}} ->
+        received_db_requests(db, [request | acc])
+
+      {:trace, ^db, :receive, _message} ->
+        received_db_requests(db, acc)
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   defp event_count(db, table) do

@@ -1760,9 +1760,17 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  @doc false
+  def mcp_servers_for_archetype(archetype_name, archetypes \\ Archetypes) do
+    archetype_name
+    |> archetypes.get()
+    |> Kernel.||(archetypes.builtin_default())
+    |> archetypes.acp_mcp_servers()
+  end
+
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
     cwd = Placement.holder_workdir(config, session)
-    mcp_servers = session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
+    mcp_servers = mcp_servers_for_archetype(session.archetype)
     harness = Harness.parse!(session.harness).id()
 
     result =
@@ -2152,7 +2160,7 @@ defmodule Tightbeam.Gateway do
     key = {harness, "shared", session.host}
     cwd = Placement.holder_workdir(config, session)
     snapshot = served_snapshot(config, session, harness, revision)
-    mcp_servers = session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers()
+    mcp_servers = mcp_servers_for_archetype(session.archetype)
 
     with {:ok, adapter, _generation} <-
            AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key),
@@ -3265,7 +3273,7 @@ defmodule Tightbeam.Gateway do
                   pointer.harness_session_id,
                   new_ref,
                   cwd,
-                  session.archetype |> Archetypes.get() |> Archetypes.acp_mcp_servers(),
+                  mcp_servers_for_archetype(session.archetype),
                   snapshot.guidance
                 )
               end)

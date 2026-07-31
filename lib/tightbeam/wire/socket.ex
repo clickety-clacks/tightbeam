@@ -458,20 +458,25 @@ defmodule Tightbeam.Wire.Socket do
       provider = Map.fetch!(defaults, :provider)
       provider = if is_function(provider, 0), do: provider.(), else: provider
 
-      Org.create(db(state), %{
-        session_key: key,
-        display_name: "Main",
-        kind: "main",
-        is_built_in: true,
-        order_index: 0,
-        owner_user_id: user_id,
-        origin: "user:#{user_id}",
-        archetype: Map.fetch!(defaults, :archetype),
-        host: Tightbeam.Placement.local_host_name(),
-        harness: defaults |> Map.fetch!(:harness) |> to_string(),
-        provider: to_string(provider),
-        model: Map.fetch!(defaults, :model)
-      })
+      try do
+        Org.create(db(state), %{
+          session_key: key,
+          display_name: "Main",
+          kind: "main",
+          is_built_in: true,
+          order_index: 0,
+          owner_user_id: user_id,
+          origin: "user:#{user_id}",
+          archetype: Map.fetch!(defaults, :archetype),
+          host: Tightbeam.Placement.local_host_name(),
+          harness: defaults |> Map.fetch!(:harness) |> to_string(),
+          provider: to_string(provider),
+          model: Map.fetch!(defaults, :model)
+        })
+      rescue
+        error in Tightbeam.DB.Error ->
+          if Org.get(db(state), key), do: :ok, else: reraise(error, __STACKTRACE__)
+      end
     end
   end
 
