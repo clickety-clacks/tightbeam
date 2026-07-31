@@ -1078,11 +1078,15 @@ defmodule Tightbeam.Placement do
   defp auth_event_handler(host, module) do
     fn classification, event ->
       if classification == :terminal do
-        Tightbeam.Credentials.mark_terminal(
-          module.credential_provider(),
-          event,
-          Tightbeam.Credentials.server(host)
-        )
+        Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+          Tightbeam.Credentials.mark_terminal(
+            module.credential_provider(),
+            event,
+            Tightbeam.Credentials.server(host)
+          )
+        end)
+
+        :ok
       end
     end
   end
@@ -1091,14 +1095,18 @@ defmodule Tightbeam.Placement do
     db = Map.get(config, :db, Tightbeam.DB)
 
     fn harness_session_id, update ->
-      Tightbeam.SubagentMarkers.consume_update(
-        db,
-        Tightbeam.WakeScheduler,
-        module.id(),
-        host,
-        harness_session_id,
-        update
-      )
+      Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+        Tightbeam.SubagentMarkers.consume_update(
+          db,
+          Tightbeam.WakeScheduler,
+          module.id(),
+          host,
+          harness_session_id,
+          update
+        )
+      end)
+
+      :ok
     end
   end
 

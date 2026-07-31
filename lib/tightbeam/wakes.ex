@@ -408,7 +408,12 @@ defmodule Tightbeam.Wakes do
   """
   @spec fire_due(GenServer.server()) :: :ok
   def fire_due(server \\ Tightbeam.WakeScheduler) do
-    GenServer.call(server, :fire_due)
+    if GenServer.whereis(server) == self() do
+      send(self(), :fire_due)
+      :ok
+    else
+      GenServer.call(server, :fire_due)
+    end
   end
 
   @doc """
@@ -463,6 +468,11 @@ defmodule Tightbeam.Wakes do
   end
 
   @impl true
+  def handle_info(:fire_due, state) do
+    deliver_due(state)
+    {:noreply, state}
+  end
+
   def handle_info(:tick, state) do
     deliver_due(state)
     schedule_tick(state.tick_ms)
