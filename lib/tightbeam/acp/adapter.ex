@@ -489,7 +489,7 @@ defmodule Tightbeam.Acp.Adapter do
   @impl true
   def handle_cast(:close, state) do
     if state.conn, do: Conn.close(state.conn)
-    {:noreply, state}
+    {:stop, :normal, state}
   end
 
   defp start_prompt(state, sid, text, opts, from) do

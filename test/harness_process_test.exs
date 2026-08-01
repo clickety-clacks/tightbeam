@@ -25,11 +25,7 @@ defmodule Tightbeam.HarnessProcessTest do
       )
 
     File.mkdir_p!(test_dir)
-
-    on_exit(fn ->
-      kill_fixture_groups(test_dir)
-      File.rm_rf!(test_dir)
-    end)
+    db_path = Path.join(test_dir, "harness.sqlite3")
 
     prior_timeout = Application.get_env(:tightbeam, :harness_process_command_timeout_ms)
 
@@ -40,9 +36,32 @@ defmodule Tightbeam.HarnessProcessTest do
     end)
 
     assert File.exists?(@helper)
-    start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!({DB, path: db_path, name: db})
     start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: sup})
     :ok = HarnessProcess.ensure_schema(db)
+
+    on_exit(fn ->
+      cleanup_db = :"harness_process_cleanup_db_#{System.unique_integer([:positive])}"
+      {:ok, cleanup_db_pid} = DB.start_link(path: db_path, name: cleanup_db)
+
+      HarnessProcess.list(cleanup_db)
+      |> Enum.filter(&is_integer(&1.resolved_at))
+      |> Enum.each(&File.rm(&1.identity_path))
+
+      cleanup_result = kill_fixture_groups(test_dir)
+      GenServer.stop(cleanup_db_pid)
+
+      case cleanup_result do
+        :ok ->
+          File.rm_rf!(test_dir)
+
+        {:error, failures} ->
+          flunk(
+            "fixture cleanup failed; identities preserved at #{test_dir}: #{inspect(failures)}"
+          )
+      end
+    end)
+
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
@@ -84,10 +103,9 @@ defmodule Tightbeam.HarnessProcessTest do
 
     assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
 
-    assert [%{state: state, resolved_at: resolved_at}] =
+    assert [%{state: "closed_gracefully", resolved_at: resolved_at}] =
              AdapterCoordinator.harness_processes(coordinator)
 
-    assert state in ["closed_gracefully", "killed"]
     assert is_integer(resolved_at)
   end
 
@@ -99,7 +117,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert [%{state: "killed"}] = HarnessProcess.list(ctx.db)
   end
 
-  test "the schema migration maps unconfirmed rows to kill_failed", ctx do
+  test "the schema migration handles populated rows from the first branch schema", ctx do
     old_db = :"old_harness_process_db_#{System.unique_integer([:positive])}"
 
     start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: old_db}, id: old_db))
@@ -113,18 +131,14 @@ defmodule Tightbeam.HarnessProcessTest do
         preset TEXT NOT NULL,
         host TEXT NOT NULL,
         ssh TEXT,
-        helperPath TEXT NOT NULL,
         identityPath TEXT NOT NULL,
-        launchSequence INTEGER NOT NULL,
         osPid INTEGER,
-        processGroupId INTEGER,
-        bootIdentity TEXT,
+        processStartedAt TEXT,
         identityToken TEXT,
         state TEXT NOT NULL CHECK (state IN
           ('launching','running','park_requested','closed_gracefully','killed','exited','unconfirmed')),
         createdAt INTEGER NOT NULL,
         parkRequestedAt INTEGER,
-        killAttemptedAt INTEGER,
         killSentAt INTEGER,
         resolvedAt INTEGER,
         lastError TEXT
@@ -136,16 +150,26 @@ defmodule Tightbeam.HarnessProcessTest do
         old_db,
         """
         INSERT INTO harness_processes
-          (launchId, adapterKey, harness, preset, host, helperPath, identityPath,
-           launchSequence, state, createdAt, lastError)
+          (launchId, adapterKey, harness, preset, host, identityPath, osPid,
+           processStartedAt, identityToken, state, createdAt, lastError)
         VALUES ('launch-1', 'claude:shared@testhost', 'claude', 'shared', 'testhost',
-                ?1, ?2, 1, 'unconfirmed', 1, 'delivery failed')
+                ?1, 42, 'Thu Jul 31 12:00:00 2026', 'old-token',
+                'unconfirmed', 1, 'delivery failed')
         """,
-        [@helper, Path.join(ctx.test_dir, "old.identity")]
+        [Path.join(ctx.test_dir, "old.identity")]
       )
 
     assert :ok = HarnessProcess.ensure_schema(old_db)
-    assert [%{state: "kill_failed", last_error: "delivery failed"}] = HarnessProcess.list(old_db)
+
+    assert [
+             %{
+               state: "kill_failed",
+               helper_path: "",
+               launch_sequence: 1,
+               identity_token: "old-token",
+               last_error: "delivery failed"
+             }
+           ] = HarnessProcess.list(old_db)
 
     assert ctx.db != old_db
   end
@@ -172,6 +196,7 @@ defmodule Tightbeam.HarnessProcessTest do
              "/srv/tightbeam/bin/tightbeam",
              "harness-exec",
              identity_path,
+             launch_id,
              "--",
              "env",
              "A=B",
@@ -179,6 +204,7 @@ defmodule Tightbeam.HarnessProcessTest do
            ] = Keyword.fetch!(opts, :cmd)
 
     assert identity_path =~ "/harness-processes/"
+    assert is_binary(launch_id)
   end
 
   test "kill delivery failure remains fenced and the reconcile sweep retries it", ctx do
@@ -195,7 +221,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
     fenced = %{fenced | helper_path: failing_helper}
 
-    assert {:error, {:kill_failed, {:sigkill_failed, 1, ""}}} =
+    assert {:error, {:kill_failed, {:sigkill_not_delivered, 1, ""}}} =
              HarnessProcess.park(ctx.db, fenced)
 
     assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
@@ -229,7 +255,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
     fenced = %{fenced | helper_path: hanging}
 
-    assert {:error, {:kill_failed, :sigkill_timeout}} =
+    assert {:error, {:kill_failed, :sigkill_delivery_unconfirmed}} =
              HarnessProcess.park(ctx.db, fenced)
 
     assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
@@ -253,7 +279,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
     started_at = System.monotonic_time(:millisecond)
 
-    assert {:error, {:kill_failed, :sigkill_timeout}} =
+    assert {:error, {:kill_failed, :sigkill_delivery_unconfirmed}} =
              HarnessProcess.park(ctx.db, %{fenced | helper_path: noisy})
 
     assert System.monotonic_time(:millisecond) - started_at < 1_000
@@ -331,6 +357,53 @@ defmodule Tightbeam.HarnessProcessTest do
     assert [%{state: "killed"}] = HarnessProcess.list(ctx.db)
     send(launcher.pid, :done)
     assert Task.await(launcher) == :ok
+  end
+
+  test "boot reconciliation clears a fence with no unresolved launch", ctx do
+    key = {:codex, "shared", "testhost"}
+
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, key)
+    assert HarnessProcess.fenced?(ctx.db, key)
+
+    assert :ok = HarnessProcess.reconcile(ctx.db)
+    refute HarnessProcess.fenced?(ctx.db, key)
+  end
+
+  test "DOWN reconciliation authorizes and signals the recorded group", ctx do
+    key = {:claude, "shared", "testhost"}
+    {_port, row} = launch_stubborn(ctx, key)
+
+    assert :ok = HarnessProcess.reconcile_key(ctx.db, key)
+    assert [%{state: "exited", kill_sent_at: sent_at}] = HarnessProcess.list(ctx.db)
+    assert is_integer(sent_at)
+    assert row.process_group_id > 0
+  end
+
+  test "a mismatched boot identity refuses the signal and remains retryable", ctx do
+    key = {:claude, "shared", "testhost"}
+    {_port, row} = launch_stubborn(ctx, key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET bootIdentity = 'prior-boot' WHERE launchId = ?1",
+        [
+          row.launch_id
+        ]
+      )
+
+    assert :ok = HarnessProcess.reconcile(ctx.db)
+
+    assert [%{state: "kill_failed", kill_sent_at: nil, last_error: last_error}] =
+             HarnessProcess.list(ctx.db)
+
+    assert last_error =~ "boot identity does not match"
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE harness_processes SET bootIdentity = ?2 WHERE launchId = ?1", [
+        row.launch_id,
+        row.boot_identity
+      ])
   end
 
   test "a park with no launch fences and cancels a pending checkout", ctx do
@@ -461,14 +534,23 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   defp kill_fixture_group(identity_path) do
-    with {:ok, identity} <- File.read(identity_path) do
-      case cleanup_group_command(["harness-group", String.trim(identity)]) do
+    with {:ok, identity} <- File.read(identity_path),
+         [_, process_group_id, boot_identity, launch_id] <-
+           identity |> String.trim() |> String.split("\t") do
+      case cleanup_group_command([
+             "harness-group",
+             process_group_id,
+             identity_path,
+             boot_identity,
+             launch_id
+           ]) do
         {:ok, {_, 0}} -> :ok
         {:ok, {output, status}} -> {:error, {:kill_failed, status, String.trim(output)}}
         {:error, reason} -> {:error, reason}
       end
     else
       {:error, reason} -> {:error, {:identity_read_failed, reason}}
+      _ -> {:error, :identity_malformed}
     end
   end
 
