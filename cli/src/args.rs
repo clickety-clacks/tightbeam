@@ -220,6 +220,9 @@ pub enum Command {
         setting: String,
         value: String,
     },
+    UpdateClients {
+        as_user: String,
+    },
     Assimilate(AssimilateArgs),
 }
 
@@ -1238,6 +1241,17 @@ fn parse_with_optional_catalog(
         "identity" => parse_identity_command(&parsed, flags),
         "onboard" => parse_onboard(&parsed, flags),
         "config" => parse_config(&parsed, flags),
+        "update-clients" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
+            }
+            let Some(as_user) = nonempty(flags, "as-user") else {
+                return Err("--as-user is required for update-clients (admin required)".to_owned());
+            };
+            let selected_identity = identity(flags)?;
+            debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
+            Ok(Command::UpdateClients { as_user })
+        }
         "assimilate" => {
             let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
                 "usage: tightbeam assimilate <ssh-dest> --as-user <adminUserId>".to_owned()
@@ -1476,6 +1490,20 @@ mod tests {
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
             })
+        );
+    }
+
+    #[test]
+    fn update_clients_is_an_admin_fleet_ceremony() {
+        assert_eq!(
+            parse(strings(&["update-clients", "--as-user", "flynn"])),
+            Ok(Command::UpdateClients {
+                as_user: "flynn".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(strings(&["update-clients"])),
+            Err("--as-user is required for update-clients (admin required)".to_owned())
         );
     }
 

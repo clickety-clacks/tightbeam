@@ -1037,7 +1037,7 @@ trait CeremonyIo {
     fn log(&mut self, message: &str);
     fn warn(&mut self, message: &str);
     fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure>;
-    fn dispatch(&mut self, request: &RequestSpec) -> Result<(), String>;
+    fn dispatch(&mut self, request: &RequestSpec) -> Result<Option<serde_json::Value>, String>;
     fn current_exe(&self) -> Result<PathBuf, String>;
 }
 
@@ -1075,8 +1075,8 @@ impl CeremonyIo for SystemIo {
         }
     }
 
-    fn dispatch(&mut self, request: &RequestSpec) -> Result<(), String> {
-        dispatch::send(request).map(|_| ())
+    fn dispatch(&mut self, request: &RequestSpec) -> Result<Option<serde_json::Value>, String> {
+        dispatch::send(request)
     }
 
     fn current_exe(&self) -> Result<PathBuf, String> {
@@ -1087,6 +1087,116 @@ impl CeremonyIo for SystemIo {
 pub fn assimilate(args: AssimilateArgs) -> Result<(), String> {
     let mut io = SystemIo;
     assimilate_with(&mut io, args)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ClientUpdateHost {
+    name: String,
+    ssh: String,
+    cli_bin: Option<String>,
+}
+
+pub fn update_clients(as_user: &str) -> Result<(), String> {
+    let mut io = SystemIo;
+    update_clients_with(&mut io, as_user)
+}
+
+fn update_clients_with(io: &mut dyn CeremonyIo, as_user: &str) -> Result<(), String> {
+    let request = dispatch::build_update_clients_request(as_user);
+    let response = io.dispatch(&request)?;
+    let hosts = client_update_hosts(response)?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    let mut failed = 0;
+
+    for host in hosts {
+        let Some(cli_bin) = host.cli_bin else {
+            failed += 1;
+            io.log(&format!(
+                "[update-clients] {}: refused — no CLI path registered",
+                host.name
+            ));
+            continue;
+        };
+        let remote_cli = format!("{cli_bin}/tightbeam");
+        let asked = ssh(
+            io,
+            false,
+            &host.ssh,
+            &format!("{} version", remote_path(&remote_cli)),
+        );
+
+        match asked {
+            Err(error) => {
+                failed += 1;
+                io.log(&format!(
+                    "[update-clients] {}: unreachable — {}",
+                    host.name,
+                    command_failure(&error)
+                ));
+            }
+            Ok(answer) if answer.trim() == current_version => {
+                io.log(&format!(
+                    "[update-clients] {}: already current ({current_version})",
+                    host.name
+                ));
+            }
+            Ok(answer) => match ship_current_cli(io, false, &host.ssh, &cli_bin) {
+                Ok(()) => io.log(&format!(
+                    "[update-clients] {}: updated ({} -> {current_version})",
+                    host.name,
+                    answer.trim()
+                )),
+                Err(error) => {
+                    failed += 1;
+                    io.log(&format!(
+                        "[update-clients] {}: refused — {}",
+                        host.name,
+                        command_failure(&error)
+                    ));
+                }
+            },
+        }
+    }
+
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "update-clients failed for {failed} host(s); see per-host outcomes above"
+        ))
+    }
+}
+
+fn client_update_hosts(
+    response: Option<serde_json::Value>,
+) -> Result<Vec<ClientUpdateHost>, String> {
+    let hosts = response
+        .as_ref()
+        .and_then(|result| result.get("hosts"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "update-clients did not return a host registry".to_owned())?;
+
+    hosts
+        .iter()
+        .map(|host| {
+            Ok(ClientUpdateHost {
+                name: host
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "update-clients returned a host without a name".to_owned())?
+                    .to_owned(),
+                ssh: host
+                    .get("ssh")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "update-clients returned a satellite without ssh".to_owned())?
+                    .to_owned(),
+                cli_bin: host
+                    .get("cliBin")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
 }
 
 fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), String> {
@@ -1188,35 +1298,7 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
     let cli_compatible = remote_target.as_deref() == Some(local_target_triple());
     if cli_compatible {
         step(io, "CLI", command_failure, |io| {
-            ssh(
-                io,
-                dry_run,
-                &args.ssh_dest,
-                &format!("mkdir -p {}", remote_path(&cli_bin)),
-            )?;
-            let executable = io.current_exe().map_err(|message| ExecFailure {
-                message,
-                stdout: String::new(),
-                stderr: String::new(),
-            })?;
-            run_command(
-                io,
-                dry_run,
-                "scp",
-                &[
-                    "-o".to_owned(),
-                    "BatchMode=yes".to_owned(),
-                    executable.display().to_string(),
-                    format!("{}:{cli_bin}/tightbeam", args.ssh_dest),
-                ],
-            )?;
-            ssh(
-                io,
-                dry_run,
-                &args.ssh_dest,
-                &format!("chmod +x {}", remote_path(&format!("{cli_bin}/tightbeam"))),
-            )?;
-            Ok(())
+            ship_current_cli(io, dry_run, &args.ssh_dest, &cli_bin)
         })?;
     } else {
         let target = remote_target.unwrap_or_else(|| "the satellite target".to_owned());
@@ -1237,7 +1319,7 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
             &cli_bin,
             &adapter_bin_dir,
         );
-        match io.dispatch(&request) {
+        match io.dispatch(&request).map(|_| ()) {
             Ok(()) => io.log("[assimilate] REGISTER... ok"),
             Err(reason) => {
                 io.log(&format!("[assimilate] REGISTER... FAILED: {reason}"));
@@ -1289,6 +1371,43 @@ fn run_command(
     } else {
         io.exec(file, args)
     }
+}
+
+fn ship_current_cli(
+    io: &mut dyn CeremonyIo,
+    dry_run: bool,
+    ssh_dest: &str,
+    cli_bin: &str,
+) -> Result<(), ExecFailure> {
+    ssh(
+        io,
+        dry_run,
+        ssh_dest,
+        &format!("mkdir -p {}", remote_path(cli_bin)),
+    )?;
+    let executable = io.current_exe().map_err(|message| ExecFailure {
+        message,
+        stdout: String::new(),
+        stderr: String::new(),
+    })?;
+    run_command(
+        io,
+        dry_run,
+        "scp",
+        &[
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            executable.display().to_string(),
+            format!("{ssh_dest}:{cli_bin}/tightbeam"),
+        ],
+    )?;
+    ssh(
+        io,
+        dry_run,
+        ssh_dest,
+        &format!("chmod +x {}", remote_path(&format!("{cli_bin}/tightbeam"))),
+    )?;
+    Ok(())
 }
 
 fn ssh(
@@ -1747,6 +1866,7 @@ mod tests {
         commands: Vec<(String, Vec<String>)>,
         responses: Vec<Result<String, ExecFailure>>,
         dispatched: Vec<String>,
+        dispatch_responses: Vec<Result<Option<serde_json::Value>, String>>,
     }
 
     impl CeremonyIo for FakeIo {
@@ -1767,9 +1887,13 @@ mod tests {
             }
         }
 
-        fn dispatch(&mut self, request: &RequestSpec) -> Result<(), String> {
+        fn dispatch(&mut self, request: &RequestSpec) -> Result<Option<serde_json::Value>, String> {
             self.dispatched.push(request.body_json.clone());
-            Ok(())
+            if self.dispatch_responses.is_empty() {
+                Ok(None)
+            } else {
+                self.dispatch_responses.remove(0)
+            }
         }
 
         fn current_exe(&self) -> Result<PathBuf, String> {
@@ -1803,6 +1927,80 @@ mod tests {
             local_platform(),
             &["node", "npm", "rsync", "claude", "codex"],
         )
+    }
+
+    fn exec_failure(stderr: &str) -> ExecFailure {
+        ExecFailure {
+            message: "process exited with status 1".to_owned(),
+            stdout: String::new(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    #[test]
+    fn update_clients_asks_every_satellite_and_reports_each_outcome() {
+        let current = env!("CARGO_PKG_VERSION");
+        let mut io = FakeIo {
+            responses: vec![
+                Ok(format!("{current}\n")),
+                Ok("0.0.9\n".to_owned()),
+                Ok(String::new()),
+                Ok(String::new()),
+                Ok(String::new()),
+                Err(exec_failure("connection refused")),
+                Ok("0.0.8\n".to_owned()),
+                Ok(String::new()),
+                Err(exec_failure("permission denied")),
+            ],
+            dispatch_responses: vec![Ok(Some(serde_json::json!({
+                "hosts": [
+                    {"name": "a-current", "ssh": "a", "cliBin": "/srv/a/bin"},
+                    {"name": "b-old", "ssh": "b", "cliBin": "/srv/b/bin"},
+                    {"name": "c-down", "ssh": "c", "cliBin": "/srv/c/bin"},
+                    {"name": "d-refused", "ssh": "d", "cliBin": "/srv/d/bin"},
+                    {"name": "e-unregistered-path", "ssh": "e", "cliBin": null}
+                ]
+            })))],
+            ..FakeIo::default()
+        };
+
+        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+
+        assert_eq!(
+            io.dispatched,
+            vec![r#"{"asUser":"flynn","verb":"update-clients","params":{}}"#]
+        );
+        assert_eq!(io.commands[0].0, "ssh");
+        assert_eq!(
+            io.commands[0].1.last().unwrap(),
+            "'/srv/a/bin/tightbeam' version"
+        );
+        assert_eq!(
+            io.commands
+                .iter()
+                .map(|(file, _args)| file.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "ssh", "ssh", "ssh", "scp", "ssh", "ssh", "ssh", "ssh", "scp"
+            ]
+        );
+        let transcript = io.logs.join("\n");
+        assert!(transcript.contains(&format!(
+            "[update-clients] a-current: already current ({current})"
+        )));
+        assert!(transcript.contains(&format!(
+            "[update-clients] b-old: updated (0.0.9 -> {current})"
+        )));
+        assert!(transcript.contains("[update-clients] c-down: unreachable — connection refused"));
+        assert!(transcript.contains("[update-clients] d-refused: refused — permission denied"));
+        assert!(
+            transcript
+                .contains("[update-clients] e-unregistered-path: refused — no CLI path registered")
+        );
+        assert_eq!(
+            error,
+            "update-clients failed for 3 host(s); see per-host outcomes above"
+        );
     }
 
     fn args() -> AssimilateArgs {
