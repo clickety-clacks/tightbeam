@@ -1067,19 +1067,33 @@ impl CeremonyIo for SystemIo {
         args: &[String],
         timeout: Duration,
     ) -> Result<String, ExecFailure> {
-        let mut child = ProcessCommand::new(file)
+        let mut command = ProcessCommand::new(file);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| ExecFailure {
-                message: error.to_string(),
-                stdout: String::new(),
-                stderr: String::new(),
-                status: None,
-                timed_out: false,
-            })?;
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| ExecFailure {
+            message: error.to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            status: None,
+            timed_out: false,
+        })?;
+        let pgid = child.id() as libc::pid_t;
+        unsafe {
+            // Close the post-spawn race before the child reaches its own `setpgid`.
+            // Either side may win; setting the same group twice is harmless.
+            libc::setpgid(pgid, pgid);
+        }
         let mut stdout = child.stdout.take().expect("stdout was piped");
         let mut stderr = child.stderr.take().expect("stderr was piped");
         let stdout_reader = thread::spawn(move || {
@@ -1094,13 +1108,17 @@ impl CeremonyIo for SystemIo {
         });
         let started = Instant::now();
         let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() < timeout => {
+            match child_exited_without_reaping(&child) {
+                Ok(true) if stdout_reader.is_finished() && stderr_reader.is_finished() => {
+                    break child.wait().expect("observed child must still be waitable");
+                }
+                Ok(_) if started.elapsed() < timeout => {
                     thread::sleep(Duration::from_millis(10));
                 }
-                Ok(None) => {
-                    let _ = child.kill();
+                Ok(_) => {
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
                     let _ = child.wait();
                     let stdout = stdout_reader.join().unwrap_or_default();
                     let stderr = stderr_reader.join().unwrap_or_default();
@@ -1113,7 +1131,9 @@ impl CeremonyIo for SystemIo {
                     });
                 }
                 Err(error) => {
-                    let _ = child.kill();
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
                     let _ = child.wait();
                     let stdout = stdout_reader.join().unwrap_or_default();
                     let stderr = stderr_reader.join().unwrap_or_default();
@@ -1149,6 +1169,25 @@ impl CeremonyIo for SystemIo {
     fn current_exe(&self) -> Result<PathBuf, String> {
         std::env::current_exe().map_err(|error| error.to_string())
     }
+}
+
+/// Observe the process-group leader without reaping it. Keeping the leader as a zombie
+/// keeps its pid (also the process-group id) reserved until any pipe-holding descendants
+/// have exited or the deadline requires the whole group to be killed.
+fn child_exited_without_reaping(child: &std::process::Child) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.si_signo != 0)
 }
 
 pub fn assimilate(args: AssimilateArgs) -> Result<(), String> {
@@ -1280,26 +1319,50 @@ fn update_clients_with(io: &mut dyn CeremonyIo, identity: &Identity) -> Result<(
 }
 
 fn version_answer(output: &str) -> Option<&str> {
-    let mut answers = output
-        .lines()
-        .map(str::trim)
-        .filter(|line| is_version(line));
-    let answer = answers.next()?;
-    answers
-        .all(|candidate| candidate == answer)
-        .then_some(answer)
+    let answer = output.strip_suffix('\n').unwrap_or(output);
+    let answer = answer.strip_suffix('\r').unwrap_or(answer);
+    (!answer.is_empty() && !answer.contains(['\r', '\n']) && is_version(answer)).then_some(answer)
 }
 
 fn is_version(value: &str) -> bool {
-    let core = value.split_once('+').map_or(value, |(core, _)| core);
-    let core = core.split_once('-').map_or(core, |(core, _)| core);
+    let (without_build, build) = value
+        .split_once('+')
+        .map_or((value, None), |(core, suffix)| (core, Some(suffix)));
+    if build.is_some_and(|suffix| !valid_version_identifiers(suffix, false)) {
+        return false;
+    }
+    let (core, pre_release) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, suffix)| (core, Some(suffix)));
+    if pre_release.is_some_and(|suffix| !valid_version_identifiers(suffix, true)) {
+        return false;
+    }
     let mut parts = core.split('.');
     let valid = (0..3).all(|_| {
         parts
             .next()
-            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .is_some_and(|part| valid_numeric_identifier(part))
     });
     valid && parts.next().is_none()
+}
+
+fn valid_numeric_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn valid_version_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!reject_numeric_leading_zero
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || valid_numeric_identifier(identifier))
+        })
 }
 
 fn target_answer(output: &str) -> Option<String> {
@@ -1547,28 +1610,76 @@ fn ship_current_cli(
         .unwrap_or_default()
         .as_nanos();
     let staged_cli = format!("{cli_bin}/.tightbeam.update-{}-{nonce}", std::process::id());
-    run_command(
-        io,
-        dry_run,
-        "scp",
-        &[
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            executable.display().to_string(),
-            format!("{ssh_dest}:{staged_cli}"),
-        ],
-    )?;
-    ssh(
-        io,
-        dry_run,
-        ssh_dest,
-        &format!(
-            "chmod +x {} && mv -f {} {}",
-            remote_path(&staged_cli),
-            remote_path(&staged_cli),
-            remote_path(&format!("{cli_bin}/tightbeam"))
-        ),
-    )?;
+    let shipped = (|| {
+        run_command(
+            io,
+            dry_run,
+            "scp",
+            &[
+                "-o".to_owned(),
+                "BatchMode=yes".to_owned(),
+                executable.display().to_string(),
+                format!("{ssh_dest}:{staged_cli}"),
+            ],
+        )?;
+        ssh(
+            io,
+            dry_run,
+            ssh_dest,
+            &format!("chmod +x {}", remote_path(&staged_cli)),
+        )?;
+        let answer = ssh(
+            io,
+            dry_run,
+            ssh_dest,
+            &format!("{} version", remote_path(&staged_cli)),
+        )?;
+        if !dry_run && version_answer(&answer) != Some(env!("CARGO_PKG_VERSION")) {
+            let message = format!(
+                "staged CLI failed verification: expected exact version {}, got {:?}",
+                env!("CARGO_PKG_VERSION"),
+                answer
+            );
+            return Err(ExecFailure {
+                message: message.clone(),
+                stdout: answer,
+                stderr: message,
+                status: None,
+                timed_out: false,
+            });
+        }
+        ssh(
+            io,
+            dry_run,
+            ssh_dest,
+            &format!(
+                "mv -f {} {}",
+                remote_path(&staged_cli),
+                remote_path(&format!("{cli_bin}/tightbeam"))
+            ),
+        )?;
+        Ok(())
+    })();
+
+    if let Err(mut error) = shipped {
+        if let Err(cleanup) = ssh(
+            io,
+            dry_run,
+            ssh_dest,
+            &format!("rm -f {}", remote_path(&staged_cli)),
+        ) {
+            let message = format!(
+                "{}; staged cleanup failed: {}",
+                command_failure(&error),
+                command_failure(&cleanup)
+            );
+            error.message = message.clone();
+            error.stdout.clear();
+            error.stderr = message;
+        }
+        return Err(error);
+    }
+
     Ok(())
 }
 
@@ -2124,6 +2235,8 @@ mod tests {
                 Ok(String::new()),
                 Ok(String::new()),
                 Ok(String::new()),
+                Ok(format!("{current}\n")),
+                Ok(String::new()),
                 Err(unreachable("connection refused")),
                 Err(exec_failure("permission denied")),
             ],
@@ -2155,7 +2268,9 @@ mod tests {
                 .iter()
                 .map(|(file, _args)| file.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ssh", "ssh", "ssh", "ssh", "scp", "ssh", "ssh", "ssh"]
+            vec![
+                "ssh", "ssh", "ssh", "ssh", "scp", "ssh", "ssh", "ssh", "ssh", "ssh"
+            ]
         );
         let transcript = io.logs.join("\n");
         assert!(transcript.contains(&format!(
@@ -2191,13 +2306,14 @@ mod tests {
     }
 
     #[test]
-    fn chatty_but_equal_version_answer_does_not_ship() {
+    fn chatty_version_answer_is_refused_as_ambiguous() {
         let current = env!("CARGO_PKG_VERSION");
         let mut io = one_update_host(vec![Ok(format!(
             "Welcome to satellite.local\nmaintenance tonight\n{current}\n"
         ))]);
 
-        update_clients_with(&mut io, &Identity::Role("operator".to_owned())).unwrap();
+        let error =
+            update_clients_with(&mut io, &Identity::Role("operator".to_owned())).unwrap_err();
 
         assert_eq!(
             io.commands
@@ -2206,7 +2322,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ssh"]
         );
-        assert!(io.logs[0].contains("already current"));
+        assert!(io.logs[0].contains("question failed"));
+        assert!(error.contains("failed for 1 host"));
+    }
+
+    #[test]
+    fn malformed_or_multiple_version_answers_are_refused() {
+        for answer in [
+            "0.1.0-warning localized text\n",
+            "0.1.0\n0.1.0\n",
+            "9.9.9\n0.1.0-warning localized text\n",
+        ] {
+            let mut io = one_update_host(vec![Ok(answer.to_owned())]);
+
+            let error = update_clients_with(&mut io, &Identity::Session).unwrap_err();
+
+            assert_eq!(io.commands.len(), 1, "answer {answer:?} must not ship");
+            assert!(io.logs[0].contains("question failed"));
+            assert!(error.contains("failed for 1 host"));
+        }
     }
 
     #[test]
@@ -2249,17 +2383,91 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_process_that_exceeds_its_deadline_is_killed_and_reported() {
+    fn a_staged_binary_that_cannot_execute_is_removed_without_promotion() {
+        let current = env!("CARGO_PKG_VERSION");
+        let mut io = one_update_host(vec![
+            Ok("0.0.9\n".to_owned()),
+            Ok(format!("{}\n", local_platform())),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Err(exec_failure("cannot execute binary file")),
+            Ok(String::new()),
+        ]);
+
+        let error = update_clients_with(&mut io, &Identity::Session).unwrap_err();
+        let remote_scripts = io
+            .commands
+            .iter()
+            .filter(|(file, _)| file == "ssh")
+            .filter_map(|(_, args)| args.last())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(remote_scripts.iter().any(|script| {
+            script.contains(".tightbeam.update-") && script.ends_with(" version")
+        }));
+        assert!(
+            remote_scripts
+                .last()
+                .is_some_and(|script| script.starts_with("rm -f "))
+        );
+        assert!(
+            !remote_scripts
+                .iter()
+                .any(|script| script.starts_with("mv -f "))
+        );
+        assert!(io.logs[0].contains("cannot execute binary file"));
+        assert!(error.contains("failed for 1 host"));
+        assert!(
+            !io.logs
+                .join("\n")
+                .contains(&format!("updated (0.0.9 -> {current})"))
+        );
+    }
+
+    #[test]
+    fn an_interrupted_copy_attempts_to_remove_its_partial_stage() {
+        let mut io = FakeIo {
+            responses: vec![
+                Ok(String::new()),
+                Err(exec_failure("copy interrupted")),
+                Ok(String::new()),
+            ],
+            ..FakeIo::default()
+        };
+
+        let error = ship_current_cli(&mut io, false, "satellite.local", "/srv/bin").unwrap_err();
+
+        assert_eq!(command_failure(&error), "copy interrupted");
+        assert_eq!(io.commands.last().unwrap().0, "ssh");
+        assert!(
+            io.commands
+                .last()
+                .unwrap()
+                .1
+                .last()
+                .unwrap()
+                .starts_with("rm -f ")
+        );
+    }
+
+    #[test]
+    fn a_timed_out_command_kills_a_descendant_that_holds_its_pipes() {
         let mut io = SystemIo;
         let started = Instant::now();
 
         let error = io
-            .exec("/bin/sleep", &["5".to_owned()], Duration::from_millis(20))
+            .exec(
+                "/bin/sh",
+                &["-c".to_owned(), "sleep 5 & wait".to_owned()],
+                Duration::from_millis(500),
+            )
             .unwrap_err();
 
         assert!(error.timed_out);
         assert!(error.message.contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     fn args() -> AssimilateArgs {
@@ -2344,7 +2552,7 @@ mod tests {
                 Ok("present\n".to_owned()),
                 Ok(String::new()),
                 Ok(String::new()),
-                Ok(String::new()),
+                Ok(format!("{}\n", env!("CARGO_PKG_VERSION"))),
                 Ok(String::new()),
             ],
             ..FakeIo::default()
@@ -2355,7 +2563,9 @@ mod tests {
                 .iter()
                 .map(|(file, _)| file.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ssh", "ssh", "ssh", "ssh", "ssh", "scp", "ssh"]
+            vec![
+                "ssh", "ssh", "ssh", "ssh", "ssh", "scp", "ssh", "ssh", "ssh"
+            ]
         );
         let probe = io.commands[0].1.last().unwrap();
         assert_eq!(
@@ -2379,9 +2589,12 @@ mod tests {
                 .unwrap()
                 .contains(":/Users/remote/.tightbeam/bin/.tightbeam.update-")
         );
-        let install = io.commands[6].1.last().unwrap();
-        assert!(install.contains("chmod +x"));
-        assert!(install.contains(" && mv -f "));
+        let chmod = io.commands[6].1.last().unwrap();
+        assert!(chmod.starts_with("chmod +x "));
+        let verify = io.commands[7].1.last().unwrap();
+        assert!(verify.ends_with(" version"));
+        let install = io.commands[8].1.last().unwrap();
+        assert!(install.starts_with("mv -f "));
         assert!(install.ends_with("'/Users/remote/.tightbeam/bin/tightbeam'"));
         let adapter_install = io.commands[3].1.last().unwrap();
         assert!(adapter_install.contains("claude-package"));
@@ -2412,7 +2625,7 @@ mod tests {
                 .iter()
                 .filter(|line| line.starts_with("DRY "))
                 .count(),
-            5
+            7
         );
         assert!(
             io.logs
