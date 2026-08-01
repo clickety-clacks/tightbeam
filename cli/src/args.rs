@@ -233,8 +233,11 @@ pub enum Command {
         setting: String,
         value: String,
     },
-    UpdateClients {
+    HarnessProcesses {
         identity: Identity,
+    },
+    UpdateClients {
+        as_user: String,
     },
     Assimilate(AssimilateArgs),
 }
@@ -449,6 +452,8 @@ COMMANDS:
       never leaves this machine.
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
+  harness-process list
+      List the durable harness launch ledger, newest launch first.
 
   doctor [--json] [--base-dir p]
       Check the local Tightbeam installation and report its health.
@@ -811,6 +816,7 @@ fn parse_with_optional_catalog(
                 base_dir,
             })
         }
+        "harness-process" => parse_harness_process(&parsed, flags),
         "wake" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -1279,11 +1285,14 @@ fn parse_with_optional_catalog(
         "config" => parse_config(&parsed, flags),
         "update-clients" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam update-clients".to_owned());
+                return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
             }
-            Ok(Command::UpdateClients {
-                identity: identity(flags)?,
-            })
+            let Some(as_user) = nonempty(flags, "as-user") else {
+                return Err("--as-user is required for update-clients (admin required)".to_owned());
+            };
+            let selected_identity = identity(flags)?;
+            debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
+            Ok(Command::UpdateClients { as_user })
         }
         "assimilate" => {
             let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
@@ -1316,8 +1325,24 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process"
         )),
+    }
+}
+
+fn parse_harness_process(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    match (
+        parsed.positional.get(1).map(String::as_str),
+        parsed.positional.get(2),
+        parsed.positional.get(3),
+    ) {
+        (Some("list"), None, None) => Ok(Command::HarnessProcesses {
+            identity: identity(flags)?,
+        }),
+        _ => Err("usage: tightbeam harness-process list".to_owned()),
     }
 }
 
@@ -1471,6 +1496,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn harness_process_operator_command_lists_launches() {
+        assert_eq!(
+            parse(strings(&["harness-process", "list", "--as-user", "flynn"])),
+            Ok(Command::HarnessProcesses {
+                identity: Identity::User("flynn".to_owned()),
+            })
+        );
+    }
+
     /// `--help` was consumed before the command was ever looked at, so every
     /// subcommand answered with the whole manual — the operator asking about one
     /// command got 150 lines and had to find the answer themselves.
@@ -1532,12 +1567,16 @@ mod tests {
     }
 
     #[test]
-    fn update_clients_accepts_any_normal_identity() {
+    fn update_clients_is_an_admin_fleet_ceremony() {
         assert_eq!(
-            parse(strings(&["update-clients", "--as", "coder"])),
+            parse(strings(&["update-clients", "--as-user", "flynn"])),
             Ok(Command::UpdateClients {
-                identity: Identity::Role("coder".to_owned())
+                as_user: "flynn".to_owned()
             })
+        );
+        assert_eq!(
+            parse(strings(&["update-clients"])),
+            Err("--as-user is required for update-clients (admin required)".to_owned())
         );
     }
 
@@ -1583,6 +1622,7 @@ mod tests {
                 "dispatch",
                 "doctor",
                 "effort-rule",
+                "harness-process",
                 "identity",
                 "learn",
                 "list",
@@ -1616,6 +1656,7 @@ mod tests {
             "onboard openai|anthropic [--api-key]",
             "config get default-archetype",
             "config set default-archetype <name>",
+            "harness-process list",
         ] {
             assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
         }
@@ -1901,7 +1942,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process".to_owned())
         );
     }
 

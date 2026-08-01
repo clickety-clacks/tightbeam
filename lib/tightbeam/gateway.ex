@@ -422,7 +422,7 @@ defmodule Tightbeam.Gateway do
         ssh: host.ssh,
         gate: fn _provider -> :ok end,
         stop: fn provider -> stop_provider_runtime(provider, machine) end,
-        park: fn provider -> park_provider_runtime(provider, machine) end,
+        park_edge: Tightbeam.CommandEdge.request_to(Tightbeam.AdapterCoordinator),
         start: fn provider, kind -> start_provider_runtime(provider, kind, machine) end,
         resume: fn _provider -> :ok end,
         capture_sessions: fn provider ->
@@ -732,7 +732,7 @@ defmodule Tightbeam.Gateway do
           end
         end),
       "update-clients" =>
-        fn _call ->
+        admin_handler(db, fn _params ->
           hosts =
             config.base_dir
             |> Placement.hosts(db)
@@ -746,7 +746,7 @@ defmodule Tightbeam.Gateway do
             |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
-        end,
+        end),
       "identity-edit" =>
         admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
       "identity-status" =>
@@ -777,6 +777,11 @@ defmodule Tightbeam.Gateway do
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
       "config" => admin_handler(db, fn p -> config_result(db, p) end),
+      "harness-processes" =>
+        admin_handler(db, fn _params ->
+          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+          %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
+        end),
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -1749,6 +1754,18 @@ defmodule Tightbeam.Gateway do
         {:error,
          "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
            "(host unreachable or adapter failing); see /version"}
+
+      {:error, {:parked, detail}} ->
+        {:error,
+         "adapter for #{session.harness} on host #{session.host} is being parked: #{detail}"}
+
+      {:error, {:park_fenced, detail}} ->
+        {:error,
+         "adapter for #{session.harness} on host #{session.host} remains fenced by an incomplete park: #{inspect(detail)}"}
+
+      {:error, reason} ->
+        {:error,
+         "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is unavailable: #{inspect(reason)}"}
     end
   end
 
@@ -3739,27 +3756,19 @@ defmodule Tightbeam.Gateway do
   defp stop_provider_runtime(provider, machine) do
     provider
     |> harnesses_for_provider()
-    |> Enum.each(fn module ->
-      AdapterCoordinator.close_adapter(
-        Tightbeam.AdapterCoordinator,
-        {module.id(), "shared", machine}
-      )
+    |> Enum.reduce(:ok, fn module, result ->
+      close_result =
+        AdapterCoordinator.close_adapter(
+          Tightbeam.AdapterCoordinator,
+          {module.id(), "shared", machine}
+        )
+
+      case {result, close_result} do
+        {:ok, :ok} -> :ok
+        {:ok, {:error, _reason} = error} -> error
+        {{:error, _reason} = error, _later_result} -> error
+      end
     end)
-
-    :ok
-  end
-
-  defp park_provider_runtime(provider, machine) do
-    provider
-    |> harnesses_for_provider()
-    |> Enum.each(fn module ->
-      AdapterCoordinator.request_close_adapter(
-        Tightbeam.AdapterCoordinator,
-        {module.id(), "shared", machine}
-      )
-    end)
-
-    :ok
   end
 
   defp capture_credential_sessions(db, provider, machine) do
@@ -5203,7 +5212,14 @@ defmodule Tightbeam.Gateway do
           )
         end)
       else
-        AdapterCoordinator.close_adapter(coordinator, key)
+        case AdapterCoordinator.close_adapter(coordinator, key) do
+          :ok ->
+            :ok
+
+          {:error, reason} = error ->
+            EventLog.lifecycle(db, "adapter_park_failed", inspect(key), inspect(reason))
+            error
+        end
       end
     end
   rescue

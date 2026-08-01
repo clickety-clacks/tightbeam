@@ -19,3 +19,12 @@
   spread into every thread/start config map. PreToolUse fires for shell/unified_exec
   (tool name "Bash", full command text) and deny actually blocks — verified at
   rust-v0.145.0. See shared specs permission-seam-spike.md.
+
+## Report dirt, never accommodate it
+
+Code that meets unexpected state — a database in an unknown shape, a missing table, a
+file an older version wrote — must REFUSE LOUDLY and name what it found, never guess
+and repair. Probing live state to deduce its shape (try-and-catch-duplicate ALTERs,
+sniffing stored DDL, existence guards) is the tell; ~2,000 lines of exactly that were
+deleted 2026-08-01. If a shape must be known, stamp it at write time; a missing or
+unknown stamp is a refusal and a bug report, never an inference.

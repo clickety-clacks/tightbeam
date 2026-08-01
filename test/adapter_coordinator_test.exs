@@ -106,6 +106,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   test "context capture frees the coordinator mailbox for a lifecycle callback", ctx do
     owner = self()
     coordinator_slot = :atomics.new(1, signed: false)
+    lifecycle_key = {:claude, "lifecycle", "testhost"}
 
     lifecycle = start_supervised!({Agent, fn -> nil end})
 
@@ -118,7 +119,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
            Agent.get(lifecycle, fn _ ->
              send(owner, {:capture_entered, self(), key})
-             :ok = AdapterCoordinator.close_adapter(coordinator, key)
+             :ok = AdapterCoordinator.close_adapter(coordinator, lifecycle_key)
              [credential_kind: :subscription]
            end)
          end,
