@@ -235,6 +235,7 @@ pub enum Command {
     },
     HarnessProcesses {
         identity: Identity,
+    },
     UpdateClients {
         as_user: String,
     },
