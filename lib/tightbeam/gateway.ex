@@ -2392,7 +2392,15 @@ defmodule Tightbeam.Gateway do
 
     with true <- Map.has_key?(Placement.hosts(config.base_dir, gateway_db(config)), machine),
          {:ok, kind} <- onboarding_kind(params[:kind]) do
-      onboard_phase(config, provider_atom(provider), phase, machine, kind, params[:reason])
+      onboard_phase(
+        config,
+        provider_atom(provider),
+        phase,
+        machine,
+        kind,
+        params[:lease_id],
+        params[:reason]
+      )
     else
       false ->
         %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
@@ -2413,16 +2421,16 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp onboard_phase(config, provider, "begin", machine, kind, _reason) do
+  defp onboard_phase(config, provider, "begin", machine, kind, _lease_id, _reason) do
     case Tightbeam.Credentials.begin_onboard(provider, Tightbeam.Credentials.server(machine)) do
-      {:ok, path} ->
+      {:ok, path, lease_id} ->
         # The lease TTL rides the reply so the CLI's ceremony watchdog and the
         # server's lease are one fact with one home. A matching constant in the
         # Rust CLI would drift from `production_config` the first time either is
         # tuned, and the CLI cannot read `production_config` itself.
         #
         # `kind` is echoed, not consumed: a LEASE carries no opinion about what
-        # will be banked into it (`Credentials.finish_onboard/3`). It is here so
+        # will be banked into it (`Credentials.finish_onboard/4`). It is here so
         # a gateway log shows which ceremony an operator started — in the WIRE
         # spelling (`wire_credential_kind/1`), like every other surface: the
         # camelizer rewrites keys, not atom values, so a bare `kind` put the
@@ -2432,6 +2440,7 @@ defmodule Tightbeam.Gateway do
           kind: wire_credential_kind(kind),
           status: "ready",
           staging_path: path,
+          lease_id: lease_id,
           lease_ttl_ms: config.onboarding_lease_ms
         }
 
@@ -2440,10 +2449,11 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "finish", machine, kind, _reason) do
+  defp onboard_phase(_config, provider, "finish", machine, kind, lease_id, _reason) do
     case Tightbeam.Credentials.finish_onboard(
            provider,
            kind,
+           lease_id,
            Tightbeam.Credentials.server(machine)
          ) do
       :ok ->
@@ -2463,15 +2473,19 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "cancel", machine, _kind, reason) do
-    :ok =
-      Tightbeam.Credentials.cancel_onboard(
-        provider,
-        onboarding_failure(reason),
-        Tightbeam.Credentials.server(machine)
-      )
+  defp onboard_phase(_config, provider, "cancel", machine, _kind, lease_id, reason) do
+    case Tightbeam.Credentials.cancel_onboard(
+           provider,
+           lease_id,
+           onboarding_failure(reason),
+           Tightbeam.Credentials.server(machine)
+         ) do
+      :ok ->
+        %{provider: provider, status: "canceled"}
 
-    %{provider: provider, status: "canceled"}
+      {:error, reason} ->
+        %{code: "needs_onboarding", message: inspect(reason)}
+    end
   end
 
   defp onboarding_failure("unsupported_no_subscription"), do: :unsupported_no_subscription

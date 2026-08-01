@@ -43,7 +43,6 @@ defmodule Tightbeam.Acp.Adapter do
   @strict_model_operation_timeout 30_000
   @strict_model_reply_margin 2_000
   @strict_model_call_timeout @strict_model_operation_timeout + @strict_model_reply_margin
-  @strict_model_request_floor 1
 
   defstruct [
     :conn,
@@ -467,7 +466,7 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_call({:apply_model_strict, sid, model, prior_model, caller_deadline}, _from, state) do
     case Map.fetch(state.models, sid) do
       {:ok, ^prior_model} ->
-        case strict_apply(state, sid, model, prior_model, caller_deadline) do
+        case strict_apply(state, sid, model, caller_deadline) do
           :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
           error -> {:reply, error, drop_model_residency(state, sid)}
         end
@@ -798,7 +797,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp map_model_refusal({:error, %{"code" => -32602}}), do: {:error, :model_unavailable}
   defp map_model_refusal(result), do: result
 
-  defp strict_apply(state, sid, model_ref, prior_model, deadline) do
+  defp strict_apply(state, sid, model_ref, deadline) do
     {model, effort} = parse_model_ref(model_ref)
 
     case map_model_refusal(strict_model_request(state, sid, "model", model, deadline)) do
@@ -822,10 +821,6 @@ defmodule Tightbeam.Acp.Adapter do
                 read_back?(elem(effort_result, 1), state.preset.effort_config, effort)) do
           :ok
         else
-          {prior_base, _prior_effort} = parse_model_ref(prior_model)
-
-          _ = strict_model_request(state, sid, "model", prior_base, deadline)
-
           {:error, :partial_apply}
         end
 
@@ -839,7 +834,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp strict_model_request(state, sid, config_id, value, deadline) do
     case deadline - System.monotonic_time(:millisecond) do
-      remaining when remaining > @strict_model_request_floor ->
+      remaining when remaining > 0 ->
         Conn.request(
           state.conn,
           "session/set_config_option",
@@ -875,7 +870,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp remember_config_model(state, _sid, _update), do: state
 
   defp drop_model_residency(state, sid) do
-    # A failed set/read-back/rollback leaves the harness value unknown. Keeping
+    # A failed set/read-back leaves the harness value unknown. Keeping
     # either cache entry would let the next residency pass project memory over
     # the owner; forgetting residency forces that pass through session/load.
     %{

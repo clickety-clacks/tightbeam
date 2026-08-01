@@ -25,6 +25,17 @@ defmodule Tightbeam.DispatchTest do
              EventLog.events_after(db, 0, 10)
   end
 
+  test "onboarding lease identities are returned but not written to the event log", %{db: db} do
+    result = %{status: "ready", staging_path: "/tmp/onboard", lease_id: "lease-secret"}
+    call = %{verb: "onboard", origin: "user:flynn", session_key: nil, params: %{}}
+
+    assert {:ok, ^result} = Dispatch.dispatch(db, %{"onboard" => fn _call -> result end}, call)
+
+    {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events")
+    assert payload =~ "/tmp/onboard"
+    refute payload =~ "lease-secret"
+  end
+
   test "unknown and handler denials append denied events", %{db: db} do
     unknown = %{verb: "nope", origin: "system", session_key: nil, params: %{}}
     assert {:error, %{code: "unknown_verb"}} = Dispatch.dispatch(db, %{}, unknown)
