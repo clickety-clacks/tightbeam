@@ -157,6 +157,17 @@ defmodule Tightbeam.Acp.AdapterTest do
           failRollback = true;
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
+        if (failMode === "strict-effort-hang" &&
+            m.params.configId === "reasoning_effort" &&
+            m.params.value === "high") {
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 200);
+        }
+        if (failMode === "strict-rollback-hang" &&
+            m.params.configId === "reasoning_effort" &&
+            m.params.value === "high") {
+          failRollback = true;
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if (failMode === "apply-effort-failure" &&
             m.params.configId === "reasoning_effort" &&
             m.params.value === "high") {
@@ -167,6 +178,12 @@ defmodule Tightbeam.Acp.AdapterTest do
             m.params.configId === "model" &&
             m.params.value === "gpt-old") {
           return send({ id: m.id, error: { code: -32000, message: "rollback refused" } });
+        }
+        if (failMode === "strict-rollback-hang" &&
+            failRollback &&
+            m.params.configId === "model" &&
+            m.params.value === "gpt-old") {
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 200);
         }
         if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
         if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
@@ -255,6 +272,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         cwd: "/tmp",
         name: :"adapter_#{System.unique_integer([:positive])}"
       ]
+      |> then(fn adapter_opts ->
+        case Keyword.get(opts, :strict_model_operation_timeout) do
+          nil -> adapter_opts
+          timeout -> Keyword.put(adapter_opts, :strict_model_operation_timeout, timeout)
+        end
+      end)
       |> then(fn adapter_opts ->
         case Keyword.get(opts, :stderr_path, stderr_path) do
           :omit -> adapter_opts
@@ -734,6 +757,38 @@ defmodule Tightbeam.Acp.AdapterTest do
              )
 
     refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "hung strict effort and rollback requests return inside the outer budget and clean up late replies" do
+    for fail_mode <- ["strict-effort-hang", "strict-rollback-hang"] do
+      {adapter, _capture_path} =
+        start_adapter(
+          harness: :codex,
+          fail_mode: fail_mode,
+          strict_model_operation_timeout: 50
+        )
+
+      assert {:ok, "sess-1"} =
+               Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, :partial_apply} =
+               Adapter.apply_model_strict(
+                 adapter,
+                 "sess-1",
+                 "gpt-new[high]",
+                 "gpt-old[medium]"
+               )
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+      refute Adapter.knows_session?(adapter, "sess-1")
+      assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
+
+      Process.sleep(250)
+      assert Process.alive?(adapter)
+      assert :sys.get_state(Adapter.conn(adapter)).pending == %{}
+    end
   end
 
   test "a failed ordinary apply also forfeits cached residency" do
