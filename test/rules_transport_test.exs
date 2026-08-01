@@ -165,6 +165,7 @@ defmodule Tightbeam.RulesTransportTest do
     agent_request =
       conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "inspect", as: "operator"}))
       |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
 
     agent_response = Router.call(agent_request, Router.init(ctx.router_opts))
     assert agent_response.status == 400

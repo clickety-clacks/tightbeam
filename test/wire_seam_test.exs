@@ -162,6 +162,7 @@ defmodule Tightbeam.Wire.SeamTest do
   defp dispatch_cli(ctx, bearer, body) do
     conn(:post, "/agent/dispatch", JSON.encode!(Map.put_new(body, :params, %{})))
     |> put_req_header("authorization", "Bearer #{bearer}")
+    |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
   end
 

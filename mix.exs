@@ -4,7 +4,7 @@ defmodule Tightbeam.MixProject do
   def project do
     [
       app: :tightbeam,
-      version: "0.1.0",
+      version: cli_version(),
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -23,6 +23,12 @@ defmodule Tightbeam.MixProject do
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_env), do: ["lib"]
+
+  defp cli_version do
+    manifest = File.read!(Path.join(__DIR__, "cli/Cargo.toml"))
+    [version] = Regex.run(~r/^version\s*=\s*"([^"]+)"$/m, manifest, capture: :all_but_first)
+    version
+  end
 
   defp deps do
     [

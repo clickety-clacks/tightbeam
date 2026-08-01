@@ -160,12 +160,51 @@ defmodule Tightbeam.Wire.RouterTest do
     request =
       conn(:get, "/harnesses")
       |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
 
     response = Router.call(request, Router.init(ctx.opts))
     expected = "[" <> Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <> "]"
 
     assert response.status == 200
     assert response.resp_body == expected
+  end
+
+  test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
+    body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
+
+    incompatible =
+      conn(:post, "/agent/dispatch", body)
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", "0.2.0")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert incompatible.status == 426
+
+    assert JSON.decode!(incompatible.resp_body) == %{
+             "error" => %{
+               "code" => "incompatible_cli",
+               "message" => "your CLI offered 0.2.0; this gateway requires 0.1.0"
+             }
+           }
+
+    auth_failure =
+      conn(:post, "/agent/dispatch", body)
+      |> put_req_header("authorization", "Bearer wrong")
+      |> put_req_header("x-tightbeam-cli-version", "0.1.0")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert auth_failure.status == 401
+    assert JSON.decode!(auth_failure.resp_body) == %{"error" => %{"code" => "auth_failed"}}
+
+    non_cli =
+      conn(:get, "/api/streams")
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert non_cli.status == 200
   end
 
   test "kungfu scaffold crosses the closed CLI verb router with its attributed name", ctx do
@@ -606,11 +645,23 @@ defmodule Tightbeam.Wire.RouterTest do
         params: %{prompt: "hi"}
       })
 
-    unauth = Router.call(conn(:post, "/agent/dispatch", body), Router.init(ctx.opts))
+    unauth =
+      conn(:post, "/agent/dispatch", body)
+      |> put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
+      |> Router.call(Router.init(ctx.opts))
+
     assert unauth.status == 401
 
     request =
-      conn(:post, "/agent/dispatch", body) |> put_req_header("authorization", "Bearer tbc_test")
+      conn(:post, "/agent/dispatch", body)
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
 
     response = Router.call(request, Router.init(ctx.opts))
     assert response.status == 200
@@ -621,6 +672,10 @@ defmodule Tightbeam.Wire.RouterTest do
     disallowed =
       conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "post", as_user: "flynn"}))
       |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
       |> Router.call(Router.init(ctx.opts))
 
     assert disallowed.status == 400
@@ -647,6 +702,10 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       conn(:post, "/agent/dispatch", forge)
       |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
       |> Router.call(Router.init(ctx.opts))
 
     # The handler being REACHED with the params is the proof; assert that first, so
@@ -679,6 +738,10 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       conn(:post, "/agent/dispatch", forged)
       |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
       |> Router.call(Router.init(ctx.opts))
 
     assert_receive {:call, %{verb: "work-item-create", params: params}}
@@ -1370,6 +1433,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     conn(:post, "/agent/dispatch", body)
     |> put_req_header("authorization", "Bearer tbc_test")
+    |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
   end
 
@@ -1383,12 +1447,14 @@ defmodule Tightbeam.Wire.RouterTest do
 
     conn(:post, "/agent/dispatch", body)
     |> put_req_header("authorization", "Bearer tbc_test")
+    |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
   end
 
   defp dispatch_cli(ctx, bearer, body) do
     conn(:post, "/agent/dispatch", JSON.encode!(Map.put_new(body, :params, %{})))
     |> put_req_header("authorization", "Bearer #{bearer}")
+    |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
   end
 

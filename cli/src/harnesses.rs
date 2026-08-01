@@ -135,17 +135,27 @@ fn load_endpoint_with_timeout(
     endpoint: &dispatch::Endpoint,
     timeout: Option<Duration>,
 ) -> Result<HarnessCatalog, String> {
-    let url = format!("{}/harnesses", endpoint.base);
-    let mut builder = ureq::AgentBuilder::new();
-    if let Some(timeout) = timeout {
-        builder = builder.timeout(timeout).timeout_connect(timeout);
-    }
-    let response = builder
-        .build()
-        .get(&url)
-        .set("authorization", &format!("Bearer {}", endpoint.token))
-        .call()
-        .map_err(|error| unavailable(&error.to_string()))?;
+    let response = match dispatch::gateway_request("GET", endpoint, "/harnesses", timeout).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let encoded = response
+                .into_string()
+                .unwrap_or_else(|_| format!("HTTP {status}"));
+            let detail = serde_json::from_str::<Value>(&encoded)
+                .ok()
+                .and_then(|json| {
+                    let code = json.pointer("/error/code")?.as_str()?;
+                    let message = json.pointer("/error/message").and_then(Value::as_str);
+                    Some(match message {
+                        Some(message) if !message.is_empty() => format!("{code}: {message}"),
+                        _ => code.to_owned(),
+                    })
+                })
+                .unwrap_or(encoded);
+            return Err(unavailable(&detail));
+        }
+        Err(ureq::Error::Transport(error)) => return Err(unavailable(&error.to_string())),
+    };
     let encoded = response
         .into_string()
         .map_err(|error| unavailable(&error.to_string()))?;

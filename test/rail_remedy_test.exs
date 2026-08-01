@@ -489,6 +489,7 @@ defmodule Tightbeam.RailRemedyTest do
 
                    DB.Txn.changes(txn)
                  end)
+
         %{id: "losing-producer"}
       end)
 
