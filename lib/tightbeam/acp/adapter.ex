@@ -31,10 +31,11 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
   @strict_model_call_timeout 30_000
-  # The caller creates this deadline before entering the Adapter queue. Keeping
-  # it 5s inside the outer call timeout guarantees that an expired operation is
-  # dequeued and replied to as a structured error while the caller still waits.
-  @strict_model_operation_timeout 25_000
+  # Once Conn receives a response, only two local BEAM replies remain
+  # (Conn -> Adapter -> caller). Reserve 100ms for those mailbox hops so an
+  # operation timeout still reaches the caller as a structured error.
+  @strict_model_reply_margin 100
+  @strict_model_operation_timeout @strict_model_call_timeout - @strict_model_reply_margin
   @strict_model_request_floor 1
 
   defstruct [

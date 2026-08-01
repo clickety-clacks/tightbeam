@@ -143,6 +143,12 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/close": capture(m); return send({ id: m.id, result: {} });
       case "session/set_config_option": {
         capture(m);
+        if (failMode === "slow-strict-success" &&
+            m.params.configId === "model" &&
+            m.params.value === "gpt-new") {
+          models[m.params.sessionId] = m.params.value;
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 26000);
+        }
         if (failMode === "slow-apply-before-strict" &&
             m.params.configId === "model" &&
             m.params.value === "gpt-blocking") {
@@ -803,6 +809,20 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert Process.alive?(adapter)
       assert :sys.get_state(Adapter.conn(adapter)).pending == %{}
     end
+  end
+
+  @tag timeout: 35_000
+  test "strict apply accepts a bare-model reply after the former inner bound and retains residency" do
+    {adapter, _capture_path} = start_adapter(harness: :codex, fail_mode: "slow-strict-success")
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, "gpt-old", "/tmp", [], "guidance")
+    assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, "gpt-new"} =
+             Adapter.apply_model_strict(adapter, "sess-1", "gpt-new", prior_model)
+
+    assert Adapter.knows_session?(adapter, "sess-1")
+    assert {:ok, "gpt-new"} = Adapter.current_model(adapter, "sess-1")
   end
 
   # FAIL-BEFORE: strict_apply/4 used to start its 25s deadline only after this
