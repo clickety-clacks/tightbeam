@@ -8,33 +8,16 @@ defmodule Tightbeam.RulesTest do
     Dispatch,
     EventLog,
     Gateway,
-    Idempotency,
     Org,
     Roles,
-    Rules,
-    WorkItems,
-    WorkState
+    Rules
   }
 
   setup do
     db = :"rules_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Tightbeam.Projection,
-          Tightbeam.Artifacts,
-          Tightbeam.Wakes,
-          Devices,
-          Idempotency,
-          Org,
-          Roles,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-rules-#{System.unique_integer([:positive])}")

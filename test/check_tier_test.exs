@@ -4,35 +4,17 @@ defmodule Tightbeam.CheckTierTest do
   alias Tightbeam.{
     Assignments,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
-    Idempotency,
     Org,
-    Roles,
-    Rules,
-    WorkItems,
-    WorkState
+    Rules
   }
 
   setup do
     db = :"check_tier_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          Idempotency,
-          Org,
-          Roles,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(

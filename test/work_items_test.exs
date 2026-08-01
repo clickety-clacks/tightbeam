@@ -4,18 +4,12 @@ defmodule Tightbeam.WorkItemsTest do
   alias Tightbeam.{
     Assignments,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     Org,
-    Roles,
     Rules,
-    Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   @sha String.duplicate("a", 64)
@@ -25,21 +19,7 @@ defmodule Tightbeam.WorkItemsTest do
     db = :work_items_db
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          Idempotency,
-          Ledger,
-          Org,
-          Roles,
-          Wakes,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(

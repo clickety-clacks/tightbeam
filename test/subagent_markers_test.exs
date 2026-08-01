@@ -5,13 +5,8 @@ defmodule Tightbeam.SubagentMarkersTest do
     ConditionFacts,
     ConnRegistry,
     DB,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
-    Roles,
     SubagentMarkers,
     Wakes
   }
@@ -35,18 +30,7 @@ defmodule Tightbeam.SubagentMarkersTest do
     scheduler = :"subagent_scheduler_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          EventLog,
-          Idempotency,
-          Ledger,
-          Projection,
-          Org,
-          Roles,
-          ConditionFacts,
-          Wakes,
-          SubagentMarkers
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})

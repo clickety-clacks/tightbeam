@@ -4,14 +4,9 @@ defmodule Tightbeam.WorkStateTest do
   alias Tightbeam.{
     Assignments,
     ConnRegistry,
-    CriticalLeases,
     DB,
-    Devices,
     Gateway,
-    Idempotency,
     Org,
-    Supervision,
-    Wakes,
     WorkItems,
     WorkState
   }
@@ -21,20 +16,7 @@ defmodule Tightbeam.WorkStateTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: ConnRegistry})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          Idempotency,
-          Org,
-          CriticalLeases,
-          Wakes,
-          WorkItems,
-          Assignments,
-          Supervision,
-          WorkState
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(

@@ -80,37 +80,7 @@ defmodule Tightbeam.TestCase do
   end
 
   @doc "Create the complete production schema for a unit-test database."
-  def ensure_all_schemas(db) do
-    for module <- [
-          Tightbeam.Ledger,
-          Tightbeam.EventLog,
-          Tightbeam.Assets,
-          Tightbeam.Artifacts,
-          Tightbeam.CausalEvents,
-          Tightbeam.Adjudication,
-          Tightbeam.Devices,
-          Tightbeam.Idempotency,
-          Tightbeam.ConditionFacts,
-          Tightbeam.SubagentMarkers,
-          Tightbeam.Escalation,
-          Tightbeam.Wakes,
-          Tightbeam.Projection,
-          Tightbeam.Org,
-          Tightbeam.CriticalLeases,
-          Tightbeam.Roles,
-          Tightbeam.WorkItems,
-          Tightbeam.Assignments,
-          Tightbeam.EffortCheckin,
-          Tightbeam.Placement,
-          Tightbeam.RailRemedy,
-          Tightbeam.Supervision,
-          Tightbeam.WorkState
-        ] do
-      :ok = module.ensure_schema(db)
-    end
-
-    :ok
-  end
+  def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
 
   @doc """
   Register satellite hosts the way the product does.

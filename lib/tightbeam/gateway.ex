@@ -64,7 +64,6 @@ defmodule Tightbeam.Gateway do
     Archetypes,
     Artifacts,
     Assignments,
-    CausalEvents,
     ConditionFacts,
     CriticalLeases,
     Placement,
@@ -82,10 +81,10 @@ defmodule Tightbeam.Gateway do
     ModelCatalog,
     Org,
     Projection,
-    RailRemedy,
     Rails,
     Rules,
     Roles,
+    Schema,
     Spinup,
     SubagentMarkers,
     Supervision,
@@ -135,9 +134,9 @@ defmodule Tightbeam.Gateway do
 
   @doc """
   The wire/adapter children to append after Tightbeam.Application's base
-  children (see moduledoc order). Also: ensure schemas for Devices/
-  Idempotency/Wakes/Projection/Org, mint + persist the cliToken and
-  gateway.json (mode 0600) in base_dir, install the CLI bin.
+  children (see moduledoc order). Also: ensure the complete production schema,
+  mint + persist the cliToken and gateway.json (mode 0600) in base_dir, and
+  install the CLI bin.
   """
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
@@ -157,31 +156,7 @@ defmodule Tightbeam.Gateway do
 
     File.mkdir_p!(config.base_dir)
 
-    for module <- [
-          Tightbeam.Assets,
-          Artifacts,
-          CausalEvents,
-          Adjudication,
-          Devices,
-          Idempotency,
-          ConditionFacts,
-          SubagentMarkers,
-          Escalation,
-          Wakes,
-          Projection,
-          Org,
-          CriticalLeases,
-          Roles,
-          WorkItems,
-          Assignments,
-          EffortCheckin,
-          Placement,
-          RailRemedy,
-          Supervision,
-          WorkState
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Schema.ensure_all(db)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 

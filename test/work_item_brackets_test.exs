@@ -6,21 +6,14 @@ defmodule Tightbeam.WorkItemBracketsTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
-    Artifacts,
     Assignments,
-    ConditionFacts,
     ConnRegistry,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
     Projection,
     RailRemedy,
-    Roles,
     Rules,
     Wakes,
     WorkItems,
@@ -67,26 +60,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: ConnRegistry})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          EventLog,
-          Idempotency,
-          ConditionFacts,
-          Projection,
-          Org,
-          Roles,
-          Ledger,
-          Wakes,
-          WorkItems,
-          Assignments,
-          Artifacts,
-          WorkState,
-          RailRemedy,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(
