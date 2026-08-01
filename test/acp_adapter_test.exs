@@ -106,7 +106,6 @@ defmodule Tightbeam.Acp.AdapterTest do
   let newCalls = 0;
   const models = {};
   const efforts = {};
-  let failRollback = false;
   const configOptions = (sid) => ({ configOptions: [
     { id: "model", currentValue: models[sid] || "haiku" },
     { id: "effort", currentValue: efforts[sid] || "default" },
@@ -167,10 +166,9 @@ defmodule Tightbeam.Acp.AdapterTest do
           // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
         }
-        if (failMode === "strict-rollback-failure" &&
+        if (failMode === "strict-partial-apply" &&
             m.params.configId === "reasoning_effort" &&
             m.params.value === "high") {
-          failRollback = true;
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if (failMode === "strict-effort-hang" &&
@@ -178,28 +176,10 @@ defmodule Tightbeam.Acp.AdapterTest do
             m.params.value === "high") {
           return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 200);
         }
-        if (failMode === "strict-rollback-hang" &&
-            m.params.configId === "reasoning_effort" &&
-            m.params.value === "high") {
-          failRollback = true;
-          return send({ id: m.id, result: configOptions(m.params.sessionId) });
-        }
         if (failMode === "apply-effort-failure" &&
             m.params.configId === "reasoning_effort" &&
             m.params.value === "high") {
           return send({ id: m.id, error: { code: -32000, message: "effort refused" } });
-        }
-        if (failMode === "strict-rollback-failure" &&
-            failRollback &&
-            m.params.configId === "model" &&
-            m.params.value === "gpt-old") {
-          return send({ id: m.id, error: { code: -32000, message: "rollback refused" } });
-        }
-        if (failMode === "strict-rollback-hang" &&
-            failRollback &&
-            m.params.configId === "model" &&
-            m.params.value === "gpt-old") {
-          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 200);
         }
         if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
         if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
@@ -752,9 +732,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert model_writes == ["gpt-old", "gpt-new", "gpt-old"]
   end
 
-  test "a failed strict apply cannot leave its pre-apply cache authoritative" do
-    {adapter, _capture_path} =
-      start_adapter(harness: :codex, fail_mode: "strict-rollback-failure")
+  test "a partial strict apply reloads and recovers canonically without a rollback request" do
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "strict-partial-apply")
 
     assert {:ok, "sess-1"} =
              Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
@@ -770,7 +750,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:error, {:model_apply_failed, %{"message" => "rollback refused"}}} =
+    assert {:ok, "gpt-old[medium]"} =
              Adapter.load_session(
                adapter,
                "sess-1",
@@ -780,35 +760,52 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
-    refute Adapter.knows_session?(adapter, "sess-1")
+    assert Adapter.knows_session?(adapter, "sess-1")
+    assert {:ok, "gpt-old[medium]"} = Adapter.current_model(adapter, "sess-1")
+
+    recovery_requests =
+      captured_requests(capture_path)
+      |> Enum.filter(fn request ->
+        request["method"] == "session/load" or
+          request["method"] == "session/set_config_option"
+      end)
+      |> Enum.map(&{&1["method"], &1["configId"], &1["value"]})
+
+    assert recovery_requests == [
+             {"session/set_config_option", "model", "gpt-old"},
+             {"session/set_config_option", "reasoning_effort", "medium"},
+             {"session/set_config_option", "model", "gpt-new"},
+             {"session/set_config_option", "reasoning_effort", "high"},
+             {"session/load", nil, nil},
+             {"session/set_config_option", "model", "gpt-old"},
+             {"session/set_config_option", "reasoning_effort", "medium"}
+           ]
   end
 
-  test "hung strict effort and rollback requests return inside the outer budget and clean up late replies" do
-    for fail_mode <- ["strict-effort-hang", "strict-rollback-hang"] do
-      {adapter, _capture_path} = start_adapter(harness: :codex, fail_mode: fail_mode)
+  test "a hung strict effort request returns inside the outer budget and cleans up its late reply" do
+    {adapter, _capture_path} = start_adapter(harness: :codex, fail_mode: "strict-effort-hang")
 
-      assert {:ok, "sess-1"} =
-               Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
 
-      started = System.monotonic_time(:millisecond)
+    started = System.monotonic_time(:millisecond)
 
-      deadline = System.monotonic_time(:millisecond) + 50
+    deadline = System.monotonic_time(:millisecond) + 50
 
-      assert {:error, :partial_apply} =
-               GenServer.call(
-                 adapter,
-                 {:apply_model_strict, "sess-1", "gpt-new[high]", "gpt-old[medium]", deadline},
-                 30_000
-               )
+    assert {:error, :partial_apply} =
+             GenServer.call(
+               adapter,
+               {:apply_model_strict, "sess-1", "gpt-new[high]", "gpt-old[medium]", deadline},
+               30_000
+             )
 
-      assert System.monotonic_time(:millisecond) - started < 1_000
-      refute Adapter.knows_session?(adapter, "sess-1")
-      assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
+    assert System.monotonic_time(:millisecond) - started < 1_000
+    refute Adapter.knows_session?(adapter, "sess-1")
+    assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
 
-      Process.sleep(250)
-      assert Process.alive?(adapter)
-      assert :sys.get_state(Adapter.conn(adapter)).pending == %{}
-    end
+    Process.sleep(250)
+    assert Process.alive?(adapter)
+    assert :sys.get_state(Adapter.conn(adapter)).pending == %{}
   end
 
   @tag timeout: 35_000
