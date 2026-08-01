@@ -94,7 +94,7 @@ defmodule Tightbeam.AdapterHealTest do
     def load_count(pid), do: GenServer.call(pid, :load_count)
     def cached(pid), do: GenServer.call(pid, :cached)
 
-    def handle_call({:apply_model_strict, _sid, model, prior_model}, _from, state) do
+    def handle_call({:apply_model_strict, _sid, model, prior_model, _deadline}, _from, state) do
       if state.cached_model == prior_model do
         state =
           %{

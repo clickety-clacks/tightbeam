@@ -30,10 +30,12 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
-  # One absolute budget, shared by the base, effort, and rollback requests. It
-  # must remain below apply_model_strict/4's 30s call budget so Conn's timeout
-  # reaches the caller as a structured error instead of a GenServer.call exit.
+  @strict_model_call_timeout 30_000
+  # The caller creates this deadline before entering the Adapter queue. Keeping
+  # it 5s inside the outer call timeout guarantees that an expired operation is
+  # dequeued and replied to as a structured error while the caller still waits.
   @strict_model_operation_timeout 25_000
+  @strict_model_request_floor 1
 
   defstruct [
     :conn,
@@ -43,7 +45,6 @@ defmodule Tightbeam.Acp.Adapter do
     :stderr_path,
     :on_auth_event,
     :on_subagent_event,
-    :strict_model_operation_timeout,
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
@@ -144,8 +145,15 @@ defmodule Tightbeam.Acp.Adapter do
              | :model_transport_failure
              | :partial_apply
              | :model_readback_unavailable}
-  def apply_model_strict(adapter, session_id, model, prior_model),
-    do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
+  def apply_model_strict(adapter, session_id, model, prior_model) do
+    deadline = System.monotonic_time(:millisecond) + @strict_model_operation_timeout
+
+    GenServer.call(
+      adapter,
+      {:apply_model_strict, session_id, model, prior_model, deadline},
+      @strict_model_call_timeout
+    )
+  end
 
   @doc "The adapter's cached model value. This does not query the harness owner."
   @spec current_model(adapter(), String.t(), timeout()) ::
@@ -287,9 +295,7 @@ defmodule Tightbeam.Acp.Adapter do
       stderr_path: stderr_path,
       stderr_offset: offset,
       on_auth_event: Keyword.get(opts, :on_auth_event),
-      on_subagent_event: Keyword.get(opts, :on_subagent_event),
-      strict_model_operation_timeout:
-        Keyword.get(opts, :strict_model_operation_timeout, @strict_model_operation_timeout)
+      on_subagent_event: Keyword.get(opts, :on_subagent_event)
     }
 
     # A binary that cannot execute still opens the port (the spawn is `sh -c`),
@@ -432,10 +438,10 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:apply_model_strict, sid, model, prior_model}, _from, state) do
+  def handle_call({:apply_model_strict, sid, model, prior_model, caller_deadline}, _from, state) do
     case Map.fetch(state.models, sid) do
       {:ok, ^prior_model} ->
-        case strict_apply(state, sid, model, prior_model) do
+        case strict_apply(state, sid, model, prior_model, caller_deadline) do
           :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
           error -> {:reply, error, drop_model_residency(state, sid)}
         end
@@ -760,11 +766,8 @@ defmodule Tightbeam.Acp.Adapter do
   defp map_model_refusal({:error, %{"code" => -32602}}), do: {:error, :model_unavailable}
   defp map_model_refusal(result), do: result
 
-  defp strict_apply(state, sid, model_ref, prior_model) do
+  defp strict_apply(state, sid, model_ref, prior_model, deadline) do
     {model, effort} = parse_model_ref(model_ref)
-
-    deadline =
-      System.monotonic_time(:millisecond) + state.strict_model_operation_timeout
 
     case map_model_refusal(strict_model_request(state, sid, "model", model, deadline)) do
       {:ok, base_result} ->
@@ -804,7 +807,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp strict_model_request(state, sid, config_id, value, deadline) do
     case deadline - System.monotonic_time(:millisecond) do
-      remaining when remaining > 0 ->
+      remaining when remaining > @strict_model_request_floor ->
         Conn.request(
           state.conn,
           "session/set_config_option",
