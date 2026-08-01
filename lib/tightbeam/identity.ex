@@ -740,13 +740,26 @@ defmodule Tightbeam.Identity do
         :error -> []
       end
 
+    newly_installed =
+      shipped.paths
+      |> Enum.reject(&(&1 in previously_owned))
+      |> Enum.filter(&index_matches_revision?(dir, @upstream, &1))
+
     paths =
-      (previously_owned ++ shipped.paths)
+      (previously_owned ++ newly_installed)
       |> Enum.uniq()
       |> Enum.filter(&File.regular?(Path.join(dir, &1)))
       |> Enum.sort()
 
     %{shipped | paths: paths}
+  end
+
+  defp index_matches_revision?(dir, revision, path) do
+    case System.cmd("git", ["diff", "--cached", "--quiet", revision, "--", path], cd: dir) do
+      {_output, 0} -> true
+      {_output, 1} -> false
+      {output, status} -> raise "git diff failed #{status}: #{output}"
+    end
   end
 
   defp path_exists_at?(dir, revision, path) do

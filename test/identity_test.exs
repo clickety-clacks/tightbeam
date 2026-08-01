@@ -523,6 +523,37 @@ defmodule Tightbeam.IdentityTest do
     refute File.exists?(absolute)
   end
 
+  test "an independently authored add/add winner is not receipted and survives unlearn", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    independent_path = "guidance/independent.md"
+    absolute = Path.join(dir, independent_path)
+    org_content = "org-authored guidance"
+
+    File.write!(absolute, org_content)
+    git!(dir, ["add", "--", independent_path])
+    git!(dir, ["commit", "-m", "identity: add independent guidance"], "operator")
+    File.write!(Path.join(ctx.source, independent_path), "newly shipped guidance")
+
+    assert {:conflict, [^independent_path]} = Identity.relearn!(ctx.base, "operator")
+
+    # Resolve the add/add conflict in the org's favor without using checkout:
+    # the staged merge result itself is the provenance Identity must inspect.
+    File.write!(absolute, org_content)
+    git!(dir, ["add", "--", independent_path])
+    assert Identity.resolve_relearn!(ctx.base, "operator")
+
+    receipt =
+      dir
+      |> Path.join("kungfu/agentic-engineering/installed.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    refute independent_path in receipt["paths"]
+    assert Identity.unlearn!(ctx.base, "agentic-engineering", "operator")
+    assert File.read!(absolute) == org_content
+  end
+
   test "removing a learned skill removes its path from the receipt", ctx do
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")

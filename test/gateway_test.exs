@@ -35,6 +35,14 @@ defmodule Tightbeam.GatewayTest do
   # weakens nothing — assert_receive still fails if the message never arrives.
   @cold_runner_prompt_timeout 60_000
 
+  @archetype_reference_writers [
+    {:main_session_seed, "lib/tightbeam/wire/socket.ex", "Org.create_in_txn"},
+    {:typed_spawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
+    {:adjudication_respawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
+    {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_in_txn"},
+    {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
+  ]
+
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
@@ -3568,6 +3576,7 @@ defmodule Tightbeam.GatewayTest do
       )
 
     base_dir = role_test_base("effort-adjudication")
+    Archetypes.load!(base_dir)
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4874,6 +4883,128 @@ defmodule Tightbeam.GatewayTest do
                origin: "user:flynn",
                params: %{name: "agentic-engineering"}
              })
+  end
+
+  test "archetype reference writer enumeration covers every production mutation call" do
+    expected =
+      Enum.frequencies_by(@archetype_reference_writers, fn {_name, file, call} -> {file, call} end)
+
+    calls = @archetype_reference_writers |> Enum.map(&elem(&1, 2)) |> Enum.uniq()
+
+    actual =
+      for file <- Path.wildcard("lib/**/*.ex"), call <- calls, reduce: %{} do
+        counts ->
+          count =
+            Regex.scan(Regex.compile!("\\b#{Regex.escape(call)}\\s*\\("), File.read!(file))
+            |> length()
+
+          if count == 0,
+            do: counts,
+            else: Map.put(counts, {file, call}, count)
+      end
+
+    assert actual == expected
+  end
+
+  test "queued adjudication respawn resolves a removed archetype to neutral default", ctx do
+    ensure_global_registry()
+    base_dir = role_test_base("unlearn-respawn-race")
+    learn_engineering_identity!(base_dir)
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    owner =
+      Org.create(ctx.db, %{
+        session_key: "agent:respawn-owner",
+        display_name: "Respawn owner",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    old =
+      Org.create(ctx.db, %{
+        session_key: "user:respawn-race",
+        display_name: "Respawn race",
+        kind: "main",
+        is_built_in: true,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        spawned_by: owner.session_key,
+        archetype: "coder",
+        identity_name: "coder",
+        overrides: %{skills_add: ["role-skill"]},
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    {:appended, failed_message} =
+      Projection.append(ctx.db, %{
+        session_key: old.session_key,
+        role: "user",
+        content: "failed prompt",
+        sender: "user:flynn"
+      })
+
+    {:ok, failed_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: old.session_key,
+        message_id: failed_message.id,
+        origin: "user:flynn",
+        prompt: "failed prompt"
+      })
+
+    :ok = DB.execute(ctx.db, "UPDATE turns SET status='running' WHERE seq=#{failed_seq}")
+    :ok = Ledger.finish(ctx.db, failed_seq, "failed", "quota")
+    episode = notify_adjudication(ctx.db, old.session_key, owner.session_key)
+
+    # Suspend the catalog so respawn has already captured `old` but cannot enter
+    # its insert transaction. Repoint and unlearn then serialize ahead of it.
+    :ok = :sys.suspend(ModelCatalog)
+
+    try do
+      respawn =
+        Task.async(fn ->
+          handlers["adjudicate"].(%{
+            origin: "agent:respawn-owner",
+            principal: {:session, owner.session_key},
+            session_key: old.session_key,
+            params: %{
+              episode: episode.correlation_key,
+              action: "respawn",
+              model: "claude-sonnet-4-6"
+            }
+          })
+        end)
+
+      assert_process_mailbox(ModelCatalog, 1)
+
+      assert {:ok, {:ok, %{archetype: "default"}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Org.repoint_archetype_in_txn(txn, old.session_key, "default")
+               end)
+
+      assert %{state: "published", kungfu: "agentic-engineering"} =
+               handlers["unlearn"].(%{
+                 origin: "user:flynn",
+                 params: %{name: "agentic-engineering"}
+               })
+
+      :ok = :sys.resume(ModelCatalog)
+      assert %{ok: true, action: "respawn", session_key: new_key} = Task.await(respawn, 5_000)
+
+      assert %{archetype: "default", identity_name: "default", overrides: nil} =
+               Org.get(ctx.db, new_key)
+
+      refute Enum.any?(Org.list_all(ctx.db), &(&1.archetype == "coder"))
+    after
+      _ = :sys.resume(ModelCatalog)
+    end
   end
 
   test "identity apply refreshes one stamped session at a turn boundary without restarting runtime",
@@ -6298,6 +6429,22 @@ defmodule Tightbeam.GatewayTest do
       {:error, {:already_started, _pid}} -> :ok
     end
   end
+
+  defp assert_process_mailbox(name, minimum, attempts \\ 100)
+
+  defp assert_process_mailbox(name, minimum, attempts) when attempts > 0 do
+    case Process.info(Process.whereis(name), :message_queue_len) do
+      {:message_queue_len, count} when count >= minimum ->
+        :ok
+
+      _ ->
+        Process.sleep(10)
+        assert_process_mailbox(name, minimum, attempts - 1)
+    end
+  end
+
+  defp assert_process_mailbox(name, minimum, 0),
+    do: flunk("#{inspect(name)} mailbox did not reach #{minimum} queued message(s)")
 
   defp credential_probe(parent, command) do
     send(parent, {:credential_command, command})

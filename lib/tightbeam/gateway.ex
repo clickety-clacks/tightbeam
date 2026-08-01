@@ -4679,6 +4679,16 @@ defmodule Tightbeam.Gateway do
 
           current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
+          {archetype, overrides, identity_name} =
+            if Archetypes.get(old.archetype) do
+              {old.archetype, old.overrides, old.identity_name}
+            else
+              # Unlearn may have published while this respawn was queued after
+              # snapshotting `old`. Resolve at the DB-owner boundary exactly as
+              # repoint does, leaving no reference to the removed identity.
+              {"default", nil, "default"}
+            end
+
           new_session =
             Org.create_in_txn(txn, %{
               session_key: new_session_key,
@@ -4687,9 +4697,9 @@ defmodule Tightbeam.Gateway do
               owner_user_id: old.owner_user_id,
               origin: old.origin,
               spawned_by: old.spawned_by,
-              archetype: old.archetype,
-              overrides: old.overrides,
-              identity_name: old.identity_name,
+              archetype: archetype,
+              overrides: overrides,
+              identity_name: identity_name,
               host: old.host,
               harness: harness,
               provider: provider,
