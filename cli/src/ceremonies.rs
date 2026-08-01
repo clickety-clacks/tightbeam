@@ -32,21 +32,12 @@ fn staging_path(ready: &serde_json::Value) -> Result<&str, String> {
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())
 }
 
-/// How long the gateway's lease on this ceremony runs, read off the same `begin` reply as
-/// the staging path (and camelCase for the same reason).
-///
-/// The ceremony watchdog and the server-side lease must expire together, so the TTL is one
-/// fact owned by `production_config` and carried on the wire. A gateway too old to send it
-/// falls back to the CLI's own bound rather than running unbounded.
-fn lease_timeout(ready: &serde_json::Value) -> Duration {
+fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Result<Instant, String> {
     ready
         .get("leaseTtlMs")
         .and_then(serde_json::Value::as_u64)
-        .map_or(CEREMONY_FALLBACK_TIMEOUT, Duration::from_millis)
-}
-
-fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
-    now + lease_timeout(ready)
+        .map(|ttl| now + Duration::from_millis(ttl))
+        .ok_or_else(|| "onboarding did not return leaseTtlMs".to_owned())
 }
 
 type HarnessLoader<'a> = dyn Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String> + 'a;
@@ -86,7 +77,7 @@ where
     );
     let ready = send_request(endpoint, &begin, None)?
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
-    let deadline = lease_deadline(&ready, Instant::now());
+    let deadline = lease_deadline(&ready, Instant::now())?;
     let staging = staging_path(&ready)?;
     let ceremony = Ceremony {
         endpoint,
@@ -188,14 +179,7 @@ fn onboard_machine(
     }
     match provisioned {
         dispatch::Provisioned::GatewayHost => Ok(None),
-        dispatch::Provisioned::Satellite {
-            machine: Some(name),
-        } => Ok(Some(name)),
-        dispatch::Provisioned::Satellite { machine: None } => Err(unnamed_machine(
-            "this satellite's gateway.json does not name it, which means the gateway that \
-             wrote the file predates that field; restarting the gateway rewrites it for \
-             every registered host",
-        )),
+        dispatch::Provisioned::Satellite { machine: name } => Ok(Some(name)),
         dispatch::Provisioned::Absent => Err(unnamed_machine(
             "there is no gateway.json here, so this machine cannot say what it is \
              registered as",
@@ -211,14 +195,6 @@ fn unnamed_machine(because: &str) -> String {
          it the gateway would onboard ITSELF instead of this machine."
     )
 }
-
-/// How long a ceremony may hold the terminal before the watchdog reaps it.
-///
-/// The gateway's `begin` reply carries the lease TTL it just started, so the CLI bound and
-/// the server bound are one fact with one home. This fallback covers only a gateway too old
-/// to send the field; a permanent second constant here would drift from `production_config`
-/// the first time either side is tuned.
-const CEREMONY_FALLBACK_TIMEOUT: Duration = Duration::from_secs(1_800);
 
 /// Hands the controlling terminal to a child's process group, and takes it back on drop.
 ///
@@ -1528,7 +1504,7 @@ mod tests {
         };
         let ceremony = Ceremony {
             endpoint: &endpoint,
-            deadline: Instant::now() + CEREMONY_FALLBACK_TIMEOUT,
+            deadline: Instant::now() + Duration::from_secs(1_800),
             load_harnesses: &|_, _| Ok(None),
         };
 
@@ -1656,9 +1632,10 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            lease_deadline(&ready, now).duration_since(now),
+            lease_deadline(&ready, now).unwrap().duration_since(now),
             Duration::from_millis(12_345)
         );
+        assert!(lease_deadline(&serde_json::json!({}), now).is_err());
     }
 
     #[test]
@@ -1844,7 +1821,6 @@ mod tests {
         fixture_args.harnesses = vec!["fixture".to_owned()];
         fixture_args.catalog = HarnessCatalog {
             harnesses: vec![crate::harnesses::HarnessProjection {
-                id: "fixture".to_owned(),
                 wire_name: "fixture".to_owned(),
                 install_package: "fixture-package".to_owned(),
                 cli_binary: "fixture".to_owned(),
@@ -2059,7 +2035,6 @@ mod tests {
             .into_iter()
             .map(
                 |(name, install_package)| crate::harnesses::HarnessProjection {
-                    id: name.to_owned(),
                     wire_name: name.to_owned(),
                     install_package: install_package.to_owned(),
                     cli_binary: name.to_owned(),
@@ -2257,22 +2232,17 @@ mod tests {
             onboard_machine(
                 None,
                 dispatch::Provisioned::Satellite {
-                    machine: Some("work-1".to_owned())
+                    machine: "work-1".to_owned()
                 }
             ),
             Ok(Some("work-1".to_owned())),
             "a provisioned satellite needs no operator env"
         );
 
-        for stale in [
-            dispatch::Provisioned::Satellite { machine: None },
-            dispatch::Provisioned::Absent,
-        ] {
-            let reason = onboard_machine(None, stale.clone()).unwrap_err();
-            assert!(reason.contains("TIGHTBEAM_MACHINE"), "{reason}");
-            assert!(reason.contains("REGISTERED"), "{reason}");
-            assert!(reason.contains("onboard ITSELF"), "{reason}");
-        }
+        let reason = onboard_machine(None, dispatch::Provisioned::Absent).unwrap_err();
+        assert!(reason.contains("TIGHTBEAM_MACHINE"), "{reason}");
+        assert!(reason.contains("REGISTERED"), "{reason}");
+        assert!(reason.contains("onboard ITSELF"), "{reason}");
     }
 
     /// Both legs failed on a missing harness CLI and neither said so: openai surfaced a
@@ -2351,7 +2321,7 @@ mod tests {
         };
         let ceremony = Ceremony {
             endpoint: &endpoint,
-            deadline: Instant::now() + CEREMONY_FALLBACK_TIMEOUT,
+            deadline: Instant::now() + Duration::from_secs(1_800),
             load_harnesses: &|_, _| Ok(None),
         };
         assert_eq!(

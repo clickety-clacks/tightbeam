@@ -47,7 +47,6 @@ defmodule Tightbeam.Rules do
     Devices,
     Escalation,
     EventLog,
-    ObligationFacts,
     Org,
     RailEpisodes,
     RailRemedy,
@@ -541,14 +540,6 @@ defmodule Tightbeam.Rules do
     fact = Map.get(condition, "fact")
     op = Map.get(condition, "op")
     value = Map.get(condition, "value")
-
-    if is_binary(fact) do
-      try do
-        ObligationFacts.register!(fact)
-      rescue
-        error in ArgumentError -> fail.(error.message)
-      end
-    end
 
     type = Map.get(@facts, fact)
 

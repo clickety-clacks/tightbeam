@@ -8,7 +8,6 @@ use crate::dispatch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessProjection {
-    pub id: String,
     pub wire_name: String,
     pub install_package: String,
     /// The vendor CLI this harness invokes directly, which the operator installs.
@@ -66,7 +65,6 @@ fn parse(encoded: &str) -> Result<HarnessCatalog, String> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(HarnessProjection {
-                id: string("id")?,
                 wire_name: string("wire_name")?,
                 install_package: string("install_package")?,
                 cli_binary: string("cli_binary")?,
@@ -198,7 +196,6 @@ pub fn catalog() -> Result<HarnessCatalog, String> {
         ]
         .into_iter()
         .map(|(name, marker)| HarnessProjection {
-            id: name.to_owned(),
             wire_name: name.to_owned(),
             install_package: format!("{name}-package"),
             cli_binary: name.to_owned(),
@@ -225,7 +222,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(catalog.names(), vec!["third"]);
-        assert_eq!(catalog.harnesses[0].id, "third");
         assert_eq!(catalog.harnesses[0].install_package, "pkg");
         assert_eq!(catalog.harnesses[0].cli_binary, "third-cli");
         assert_eq!(catalog.harnesses[0].process_markers, vec!["marker"]);

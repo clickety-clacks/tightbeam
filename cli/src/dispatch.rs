@@ -9,7 +9,6 @@ use crate::args::{Command, Identity, Target, ToplineSelection};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
     pub path: &'static str,
-    pub headers_sans_token_value: [(&'static str, &'static str); 2],
     pub body_json: String,
 }
 
@@ -79,10 +78,6 @@ fn request(
     body.push(params_field(params));
     RequestSpec {
         path: "/agent/dispatch",
-        headers_sans_token_value: [
-            ("authorization", "Bearer <token>"),
-            ("content-type", "application/json"),
-        ],
         body_json: object(body),
     }
 }
@@ -160,10 +155,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         // command it observed has not run yet.
         Command::ToolCallObserved => Ok(RequestSpec {
             path: "/agent/tool-call-observed",
-            headers_sans_token_value: [
-                ("authorization", "Bearer <token>"),
-                ("content-type", "application/json"),
-            ],
             body_json: "{}".to_owned(),
         }),
         Command::Spawn {
@@ -790,10 +781,9 @@ fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
 /// ceremony must name the satellite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provisioned {
-    /// A satellite's file. It names the gateway's advertised url, and carries this
-    /// host's REGISTERED name unless an older gateway wrote it (`Placement.write_endpoint`
-    /// has included `machine` since 4dd0d39; a gateway restart rewrites every host's).
-    Satellite { machine: Option<String> },
+    /// A satellite's file. It names the gateway's advertised url and this host's
+    /// REGISTERED name.
+    Satellite { machine: String },
     /// The gateway host's own file: a port, and no machine. The gateway defaults an
     /// unnamed onboarding machine to its own hostname, which is correct exactly here.
     GatewayHost,
@@ -822,11 +812,10 @@ fn provisioned_in(base_dir: &Path) -> Provisioned {
     };
     // The url/port split is the same one `endpoint_from_gateway_file` reads, and for the
     // same reason: only a satellite's file names a url.
-    match text("url") {
-        Some(_) => Provisioned::Satellite {
-            machine: text("machine"),
-        },
-        None => Provisioned::GatewayHost,
+    match (text("url"), text("machine")) {
+        (Some(_), Some(machine)) => Provisioned::Satellite { machine },
+        (None, _) => Provisioned::GatewayHost,
+        _ => Provisioned::Absent,
     }
 }
 
@@ -1935,7 +1924,6 @@ mod tests {
                     .push((endpoint.base.clone(), deadline));
                 Ok(Some(crate::harnesses::HarnessCatalog {
                     harnesses: vec![crate::harnesses::HarnessProjection {
-                        id: "codex".to_owned(),
                         wire_name: "codex".to_owned(),
                         install_package: "codex-acp".to_owned(),
                         cli_binary: "true".to_owned(),
@@ -2049,16 +2037,13 @@ mod tests {
                 "satellite",
                 r#"{"url":"http://gw:11373","cliToken":"t","machine":"work-1"}"#,
                 Provisioned::Satellite {
-                    machine: Some("work-1".to_owned()),
+                    machine: "work-1".to_owned(),
                 },
             ),
-            // Written by a gateway from before `machine` was included. The name is not
-            // derivable here -- it is whatever `assimilate` registered -- so this must
-            // stay distinguishable from the gateway host, which legitimately has none.
             (
-                "stale_satellite",
+                "invalid_satellite",
                 r#"{"url":"http://gw:11373","cliToken":"t"}"#,
-                Provisioned::Satellite { machine: None },
+                Provisioned::Absent,
             ),
             (
                 "gateway_host",
