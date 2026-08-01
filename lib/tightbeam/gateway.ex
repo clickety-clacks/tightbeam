@@ -763,24 +763,6 @@ defmodule Tightbeam.Gateway do
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
           %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
         end),
-      "harness-process-retry" =>
-        admin_handler(db, fn p ->
-          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
-
-          case AdapterCoordinator.retry_harness_park(coordinator, p.launch_id) do
-            :ok -> %{retried: p.launch_id}
-            {:error, reason} -> %{code: "harness_park_retry_failed", message: inspect(reason)}
-          end
-        end),
-      "harness-process-release" =>
-        admin_handler(db, fn p ->
-          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
-
-          case AdapterCoordinator.release_harness_park(coordinator, p.launch_id, p.reason) do
-            :ok -> %{released: p.launch_id}
-            {:error, reason} -> %{code: "harness_park_release_failed", message: inspect(reason)}
-          end
-        end),
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -1758,9 +1740,9 @@ defmodule Tightbeam.Gateway do
         {:error,
          "adapter for #{session.harness} on host #{session.host} is being parked: #{detail}"}
 
-      {:error, {:park_unconfirmed, detail}} ->
+      {:error, {:park_fenced, detail}} ->
         {:error,
-         "adapter for #{session.harness} on host #{session.host} remains fenced after an unconfirmed park: #{inspect(detail)}"}
+         "adapter for #{session.harness} on host #{session.host} remains fenced by an incomplete park: #{inspect(detail)}"}
 
       {:error, reason} ->
         {:error,
@@ -5002,7 +4984,7 @@ defmodule Tightbeam.Gateway do
             :ok
 
           {:error, reason} = error ->
-            EventLog.lifecycle(db, "adapter_park_unconfirmed", inspect(key), inspect(reason))
+            EventLog.lifecycle(db, "adapter_park_failed", inspect(key), inspect(reason))
             error
         end
       end

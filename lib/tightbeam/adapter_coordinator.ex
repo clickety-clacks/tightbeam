@@ -118,17 +118,6 @@ defmodule Tightbeam.AdapterCoordinator do
   @spec harness_processes(GenServer.server()) :: [Tightbeam.HarnessProcess.row()]
   def harness_processes(server \\ __MODULE__), do: GenServer.call(server, :harness_processes)
 
-  @doc "Retry an unresolved harness park by durable launch ID."
-  @spec retry_harness_park(GenServer.server(), String.t()) :: :ok | {:error, term()}
-  def retry_harness_park(server \\ __MODULE__, launch_id),
-    do: GenServer.call(server, {:retry_harness_park, launch_id}, 30_000)
-
-  @doc "Explicitly release an unresolved harness fence while preserving its unconfirmed row."
-  @spec release_harness_park(GenServer.server(), String.t(), String.t()) ::
-          :ok | {:error, term()}
-  def release_harness_park(server \\ __MODULE__, launch_id, reason),
-    do: GenServer.call(server, {:release_harness_park, launch_id, reason})
-
   @typedoc "Heal token: epoch-first, then generation (see the moduledoc)."
   @type heal_token :: {pos_integer(), non_neg_integer()}
 
@@ -284,7 +273,7 @@ defmodule Tightbeam.AdapterCoordinator do
         {:reply, checkout(entry), state}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
-        {:reply, {:error, {:park_unconfirmed, key_name(key)}}, state}
+        {:reply, {:error, {:park_fenced, key_name(key)}}, state}
 
       entry.circuit == :open ->
         {:reply, {:error, :degraded}, state}
@@ -350,20 +339,6 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, Tightbeam.HarnessProcess.list(state.db), state}
   end
 
-  def handle_call({:retry_harness_park, launch_id}, _from, state) do
-    adapter_key = launch_adapter_key(state.db, launch_id)
-    result = Tightbeam.HarnessProcess.retry(state.db, launch_id)
-    state = if result == :ok, do: unblock_adapter(adapter_key, state), else: state
-    {:reply, result, state}
-  end
-
-  def handle_call({:release_harness_park, launch_id, reason}, _from, state) do
-    adapter_key = launch_adapter_key(state.db, launch_id)
-    result = Tightbeam.HarnessProcess.release(state.db, launch_id, reason)
-    state = if result == :ok, do: unblock_adapter(adapter_key, state), else: state
-    {:reply, result, state}
-  end
-
   def handle_call(
         {:tightbeam_command, %Tightbeam.CommandEdge.CredentialPark{} = command},
         _from,
@@ -405,7 +380,7 @@ defmodule Tightbeam.AdapterCoordinator do
         {:reply, checkout(entry), state}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
-        {:reply, {:error, {:park_unconfirmed, key_name(key)}}, state}
+        {:reply, {:error, {:park_fenced, key_name(key)}}, state}
 
       entry.circuit == :open ->
         {:reply, {:error, :degraded}, state}
@@ -430,24 +405,39 @@ defmodule Tightbeam.AdapterCoordinator do
     {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
     state = cancel_pending_starts(key, state)
 
-    case state.adapters[key] do
-      %{pid: pid} when is_pid(pid) ->
-        Tightbeam.Acp.Adapter.request_close(pid)
+    exited? =
+      case state.adapters[key] do
+        %{pid: pid, monitor: monitor} when is_pid(pid) and is_reference(monitor) ->
+          Tightbeam.Acp.Adapter.request_close(pid)
+          await_adapter_exit(monitor, pid, state.park_grace_ms)
 
-      _ ->
-        :ok
-    end
+        %{pid: pid} when is_pid(pid) ->
+          Tightbeam.Acp.Adapter.request_close(pid)
+          false
+
+        _ ->
+          false
+      end
 
     result =
       case process_row do
         :no_launch -> :ok
-        row -> Tightbeam.HarnessProcess.park(state.db, row, state.park_grace_ms)
+        _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+        row -> Tightbeam.HarnessProcess.park(state.db, row)
       end
 
     state = retire_adapter(key, state)
     if result == :ok, do: Tightbeam.HarnessProcess.complete_park(state.db, key)
 
     {result, state}
+  end
+
+  defp await_adapter_exit(monitor, pid, grace_ms) do
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> true
+    after
+      grace_ms -> false
+    end
   end
 
   defp cancel_pending_starts(key, state) do
@@ -501,25 +491,6 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp launch_adapter_key(db, launch_id) do
-    case Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.launch_id == launch_id)) do
-      nil -> nil
-      row -> row.adapter_key
-    end
-  end
-
-  defp unblock_adapter(nil, state), do: state
-
-  defp unblock_adapter(adapter_key, state) do
-    case Enum.find(state.adapters, fn {key, _entry} -> key_name(key) == adapter_key end) do
-      {key, entry} ->
-        put_in(state.adapters[key], %{entry | circuit: :closed, timer: nil})
-
-      nil ->
-        state
-    end
-  end
-
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     context_request = context_request_for_monitor(state.context_requests, ref)
@@ -547,13 +518,10 @@ defmodule Tightbeam.AdapterCoordinator do
           :ok =
             Tightbeam.EventLog.lifecycle(state.db, "adapter_down", key_name(key), inspect(reason))
 
-          process_result = Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+          :ok = Tightbeam.HarnessProcess.reconcile_key(state.db, key)
           failures = entry.failures + 1
 
-          circuit =
-            if failures >= state.failure_circuit or match?({:error, _}, process_result),
-              do: :open,
-              else: :closed
+          circuit = if failures >= state.failure_circuit, do: :open, else: :closed
 
           # The death belongs to the generation that DIED, not to the bumped one
           # the replacement will carry — that is the generation a turn holding
@@ -562,10 +530,7 @@ defmodule Tightbeam.AdapterCoordinator do
           generation = entry.generation + 1
           delay = backoff(state, failures)
 
-          timer =
-            if process_result == :ok,
-              do: Process.send_after(self(), {:restart_adapter, key, generation}, delay),
-              else: nil
+          timer = Process.send_after(self(), {:restart_adapter, key, generation}, delay)
 
           entry = %{
             entry
@@ -639,7 +604,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   defp start_adapter(key, entry, state, context) do
     if Tightbeam.HarnessProcess.fenced?(state.db, key) do
-      {{:error, {:park_unconfirmed, key_name(key)}}, state}
+      {{:error, {:park_fenced, key_name(key)}}, state}
     else
       start_adapter_unfenced(key, entry, state, context)
     end

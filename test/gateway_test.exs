@@ -121,21 +121,7 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call(:harness_processes, _from, {_adapter, parent} = state) do
       if is_pid(parent), do: send(parent, :harness_processes)
-      {:reply, [%{launch_id: "launch-1", state: "unconfirmed"}], state}
-    end
-
-    def handle_call({:retry_harness_park, launch_id}, _from, {_adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:retry_harness_park, launch_id})
-      {:reply, :ok, state}
-    end
-
-    def handle_call(
-          {:release_harness_park, launch_id, reason},
-          _from,
-          {_adapter, parent} = state
-        ) do
-      if is_pid(parent), do: send(parent, {:release_harness_park, launch_id, reason})
-      {:reply, :ok, state}
+      {:reply, [%{launch_id: "launch-1", state: "kill_failed"}], state}
     end
 
     def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
@@ -570,32 +556,16 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, Org.personal_session_key("flynn")).state == "active"
   end
 
-  test "admin operator handlers list, retry, and release durable harness launches", ctx do
+  test "admin operator handler lists durable harness launches", ctx do
     adapter = start_supervised!({AdapterStub, self()})
     coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
     handlers = Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})
     call = %{origin: "user:flynn", session_key: nil, params: %{}}
 
-    assert %{harness_processes: [%{launch_id: "launch-1", state: "unconfirmed"}]} =
+    assert %{harness_processes: [%{launch_id: "launch-1", state: "kill_failed"}]} =
              handlers["harness-processes"].(call)
 
     assert_receive :harness_processes
-
-    assert %{retried: "launch-1"} =
-             handlers["harness-process-retry"].(%{
-               call
-               | params: %{launch_id: "launch-1"}
-             })
-
-    assert_receive {:retry_harness_park, "launch-1"}
-
-    assert %{released: "launch-1"} =
-             handlers["harness-process-release"].(%{
-               call
-               | params: %{launch_id: "launch-1", reason: "verified absent"}
-             })
-
-    assert_receive {:release_harness_park, "launch-1", "verified absent"}
   end
 
   test "retire atomically cascades parent-last, interrupts assignments, and removes every wire",
