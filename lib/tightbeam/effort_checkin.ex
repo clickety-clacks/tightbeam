@@ -748,23 +748,18 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp supersede_requests_in_txn(txn, assignment_id) do
-    if Txn.q(
-         txn,
-         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'decision_requests'"
-       ) == [[1]] do
-      Txn.q(
-        txn,
-        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-        [assignment_id]
-      )
-      |> Enum.each(fn [wake_id] -> Wakes.cancel_in_txn(txn, wake_id, @origin) end)
+    Txn.q(
+      txn,
+      "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
+    |> Enum.each(fn [wake_id] -> Wakes.cancel_in_txn(txn, wake_id, @origin) end)
 
-      Txn.q(
-        txn,
-        "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-        [assignment_id]
-      )
-    end
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
   end
 
   defp initial_expecter(txn, assignment) do

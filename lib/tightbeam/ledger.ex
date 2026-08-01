@@ -151,35 +151,14 @@ defmodule Tightbeam.Ledger do
             :busy
 
           [] ->
-            {session_filter, selected_mind} =
+            selected_mind =
               case Txn.q(
                      txn,
-                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+                     "SELECT model, harness FROM sessions WHERE sessionKey = ?1",
+                     [session_key]
                    ) do
-                [[1]] ->
-                  mind =
-                    case Txn.q(
-                           txn,
-                           "SELECT model, harness FROM sessions WHERE sessionKey = ?1",
-                           [session_key]
-                         ) do
-                      [[model, harness]] -> {model, harness}
-                      [] -> {nil, nil}
-                    end
-
-                  filter = """
-                  AND EXISTS (
-                    SELECT 1 FROM sessions AS s
-                    WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
-                      AND (s.adjudicationHold IS NULL OR
-                           (s.adjudicationHold != '*' AND t.wakeId = s.adjudicationHold))
-                  )
-                  """
-
-                  {filter, mind}
-
-                [] ->
-                  {"", {nil, nil}}
+                [[model, harness]] -> {model, harness}
+                [] -> {nil, nil}
               end
 
             Txn.q(
@@ -190,7 +169,12 @@ defmodule Tightbeam.Ledger do
                     model = ?4, harness = ?5
                 WHERE seq = (SELECT t.seq FROM turns AS t
                              WHERE t.sessionKey = ?1 AND t.status = 'queued'
-                               #{session_filter}
+                               AND EXISTS (
+                                 SELECT 1 FROM sessions AS s
+                                 WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
+                                   AND (s.adjudicationHold IS NULL OR
+                                        (s.adjudicationHold != '*' AND t.wakeId = s.adjudicationHold))
+                               )
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
               """,
@@ -254,10 +238,7 @@ defmodule Tightbeam.Ledger do
 
     won = Txn.changes(txn) == 1
 
-    sessions_exist? =
-      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [[1]]
-
-    if won and sessions_exist? do
+    if won do
       episode = if terminal == "delivered", do: nil, else: probe_episode(txn, seq)
 
       if is_nil(episode) do
@@ -311,15 +292,7 @@ defmodule Tightbeam.Ledger do
   end
 
   defp probe_episode(%Txn{} = txn, seq) do
-    episodes_exist? =
-      Txn.q(
-        txn,
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudication_episodes'"
-      ) ==
-        [[1]]
-
-    with true <- episodes_exist?,
-         [[wake_id]] when is_binary(wake_id) <-
+    with [[wake_id]] when is_binary(wake_id) <-
            Txn.q(txn, "SELECT wakeId FROM turns WHERE seq = ?1", [seq]) do
       Tightbeam.Adjudication.probe_episode_for_wake_in_txn(txn, wake_id)
     else
@@ -336,30 +309,23 @@ defmodule Tightbeam.Ledger do
   """
   @spec drain_queued_for_retire_in_txn(Txn.t(), String.t(), String.t()) :: [integer()]
   def drain_queued_for_retire_in_txn(%Txn{} = txn, session_key, reason) do
-    turns_exist? =
-      Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='turns'") == [[1]]
-
-    if turns_exist? do
-      rows =
-        Txn.q(
-          txn,
-          "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'queued' ORDER BY seq",
-          [session_key]
-        )
-
+    rows =
       Txn.q(
         txn,
-        """
-        UPDATE turns SET status = 'canceled', endedAt = ?2, error = ?3
-        WHERE sessionKey = ?1 AND status = 'queued'
-        """,
-        [session_key, System.system_time(:millisecond), reason]
+        "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'queued' ORDER BY seq",
+        [session_key]
       )
 
-      Enum.map(rows, &hd/1)
-    else
-      []
-    end
+    Txn.q(
+      txn,
+      """
+      UPDATE turns SET status = 'canceled', endedAt = ?2, error = ?3
+      WHERE sessionKey = ?1 AND status = 'queued'
+      """,
+      [session_key, System.system_time(:millisecond), reason]
+    )
+
+    Enum.map(rows, &hd/1)
   end
 
   @doc """
@@ -381,11 +347,6 @@ defmodule Tightbeam.Ledger do
         # boot-reconciliation sweep (spec s4-operability-v1 §2, totality).
         # Read before the UPDATE only for the seqs; the re-hold is keyed by seq
         # and so is order-independent.
-        sessions_exist? =
-          Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'") == [
-            [1]
-          ]
-
         Txn.q(
           txn,
           """
@@ -396,11 +357,9 @@ defmodule Tightbeam.Ledger do
           [now]
         )
 
-        if sessions_exist? do
-          for seq <- seqs,
-              episode = probe_episode(txn, seq),
-              do: rehold_probe(txn, seq, now, episode)
-        end
+        for seq <- seqs,
+            episode = probe_episode(txn, seq),
+            do: rehold_probe(txn, seq, now, episode)
 
         seqs
       end)

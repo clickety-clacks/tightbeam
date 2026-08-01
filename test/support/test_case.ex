@@ -48,7 +48,13 @@ defmodule Tightbeam.TestCase do
   using do
     quote do
       import Tightbeam.TestCase,
-        only: [register_hosts: 2, catalog_reply: 1, catalog_reply: 2, catalog_probe_harness: 1]
+        only: [
+          register_hosts: 2,
+          catalog_reply: 1,
+          catalog_reply: 2,
+          catalog_probe_harness: 1,
+          ensure_all_schemas: 1
+        ]
     end
   end
 
@@ -69,6 +75,39 @@ defmodule Tightbeam.TestCase do
     # than failing loudly — so a suite that asserts `tool-call-observed` must find
     # a real writer here or it would silently be asserting the fallback.
     start_supervised!({Tightbeam.TurnObservations, name: Tightbeam.TurnObservations})
+
+    :ok
+  end
+
+  @doc "Create the complete production schema for a unit-test database."
+  def ensure_all_schemas(db) do
+    for module <- [
+          Tightbeam.Ledger,
+          Tightbeam.EventLog,
+          Tightbeam.Assets,
+          Tightbeam.Artifacts,
+          Tightbeam.CausalEvents,
+          Tightbeam.Adjudication,
+          Tightbeam.Devices,
+          Tightbeam.Idempotency,
+          Tightbeam.ConditionFacts,
+          Tightbeam.SubagentMarkers,
+          Tightbeam.Escalation,
+          Tightbeam.Wakes,
+          Tightbeam.Projection,
+          Tightbeam.Org,
+          Tightbeam.CriticalLeases,
+          Tightbeam.Roles,
+          Tightbeam.WorkItems,
+          Tightbeam.Assignments,
+          Tightbeam.EffortCheckin,
+          Tightbeam.Placement,
+          Tightbeam.RailRemedy,
+          Tightbeam.Supervision,
+          Tightbeam.WorkState
+        ] do
+      :ok = module.ensure_schema(db)
+    end
 
     :ok
   end

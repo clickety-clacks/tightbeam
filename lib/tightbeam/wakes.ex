@@ -758,13 +758,7 @@ defmodule Tightbeam.Wakes do
             role_ref: wake.target_role
           )
 
-        episodes_exist? =
-          Txn.q(
-            txn,
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudication_episodes'"
-          ) == [[1]]
-
-        if episodes_exist? and match?({:appended, _, _, _}, delivery) do
+        if match?({:appended, _, _, _}, delivery) do
           Txn.q(
             txn,
             """

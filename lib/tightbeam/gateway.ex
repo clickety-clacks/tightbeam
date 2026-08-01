@@ -967,21 +967,12 @@ defmodule Tightbeam.Gateway do
           [] -> {assignment_id, nil}
         end
 
-      table?(txn, "work_items") ->
+      true ->
         case DB.Txn.q(txn, "SELECT id FROM work_items WHERE routingWakeId = ?1", [wake_id]) do
           [[job_ref]] -> {nil, job_ref}
           [] -> {nil, nil}
         end
-
-      true ->
-        {nil, nil}
     end
-  end
-
-  defp table?(txn, name) do
-    DB.Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name]) == [
-      [1]
-    ]
   end
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."

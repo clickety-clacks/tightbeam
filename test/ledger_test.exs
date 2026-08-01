@@ -6,7 +6,7 @@ defmodule Tightbeam.LedgerTest do
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
-    :ok = Ledger.ensure_schema(name)
+    :ok = ensure_all_schemas(name)
     create_test_sessions(name)
     %{db: name}
   end
@@ -14,18 +14,14 @@ defmodule Tightbeam.LedgerTest do
   defp create_test_sessions(db) do
     :ok =
       DB.execute(db, """
-      CREATE TABLE sessions (
-        sessionKey TEXT PRIMARY KEY,
-        model TEXT NOT NULL,
-        harness TEXT NOT NULL,
-        state TEXT NOT NULL DEFAULT 'active',
-        adjudicationHold TEXT,
-        updatedAt INTEGER NOT NULL DEFAULT 0
-      );
-      INSERT INTO sessions (sessionKey, model, harness)
+      INSERT INTO sessions
+        (sessionKey, displayName, ownerUserId, origin, archetype, identityName,
+         harness, provider, model, createdAt, updatedAt)
       VALUES
-        ('k1', 'claude-sonnet-5[medium]', 'claude'),
-        ('k2', 'claude-sonnet-5[medium]', 'claude');
+        ('k1', 'K1', 'flynn', 'user:flynn', 'default', 'default',
+         'claude', 'anthropic', 'claude-sonnet-5[medium]', 1, 1),
+        ('k2', 'K2', 'flynn', 'user:flynn', 'default', 'default',
+         'claude', 'anthropic', 'claude-sonnet-5[medium]', 1, 1);
       """)
   end
 

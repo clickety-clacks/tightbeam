@@ -553,21 +553,13 @@ defmodule Tightbeam.Escalation do
   @doc "Boot backstop for retirement casts lost across a crash."
   @spec recover_retired(DB.server()) :: :ok
   def recover_retired(db \\ DB) do
-    {:ok, [[sessions_table]]} =
+    {:ok, rows} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
       )
 
-    if sessions_table == 1 do
-      {:ok, rows} =
-        DB.query(
-          db,
-          "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
-        )
-
-      Enum.each(rows, fn [key] -> withdraw_for_retired(db, key) end)
-    end
+    Enum.each(rows, fn [key] -> withdraw_for_retired(db, key) end)
 
     :ok
   end
@@ -654,7 +646,7 @@ defmodule Tightbeam.Escalation do
     owner_user_id = Keyword.get(opts, :owner_user_id)
     admin? = Keyword.get(opts, :admin, false)
 
-    if holds_available?(db) and (admin? or is_binary(owner_user_id)) do
+    if admin? or is_binary(owner_user_id) do
       {:ok, rows} =
         DB.query(
           db,
@@ -690,16 +682,6 @@ defmodule Tightbeam.Escalation do
     else
       []
     end
-  end
-
-  defp holds_available?(db) do
-    {:ok, [[count]]} =
-      DB.query(
-        db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('adjudication_episodes', 'sessions')"
-      )
-
-    count == 2
   end
 
   @doc "Canonical SHA-256 action fingerprint."
