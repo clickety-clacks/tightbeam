@@ -136,6 +136,7 @@ defmodule Tightbeam.Acp.Adapter do
           {:ok, model_ref()}
           | {:error,
              :model_unavailable
+             | :model_transport_failure
              | :partial_apply
              | :model_readback_unavailable}
   def apply_model_strict(adapter, session_id, model, prior_model),
@@ -427,7 +428,7 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_call({:apply_model_strict, sid, model, prior_model}, _from, state) do
     case Map.fetch(state.models, sid) do
       {:ok, ^prior_model} ->
-        case strict_apply_with_retry(state, sid, model, prior_model, 3) do
+        case strict_apply(state, sid, model, prior_model) do
           :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
           error -> {:reply, error, drop_model_residency(state, sid)}
         end
@@ -752,24 +753,16 @@ defmodule Tightbeam.Acp.Adapter do
   defp map_model_refusal({:error, %{"code" => -32602}}), do: {:error, :model_unavailable}
   defp map_model_refusal(result), do: result
 
-  defp strict_apply_with_retry(state, sid, model_ref, prior_model, attempts) do
-    case strict_apply(state, sid, model_ref, prior_model) do
-      {:error, :model_unavailable} when attempts > 1 ->
-        strict_apply_with_retry(state, sid, model_ref, prior_model, attempts - 1)
-
-      result ->
-        result
-    end
-  end
-
   defp strict_apply(state, sid, model_ref, prior_model) do
     {model, effort} = parse_model_ref(model_ref)
 
-    case Conn.request(state.conn, "session/set_config_option", %{
-           sessionId: sid,
-           configId: "model",
-           value: model
-         }) do
+    case map_model_refusal(
+           Conn.request(state.conn, "session/set_config_option", %{
+             sessionId: sid,
+             configId: "model",
+             value: model
+           })
+         ) do
       {:ok, base_result} ->
         effort_result =
           if effort do
@@ -800,7 +793,10 @@ defmodule Tightbeam.Acp.Adapter do
           {:error, :partial_apply}
         end
 
-      {:error, _} ->
+      {:error, reason} when reason in [:closed, :timeout] ->
+        {:error, :model_transport_failure}
+
+      {:error, _reason} ->
         {:error, :model_unavailable}
     end
   end

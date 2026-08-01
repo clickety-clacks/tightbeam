@@ -632,6 +632,23 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Adapter.knows_session?(adapter, "sess-1")
   end
 
+  test "strict apply does not retry an invalid-params model refusal" do
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "model-invalid-params")
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+    assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:error, :model_unavailable} =
+             Adapter.apply_model_strict(adapter, "sess-1", "gpt-5.1-codex", prior_model)
+
+    model_writes =
+      captured_requests(capture_path)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+
+    assert length(model_writes) == 1
+  end
+
   test "new and canonical reattach surface model apply failures" do
     {adapter, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
 
