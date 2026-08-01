@@ -33,6 +33,13 @@ fn staging_path(ready: &serde_json::Value) -> Result<&str, String> {
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())
 }
 
+fn lease_id(ready: &serde_json::Value) -> Result<&str, String> {
+    ready
+        .get("leaseId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "onboarding did not return a lease identity".to_owned())
+}
+
 /// How long the gateway's lease on this ceremony runs, read off the same `begin` reply as
 /// the staging path (and camelCase for the same reason).
 ///
@@ -84,6 +91,7 @@ where
         kind,
         machine.as_deref(),
         None,
+        None,
     );
     let ready = send_request(endpoint, &begin, None)?;
     let deadline = ready.as_ref().map_or_else(
@@ -105,7 +113,24 @@ where
                 kind,
                 machine.as_deref(),
                 None,
+                None,
                 reason,
+                &ceremony,
+                &send_request,
+            ));
+        }
+    };
+    let lease_id = match lease_id(&ready) {
+        Ok(lease_id) => lease_id,
+        Err(reason) => {
+            return Err(cancel_after_begin(
+                identity,
+                provider,
+                kind,
+                machine.as_deref(),
+                None,
+                None,
+                &reason,
                 &ceremony,
                 &send_request,
             ));
@@ -119,6 +144,7 @@ where
                 provider,
                 kind,
                 machine.as_deref(),
+                Some(lease_id),
                 None,
                 &reason,
                 &ceremony,
@@ -145,6 +171,7 @@ where
             provider,
             kind,
             machine.as_deref(),
+            Some(lease_id),
             classified,
             &reason,
             &ceremony,
@@ -158,6 +185,7 @@ where
         "finish",
         kind,
         machine.as_deref(),
+        Some(lease_id),
         None,
     );
     match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
@@ -175,6 +203,7 @@ where
                 provider,
                 kind,
                 machine.as_deref(),
+                Some(lease_id),
                 None,
                 &reason,
                 &ceremony,
@@ -190,6 +219,7 @@ fn cancel_after_begin<S>(
     provider: &str,
     kind: &str,
     machine: Option<&str>,
+    lease_id: Option<&str>,
     classified: Option<&str>,
     reason: &str,
     ceremony: &Ceremony<'_>,
@@ -199,7 +229,7 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
 {
     let cancel = dispatch::build_onboard_phase_request(
-        identity, provider, "cancel", kind, machine, classified,
+        identity, provider, "cancel", kind, machine, lease_id, classified,
     );
     match send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline)) {
         Err(cancel_reason) if cancel_reason.contains("onboarding lease expired") => {
@@ -2108,6 +2138,7 @@ mod tests {
             "anthropic",
             "subscription",
             Some("worker"),
+            Some("lease-7"),
             None,
             "malformed begin reply",
             &ceremony,
@@ -2122,6 +2153,11 @@ mod tests {
         let sent = sent.into_inner();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].0.contains(r#""phase":"cancel""#), "{}", sent[0].0);
+        assert!(
+            sent[0].0.contains(r#""leaseId":"lease-7""#),
+            "{}",
+            sent[0].0
+        );
         assert_eq!(sent[0].1, Some(deadline));
     }
 
@@ -3093,7 +3129,7 @@ mod tests {
         // during the production-install smoke. Every response key is lower-camelCase
         // because router.ex camelizes atom keys on the way out.
         let ready: serde_json::Value = serde_json::from_str(
-            r#"{"provider":"anthropic","stagingPath":"/tmp/tightbeam-anthropic-onboard-7","status":"ready"}"#,
+            r#"{"provider":"anthropic","stagingPath":"/tmp/tightbeam-anthropic-onboard-7","leaseId":"lease-7","status":"ready"}"#,
         )
         .unwrap();
 
@@ -3101,6 +3137,7 @@ mod tests {
             staging_path(&ready).unwrap(),
             "/tmp/tightbeam-anthropic-onboard-7"
         );
+        assert_eq!(lease_id(&ready).unwrap(), "lease-7");
     }
 
     #[test]

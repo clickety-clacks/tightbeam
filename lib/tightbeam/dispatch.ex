@@ -220,6 +220,9 @@ defmodule Tightbeam.Dispatch do
   # deliberate and unchanged — the caller just passed authorization for those very
   # rows, so it is content they were entitled to read, and narrowing it is a
   # behavior change no spec here authorizes. Elision governs the audit row only.
+  defp outcome_payload("onboard", _call, {:returned, result}) when is_map(result),
+    do: Map.delete(result, :lease_id)
+
   defp outcome_payload(verb, call, outcome) do
     if verb in @result_elided do
       elided = %{elided: true, params: Map.get(call, :params, %{})}

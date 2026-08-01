@@ -609,6 +609,7 @@ pub fn build_onboard_phase_request(
     phase: &str,
     kind: &str,
     machine: Option<&str>,
+    lease_id: Option<&str>,
     reason: Option<&str>,
 ) -> RequestSpec {
     // `kind` rides on EVERY phase, not just finish, so the conversation is
@@ -620,6 +621,9 @@ pub fn build_onboard_phase_request(
     ];
     if let Some(machine) = machine {
         params.push(string_field("machine", machine));
+    }
+    if let Some(lease_id) = lease_id {
+        params.push(string_field("leaseId", lease_id));
     }
     if let Some(reason) = reason {
         params.push(string_field("reason", reason));
@@ -1463,6 +1467,7 @@ mod tests {
             "subscription",
             Some("work-1"),
             None,
+            None,
         );
 
         assert_eq!(
@@ -1481,12 +1486,13 @@ mod tests {
             "finish",
             "apiKey",
             Some("work-1"),
+            Some("lease-7"),
             None,
         );
 
         assert_eq!(
             keyed.body_json,
-            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1"}}"#
+            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
         );
         assert!(!keyed.body_json.contains("sk-"));
     }
@@ -1921,6 +1927,7 @@ mod tests {
                 if phase == "begin" {
                     Ok(Some(serde_json::json!({
                         "stagingPath": staging,
+                        "leaseId": "lease-7",
                         "leaseTtlMs": 60_000
                     })))
                 } else {
@@ -1974,6 +1981,7 @@ mod tests {
             "finish",
             "subscription",
             Some("work-1"),
+            None,
             None,
         );
         let error = send_to_with_deadline(

@@ -2840,9 +2840,9 @@ defmodule Tightbeam.GatewayTest do
     end
 
     defp bank_into!(server, kind) do
-      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, "oauth-token"), "credential-bytes")
-      :ok = Credentials.finish_onboard(:anthropic, kind, server)
+      :ok = Credentials.finish_onboard(:anthropic, kind, lease_id, server)
     end
 
     test "an API-key host reports apiKey", ctx do

@@ -96,31 +96,35 @@ defmodule Tightbeam.Credentials do
     do: GenServer.call(server, {:onboard, provider}, :infinity)
 
   @doc "Begin an interactive CLI onboarding lease after gate + runtime stop."
-  @spec begin_onboard(provider(), GenServer.server()) :: {:ok, String.t()} | {:error, term()}
+  @spec begin_onboard(provider(), GenServer.server()) ::
+          {:ok, String.t(), String.t()} | {:error, term()}
   def begin_onboard(provider, server \\ __MODULE__),
     do: GenServer.call(server, {:begin_onboard, provider})
 
   @doc """
-  Install the credential produced in the active onboarding lease, as `kind`.
+  Install the credential produced in the identified active onboarding lease, as `kind`.
 
   The kind is stated by the ceremony that produced the credential rather than
   stashed at `begin_onboard/2`, so a lease carries no opinion about what will be
   banked into it. No default arity, deliberately: an omitted kind must fail to
   COMPILE, not silently bank an API key as a subscription.
   """
-  @spec finish_onboard(provider(), kind(), GenServer.server()) :: :ok | {:error, term()}
-  def finish_onboard(provider, kind, server) when kind in [:api_key, :subscription],
-    do: GenServer.call(server, {:finish_onboard, provider, kind}, :infinity)
+  @spec finish_onboard(provider(), kind(), String.t(), GenServer.server()) ::
+          :ok | {:error, term()}
+  def finish_onboard(provider, kind, lease_id, server)
+      when kind in [:api_key, :subscription] and is_binary(lease_id),
+      do: GenServer.call(server, {:finish_onboard, provider, kind, lease_id}, :infinity)
 
-  @doc "Cancel the active onboarding lease without restarting the old credential."
-  @spec cancel_onboard(provider(), GenServer.server()) :: :ok
-  def cancel_onboard(provider, server \\ __MODULE__),
-    do: cancel_onboard(provider, nil, server)
+  @doc "Cancel the identified active onboarding lease without restarting the old credential."
+  @spec cancel_onboard(provider(), String.t(), GenServer.server()) :: :ok | {:error, term()}
+  def cancel_onboard(provider, lease_id, server \\ __MODULE__),
+    do: cancel_onboard(provider, lease_id, nil, server)
 
   @doc "Cancel an onboarding lease and record a provider-classified failure."
-  @spec cancel_onboard(provider(), term(), GenServer.server()) :: :ok
-  def cancel_onboard(provider, reason, server),
-    do: GenServer.call(server, {:cancel_onboard, provider, reason})
+  @spec cancel_onboard(provider(), String.t(), term(), GenServer.server()) ::
+          :ok | {:error, term()}
+  def cancel_onboard(provider, lease_id, reason, server),
+    do: GenServer.call(server, {:cancel_onboard, provider, lease_id, reason})
 
   @doc "Record terminal evidence, gate new sessions, and park running sessions."
   @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok
@@ -226,17 +230,19 @@ defmodule Tightbeam.Credentials do
     with :ok <- state.gate.(provider),
          :ok <- state.stop.(provider) do
       path = onboarding_staging_path(state, provider)
+      lease_id = Tightbeam.Id.uuid4()
       :ok = prepare_staging!(state, path)
 
-      {:reply, {:ok, path}, put_in(state.pending[provider], %{path: path})}
+      {:reply, {:ok, path, lease_id},
+       put_in(state.pending[provider], %{id: lease_id, path: path})}
     else
       {:error, _reason} = error -> {:reply, error, state}
     end
   end
 
-  def handle_call({:finish_onboard, provider, kind}, _from, state) do
+  def handle_call({:finish_onboard, provider, kind, lease_id}, _from, state) do
     case Map.fetch(state.pending, provider) do
-      {:ok, %{path: path}} ->
+      {:ok, %{id: ^lease_id, path: path}} ->
         result =
           with {:ok, credential} <- install_staged!(state, provider, kind, path),
                :ok <- state.start.(provider, kind),
@@ -250,20 +256,20 @@ defmodule Tightbeam.Credentials do
         cleanup_staging!(state, path)
         {:reply, result, update_in(state.pending, &Map.delete(&1, provider))}
 
-      :error ->
-        {:reply, {:error, :onboarding_not_started}, state}
+      _missing_or_superseded ->
+        {:reply, {:error, :onboarding_lease_superseded}, state}
     end
   end
 
-  def handle_call({:cancel_onboard, provider, reason}, _from, state) do
-    case Map.pop(state.pending, provider) do
-      {nil, pending} ->
-        {:reply, :ok, %{state | pending: pending}}
-
-      {%{path: path}, pending} ->
+  def handle_call({:cancel_onboard, provider, lease_id, reason}, _from, state) do
+    case Map.fetch(state.pending, provider) do
+      {:ok, %{id: ^lease_id, path: path}} ->
         cleanup_staging!(state, path)
         record_onboarding_failure!(state, provider, reason)
-        {:reply, :ok, %{state | pending: pending}}
+        {:reply, :ok, update_in(state.pending, &Map.delete(&1, provider))}
+
+      _missing_or_superseded ->
+        {:reply, {:error, :onboarding_lease_superseded}, state}
     end
   end
 

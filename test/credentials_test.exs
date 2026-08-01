@@ -329,13 +329,13 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    assert {:ok, staging} = Credentials.begin_onboard(:openai, server)
+    assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
     assert_receive :gate
     assert_receive :stop
     assert {:messages, []} = Process.info(server, :messages)
     File.write!(Path.join(staging, "auth.json"), "device-code-result")
 
-    assert :ok = Credentials.finish_onboard(:openai, :subscription, server)
+    assert :ok = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
     assert_receive :start
     assert_receive :resume
     refute File.exists?(staging)
@@ -368,12 +368,12 @@ defmodule Tightbeam.CredentialsTest do
         sh: sh
       )
 
-    assert {:ok, staging} = Credentials.begin_onboard(:openai, server)
+    assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
     assert staging =~ "/staging/credential-onboarding/openai-"
     assert Credentials.status(:openai, server) == {:needs_onboarding, :in_progress}
 
     File.write!(Path.join(staging, "auth.json"), "satellite-only-secret")
-    assert :ok = Credentials.finish_onboard(:openai, :subscription, server)
+    assert :ok = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
     assert Credentials.status(:openai, server) == :onboarded
 
     store = Path.join([ctx.base, "auth", "codex", "auth.json"])
@@ -398,11 +398,12 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    assert {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+    assert {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
 
     assert :ok =
              Credentials.cancel_onboard(
                :anthropic,
+               lease_id,
                :unsupported_no_subscription,
                server
              )
@@ -429,25 +430,46 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    assert {:ok, staging} = Credentials.begin_onboard(:openai, server)
+    assert {:ok, staging, stale_lease_id} = Credentials.begin_onboard(:openai, server)
     File.write!(Path.join(staging, "auth.json"), ~S({"token":"stale"}))
     assert_receive {:stop, :openai}
 
-    assert {:ok, fresh} = Credentials.begin_onboard(:openai, server)
+    assert {:ok, fresh, current_lease_id} = Credentials.begin_onboard(:openai, server)
     assert fresh != staging
+    assert current_lease_id != stale_lease_id
     assert_receive {:stop, :openai}
     refute File.exists?(staging)
+    File.write!(Path.join(fresh, "auth.json"), ~S({"token":"successor"}))
 
-    assert {:error, {:device_auth_failed, :enoent}} =
-             Credentials.finish_onboard(:openai, :subscription, server)
+    assert {:error, :onboarding_lease_superseded} =
+             Credentials.finish_onboard(:openai, :subscription, stale_lease_id, server)
+
+    refute File.exists?(Path.join([ctx.base, "auth", "codex", "auth.json"]))
+    assert File.exists?(fresh)
+  end
+
+  test "a stale cancel does not cancel the successor's lease", ctx do
+    {:ok, server} =
+      Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    assert {:ok, _abandoned, stale_lease_id} = Credentials.begin_onboard(:anthropic, server)
+    assert {:ok, fresh, current_lease_id} = Credentials.begin_onboard(:anthropic, server)
+
+    assert {:error, :onboarding_lease_superseded} =
+             Credentials.cancel_onboard(:anthropic, stale_lease_id, server)
+
+    assert File.exists?(fresh)
+    assert Credentials.status(:anthropic, server) == {:needs_onboarding, :in_progress}
+    assert :ok = Credentials.cancel_onboard(:anthropic, current_lease_id, server)
+    refute File.exists?(fresh)
   end
 
   test "an operator whose CLI died can immediately begin again", ctx do
     {:ok, server} =
       Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-    assert {:ok, abandoned} = Credentials.begin_onboard(:anthropic, server)
-    assert {:ok, fresh} = Credentials.begin_onboard(:anthropic, server)
+    assert {:ok, abandoned, _abandoned_id} = Credentials.begin_onboard(:anthropic, server)
+    assert {:ok, fresh, _fresh_id} = Credentials.begin_onboard(:anthropic, server)
     assert fresh != abandoned
     refute File.exists?(abandoned)
   end
@@ -477,9 +499,9 @@ defmodule Tightbeam.CredentialsTest do
     test "an API key banks with its kind recorded and no expiry", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, "oauth-token"), "sk-ant-api03-staged")
-      assert :ok = Credentials.finish_onboard(:anthropic, :api_key, server)
+      assert :ok = Credentials.finish_onboard(:anthropic, :api_key, lease_id, server)
 
       metadata = credential_metadata(ctx.base, "claude")
 
@@ -500,9 +522,9 @@ defmodule Tightbeam.CredentialsTest do
     test "a subscription banks with its kind and keeps its expiry", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, "oauth-token"), "sk-ant-oat01-staged")
-      assert :ok = Credentials.finish_onboard(:anthropic, :subscription, server)
+      assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata = credential_metadata(ctx.base, "claude")
 
@@ -523,13 +545,13 @@ defmodule Tightbeam.CredentialsTest do
     test "one host holds a different kind per provider", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-      {:ok, claude_staging} = Credentials.begin_onboard(:anthropic, server)
+      {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(claude_staging, "oauth-token"), "sk-ant-api03-staged")
-      :ok = Credentials.finish_onboard(:anthropic, :api_key, server)
+      :ok = Credentials.finish_onboard(:anthropic, :api_key, claude_lease_id, server)
 
-      {:ok, codex_staging} = Credentials.begin_onboard(:openai, server)
+      {:ok, codex_staging, codex_lease_id} = Credentials.begin_onboard(:openai, server)
       File.write!(Path.join(codex_staging, "auth.json"), ~s({"tokens":{"access_token":"t"}}))
-      :ok = Credentials.finish_onboard(:openai, :subscription, server)
+      :ok = Credentials.finish_onboard(:openai, :subscription, codex_lease_id, server)
 
       assert Credentials.kind(:anthropic, server) == :api_key
       assert Credentials.kind(:openai, server) == :subscription

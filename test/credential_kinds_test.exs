@@ -55,9 +55,9 @@ defmodule Tightbeam.CredentialKindsTest do
     test "an API key banks with the kind recorded and no expiry", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, "oauth-token"), "sk-ant-api03-staged")
-      assert :ok = Credentials.finish_onboard(:anthropic, :api_key, server)
+      assert :ok = Credentials.finish_onboard(:anthropic, :api_key, lease_id, server)
 
       metadata =
         [ctx.base, "auth", "claude", ".tightbeam", "credential.json"]
@@ -81,9 +81,9 @@ defmodule Tightbeam.CredentialKindsTest do
     test "a subscription banks with its kind and keeps its expiry", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-      {:ok, staging} = Credentials.begin_onboard(:anthropic, server)
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, "oauth-token"), "sk-ant-oat01-staged")
-      assert :ok = Credentials.finish_onboard(:anthropic, :subscription, server)
+      assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata =
         [ctx.base, "auth", "claude", ".tightbeam", "credential.json"]
@@ -108,13 +108,13 @@ defmodule Tightbeam.CredentialKindsTest do
     test "both providers on one host can hold different kinds", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-      {:ok, claude_staging} = Credentials.begin_onboard(:anthropic, server)
+      {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(claude_staging, "oauth-token"), "sk-ant-api03-staged")
-      :ok = Credentials.finish_onboard(:anthropic, :api_key, server)
+      :ok = Credentials.finish_onboard(:anthropic, :api_key, claude_lease_id, server)
 
-      {:ok, codex_staging} = Credentials.begin_onboard(:openai, server)
+      {:ok, codex_staging, codex_lease_id} = Credentials.begin_onboard(:openai, server)
       File.write!(Path.join(codex_staging, "auth.json"), ~s({"tokens":{"access_token":"t"}}))
-      :ok = Credentials.finish_onboard(:openai, :subscription, server)
+      :ok = Credentials.finish_onboard(:openai, :subscription, codex_lease_id, server)
 
       assert Credentials.kind(:anthropic, server) == :api_key
       assert Credentials.kind(:openai, server) == :subscription
@@ -428,13 +428,17 @@ defmodule Tightbeam.CredentialKindsTest do
         params: %{provider: "anthropic", kind: "apiKey"}
       }
 
-      assert %{status: "ready", staging_path: staging} =
+      assert %{status: "ready", staging_path: staging, lease_id: lease_id} =
                onboard.(put_in(call.params[:phase], "begin"))
 
       File.write!(Path.join(staging, "oauth-token"), "sk-ant-api03-ceremony")
 
       assert %{provider: :anthropic, credential_kind: "apiKey", status: "onboarded"} =
-               onboard.(put_in(call.params[:phase], "finish"))
+               onboard.(
+                 call
+                 |> put_in([:params, :phase], "finish")
+                 |> put_in([:params, :lease_id], lease_id)
+               )
 
       # The wire translation did not leak into the store, whose spelling is its
       # own (invariant: one authority per vocabulary).
@@ -470,11 +474,15 @@ defmodule Tightbeam.CredentialKindsTest do
         params: %{provider: "anthropic", phase: "begin"}
       }
 
-      assert %{provider: :anthropic, kind: "apiKey", status: "ready"} =
+      assert %{provider: :anthropic, kind: "apiKey", status: "ready", lease_id: lease_id} =
                onboard.(put_in(call.params[:kind], "apiKey"))
 
       # Release the lease so the subscription spelling gets its own ceremony.
-      onboard.(%{call | params: Map.put(call.params, :phase, "cancel")})
+      onboard.(
+        call
+        |> put_in([:params, :phase], "cancel")
+        |> put_in([:params, :lease_id], lease_id)
+      )
 
       assert %{provider: :anthropic, kind: "subscription", status: "ready"} =
                onboard.(put_in(call.params[:kind], "subscription"))
