@@ -1274,7 +1274,7 @@ defmodule Tightbeam.GatewayTest do
 
     System.put_env("PATH", Path.dirname(self_codex))
 
-    assert_raise RuntimeError, ~r/no registered harness CLI is installed/, fn ->
+    assert_raise RuntimeError, ~r/no usable harness CLI/, fn ->
       Gateway.children(gateway_config(self_base, ctx.db, 0))
     end
 
