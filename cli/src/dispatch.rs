@@ -671,8 +671,13 @@ pub fn build_register_host_request(
     )
 }
 
-pub fn build_update_clients_request(identity: &Identity) -> RequestSpec {
-    request(identity, "update-clients", vec![], vec![])
+pub fn build_update_clients_request(as_user: &str) -> RequestSpec {
+    request(
+        &Identity::User(as_user.to_owned()),
+        "update-clients",
+        vec![],
+        vec![],
+    )
 }
 
 pub fn discover() -> Result<Endpoint, String> {
@@ -1009,7 +1014,7 @@ where
             unreachable!("help is handled before dispatch")
         }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
-        Command::UpdateClients { identity } => crate::ceremonies::update_clients(&identity),
+        Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::Onboard {
             identity,
@@ -1101,8 +1106,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
         | Command::ToolCallObserved
+        | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
-        Command::UpdateClients { identity } => Some(identity),
     }
 }
 

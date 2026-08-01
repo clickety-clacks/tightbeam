@@ -732,7 +732,7 @@ defmodule Tightbeam.Gateway do
           end
         end),
       "update-clients" =>
-        fn _call ->
+        admin_handler(db, fn _params ->
           hosts =
             config.base_dir
             |> Placement.hosts(db)
@@ -746,7 +746,7 @@ defmodule Tightbeam.Gateway do
             |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
-        end,
+        end),
       "identity-edit" =>
         admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
       "identity-status" =>

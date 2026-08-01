@@ -2140,7 +2140,7 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
-  test "update-clients enumerates satellites without an admin guard", ctx do
+  test "update-clients refuses non-admin callers and enumerates satellites for admins", ctx do
     register_hosts(ctx.db, %{
       "alpha" => %{
         ssh: "flynn@alpha.local",
@@ -2150,14 +2150,43 @@ defmodule Tightbeam.GatewayTest do
       "beta" => %{ssh: "beta.local", base_dir: "/srv/beta", cli_bin: nil}
     })
 
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["update-clients"]
+
+    # A RESOLVED non-admin, not an unknown caller: an unknown origin is refused
+    # by resolution failing, which would keep this green even if every real
+    # non-admin were wrongly authorized. Pair a second user (the cold-start rule
+    # gives admin only to the first) and refuse THAT principal.
+    {:pending, _guest_device} =
+      Devices.pair(ctx.db, %{
+        device_id: "guest-device",
+        claimed_name: "Guest",
+        platform: nil,
+        model: nil
+      })
+
+    refute match?(%{is_admin: true}, Devices.user(ctx.db, "guest"))
+
+    assert %{code: "forbidden", message: "admin required"} =
+             handler.(%{
+               origin: "user:guest",
+               session_key: nil,
+               params: %{}
+             })
+
+    # Prove the admin BIT is what decided, not a resolution failure that
+    # produces the same refusal shape: the same principal, promoted, passes.
+    %{is_admin: true} = Devices.set_user_admin(ctx.db, "guest", true)
+    assert %{hosts: _} = handler.(%{origin: "user:guest", session_key: nil, params: %{}})
+    %{is_admin: false} = Devices.set_user_admin(ctx.db, "guest", false)
+
     assert %{
              hosts: [
                %{name: "alpha", ssh: "flynn@alpha.local", cli_bin: "/srv/alpha/bin"},
                %{name: "beta", ssh: "beta.local", cli_bin: nil}
              ]
            } =
-             Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["update-clients"].(%{
-               origin: "agent:operator:app",
+             handler.(%{
+               origin: "user:flynn",
                session_key: nil,
                params: %{}
              })
