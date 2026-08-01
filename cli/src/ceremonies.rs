@@ -1244,13 +1244,13 @@ struct ClientUpdateHost {
     cli_bin: Option<String>,
 }
 
-pub fn update_clients(identity: &Identity) -> Result<(), String> {
+pub fn update_clients(as_user: &str) -> Result<(), String> {
     let mut io = SystemIo;
-    update_clients_with(&mut io, identity)
+    update_clients_with(&mut io, as_user)
 }
 
-fn update_clients_with(io: &mut dyn CeremonyIo, identity: &Identity) -> Result<(), String> {
-    let request = dispatch::build_update_clients_request(identity);
+fn update_clients_with(io: &mut dyn CeremonyIo, as_user: &str) -> Result<(), String> {
+    let request = dispatch::build_update_clients_request(as_user);
     let response = io.dispatch(&request)?;
     let hosts = client_update_hosts(response)?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -2353,7 +2353,7 @@ mod tests {
             ..FakeIo::default()
         };
 
-        let error = update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap_err();
+        let error = update_clients_with(&mut io, "flynn").unwrap_err();
 
         assert_eq!(
             io.dispatched,
@@ -2427,7 +2427,7 @@ mod tests {
             ..FakeIo::default()
         };
 
-        update_clients_with(&mut io, &Identity::Session).unwrap();
+        update_clients_with(&mut io, "flynn").unwrap();
 
         assert_eq!(
             io.commands[0].1,
@@ -2456,8 +2456,7 @@ mod tests {
             "Welcome to satellite.local\nmaintenance tonight\n{current}\n"
         ))]);
 
-        let error =
-            update_clients_with(&mut io, &Identity::Role("operator".to_owned())).unwrap_err();
+        let error = update_clients_with(&mut io, "flynn").unwrap_err();
 
         assert_eq!(
             io.commands
@@ -2479,7 +2478,7 @@ mod tests {
         ] {
             let mut io = one_update_host(vec![Ok(answer.to_owned())]);
 
-            let error = update_clients_with(&mut io, &Identity::Session).unwrap_err();
+            let error = update_clients_with(&mut io, "flynn").unwrap_err();
 
             assert_eq!(io.commands.len(), 1, "answer {answer:?} must not ship");
             assert!(io.logs[0].contains("question failed"));
@@ -2491,7 +2490,7 @@ mod tests {
     fn failed_version_question_does_not_ship() {
         let mut io = one_update_host(vec![Err(exec_failure("tightbeam: version refused"))]);
 
-        let error = update_clients_with(&mut io, &Identity::Session).unwrap_err();
+        let error = update_clients_with(&mut io, "flynn").unwrap_err();
 
         assert_eq!(
             io.commands
@@ -2513,7 +2512,7 @@ mod tests {
         };
         let mut io = one_update_host(vec![Ok("0.0.9\n".to_owned()), Ok(format!("{remote}\n"))]);
 
-        let error = update_clients_with(&mut io, &Identity::Session).unwrap_err();
+        let error = update_clients_with(&mut io, "flynn").unwrap_err();
 
         assert_eq!(
             io.commands
@@ -2539,7 +2538,7 @@ mod tests {
             Ok(String::new()),
         ]);
 
-        let error = update_clients_with(&mut io, &Identity::Session).unwrap_err();
+        let error = update_clients_with(&mut io, "flynn").unwrap_err();
         let remote_scripts = io
             .commands
             .iter()

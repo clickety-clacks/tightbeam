@@ -4,6 +4,7 @@ mod ceremonies;
 mod child_process;
 mod contain;
 mod dispatch;
+mod harness_process;
 mod harnesses;
 mod lease;
 mod preflight;
@@ -15,6 +16,26 @@ fn main() {
 
     if args.first().is_some_and(|arg| arg == "rail-exec") {
         match contain::rail_exec(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.first().is_some_and(|arg| arg == "harness-exec") {
+        match harness_process::session_exec(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.first().is_some_and(|arg| arg == "harness-group") {
+        match harness_process::group(&args[1..]) {
             Ok(status) => std::process::exit(status),
             Err(error) => {
                 eprintln!("{error}");

@@ -67,6 +67,8 @@ defmodule Tightbeam.Placement do
   an unreachable host degrades exactly like a dead adapter, per spec.
   """
 
+  require Logger
+
   alias Tightbeam.{Archetypes, DB, Harness, Homes, Identity, Org, Rails}
   import Bitwise
 
@@ -913,6 +915,9 @@ defmodule Tightbeam.Placement do
       home: home,
       cwd: config.cwd,
       stderr_path: stderr_path,
+      process_ssh: host_config.ssh,
+      process_identity_dir: host_config.base_dir,
+      process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
       on_auth_event: auth_event_handler(host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
@@ -1019,11 +1024,19 @@ defmodule Tightbeam.Placement do
     fn classification, event ->
       if classification == :terminal do
         Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-          Tightbeam.Credentials.mark_terminal(
-            module.credential_provider(),
-            event,
-            Tightbeam.Credentials.server(host)
-          )
+          case Tightbeam.Credentials.mark_terminal(
+                 module.credential_provider(),
+                 event,
+                 Tightbeam.Credentials.server(host)
+               ) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              Logger.error(
+                "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(reason)}"
+              )
+          end
         end)
 
         :ok

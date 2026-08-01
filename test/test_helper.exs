@@ -175,6 +175,29 @@ ExUnit.start(assert_receive_timeout: 1_000)
 
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 
+ExUnit.after_suite(fn _result ->
+  leaked = Tightbeam.HarnessProcessCensus.capture_for_suite(suite_tmp)
+
+  if leaked.count != 0 do
+    raise """
+    harness process fixtures leaked from this suite run:
+    #{Tightbeam.HarnessProcessCensus.format(leaked)}
+    """
+  end
+end)
+
+defmodule Tightbeam.CredentialParkTestReceiver do
+  use GenServer
+
+  def start_link(fun), do: GenServer.start_link(__MODULE__, fun)
+  def init(fun), do: {:ok, fun}
+
+  def handle_call({:tightbeam_command, command}, _from, fun) do
+    command = Tightbeam.CommandEdge.validate_command!(command)
+    {:reply, fun.(command.provider), fun}
+  end
+end
+
 # Remove the suite scratch root when the VM exits, NOT after each suite run:
 # `--repeat-until-failure` reruns the whole suite inside one BEAM and fires
 # `ExUnit.after_suite/1` every time. Deleting the root between iterations leaves
