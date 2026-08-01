@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::args::{AssimilateArgs, Identity};
+use crate::child_process::{exited_without_reaping, reset_sigchld_before_spawn};
 use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
 use crate::preflight;
@@ -1081,6 +1082,7 @@ impl CeremonyIo for SystemIo {
                 Ok(())
             });
         }
+        reset_sigchld_before_spawn();
         let mut child = command.spawn().map_err(|error| ExecFailure {
             message: error.to_string(),
             stdout: String::new(),
@@ -1108,7 +1110,7 @@ impl CeremonyIo for SystemIo {
         });
         let started = Instant::now();
         let status = loop {
-            match child_exited_without_reaping(&child) {
+            match exited_without_reaping(&child) {
                 Ok(true) if stdout_reader.is_finished() && stderr_reader.is_finished() => {
                     break child.wait().expect("observed child must still be waitable");
                 }
@@ -1131,16 +1133,18 @@ impl CeremonyIo for SystemIo {
                     });
                 }
                 Err(error) => {
-                    unsafe {
-                        libc::killpg(pgid, libc::SIGKILL);
-                    }
-                    let _ = child.wait();
-                    let stdout = stdout_reader.join().unwrap_or_default();
-                    let stderr = stderr_reader.join().unwrap_or_default();
+                    // An error says the child's identity could not be confirmed; ECHILD
+                    // says outright that it is no longer ours. That is not permission to
+                    // SIGKILL the number it used to have. Signal nothing and wait for
+                    // nothing: the child may still be live, so waiting or joining a pipe
+                    // it holds could hang this host operation indefinitely.
                     return Err(ExecFailure {
-                        message: error.to_string(),
-                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        message: format!(
+                            "wait for {} failed: {error}; process group left unsignalled",
+                            display_command(file, args)
+                        ),
+                        stdout: String::new(),
+                        stderr: String::new(),
                         status: None,
                         timed_out: false,
                     });
@@ -1169,25 +1173,6 @@ impl CeremonyIo for SystemIo {
     fn current_exe(&self) -> Result<PathBuf, String> {
         std::env::current_exe().map_err(|error| error.to_string())
     }
-}
-
-/// Observe the process-group leader without reaping it. Keeping the leader as a zombie
-/// keeps its pid (also the process-group id) reserved until any pipe-holding descendants
-/// have exited or the deadline requires the whole group to be killed.
-fn child_exited_without_reaping(child: &std::process::Child) -> io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id() as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(info.si_signo != 0)
 }
 
 pub fn assimilate(args: AssimilateArgs) -> Result<(), String> {
@@ -2468,6 +2453,93 @@ mod tests {
         assert!(error.timed_out);
         assert!(error.message.contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The inherited disposition has to be installed in the process that execs this test
+    /// binary. Changing it in the cargo test process would auto-reap children belonging to
+    /// unrelated tests running in parallel. The outer run therefore re-execs exactly this
+    /// test with SIGCHLD ignored; the inner run exercises `SystemIo` in that inherited
+    /// environment.
+    ///
+    /// The command's leader exits after forking a pipe-holding descendant. A correct
+    /// executor keeps that leader as a zombie, remains armed until the deadline, and then
+    /// kills the still-identified group. On linux without the parent-side reset, the
+    /// kernel auto-reaps the leader, `waitid` returns ECHILD, and the executor reports a
+    /// non-timeout failure after signalling a group id whose leader it no longer owns.
+    #[test]
+    fn an_inherited_sigchld_ignore_keeps_timeout_group_identity_reserved() {
+        const INNER: &str = "TIGHTBEAM_SIGCHLD_CEREMONY_INNER";
+        const DIR: &str = "TIGHTBEAM_SIGCHLD_CEREMONY_DIR";
+
+        if std::env::var_os(INNER).is_some() {
+            let dir = PathBuf::from(std::env::var_os(DIR).expect("outer test supplied temp dir"));
+            let forked = dir.join("descendant-forked");
+            let survived = dir.join("descendant-survived");
+            let script = format!(
+                "(sleep 2; echo survived > '{}') & echo forked > '{}'; exit 0",
+                survived.display(),
+                forked.display()
+            );
+            let mut io = SystemIo;
+            let error = io
+                .exec(
+                    "/bin/sh",
+                    &["-c".to_owned(), script],
+                    Duration::from_millis(500),
+                )
+                .unwrap_err();
+            let disposition_after_exec = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+
+            assert!(forked.exists(), "the pipe-holding descendant never started");
+            assert_eq!(
+                disposition_after_exec,
+                libc::SIG_DFL,
+                "the executor left its inherited SIGCHLD ignore in force"
+            );
+            assert!(error.timed_out, "wrong failure band: {}", error.message);
+            assert!(error.message.contains("timed out"));
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("tightbeam-ceremony-sigchld-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut command = ProcessCommand::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "ceremonies::tests::an_inherited_sigchld_ignore_keeps_timeout_group_identity_reserved",
+                "--nocapture",
+            ])
+            .env(INNER, "1")
+            .env(DIR, &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "inherited-SIGCHLD child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        thread::sleep(Duration::from_millis(2_100));
+        assert!(
+            !dir.join("descendant-survived").exists(),
+            "the timed-out command left its pipe-holding descendant alive"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn args() -> AssimilateArgs {
