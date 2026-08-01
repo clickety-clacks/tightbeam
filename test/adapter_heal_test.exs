@@ -218,6 +218,38 @@ defmodule Tightbeam.AdapterHealTest do
       do: {:reply, GenServer.call(state.real, message, 30_000), state}
   end
 
+  defmodule RulingQueryBarrierDB do
+    @moduledoc false
+    use GenServer
+
+    @doc "Captures the first correlation query result, then blocks before returning it."
+    def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+
+    def init(state), do: {:ok, Map.put(state, :captured, false)}
+
+    def handle_call({:query, sql, _params} = message, _from, state) do
+      reply = GenServer.call(state.real, message, 30_000)
+
+      state =
+        if not state.captured and String.contains?(sql, "WHERE correlationKey=?1") do
+          send(state.parent, {:ruling_read_episode, self()})
+
+          receive do
+            :release_ruling -> :ok
+          end
+
+          %{state | captured: true}
+        else
+          state
+        end
+
+      {:reply, reply, state}
+    end
+
+    def handle_call(message, _from, state),
+      do: {:reply, GenServer.call(state.real, message, 30_000), state}
+  end
+
   defmodule ModelReadBarrierDB do
     @moduledoc false
     use GenServer
@@ -1329,18 +1361,23 @@ defmodule Tightbeam.AdapterHealTest do
 
     assert_receive {:heal_has_lock, heal_proxy}
 
+    ruling_db =
+      start_supervised!({RulingQueryBarrierDB, real: ctx.db, parent: self()})
+
     ruling =
       Task.async(fn ->
-        Gateway.handlers(ctx.config)["adjudicate"].(%{
+        Gateway.handlers(Map.put(ctx.config, :db, ruling_db))["adjudicate"].(%{
           origin: "user:flynn",
           principal: {:session, episode.owner_target},
           params: %{episode: episode.correlation_key, action: "park"}
         })
       end)
 
+    assert_receive {:ruling_read_episode, ruling_db}
     send(heal_proxy, :release_heal)
     assert [{"k1", "other", :released}] = Task.await(healing)
 
+    send(ruling_db, :release_ruling)
     result = Task.await(ruling)
 
     # The ruling is DENIED — not a MatchError escaping to the wire.
