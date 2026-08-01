@@ -233,6 +233,9 @@ pub enum Command {
         setting: String,
         value: String,
     },
+    UpdateClients {
+        identity: Identity,
+    },
     Assimilate(AssimilateArgs),
 }
 
@@ -1274,6 +1277,14 @@ fn parse_with_optional_catalog(
         }
         "onboard" => parse_onboard(&parsed, flags),
         "config" => parse_config(&parsed, flags),
+        "update-clients" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam update-clients".to_owned());
+            }
+            Ok(Command::UpdateClients {
+                identity: identity(flags)?,
+            })
+        }
         "assimilate" => {
             let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
                 "usage: tightbeam assimilate <ssh-dest> --as-user <adminUserId>".to_owned()
@@ -1521,6 +1532,16 @@ mod tests {
     }
 
     #[test]
+    fn update_clients_accepts_any_normal_identity() {
+        assert_eq!(
+            parse(strings(&["update-clients", "--as", "coder"])),
+            Ok(Command::UpdateClients {
+                identity: Identity::Role("coder".to_owned())
+            })
+        );
+    }
+
+    #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
         let command_section = help
@@ -1604,7 +1625,6 @@ mod tests {
     fn help_uses_only_supplied_projection_names() {
         let catalog = HarnessCatalog {
             harnesses: vec![crate::harnesses::HarnessProjection {
-                id: "third".to_owned(),
                 wire_name: "third".to_owned(),
                 install_package: "third-package".to_owned(),
                 cli_binary: "third-cli".to_owned(),
@@ -1621,7 +1641,6 @@ mod tests {
     fn fixture_projection_drives_spawn_validation_and_assimilation_defaults() {
         let catalog = HarnessCatalog {
             harnesses: vec![crate::harnesses::HarnessProjection {
-                id: "fixture".to_owned(),
                 wire_name: "fixture".to_owned(),
                 install_package: "fixture-package".to_owned(),
                 cli_binary: "fixture".to_owned(),

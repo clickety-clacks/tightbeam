@@ -8,7 +8,6 @@ use crate::dispatch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessProjection {
-    pub id: String,
     pub wire_name: String,
     pub install_package: String,
     /// The vendor CLI this harness invokes directly, which the operator installs.
@@ -65,8 +64,8 @@ fn parse(encoded: &str) -> Result<HarnessCatalog, String> {
                         .ok_or_else(|| "harness process marker is not a string".to_owned())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            string("id")?;
             Ok(HarnessProjection {
-                id: string("id")?,
                 wire_name: string("wire_name")?,
                 install_package: string("install_package")?,
                 cli_binary: string("cli_binary")?,
@@ -198,7 +197,6 @@ pub fn catalog() -> Result<HarnessCatalog, String> {
         ]
         .into_iter()
         .map(|(name, marker)| HarnessProjection {
-            id: name.to_owned(),
             wire_name: name.to_owned(),
             install_package: format!("{name}-package"),
             cli_binary: name.to_owned(),
@@ -225,7 +223,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(catalog.names(), vec!["third"]);
-        assert_eq!(catalog.harnesses[0].id, "third");
         assert_eq!(catalog.harnesses[0].install_package, "pkg");
         assert_eq!(catalog.harnesses[0].cli_binary, "third-cli");
         assert_eq!(catalog.harnesses[0].process_markers, vec!["marker"]);
@@ -244,6 +241,29 @@ mod tests {
             .unwrap_err()
             .contains("missing cli_binary")
         );
+    }
+
+    #[test]
+    fn a_cached_projection_without_an_id_uses_the_live_route() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-missing-harness-id-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("harnesses.json"),
+            r#"[{"wire_name":"cached","install_package":"pkg","cli_binary":"cached-cli","process_markers":[]}]"#,
+        )
+        .unwrap();
+
+        let live = r#"[{"id":"live","wire_name":"live","install_package":"live-pkg","cli_binary":"live-cli","process_markers":[]}]"#;
+        let catalog = load_from_with(&root, || parse(live)).unwrap();
+
+        assert_eq!(catalog.names(), vec!["live"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

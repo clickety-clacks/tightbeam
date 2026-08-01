@@ -2140,6 +2140,29 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "update-clients enumerates satellites without an admin guard", ctx do
+    register_hosts(ctx.db, %{
+      "alpha" => %{
+        ssh: "flynn@alpha.local",
+        base_dir: "/srv/alpha",
+        cli_bin: "/srv/alpha/bin"
+      },
+      "beta" => %{ssh: "beta.local", base_dir: "/srv/beta", cli_bin: nil}
+    })
+
+    assert %{
+             hosts: [
+               %{name: "alpha", ssh: "flynn@alpha.local", cli_bin: "/srv/alpha/bin"},
+               %{name: "beta", ssh: "beta.local", cli_bin: nil}
+             ]
+           } =
+             Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["update-clients"].(%{
+               origin: "agent:operator:app",
+               session_key: nil,
+               params: %{}
+             })
+  end
+
   test "a crash-recovered turn warns that side effects are unknown, not undone", ctx do
     # Boot recovery terminalizes an interrupted turn as "outcome unknown". The
     # in-chat marker must tell the agent to VERIFY before repeating anything
