@@ -18,19 +18,20 @@ defmodule Tightbeam.HarnessProcessCensus do
     )
   end
 
-  # Suite-end leak check. The root-path regex above is ONE fragile channel: it
-  # dies with the identity files a believed-clean teardown deletes, and with any
-  # spelling difference between the recorded root and what ps prints. Every
-  # fixture path embeds THIS suite's OS pid (`harness-process-<suite-pid>-<n>`,
-  # config/test.exs), so that number is a scope key that survives all of the
-  # above while still excluding a concurrent suite's fixtures on a shared box.
-  # A survivor is a leak if EITHER channel sees it.
+  # Suite-end leak check. The full root-path regex above is ONE fragile
+  # channel: it dies with the identity files a believed-clean teardown deletes,
+  # and with any spelling difference between the recorded root and what ps
+  # prints (macOS spells the same tmpdir /var/... and /private/var/...). The
+  # root's BASENAME -- tightbeam-test-<suite-pid>-<nonce>, config/test.exs --
+  # is prefix-independent and, because of the nonce, unique across pid reuse
+  # and reboots, so it cannot claim an older leaked suite's fixtures the way a
+  # bare pid pattern could. A survivor is a leak if EITHER channel sees it.
   def capture_for_suite(root) do
-    suite = System.pid()
+    base = Path.basename(root)
 
     capture(
       Path.wildcard(Path.join(root, "**/harness-processes/*.identity")),
-      ~r{(?:^|\s)#{Regex.escape(root)}/\S+|/harness-process-#{suite}-\d+/}
+      ~r{(?:^|\s)#{Regex.escape(root)}/\S+|/#{Regex.escape(base)}/}
     )
   end
 

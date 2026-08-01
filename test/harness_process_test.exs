@@ -227,7 +227,12 @@ defmodule Tightbeam.HarnessProcessTest do
 
     launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
     [row] = HarnessProcess.list(ctx.db)
-    File.write!(row.identity_path, "123\t123\tboot-marker\t#{launch_id}\n")
+    # Forged identities MUST carry an unallocatable pgid: teardown raw-kills
+    # every identity-recorded group it discovers, and 999999123 exceeds every
+    # OS pid ceiling (macOS ~99998, linux default 4194304), so the kill is
+    # ESRCH by construction and can never reach a real process. Never forge a
+    # low number here.
+    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
 
     {:ok, _} =
       DB.query(
@@ -654,7 +659,10 @@ defmodule Tightbeam.HarnessProcessTest do
       #!/bin/sh
       #{@helper} "$@"
       status=$?
-      if [ "$status" -eq 0 ]; then
+      # Sabotage ONLY the harness-group (kill/cleanup) mode: under harness-exec
+      # $3 is the launch ULID, not a path, and mutating it litters the cwd with
+      # <ULID>/residual directories (two were once committed by mistake).
+      if [ "$status" -eq 0 ] && [ "$1" = "harness-group" ]; then
         rm -f "$3"
         mkdir "$3"
         touch "$3/residual"
