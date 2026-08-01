@@ -634,6 +634,7 @@ pub fn build_onboard_phase_request(
     phase: &str,
     kind: &str,
     machine: Option<&str>,
+    lease_id: Option<&str>,
     reason: Option<&str>,
 ) -> RequestSpec {
     // `kind` rides on EVERY phase, not just finish, so the conversation is
@@ -645,6 +646,9 @@ pub fn build_onboard_phase_request(
     ];
     if let Some(machine) = machine {
         params.push(string_field("machine", machine));
+    }
+    if let Some(lease_id) = lease_id {
+        params.push(string_field("leaseId", lease_id));
     }
     if let Some(reason) = reason {
         params.push(string_field("reason", reason));
@@ -896,9 +900,7 @@ fn send_to_with_timeout(
         Err(ureq::Error::Status(status, response)) => (status, response),
         Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
     };
-    let encoded = response
-        .into_string()
-        .map_err(|error| response_read_error(status, error.to_string()))?;
+    let encoded = response.into_string().map_err(|error| error.to_string())?;
     parse_response(status, &encoded)
 }
 
@@ -923,24 +925,8 @@ fn ceremony_expired() -> String {
     "gateway request refused because the onboarding lease expired".to_owned()
 }
 
-const ACCEPTED_RESPONSE_UNREADABLE: &str =
-    "gateway accepted the request but its response was unreadable";
-
-fn response_read_error(status: u16, reason: String) -> String {
-    if (200..300).contains(&status) {
-        format!("{ACCEPTED_RESPONSE_UNREADABLE} (HTTP {status}): {reason}")
-    } else {
-        reason
-    }
-}
-
-pub(crate) fn accepted_response_was_unreadable(reason: &str) -> bool {
-    reason.starts_with(ACCEPTED_RESPONSE_UNREADABLE)
-}
-
 pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
-    let json: Value = serde_json::from_str(encoded)
-        .map_err(|error| response_read_error(status, error.to_string()))?;
+    let json: Value = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
 
     if !(200..300).contains(&status) {
         let code = json
@@ -1523,6 +1509,7 @@ mod tests {
             "subscription",
             Some("work-1"),
             None,
+            None,
         );
 
         assert_eq!(
@@ -1541,12 +1528,13 @@ mod tests {
             "finish",
             "apiKey",
             Some("work-1"),
+            Some("lease-7"),
             None,
         );
 
         assert_eq!(
             keyed.body_json,
-            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1"}}"#
+            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
         );
         assert!(!keyed.body_json.contains("sk-"));
     }
@@ -2000,6 +1988,7 @@ mod tests {
                 if phase == "begin" {
                     Ok(Some(serde_json::json!({
                         "stagingPath": staging,
+                        "leaseId": "lease-7",
                         "leaseTtlMs": 60_000
                     })))
                 } else {
@@ -2053,6 +2042,7 @@ mod tests {
             "finish",
             "subscription",
             Some("work-1"),
+            None,
             None,
         );
         let error = send_to_with_deadline(

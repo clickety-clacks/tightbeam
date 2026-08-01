@@ -45,13 +45,22 @@ defmodule Tightbeam.ProviderAdditivityTest do
 
     call = %{origin: "user:fixture-admin", params: %{provider: "fixture-provider"}}
 
-    assert %{provider: :fixture_provider, status: "ready", staging_path: staging_path} =
+    assert %{
+             provider: :fixture_provider,
+             status: "ready",
+             staging_path: staging_path,
+             lease_id: lease_id
+           } =
              onboard.(put_in(call.params[:phase], "begin"))
 
     File.write!(Path.join(staging_path, "fixture.json"), "fixture-provider-credential")
 
     assert %{provider: :fixture_provider, status: "onboarded"} =
-             onboard.(put_in(call.params[:phase], "finish"))
+             onboard.(
+               call
+               |> put_in([:params, :phase], "finish")
+               |> put_in([:params, :lease_id], lease_id)
+             )
 
     assert Credentials.status(:fixture_provider) == :onboarded
 
