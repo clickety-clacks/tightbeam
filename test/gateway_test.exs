@@ -35,6 +35,14 @@ defmodule Tightbeam.GatewayTest do
   # weakens nothing — assert_receive still fails if the message never arrives.
   @cold_runner_prompt_timeout 60_000
 
+  @archetype_reference_writers [
+    {:main_session_seed, "lib/tightbeam/wire/socket.ex", "Org.create_in_txn"},
+    {:typed_spawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
+    {:adjudication_respawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
+    {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_in_txn"},
+    {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
+  ]
+
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
@@ -62,6 +70,7 @@ defmodule Tightbeam.GatewayTest do
     Projection,
     Rails,
     Roles,
+    Rules,
     SessionLane,
     Wakes,
     WorkItems,
@@ -2148,6 +2157,58 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "update-clients refuses non-admin callers and enumerates satellites for admins", ctx do
+    register_hosts(ctx.db, %{
+      "alpha" => %{
+        ssh: "flynn@alpha.local",
+        base_dir: "/srv/alpha",
+        cli_bin: "/srv/alpha/bin"
+      },
+      "beta" => %{ssh: "beta.local", base_dir: "/srv/beta", cli_bin: nil}
+    })
+
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["update-clients"]
+
+    # A RESOLVED non-admin, not an unknown caller: an unknown origin is refused
+    # by resolution failing, which would keep this green even if every real
+    # non-admin were wrongly authorized. Pair a second user (the cold-start rule
+    # gives admin only to the first) and refuse THAT principal.
+    {:pending, _guest_device} =
+      Devices.pair(ctx.db, %{
+        device_id: "guest-device",
+        claimed_name: "Guest",
+        platform: nil,
+        model: nil
+      })
+
+    refute match?(%{is_admin: true}, Devices.user(ctx.db, "guest"))
+
+    assert %{code: "forbidden", message: "admin required"} =
+             handler.(%{
+               origin: "user:guest",
+               session_key: nil,
+               params: %{}
+             })
+
+    # Prove the admin BIT is what decided, not a resolution failure that
+    # produces the same refusal shape: the same principal, promoted, passes.
+    %{is_admin: true} = Devices.set_user_admin(ctx.db, "guest", true)
+    assert %{hosts: _} = handler.(%{origin: "user:guest", session_key: nil, params: %{}})
+    %{is_admin: false} = Devices.set_user_admin(ctx.db, "guest", false)
+
+    assert %{
+             hosts: [
+               %{name: "alpha", ssh: "flynn@alpha.local", cli_bin: "/srv/alpha/bin"},
+               %{name: "beta", ssh: "beta.local", cli_bin: nil}
+             ]
+           } =
+             handler.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{}
+             })
+  end
+
   test "a crash-recovered turn warns that side effects are unknown, not undone", ctx do
     # Boot recovery terminalizes an interrupted turn as "outcome unknown". The
     # in-chat marker must tell the agent to VERIFY before repeating anything
@@ -3584,6 +3645,7 @@ defmodule Tightbeam.GatewayTest do
       )
 
     base_dir = role_test_base("effort-adjudication")
+    Archetypes.load!(base_dir)
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4703,11 +4765,321 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "pre-merge policy rejected relearn"
   end
 
+  test "learn and unlearn reload all law and unlearn names durable references", ctx do
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    base_dir = role_test_base("learn-unlearn")
+    Identity.init!(base_dir)
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    learn = handlers["learn"]
+    unlearn = handlers["unlearn"]
+    repoint = handlers["identity-repoint"]
+    retire = handlers["retire"]
+
+    assert %{state: "published", kungfu: "agentic-engineering", live_revision: revision} =
+             learn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert revision == Identity.live_revision!(base_dir)
+    assert Archetypes.get("coder").name == "coder"
+    assert Rails.statutes?()
+    assert :persistent_term.get(Rules, []) != []
+
+    active =
+      Org.create(ctx.db, %{
+        session_key: "agent:bundle-active",
+        display_name: "Bundle active",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    retired =
+      Org.create(ctx.db, %{
+        session_key: "agent:bundle-retired",
+        display_name: "Bundle retired",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+      |> then(&Org.retire(ctx.db, &1.session_key))
+
+    assert %{
+             state: "referenced",
+             code: "kungfu_referenced",
+             message: message,
+             sessions: sessions,
+             setting: nil
+           } = unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert message =~ active.session_key
+    assert message =~ retired.session_key
+
+    assert Enum.map(sessions, &{&1.session_key, &1.state}) |> Enum.sort() ==
+             [{active.session_key, "active"}, {retired.session_key, "retired"}]
+
+    assert %{state: "repointed", session_key: retired_key, archetype: "default"} =
+             repoint.(%{
+               origin: "user:flynn",
+               session_key: retired.session_key,
+               params: %{archetype: "default"}
+             })
+
+    assert retired_key == retired.session_key
+
+    assert %{retired_session_keys: [active_key]} =
+             retire.(%{
+               origin: "user:flynn",
+               session_key: active.session_key,
+               params: %{}
+             })
+
+    assert active_key == active.session_key
+
+    assert %{state: "repointed", session_key: ^active_key, archetype: "default"} =
+             repoint.(%{
+               origin: "user:flynn",
+               session_key: active.session_key,
+               params: %{archetype: "default"}
+             })
+
+    assert Org.get(ctx.db, retired.session_key).archetype == "default"
+    assert Org.get(ctx.db, retired.session_key).identity_name == "default"
+
+    :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
+
+    assert %{state: "referenced", sessions: [], setting: "coder", message: setting_message} =
+             unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert setting_message =~ "default-archetype setting: coder"
+    :ok = Org.put_setting(ctx.db, "default-archetype", "default")
+
+    assert %{state: "published", kungfu: "agentic-engineering"} =
+             unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert Archetypes.get("coder") == nil
+    refute Rails.statutes?()
+    assert :persistent_term.get(Rules, []) == []
+  end
+
+  test "every unlearn reference kind supplies supported commands that clear it", ctx do
+    ensure_global_registry()
+    base_dir = role_test_base("unlearn-reference-property")
+    learn_engineering_identity!(base_dir)
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    active =
+      Org.create(ctx.db, %{
+        session_key: "agent:clear-active",
+        display_name: "Clear active",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    retired =
+      Org.create(ctx.db, %{
+        session_key: "agent:clear-retired",
+        display_name: "Clear retired",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+      |> then(&Org.retire(ctx.db, &1.session_key))
+
+    main =
+      Org.create(ctx.db, %{
+        session_key: "user:bundle-main",
+        display_name: "Main",
+        kind: "main",
+        is_built_in: true,
+        owner_user_id: "bundle-owner",
+        origin: "user:bundle-owner",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    Org.append_pointer(ctx.db, main.session_key, "bundle-main-resident", "created")
+    start_lane!(ctx.db, main.session_key)
+    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
+
+    assert %{state: "referenced", references: references} =
+             handlers["unlearn"].(%{
+               origin: "user:flynn",
+               params: %{name: "agentic-engineering"}
+             })
+
+    assert MapSet.new(Enum.map(references, & &1.kind)) == MapSet.new(["session", "setting"])
+    assert Enum.all?(references, &(&1.clear_commands != []))
+
+    for reference <- references, command <- reference.clear_commands do
+      assert Map.has_key?(handlers, command.verb)
+      result = handlers[command.verb].(Map.put(command, :origin, "user:flynn"))
+      refute result[:code], inspect({reference, command, result})
+    end
+
+    assert Org.get(ctx.db, active.session_key).archetype == "default"
+    assert Org.get(ctx.db, retired.session_key).archetype == "default"
+    assert Org.get(ctx.db, main.session_key).archetype == "default"
+    assert Org.get(ctx.db, main.session_key).state == "active"
+    assert_received {:identity_apply_close, "bundle-main-resident"}
+
+    assert %{state: "published", kungfu: "agentic-engineering"} =
+             handlers["unlearn"].(%{
+               origin: "user:flynn",
+               params: %{name: "agentic-engineering"}
+             })
+  end
+
+  test "archetype reference writer enumeration covers every production mutation call" do
+    expected =
+      Enum.frequencies_by(@archetype_reference_writers, fn {_name, file, call} -> {file, call} end)
+
+    calls = @archetype_reference_writers |> Enum.map(&elem(&1, 2)) |> Enum.uniq()
+
+    actual =
+      for file <- Path.wildcard("lib/**/*.ex"), call <- calls, reduce: %{} do
+        counts ->
+          count =
+            Regex.scan(Regex.compile!("\\b#{Regex.escape(call)}\\s*\\("), File.read!(file))
+            |> length()
+
+          if count == 0,
+            do: counts,
+            else: Map.put(counts, {file, call}, count)
+      end
+
+    assert actual == expected
+  end
+
+  test "queued adjudication respawn resolves a removed archetype to neutral default", ctx do
+    ensure_global_registry()
+    base_dir = role_test_base("unlearn-respawn-race")
+    learn_engineering_identity!(base_dir)
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    owner =
+      Org.create(ctx.db, %{
+        session_key: "agent:respawn-owner",
+        display_name: "Respawn owner",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    old =
+      Org.create(ctx.db, %{
+        session_key: "user:respawn-race",
+        display_name: "Respawn race",
+        kind: "main",
+        is_built_in: true,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        spawned_by: owner.session_key,
+        archetype: "coder",
+        identity_name: "coder",
+        overrides: %{skills_add: ["role-skill"]},
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    {:appended, failed_message} =
+      Projection.append(ctx.db, %{
+        session_key: old.session_key,
+        role: "user",
+        content: "failed prompt",
+        sender: "user:flynn"
+      })
+
+    {:ok, failed_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: old.session_key,
+        message_id: failed_message.id,
+        origin: "user:flynn",
+        prompt: "failed prompt"
+      })
+
+    :ok = DB.execute(ctx.db, "UPDATE turns SET status='running' WHERE seq=#{failed_seq}")
+    :ok = Ledger.finish(ctx.db, failed_seq, "failed", "quota")
+    episode = notify_adjudication(ctx.db, old.session_key, owner.session_key)
+
+    # Suspend the catalog so respawn has already captured `old` but cannot enter
+    # its insert transaction. Repoint and unlearn then serialize ahead of it.
+    :ok = :sys.suspend(ModelCatalog)
+
+    try do
+      respawn =
+        Task.async(fn ->
+          handlers["adjudicate"].(%{
+            origin: "agent:respawn-owner",
+            principal: {:session, owner.session_key},
+            session_key: old.session_key,
+            params: %{
+              episode: episode.correlation_key,
+              action: "respawn",
+              model: "claude-sonnet-4-6"
+            }
+          })
+        end)
+
+      assert_process_mailbox(ModelCatalog, 1)
+
+      assert {:ok, {:ok, %{archetype: "default"}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Org.repoint_archetype_in_txn(txn, old.session_key, "default")
+               end)
+
+      assert %{state: "published", kungfu: "agentic-engineering"} =
+               handlers["unlearn"].(%{
+                 origin: "user:flynn",
+                 params: %{name: "agentic-engineering"}
+               })
+
+      :ok = :sys.resume(ModelCatalog)
+      assert %{ok: true, action: "respawn", session_key: new_key} = Task.await(respawn, 5_000)
+
+      assert %{archetype: "default", identity_name: "default", overrides: nil} =
+               Org.get(ctx.db, new_key)
+
+      refute Enum.any?(Org.list_all(ctx.db), &(&1.archetype == "coder"))
+    after
+      _ = :sys.resume(ModelCatalog)
+    end
+  end
+
   test "identity apply refreshes one stamped session at a turn boundary without restarting runtime",
        ctx do
     base_dir = role_test_base("identity-apply")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -4814,8 +5186,7 @@ defmodule Tightbeam.GatewayTest do
   # (drain series 25/11/6/13/8/6/8) from its own bracket nags and DR notifications.
   test "identity apply proceeds with queued turns that have not started", ctx do
     base_dir = role_test_base("identity-apply-queued")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -4865,8 +5236,7 @@ defmodule Tightbeam.GatewayTest do
   # started-and-not-terminal discriminator.
   test "identity apply refuses while a turn is genuinely running", ctx do
     base_dir = role_test_base("identity-apply-running")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -4924,8 +5294,7 @@ defmodule Tightbeam.GatewayTest do
   # session's barrier.
   test "queued turns on a bystander session do not block org-wide apply", ctx do
     base_dir = role_test_base("identity-apply-bystander")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     for {key, name} <- [{"agent:leg-one", "Leg one"}, {"agent:leg-two", "Leg two"}] do
@@ -4978,8 +5347,7 @@ defmodule Tightbeam.GatewayTest do
   # outright, so this window is newly reachable and gets its own adversarial test.
   test "a queued turn cannot start while apply is bouncing the session", ctx do
     base_dir = role_test_base("identity-apply-toctou")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5076,8 +5444,7 @@ defmodule Tightbeam.GatewayTest do
   # ensures the lane before deciding, so there is one path rather than two.
   test "a lane born during the bounce cannot claim a turn either", ctx do
     base_dir = role_test_base("identity-apply-newborn")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5187,8 +5554,7 @@ defmodule Tightbeam.GatewayTest do
   # is broken" when the truth is "nothing was running".
   test "cancel waits for the boundary instead of timing out under it", ctx do
     base_dir = role_test_base("identity-apply-cancel-wait")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5279,8 +5645,7 @@ defmodule Tightbeam.GatewayTest do
   # this seam's to make.
   test "a lane ensured over queued work defers, and the retry after it succeeds", ctx do
     base_dir = role_test_base("identity-apply-residual")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5395,8 +5760,7 @@ defmodule Tightbeam.GatewayTest do
   # session is a no-op: it materializes from live at first start, already current.
   test "identity apply skips a never-started session instead of raising", ctx do
     base_dir = role_test_base("identity-apply-unstarted")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5449,8 +5813,7 @@ defmodule Tightbeam.GatewayTest do
   test "identity apply advances the stamp of a started session the adapter no longer holds",
        ctx do
     base_dir = role_test_base("identity-apply-gone")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5524,8 +5887,7 @@ defmodule Tightbeam.GatewayTest do
   test "identity apply --all handles resident, gone, and never-started sessions in one pass",
        ctx do
     base_dir = role_test_base("identity-apply-all")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     make = fn key, pointer ->
@@ -5596,8 +5958,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "identity apply refuses by name when a live adapter fails for its own reason", ctx do
     base_dir = role_test_base("identity-apply-error")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -6085,6 +6446,12 @@ defmodule Tightbeam.GatewayTest do
     base_dir
   end
 
+  defp learn_engineering_identity!(base_dir) do
+    assert :initialized = Identity.init!(base_dir)
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "test")
+    Archetypes.load!(base_dir)
+  end
+
   defp create_session(db, session_key, owner_user_id, spawned_by \\ nil) do
     Org.create(db, %{
       session_key: session_key,
@@ -6133,6 +6500,22 @@ defmodule Tightbeam.GatewayTest do
       {:error, {:already_started, _pid}} -> :ok
     end
   end
+
+  defp assert_process_mailbox(name, minimum, attempts \\ 100)
+
+  defp assert_process_mailbox(name, minimum, attempts) when attempts > 0 do
+    case Process.info(Process.whereis(name), :message_queue_len) do
+      {:message_queue_len, count} when count >= minimum ->
+        :ok
+
+      _ ->
+        Process.sleep(10)
+        assert_process_mailbox(name, minimum, attempts - 1)
+    end
+  end
+
+  defp assert_process_mailbox(name, minimum, 0),
+    do: flunk("#{inspect(name)} mailbox did not reach #{minimum} queued message(s)")
 
   defp credential_probe(parent, command) do
     send(parent, {:credential_command, command})

@@ -492,50 +492,10 @@ defmodule Tightbeam.Archetypes do
   @doc "The built-in guidance fragment library."
   @spec builtin_fragments() :: %{optional(String.t()) => String.t()}
   def builtin_fragments do
-    shared =
-      for name <- [
-            "engineering-tenets.md",
-            "harness-support.md",
-            "preferred-models.md",
-            "wisdom-core.md",
-            "wisdom-meta.md"
-          ],
-          into: %{} do
-        {name, shipped_guidance!(Path.join(["kungfu", "agentic-engineering", "guidance", name]))}
-      end
-
-    archetypes =
-      for name <- engineering_archetype_names(), into: %{} do
-        {"#{name}.md",
-         shipped_guidance!(Path.join(["kungfu", "agentic-engineering", "guidance", "#{name}.md"]))}
-      end
-
-    shared
-    |> Map.merge(archetypes)
     # The operating manual is shipped content (priv/guidance/operating-manual.md),
     # the single source of truth — not a hardcoded literal that can drift from it.
-    |> Map.put("operating-manual.md", shipped_guidance!("guidance/operating-manual.md"))
+    %{"operating-manual.md" => shipped_guidance!("guidance/operating-manual.md")}
   end
-
-  @bundle_skill_names [
-    "feature-cycle",
-    "work-tracking",
-    "unblocking",
-    "spec-homing",
-    "spec-handoff",
-    "worktree-session",
-    "committing-and-pushing",
-    "reviewing-code",
-    "reviewing-specs",
-    "spec-conformance",
-    "review-for-completeness",
-    "review-for-yagni",
-    "recon-first-investigation",
-    "recon-lifecycle",
-    "bug-provenance",
-    "drafting-requirements",
-    "product-discovery"
-  ]
 
   @kungfu_template_paths [
     "archetypes/<name>-role.toml",
@@ -564,13 +524,9 @@ defmodule Tightbeam.Archetypes do
   @spec skills_dir(String.t()) :: String.t()
   def skills_dir(base_dir), do: Path.join([base_dir, "identity", "skills"])
 
-  @doc "Learn the shipped kungfu into the three-ref served-identity repository."
+  @doc "Seed the neutral three-ref served-identity repository."
   @spec init_identity!(String.t()) :: :initialized | :noop
   def init_identity!(base_dir), do: Tightbeam.Identity.init!(base_dir)
-
-  @doc "Skill files shipped by the built-in agentic-engineering bundle."
-  @spec builtin_skill_names() :: [String.t()]
-  def builtin_skill_names, do: @bundle_skill_names
 
   @doc "Create a valid, unelected kungfu starter through the served-identity seam."
   @spec scaffold_kungfu!(String.t(), String.t(), String.t()) :: [String.t()]
@@ -591,10 +547,6 @@ defmodule Tightbeam.Archetypes do
       end)
 
     Tightbeam.Identity.scaffold!(base_dir, name, entries, author)
-  end
-
-  defp engineering_archetype_names do
-    ["orchestrator", "spec-writer", "coder", "reviewer", "recon", "product-owner"]
   end
 
   defp shipped_guidance!(relative_path) do

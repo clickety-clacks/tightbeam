@@ -16,6 +16,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     Escalation,
     EventLog,
     Gateway,
+    Identity,
     Idempotency,
     Ledger,
     Org,
@@ -97,11 +98,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
     %{db: db, base_dir: base_dir, handlers: handlers, holder: holder, reviewer: reviewer}
   end
 
-  # The statutes are NOT copied in: the setup's `init_identity!` is a real learn
-  # from the shipped bundle, so loading the org's own identity tree is what
-  # arrives on learn (§7). Copying them here would pass even if learn stopped
-  # delivering `rules/`.
+  # The statutes are NOT copied in: `learn!` performs the real shipped-bundle
+  # import, so loading the org's own identity tree is what arrives on learn
+  # (§7). Copying them here would pass even if learn stopped delivering
+  # `rules/`.
   defp learn_engineering_rules!(ctx) do
+    assert {:ok, _revision} =
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "flynn")
+
     for file <- ["engineering.toml", "verification.toml"] do
       assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
              "learn did not deliver rules/#{file} into the org's identity tree"
@@ -341,7 +345,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
     shipped = File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
     delivered = Path.join([ctx.base_dir, "identity", "rules", "verification.toml"])
 
-    # The setup's init_identity! is the real bundle import, not a fixture copy.
+    learn_engineering_rules!(ctx)
+
     assert File.read!(delivered) == shipped
 
     loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))

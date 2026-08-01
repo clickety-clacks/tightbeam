@@ -29,7 +29,7 @@ command is attributed to, not its target.
 ## Talk to a colleague: wake
 Agents communicate by waking each other — delivering a prompt to a mailbox:
 
-    tightbeam wake --role reviewer --prompt "review the auth change"
+    tightbeam wake --role colleague --prompt "check the auth change"
 
 That delivers a message now. To deliver it later, add `--after 30m` or `--at <epochMs>`.
 Every wake carries a prompt. To answer a prompt tagged `[from user:mike]`, run
@@ -52,7 +52,7 @@ idle status requests or nudges. Send routine progress to your owner.
 ## Hire help: spawn and retire
 Start a new session:
 
-    tightbeam spawn --display "Reviewer" --name reviewer --harness codex --model "gpt-5.6-sol[high]"
+    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model "gpt-5.6-sol[high]"
 
 `--display` is the human label; `--name` registers a role bound to the new session so you can
 address it. Add `--archetype <name>` to give the session that archetype's identity — its
@@ -61,8 +61,8 @@ archetype allows. End a session with `tightbeam retire --session <key>`; its his
 Pass `--key <idempotencyKey>` on a spawn, assign, or wake you may retry, so the retry does not
 create a duplicate.
 Name what you hire so a directory of fifty reads at a glance. `--display` is
-"<Role> — <specific purpose>" ("Reviewer — picker duplicate titles"), never a bare
-role noun; `--name` is "<function>:<work-slug>" ("reviewer:picker-titles") so wakes
+"<Role> — <specific purpose>" ("Helper — picker duplicate titles"), never a bare
+role noun; `--name` is "<function>:<work-slug>" ("helper:picker-titles") so wakes
 address it unambiguously and a second hire for other work gets a different slug. The
 substrate already records who spawned what and why it exists; the name's job is what
 it is FOR.
@@ -96,7 +96,7 @@ Work is tracked as durable records, not in chat.
 
 - An assignment is an obligation on that work, held by a session:
 
-    tightbeam assign --subject "fix the resume crash" --role coder --work-item <workItemId>
+    tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
 
 - Record what happens against your assignment with attest:
 
@@ -150,8 +150,7 @@ Other agents edit at the same time.
   it, and either ask that owner to clean it up, or, once you have established it is safe to
   remove (abandoned, yours, or the owner agrees), remove it yourself.
 - Do your own work only in your own worktree, created inside your own workdir — an
-  assignment's workdir holds everything the assignment produces, the worktree included
-  (the full convention is the `worktree-session` skill).
+  assignment's workdir holds everything the assignment produces, the worktree included.
 
 ## When a rule stops a command
 A rule can stop a command and name itself. Do not route around it. Take a path that does not

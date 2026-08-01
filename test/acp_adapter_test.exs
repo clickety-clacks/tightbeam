@@ -143,6 +143,22 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/close": capture(m); return send({ id: m.id, result: {} });
       case "session/set_config_option": {
         capture(m);
+        if (failMode === "slow-strict-success" &&
+            m.params.configId === "model" &&
+            m.params.value === "gpt-new") {
+          models[m.params.sessionId] = m.params.value;
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 26000);
+        }
+        if (failMode === "slow-apply-before-strict" &&
+            m.params.configId === "model" &&
+            m.params.value === "gpt-blocking") {
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 30600);
+        }
+        if (failMode === "slow-apply-before-strict" &&
+            m.params.configId === "model" &&
+            m.params.value === "gpt-new") {
+          return;
+        }
         if (failMode === "model-refusal") {
           return send({ id: m.id, error: { code: -32000, message: "Invalid value for config option model" } });
         }
@@ -152,6 +168,17 @@ defmodule Tightbeam.Acp.AdapterTest do
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
         }
         if (failMode === "strict-rollback-failure" &&
+            m.params.configId === "reasoning_effort" &&
+            m.params.value === "high") {
+          failRollback = true;
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "strict-effort-hang" &&
+            m.params.configId === "reasoning_effort" &&
+            m.params.value === "high") {
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 200);
+        }
+        if (failMode === "strict-rollback-hang" &&
             m.params.configId === "reasoning_effort" &&
             m.params.value === "high") {
           failRollback = true;
@@ -167,6 +194,12 @@ defmodule Tightbeam.Acp.AdapterTest do
             m.params.configId === "model" &&
             m.params.value === "gpt-old") {
           return send({ id: m.id, error: { code: -32000, message: "rollback refused" } });
+        }
+        if (failMode === "strict-rollback-hang" &&
+            failRollback &&
+            m.params.configId === "model" &&
+            m.params.value === "gpt-old") {
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 200);
         }
         if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
         if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
@@ -405,6 +438,20 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  defp assert_request_captured(path, config_id, value, attempts \\ 500) do
+    captured? =
+      Enum.any?(captured_requests(path), fn request ->
+        request["method"] == "session/set_config_option" and
+          request["configId"] == config_id and request["value"] == value
+      end)
+
+    cond do
+      captured? -> :ok
+      attempts == 0 -> flunk("request #{config_id}=#{value} was not captured")
+      true -> Process.sleep(10) && assert_request_captured(path, config_id, value, attempts - 1)
+    end
+  end
+
   defp session_requests(path) do
     Enum.filter(captured_requests(path), &(&1["method"] in ["session/new", "session/load"]))
   end
@@ -632,6 +679,23 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Adapter.knows_session?(adapter, "sess-1")
   end
 
+  test "strict apply does not retry an invalid-params model refusal" do
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "model-invalid-params")
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+    assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:error, :model_unavailable} =
+             Adapter.apply_model_strict(adapter, "sess-1", "gpt-5.1-codex", prior_model)
+
+    model_writes =
+      captured_requests(capture_path)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+
+    assert length(model_writes) == 1
+  end
+
   test "new and canonical reattach surface model apply failures" do
     {adapter, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
 
@@ -717,6 +781,96 @@ defmodule Tightbeam.Acp.AdapterTest do
              )
 
     refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "hung strict effort and rollback requests return inside the outer budget and clean up late replies" do
+    for fail_mode <- ["strict-effort-hang", "strict-rollback-hang"] do
+      {adapter, _capture_path} = start_adapter(harness: :codex, fail_mode: fail_mode)
+
+      assert {:ok, "sess-1"} =
+               Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+
+      started = System.monotonic_time(:millisecond)
+
+      deadline = System.monotonic_time(:millisecond) + 50
+
+      assert {:error, :partial_apply} =
+               GenServer.call(
+                 adapter,
+                 {:apply_model_strict, "sess-1", "gpt-new[high]", "gpt-old[medium]", deadline},
+                 30_000
+               )
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+      refute Adapter.knows_session?(adapter, "sess-1")
+      assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
+
+      Process.sleep(250)
+      assert Process.alive?(adapter)
+      assert :sys.get_state(Adapter.conn(adapter)).pending == %{}
+    end
+  end
+
+  @tag timeout: 35_000
+  test "strict apply accepts a bare-model reply after the former inner bound and retains residency" do
+    {adapter, _capture_path} = start_adapter(harness: :codex, fail_mode: "slow-strict-success")
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, "gpt-old", "/tmp", [], "guidance")
+    assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, "gpt-new"} =
+             Adapter.apply_model_strict(adapter, "sess-1", "gpt-new", prior_model)
+
+    assert Adapter.knows_session?(adapter, "sess-1")
+    assert {:ok, "gpt-new"} = Adapter.current_model(adapter, "sess-1")
+  end
+
+  # FAIL-BEFORE: strict_apply/4 used to start its deadline only after the
+  # preceding blocked request released the shared Adapter, so queue time was
+  # free and its fresh request outlived the caller's 30s GenServer.call budget.
+  # The 30.6s blocker exceeds the 30s operation deadline, so a correctly
+  # caller-stamped budget is exhausted at dequeue: nothing may be dispatched,
+  # and the structured error must still beat the caller's exit, which waits
+  # the reply margin past the operation deadline.
+  @tag timeout: 40_000
+  test "strict apply queue time spends the caller-owned operation budget" do
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "slow-apply-before-strict")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+
+    # The blocker exists to OCCUPY the shared Adapter past the strict
+    # operation deadline; the handler holds the server until Conn answers at
+    # 30.6s whether or not the blocker's own 30s caller is still listening,
+    # so its caller exit is expected and irrelevant to what is under test.
+    blocker =
+      Task.async(fn ->
+        try do
+          Adapter.apply_model(adapter, "sess-1", "gpt-blocking")
+        catch
+          :exit, reason -> {:caller_exit, reason}
+        end
+      end)
+
+    assert_request_captured(capture_path, "model", "gpt-blocking")
+
+    strict =
+      Task.async(fn ->
+        try do
+          Adapter.apply_model_strict(adapter, "sess-1", "gpt-new[high]", "gpt-old[medium]")
+        catch
+          :exit, reason -> {:caller_exit, reason}
+        end
+      end)
+
+    assert {:error, :model_transport_failure} = Task.await(strict, 33_000)
+    assert {:caller_exit, _} = Task.await(blocker, 33_000)
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "gpt-new"
+           end)
   end
 
   test "a failed ordinary apply also forfeits cached residency" do

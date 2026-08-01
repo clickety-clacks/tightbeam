@@ -30,6 +30,20 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
+  # The operation budget matches what this path always offered: a harness reply
+  # that arrives inside 30s succeeds, exactly as it did before the deadline was
+  # derived. The margin lives OUTSIDE that window -- the caller waits 2s past
+  # the operation deadline -- so delivering the structured error costs no
+  # success case. Once Conn receives a response, only two local BEAM replies
+  # remain (Conn -> Adapter -> caller); they take microseconds idle, but the
+  # margin must hold on a loaded scheduler where mailbox residence is real
+  # time: with a thin margin an operation timing out at its deadline loses the
+  # race and the caller exits instead of receiving the structured error -- the
+  # defect this deadline exists to prevent.
+  @strict_model_operation_timeout 30_000
+  @strict_model_reply_margin 2_000
+  @strict_model_call_timeout @strict_model_operation_timeout + @strict_model_reply_margin
+  @strict_model_request_floor 1
 
   defstruct [
     :conn,
@@ -140,10 +154,18 @@ defmodule Tightbeam.Acp.Adapter do
           {:ok, model_ref()}
           | {:error,
              :model_unavailable
+             | :model_transport_failure
              | :partial_apply
              | :model_readback_unavailable}
-  def apply_model_strict(adapter, session_id, model, prior_model),
-    do: GenServer.call(adapter, {:apply_model_strict, session_id, model, prior_model}, 30_000)
+  def apply_model_strict(adapter, session_id, model, prior_model) do
+    deadline = System.monotonic_time(:millisecond) + @strict_model_operation_timeout
+
+    GenServer.call(
+      adapter,
+      {:apply_model_strict, session_id, model, prior_model, deadline},
+      @strict_model_call_timeout
+    )
+  end
 
   @doc "The adapter's cached model value. This does not query the harness owner."
   @spec current_model(adapter(), String.t(), timeout()) ::
@@ -442,10 +464,10 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:apply_model_strict, sid, model, prior_model}, _from, state) do
+  def handle_call({:apply_model_strict, sid, model, prior_model, caller_deadline}, _from, state) do
     case Map.fetch(state.models, sid) do
       {:ok, ^prior_model} ->
-        case strict_apply_with_retry(state, sid, model, prior_model, 3) do
+        case strict_apply(state, sid, model, prior_model, caller_deadline) do
           :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
           error -> {:reply, error, drop_model_residency(state, sid)}
         end
@@ -776,32 +798,20 @@ defmodule Tightbeam.Acp.Adapter do
   defp map_model_refusal({:error, %{"code" => -32602}}), do: {:error, :model_unavailable}
   defp map_model_refusal(result), do: result
 
-  defp strict_apply_with_retry(state, sid, model_ref, prior_model, attempts) do
-    case strict_apply(state, sid, model_ref, prior_model) do
-      {:error, :model_unavailable} when attempts > 1 ->
-        strict_apply_with_retry(state, sid, model_ref, prior_model, attempts - 1)
-
-      result ->
-        result
-    end
-  end
-
-  defp strict_apply(state, sid, model_ref, prior_model) do
+  defp strict_apply(state, sid, model_ref, prior_model, deadline) do
     {model, effort} = parse_model_ref(model_ref)
 
-    case Conn.request(state.conn, "session/set_config_option", %{
-           sessionId: sid,
-           configId: "model",
-           value: model
-         }) do
+    case map_model_refusal(strict_model_request(state, sid, "model", model, deadline)) do
       {:ok, base_result} ->
         effort_result =
           if effort do
-            Conn.request(state.conn, "session/set_config_option", %{
-              sessionId: sid,
-              configId: state.preset.effort_config,
-              value: effort
-            })
+            strict_model_request(
+              state,
+              sid,
+              state.preset.effort_config,
+              effort,
+              deadline
+            )
           else
             {:ok, base_result}
           end
@@ -814,18 +824,31 @@ defmodule Tightbeam.Acp.Adapter do
         else
           {prior_base, _prior_effort} = parse_model_ref(prior_model)
 
-          _ =
-            Conn.request(state.conn, "session/set_config_option", %{
-              sessionId: sid,
-              configId: "model",
-              value: prior_base
-            })
+          _ = strict_model_request(state, sid, "model", prior_base, deadline)
 
           {:error, :partial_apply}
         end
 
-      {:error, _} ->
+      {:error, reason} when reason in [:closed, :timeout] ->
+        {:error, :model_transport_failure}
+
+      {:error, _reason} ->
         {:error, :model_unavailable}
+    end
+  end
+
+  defp strict_model_request(state, sid, config_id, value, deadline) do
+    case deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > @strict_model_request_floor ->
+        Conn.request(
+          state.conn,
+          "session/set_config_option",
+          %{sessionId: sid, configId: config_id, value: value},
+          timeout: remaining
+        )
+
+      _expired ->
+        {:error, :timeout}
     end
   end
 

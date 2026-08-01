@@ -201,6 +201,19 @@ pub enum Command {
         identity: Identity,
         action: Option<String>,
     },
+    IdentityRepoint {
+        identity: Identity,
+        session_key: String,
+        archetype: String,
+    },
+    Learn {
+        identity: Identity,
+        name: String,
+    },
+    Unlearn {
+        identity: Identity,
+        name: String,
+    },
     IdentityApply {
         identity: Identity,
         session_key: Option<String>,
@@ -222,6 +235,8 @@ pub enum Command {
     },
     HarnessProcesses {
         identity: Identity,
+    UpdateClients {
+        as_user: String,
     },
     Assimilate(AssimilateArgs),
 }
@@ -413,7 +428,15 @@ COMMANDS:
                 [--file <path>]
       Edit the served identity. Without --file, content is read from stdin.
   identity relearn [--abort | --resolve]
-      Import and merge the shipped kungfu; resolve or abort a conflict.
+      Re-import and merge the neutral seed plus every learned kungfu bundle;
+      resolve or abort a conflict.
+  identity repoint <retired-session> <archetype>
+      Repoint a retired session row to an installed archetype.
+  learn <bundle>
+      Install a shipped kungfu bundle. Available bundles ship with Tightbeam
+      under priv/kungfu/; learning an installed bundle is a no-op.
+  unlearn <bundle>
+      Remove a learned kungfu bundle by its committed receipt.
   identity status [<archetype>]
       Report the live revision, session revisions, staleness, and conflicts.
   identity apply (<session> | --all)
@@ -1242,8 +1265,34 @@ fn parse_with_optional_catalog(
             })
         }
         "identity" => parse_identity_command(&parsed, flags),
+        "learn" | "unlearn" => {
+            if parsed.positional.len() != 2 {
+                return Err(format!(
+                    "usage: tightbeam {} <bundle>",
+                    parsed.positional[0]
+                ));
+            }
+            let name = parsed.positional[1].clone();
+            let identity = identity(flags)?;
+            if parsed.positional[0] == "learn" {
+                Ok(Command::Learn { identity, name })
+            } else {
+                Ok(Command::Unlearn { identity, name })
+            }
+        }
         "onboard" => parse_onboard(&parsed, flags),
         "config" => parse_config(&parsed, flags),
+        "update-clients" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
+            }
+            let Some(as_user) = nonempty(flags, "as-user") else {
+                return Err("--as-user is required for update-clients (admin required)".to_owned());
+            };
+            let selected_identity = identity(flags)?;
+            debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
+            Ok(Command::UpdateClients { as_user })
+        }
         "assimilate" => {
             let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
                 "usage: tightbeam assimilate <ssh-dest> --as-user <adminUserId>".to_owned()
@@ -1275,7 +1324,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, harness-process, doctor, assimilate"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -1386,6 +1435,11 @@ fn parse_identity_command(
                 action: actions.first().map(|value| (*value).to_owned()),
             })
         }
+        Some("repoint") if parsed.positional.len() == 4 => Ok(Command::IdentityRepoint {
+            identity: identity(flags)?,
+            session_key: parsed.positional[2].clone(),
+            archetype: parsed.positional[3].clone(),
+        }),
         Some("apply") => {
             let session_key = parsed.positional.get(2).cloned();
             let all = flags.contains_key("all");
@@ -1398,7 +1452,7 @@ fn parse_identity_command(
                 all,
             })
         }
-        _ => Err("usage: tightbeam identity edit|status|relearn|apply ...".to_owned()),
+        _ => Err("usage: tightbeam identity edit|status|relearn|repoint|apply ...".to_owned()),
     }
 }
 
@@ -1512,6 +1566,20 @@ mod tests {
     }
 
     #[test]
+    fn update_clients_is_an_admin_fleet_ceremony() {
+        assert_eq!(
+            parse(strings(&["update-clients", "--as-user", "flynn"])),
+            Ok(Command::UpdateClients {
+                as_user: "flynn".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(strings(&["update-clients"])),
+            Err("--as-user is required for update-clients (admin required)".to_owned())
+        );
+    }
+
+    #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
         let command_section = help
@@ -1555,6 +1623,7 @@ mod tests {
                 "effort-rule",
                 "harness-process",
                 "identity",
+                "learn",
                 "list",
                 "onboard",
                 "retire",
@@ -1567,6 +1636,7 @@ mod tests {
                 "work-item-get",
                 "attend",
                 "transcript",
+                "unlearn",
                 "topline",
                 "toplines",
                 "work-item-trace",
@@ -1579,6 +1649,7 @@ mod tests {
         for syntax in [
             "identity edit <archetype>",
             "identity relearn [--abort | --resolve]",
+            "identity repoint <retired-session> <archetype>",
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
@@ -1594,7 +1665,6 @@ mod tests {
     fn help_uses_only_supplied_projection_names() {
         let catalog = HarnessCatalog {
             harnesses: vec![crate::harnesses::HarnessProjection {
-                id: "third".to_owned(),
                 wire_name: "third".to_owned(),
                 install_package: "third-package".to_owned(),
                 cli_binary: "third-cli".to_owned(),
@@ -1611,7 +1681,6 @@ mod tests {
     fn fixture_projection_drives_spawn_validation_and_assimilation_defaults() {
         let catalog = HarnessCatalog {
             harnesses: vec![crate::harnesses::HarnessProjection {
-                id: "fixture".to_owned(),
                 wire_name: "fixture".to_owned(),
                 install_package: "fixture-package".to_owned(),
                 cli_binary: "fixture".to_owned(),
@@ -1872,7 +1941,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, onboard, artifact-record, artifacts, config, harness-process, doctor, assimilate".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -2138,6 +2207,35 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     session_key: None,
                     all: true,
+                },
+            ),
+            (
+                strings(&[
+                    "identity",
+                    "repoint",
+                    "agent:retired",
+                    "default",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::IdentityRepoint {
+                    identity: Identity::User("flynn".to_owned()),
+                    session_key: "agent:retired".to_owned(),
+                    archetype: "default".to_owned(),
+                },
+            ),
+            (
+                strings(&["learn", "agentic-engineering", "--as-user", "flynn"]),
+                Command::Learn {
+                    identity: Identity::User("flynn".to_owned()),
+                    name: "agentic-engineering".to_owned(),
+                },
+            ),
+            (
+                strings(&["unlearn", "agentic-engineering", "--as-user", "flynn"]),
+                Command::Unlearn {
+                    identity: Identity::User("flynn".to_owned()),
+                    name: "agentic-engineering".to_owned(),
                 },
             ),
             (
