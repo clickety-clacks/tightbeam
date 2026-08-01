@@ -1913,7 +1913,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     assert %{code: "placement_denied", detail: %{code: "host_unready"}, message: message} = result
-    assert message =~ "no claude credentials"
+    assert message =~ "Tightbeam has no credential for anthropic on testhost"
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
     assert Roles.get(ctx.db, "unready") == nil
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
@@ -2065,13 +2065,10 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:credential_command, second_command}
     assert Enum.join(second_command, " ") =~ "/remote/new-tb"
 
-    expected_message =
-      "claude on #{machine} needs onboarding: :missing; run tightbeam onboard anthropic on #{machine}"
-
     assert %{
              code: "placement_denied",
              detail: %{code: "needs_onboarding"},
-             message: ^expected_message
+             message: message
            } =
              handlers["spawn"].(%{
                origin: "user:flynn",
@@ -2082,6 +2079,13 @@ defmodule Tightbeam.GatewayTest do
                  idempotency_key: "spawn-fresh-remote"
                }
              })
+
+    assert message =~ "Tightbeam has no credential for anthropic on #{machine}"
+    assert message =~ "normal claude CLI login"
+    assert message =~ "under /remote/new-tb/auth"
+
+    assert message =~
+             "Run on #{machine}: tightbeam onboard anthropic --as-user <userId>"
   end
 
   test "update-clients refuses non-admin callers and enumerates satellites for admins", ctx do
@@ -3518,7 +3522,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_host", host: "worker"}
              })
 
-    assert message =~ "no claude credentials"
+    assert message =~ "Tightbeam has no credential for anthropic on worker"
     assert Org.get(ctx.db, "k1").host == "testhost"
   end
 
@@ -3765,7 +3769,7 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "no codex credentials"
+    assert message =~ "Tightbeam has no credential for openai on testhost"
     assert Org.get(ctx.db, "k1") == before
   end
 

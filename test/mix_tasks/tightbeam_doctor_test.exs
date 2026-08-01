@@ -132,6 +132,22 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert find(report, "harness_binary:codex").level == :warn
   end
 
+  test "no credential makes doctor nonzero and prints the readiness remedy", ctx do
+    inputs = Keyword.put(ctx.inputs, :credential_state, fn _provider -> :missing end)
+
+    {1, report} = Doctor.evaluate(ctx.catalog, inputs)
+
+    refute report.ready
+    auth = find(report, "harness_auth:claude")
+    refute auth.ok
+    assert auth.detail =~ "Tightbeam has no credential for anthropic on local-test"
+    assert auth.detail =~ "normal claude CLI login"
+    assert auth.detail =~ Path.join(ctx.base_dir, "auth")
+    assert auth.detail =~ "tightbeam onboard anthropic --as-user <userId>"
+    assert auth.fix == "tightbeam onboard anthropic --as-user <userId>"
+    assert Doctor.format(report, :human) =~ "Tightbeam has no credential"
+  end
+
   # The exit code is the contract a deploy script gates on, so the difference
   # between "this credential is dead" and "this task cannot see credentials"
   # has to be visible THERE, not only in the prose.

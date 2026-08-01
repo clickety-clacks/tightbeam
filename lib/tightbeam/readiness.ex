@@ -34,6 +34,7 @@ defmodule Tightbeam.Readiness do
 
   @type harness_row :: %{
           host: String.t(),
+          base_dir: String.t(),
           harness: String.t(),
           adapter: :present | {:missing, String.t()} | {:unknown, atom()},
           credential: :live | {:absent, atom()} | {:unknown, term()} | {:degraded, term()},
@@ -97,19 +98,19 @@ defmodule Tightbeam.Readiness do
     local = Placement.local_host_name()
 
     hosts =
-      Placement.hosts(config.base_dir, Map.get(config, :db, Tightbeam.DB))
-      |> Map.keys()
+      config.base_dir
+      |> Placement.hosts(Map.get(config, :db, Tightbeam.DB))
       |> Enum.sort()
 
     rows =
-      for host <- hosts, module <- Harness.all() do
-        harness_row(module, host, host == local, config, catalog)
+      for {host, host_config} <- hosts, module <- Harness.all() do
+        harness_row(module, host, host_config, host == local, config, catalog)
       end
 
     %{
       harnesses: rows,
       runnable?: Enum.any?(rows, & &1.runnable?),
-      unplaceable_archetypes: unplaceable_archetypes(archetypes, hosts)
+      unplaceable_archetypes: unplaceable_archetypes(archetypes, Enum.map(hosts, &elem(&1, 0)))
     }
   end
 
@@ -125,7 +126,7 @@ defmodule Tightbeam.Readiness do
     end
   end
 
-  defp harness_row(module, host, local?, config, catalog) do
+  defp harness_row(module, host, host_config, local?, config, catalog) do
     wire = module.wire_name()
     {entries, health} = ModelCatalog.get(host, wire, catalog)
 
@@ -135,6 +136,7 @@ defmodule Tightbeam.Readiness do
 
     %{
       host: host,
+      base_dir: host_config.base_dir,
       harness: wire,
       # `onboard` takes the CREDENTIAL PROVIDER, not the harness: a credential
       # belongs to anthropic or openai, and claude/codex are the harnesses that
@@ -300,6 +302,19 @@ defmodule Tightbeam.Readiness do
   end
 
   defp credential_line(%{credential: :live}), do: nil
+
+  defp credential_line(%{
+         provider: provider,
+         harness: harness,
+         host: host,
+         base_dir: base_dir,
+         credential: {:absent, :missing}
+       }) do
+    "Tightbeam has no credential for #{provider} on #{host}. It does not use or import " <>
+      "your normal #{harness} CLI login; Tightbeam keeps its own credential under " <>
+      "#{Path.join(base_dir, "auth")}. Run on #{host}: tightbeam onboard #{provider} " <>
+      "--as-user <userId>"
+  end
 
   defp credential_line(%{provider: provider, host: host, credential: {:absent, reason}}) do
     "no credential on #{host} (#{inspect(reason)}) — this host's model catalog is " <>

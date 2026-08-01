@@ -232,8 +232,12 @@ defmodule Tightbeam.Spinup do
                     )
 
                   message =
-                    "host #{target.host_name} is not ready for #{module.wire_name()}: no #{module.wire_name()} credentials in #{auth_dir} " <>
-                      "(run the setup ceremony on #{target.host_name})"
+                    "host #{target.host_name} is not ready for #{module.wire_name()}: " <>
+                      "Tightbeam has no credential for #{module.credential_provider()} on " <>
+                      "#{target.host_name}. It does not use or import your normal " <>
+                      "#{module.wire_name()} CLI login; Tightbeam keeps its own credential " <>
+                      "under #{Path.dirname(auth_dir)}. Run on #{target.host_name}: " <>
+                      "tightbeam onboard #{module.credential_provider()} --as-user <userId>"
 
                   {{:error, host_unready(message)},
                    "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}

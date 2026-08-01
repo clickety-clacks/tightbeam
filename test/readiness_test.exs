@@ -122,7 +122,7 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "no turn can start"
   end
 
-  test "a missing credential names the onboard command", ctx do
+  test "a missing credential names the separate login, auth root, and onboard command", ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)
 
@@ -133,7 +133,7 @@ defmodule Tightbeam.ReadinessTest do
       ctx.config
       |> Readiness.summary(catalog)
       |> Readiness.render(ctx.config)
-      |> Enum.find(&(&1 =~ "no credential"))
+      |> Enum.find(&(&1 =~ "Tightbeam has no credential"))
 
     # The CLI's `onboard` takes the credential PROVIDER (anthropic|openai), not the
     # harness (claude|codex). This assertion used to pin wire_name(), so it stayed
@@ -141,7 +141,11 @@ defmodule Tightbeam.ReadinessTest do
     # one surface the operator is told to act on. Assert the provider, and assert
     # the harness name is NOT what gets handed to the verb.
     assert line =~ "tightbeam onboard #{module.credential_provider()}"
+    assert line =~ "--as-user <userId>"
     refute line =~ "tightbeam onboard #{module.wire_name()}"
+    assert line =~ "normal #{module.wire_name()} CLI login"
+    assert line =~ Path.join(ctx.base, "auth")
+    assert line =~ "on testhost"
   end
 
   test "a default model outside the live catalog is named with the ref", ctx do
@@ -243,6 +247,7 @@ defmodule Tightbeam.ReadinessTest do
           model <- [:selectable, {:absent, "m"}, :unknown] do
         %{
           host: "somehost",
+          base_dir: "/some/base",
           harness: "h",
           # Rows here are built directly rather than through harness_row/3, so a
           # new key must be mirrored or every row crashes instead of rendering —

@@ -107,8 +107,10 @@ gaps below are closed.
   claude:
     ACP adapter missing at <base_dir>/adapters/node_modules/.bin/claude-agent-acp
       — no turn can start.
-    no credential (:missing) — the model catalog is empty, so no model can
-      be selected. Onboard it with: tightbeam onboard claude --as-user <userId>
+    Tightbeam has no credential for anthropic on <host>. It does not use or
+      import your normal claude CLI login; Tightbeam keeps its own credential
+      under <base_dir>/auth. Run on <host>:
+      tightbeam onboard anthropic --as-user <userId>
 ```
 
 The summary is assembled from state the gateway already has plus one file
@@ -117,11 +119,12 @@ failure — for anything it could not look at, such as a credential whose refres
 had not landed yet, and offers no repair advice for those. A row saying UNKNOWN
 is not a claim that the credential is bad.
 
-`mix tightbeam.doctor` diagnoses further, with one documented limitation: it
-runs as a bare mix task, where the Credentials server is not running, so **it
-cannot determine credential state at all**. Those rows say so rather than
-guessing. To check credentials for real, read the boot summary above or the
-running gateway's catalog.
+`mix tightbeam.doctor` diagnoses further. It can identify a credential that is
+absent from Tightbeam's local store and fails when that leaves no runnable
+harness. Because it runs as a bare mix task where the Credentials server is not
+running, it still cannot judge the liveness of a credential that is present;
+those rows say UNKNOWN rather than guessing. To check liveness for real, read
+the boot summary above or the running gateway's catalog.
 
 ## Installing as a service
 

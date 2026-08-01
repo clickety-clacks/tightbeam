@@ -184,8 +184,8 @@ defmodule Tightbeam.SpinupTest do
     assert message =~ "fix directory permissions on testhost"
   end
 
-  test "missing credentials denies with path and setup ceremony", ctx do
-    auth_dir = Path.join([ctx.base_dir, "auth", "claude"])
+  test "missing credentials deny with separate login fact and exact remedy", ctx do
+    auth_dir = Path.join(ctx.base_dir, "auth")
     stage_claude!(ctx.base_dir)
 
     assert {:error, %{code: "host_unready", message: message}} =
@@ -194,8 +194,10 @@ defmodule Tightbeam.SpinupTest do
                patch_adapter: no_patch()
              )
 
-    assert message =~ "no claude credentials in #{auth_dir}"
-    assert message =~ "run the setup ceremony on testhost"
+    assert message =~ "Tightbeam has no credential for anthropic on testhost"
+    assert message =~ "normal claude CLI login"
+    assert message =~ "keeps its own credential under #{auth_dir}"
+    assert message =~ "Run on testhost: tightbeam onboard anthropic --as-user <userId>"
     assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "DENIED"
   end
