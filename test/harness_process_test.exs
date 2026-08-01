@@ -1,7 +1,7 @@
 defmodule Tightbeam.HarnessProcessTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{AdapterCoordinator, DB, HarnessProcess}
+  alias Tightbeam.{AdapterCoordinator, DB, EventLog, HarnessProcess}
 
   @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cleanup_command_timeout_ms 500
@@ -421,6 +421,56 @@ defmodule Tightbeam.HarnessProcessTest do
     assert is_integer(attempted_at)
   end
 
+  test "a second reconciler losing the terminal race cannot corrupt the resolved row", ctx do
+    key = {:claude, "shared", "testhost"}
+    {_port, row} = launch_stubborn(ctx, key)
+    gate_dir = Path.join(ctx.test_dir, "reconcile-race")
+    racing_helper = Path.join(ctx.test_dir, "racing-helper")
+    File.mkdir_p!(gate_dir)
+
+    File.write!(
+      racing_helper,
+      """
+      #!/bin/sh
+      if mkdir #{gate_dir}/first 2>/dev/null; then
+        touch #{gate_dir}/first-started
+        while [ ! -f #{gate_dir}/release-first ]; do sleep 0.01; done
+        exec #{@helper} "$@"
+      else
+        touch #{gate_dir}/second-started
+        while [ -e "$3" ]; do sleep 0.01; done
+        exec #{@helper} "$@"
+      fi
+      """
+    )
+
+    File.chmod!(racing_helper, 0o755)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1",
+        [row.launch_id, racing_helper]
+      )
+
+    first = Task.async(fn -> HarnessProcess.reconcile_key(ctx.db, key) end)
+    assert eventually(fn -> File.exists?(Path.join(gate_dir, "first-started")) end)
+
+    second = Task.async(fn -> HarnessProcess.reconcile_key(ctx.db, key) end)
+    assert eventually(fn -> File.exists?(Path.join(gate_dir, "second-started")) end)
+    File.touch!(Path.join(gate_dir, "release-first"))
+
+    assert Task.await(first) == :ok
+    assert Task.await(second) == :already_resolved
+
+    assert [%{state: "exited", resolved_at: resolved_at, last_error: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+    refute File.exists?(row.identity_path)
+    refute HarnessProcess.fenced?(ctx.db, key)
+  end
+
   test "a mismatched boot identity refuses the signal and remains retryable", ctx do
     key = {:claude, "shared", "testhost"}
     {_port, row} = launch_stubborn(ctx, key)
@@ -499,6 +549,67 @@ defmodule Tightbeam.HarnessProcessTest do
              AdapterCoordinator.harness_processes(coordinator)
 
     assert HarnessProcess.fenced?(ctx.db, key)
+  end
+
+  test "a propagated reconciliation failure does not kill coordinator accounting", ctx do
+    :ok = EventLog.ensure_schema(ctx.db)
+    path = Path.join(ctx.test_dir, "failed-reconcile-adapter.js")
+    File.write!(path, @fake_adapter)
+    key = {:claude, "shared", "testhost"}
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, "failed-reconcile.stderr"),
+             process_identity_dir: ctx.test_dir,
+             process_helper: @helper
+           ]
+         end,
+         backoff_base_ms: 60_000,
+         db: ctx.db,
+         name: :surviving_failed_reconcile_coordinator}
+      )
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert eventually(fn ->
+             match?([%{state: "running"}], AdapterCoordinator.harness_processes(coordinator))
+           end)
+
+    [%{launch_id: launch_id}] = AdapterCoordinator.harness_processes(coordinator)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET bootIdentity = 'prior-boot' WHERE launchId = ?1",
+        [launch_id]
+      )
+
+    Process.exit(adapter, :kill)
+
+    assert eventually(fn ->
+             Process.alive?(coordinator) and
+               match?(
+                 %{generation: 2, failures: 1, timer: timer} when is_reference(timer),
+                 :sys.get_state(coordinator).adapters[key]
+               )
+           end)
+
+    assert [%{state: "kill_failed", resolved_at: nil}] = HarnessProcess.list(ctx.db)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "adapter_reconcile_failed" and
+               event.subject == "claude:shared@testhost" and
+               event.detail =~ "kill_failed"
+           end)
   end
 
   test "a park with no launch fences and cancels a pending checkout", ctx do

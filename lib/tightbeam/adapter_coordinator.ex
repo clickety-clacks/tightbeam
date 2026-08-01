@@ -419,13 +419,14 @@ defmodule Tightbeam.AdapterCoordinator do
           false
       end
 
-    result =
+    reconcile_result =
       case process_row do
         :no_launch -> :ok
         _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
         row -> Tightbeam.HarnessProcess.park(state.db, row)
       end
 
+    result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result
     state = retire_adapter(key, state)
     if result == :ok, do: Tightbeam.HarnessProcess.complete_park(state.db, key)
 
@@ -518,7 +519,23 @@ defmodule Tightbeam.AdapterCoordinator do
           :ok =
             Tightbeam.EventLog.lifecycle(state.db, "adapter_down", key_name(key), inspect(reason))
 
-          :ok = Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+          case Tightbeam.HarnessProcess.reconcile_key(state.db, key) do
+            :ok ->
+              :ok
+
+            :already_resolved ->
+              :ok
+
+            {:error, reconcile_reason} ->
+              :ok =
+                Tightbeam.EventLog.lifecycle(
+                  state.db,
+                  "adapter_reconcile_failed",
+                  key_name(key),
+                  inspect(reconcile_reason)
+                )
+          end
+
           failures = entry.failures + 1
 
           circuit = if failures >= state.failure_circuit, do: :open, else: :closed

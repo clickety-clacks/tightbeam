@@ -308,7 +308,7 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   @doc "Deliver SIGKILL to a parked process group."
-  @spec park(DB.server(), row()) :: :ok | {:error, term()}
+  @spec park(DB.server(), row()) :: :ok | :already_resolved | {:error, term()}
   def park(db, row) do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
       kill(db, row)
@@ -336,7 +336,7 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   @doc "Reconcile the latest unresolved launch for one adapter after its BEAM owner goes down."
-  @spec reconcile_key(DB.server(), tuple()) :: :ok | {:error, term()}
+  @spec reconcile_key(DB.server(), tuple()) :: :ok | :already_resolved | {:error, term()}
   def reconcile_key(db, key) do
     case latest_unresolved(db, key) do
       nil ->
@@ -349,6 +349,7 @@ defmodule Tightbeam.HarnessProcess do
 
         case reconcile_row(db, row, terminal_state) do
           :ok -> complete_park(db, key)
+          :already_resolved -> :already_resolved
           {:error, _reason} = error -> error
         end
     end
@@ -744,23 +745,25 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp resolve(db, row, state) do
-    case remove_identity(row) do
-      :ok ->
-        {:ok, _} =
-          DB.query(
-            db,
-            """
-            UPDATE harness_processes
-               SET state = ?2, resolvedAt = ?3, lastError = NULL
-             WHERE launchId = ?1
-            """,
-            [row.launch_id, state, now()]
-          )
+    {:ok, resolved?} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          """
+          UPDATE harness_processes
+             SET state = ?2, resolvedAt = ?3, lastError = NULL
+           WHERE launchId = ?1 AND resolvedAt IS NULL
+          """,
+          [row.launch_id, state, now()]
+        )
 
-        :ok
+        DB.Txn.changes(txn) == 1
+      end)
 
-      {:error, reason} ->
-        kill_failed(db, row, reason)
+    if resolved? do
+      remove_identity(row)
+    else
+      :already_resolved
     end
   end
 
@@ -785,14 +788,22 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp kill_failed(db, row, reason) do
-    {:ok, _} =
-      DB.query(
-        db,
-        "UPDATE harness_processes SET state = 'kill_failed', lastError = ?2 WHERE launchId = ?1",
-        [row.launch_id, inspect(reason)]
-      )
+    {:ok, recorded?} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          """
+          UPDATE harness_processes
+             SET state = 'kill_failed', lastError = ?2
+           WHERE launchId = ?1 AND resolvedAt IS NULL
+          """,
+          [row.launch_id, inspect(reason)]
+        )
 
-    {:error, {:kill_failed, reason}}
+        DB.Txn.changes(txn) == 1
+      end)
+
+    if recorded?, do: {:error, {:kill_failed, reason}}, else: :already_resolved
   end
 
   defp persist_identity(
