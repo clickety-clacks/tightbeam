@@ -848,17 +848,23 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   defp kill_fixture_groups(test_dir) do
-    test_dir
-    |> Path.join("**/harness-processes/*.identity")
-    |> Path.wildcard()
-    |> Enum.each(&kill_fixture_group/1)
-
-    if eventually(fn -> HarnessProcessCensus.capture_for_root(test_dir).count == 0 end) do
+    if eventually(fn -> kill_censused_fixture_groups(test_dir) end) do
       :ok
     else
       snapshot = HarnessProcessCensus.capture_for_root(test_dir)
       {:error, [{:fixture_processes_survived, HarnessProcessCensus.format(snapshot)}]}
     end
+  end
+
+  defp kill_censused_fixture_groups(test_dir) do
+    test_dir
+    |> HarnessProcessCensus.capture_for_root()
+    |> Map.fetch!(:processes)
+    |> Enum.map(& &1.pgid)
+    |> Enum.uniq()
+    |> Enum.each(&kill_fixture_group/1)
+
+    HarnessProcessCensus.capture_for_root(test_dir).count == 0
   end
 
   defp grouped_helper(ctx, name, command) do
@@ -879,13 +885,8 @@ defmodule Tightbeam.HarnessProcessTest do
     helper
   end
 
-  defp kill_fixture_group(identity_path) do
-    with {:ok, identity} <- File.read(identity_path),
-         [_, process_group_id | _] <- identity |> String.trim() |> String.split("\t"),
-         {process_group_id, ""} <- Integer.parse(process_group_id) do
-      System.cmd("/bin/kill", ["-KILL", "--", "-#{process_group_id}"], stderr_to_stdout: true)
-    end
-
+  defp kill_fixture_group(process_group_id) do
+    System.cmd("/bin/kill", ["-KILL", "--", "-#{process_group_id}"], stderr_to_stdout: true)
     :ok
   end
 
