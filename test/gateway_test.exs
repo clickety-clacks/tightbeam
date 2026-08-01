@@ -4794,6 +4794,88 @@ defmodule Tightbeam.GatewayTest do
     assert :persistent_term.get(Rules, []) == []
   end
 
+  test "every unlearn reference kind supplies supported commands that clear it", ctx do
+    ensure_global_registry()
+    base_dir = role_test_base("unlearn-reference-property")
+    learn_engineering_identity!(base_dir)
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    active =
+      Org.create(ctx.db, %{
+        session_key: "agent:clear-active",
+        display_name: "Clear active",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    retired =
+      Org.create(ctx.db, %{
+        session_key: "agent:clear-retired",
+        display_name: "Clear retired",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+      |> then(&Org.retire(ctx.db, &1.session_key))
+
+    main =
+      Org.create(ctx.db, %{
+        session_key: "user:bundle-main",
+        display_name: "Main",
+        kind: "main",
+        is_built_in: true,
+        owner_user_id: "bundle-owner",
+        origin: "user:bundle-owner",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    Org.append_pointer(ctx.db, main.session_key, "bundle-main-resident", "created")
+    start_lane!(ctx.db, main.session_key)
+    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
+
+    assert %{state: "referenced", references: references} =
+             handlers["unlearn"].(%{
+               origin: "user:flynn",
+               params: %{name: "agentic-engineering"}
+             })
+
+    assert MapSet.new(Enum.map(references, & &1.kind)) == MapSet.new(["session", "setting"])
+    assert Enum.all?(references, &(&1.clear_commands != []))
+
+    for reference <- references, command <- reference.clear_commands do
+      assert Map.has_key?(handlers, command.verb)
+      result = handlers[command.verb].(Map.put(command, :origin, "user:flynn"))
+      refute result[:code], inspect({reference, command, result})
+    end
+
+    assert Org.get(ctx.db, active.session_key).archetype == "default"
+    assert Org.get(ctx.db, retired.session_key).archetype == "default"
+    assert Org.get(ctx.db, main.session_key).archetype == "default"
+    assert Org.get(ctx.db, main.session_key).state == "active"
+    assert_received {:identity_apply_close, "bundle-main-resident"}
+
+    assert %{state: "published", kungfu: "agentic-engineering"} =
+             handlers["unlearn"].(%{
+               origin: "user:flynn",
+               params: %{name: "agentic-engineering"}
+             })
+  end
+
   test "identity apply refreshes one stamped session at a turn boundary without restarting runtime",
        ctx do
     base_dir = role_test_base("identity-apply")

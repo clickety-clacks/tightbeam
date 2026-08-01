@@ -498,6 +498,31 @@ defmodule Tightbeam.IdentityTest do
     refute File.exists?(Path.join(dir, "kungfu/agentic-engineering/installed.toml"))
   end
 
+  test "a customized path kept through a relearn deletion conflict remains owned", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    owned_path = "guidance/coder.md"
+    absolute = Path.join(dir, owned_path)
+
+    Identity.edit!(ctx.base, "coder", :guidance, "operator-kept guidance", "operator")
+    File.rm!(Path.join(ctx.source, owned_path))
+
+    assert {:conflict, [^owned_path]} = Identity.relearn!(ctx.base, "operator")
+    assert File.read!(absolute) == "operator-kept guidance"
+    git!(dir, ["add", "--", owned_path])
+    assert Identity.resolve_relearn!(ctx.base, "operator")
+
+    receipt =
+      dir
+      |> Path.join("kungfu/agentic-engineering/installed.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    assert owned_path in receipt["paths"]
+    assert Identity.unlearn!(ctx.base, "agentic-engineering", "operator")
+    refute File.exists?(absolute)
+  end
+
   test "removing a learned skill removes its path from the receipt", ctx do
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")

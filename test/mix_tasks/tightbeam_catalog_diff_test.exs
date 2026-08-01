@@ -106,6 +106,23 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     end
   end
 
+  test "a learned org reads the working set from installed guidance" do
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-learned-catalog-diff-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+    assert :initialized = Tightbeam.Identity.init!(base_dir)
+    assert {:ok, _revision} = Tightbeam.Identity.learn!(base_dir, "agentic-engineering", "test")
+
+    path = Diff.working_set_path(base_dir)
+    assert path == Path.join([base_dir, "identity", "guidance", "preferred-models.md"])
+    {_status, diff} = Diff.evaluate(%{"claude" => [], "codex" => []}, path)
+    assert diff.working_set != []
+  end
+
   @tag :external
   if :external not in ExUnit.configuration()[:include] do
     @tag skip: "run with --only external"
@@ -114,14 +131,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
   test "real working set is present in the live catalog" do
     base_dir = Diff.base_dir()
 
-    guidance_path =
-      Path.join([
-        base_dir,
-        "identity",
-        "kungfu",
-        "agentic-engineering",
-        "preferred-models.md"
-      ])
+    guidance_path = Diff.working_set_path(base_dir)
 
     assert {:ok, inventories} = Diff.fetch_live(base_dir)
     {status, diff} = Diff.evaluate(inventories, guidance_path)

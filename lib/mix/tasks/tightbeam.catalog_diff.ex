@@ -20,14 +20,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
     base_dir = options[:base_dir] || base_dir()
 
-    guidance_path =
-      Path.join([
-        base_dir,
-        "identity",
-        "kungfu",
-        "agentic-engineering",
-        "preferred-models.md"
-      ])
+    guidance_path = working_set_path(base_dir)
 
     working_set = read_working_set!(guidance_path)
 
@@ -48,6 +41,11 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
   @doc false
   def base_dir, do: Tightbeam.BaseDir.resolve()
+
+  @doc false
+  def working_set_path(base_dir) do
+    Path.join([base_dir, "identity", "guidance", "preferred-models.md"])
+  end
 
   @doc false
   def fetch_live(base_dir, timeout_ms \\ @fetch_timeout_ms, options \\ []) do

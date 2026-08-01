@@ -732,8 +732,21 @@ defmodule Tightbeam.Identity do
   end
 
   defp current_bundle_receipt(dir, name) do
-    receipt = bundle_receipt(name, bundle_dir(name))
-    %{receipt | paths: Enum.filter(receipt.paths, &File.regular?(Path.join(dir, &1)))}
+    shipped = bundle_receipt(name, bundle_dir(name))
+
+    previously_owned =
+      case receipt_at(dir, "main", name) do
+        {:ok, receipt} -> receipt.paths
+        :error -> []
+      end
+
+    paths =
+      (previously_owned ++ shipped.paths)
+      |> Enum.uniq()
+      |> Enum.filter(&File.regular?(Path.join(dir, &1)))
+      |> Enum.sort()
+
+    %{shipped | paths: paths}
   end
 
   defp path_exists_at?(dir, revision, path) do
