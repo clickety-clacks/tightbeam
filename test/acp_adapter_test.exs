@@ -152,7 +152,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "slow-apply-before-strict" &&
             m.params.configId === "model" &&
             m.params.value === "gpt-blocking") {
-          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 28600);
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 30600);
         }
         if (failMode === "slow-apply-before-strict" &&
             m.params.configId === "model" &&
@@ -828,10 +828,10 @@ defmodule Tightbeam.Acp.AdapterTest do
   # FAIL-BEFORE: strict_apply/4 used to start its deadline only after the
   # preceding blocked request released the shared Adapter, so queue time was
   # free and its fresh request outlived the caller's 30s GenServer.call budget.
-  # The 28.6s blocker exceeds the derived operation deadline (30s call budget
-  # minus the 2s reply margin), so a correctly caller-stamped budget is
-  # exhausted at dequeue: nothing may be dispatched, and the structured error
-  # must still beat the caller's exit.
+  # The 30.6s blocker exceeds the 30s operation deadline, so a correctly
+  # caller-stamped budget is exhausted at dequeue: nothing may be dispatched,
+  # and the structured error must still beat the caller's exit, which waits
+  # the reply margin past the operation deadline.
   @tag timeout: 40_000
   test "strict apply queue time spends the caller-owned operation budget" do
     {adapter, capture_path} =
@@ -840,7 +840,18 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, "sess-1"} =
              Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
 
-    blocker = Task.async(fn -> Adapter.apply_model(adapter, "sess-1", "gpt-blocking") end)
+    # The blocker exists to OCCUPY the shared Adapter past the strict
+    # operation deadline; the handler holds the server until Conn answers at
+    # 30.6s whether or not the blocker's own 30s caller is still listening,
+    # so its caller exit is expected and irrelevant to what is under test.
+    blocker =
+      Task.async(fn ->
+        try do
+          Adapter.apply_model(adapter, "sess-1", "gpt-blocking")
+        catch
+          :exit, reason -> {:caller_exit, reason}
+        end
+      end)
 
     assert_request_captured(capture_path, "model", "gpt-blocking")
 
@@ -853,8 +864,8 @@ defmodule Tightbeam.Acp.AdapterTest do
         end
       end)
 
-    assert {:error, :model_transport_failure} = Task.await(strict, 31_000)
-    assert :ok = Task.await(blocker)
+    assert {:error, :model_transport_failure} = Task.await(strict, 33_000)
+    assert {:caller_exit, _} = Task.await(blocker, 33_000)
 
     refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/set_config_option" and

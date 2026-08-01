@@ -30,17 +30,19 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
   @gate_raw_log_limit 4_096
-  @strict_model_call_timeout 30_000
-  # Once Conn receives a response, only two local BEAM replies remain
-  # (Conn -> Adapter -> caller). Those hops take microseconds when idle, but the
-  # margin must hold on a loaded scheduler where mailbox residence is real time:
-  # with a thin margin, an operation that times out right at its deadline loses
-  # the race and the caller exits instead of receiving the structured error --
-  # the exact defect this deadline exists to prevent. 2s buys that guarantee and
-  # costs only responses arriving in the final 2s of a 30s budget, which no
-  # working harness produces.
+  # The operation budget matches what this path always offered: a harness reply
+  # that arrives inside 30s succeeds, exactly as it did before the deadline was
+  # derived. The margin lives OUTSIDE that window -- the caller waits 2s past
+  # the operation deadline -- so delivering the structured error costs no
+  # success case. Once Conn receives a response, only two local BEAM replies
+  # remain (Conn -> Adapter -> caller); they take microseconds idle, but the
+  # margin must hold on a loaded scheduler where mailbox residence is real
+  # time: with a thin margin an operation timing out at its deadline loses the
+  # race and the caller exits instead of receiving the structured error -- the
+  # defect this deadline exists to prevent.
+  @strict_model_operation_timeout 30_000
   @strict_model_reply_margin 2_000
-  @strict_model_operation_timeout @strict_model_call_timeout - @strict_model_reply_margin
+  @strict_model_call_timeout @strict_model_operation_timeout + @strict_model_reply_margin
   @strict_model_request_floor 1
 
   defstruct [
