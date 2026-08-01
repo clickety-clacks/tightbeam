@@ -247,13 +247,11 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:on_retired, on_retired)
       |> handlers()
 
-    Rules.load!(config.base_dir, Map.keys(handler_table))
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
-    Archetypes.load!(config.base_dir)
-    Rails.load!(config.base_dir)
+    reload_law!(config, Map.keys(handler_table))
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -739,6 +737,9 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
       "identity-relearn" =>
         admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
+      "learn" => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
+      "unlearn" =>
+        admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
       "identity-apply" =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
       "kungfu-scaffold" =>
@@ -1976,14 +1977,14 @@ defmodule Tightbeam.Gateway do
 
   defp identity_relearn_result(config, %{params: %{action: "resolve"}} = call) do
     revision = Identity.resolve_relearn!(config.base_dir, call.origin)
-    Archetypes.load!(config.base_dir)
+    reload_law!(config)
     %{state: "published", live_revision: revision}
   end
 
   defp identity_relearn_result(config, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, revision} ->
-        Archetypes.load!(config.base_dir)
+        reload_law!(config)
         %{state: "published", live_revision: revision}
 
       {:conflict, paths} ->
@@ -2001,6 +2002,83 @@ defmodule Tightbeam.Gateway do
           live_revision: Identity.live_revision!(config.base_dir)
         }
     end
+  end
+
+  defp identity_learn_result(config, call) do
+    case Identity.learn!(config.base_dir, call.params.name, call.origin) do
+      {:ok, revision} ->
+        reload_law!(config)
+        %{state: "published", kungfu: call.params.name, live_revision: revision}
+
+      {:noop, revision} ->
+        reload_law!(config)
+        %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
+
+      {:conflict, paths} ->
+        %{
+          state: "relearn-conflicted",
+          kungfu: call.params.name,
+          conflicting_paths: paths,
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
+
+      {:error, message} ->
+        %{
+          state: "learn-failed",
+          code: "learn_failed",
+          message: message,
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
+    end
+  end
+
+  defp identity_unlearn_result(config, db, call) do
+    name = call.params.name
+    archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
+
+    sessions =
+      db
+      |> Org.list_all()
+      |> Enum.filter(&(&1.archetype in archetypes))
+
+    setting = Org.get_setting(db, "default-archetype")
+    setting_reference = if setting in archetypes, do: setting, else: nil
+
+    if sessions != [] or setting_reference do
+      session_names = Enum.map(sessions, & &1.session_key)
+
+      references =
+        [
+          if(session_names != [], do: "sessions: #{Enum.join(session_names, ", ")}"),
+          if(setting_reference,
+            do: "default-archetype setting: #{setting_reference}"
+          )
+        ]
+        |> Enum.reject(&is_nil/1)
+
+      %{
+        state: "referenced",
+        code: "kungfu_referenced",
+        message: "cannot unlearn #{name}; #{Enum.join(references, "; ")}",
+        sessions:
+          Enum.map(
+            sessions,
+            &%{session_key: &1.session_key, state: &1.state, archetype: &1.archetype}
+          ),
+        setting: setting_reference
+      }
+    else
+      revision = Identity.unlearn!(config.base_dir, name, call.origin)
+      reload_law!(config)
+      %{state: "published", kungfu: name, live_revision: revision}
+    end
+  end
+
+  defp reload_law!(config, verbs \\ nil) do
+    verbs = verbs || config |> handlers() |> Map.keys()
+    Archetypes.load!(config.base_dir)
+    Rails.load!(config.base_dir)
+    Rules.load!(config.base_dir, verbs)
   end
 
   defp identity_status_result(config, db, call) do

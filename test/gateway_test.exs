@@ -62,6 +62,7 @@ defmodule Tightbeam.GatewayTest do
     Projection,
     Rails,
     Roles,
+    Rules,
     SessionLane,
     Wakes,
     WorkItems,
@@ -4686,11 +4687,85 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "pre-merge policy rejected relearn"
   end
 
+  test "learn and unlearn reload all law and unlearn names durable references", ctx do
+    base_dir = role_test_base("learn-unlearn")
+    Identity.init!(base_dir)
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    learn = handlers["learn"]
+    unlearn = handlers["unlearn"]
+
+    assert %{state: "published", kungfu: "agentic-engineering", live_revision: revision} =
+             learn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert revision == Identity.live_revision!(base_dir)
+    assert Archetypes.get("coder").name == "coder"
+    assert Rails.statutes?()
+    assert :persistent_term.get(Rules, []) != []
+
+    active =
+      Org.create(ctx.db, %{
+        session_key: "agent:bundle-active",
+        display_name: "Bundle active",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+
+    retired =
+      Org.create(ctx.db, %{
+        session_key: "agent:bundle-retired",
+        display_name: "Bundle retired",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: "fable"
+      })
+      |> then(&Org.retire(ctx.db, &1.session_key))
+
+    assert %{
+             state: "referenced",
+             code: "kungfu_referenced",
+             message: message,
+             sessions: sessions,
+             setting: nil
+           } = unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert message =~ active.session_key
+    assert message =~ retired.session_key
+
+    assert Enum.map(sessions, &{&1.session_key, &1.state}) |> Enum.sort() ==
+             [{active.session_key, "active"}, {retired.session_key, "retired"}]
+
+    {:ok, _rows} =
+      DB.query(ctx.db, "UPDATE sessions SET archetype = 'default' WHERE archetype = 'coder'")
+
+    :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
+
+    assert %{state: "referenced", sessions: [], setting: "coder", message: setting_message} =
+             unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert setting_message =~ "default-archetype setting: coder"
+    :ok = Org.put_setting(ctx.db, "default-archetype", "default")
+
+    assert %{state: "published", kungfu: "agentic-engineering"} =
+             unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert Archetypes.get("coder") == nil
+    refute Rails.statutes?()
+    assert :persistent_term.get(Rules, []) == []
+  end
+
   test "identity apply refreshes one stamped session at a turn boundary without restarting runtime",
        ctx do
     base_dir = role_test_base("identity-apply")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -4797,8 +4872,7 @@ defmodule Tightbeam.GatewayTest do
   # (drain series 25/11/6/13/8/6/8) from its own bracket nags and DR notifications.
   test "identity apply proceeds with queued turns that have not started", ctx do
     base_dir = role_test_base("identity-apply-queued")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -4848,8 +4922,7 @@ defmodule Tightbeam.GatewayTest do
   # started-and-not-terminal discriminator.
   test "identity apply refuses while a turn is genuinely running", ctx do
     base_dir = role_test_base("identity-apply-running")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -4907,8 +4980,7 @@ defmodule Tightbeam.GatewayTest do
   # session's barrier.
   test "queued turns on a bystander session do not block org-wide apply", ctx do
     base_dir = role_test_base("identity-apply-bystander")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     for {key, name} <- [{"agent:leg-one", "Leg one"}, {"agent:leg-two", "Leg two"}] do
@@ -4961,8 +5033,7 @@ defmodule Tightbeam.GatewayTest do
   # outright, so this window is newly reachable and gets its own adversarial test.
   test "a queued turn cannot start while apply is bouncing the session", ctx do
     base_dir = role_test_base("identity-apply-toctou")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5059,8 +5130,7 @@ defmodule Tightbeam.GatewayTest do
   # ensures the lane before deciding, so there is one path rather than two.
   test "a lane born during the bounce cannot claim a turn either", ctx do
     base_dir = role_test_base("identity-apply-newborn")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5170,8 +5240,7 @@ defmodule Tightbeam.GatewayTest do
   # is broken" when the truth is "nothing was running".
   test "cancel waits for the boundary instead of timing out under it", ctx do
     base_dir = role_test_base("identity-apply-cancel-wait")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5262,8 +5331,7 @@ defmodule Tightbeam.GatewayTest do
   # this seam's to make.
   test "a lane ensured over queued work defers, and the retry after it succeeds", ctx do
     base_dir = role_test_base("identity-apply-residual")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5378,8 +5446,7 @@ defmodule Tightbeam.GatewayTest do
   # session is a no-op: it materializes from live at first start, already current.
   test "identity apply skips a never-started session instead of raising", ctx do
     base_dir = role_test_base("identity-apply-unstarted")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5432,8 +5499,7 @@ defmodule Tightbeam.GatewayTest do
   test "identity apply advances the stamp of a started session the adapter no longer holds",
        ctx do
     base_dir = role_test_base("identity-apply-gone")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -5507,8 +5573,7 @@ defmodule Tightbeam.GatewayTest do
   test "identity apply --all handles resident, gone, and never-started sessions in one pass",
        ctx do
     base_dir = role_test_base("identity-apply-all")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     make = fn key, pointer ->
@@ -5579,8 +5644,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "identity apply refuses by name when a live adapter fails for its own reason", ctx do
     base_dir = role_test_base("identity-apply-error")
-    Identity.init!(base_dir)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
@@ -6064,6 +6128,12 @@ defmodule Tightbeam.GatewayTest do
     end)
 
     base_dir
+  end
+
+  defp learn_engineering_identity!(base_dir) do
+    assert :initialized = Identity.init!(base_dir)
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "test")
+    Archetypes.load!(base_dir)
   end
 
   defp create_session(db, session_key, owner_user_id, spawned_by \\ nil) do

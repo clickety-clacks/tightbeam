@@ -18,11 +18,13 @@ must never be committed as product files.
 
 Use the identity seam for every customization:
 
+- `tightbeam learn <bundle>` installs a shipped kungfu bundle.
+- `tightbeam unlearn <bundle>` removes a learned kungfu bundle.
 - `tightbeam identity edit <archetype>` edits that archetype's guidance.
 - `tightbeam identity edit <archetype> --manifest` edits its elections and defaults.
 - `tightbeam identity edit <archetype> --skill <name>` adds or updates a shared skill;
   de-elect it from every manifest before `--skill <name> --rm`.
-- `tightbeam identity relearn` merges a new shipped kungfu snapshot.
+- `tightbeam identity relearn` merges current snapshots of the neutral seed and learned kungfu.
 - `tightbeam identity status` reports the published revision and stale sessions.
 - `tightbeam identity apply <session>` or `--all` refreshes sessions explicitly.
 

@@ -1,5 +1,6 @@
 defmodule Tightbeam.IdentityTest do
   use Tightbeam.TestCase, async: false
+  import ExUnit.CaptureLog
 
   alias Tightbeam.Identity
 
@@ -24,20 +25,41 @@ defmodule Tightbeam.IdentityTest do
     %{base: runtime, root: base, source: source}
   end
 
-  test "learn creates the exact three refs and live snapshots compose both channels", ctx do
+  test "neutral seed creates the exact three refs and only the two seed files", ctx do
     assert :initialized = Identity.init!(ctx.base)
-    refs = git!(Path.join(ctx.base, "identity"), ["branch", "--format=%(refname:short)"])
+    dir = Path.join(ctx.base, "identity")
+    refs = git!(dir, ["branch", "--format=%(refname:short)"])
 
     assert MapSet.new(String.split(refs, "\n", trim: true)) ==
              MapSet.new(["main", "tightbeam/live", "tightbeam/upstream"])
 
+    assert git!(dir, ["log", "--max-parents=0", "-1", "--format=%s", "main"]) ==
+             "seed: neutral-identity"
+
+    assert git!(dir, ["ls-tree", "-r", "--name-only", "main"])
+           |> String.split("\n", trim: true) ==
+             ["archetypes/default.toml", "guidance/operating-model.md"]
+
+    snapshot = Identity.snapshot!(ctx.base, "default", :codex)
+    assert snapshot.skills == %{}
+    assert snapshot.guidance =~ "tightbeam learn <bundle>"
+    refute snapshot.guidance =~ "role-v1"
+  end
+
+  test "explicit learn installs the shipped bundle and committed receipt", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+    assert {:ok, revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
     codex = Identity.snapshot!(ctx.base, "coder", :codex)
     claude = Identity.snapshot!(ctx.base, "coder", :claude)
-    assert codex.revision == claude.revision
+    assert codex.revision == claude.revision and codex.revision == revision
     assert codex.skills == %{"role-skill" => "skill-v1"}
     assert codex.guidance =~ "Codex developer message"
     assert claude.guidance =~ "Claude system prompt"
     assert codex.guidance =~ "tightbeam identity edit"
+
+    receipt = Path.join(ctx.base, "identity/kungfu/agentic-engineering/installed.toml")
+    assert File.read!(receipt) =~ ~s(name = "agentic-engineering")
+    assert {:noop, ^revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
   end
 
   test "init refuses an identity repository missing the live ref with repair guidance", ctx do
@@ -91,7 +113,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "reserved skills reconcile at exact cwd without product collisions", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     cwd = Path.join(ctx.root, "plain")
     nested = Path.join(cwd, "nested-repo")
     File.mkdir_p!(Path.join(cwd, ".codex/skills/role-skill"))
@@ -125,7 +147,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "real repo exclusion hides only reserved materialized skills", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     repo = Path.join(ctx.root, "repo")
     File.mkdir_p!(Path.join(repo, ".codex/skills/product"))
     File.write!(Path.join(repo, ".codex/skills/product/SKILL.md"), "product")
@@ -143,7 +165,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "linked worktrees keep product collisions visible and reserved skills hidden", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     repo = Path.join(ctx.root, "linked-source")
     linked = Path.join(ctx.root, "linked-worktree")
     File.mkdir_p!(Path.join(repo, ".codex/skills/role-skill"))
@@ -166,7 +188,7 @@ defmodule Tightbeam.IdentityTest do
 
   test "plain workdirs materialize at exact cwd for both harnesses and never touch nested repos",
        ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
 
     for harness <- [:codex, :claude] do
       cwd = Path.join(ctx.root, "plain-#{harness}")
@@ -190,7 +212,7 @@ defmodule Tightbeam.IdentityTest do
   defp skills_prefix(:claude), do: ".claude"
 
   test "personal skills are outside the elected served snapshot", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     personal = Path.join(ctx.root, "personal/.codex/skills/personal/SKILL.md")
     File.mkdir_p!(Path.dirname(personal))
     File.write!(personal, "personal")
@@ -201,7 +223,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "invalid manifest is refused without a commit or dirty tree", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     before = git!(dir, ["rev-parse", "main"])
     original = File.read!(Path.join(dir, "archetypes/coder.toml"))
@@ -222,7 +244,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "customization leaves source untouched and relearn preserves changes and deletions", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     prior_upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
     source_before = tree_digest(ctx.source)
@@ -280,7 +302,7 @@ defmodule Tightbeam.IdentityTest do
       System.delete_env(key)
     end
 
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
 
     # The environment really is bare: git itself cannot commit here unaided, so a
@@ -332,7 +354,9 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["commit", "-m", "pre-upgrade tree"], "tightbeam")
     git!(dir, ["branch", "-f", "tightbeam/live", "main"])
 
-    error = assert_raise(ArgumentError, fn -> Identity.snapshot!(ctx.base, "coder", :claude) end)
+    error =
+      assert_raise(ArgumentError, fn -> Identity.snapshot!(ctx.base, "default", :claude) end)
+
     message = error.message
 
     assert message =~ "has no guidance/operating-model.md"
@@ -358,7 +382,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "dirty and conflicted relearns never move live", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     live = Identity.live_revision!(ctx.base)
     File.write!(Path.join(dir, "guidance/dirty.md"), "dirty")
@@ -377,7 +401,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "relearn surfaces a non-conflict merge failure with git's reason", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     live = Identity.live_revision!(ctx.base)
     hook = Path.join(dir, ".git/hooks/pre-merge-commit")
@@ -399,7 +423,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "live is the only publication and one stamped OID cannot mix revisions", ctx do
-    Identity.init!(ctx.base)
+    learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     live = Identity.live_revision!(ctx.base)
     cwd = Path.join(ctx.root, "published")
@@ -437,6 +461,86 @@ defmodule Tightbeam.IdentityTest do
     assert refreshed.skills == %{"role-skill" => "skill-main"}
   end
 
+  test "unlearn removes exactly the receipted bundle and relearn does not resurrect it", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    receipt_path = Path.join(dir, "kungfu/agentic-engineering/installed.toml")
+    receipt = receipt_path |> File.read!() |> Toml.decode!()
+
+    assert revision = Identity.unlearn!(ctx.base, "agentic-engineering", "operator")
+    assert revision == Identity.live_revision!(ctx.base)
+
+    for relative <- receipt["paths"] do
+      refute File.exists?(Path.join(dir, relative))
+    end
+
+    refute File.exists?(receipt_path)
+    assert File.regular?(Path.join(dir, "archetypes/default.toml"))
+    assert File.regular?(Path.join(dir, "guidance/operating-model.md"))
+    assert git!(dir, ["log", "-1", "--format=%s"]) == "unlearn: agentic-engineering"
+
+    assert {:ok, _revision} = Identity.relearn!(ctx.base, "operator")
+    refute File.exists?(Path.join(dir, "archetypes/coder.toml"))
+    refute File.exists?(receipt_path)
+  end
+
+  test "learn refuses seed-owned bundle paths and unknown names list shipped bundles", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+    forbidden = Path.join(ctx.source, "archetypes/default.toml")
+    File.write!(forbidden, "name = \"default\"\nskills = []\n")
+
+    assert_raise ArgumentError, ~r/claims seed-owned path archetypes\/default.toml/, fn ->
+      Identity.learn!(ctx.base, "agentic-engineering", "operator")
+    end
+
+    File.rm!(forbidden)
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Identity.learn!(ctx.base, "missing", "operator")
+      end
+
+    assert error.message =~ "unknown kungfu bundle missing"
+    assert error.message =~ "available bundles: agentic-engineering"
+  end
+
+  test "legacy enriched roots mint one receipt without changing their seed-owned paths", ctx do
+    dir = build_legacy_org!(ctx)
+    enriched_default = File.read!(Path.join(dir, "archetypes/default.toml"))
+
+    assert :noop = Identity.init!(ctx.base)
+    assert File.regular?(Path.join(dir, "kungfu/agentic-engineering/installed.toml"))
+    assert File.read!(Path.join(dir, "archetypes/default.toml")) == enriched_default
+    assert git!(dir, ["log", "-1", "--format=%s"]) == "learn-receipt: agentic-engineering"
+
+    assert :noop = Identity.init!(ctx.base)
+
+    assert git!(dir, ["log", "--format=%s"])
+           |> String.split("\n", trim: true)
+           |> Enum.count(&(&1 == "learn-receipt: agentic-engineering")) == 1
+
+    assert {:ok, _revision} = Identity.relearn!(ctx.base, "operator")
+    assert File.read!(Path.join(dir, "archetypes/default.toml")) == enriched_default
+  end
+
+  test "dirty legacy roots defer grandfather mint and refuse relearn until a clean boot", ctx do
+    dir = build_legacy_org!(ctx)
+    dirty = Path.join(dir, "dirty.md")
+    File.write!(dirty, "operator work")
+
+    log = capture_log(fn -> assert :noop = Identity.init!(ctx.base) end)
+    assert log =~ "grandfather receipt mint deferred"
+    refute File.exists?(Path.join(dir, "kungfu/agentic-engineering/installed.toml"))
+
+    assert_raise ArgumentError, ~r/grandfather receipt mint is pending/, fn ->
+      Identity.relearn!(ctx.base, "operator")
+    end
+
+    File.rm!(dirty)
+    assert :noop = Identity.init!(ctx.base)
+    assert File.regular?(Path.join(dir, "kungfu/agentic-engineering/installed.toml"))
+  end
+
   defp write_source!(source, role, skill) do
     File.mkdir_p!(Path.join(source, "archetypes"))
     File.mkdir_p!(Path.join(source, "guidance"))
@@ -451,8 +555,41 @@ defmodule Tightbeam.IdentityTest do
     """)
 
     File.write!(Path.join(source, "guidance/coder.md"), role)
-    File.write!(Path.join(source, "guidance/operating-model.md"), "tightbeam identity edit")
     File.write!(Path.join(source, "skills/role-skill/SKILL.md"), skill)
+  end
+
+  defp learn_test_bundle!(ctx) do
+    Identity.init!(ctx.base)
+    assert {:ok, _revision} = Identity.learn!(ctx.base, "agentic-engineering", "test")
+  end
+
+  defp build_legacy_org!(ctx) do
+    dir = Path.join(ctx.base, "identity")
+    File.mkdir_p!(dir)
+    git!(dir, ["init", "-b", "main"])
+
+    for entry <- File.ls!(ctx.source) do
+      File.cp_r!(Path.join(ctx.source, entry), Path.join(dir, entry))
+    end
+
+    File.write!(Path.join(dir, "archetypes/default.toml"), """
+    name = "default"
+    skills = []
+
+    [guidance]
+    text = '#include "coder.md"'
+    """)
+
+    File.cp!(
+      Application.app_dir(:tightbeam, "priv/seed/guidance/operating-model.md"),
+      Path.join(dir, "guidance/operating-model.md")
+    )
+
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "-m", "learn: agentic-engineering"], "tightbeam")
+    git!(dir, ["branch", "tightbeam/upstream"])
+    git!(dir, ["branch", "tightbeam/live"])
+    dir
   end
 
   defp tree_digest(path) do
