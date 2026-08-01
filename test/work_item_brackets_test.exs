@@ -345,101 +345,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert assignment_state(ctx.db, d.id) == "closed"
   end
 
-  ## Proof 8 — migration: pre-change DB rebuilds, backfills owners, arms nothing retroactively.
-
-  test "Proof 8 + migration proof: pre-change schema rebuilds with owners and a clean FK check" do
-    db = :"brackets_migrate_#{System.unique_integer([:positive])}"
-    start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
-
-    :ok = Devices.ensure_schema(db)
-    :ok = Org.ensure_schema(db)
-    :ok = Projection.ensure_schema(db)
-
-    # Pre-brackets work_items schema (no owner/state/wake columns).
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE work_items (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        specRefName TEXT,
-        specRefSha256 TEXT,
-        isBug INTEGER NOT NULL DEFAULT 0,
-        createdByUser TEXT,
-        createdBySession TEXT,
-        createdAt INTEGER NOT NULL
-      )
-      """)
-
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1), ('aaronadmin', 1, 1), ('dana', 0, 1)"
-      )
-
-    _dsession = session(db, "dsession", "dana")
-
-    {:ok, _} =
-      DB.query(db, """
-      INSERT INTO work_items (id, title, isBug, createdByUser, createdBySession, createdAt)
-      VALUES
-        ('wi_user', 'User owned', 0, 'dana', NULL, 1),
-        ('wi_sess', 'Session owned', 1, NULL, 'dsession', 2),
-        ('wi_orphan', 'Orphan', 0, NULL, 'ghost-session', 3)
-      """)
-
-    # Child references across the parent-table rebuild.
-    :ok = Assignments.ensure_schema(db)
-    :ok = Artifacts.ensure_schema(db)
-    :ok = WorkState.ensure_schema(db)
-
-    {:ok, _} =
-      DB.query(db, """
-      INSERT INTO assignments (id, subject, holderKey, openedBySession, openedAt, workItemId)
-      VALUES ('asg_m', 'legacy', 'dsession', 'dsession', 1, 'wi_user')
-      """)
-
-    {:ok, _} =
-      DB.query(db, """
-      INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId)
-      VALUES ('msg_m', 'dsession', 'assistant', 'x', 1, 'msg_m')
-      """)
-
-    {:ok, _} =
-      DB.query(db, """
-      INSERT INTO artifacts
-        (artifactId, kind, title, createdBySession, workItemId, originPath, recordedMessageId, createdAt, updatedAt)
-      VALUES ('art_m', 'doc', 'Legacy art', 'dsession', 'wi_sess', '/tmp/a', 'msg_m', 1, 1)
-      """)
-
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO work_item_events (ts, workItemId, kind) VALUES (1, 'wi_orphan', 'metadata')"
-      )
-
-    # Run the migration (idempotent).
-    assert :ok = WorkItems.ensure_schema(db)
-    assert :ok = WorkItems.ensure_schema(db)
-
-    assert owner(db, "wi_user") == "dana"
-    assert owner(db, "wi_sess") == "dana"
-    # Orphan session inherits the deterministic org owner (lowest-id admin).
-    assert owner(db, "wi_orphan") == "aaronadmin"
-
-    # No retroactive brackets, all open.
-    {:ok, rows} =
-      DB.query(db, "SELECT state, routingWakeId, slateWakeId FROM work_items ORDER BY id")
-
-    assert Enum.all?(rows, fn [state, routing, slate] ->
-             state == "open" and is_nil(routing) and is_nil(slate)
-           end)
-
-    # The parent-table rebuild left every foreign key intact.
-    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
-    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
-  end
-
-  ## Proof 9 — feature_smoke journey.
+  ## Proof 8 — feature_smoke journey.
 
   test "Proof 9: create -> nag -> dispatch cancels -> revoke arms slate -> fail disposes", ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Journey"})
@@ -831,7 +737,6 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   defp routing_wake_id(db, id), do: column(db, id, "routingWakeId")
   defp slate_wake_id(db, id), do: column(db, id, "slateWakeId")
-  defp owner(db, id), do: column(db, id, "ownerUserId")
 
   defp column(db, id, name) do
     {:ok, [[value]]} = DB.query(db, "SELECT #{name} FROM work_items WHERE id = ?1", [id])

@@ -853,58 +853,6 @@ defmodule Tightbeam.PlacementTest do
     assert Placement.hosts(base_dir, db)["work-1"].base_dir == "/z"
   end
 
-  # host-registry-v1 acceptance 3, plus the migration's authority rule: the
-  # table is the authority and a legacy file only fills gaps — a stale file
-  # spelling for a host that is already a row must not win a re-run.
-  test "migrate_registry! imports a legacy hosts.json once and table rows win", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    {:ok, _} = Placement.register_host(db, "kept", %{ssh: "kept.live", base_dir: "/live"})
-
-    path = Path.join(base_dir, "hosts.json")
-
-    File.write!(
-      path,
-      JSON.encode!(%{
-        "kept" => %{ssh: "kept.stale", base_dir: "/stale", cli_bin: nil},
-        "imported" => %{ssh: "imported.example", base_dir: "/srv/tb", cli_bin: "/srv/bin"}
-      })
-    )
-
-    assert :ok = Placement.migrate_registry!(db, base_dir)
-
-    hosts = Placement.hosts(base_dir, db)
-    assert hosts["kept"].ssh == "kept.live"
-    assert hosts["kept"].base_dir == "/live"
-    assert hosts["imported"].ssh == "imported.example"
-    assert hosts["imported"].cli_bin == "/srv/bin"
-    assert hosts[Placement.local_host_name()].ssh == nil
-
-    # The rename is what retires the file and makes the old bytes recoverable.
-    refute File.exists?(path)
-    assert File.exists?(path <> ".migrated")
-
-    # Second boot: nothing to migrate, nothing changes.
-    assert :ok = Placement.migrate_registry!(db, base_dir)
-    assert Placement.hosts(base_dir, db) == hosts
-  end
-
-  # host-registry-v1 acceptance 4: no hosts.json boots clean, and the gateway's
-  # own entry is synthesized either way.
-  test "an org with no hosts.json boots clean with the gateway's own entry", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    assert :ok = Placement.migrate_registry!(db, base_dir)
-
-    assert Placement.hosts(base_dir, db) == %{
-             Placement.local_host_name() => %{ssh: nil, base_dir: base_dir, cli_bin: nil}
-           }
-
-    refute File.exists?(Path.join(base_dir, "hosts.json.migrated"))
-  end
-
   # Fail-before evidence, measured 2026-07-28 against the hosts.json registry
   # this table replaced (40 concurrent registrations of distinct hosts, 10
   # trials, through the same public API): 371 of 400 calls returned {:ok, entry}

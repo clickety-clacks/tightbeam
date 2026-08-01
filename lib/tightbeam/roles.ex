@@ -78,29 +78,6 @@ defmodule Tightbeam.Roles do
     end
   end
 
-  @doc false
-  @spec migrate_handle(db(), String.t(), String.t(), String.t()) ::
-          role() | {:error, %{code: String.t(), message: String.t()}}
-  def migrate_handle(db, name, owner_user_id, bound_session_key) do
-    transaction!(db, fn txn ->
-      with :ok <- validate_name(name),
-           :ok <- role_absent(txn, name) do
-        now = now()
-
-        Txn.q(
-          txn,
-          """
-          INSERT INTO roles (name, boundSessionKey, ownerUserId, createdAt, updatedAt)
-          VALUES (?1, ?2, ?3, ?4, ?4)
-          """,
-          [name, bound_session_key, owner_user_id, now]
-        )
-
-        %{name: name, bound_session_key: bound_session_key, owner_user_id: owner_user_id}
-      end
-    end)
-  end
-
   @doc "Bind a role to an existing active session."
   @spec bind(db(), String.t(), String.t()) ::
           :ok | {:error, %{code: String.t(), message: String.t()}}

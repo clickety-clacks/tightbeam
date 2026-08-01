@@ -1092,49 +1092,6 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prods(ctx.db, "holder") == []
   end
 
-  test "proof 8d: pre-change wakes and requests rebuild and preserve rows" do
-    db = :"effort_migration_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db}, id: {:migration, db})
-
-    :ok =
-      DB.execute(
-        db,
-        """
-        CREATE TABLE wakes (
-          wakeId TEXT PRIMARY KEY, sessionKey TEXT NOT NULL, targetRole TEXT,
-          origin TEXT NOT NULL, prompt TEXT NOT NULL, dueAt INTEGER NOT NULL,
-          state TEXT NOT NULL, createdAt INTEGER NOT NULL, firedAt INTEGER,
-          reresolve TEXT, reresolveSeed TEXT, reresolveRung INTEGER,
-          conditionKind TEXT, conditionScope TEXT, conditionAfterId INTEGER,
-          firedBy TEXT, creatorSessionKey TEXT, rumination INTEGER NOT NULL DEFAULT 0,
-          work_item_id TEXT
-        );
-        INSERT INTO wakes (wakeId,sessionKey,origin,prompt,dueAt,state,createdAt)
-          VALUES ('old-wake','holder','agent:parent','old prompt',9,'pending',1);
-        CREATE TABLE decision_requests (
-          id TEXT PRIMARY KEY, raiserId TEXT NOT NULL, raiserSessionKey TEXT,
-          ownerUserId TEXT NOT NULL, assignmentId TEXT, raisedAt INTEGER NOT NULL,
-          deadlineAt INTEGER NOT NULL, statuteName TEXT NOT NULL, actionKey TEXT NOT NULL,
-          question TEXT NOT NULL, options TEXT, context TEXT NOT NULL, status TEXT NOT NULL,
-          decision TEXT, rationale TEXT, ruledBy TEXT, ruledAt INTEGER, rulingFactId INTEGER,
-          consumedAt INTEGER, parkWakeId TEXT, withdrawnBy TEXT, withdrawnReason TEXT,
-          withdrawnAt INTEGER
-        );
-        INSERT INTO decision_requests
-          (id,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,context,status)
-          VALUES ('old-request','session:parent','h1',1,2,'old-statute','digest','why','{}','open');
-        """
-      )
-
-    assert :ok = Wakes.ensure_schema(db)
-    assert :ok = Escalation.ensure_schema(db)
-    assert %{consumer: "prompt", prompt: "old prompt"} = Wakes.get(db, "old-wake")
-
-    assert rows(db, "SELECT kind,status FROM decision_requests WHERE id='old-request'", []) == [
-             ["statute", "open"]
-           ]
-  end
-
   test "proofs 6 and 8b: request and notification commit together and stay pending until delivered",
        ctx do
     personal_key = Org.personal_session_key("h1")

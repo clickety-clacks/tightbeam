@@ -190,50 +190,6 @@ defmodule Tightbeam.WorkItemsTest do
              )
   end
 
-  test "Proof 4: migration uses two additive columns, existing rows land known = 0, and createdInTurnSeq is indexed" do
-    db = :"c1_migration_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: db,
-      start: {DB, :start_link, [[path: ":memory:", name: db]]}
-    })
-
-    :ok =
-      DB.execute(
-        db,
-        """
-        CREATE TABLE work_items (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 2000),
-          specRefName TEXT NULL,
-          specRefSha256 TEXT NULL,
-          isBug INTEGER NOT NULL DEFAULT 0,
-          ownerUserId TEXT NOT NULL,
-          state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','iceboxed','closed','failed')),
-          failReason TEXT NULL,
-          routingWakeId TEXT NULL,
-          slateWakeId TEXT NULL,
-          createdByUser TEXT NULL,
-          createdBySession TEXT NULL,
-          createdAt INTEGER NOT NULL
-        );
-        INSERT INTO work_items
-          (id, title, ownerUserId, createdByUser, createdAt)
-        VALUES ('wi_legacy', 'legacy', 'flynn', 'flynn', 1);
-        """
-      )
-
-    :ok = WorkItems.ensure_schema(db)
-
-    assert {:ok, [[nil, 0]]} = creation_context(db, "wi_legacy")
-
-    assert {:ok, indexes} = DB.query(db, "PRAGMA index_list(work_items)")
-
-    assert Enum.any?(indexes, fn [_seq, name | _] ->
-             name == "work_items_created_in_turn"
-           end)
-  end
-
   test "Proof 5: a cancel-then-arriving create lands known = 1, seq = NULL", ctx do
     running_seq = running_turn!(ctx.db, "holder")
     :ok = Ledger.finish(ctx.db, running_seq, "canceled")
@@ -318,44 +274,6 @@ defmodule Tightbeam.WorkItemsTest do
              "Retitled again"
 
     refute_received :work_item_change
-  end
-
-  test "schema migration adds the org-set bug attribute with a false default" do
-    legacy = :"legacy_work_items_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: legacy,
-      start: {DB, :start_link, [[path: ":memory:", name: legacy]]}
-    })
-
-    :ok =
-      DB.execute(
-        legacy,
-        """
-        CREATE TABLE work_items (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          specRefName TEXT,
-          specRefSha256 TEXT,
-          createdByUser TEXT,
-          createdBySession TEXT,
-          createdAt INTEGER NOT NULL
-        );
-        INSERT INTO work_items
-          (id, title, createdByUser, createdAt)
-        VALUES ('wi_legacy', 'Legacy', 'flynn', 1)
-        """
-      )
-
-    assert :ok = WorkItems.ensure_schema(legacy)
-    assert :ok = WorkItems.ensure_schema(legacy)
-    assert {:ok, [[0]]} = DB.query(legacy, "SELECT isBug FROM work_items WHERE id = 'wi_legacy'")
-
-    assert %{workItems: [%{id: "wi_legacy", isBug: false}]} =
-             WorkItems.__handle__(legacy, "work-item-list", %{
-               principal: {:user, "flynn"},
-               params: %{}
-             })
   end
 
   test "get and list return deterministic eras, aspects, and ordering", ctx do

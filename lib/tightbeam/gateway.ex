@@ -183,10 +183,6 @@ defmodule Tightbeam.Gateway do
       :ok = module.ensure_schema(db)
     end
 
-    # One-time: a pre-DB hosts.json becomes rows and the file is renamed aside
-    # (host-registry-v1). Idempotent — the rename is what retires it.
-    :ok = Placement.migrate_registry!(db, config.base_dir)
-
     :ok = Assignments.audit_review_item_conflicts(db)
 
     :ok = Adjudication.reconcile(db)
@@ -196,28 +192,6 @@ defmodule Tightbeam.Gateway do
         db,
         Map.get(config, :adjudication_response_window_ms, 86_400_000)
       )
-
-    migrate_handle_roles(db)
-
-    # Sessions created before real-hostname registration stored the retired
-    # "local" indexical; rewrite once so rows speak the org's vocabulary.
-    {:ok, _} =
-      DB.query(db, "UPDATE sessions SET host = ?1 WHERE host = 'local'", [
-        Placement.local_host_name()
-      ])
-
-    {:ok, rows} =
-      DB.query(db, "SELECT sessionKey FROM sessions WHERE state = 'active' AND cliToken IS NULL")
-
-    Enum.each(rows, fn [session_key] ->
-      token = "tbs_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
-
-      {:ok, _} =
-        DB.query(db, "UPDATE sessions SET cliToken = ?2 WHERE sessionKey = ?1", [
-          session_key,
-          token
-        ])
-    end)
 
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
@@ -731,22 +705,21 @@ defmodule Tightbeam.Gateway do
               %{code: to_string(reason), message: endpoint_failure_message(reason, p.name)}
           end
         end),
-      "update-clients" =>
-        fn _call ->
-          hosts =
-            config.base_dir
-            |> Placement.hosts(db)
-            |> Enum.flat_map(fn
-              {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
-                [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
+      "update-clients" => fn _call ->
+        hosts =
+          config.base_dir
+          |> Placement.hosts(db)
+          |> Enum.flat_map(fn
+            {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
+              [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
 
-              {_name, %{ssh: nil}} ->
-                []
-            end)
-            |> Enum.sort_by(& &1.name)
+            {_name, %{ssh: nil}} ->
+              []
+          end)
+          |> Enum.sort_by(& &1.name)
 
-          %{hosts: hosts}
-        end,
+        %{hosts: hosts}
+      end,
       "identity-edit" =>
         admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
       "identity-status" =>
@@ -2628,26 +2601,6 @@ defmodule Tightbeam.Gateway do
   end
 
   defp resolve_caller(_db, _origin), do: nil
-
-  defp migrate_handle_roles(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT handle, sessionKey, ownerUserId
-        FROM sessions WHERE handle IS NOT NULL ORDER BY createdAt, sessionKey
-        """
-      )
-
-    Enum.each(rows, fn [handle, session_key, owner_user_id] ->
-      if is_nil(Roles.get(db, handle)) do
-        case Roles.migrate_handle(db, handle, owner_user_id, session_key) do
-          {:error, error} -> raise error.message
-          _role -> :ok
-        end
-      end
-    end)
-  end
 
   defp admin_origin?(db, origin) do
     case resolve_caller(db, origin) do

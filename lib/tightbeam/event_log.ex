@@ -79,16 +79,7 @@ defmodule Tightbeam.EventLog do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB) do
-    result = DB.execute(db, @ddl)
-
-    case DB.query(db, "ALTER TABLE events ADD COLUMN principal TEXT") do
-      {:ok, _} -> :ok
-      {:error, error} -> if inspect(error) =~ "duplicate column", do: :ok, else: raise(error)
-    end
-
-    result
-  end
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   ## Verb events (dispatch appends these)
 

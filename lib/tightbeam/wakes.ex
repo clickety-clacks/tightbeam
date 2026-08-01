@@ -89,76 +89,11 @@ defmodule Tightbeam.Wakes do
     afterFact INTEGER NOT NULL DEFAULT 0
   );
   INSERT OR IGNORE INTO scheduler_state (id, afterFact) VALUES (0, 0);
-  """
-
-  @rebuild_ddl """
-  CREATE TABLE wakes_new (
-    wakeId TEXT PRIMARY KEY,
-    sessionKey TEXT NOT NULL,
-    targetRole TEXT,
-    origin TEXT NOT NULL,
-    prompt TEXT,
-    consumer TEXT NOT NULL DEFAULT 'prompt',
-    dueAt INTEGER NOT NULL,
-    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
-    createdAt INTEGER NOT NULL,
-    firedAt INTEGER,
-    reresolve TEXT NULL CHECK (reresolve IN ('lineage')),
-    reresolveSeed TEXT NULL,
-    reresolveRung INTEGER NULL,
-    conditionKind TEXT NULL,
-    conditionScope TEXT NULL,
-    conditionAfterId INTEGER NULL,
-    firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
-    creatorSessionKey TEXT NULL,
-    rumination INTEGER NOT NULL DEFAULT 0,
-    work_item_id TEXT,
-    assignmentId TEXT,
-    canceledAt INTEGER,
-    targetGate INTEGER NOT NULL DEFAULT 1,
-    CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
-  )
+  CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB) do
-    result = DB.execute(db, @ddl)
-
-    for ddl <- [
-          "ALTER TABLE wakes ADD COLUMN targetRole TEXT",
-          "ALTER TABLE wakes ADD COLUMN reresolve TEXT NULL CHECK (reresolve IN ('lineage'))",
-          "ALTER TABLE wakes ADD COLUMN reresolveSeed TEXT NULL",
-          "ALTER TABLE wakes ADD COLUMN reresolveRung INTEGER NULL",
-          "ALTER TABLE wakes ADD COLUMN conditionKind TEXT NULL",
-          "ALTER TABLE wakes ADD COLUMN conditionScope TEXT NULL",
-          "ALTER TABLE wakes ADD COLUMN conditionAfterId INTEGER NULL",
-          "ALTER TABLE wakes ADD COLUMN firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback'))",
-          "ALTER TABLE wakes ADD COLUMN creatorSessionKey TEXT NULL",
-          "ALTER TABLE wakes ADD COLUMN rumination INTEGER NOT NULL DEFAULT 0",
-          "ALTER TABLE wakes ADD COLUMN work_item_id TEXT",
-          "ALTER TABLE wakes ADD COLUMN assignmentId TEXT",
-          "ALTER TABLE wakes ADD COLUMN canceledAt INTEGER",
-          "ALTER TABLE wakes ADD COLUMN targetGate INTEGER NOT NULL DEFAULT 1"
-        ] do
-      case DB.query(db, ddl) do
-        {:ok, _} -> :ok
-        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-      end
-    end
-
-    ensure_wakes_shape(db)
-
-    :ok =
-      DB.execute(
-        db,
-        """
-        CREATE INDEX IF NOT EXISTS wakes_due ON wakes (state, dueAt);
-        CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
-        """
-      )
-
-    result
-  end
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   ## Store (pure DB ops — callable without the scheduler process, e.g. by inspect)
 
@@ -947,36 +882,6 @@ defmodule Tightbeam.Wakes do
   end
 
   defp schedule_tick(tick_ms), do: Process.send_after(self(), :tick, tick_ms)
-
-  defp ensure_wakes_shape(db) do
-    {:ok, [[sql]]} =
-      DB.query(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wakes'")
-
-    unless String.contains?(sql, "consumer") and
-             String.contains?(sql, "consumer != 'prompt' OR prompt IS NOT NULL") do
-      {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
-      names = Enum.map(columns, &Enum.at(&1, 1))
-
-      copied =
-        ~w(wakeId sessionKey targetRole origin prompt dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination work_item_id assignmentId canceledAt targetGate)
-        |> Enum.filter(&(&1 in names))
-
-      transaction!(db, fn txn ->
-        Txn.exec(txn, @rebuild_ddl)
-        columns_sql = Enum.join(copied, ", ")
-
-        Txn.exec(
-          txn,
-          "INSERT INTO wakes_new (#{columns_sql}, consumer) SELECT #{columns_sql}, 'prompt' FROM wakes"
-        )
-
-        Txn.exec(txn, "DROP TABLE wakes")
-        Txn.exec(txn, "ALTER TABLE wakes_new RENAME TO wakes")
-      end)
-    end
-
-    :ok
-  end
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do

@@ -67,38 +67,12 @@ defmodule Tightbeam.Ledger do
   CREATE INDEX IF NOT EXISTS turns_session ON turns (sessionKey, seq);
   CREATE INDEX IF NOT EXISTS turns_unpublished
     ON turns (endedAt) WHERE endedAt IS NOT NULL AND publishedAt IS NULL;
+  CREATE INDEX IF NOT EXISTS turns_job_ref ON turns (jobRef);
+  CREATE INDEX IF NOT EXISTS turns_assignment_id ON turns (assignmentId);
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB) do
-    result = DB.execute(db, @ddl)
-
-    for ddl <- [
-          "ALTER TABLE turns ADD COLUMN roleRef TEXT",
-          "ALTER TABLE turns ADD COLUMN roleFallback INTEGER NOT NULL DEFAULT 0",
-          "ALTER TABLE turns ADD COLUMN assignmentId TEXT",
-          "ALTER TABLE turns ADD COLUMN jobRef TEXT",
-          "ALTER TABLE turns ADD COLUMN model TEXT",
-          "ALTER TABLE turns ADD COLUMN harness TEXT",
-          "ALTER TABLE turns ADD COLUMN replyAttention INTEGER NOT NULL DEFAULT 0"
-        ] do
-      case DB.query(db, ddl) do
-        {:ok, _} -> :ok
-        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-      end
-    end
-
-    :ok =
-      DB.execute(
-        db,
-        """
-        CREATE INDEX IF NOT EXISTS turns_job_ref ON turns (jobRef);
-        CREATE INDEX IF NOT EXISTS turns_assignment_id ON turns (assignmentId);
-        """
-      )
-
-    result
-  end
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc """
   Transactionally enqueue a turn (call inside the same DB.transaction that

@@ -168,45 +168,8 @@ defmodule Tightbeam.LedgerTest do
     assert rows == [[0]]
   end
 
-  test "legacy turns gains exactly four nullable trace columns additively with indexes" do
-    db = :"legacy_turns_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: db,
-      start: {DB, :start_link, [[path: ":memory:", name: db]]}
-    })
-
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE turns (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, sessionKey TEXT NOT NULL,
-        messageId TEXT NOT NULL, wakeId TEXT UNIQUE, origin TEXT NOT NULL,
-        prompt TEXT NOT NULL, roleRef TEXT, roleFallback INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'queued', owner TEXT, adapterGen INTEGER,
-        requestRef TEXT, error TEXT, createdAt INTEGER NOT NULL, startedAt INTEGER,
-        endedAt INTEGER, publishedAt INTEGER
-      );
-      INSERT INTO turns
-        (sessionKey, messageId, origin, prompt, createdAt)
-      VALUES ('legacy', 'm_old', 'user:test', 'preserve', 7);
-      """)
-
-    assert {:ok, [[root_before]]} =
-             DB.query(
-               db,
-               "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='turns'"
-             )
-
+  test "fresh schema has trace columns and indexes and is idempotent", %{db: db} do
     assert :ok = Ledger.ensure_schema(db)
-
-    assert {:ok, [[root_after]]} =
-             DB.query(
-               db,
-               "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='turns'"
-             )
-
-    assert root_after == root_before
-
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(turns)")
 
     trace_columns =
@@ -220,12 +183,6 @@ defmodule Tightbeam.LedgerTest do
              {"model", 0, nil},
              {"harness", 0, nil}
            ]
-
-    assert {:ok, [["legacy", "m_old", "preserve", nil, nil, nil, nil]]} =
-             DB.query(
-               db,
-               "SELECT sessionKey, messageId, prompt, assignmentId, jobRef, model, harness FROM turns"
-             )
 
     assert {:ok, indexes} = DB.query(db, "PRAGMA index_list(turns)")
     index_names = Enum.map(indexes, &Enum.at(&1, 1))

@@ -53,21 +53,7 @@ defmodule Tightbeam.EffortCheckin do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB) do
-    result = DB.execute(db, @ddl)
-
-    for column <- ~w(agentProdded artifactWatermark attestWatermark workItemWatermark) do
-      case DB.query(
-             db,
-             "ALTER TABLE effort_checkin_generations ADD COLUMN #{column} INTEGER NOT NULL DEFAULT 0"
-           ) do
-        {:ok, _} -> :ok
-        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-      end
-    end
-
-    result
-  end
+  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
   @spec valid_workdir_root(term()) :: :ok | {:error, map()}
   def valid_workdir_root(nil), do: :ok

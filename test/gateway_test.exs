@@ -1109,54 +1109,6 @@ defmodule Tightbeam.GatewayTest do
     refute File.exists?(base_dir)
   end
 
-  test "children backfills distinct tokens for active NULL rows only", ctx do
-    second =
-      Org.create(ctx.db, %{
-        session_key: "backfill-active",
-        display_name: "Active",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: "fable"
-      })
-
-    retired =
-      Org.create(ctx.db, %{
-        session_key: "backfill-retired",
-        display_name: "Retired",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: "fable"
-      })
-      |> then(&Org.retire(ctx.db, &1.session_key))
-
-    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET cliToken = NULL")
-
-    base_dir =
-      Path.join(
-        System.tmp_dir!(),
-        "gateway_backfill_#{:os.getpid()}_#{System.unique_integer([:positive])}"
-      )
-
-    on_exit(fn -> File.rm_rf!(base_dir) end)
-
-    Gateway.children(gateway_config(base_dir, ctx.db, 0))
-
-    first_token = Org.get(ctx.db, "k1").cli_token
-    second_token = Org.get(ctx.db, second.session_key).cli_token
-    assert first_token =~ ~r/^tbs_/
-    assert second_token =~ ~r/^tbs_/
-    refute first_token == second_token
-    assert Org.get(ctx.db, retired.session_key).cli_token == nil
-  end
-
   test "session projections never expose cli tokens", ctx do
     session = Org.get(ctx.db, "k1")
     base_dir = role_test_base("projection-leak")
@@ -3397,35 +3349,6 @@ defmodule Tightbeam.GatewayTest do
 
     send(adapter, :release_cancel_conn)
     assert %{ok: true} = Task.await(cancel)
-  end
-
-  test "boot migration turns legacy handles into roles idempotently", ctx do
-    legacy =
-      Org.create(ctx.db, %{
-        session_key: "legacy-session",
-        display_name: "Legacy",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        handle: "legacy-office",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: "fable"
-      })
-
-    base_dir = role_test_base("migration")
-    config = gateway_config(base_dir, ctx.db, 0)
-    Gateway.children(config)
-    Gateway.children(config)
-
-    assert %{bound_session_key: key, owner_user_id: "flynn"} =
-             Roles.get(ctx.db, "legacy-office")
-
-    assert key == legacy.session_key
-
-    assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM roles WHERE name = 'legacy-office'")
   end
 
   test "role verbs enforce owner, admin, binding ownership, and process denials", ctx do

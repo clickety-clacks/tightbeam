@@ -282,58 +282,7 @@ defmodule Tightbeam.AttentionTierTest do
     assert Payloads.server_message(high.echo)["attentionTier"] == 0
   end
 
-  ## Proof 5 — the migration is additive
-
-  test "an existing database gains both columns and reads normal for every old row", _ctx do
-    legacy = :"attention_legacy_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: legacy}, id: legacy)
-
-    # Build the PRE-column shape, then insert rows into it.
-    :ok =
-      DB.execute(legacy, """
-      CREATE TABLE messages (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-        sessionKey TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-        timestamp INTEGER NOT NULL, sender TEXT, deviceId TEXT, clientMessageId TEXT,
-        replyToMessageId TEXT, replyToClientMessageId TEXT,
-        llmVisibleMessageId TEXT NOT NULL, attachments TEXT NOT NULL DEFAULT '[]'
-      );
-      CREATE TABLE turns (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, sessionKey TEXT NOT NULL,
-        messageId TEXT NOT NULL, wakeId TEXT UNIQUE, origin TEXT NOT NULL,
-        prompt TEXT NOT NULL, roleRef TEXT, roleFallback INTEGER NOT NULL DEFAULT 0,
-        assignmentId TEXT, jobRef TEXT, model TEXT, harness TEXT,
-        status TEXT NOT NULL DEFAULT 'queued', owner TEXT, adapterGen INTEGER,
-        requestRef TEXT, error TEXT, createdAt INTEGER NOT NULL, startedAt INTEGER,
-        endedAt INTEGER, publishedAt INTEGER
-      );
-      INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId)
-        VALUES ('s_old', 'k1', 'assistant', 'an old reply', 1, 's_old');
-      INSERT INTO turns (sessionKey, messageId, origin, prompt, createdAt)
-        VALUES ('k1', 's_old', 'user:flynn', 'old prompt', 1);
-      """)
-
-    refute column?(legacy, "messages", "attentionTier")
-    refute column?(legacy, "turns", "replyAttention")
-
-    :ok = Projection.ensure_schema(legacy)
-    :ok = Ledger.ensure_schema(legacy)
-
-    assert column?(legacy, "messages", "attentionTier")
-    assert column?(legacy, "turns", "replyAttention")
-
-    # The pre-existing rows survive and read normal.
-    assert Projection.get(legacy, "s_old").attention_tier == 0
-    assert Projection.get(legacy, "s_old").content == "an old reply"
-    {:ok, [[tier]]} = DB.query(legacy, "SELECT replyAttention FROM turns WHERE messageId='s_old'")
-    assert tier == 0
-
-    # Re-running is idempotent, not an error.
-    assert :ok = Projection.ensure_schema(legacy)
-    assert :ok = Ledger.ensure_schema(legacy)
-  end
-
-  ## Proof 6 — the verb's own contract
+  ## Proof 5 — the verb's own contract
 
   test "attend elects on the caller's running turn only", ctx do
     handlers = Gateway.handlers(ctx.config)
@@ -478,10 +427,5 @@ defmodule Tightbeam.AttentionTierTest do
   defp turn_attention(db, seq) do
     {:ok, [[tier]]} = DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [seq])
     tier
-  end
-
-  defp column?(db, table, column) do
-    {:ok, rows} = DB.query(db, "PRAGMA table_info(#{table})")
-    Enum.any?(rows, &(Enum.at(&1, 1) == column))
   end
 end

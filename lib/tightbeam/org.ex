@@ -117,32 +117,9 @@ defmodule Tightbeam.Org do
       |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
 
     result = DB.execute(db, ddl)
-    # Additive migration for pre-placement databases (incl. TS-created ones,
-    # adopt-in-place): a DEFAULT'd column is invisible to writers that name
-    # their columns. Duplicate-column error means already migrated.
-    for ddl <- [
-          "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT 'local'",
-          "ALTER TABLE sessions ADD COLUMN clearedThroughSeq INTEGER NOT NULL DEFAULT 0",
-          "ALTER TABLE sessions ADD COLUMN overrides TEXT",
-          "ALTER TABLE sessions ADD COLUMN identityName TEXT",
-          "ALTER TABLE sessions ADD COLUMN identityRevision TEXT",
-          "ALTER TABLE sessions ADD COLUMN cliToken TEXT",
-          "ALTER TABLE sessions ADD COLUMN adjudicationHold TEXT",
-          "ALTER TABLE harness_pointers ADD COLUMN sourceSessionRef TEXT",
-          "ALTER TABLE harness_pointers ADD COLUMN harness TEXT",
-          "ALTER TABLE harness_pointers ADD COLUMN machine TEXT"
-        ] do
-      case DB.query(db, ddl) do
-        {:ok, _} -> :ok
-        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-      end
-    end
 
     {:ok, _} =
       DB.query(db, "CREATE UNIQUE INDEX IF NOT EXISTS sessions_cli_token ON sessions(cliToken)")
-
-    {:ok, _} =
-      DB.query(db, "UPDATE sessions SET identityName = archetype WHERE identityName IS NULL")
 
     :ok =
       DB.execute(
