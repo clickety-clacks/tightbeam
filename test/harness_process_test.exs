@@ -215,6 +215,38 @@ defmodule Tightbeam.HarnessProcessTest do
     assert is_binary(launch_id)
   end
 
+  test "identity capture cannot mutate an already-resolved launch", ctx do
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("false")],
+          stderr_path: Path.join(ctx.test_dir, "resolved-capture.stderr"),
+          process_helper: @helper
+        ],
+        ctx.db,
+        {:claude, "shared", "testhost"}
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [row] = HarnessProcess.list(ctx.db)
+    File.write!(row.identity_path, "123\t123\tboot-marker\t#{launch_id}\n")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE harness_processes
+           SET state = 'exited', resolvedAt = 42, lastError = 'terminal'
+         WHERE launchId = ?1
+        """,
+        [launch_id]
+      )
+
+    [resolved] = HarnessProcess.list(ctx.db)
+    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
+    assert HarnessProcess.list(ctx.db) == [resolved]
+  end
+
   test "kill delivery failure remains fenced and the reconcile sweep retries it", ctx do
     {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
@@ -610,6 +642,98 @@ defmodule Tightbeam.HarnessProcessTest do
                event.subject == "claude:shared@testhost" and
                event.detail =~ "kill_failed"
            end)
+  end
+
+  test "identity removal failure is cleanup and does not suppress the scheduled restart", ctx do
+    :ok = EventLog.ensure_schema(ctx.db)
+    path = Path.join(ctx.test_dir, "cleanup-failure-adapter.js")
+    cleanup_failing_helper = Path.join(ctx.test_dir, "cleanup-failing-helper")
+    File.write!(path, @fake_adapter)
+
+    File.write!(
+      cleanup_failing_helper,
+      """
+      #!/bin/sh
+      #{@helper} "$@"
+      status=$?
+      if [ "$status" -eq 0 ]; then
+        rm -f "$3"
+        mkdir "$3"
+        touch "$3/residual"
+      fi
+      exit "$status"
+      """
+    )
+
+    File.chmod!(cleanup_failing_helper, 0o755)
+    key = {:claude, "shared", "testhost"}
+    owner = self()
+    starts = :atomics.new(1, signed: false)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           attempt = :atomics.add_get(starts, 1, 1)
+           send(owner, {:adapter_started, attempt})
+
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, "cleanup-failure.stderr"),
+             process_identity_dir: ctx.test_dir,
+             process_helper: if(attempt == 1, do: cleanup_failing_helper, else: @helper)
+           ]
+         end,
+         backoff_base_ms: 1,
+         db: ctx.db,
+         name: :cleanup_failure_restart_coordinator}
+      )
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert_receive {:adapter_started, 1}
+
+    assert eventually(fn ->
+             match?([%{state: "running"}], AdapterCoordinator.harness_processes(coordinator))
+           end)
+
+    Process.exit(adapter, :kill)
+
+    assert_receive {:adapter_started, 2}, 2_000
+
+    assert eventually(fn ->
+             case :sys.get_state(coordinator).adapters[key].pid do
+               pid when is_pid(pid) -> Process.alive?(pid)
+               _ -> false
+             end
+           end)
+
+    assert eventually(fn ->
+             Enum.any?(AdapterCoordinator.harness_processes(coordinator), &(&1.state == "exited"))
+           end)
+
+    resolved =
+      Enum.find(AdapterCoordinator.harness_processes(coordinator), &(&1.state == "exited"))
+
+    assert is_integer(resolved.resolved_at)
+    assert resolved.last_error == nil
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1",
+               ["claude:shared@testhost"]
+             )
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "identity_remove_failed" and
+               event.subject == "claude:shared@testhost"
+           end)
+
+    File.rm_rf!(resolved.identity_path)
   end
 
   test "a park with no launch fences and cancels a pending checkout", ctx do

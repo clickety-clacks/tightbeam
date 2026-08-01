@@ -9,7 +9,7 @@ defmodule Tightbeam.HarnessProcess do
   identity file until the launch resolves to a terminal state.
   """
 
-  alias Tightbeam.{DB, Id}
+  alias Tightbeam.{DB, EventLog, Id}
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @command_timeout_ms 5_000
@@ -264,7 +264,7 @@ defmodule Tightbeam.HarnessProcess do
               """
               UPDATE harness_processes
                  SET state = 'park_requested', parkRequestedAt = COALESCE(parkRequestedAt, ?2)
-               WHERE launchId = ?1
+               WHERE launchId = ?1 AND resolvedAt IS NULL
               """,
               [row.launch_id, at]
             )
@@ -388,20 +388,30 @@ defmodule Tightbeam.HarnessProcess do
     attempted_at = now()
 
     {:ok, _} =
-      DB.query(db, "UPDATE harness_processes SET killAttemptedAt = ?2 WHERE launchId = ?1", [
-        row.launch_id,
-        attempted_at
-      ])
+      DB.query(
+        db,
+        """
+        UPDATE harness_processes
+           SET killAttemptedAt = ?2
+         WHERE launchId = ?1 AND resolvedAt IS NULL
+        """,
+        [row.launch_id, attempted_at]
+      )
 
     case send_sigkill(row) do
       :ok ->
         sent_at = now()
 
         {:ok, _} =
-          DB.query(db, "UPDATE harness_processes SET killSentAt = ?2 WHERE launchId = ?1", [
-            row.launch_id,
-            sent_at
-          ])
+          DB.query(
+            db,
+            """
+            UPDATE harness_processes
+               SET killSentAt = ?2
+             WHERE launchId = ?1 AND resolvedAt IS NULL
+            """,
+            [row.launch_id, sent_at]
+          )
 
         resolve(db, row, terminal_state)
 
@@ -761,7 +771,21 @@ defmodule Tightbeam.HarnessProcess do
       end)
 
     if resolved? do
-      remove_identity(row)
+      case remove_identity(row) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          :ok =
+            EventLog.lifecycle(
+              db,
+              "identity_remove_failed",
+              row.adapter_key,
+              inspect(%{launch_id: row.launch_id, reason: reason})
+            )
+
+          :ok
+      end
     else
       :already_resolved
     end
@@ -826,7 +850,12 @@ defmodule Tightbeam.HarnessProcess do
     {:ok, _} =
       DB.query(
         db,
-        "UPDATE harness_processes SET osPid = ?2, processGroupId = ?3, bootIdentity = ?4, identityToken = ?5#{state_update} WHERE launchId = ?1",
+        """
+        UPDATE harness_processes
+           SET osPid = ?2, processGroupId = ?3, bootIdentity = ?4,
+               identityToken = ?5#{state_update}
+         WHERE launchId = ?1 AND resolvedAt IS NULL
+        """,
         [row.launch_id, pid, process_group_id, boot_identity, identity_token]
       )
 
