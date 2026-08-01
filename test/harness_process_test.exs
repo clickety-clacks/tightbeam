@@ -123,63 +123,6 @@ defmodule Tightbeam.HarnessProcessTest do
     refute File.exists?(row.identity_path)
   end
 
-  test "the schema migration handles populated rows from the first branch schema", ctx do
-    old_db = :"old_harness_process_db_#{System.unique_integer([:positive])}"
-
-    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: old_db}, id: old_db))
-
-    :ok =
-      DB.execute(old_db, """
-      CREATE TABLE harness_processes (
-        launchId TEXT PRIMARY KEY,
-        adapterKey TEXT NOT NULL,
-        harness TEXT NOT NULL,
-        preset TEXT NOT NULL,
-        host TEXT NOT NULL,
-        ssh TEXT,
-        identityPath TEXT NOT NULL,
-        osPid INTEGER,
-        processStartedAt TEXT,
-        identityToken TEXT,
-        state TEXT NOT NULL CHECK (state IN
-          ('launching','running','park_requested','closed_gracefully','killed','exited','unconfirmed')),
-        createdAt INTEGER NOT NULL,
-        parkRequestedAt INTEGER,
-        killSentAt INTEGER,
-        resolvedAt INTEGER,
-        lastError TEXT
-      )
-      """)
-
-    {:ok, _} =
-      DB.query(
-        old_db,
-        """
-        INSERT INTO harness_processes
-          (launchId, adapterKey, harness, preset, host, identityPath, osPid,
-           processStartedAt, identityToken, state, createdAt, lastError)
-        VALUES ('launch-1', 'claude:shared@testhost', 'claude', 'shared', 'testhost',
-                ?1, 42, 'Thu Jul 31 12:00:00 2026', 'old-token',
-                'unconfirmed', 1, 'delivery failed')
-        """,
-        [Path.join(ctx.test_dir, "old.identity")]
-      )
-
-    assert :ok = HarnessProcess.ensure_schema(old_db)
-
-    assert [
-             %{
-               state: "kill_failed",
-               helper_path: "",
-               launch_sequence: 1,
-               identity_token: "old-token",
-               last_error: "delivery failed"
-             }
-           ] = HarnessProcess.list(old_db)
-
-    assert ctx.db != old_db
-  end
-
   test "remote launch wraps the harness with the same session helper", ctx do
     opts =
       HarnessProcess.prepare_launch(
