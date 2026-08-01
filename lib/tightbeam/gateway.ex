@@ -737,6 +737,8 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
       "identity-relearn" =>
         admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
+      "identity-repoint" =>
+        admin_call_handler(db, fn call -> identity_repoint_result(db, call) end),
       "learn" => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
       "unlearn" =>
         admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
@@ -2071,6 +2073,34 @@ defmodule Tightbeam.Gateway do
       revision = Identity.unlearn!(config.base_dir, name, call.origin)
       reload_law!(config)
       %{state: "published", kungfu: name, live_revision: revision}
+    end
+  end
+
+  defp identity_repoint_result(db, call) do
+    archetype = call.params.archetype
+
+    cond do
+      Archetypes.get(archetype) == nil ->
+        %{code: "unknown_archetype", message: "unknown archetype: #{archetype}"}
+
+      true ->
+        case Org.repoint_retired_archetype(db, call.session_key, archetype) do
+          {:ok, session} ->
+            %{
+              state: "repointed",
+              session_key: session.session_key,
+              archetype: session.archetype
+            }
+
+          {:error, :not_found} ->
+            %{code: "not_found", message: "unknown session: #{call.session_key}"}
+
+          {:error, :not_retired} ->
+            %{
+              code: "session_not_retired",
+              message: "session #{call.session_key} must be retired before archetype repoint"
+            }
+        end
     end
   end
 

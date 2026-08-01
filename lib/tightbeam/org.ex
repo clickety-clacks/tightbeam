@@ -530,6 +530,38 @@ defmodule Tightbeam.Org do
     must_get(txn, session_key)
   end
 
+  @doc "Repoint a retired session to another archetype and its base identity."
+  @spec repoint_retired_archetype(db(), String.t(), String.t()) ::
+          {:ok, session()} | {:error, :not_found | :not_retired}
+  def repoint_retired_archetype(db \\ Tightbeam.DB, session_key, archetype) do
+    transaction!(db, fn txn ->
+      case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
+        [] ->
+          {:error, :not_found}
+
+        [row] ->
+          session = to_session(row)
+
+          if session.state == "retired" do
+            Txn.q(
+              txn,
+              """
+              UPDATE sessions
+              SET archetype = ?2, overrides = NULL, identityName = ?2,
+                  identityRevision = NULL, updatedAt = ?3
+              WHERE sessionKey = ?1 AND state = 'retired'
+              """,
+              [session_key, archetype, now()]
+            )
+
+            {:ok, must_get(txn, session_key)}
+          else
+            {:error, :not_retired}
+          end
+      end
+    end)
+  end
+
   @doc """
   Append a harness-session pointer (`reason`: created | loaded | fallback).
   The chain is append-only — repointing never erases where the session used to

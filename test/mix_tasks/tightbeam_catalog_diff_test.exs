@@ -82,6 +82,30 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     end)
   end
 
+  test "refuses with a classified not-installed error when the working set is absent" do
+    missing =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-missing-working-set-#{System.unique_integer([:positive])}.md"
+      )
+
+    assert_raise Mix.Error,
+                 ~r/working_set_not_installed:.*agentic-engineering.*tightbeam learn agentic-engineering/,
+                 fn -> Diff.evaluate(inventories(["known"]), missing) end
+  end
+
+  test "task refuses a neutral org before fetching the live catalog" do
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-neutral-catalog-diff-#{System.unique_integer([:positive])}"
+      )
+
+    assert_raise Mix.Error, ~r/working_set_not_installed:/, fn ->
+      Diff.run(["--base-dir", base_dir])
+    end
+  end
+
   @tag :external
   if :external not in ExUnit.configuration()[:include] do
     @tag skip: "run with --only external"
@@ -89,7 +113,15 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
 
   test "real working set is present in the live catalog" do
     base_dir = Diff.base_dir()
-    guidance_path = Path.join([base_dir, "identity", "guidance", "preferred-models.md"])
+
+    guidance_path =
+      Path.join([
+        base_dir,
+        "identity",
+        "kungfu",
+        "agentic-engineering",
+        "preferred-models.md"
+      ])
 
     assert {:ok, inventories} = Diff.fetch_live(base_dir)
     {status, diff} = Diff.evaluate(inventories, guidance_path)

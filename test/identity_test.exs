@@ -484,6 +484,38 @@ defmodule Tightbeam.IdentityTest do
     refute File.exists?(receipt_path)
   end
 
+  test "unlearn tolerates a receipted path that is already absent", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    missing = "skills/role-skill/SKILL.md"
+
+    File.rm!(Path.join(dir, missing))
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "-m", "remove receipted path outside identity edit"], "operator")
+
+    assert Identity.unlearn!(ctx.base, "agentic-engineering", "operator")
+    refute File.exists?(Path.join(dir, missing))
+    refute File.exists?(Path.join(dir, "kungfu/agentic-engineering/installed.toml"))
+  end
+
+  test "removing a learned skill removes its path from the receipt", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+
+    neutral_manifest = "name = \"coder\"\nskills = []\n"
+    Identity.edit!(ctx.base, "coder", :manifest, neutral_manifest, "operator")
+    Identity.edit!(ctx.base, "coder", {:skill, "role-skill", true}, nil, "operator")
+
+    receipt =
+      dir
+      |> Path.join("kungfu/agentic-engineering/installed.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    refute "skills/role-skill/SKILL.md" in receipt["paths"]
+    assert Identity.unlearn!(ctx.base, "agentic-engineering", "operator")
+  end
+
   test "learn refuses seed-owned bundle paths and unknown names list shipped bundles", ctx do
     assert :initialized = Identity.init!(ctx.base)
     forbidden = Path.join(ctx.source, "archetypes/default.toml")
@@ -502,6 +534,14 @@ defmodule Tightbeam.IdentityTest do
 
     assert error.message =~ "unknown kungfu bundle missing"
     assert error.message =~ "available bundles: agentic-engineering"
+
+    traversal =
+      assert_raise ArgumentError, fn ->
+        Identity.learn!(ctx.base, "../guidance", "operator")
+      end
+
+    assert traversal.message =~ "unknown kungfu bundle ../guidance"
+    assert traversal.message =~ "available bundles: agentic-engineering"
   end
 
   test "legacy enriched roots mint one receipt without changing their seed-owned paths", ctx do
@@ -521,6 +561,25 @@ defmodule Tightbeam.IdentityTest do
 
     assert {:ok, _revision} = Identity.relearn!(ctx.base, "operator")
     assert File.read!(Path.join(dir, "archetypes/default.toml")) == enriched_default
+
+    receipt =
+      dir
+      |> Path.join("kungfu/agentic-engineering/installed.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    for doc <- ~w(capabilities.md intake.md preferred-models.md manifest.toml) do
+      refute doc in receipt["paths"]
+      assert "kungfu/agentic-engineering/#{doc}" in receipt["paths"]
+      refute File.exists?(Path.join(dir, doc))
+      assert File.regular?(Path.join(dir, "kungfu/agentic-engineering/#{doc}"))
+    end
+
+    neutral_default =
+      Application.app_dir(:tightbeam, "priv/seed/archetypes/default.toml") |> File.read!()
+
+    Identity.edit!(ctx.base, "default", :manifest, neutral_default, "operator")
+    assert Identity.unlearn!(ctx.base, "agentic-engineering", "operator")
   end
 
   test "dirty legacy roots defer grandfather mint and refuse relearn until a clean boot", ctx do
@@ -556,6 +615,13 @@ defmodule Tightbeam.IdentityTest do
 
     File.write!(Path.join(source, "guidance/coder.md"), role)
     File.write!(Path.join(source, "skills/role-skill/SKILL.md"), skill)
+
+    for doc <- ~w(capabilities.md intake.md preferred-models.md manifest.toml) do
+      File.cp!(
+        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/#{doc}"),
+        Path.join(source, doc)
+      )
+    end
   end
 
   defp learn_test_bundle!(ctx) do

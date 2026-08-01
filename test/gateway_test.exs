@@ -4688,11 +4688,18 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "learn and unlearn reload all law and unlearn names durable references", ctx do
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
     base_dir = role_test_base("learn-unlearn")
     Identity.init!(base_dir)
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
     learn = handlers["learn"]
     unlearn = handlers["unlearn"]
+    repoint = handlers["identity-repoint"]
+    retire = handlers["retire"]
 
     assert %{state: "published", kungfu: "agentic-engineering", live_revision: revision} =
              learn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
@@ -4743,8 +4750,33 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.map(sessions, &{&1.session_key, &1.state}) |> Enum.sort() ==
              [{active.session_key, "active"}, {retired.session_key, "retired"}]
 
-    {:ok, _rows} =
-      DB.query(ctx.db, "UPDATE sessions SET archetype = 'default' WHERE archetype = 'coder'")
+    assert %{state: "repointed", session_key: retired_key, archetype: "default"} =
+             repoint.(%{
+               origin: "user:flynn",
+               session_key: retired.session_key,
+               params: %{archetype: "default"}
+             })
+
+    assert retired_key == retired.session_key
+
+    assert %{retired_session_keys: [active_key]} =
+             retire.(%{
+               origin: "user:flynn",
+               session_key: active.session_key,
+               params: %{}
+             })
+
+    assert active_key == active.session_key
+
+    assert %{state: "repointed", session_key: ^active_key, archetype: "default"} =
+             repoint.(%{
+               origin: "user:flynn",
+               session_key: active.session_key,
+               params: %{archetype: "default"}
+             })
+
+    assert Org.get(ctx.db, retired.session_key).archetype == "default"
+    assert Org.get(ctx.db, retired.session_key).identity_name == "default"
 
     :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
 

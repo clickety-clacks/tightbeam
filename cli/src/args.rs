@@ -201,6 +201,11 @@ pub enum Command {
         identity: Identity,
         action: Option<String>,
     },
+    IdentityRepoint {
+        identity: Identity,
+        session_key: String,
+        archetype: String,
+    },
     Learn {
         identity: Identity,
         name: String,
@@ -420,6 +425,8 @@ COMMANDS:
   identity relearn [--abort | --resolve]
       Re-import and merge the neutral seed plus every learned kungfu bundle;
       resolve or abort a conflict.
+  identity repoint <retired-session> <archetype>
+      Repoint a retired session row to an installed archetype.
   learn <bundle>
       Install a shipped kungfu bundle. Available bundles ship with Tightbeam
       under priv/kungfu/; learning an installed bundle is a no-op.
@@ -1393,6 +1400,11 @@ fn parse_identity_command(
                 action: actions.first().map(|value| (*value).to_owned()),
             })
         }
+        Some("repoint") if parsed.positional.len() == 4 => Ok(Command::IdentityRepoint {
+            identity: identity(flags)?,
+            session_key: parsed.positional[2].clone(),
+            archetype: parsed.positional[3].clone(),
+        }),
         Some("apply") => {
             let session_key = parsed.positional.get(2).cloned();
             let all = flags.contains_key("all");
@@ -1405,7 +1417,7 @@ fn parse_identity_command(
                 all,
             })
         }
-        _ => Err("usage: tightbeam identity edit|status|relearn|apply ...".to_owned()),
+        _ => Err("usage: tightbeam identity edit|status|relearn|repoint|apply ...".to_owned()),
     }
 }
 
@@ -1577,6 +1589,7 @@ mod tests {
         for syntax in [
             "identity edit <archetype>",
             "identity relearn [--abort | --resolve]",
+            "identity repoint <retired-session> <archetype>",
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
@@ -2135,6 +2148,21 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     session_key: None,
                     all: true,
+                },
+            ),
+            (
+                strings(&[
+                    "identity",
+                    "repoint",
+                    "agent:retired",
+                    "default",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::IdentityRepoint {
+                    identity: Identity::User("flynn".to_owned()),
+                    session_key: "agent:retired".to_owned(),
+                    archetype: "default".to_owned(),
                 },
             ),
             (

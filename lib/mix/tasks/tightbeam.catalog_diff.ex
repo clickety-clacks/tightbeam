@@ -19,7 +19,17 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     end
 
     base_dir = options[:base_dir] || base_dir()
-    guidance_path = Path.join([base_dir, "identity", "guidance", "preferred-models.md"])
+
+    guidance_path =
+      Path.join([
+        base_dir,
+        "identity",
+        "kungfu",
+        "agentic-engineering",
+        "preferred-models.md"
+      ])
+
+    working_set = read_working_set!(guidance_path)
 
     inventories =
       case fetch_live(base_dir) do
@@ -28,7 +38,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
         {:error, degraded} -> Mix.raise(catalog_error(degraded))
       end
 
-    {status, diff} = evaluate(inventories, guidance_path)
+    {status, diff} = evaluate_working_set(inventories, working_set)
     Mix.shell().info(format(diff, if(options[:json], do: :json, else: :human)))
 
     if status != 0 do
@@ -74,8 +84,10 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
   @doc false
   def evaluate(inventories, guidance_path) do
-    working_set = read_working_set!(guidance_path)
+    evaluate_working_set(inventories, read_working_set!(guidance_path))
+  end
 
+  defp evaluate_working_set(inventories, working_set) do
     live =
       inventories
       |> Map.values()
@@ -161,12 +173,28 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
   defp read_working_set!(guidance_path) do
     guidance_path
-    |> File.read!()
+    |> read_working_set_source!()
     |> String.split("\n")
     |> Enum.drop_while(&(&1 != "## Working set (capsules)"))
     |> case do
       [] -> Mix.raise("preferred_models_parse_failed: Working set (capsules) section not found")
       [_heading | section] -> working_set_bullets(section)
+    end
+  end
+
+  defp read_working_set_source!(guidance_path) do
+    case File.read(guidance_path) do
+      {:ok, contents} ->
+        contents
+
+      {:error, :enoent} ->
+        Mix.raise(
+          "working_set_not_installed: the agentic-engineering kungfu bundle and its " <>
+            "preferred-model working set are not installed; run: tightbeam learn agentic-engineering"
+        )
+
+      {:error, reason} ->
+        Mix.raise("preferred_models_read_failed: #{:file.format_error(reason)}")
     end
   end
 

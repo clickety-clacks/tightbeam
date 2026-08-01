@@ -566,6 +566,16 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 .map(|value| vec![string_field("action", value)])
                 .unwrap_or_default(),
         )),
+        Command::IdentityRepoint {
+            identity,
+            session_key,
+            archetype,
+        } => Ok(request(
+            identity,
+            "identity-repoint",
+            vec![string_field("sessionKey", session_key)],
+            vec![string_field("archetype", archetype)],
+        )),
         Command::Learn { identity, name } => Ok(request(
             identity,
             "learn",
@@ -1065,6 +1075,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityEdit { identity, .. }
         | Command::IdentityStatus { identity, .. }
         | Command::IdentityRelearn { identity, .. }
+        | Command::IdentityRepoint { identity, .. }
         | Command::Learn { identity, .. }
         | Command::Unlearn { identity, .. }
         | Command::IdentityApply { identity, .. }
@@ -1537,6 +1548,17 @@ mod tests {
             (
                 &["identity", "apply", "agent:coder:app", "--as-user", "flynn"][..],
                 r#"{"asUser":"flynn","verb":"identity-apply","params":{"all":false,"sessionKey":"agent:coder:app"}}"#,
+            ),
+            (
+                &[
+                    "identity",
+                    "repoint",
+                    "agent:retired",
+                    "default",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"identity-repoint","sessionKey":"agent:retired","params":{"archetype":"default"}}"#,
             ),
             (
                 &["learn", "agentic-engineering", "--as-user", "flynn"][..],

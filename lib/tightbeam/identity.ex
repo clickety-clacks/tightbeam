@@ -313,7 +313,7 @@ defmodule Tightbeam.Identity do
         reraise error, __STACKTRACE__
     end
 
-    git!(dir, ["add", "-A", "--", Path.relative_to(path, dir)])
+    git!(dir, ["add", "-A"])
     git!(dir, ["commit", "-m", edit_message(archetype, target)], author)
     publish_live!(dir)
   end
@@ -368,14 +368,14 @@ defmodule Tightbeam.Identity do
   def learn!(base_dir, name, author) do
     init!(base_dir)
     dir = identity_dir(base_dir)
-    bundle = bundle_dir(name)
+    available = available_bundle_names()
 
-    unless File.dir?(bundle) do
-      available = available_bundle_names()
-
+    unless name in available do
       raise ArgumentError,
             "unknown kungfu bundle #{name}; available bundles: #{Enum.join(available, ", ")}"
     end
+
+    bundle = bundle_dir(name)
 
     case receipt_at(dir, "main", name) do
       {:ok, _receipt} ->
@@ -406,12 +406,14 @@ defmodule Tightbeam.Identity do
     require_clean_main!(dir)
 
     originals =
-      Map.new(receipt.paths, fn relative ->
+      receipt.paths
+      |> Enum.filter(&File.regular?(Path.join(dir, &1)))
+      |> Map.new(fn relative ->
         path = Path.join(dir, relative)
         {relative, File.read!(path)}
       end)
 
-    Enum.each(receipt.paths, &File.rm!(Path.join(dir, &1)))
+    Enum.each(receipt.paths, &File.rm(Path.join(dir, &1)))
     receipt_path = receipt_path(name)
     receipt_bytes = File.read!(Path.join(dir, receipt_path))
     File.rm!(Path.join(dir, receipt_path))
@@ -473,7 +475,7 @@ defmodule Tightbeam.Identity do
     names = ["neutral-identity" | learned]
     message = "relearn: #{Enum.join(names, ", ")}"
     import_upstream!(dir, learned, message)
-    merge_upstream(dir, message, author, fn -> :ok end)
+    merge_upstream(dir, message, author, fn -> refresh_receipts!(dir, learned) end)
   end
 
   @doc "Abort a conflicted re-learn without moving live."
@@ -496,10 +498,7 @@ defmodule Tightbeam.Identity do
       paths -> raise ArgumentError, "unresolved identity conflicts: #{Enum.join(paths, ", ")}"
     end
 
-    case merge_subject(dir) do
-      "learn: " <> name -> write_receipt!(dir, bundle_receipt(name, bundle_dir(name)))
-      _ -> :ok
-    end
+    refresh_receipts_for_merge!(dir, merge_subject(dir))
 
     git!(dir, ["add", "-A"])
     git!(dir, ["commit", "--no-edit"], author)
@@ -718,6 +717,25 @@ defmodule Tightbeam.Identity do
     File.write!(path, "name = #{inspect(receipt.name)}\npaths = [\n#{paths}\n]\n")
   end
 
+  defp refresh_receipts_for_merge!(dir, "learn: " <> name),
+    do: write_receipt!(dir, current_bundle_receipt(dir, name))
+
+  defp refresh_receipts_for_merge!(dir, "relearn: " <> _names),
+    do: refresh_receipts!(dir, learned_bundle_names(dir))
+
+  defp refresh_receipts_for_merge!(_dir, _subject), do: :ok
+
+  defp refresh_receipts!(dir, names) do
+    Enum.each(names, fn name ->
+      write_receipt!(dir, current_bundle_receipt(dir, name))
+    end)
+  end
+
+  defp current_bundle_receipt(dir, name) do
+    receipt = bundle_receipt(name, bundle_dir(name))
+    %{receipt | paths: Enum.filter(receipt.paths, &File.regular?(Path.join(dir, &1)))}
+  end
+
   defp path_exists_at?(dir, revision, path) do
     case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"], cd: dir) do
       {_output, 0} -> true
@@ -880,7 +898,7 @@ defmodule Tightbeam.Identity do
     Path.join([dir, "skills", name, "SKILL.md"])
   end
 
-  defp apply_edit!(_dir, path, {:skill, name, true}, nil) do
+  defp apply_edit!(dir, path, {:skill, name, true}, nil) do
     electors = skill_electors(Path.dirname(Path.dirname(Path.dirname(path))), name)
 
     if electors != [] do
@@ -889,11 +907,22 @@ defmodule Tightbeam.Identity do
     end
 
     File.rm_rf!(Path.dirname(path))
+    remove_path_from_receipts!(dir, Path.relative_to(path, dir))
   end
 
   defp apply_edit!(_dir, path, _target, content) when is_binary(content) do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, content)
+  end
+
+  defp remove_path_from_receipts!(dir, removed_path) do
+    Enum.each(learned_bundle_names(dir), fn name ->
+      receipt = read_receipt!(dir, "main", name)
+
+      if removed_path in receipt.paths do
+        write_receipt!(dir, %{receipt | paths: List.delete(receipt.paths, removed_path)})
+      end
+    end)
   end
 
   defp validate_edit!(dir, :manifest, _path), do: validate_tree!(dir)
