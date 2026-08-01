@@ -397,7 +397,7 @@ fn token_fields(token: Option<&[u8]>) -> TokenFields {
     };
     let bounded = &token[..token.len().min(256)];
     let raw = String::from_utf8_lossy(bounded);
-    let raw_b64 = matches!(raw, std::borrow::Cow::Owned(_)).then(|| base64_standard(bounded));
+    let raw_b64 = Some(base64_standard(bounded));
     let lineage = token
         .strip_prefix(b"tb1-")
         .and_then(base64url_decode)
@@ -1177,7 +1177,6 @@ fn candidate_value(candidate: &Candidate) -> Value {
         ("ppid", optional_u32(candidate.ppid)),
         ("pgid", optional_u32(candidate.pgid)),
         ("lineage", optional_string(&candidate.lineage)),
-        ("lineage_raw", optional_string(&candidate.lineage_raw)),
         (
             "lineage_raw_b64",
             optional_string(&candidate.lineage_raw_b64),
@@ -1197,7 +1196,6 @@ fn adapter_candidate_value(candidate: &AdapterCandidate) -> Value {
         ("ppid", optional_u32(candidate.ppid)),
         ("pgid", optional_u32(candidate.pgid)),
         ("lineage", optional_string(&candidate.lineage)),
-        ("lineage_raw", optional_string(&candidate.lineage_raw)),
         (
             "lineage_raw_b64",
             optional_string(&candidate.lineage_raw_b64),
@@ -1340,131 +1338,12 @@ fn report_value(report: &Report) -> Value {
     ])
 }
 
-#[derive(Clone, Copy)]
-enum JsonOrder {
-    Report,
-    Host,
-    BaseDir,
-    Entries,
-    Candidate,
-    AdapterCandidate,
-    Epistemics,
-    Natural,
-}
-
-fn object_key_order(order: JsonOrder) -> Option<&'static [&'static str]> {
-    match order {
-        JsonOrder::Report => Some(&[
-            "schema",
-            "probed_at_ms",
-            "collection_ms",
-            "host",
-            "base_dir",
-            "marked_candidates",
-            "identity_candidates",
-            "adapter_candidates",
-            "epistemics",
-        ]),
-        JsonOrder::Host => Some(&["hostname", "platform", "probe_version"]),
-        JsonOrder::BaseDir => Some(&["path", "status", "entries", "adapter_stderr_log_count"]),
-        JsonOrder::Entries => Some(&CANONICAL_ENTRIES),
-        JsonOrder::Candidate => Some(&[
-            "pid",
-            "ppid",
-            "pgid",
-            "lineage",
-            "lineage_raw",
-            "lineage_raw_b64",
-            "evidence",
-            "executable",
-            "elapsed_s",
-            "started_at_s",
-            "cwd",
-        ]),
-        JsonOrder::AdapterCandidate => Some(&[
-            "pid",
-            "harness",
-            "ppid",
-            "pgid",
-            "lineage",
-            "lineage_raw",
-            "lineage_raw_b64",
-            "evidence",
-            "executable",
-            "elapsed_s",
-            "started_at_s",
-            "cwd",
-        ]),
-        JsonOrder::Epistemics => Some(&[
-            "census_grade",
-            "absence_means",
-            "lineage_is_claim",
-            "pids_scanned",
-            "pids_env_unreadable",
-            "platform_limits",
-            "notes",
-        ]),
-        JsonOrder::Natural => None,
-    }
-}
-
-fn child_order(order: JsonOrder, key: &str) -> JsonOrder {
-    match (order, key) {
-        (JsonOrder::Report, "host") => JsonOrder::Host,
-        (JsonOrder::Report, "base_dir") => JsonOrder::BaseDir,
-        (JsonOrder::Report, "marked_candidates") => JsonOrder::Candidate,
-        (JsonOrder::Report, "adapter_candidates") => JsonOrder::AdapterCandidate,
-        (JsonOrder::Report, "epistemics") => JsonOrder::Epistemics,
-        (JsonOrder::BaseDir, "entries") => JsonOrder::Entries,
-        _ => JsonOrder::Natural,
-    }
-}
-
-fn write_pretty_value(value: &Value, indent: usize, output: &mut String, order: JsonOrder) {
-    match value {
-        Value::Array(values) if values.is_empty() => output.push_str("[]"),
-        Value::Array(values) => {
-            output.push('[');
-            for (index, value) in values.iter().enumerate() {
-                output.push('\n');
-                output.push_str(&" ".repeat(indent + 2));
-                write_pretty_value(value, indent + 2, output, order);
-                if index + 1 != values.len() {
-                    output.push(',');
-                }
-            }
-            output.push('\n');
-            output.push_str(&" ".repeat(indent));
-            output.push(']');
-        }
-        Value::Object(map) if map.is_empty() => output.push_str("{}"),
-        Value::Object(map) => {
-            output.push('{');
-            let keys = object_key_order(order)
-                .map(|keys| keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>())
-                .unwrap_or_else(|| map.keys().cloned().collect());
-            for (index, key) in keys.iter().enumerate() {
-                output.push('\n');
-                output.push_str(&" ".repeat(indent + 2));
-                output.push_str(&serde_json::to_string_pretty(key).expect("JSON key serializes"));
-                output.push_str(": ");
-                write_pretty_value(&map[key], indent + 2, output, child_order(order, key));
-                if index + 1 != keys.len() {
-                    output.push(',');
-                }
-            }
-            output.push('\n');
-            output.push_str(&" ".repeat(indent));
-            output.push('}');
-        }
-        _ => output.push_str(&serde_json::to_string_pretty(value).expect("JSON value serializes")),
-    }
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).expect("probe report serializes")
 }
 
 fn report_json(report: &Report) -> String {
-    let mut output = String::new();
-    write_pretty_value(&report_value(report), 0, &mut output, JsonOrder::Report);
-    output
+    pretty_json(&report_value(report))
 }
 
 pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
@@ -1586,7 +1465,10 @@ mod tests {
     fn marker_codec_and_raw_policy() {
         let value = token_fields(Some(b"tb1-cmVzaWRlbnRAZWV6bw"));
         assert_eq!(value.lineage.as_deref(), Some("resident@eezo"));
-        assert_eq!(value.raw_b64, None);
+        assert_eq!(
+            value.raw_b64.as_deref(),
+            Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==")
+        );
         assert_eq!(token_fields(Some(b"tb2-any")).lineage, None);
         assert_eq!(token_fields(Some(b"tb1-!!!")).lineage, None);
         let invalid = token_fields(Some(b"tb2-\xff"));
@@ -2091,7 +1973,31 @@ mod tests {
     }
 
     #[test]
-    fn empty_report_schema_is_byte_stable() {
+    fn candidate_json_preserves_keys_absent_from_order_table() {
+        let mut row = candidate_value(&Candidate {
+            pid: 7,
+            ppid: Some(1),
+            pgid: Some(7),
+            lineage: Some("resident@eezo".to_owned()),
+            lineage_raw: Some("tb1-cmVzaWRlbnRAZWV6bw".to_owned()),
+            lineage_raw_b64: Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==".to_owned()),
+            evidence: "environ_exact",
+            executable: Some("/usr/local/bin/codex".to_owned()),
+            elapsed_s: Some(9),
+            started_at_s: Some(11),
+            cwd: Some("/srv/tightbeam".to_owned()),
+        });
+        row.as_object_mut()
+            .unwrap()
+            .insert("future_diagnostic".to_owned(), Value::from("present"));
+        let encoded = pretty_json(&row);
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded["future_diagnostic"], "present");
+    }
+
+    #[test]
+    fn empty_report_schema_content_is_stable() {
         let raw = RawFacts {
             platform: "linux",
             pids_scanned: 0,
@@ -2111,10 +2017,11 @@ mod tests {
                 adapter_stderr_log_count: None,
             },
         );
-        let encoded = format!("{}\n", report_json(&report));
+        let encoded: Value = serde_json::from_str(&report_json(&report)).unwrap();
         assert_eq!(
             encoded,
-            r#"{
+            serde_json::from_str::<Value>(
+                r#"{
   "schema": "tightbeam.probe.v1",
   "probed_at_ms": 1000,
   "collection_ms": 5,
@@ -2158,11 +2065,13 @@ mod tests {
   }
 }
 "#
+            )
+            .unwrap()
         );
     }
 
     #[test]
-    fn populated_report_schema_is_byte_stable() {
+    fn populated_report_schema_content_is_stable() {
         let raw = RawFacts {
             platform: "linux",
             pids_scanned: 3,
@@ -2207,10 +2116,11 @@ mod tests {
                 adapter_stderr_log_count: Some(2),
             },
         );
-        let encoded = format!("{}\n", report_json(&report));
+        let encoded: Value = serde_json::from_str(&report_json(&report)).unwrap();
         assert_eq!(
             encoded,
-            r#"{
+            serde_json::from_str::<Value>(
+                r#"{
   "schema": "tightbeam.probe.v1",
   "probed_at_ms": 10000,
   "collection_ms": 7,
@@ -2242,8 +2152,7 @@ mod tests {
       "ppid": 1,
       "pgid": 4,
       "lineage": "a@b",
-      "lineage_raw": "tb1-YUBi",
-      "lineage_raw_b64": null,
+      "lineage_raw_b64": "dGIxLVlVQmk=",
       "evidence": "environ_exact",
       "executable": "/bin/node",
       "elapsed_s": 3,
@@ -2255,7 +2164,6 @@ mod tests {
       "ppid": 2,
       "pgid": 9,
       "lineage": null,
-      "lineage_raw": "raw�",
       "lineage_raw_b64": "cmF3/w==",
       "evidence": "env_unreadable",
       "executable": "/bin/codex",
@@ -2279,8 +2187,7 @@ mod tests {
       "ppid": 1,
       "pgid": 4,
       "lineage": "a@b",
-      "lineage_raw": "tb1-YUBi",
-      "lineage_raw_b64": null,
+      "lineage_raw_b64": "dGIxLVlVQmk=",
       "evidence": "environ_exact",
       "executable": "/bin/node",
       "elapsed_s": 3,
@@ -2293,8 +2200,7 @@ mod tests {
       "ppid": 1,
       "pgid": 4,
       "lineage": "a@b",
-      "lineage_raw": "tb1-YUBi",
-      "lineage_raw_b64": null,
+      "lineage_raw_b64": "dGIxLVlVQmk=",
       "evidence": "environ_exact",
       "executable": "/bin/node",
       "elapsed_s": 3,
@@ -2307,7 +2213,6 @@ mod tests {
       "ppid": 2,
       "pgid": 9,
       "lineage": null,
-      "lineage_raw": "raw�",
       "lineage_raw_b64": "cmF3/w==",
       "evidence": "env_unreadable",
       "executable": "/bin/codex",
@@ -2333,6 +2238,8 @@ mod tests {
   }
 }
 "#
+            )
+            .unwrap()
         );
     }
 }
