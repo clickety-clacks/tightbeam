@@ -56,6 +56,18 @@ process behind it starts waiting on an adapter.
 
 Read and act in the same place. A value read here and used there can change in between.
 
+## Report dirt, never accommodate it
+When your code meets state it did not expect — a database in an unknown shape, a file an
+older version wrote, a table that should exist and does not — the correct output is a
+loud refusal that names what was found, not code that guesses and repairs. Accommodation
+buries the defect where nobody will see it and turns one bug into a family: the price
+here was ~2,000 lines of schema archaeology (try-ALTER ladders, stored-DDL sniffing,
+recovery for the recovery) deleted 2026-08-01. The tell that you are about to break this
+rule: probing live state to deduce what shape it is in — try-and-catch-duplicate,
+reading stored blueprints, existence checks — instead of reading a stamp someone wrote
+on purpose. If a shape genuinely must be known, the fix is to STAMP it at write time;
+a missing or unknown stamp is a refusal and a report, never an inference.
+
 ## Keep the change reviewable
 At any moment you are changing behavior or changing structure — never both in one diff.
 Sort them into separate commits: a behavior diff a reviewer reads for correctness, a
