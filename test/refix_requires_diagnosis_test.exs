@@ -10,6 +10,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     Dispatch,
     EventLog,
     Gateway,
+    Identity,
     Idempotency,
     Ledger,
     Org,
@@ -64,12 +65,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       )
 
     assert :initialized = Archetypes.init_identity!(base_dir)
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
     archetypes = Archetypes.load!(base_dir)
-
-    File.cp!(
-      "priv/kungfu/agentic-engineering/rules/engineering.toml",
-      Path.join([base_dir, "identity", "rules", "engineering.toml"])
-    )
 
     handlers = Gateway.handlers(%{db: db})
 

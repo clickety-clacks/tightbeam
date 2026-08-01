@@ -247,13 +247,11 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:on_retired, on_retired)
       |> handlers()
 
-    Rules.load!(config.base_dir, Map.keys(handler_table))
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
-    Archetypes.load!(config.base_dir)
-    Rails.load!(config.base_dir)
+    reload_law!(config, Map.keys(handler_table))
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -755,6 +753,11 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
       "identity-relearn" =>
         admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
+      "identity-repoint" =>
+        admin_call_handler(db, fn call -> identity_repoint_result(config, db, call) end),
+      "learn" => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
+      "unlearn" =>
+        admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
       "identity-apply" =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
       "kungfu-scaffold" =>
@@ -1992,14 +1995,14 @@ defmodule Tightbeam.Gateway do
 
   defp identity_relearn_result(config, %{params: %{action: "resolve"}} = call) do
     revision = Identity.resolve_relearn!(config.base_dir, call.origin)
-    Archetypes.load!(config.base_dir)
+    reload_law!(config)
     %{state: "published", live_revision: revision}
   end
 
   defp identity_relearn_result(config, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, revision} ->
-        Archetypes.load!(config.base_dir)
+        reload_law!(config)
         %{state: "published", live_revision: revision}
 
       {:conflict, paths} ->
@@ -2017,6 +2020,195 @@ defmodule Tightbeam.Gateway do
           live_revision: Identity.live_revision!(config.base_dir)
         }
     end
+  end
+
+  defp identity_learn_result(config, call) do
+    case Identity.learn!(config.base_dir, call.params.name, call.origin) do
+      {:ok, revision} ->
+        reload_law!(config)
+        %{state: "published", kungfu: call.params.name, live_revision: revision}
+
+      {:noop, revision} ->
+        reload_law!(config)
+        %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
+
+      {:conflict, paths} ->
+        %{
+          state: "relearn-conflicted",
+          kungfu: call.params.name,
+          conflicting_paths: paths,
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
+
+      {:error, message} ->
+        %{
+          state: "learn-failed",
+          code: "learn_failed",
+          message: message,
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
+    end
+  end
+
+  defp identity_unlearn_result(config, db, call) do
+    name = call.params.name
+    archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
+
+    case Org.release_archetypes(db, archetypes, fn ->
+           revision = Identity.unlearn!(config.base_dir, name, call.origin)
+           # Reload before releasing the DB owner. Every reference writer rechecks
+           # the archetype inside that same owner, so a writer queued behind this
+           # publication cannot commit from a pre-unlearn validation snapshot.
+           reload_law!(config)
+           revision
+         end) do
+      {:referenced, references} ->
+        unlearn_referenced_result(name, references)
+
+      {:released, revision} ->
+        %{state: "published", kungfu: name, live_revision: revision}
+    end
+  end
+
+  defp unlearn_referenced_result(name, references) do
+    sessions = Enum.filter(references, &(&1.kind == "session"))
+    setting = Enum.find(references, &(&1.kind == "setting"))
+    session_names = Enum.map(sessions, & &1.session_key)
+
+    descriptions =
+      [
+        if(session_names != [], do: "sessions: #{Enum.join(session_names, ", ")}"),
+        if(setting, do: "default-archetype setting: #{setting.archetype}")
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    %{
+      state: "referenced",
+      code: "kungfu_referenced",
+      message: "cannot unlearn #{name}; #{Enum.join(descriptions, "; ")}",
+      sessions:
+        Enum.map(
+          sessions,
+          &%{session_key: &1.session_key, state: &1.state, archetype: &1.archetype}
+        ),
+      setting: setting && setting.archetype,
+      references: references
+    }
+  end
+
+  defp identity_repoint_result(config, db, call) do
+    archetype = call.params.archetype
+
+    result =
+      case Org.get(db, call.session_key) do
+        nil ->
+          {:error, :not_found}
+
+        %{state: "retired"} ->
+          repoint_session_record(db, call.session_key, archetype)
+
+        %{kind: "main"} = session ->
+          repoint_main_session(config, db, session, archetype)
+
+        %{is_built_in: true} = session ->
+          repoint_main_session(config, db, session, archetype)
+
+        _session ->
+          {:error, :not_repointable}
+      end
+
+    case result do
+      {:ok, session} ->
+        %{
+          state: "repointed",
+          session_key: session.session_key,
+          archetype: session.archetype
+        }
+
+      {:error, :unknown_archetype} ->
+        %{code: "unknown_archetype", message: "unknown archetype: #{archetype}"}
+
+      {:error, :not_found} ->
+        %{code: "not_found", message: "unknown session: #{call.session_key}"}
+
+      {:error, :not_repointable} ->
+        %{
+          code: "session_not_retired",
+          message: "session #{call.session_key} must be retired before archetype repoint"
+        }
+
+      {:error, :turn_in_progress} ->
+        turn_in_progress([call.session_key])
+
+      {:error, reason} ->
+        %{
+          code: "identity_repoint_failed",
+          message: "session #{call.session_key} could not change archetype: #{inspect(reason)}"
+        }
+    end
+  end
+
+  defp repoint_main_session(config, db, session, archetype) do
+    lane_manager = config[:lane_manager] || LaneManager
+    LaneManager.ensure_lane_quiet(lane_manager, session.session_key)
+
+    case Tightbeam.SessionLane.at_turn_boundary(session.session_key, fn ->
+           run_session_mutation(session.session_key, fn ->
+             current = Org.get(db, session.session_key)
+
+             with :ok <- close_repointed_main_session(config, db, current) do
+               repoint_session_record(db, session.session_key, archetype)
+             end
+           end)
+         end) do
+      {:ok, result} -> result
+      :busy -> {:error, :turn_in_progress}
+      :no_lane -> {:error, :turn_in_progress}
+    end
+  end
+
+  defp close_repointed_main_session(config, db, session) do
+    pointer = Org.current_pointer(db, session.session_key)
+
+    if pointer do
+      close_resident_main_session(config, session, pointer)
+    else
+      :ok
+    end
+  end
+
+  defp close_resident_main_session(config, session, pointer) do
+    coordinator = config[:adapter_coordinator] || AdapterCoordinator
+    harness = Harness.parse!(session.harness).id()
+
+    with {:ok, adapter, _generation} <-
+           AdapterCoordinator.adapter_for(coordinator, {harness, "shared", session.host}) do
+      case Adapter.knows_session?(adapter, pointer.harness_session_id) do
+        true -> Adapter.close_session(adapter, pointer.harness_session_id)
+        false -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp repoint_session_record(db, session_key, archetype) do
+    case DB.transaction(db, fn txn ->
+           if Archetypes.get(archetype) do
+             Org.repoint_archetype_in_txn(txn, session_key, archetype)
+           else
+             {:error, :unknown_archetype}
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp reload_law!(config, verbs \\ nil) do
+    verbs = verbs || config |> handlers() |> Map.keys()
+    Archetypes.load!(config.base_dir)
+    Rails.load!(config.base_dir)
+    Rules.load!(config.base_dir, verbs)
   end
 
   defp identity_status_result(config, db, call) do
@@ -2476,13 +2668,21 @@ defmodule Tightbeam.Gateway do
          setting: "default-archetype",
          value: archetype_name
        }) do
-    case Archetypes.get(archetype_name) do
-      nil ->
+    case DB.transaction(db, fn txn ->
+           if Archetypes.get(archetype_name) do
+             Org.put_setting_in_txn(txn, "default-archetype", archetype_name)
+           else
+             {:error, :unknown_archetype}
+           end
+         end) do
+      {:ok, :ok} ->
+        %{setting: "default-archetype", value: archetype_name}
+
+      {:ok, {:error, :unknown_archetype}} ->
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
 
-      _archetype ->
-        :ok = Org.put_setting(db, "default-archetype", archetype_name)
-        %{setting: "default-archetype", value: archetype_name}
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -2914,25 +3114,29 @@ defmodule Tightbeam.Gateway do
                  p.idempotency_key
                ) do
             nil ->
-              session = Org.create_in_txn(txn, input)
+              if Archetypes.get(archetype.name) do
+                session = Org.create_in_txn(txn, input)
 
-              if p[:handle] do
-                Roles.create_in_txn!(
-                  txn,
-                  p.handle,
-                  caller.owner_user_id,
-                  session.session_key
-                )
+                if p[:handle] do
+                  Roles.create_in_txn!(
+                    txn,
+                    p.handle,
+                    caller.owner_user_id,
+                    session.session_key
+                  )
+                end
+
+                Idempotency.put_in_txn(txn, %{
+                  owner_user_id: caller.owner_user_id,
+                  operation: "spawn",
+                  idempotency_key: p.idempotency_key,
+                  session_key: session.session_key
+                })
+
+                {:created, session}
+              else
+                {:error, :unknown_archetype}
               end
-
-              Idempotency.put_in_txn(txn, %{
-                owner_user_id: caller.owner_user_id,
-                operation: "spawn",
-                idempotency_key: p.idempotency_key,
-                session_key: session.session_key
-              })
-
-              {:created, session}
 
             prior ->
               {:replayed, prior.session_key}
@@ -2940,6 +3144,9 @@ defmodule Tightbeam.Gateway do
         end)
 
       case session_result do
+        {:ok, {:error, :unknown_archetype}} ->
+          %{code: "unknown_archetype", message: "no such archetype: #{archetype.name}"}
+
         {:error, %Roles.TransactionError{error: error}} ->
           classified_denial("config_denied", error)
 
@@ -4488,6 +4695,16 @@ defmodule Tightbeam.Gateway do
 
           current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
+          {archetype, overrides, identity_name} =
+            if Archetypes.get(old.archetype) do
+              {old.archetype, old.overrides, old.identity_name}
+            else
+              # Unlearn may have published while this respawn was queued after
+              # snapshotting `old`. Resolve at the DB-owner boundary exactly as
+              # repoint does, leaving no reference to the removed identity.
+              {"default", nil, "default"}
+            end
+
           new_session =
             Org.create_in_txn(txn, %{
               session_key: new_session_key,
@@ -4496,9 +4713,9 @@ defmodule Tightbeam.Gateway do
               owner_user_id: old.owner_user_id,
               origin: old.origin,
               spawned_by: old.spawned_by,
-              archetype: old.archetype,
-              overrides: old.overrides,
-              identity_name: old.identity_name,
+              archetype: archetype,
+              overrides: overrides,
+              identity_name: identity_name,
               host: old.host,
               harness: harness,
               provider: provider,

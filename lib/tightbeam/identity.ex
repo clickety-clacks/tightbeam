@@ -10,6 +10,8 @@ defmodule Tightbeam.Identity do
   session cwd, and returns the OID to stamp on the session row.
   """
 
+  require Logger
+
   alias Tightbeam.{Archetypes, Harness}
   alias Tightbeam.Harness.Support
 
@@ -17,6 +19,8 @@ defmodule Tightbeam.Identity do
   @live "tightbeam/live"
   @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
+  @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
+  @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
 
   @type harness :: atom()
   @type snapshot :: %{
@@ -26,20 +30,21 @@ defmodule Tightbeam.Identity do
           skills: %{optional(String.t()) => binary()}
         }
 
-  @doc "First learn: import the shipped kungfu and publish it as main/live."
+  @doc "Seed a new organization with the neutral identity substrate."
   @spec init!(String.t()) :: :initialized | :noop
   def init!(base_dir) do
     identity_dir = identity_dir(base_dir)
 
     if File.dir?(Path.join(identity_dir, ".git")) do
       verify_required_refs!(identity_dir)
+      maybe_mint_grandfather_receipt!(identity_dir)
       :noop
     else
       File.mkdir_p!(identity_dir)
       git!(identity_dir, ["init", "-b", "main"])
-      replace_with_source!(identity_dir)
+      replace_with_entries!(identity_dir, seed_entries())
       git!(identity_dir, ["add", "-A"])
-      git!(identity_dir, ["commit", "-m", "learn: agentic-engineering"], "tightbeam")
+      git!(identity_dir, ["commit", "-m", "seed: neutral-identity"], "tightbeam")
       git!(identity_dir, ["branch", @upstream])
       git!(identity_dir, ["branch", @live])
       :initialized
@@ -308,7 +313,7 @@ defmodule Tightbeam.Identity do
         reraise error, __STACKTRACE__
     end
 
-    git!(dir, ["add", "-A", "--", Path.relative_to(path, dir)])
+    git!(dir, ["add", "-A"])
     git!(dir, ["commit", "-m", edit_message(archetype, target)], author)
     publish_live!(dir)
   end
@@ -354,36 +359,123 @@ defmodule Tightbeam.Identity do
     paths
   end
 
-  @doc "Import the next source snapshot and merge it into main."
+  @doc "Learn one shipped kungfu bundle and publish it."
+  @spec learn!(String.t(), String.t(), String.t()) ::
+          {:ok, String.t()}
+          | {:noop, String.t()}
+          | {:conflict, [String.t()]}
+          | {:error, String.t()}
+  def learn!(base_dir, name, author) do
+    init!(base_dir)
+    dir = identity_dir(base_dir)
+    available = available_bundle_names()
+
+    unless name in available do
+      raise ArgumentError,
+            "unknown kungfu bundle #{name}; available bundles: #{Enum.join(available, ", ")}"
+    end
+
+    bundle = bundle_dir(name)
+
+    case receipt_at(dir, "main", name) do
+      {:ok, _receipt} ->
+        {:noop, git_output!(dir, ["rev-parse", @live])}
+
+      :error ->
+        refuse_seed_owned_bundle_paths!(name, bundle)
+        require_clean_main!(dir)
+        learned = learned_bundle_names(dir)
+        receipt = bundle_receipt(name, bundle)
+        import_upstream!(dir, learned ++ [name], "learn: #{name}")
+
+        case merge_upstream(dir, "learn: #{name}", author, fn ->
+               write_receipt!(dir, receipt)
+             end) do
+          {:ok, revision} -> {:ok, revision}
+          other -> other
+        end
+    end
+  end
+
+  @doc "Remove one learned kungfu bundle by its committed receipt."
+  @spec unlearn!(String.t(), String.t(), String.t()) :: String.t()
+  def unlearn!(base_dir, name, author) do
+    init!(base_dir)
+    dir = identity_dir(base_dir)
+    receipt = read_receipt!(dir, "main", name)
+    require_clean_main!(dir)
+
+    originals =
+      receipt.paths
+      |> Enum.filter(&File.regular?(Path.join(dir, &1)))
+      |> Map.new(fn relative ->
+        path = Path.join(dir, relative)
+        {relative, File.read!(path)}
+      end)
+
+    Enum.each(receipt.paths, &File.rm(Path.join(dir, &1)))
+    receipt_path = receipt_path(name)
+    receipt_bytes = File.read!(Path.join(dir, receipt_path))
+    File.rm!(Path.join(dir, receipt_path))
+
+    try do
+      validate_tree!(dir)
+    rescue
+      error ->
+        Enum.each(Map.put(originals, receipt_path, receipt_bytes), fn {relative, bytes} ->
+          path = Path.join(dir, relative)
+          File.mkdir_p!(Path.dirname(path))
+          File.write!(path, bytes)
+        end)
+
+        reraise error, __STACKTRACE__
+    end
+
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "-m", "unlearn: #{name}"], author)
+    publish_live!(dir)
+  end
+
+  @doc "Bundle-owned archetype names recorded by a learned receipt."
+  @spec bundle_archetype_names!(String.t(), String.t()) :: [String.t()]
+  def bundle_archetype_names!(base_dir, name) do
+    dir = identity_dir(base_dir)
+
+    dir
+    |> read_receipt!("main", name)
+    |> Map.fetch!(:paths)
+    |> Enum.filter(&(Path.dirname(&1) == "archetypes" and String.ends_with?(&1, ".toml")))
+    |> Enum.map(&(&1 |> Path.basename() |> Path.rootname()))
+    |> Enum.sort()
+  end
+
+  @doc "Names of kungfu bundles shipped with this Tightbeam build."
+  @spec available_bundle_names() :: [String.t()]
+  def available_bundle_names do
+    bundle_root_dir()
+    |> File.ls!()
+    |> Enum.filter(&File.dir?(Path.join(bundle_root_dir(), &1)))
+    |> Enum.sort()
+  end
+
+  @doc "Import the current seed and learned bundle snapshots, then merge them into main."
   @spec relearn!(String.t(), String.t()) ::
           {:ok, String.t()} | {:conflict, [String.t()]} | {:error, String.t()}
   def relearn!(base_dir, author) do
     init!(base_dir)
     dir = identity_dir(base_dir)
-    require_clean_main!(dir)
 
-    git!(dir, ["switch", @upstream])
-    replace_with_source!(dir)
-    git!(dir, ["add", "-A"])
-    git!(dir, ["commit", "--allow-empty", "-m", "relearn: agentic-engineering"], "tightbeam")
-    git!(dir, ["switch", "main"])
-
-    case System.cmd(
-           "git",
-           ["merge", "--no-ff", @upstream, "-m", "merge: relearn agentic-engineering"],
-           cd: dir,
-           stderr_to_stdout: true,
-           env: git_env(author)
-         ) do
-      {_output, 0} ->
-        {:ok, publish_live!(dir)}
-
-      {output, _status} ->
-        case conflict_paths(dir) do
-          [] -> {:error, String.trim(output)}
-          paths -> {:conflict, paths}
-        end
+    if grandfather_receipt_pending?(dir) do
+      raise ArgumentError,
+            "identity relearn is unavailable while the agentic-engineering grandfather receipt mint is pending"
     end
+
+    require_clean_main!(dir)
+    learned = learned_bundle_names(dir)
+    names = ["neutral-identity" | learned]
+    message = "relearn: #{Enum.join(names, ", ")}"
+    import_upstream!(dir, learned, message)
+    merge_upstream(dir, message, author, fn -> refresh_receipts!(dir, learned) end)
   end
 
   @doc "Abort a conflicted re-learn without moving live."
@@ -406,6 +498,8 @@ defmodule Tightbeam.Identity do
       paths -> raise ArgumentError, "unresolved identity conflicts: #{Enum.join(paths, ", ")}"
     end
 
+    refresh_receipts_for_merge!(dir, merge_subject(dir))
+
     git!(dir, ["add", "-A"])
     git!(dir, ["commit", "--no-edit"], author)
     publish_live!(dir)
@@ -427,27 +521,327 @@ defmodule Tightbeam.Identity do
 
   defp identity_dir(base_dir), do: Path.join(base_dir, "identity")
 
-  defp source_dir do
+  defp seed_dir do
     Application.get_env(
       :tightbeam,
-      :identity_source_dir,
-      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering")
+      :identity_seed_dir,
+      Application.app_dir(:tightbeam, "priv/seed")
     )
   end
 
-  defp replace_with_source!(identity_dir) do
+  defp bundle_root_dir, do: Application.app_dir(:tightbeam, "priv/kungfu")
+
+  defp bundle_dir("agentic-engineering") do
+    Application.get_env(
+      :tightbeam,
+      :identity_source_dir,
+      Path.join(bundle_root_dir(), "agentic-engineering")
+    )
+  end
+
+  defp bundle_dir(name), do: Path.join(bundle_root_dir(), name)
+
+  defp replace_with_entries!(identity_dir, entries) do
     identity_dir
     |> File.ls!()
     |> Enum.reject(&(&1 == ".git"))
     |> Enum.each(&File.rm_rf!(Path.join(identity_dir, &1)))
 
-    source_dir()
-    |> File.ls!()
-    |> Enum.each(fn entry ->
-      source = Path.join(source_dir(), entry)
-      destination = Path.join(identity_dir, entry)
-      File.cp_r!(source, destination)
+    Enum.each(entries, fn {relative, bytes} ->
+      destination = Path.join(identity_dir, relative)
+      File.mkdir_p!(Path.dirname(destination))
+      File.write!(destination, bytes)
     end)
+  end
+
+  defp seed_entries, do: source_entries(seed_dir())
+
+  defp source_entries(root), do: source_entries(root, "")
+
+  defp source_entries(root, relative) do
+    root
+    |> Path.join(relative)
+    |> File.ls!()
+    |> Enum.sort()
+    |> Enum.flat_map(fn entry ->
+      child_relative = if relative == "", do: entry, else: Path.join(relative, entry)
+      child = Path.join(root, child_relative)
+
+      if File.dir?(child) do
+        source_entries(root, child_relative)
+      else
+        [{child_relative, File.read!(child)}]
+      end
+    end)
+  end
+
+  defp bundle_entries(name, bundle) do
+    bundle
+    |> source_entries()
+    |> Enum.map(fn
+      {relative, bytes}
+      when relative in @bundle_doc_paths ->
+        {Path.join(["kungfu", name, relative]), bytes}
+
+      {relative, bytes} ->
+        {relative, bytes}
+    end)
+  end
+
+  defp bundle_receipt(name, bundle) do
+    %{
+      name: name,
+      paths: bundle_entries(name, bundle) |> Enum.map(&elem(&1, 0)) |> Enum.sort()
+    }
+  end
+
+  defp import_upstream!(dir, bundle_names, message) do
+    entries =
+      seed_entries_for_import(dir) ++
+        Enum.flat_map(bundle_names, fn name ->
+          bundle = bundle_dir(name)
+          refuse_seed_owned_bundle_paths!(name, bundle)
+          bundle_entries(name, bundle)
+        end)
+
+    git!(dir, ["switch", @upstream])
+    replace_with_entries!(dir, entries)
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "--allow-empty", "-m", message], "tightbeam")
+    git!(dir, ["switch", "main"])
+  end
+
+  defp seed_entries_for_import(dir) do
+    Enum.map(seed_entries(), fn {relative, shipped_bytes} ->
+      bytes =
+        if path_exists_at?(dir, "main", relative),
+          do: git_show_bytes!(dir, "main", relative),
+          else: shipped_bytes
+
+      {relative, bytes}
+    end)
+  end
+
+  defp merge_upstream(dir, message, author, before_commit) do
+    case System.cmd(
+           "git",
+           ["merge", "--no-ff", "--no-commit", @upstream, "-m", message],
+           cd: dir,
+           stderr_to_stdout: true,
+           env: git_env(author)
+         ) do
+      {_output, 0} ->
+        case run_pre_merge_hook(dir, author) do
+          {_output, 0} ->
+            before_commit.()
+            git!(dir, ["add", "-A"])
+            git!(dir, ["commit", "-m", message], author)
+            {:ok, publish_live!(dir)}
+
+          {output, _status} ->
+            git!(dir, ["merge", "--abort"])
+            {:error, String.trim(output)}
+        end
+
+      {output, _status} ->
+        case conflict_paths(dir) do
+          [] -> {:error, String.trim(output)}
+          paths -> {:conflict, paths}
+        end
+    end
+  end
+
+  defp run_pre_merge_hook(dir, author) do
+    hook = Path.join([dir, ".git", "hooks", "pre-merge-commit"])
+
+    if File.regular?(hook) do
+      System.cmd("git", ["hook", "run", "pre-merge-commit"],
+        cd: dir,
+        stderr_to_stdout: true,
+        env: git_env(author)
+      )
+    else
+      {"", 0}
+    end
+  end
+
+  defp refuse_seed_owned_bundle_paths!(name, bundle) do
+    case Enum.find(@seed_owned_paths, &File.exists?(Path.join(bundle, &1))) do
+      nil -> :ok
+      path -> raise ArgumentError, "kungfu bundle #{name} claims seed-owned path #{path}"
+    end
+  end
+
+  defp learned_bundle_names(dir) do
+    git_output!(dir, ["ls-tree", "-r", "--name-only", "main", "--", "kungfu"])
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn path ->
+      case String.split(path, "/") do
+        ["kungfu", name, "installed.toml"] -> [name]
+        _ -> []
+      end
+    end)
+    |> Enum.sort()
+  end
+
+  defp receipt_path(name), do: Path.join(["kungfu", name, "installed.toml"])
+
+  defp receipt_at(dir, revision, name) do
+    path = receipt_path(name)
+
+    case System.cmd("git", ["show", "#{revision}:#{path}"], cd: dir, stderr_to_stdout: true) do
+      {bytes, 0} -> {:ok, parse_receipt!(bytes, path)}
+      {_output, _status} -> :error
+    end
+  end
+
+  defp read_receipt!(dir, revision, name) do
+    case receipt_at(dir, revision, name) do
+      {:ok, receipt} -> receipt
+      :error -> raise ArgumentError, "kungfu bundle #{name} is not learned"
+    end
+  end
+
+  defp parse_receipt!(bytes, path) do
+    receipt = Toml.decode!(bytes)
+    %{name: Map.fetch!(receipt, "name"), paths: Map.fetch!(receipt, "paths")}
+  rescue
+    error -> raise ArgumentError, "#{path}: #{Exception.message(error)}"
+  end
+
+  defp write_receipt!(dir, receipt) do
+    path = Path.join(dir, receipt_path(receipt.name))
+    File.mkdir_p!(Path.dirname(path))
+
+    paths = Enum.map_join(receipt.paths, ",\n", &"  #{inspect(&1)}")
+    File.write!(path, "name = #{inspect(receipt.name)}\npaths = [\n#{paths}\n]\n")
+  end
+
+  defp refresh_receipts_for_merge!(dir, "learn: " <> name),
+    do: write_receipt!(dir, current_bundle_receipt(dir, name))
+
+  defp refresh_receipts_for_merge!(dir, "relearn: " <> _names),
+    do: refresh_receipts!(dir, learned_bundle_names(dir))
+
+  defp refresh_receipts_for_merge!(_dir, _subject), do: :ok
+
+  defp refresh_receipts!(dir, names) do
+    Enum.each(names, fn name ->
+      write_receipt!(dir, current_bundle_receipt(dir, name))
+    end)
+  end
+
+  defp current_bundle_receipt(dir, name) do
+    shipped = bundle_receipt(name, bundle_dir(name))
+
+    previously_owned =
+      case receipt_at(dir, "main", name) do
+        {:ok, receipt} -> receipt.paths
+        :error -> []
+      end
+
+    newly_installed =
+      shipped.paths
+      |> Enum.reject(&(&1 in previously_owned))
+      |> Enum.filter(&index_matches_revision?(dir, @upstream, &1))
+
+    paths =
+      (previously_owned ++ newly_installed)
+      |> Enum.uniq()
+      |> Enum.filter(&File.regular?(Path.join(dir, &1)))
+      |> Enum.sort()
+
+    %{shipped | paths: paths}
+  end
+
+  defp index_matches_revision?(dir, revision, path) do
+    case System.cmd("git", ["diff", "--cached", "--quiet", revision, "--", path], cd: dir) do
+      {_output, 0} -> true
+      {_output, 1} -> false
+      {output, status} -> raise "git diff failed #{status}: #{output}"
+    end
+  end
+
+  defp path_exists_at?(dir, revision, path) do
+    case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"], cd: dir) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp maybe_mint_grandfather_receipt!(dir) do
+    if grandfather_receipt_pending?(dir) do
+      if merge_pending?(dir) or git_output!(dir, ["status", "--porcelain"]) != "" do
+        Logger.warning(
+          "agentic-engineering grandfather receipt mint deferred: identity main is dirty or a merge is pending; retrying next boot"
+        )
+      else
+        receipt = grandfather_receipt(dir)
+        write_receipt!(dir, receipt)
+        git!(dir, ["add", "-A", "--", receipt_path(receipt.name)])
+        git!(dir, ["commit", "-m", "learn-receipt: agentic-engineering"], "tightbeam")
+        publish_live!(dir)
+      end
+    end
+  end
+
+  defp grandfather_receipt_pending?(dir) do
+    root =
+      dir
+      |> git_output!(["rev-list", "--max-parents=0", "--reverse", "main"])
+      |> String.split("\n", trim: true)
+      |> List.first()
+
+    root != nil and
+      git_output!(dir, ["show", "-s", "--format=%s", root]) ==
+        "learn: agentic-engineering" and
+      receipt_at(dir, "main", "agentic-engineering") == :error and
+      not history_has_subject?(dir, "unlearn: agentic-engineering")
+  end
+
+  defp grandfather_receipt(dir) do
+    paths =
+      bundle_dir("agentic-engineering")
+      |> source_entries()
+      |> Enum.flat_map(fn {relative, _bytes} ->
+        cond do
+          relative in @seed_owned_paths ->
+            []
+
+          relative in @bundle_doc_paths and path_exists_at?(dir, "main", relative) ->
+            [relative]
+
+          relative in @bundle_doc_paths ->
+            installed = Path.join(["kungfu", "agentic-engineering", relative])
+            if path_exists_at?(dir, "main", installed), do: [installed], else: []
+
+          path_exists_at?(dir, "main", relative) ->
+            [relative]
+
+          true ->
+            []
+        end
+      end)
+      |> Enum.sort()
+
+    %{name: "agentic-engineering", paths: paths}
+  end
+
+  defp history_has_subject?(dir, subject) do
+    dir
+    |> git_output!(["log", "--format=%s", "main"])
+    |> String.split("\n", trim: true)
+    |> Enum.member?(subject)
+  end
+
+  defp merge_pending?(dir), do: File.exists?(Path.join([dir, ".git", "MERGE_HEAD"]))
+
+  defp merge_subject(dir) do
+    dir
+    |> Path.join(".git/MERGE_MSG")
+    |> File.read!()
+    |> String.split("\n", parts: 2)
+    |> hd()
   end
 
   defp revision_fragments!(dir, revision) do
@@ -530,7 +924,7 @@ defmodule Tightbeam.Identity do
     Path.join([dir, "skills", name, "SKILL.md"])
   end
 
-  defp apply_edit!(_dir, path, {:skill, name, true}, nil) do
+  defp apply_edit!(dir, path, {:skill, name, true}, nil) do
     electors = skill_electors(Path.dirname(Path.dirname(Path.dirname(path))), name)
 
     if electors != [] do
@@ -539,11 +933,22 @@ defmodule Tightbeam.Identity do
     end
 
     File.rm_rf!(Path.dirname(path))
+    remove_path_from_receipts!(dir, Path.relative_to(path, dir))
   end
 
   defp apply_edit!(_dir, path, _target, content) when is_binary(content) do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, content)
+  end
+
+  defp remove_path_from_receipts!(dir, removed_path) do
+    Enum.each(learned_bundle_names(dir), fn name ->
+      receipt = read_receipt!(dir, "main", name)
+
+      if removed_path in receipt.paths do
+        write_receipt!(dir, %{receipt | paths: List.delete(receipt.paths, removed_path)})
+      end
+    end)
   end
 
   defp validate_edit!(dir, :manifest, _path), do: validate_tree!(dir)
@@ -679,6 +1084,13 @@ defmodule Tightbeam.Identity do
     error ->
       raise ArgumentError,
             "identity revision #{revision} has no #{path}: #{Exception.message(error)}"
+  end
+
+  defp git_show_bytes!(dir, revision, path) do
+    case System.cmd("git", ["show", "#{revision}:#{path}"], cd: dir, stderr_to_stdout: true) do
+      {output, 0} -> output
+      {output, status} -> raise "git show #{revision}:#{path} failed (#{status}): #{output}"
+    end
   end
 
   defp git_output!(dir, args) do
