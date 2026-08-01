@@ -2,6 +2,7 @@ defmodule Tightbeam.HarnessProcessTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{AdapterCoordinator, DB, EventLog, HarnessProcess}
+  alias Tightbeam.HarnessProcessCensus
 
   @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cleanup_command_timeout_ms 500
@@ -41,6 +42,14 @@ defmodule Tightbeam.HarnessProcessTest do
     :ok = HarnessProcess.ensure_schema(db)
 
     on_exit(fn ->
+      cleanup_result = kill_fixture_groups(test_dir)
+
+      if cleanup_result != :ok do
+        {:error, failures} = cleanup_result
+
+        flunk("fixture cleanup failed; identities preserved at #{test_dir}: #{inspect(failures)}")
+      end
+
       cleanup_db = :"harness_process_cleanup_db_#{System.unique_integer([:positive])}"
       {:ok, cleanup_db_pid} = DB.start_link(path: db_path, name: cleanup_db)
 
@@ -48,18 +57,8 @@ defmodule Tightbeam.HarnessProcessTest do
       |> Enum.filter(&is_integer(&1.resolved_at))
       |> Enum.each(&File.rm(&1.identity_path))
 
-      cleanup_result = kill_fixture_groups(test_dir)
       GenServer.stop(cleanup_db_pid)
-
-      case cleanup_result do
-        :ok ->
-          File.rm_rf!(test_dir)
-
-        {:error, failures} ->
-          flunk(
-            "fixture cleanup failed; identities preserved at #{test_dir}: #{inspect(failures)}"
-          )
-      end
+      File.rm_rf!(test_dir)
     end)
 
     %{db: db, sup: sup, test_dir: test_dir}
@@ -280,9 +279,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
   test "a kill command that never returns is bounded and remains kill_failed", ctx do
     {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
-    hanging = Path.join(ctx.test_dir, "hanging-helper")
-    File.write!(hanging, "#!/bin/sh\nexec sleep 30\n")
-    File.chmod!(hanging, 0o755)
+    hanging = grouped_helper(ctx, "hanging-helper", "exec sleep 30")
     Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 50)
 
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
@@ -304,9 +301,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
   test "continuous helper output cannot starve the absolute command deadline", ctx do
     {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
-    noisy = Path.join(ctx.test_dir, "noisy-helper")
-    File.write!(noisy, "#!/bin/sh\nwhile :; do printf x; done\n")
-    File.chmod!(noisy, 0o755)
+    noisy = grouped_helper(ctx, "noisy-helper", "while :; do printf x; done")
     Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 50)
 
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
@@ -323,6 +318,10 @@ defmodule Tightbeam.HarnessProcessTest do
              HarnessProcess.park(ctx.db, %{fenced | helper_path: noisy})
 
     assert System.monotonic_time(:millisecond) - started_at < 1_000
+
+    assert eventually(fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count >= 2 end)
+    assert :ok = kill_fixture_groups(ctx.test_dir)
+    assert eventually(fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end)
   end
 
   test "every unresolved launch fences a replacement before DOWN reconciliation", ctx do
@@ -721,6 +720,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
     assert is_integer(resolved.resolved_at)
     assert resolved.last_error == nil
+
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
@@ -860,7 +860,35 @@ defmodule Tightbeam.HarnessProcessTest do
         end
       end)
 
-    if failures == [], do: :ok, else: {:error, failures}
+    cond do
+      failures != [] ->
+        {:error, failures}
+
+      eventually(fn -> HarnessProcessCensus.capture_for_root(test_dir).count == 0 end) ->
+        :ok
+
+      true ->
+        snapshot = HarnessProcessCensus.capture_for_root(test_dir)
+        {:error, [{:fixture_processes_survived, HarnessProcessCensus.format(snapshot)}]}
+    end
+  end
+
+  defp grouped_helper(ctx, name, command) do
+    helper = Path.join(ctx.test_dir, name)
+    launch_id = "#{name}-#{System.unique_integer([:positive, :monotonic])}"
+
+    identity_path =
+      Path.join([ctx.test_dir, "helper", "harness-processes", launch_id <> ".identity"])
+
+    File.mkdir_p!(Path.dirname(identity_path))
+
+    File.write!(
+      helper,
+      "#!/bin/sh\nexec \"#{@helper}\" harness-exec \"#{identity_path}\" \"#{launch_id}\" -- sh -c '#{command}'\n"
+    )
+
+    File.chmod!(helper, 0o755)
+    helper
   end
 
   defp kill_fixture_group(identity_path) do
