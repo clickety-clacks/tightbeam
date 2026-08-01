@@ -63,6 +63,14 @@ fn main() {
         std::process::exit(0);
     }
 
+    if args
+        .first()
+        .is_some_and(|arg| arg == "version" || arg == "--version")
+    {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     match args::parse(args) {
         Ok(args::Command::Help) => {
             println!("{}", args::render_help(harnesses::load_optional().as_ref()))

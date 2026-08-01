@@ -62,37 +62,117 @@ defmodule Tightbeam.AdapterHealTest do
 
     def handle_call({:load_session, _sid, _model, _cwd, _mcp, _guidance}, _from, state),
       do: {:reply, Map.fetch!(state, :load_session), state}
+
+    def handle_call({:current_model, _sid}, _from, state),
+      do: {:reply, Map.get(state, :current_model, {:error, :model_readback_unavailable}), state}
   end
 
-  # The HARNESS side of a model swap, and the only authority on which model is
-  # loaded: `held/1` is a read of the running agent, never of the substrate's
-  # record. `on_applied` fires INSIDE the accepted swap, which is the seam F3
-  # needs — the live harness has already moved, and nothing the ruling does has
-  # run yet.
+  # The HARNESS side of a model swap. `held/1` is a read of the running agent,
+  # while the record is the canonical value each reattach pushes. `on_applied`
+  # fires INSIDE the accepted swap, which is the seam F3 needs — the live
+  # harness has already moved, and nothing the ruling does has run yet.
   defmodule SwapAdapterStub do
     @moduledoc false
     use GenServer
     def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
-    def init(state), do: {:ok, Map.put_new(state, :apply_count, 0)}
+
+    def init(state) do
+      model = Map.fetch!(state, :model)
+
+      state =
+        state
+        |> Map.put_new(:apply_count, 0)
+        |> Map.put_new(:load_count, 0)
+        |> Map.put_new(:known, true)
+        |> Map.put_new(:cached_model, model)
+
+      {:ok, state}
+    end
 
     def held(pid), do: GenServer.call(pid, :held)
     def apply_count(pid), do: GenServer.call(pid, :apply_count)
+    def load_count(pid), do: GenServer.call(pid, :load_count)
+    def cached(pid), do: GenServer.call(pid, :cached)
 
     def handle_call({:apply_model_strict, _sid, model, prior_model}, _from, state) do
-      if state.model == prior_model do
-        state = %{state | model: model, apply_count: state.apply_count + 1}
+      if state.cached_model == prior_model do
+        state =
+          %{
+            state
+            | model: model,
+              cached_model: model,
+              apply_count: state.apply_count + 1
+          }
+          |> Map.put(:known, is_nil(state[:strict_error]))
+
         if fire = state[:on_applied], do: fire.()
-        {:reply, {:ok, model}, state}
+
+        case state[:strict_error] do
+          nil -> {:reply, {:ok, model}, state}
+          reason -> {:reply, {:error, reason}, %{state | cached_model: nil}}
+        end
       else
-        {:reply, {:error, {:stale_model, state.model}}, state}
+        state = %{state | known: false}
+        {:reply, {:error, :model_readback_unavailable}, state}
       end
     end
 
     def handle_call(:held, _from, state), do: {:reply, state.model, state}
+    def handle_call(:cached, _from, state), do: {:reply, state.cached_model, state}
     def handle_call(:apply_count, _from, state), do: {:reply, state.apply_count, state}
+    def handle_call(:load_count, _from, state), do: {:reply, state.load_count, state}
+
+    def handle_call({:knows_session?, _sid}, _from, state),
+      do: {:reply, state.known, state}
+
+    def handle_call({:load_session, _sid, model, _cwd, _mcp, _guidance}, _from, state) do
+      case model do
+        model when is_binary(model) ->
+          state = %{
+            state
+            | model: model,
+              known: true,
+              cached_model: model,
+              load_count: state.load_count + 1
+          }
+
+          {:reply, {:ok, model}, state}
+
+        _unknown ->
+          state = %{state | known: true, cached_model: nil, load_count: state.load_count + 1}
+          {:reply, {:ok, :unknown}, state}
+      end
+    end
+
+    def handle_call({:apply_model, _sid, model}, _from, state) do
+      if state[:block_apply] do
+        send(state.parent, {:tune_apply_waiting, self()})
+
+        receive do
+          :release_tune_apply -> :ok
+        end
+      end
+
+      if parent = state[:parent], do: send(parent, {:tune_model_applied, model})
+
+      case state[:apply_error] do
+        nil -> {:reply, :ok, %{state | model: model, cached_model: model}}
+        reason -> {:reply, {:error, reason}, state}
+      end
+    end
+
+    def handle_call({:prompt, _sid, _text, _opts}, _from, state) do
+      case state[:prompt_error] do
+        nil -> {:reply, {:ok, %{stop_reason: "end_turn", text: "continued"}}, state}
+        reason -> {:reply, {:error, reason}, state}
+      end
+    end
 
     def handle_call({:current_model, _sid}, _from, state),
-      do: {:reply, {:ok, state.model}, state}
+      do: {:reply, {:ok, state.cached_model}, state}
+
+    def handle_call({:forget_model_residency, _sid}, _from, state),
+      do: {:reply, :ok, %{state | known: false, cached_model: nil}}
 
     def handle_call({:on_applied, fun}, _from, state),
       do: {:reply, :ok, Map.put(state, :on_applied, fun)}
@@ -108,6 +188,8 @@ defmodule Tightbeam.AdapterHealTest do
 
     def handle_call({:current_model, _sid}, _from, state),
       do: {:reply, {:ok, "claude-fable-5"}, state}
+
+    def handle_call({:apply_model, _sid, _model}, _from, state), do: {:reply, :ok, state}
 
     # What Acp.Adapter's own {:acp_exit, status} handler produces when the harness
     # process dies mid-turn: the adapter stops before it can reply.
@@ -139,6 +221,44 @@ defmodule Tightbeam.AdapterHealTest do
 
       {:reply, GenServer.call(state.real, {:transaction, fun}, 30_000),
        Map.put(state, :txns, count)}
+    end
+
+    def handle_call(message, _from, state),
+      do: {:reply, GenServer.call(state.real, message, 30_000), state}
+  end
+
+  defmodule ModelReadBarrierDB do
+    @moduledoc false
+    use GenServer
+
+    @doc "Forwards to `real`; blocks the turn's first post-session-read query."
+    def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+
+    def init(state), do: {:ok, Map.merge(state, %{blocked: false, read_model: nil})}
+
+    def handle_call({:query, sql, params} = message, _from, state) do
+      state =
+        if not state.blocked and String.contains?(sql, "FROM messages WHERE id = ?1") do
+          send(state.parent, {:turn_has_read_model, self(), state.read_model})
+
+          receive do
+            :release_turn -> :ok
+          end
+
+          %{state | blocked: true}
+        else
+          state
+        end
+
+      reply = GenServer.call(state.real, message, 30_000)
+
+      state =
+        case {String.contains?(sql, "FROM sessions"), params, reply} do
+          {true, ["k1"], {:ok, [row]}} -> Map.put(state, :read_model, Enum.at(row, 17))
+          _ -> state
+        end
+
+      {:reply, reply, state}
     end
 
     def handle_call(message, _from, state),
@@ -200,6 +320,7 @@ defmodule Tightbeam.AdapterHealTest do
 
   setup do
     db = :"heal_db_#{System.unique_integer([:positive])}"
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Placement.ensure_schema(db)
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
@@ -358,7 +479,7 @@ defmodule Tightbeam.AdapterHealTest do
     assert episode(ctx.db).cause == @cause
   end
 
-  test "the owner's brief names the precise cause the episode carries", ctx do
+  test "the owner's brief names the precise cause and known canonical model", ctx do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "the turn whose brief must be legible")
 
@@ -375,6 +496,57 @@ defmodule Tightbeam.AdapterHealTest do
     # no longer the only classification the human gets.
     assert prompt =~ "condition="
     refute prompt =~ "cause=unclassified"
+    assert prompt =~ "current_model=claude-fable-5"
+  end
+
+  test "the owner's brief reports the known canonical record after it is pushed", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        model: "claude-sonnet-4-6",
+        cached_model: "claude-fable-5",
+        prompt_error: :prompt_dispatch_failed
+      )
+
+    swap_ready(adapter, nil)
+    run_failing_turn(ctx, "the turn whose brief must name the owner")
+
+    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert SwapAdapterStub.held(adapter) == "claude-fable-5"
+    assert SwapAdapterStub.cached(adapter) == "claude-fable-5"
+
+    prompt = Wakes.get(ctx.db, episode(ctx.db).owner_wake_id).prompt
+    assert prompt =~ "current_model=claude-fable-5"
+    refute prompt =~ "current_model=claude-sonnet-4-6"
+  end
+
+  test "the owner's brief reports unknown when the canonical record is unknown", ctx do
+    make_model_unknown(ctx.db, "k1")
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+
+    run_failing_turn(ctx, "the turn whose model is genuinely unknown")
+
+    prompt = Wakes.get(ctx.db, episode(ctx.db).owner_wake_id).prompt
+    assert prompt =~ "current_model=unknown"
+  end
+
+  test "resident stale adapter cache is replaced by the canonical record", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        model: "claude-sonnet-4-6",
+        cached_model: "claude-fable-5"
+      )
+
+    Org.set_model(ctx.db, "k1", "claude-sonnet-4-6", "anthropic")
+    swap_ready(adapter, nil)
+
+    run_residency_pass(ctx)
+
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    assert SwapAdapterStub.cached(adapter) == "claude-sonnet-4-6"
+    assert SwapAdapterStub.load_count(adapter) == 0
   end
 
   ## Proof 2 — fault → hold → heal → auto-release, probe FIRST
@@ -1156,15 +1328,14 @@ defmodule Tightbeam.AdapterHealTest do
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "adjudication_heal_lost"))
   end
 
-  test "F3: a ruling that loses to a heal MID-FLIGHT is DENIED, not a crash", ctx do
+  test "F3: a ruling queued behind a winning heal is DENIED, not a crash", ctx do
     start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
     run_failing_turn(ctx, "fault")
     episode = episode(ctx.db)
 
-    # The ruling validates the episode as `notified` (a read), then opens its
-    # action transaction. The heal has to land BETWEEN those two — validating
-    # first and healing second is the early stale check, which is a DIFFERENT
-    # branch and the one the previous version of this test was hitting.
+    # The heal owns the session-mutation lock before its transaction starts.
+    # The ruling still validates the old notified snapshot while the heal is
+    # paused, then queues behind the lock and must observe the heal as winner.
     parent = self()
 
     proxy =
@@ -1173,30 +1344,42 @@ defmodule Tightbeam.AdapterHealTest do
          real: ctx.db,
          at: 1,
          before_txn: fn ->
-           heal(ctx, {7, 2})
-           send(parent, {:healed_mid_flight, hold(ctx.db)})
+           send(parent, {:heal_has_lock, self()})
+
+           receive do
+             :release_heal -> :ok
+           end
          end}
       )
 
-    handlers = Gateway.handlers(Map.put(ctx.config, :db, proxy))
+    healing =
+      Task.async(fn ->
+        Gateway.adapter_healed(ctx.config, proxy, @cause, {7, 2})
+      end)
 
-    result =
-      handlers["adjudicate"].(%{
-        origin: "user:flynn",
-        principal: {:session, episode.owner_target},
-        params: %{episode: episode.correlation_key, action: "park"}
-      })
+    assert_receive {:heal_has_lock, heal_proxy}
 
-    # The heal really did land mid-flight, and really did take the hold.
-    assert_received {:healed_mid_flight, probe}
-    assert is_binary(probe) and probe != "*"
+    ruling =
+      Task.async(fn ->
+        Gateway.handlers(ctx.config)["adjudicate"].(%{
+          origin: "user:flynn",
+          principal: {:session, episode.owner_target},
+          params: %{episode: episode.correlation_key, action: "park"}
+        })
+      end)
+
+    send(heal_proxy, :release_heal)
+    assert [{"k1", "other", :released}] = Task.await(healing)
+
+    result = Task.await(ruling)
 
     # The ruling is DENIED — not a MatchError escaping to the wire.
     assert %{code: "denied"} = result
 
-    # Rolled back cleanly: the probe still owns the hold, and park's own wake was
-    # never left behind on the episode.
-    assert hold(ctx.db) == probe
+    probe = hold(ctx.db)
+    assert is_binary(probe) and probe != "*"
+
+    # The probe still owns the hold, and park's own wake was never left behind.
     assert Adjudication.get(ctx.db, "k1", "other").recovery_wake_id == probe
 
     superseded =
@@ -1205,7 +1388,7 @@ defmodule Tightbeam.AdapterHealTest do
         &(&1.kind == "adjudication_ruling_superseded")
       )
 
-    assert JSON.decode!(superseded.detail)["healToken"] == "7:2"
+    assert is_nil(JSON.decode!(superseded.detail)["healToken"])
   end
 
   test "F3: a heal arriving after the harness moved cannot split the atomic ruling", ctx do
@@ -1214,9 +1397,9 @@ defmodule Tightbeam.AdapterHealTest do
     episode = episode(ctx.db)
     assert Org.get(ctx.db, "k1").model == "claude-fable-5"
 
-    # The heal starts at the old split point: after the harness accepted the
-    # model. The ruling's DB-owner transaction is already in flight, so the heal
-    # must queue behind it and observe the human ruling as the winner.
+    # The heal starts after the harness accepted the model. The session-mutation
+    # worker still owns the lock, so the heal cannot resolve the episode until
+    # the ruling's projection and recovery prompt commit.
     parent = self()
 
     swap_ready(adapter, fn ->
@@ -1321,7 +1504,7 @@ defmodule Tightbeam.AdapterHealTest do
       start_supervised!(
         {RaceDB,
          real: ctx.db,
-         at: 1,
+         at: 2,
          before_txn: fn ->
            send(parent, :first_swap_reached_projection)
 
@@ -1351,19 +1534,188 @@ defmodule Tightbeam.AdapterHealTest do
     assert_receive :first_swap_reached_projection
 
     second = Task.async(fn -> call.(ctx.db, "claude-opus-4-6") end)
-    second_result = Task.await(second)
     send(proxy, :release_first_swap)
     first_result = Task.await(first)
+    second_result = Task.await(second)
 
     refute match?({:raised, _}, first_result)
     refute match?({:raised, _}, second_result)
 
-    owner_model = SwapAdapterStub.held(adapter)
-    assert Org.get(ctx.db, "k1").model == owner_model
+    applied_model = SwapAdapterStub.held(adapter)
+    assert Org.get(ctx.db, "k1").model == applied_model
 
     resolved = Adjudication.get(ctx.db, "k1", "other")
     prompt = Wakes.get(ctx.db, resolved.recovery_wake_id).prompt
-    assert prompt =~ "You now run on #{owner_model}"
+    assert prompt =~ "You now run on #{applied_model}"
+  end
+
+  test "F3: a concurrent tune cannot invalidate the model before its ruling commits", ctx do
+    adapter = swap_harness(ctx, checkout: {:error, :degraded})
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    parent = self()
+
+    swap_ready(adapter, nil)
+
+    proxy =
+      start_supervised!(
+        {RaceDB,
+         real: ctx.db,
+         at: 2,
+         before_txn: fn ->
+           send(parent, {:swap_confirmed, self()})
+
+           receive do
+             :release_swap_commit -> :ok
+           end
+         end}
+      )
+
+    swap =
+      Task.async(fn ->
+        Gateway.handlers(Map.put(ctx.config, :db, proxy))["adjudicate"].(%{
+          origin: "user:flynn",
+          principal: {:session, episode.owner_target},
+          params: %{
+            episode: episode.correlation_key,
+            action: "swap",
+            model: "claude-sonnet-4-6"
+          }
+        })
+      end)
+
+    assert_receive {:swap_confirmed, db_proxy}
+
+    tune =
+      Task.async(fn ->
+        Gateway.handlers(ctx.config)["tune"].(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{setting: "set_model", model: "claude-opus-4-6"}
+        })
+      end)
+
+    try do
+      refute_receive {:tune_model_applied, "claude-opus-4-6"}, 100
+      assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    after
+      send(db_proxy, :release_swap_commit)
+    end
+
+    assert %{ok: true, action: "swap", model: "claude-sonnet-4-6"} = Task.await(swap)
+    assert %{ok: true} = Task.await(tune)
+
+    resolved = Adjudication.get(ctx.db, "k1", "other")
+
+    assert Wakes.get(ctx.db, resolved.recovery_wake_id).prompt =~
+             "You now run on claude-sonnet-4-6"
+
+    assert SwapAdapterStub.held(adapter) == "claude-opus-4-6"
+    assert Org.get(ctx.db, "k1").model == "claude-opus-4-6"
+  end
+
+  test "before-turn push waits for tune commit and reads the new canonical model", ctx do
+    adapter = swap_harness(ctx, checkout: {:error, :degraded})
+    swap_ready(adapter, nil)
+    parent = self()
+
+    proxy =
+      start_supervised!(
+        {RaceDB,
+         real: ctx.db,
+         at: 1,
+         before_txn: fn ->
+           send(parent, {:tune_waiting_to_commit, self()})
+
+           receive do
+             :release_tune_commit -> :ok
+           end
+         end}
+      )
+
+    tune =
+      Task.async(fn ->
+        Gateway.handlers(Map.put(ctx.config, :db, proxy))["tune"].(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+        })
+      end)
+
+    assert_receive {:tune_model_applied, "claude-sonnet-4-6"}
+    assert_receive {:tune_waiting_to_commit, db_proxy}
+
+    turn_db =
+      start_supervised!(
+        {ModelReadBarrierDB, real: ctx.db, parent: self()},
+        id: :model_read_barrier_db
+      )
+
+    turn_ctx = put_in(ctx.config.db, turn_db)
+    turn = Task.async(fn -> run_residency_pass(turn_ctx) end)
+
+    assert_receive {:turn_has_read_model, turn_proxy, "claude-fable-5"}
+
+    try do
+      send(db_proxy, :release_tune_commit)
+      assert %{ok: true} = Task.await(tune)
+      assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    after
+      send(turn_proxy, :release_turn)
+    end
+
+    assert :ok = Task.await(turn)
+    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+  end
+
+  test "resident before-turn refusal has the same model-decision cause as reattach", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        apply_error: :model_unavailable
+      )
+
+    swap_ready(adapter, nil)
+    {_seq, reason} = run_failing_turn(ctx, "refuse the canonical model")
+
+    assert reason == {:model_apply_failed, :model_unavailable}
+    assert episode(ctx.db).cause == "model_decision"
+  end
+
+  test "F3: a non-replying adapter apply never occupies the DB owner", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        block_apply: true
+      )
+
+    swap_ready(adapter, nil)
+
+    tune =
+      Task.async(fn ->
+        Gateway.handlers(ctx.config)["tune"].(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{setting: "set_model", model: "claude-opus-4-6"}
+        })
+      end)
+
+    assert_receive {:tune_apply_waiting, ^adapter}
+
+    db_read =
+      Task.async(fn ->
+        DB.query(ctx.db, "SELECT model FROM sessions WHERE sessionKey='k1'")
+      end)
+
+    try do
+      assert {:ok, {:ok, [["claude-fable-5"]]}} = Task.yield(db_read, 2_000)
+    after
+      send(adapter, :release_tune_apply)
+    end
+
+    assert %{ok: true} = Task.await(tune)
+    assert Org.get(ctx.db, "k1").model == "claude-opus-4-6"
   end
 
   test "F3: the DB owner finishes projection and ruling after the wire caller dies", ctx do
@@ -1410,7 +1762,8 @@ defmodule Tightbeam.AdapterHealTest do
              "You now run on claude-sonnet-4-6"
   end
 
-  test "F3: a failed projection heals from the owner on the next swap opportunity", ctx do
+  test "F3: a failed projection reasserts the canonical record on the next residency pass",
+       ctx do
     adapter = swap_harness(ctx, checkout: {:error, :degraded})
     run_failing_turn(ctx, "fault")
     episode = episode(ctx.db)
@@ -1429,7 +1782,7 @@ defmodule Tightbeam.AdapterHealTest do
         """
       )
 
-    call = fn ->
+    assert_raise DB.Error, ~r/staged projection failure/, fn ->
       Gateway.handlers(ctx.config)["adjudicate"].(%{
         origin: "user:flynn",
         principal: {:session, episode.owner_target},
@@ -1441,18 +1794,50 @@ defmodule Tightbeam.AdapterHealTest do
       })
     end
 
-    assert_raise DB.Error, ~r/staged projection failure/, call
     assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
     assert Org.get(ctx.db, "k1").model == "claude-fable-5"
     assert SwapAdapterStub.apply_count(adapter) == 1
 
     :ok = DB.execute(ctx.db, "DROP TRIGGER fail_model_projection")
 
-    assert %{code: "stale_model"} = call.()
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    run_residency_pass(ctx)
+    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
     assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter)
     assert SwapAdapterStub.apply_count(adapter) == 1
     assert episode(ctx.db).status == "notified"
+  end
+
+  test "F3: an uncertain strict apply reasserts the record on the next residency pass", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        strict_error: :partial_apply
+      )
+
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    assert %{code: "partial_apply"} =
+             Gateway.handlers(ctx.config)["adjudicate"].(%{
+               origin: "user:flynn",
+               principal: {:session, episode.owner_target},
+               params: %{
+                 episode: episode.correlation_key,
+                 action: "swap",
+                 model: "claude-sonnet-4-6"
+               }
+             })
+
+    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert SwapAdapterStub.load_count(adapter) == 0
+
+    run_residency_pass(ctx)
+
+    assert SwapAdapterStub.load_count(adapter) == 1
+    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter)
   end
 
   test "F4: a remembered death reason is served ONLY to the generation that died", ctx do
@@ -1584,6 +1969,32 @@ defmodule Tightbeam.AdapterHealTest do
     Keyword.fetch!(lane_opts, :runner)
   end
 
+  defp run_residency_pass(ctx) do
+    message_id = "residency_#{System.unique_integer([:positive])}"
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "k1",
+               message_id: message_id,
+               origin: "process:tightbeam",
+               prompt: "continue"
+             })
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE turns SET status='running' WHERE seq=?1", [seq])
+
+    assert {:ok, _} =
+             turn_runner(ctx).(%{
+               session_key: "k1",
+               seq: seq,
+               message_id: message_id,
+               prompt: "continue",
+               wake_id: nil
+             })
+
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+  end
+
   defp heal(ctx, token), do: Gateway.adapter_healed(ctx.config, ctx.db, @cause, token)
 
   # The harness half of a model swap: a coordinator checkout that can be flipped
@@ -1597,7 +2008,21 @@ defmodule Tightbeam.AdapterHealTest do
     })
 
     start_supervised!({CoordinatorStub, checkout: fn -> Agent.get(:swap_checkout, & &1) end})
-    adapter = start_supervised!({SwapAdapterStub, model: "claude-fable-5"}, id: :swap_adapter)
+
+    adapter_opts =
+      opts
+      |> Keyword.take([
+        :strict_error,
+        :prompt_error,
+        :model,
+        :cached_model,
+        :block_apply,
+        :apply_error
+      ])
+      |> Keyword.put_new(:model, "claude-fable-5")
+      |> Keyword.put(:parent, self())
+
+    adapter = start_supervised!({SwapAdapterStub, adapter_opts}, id: :swap_adapter)
 
     seed_swap_catalog(ctx)
     Org.append_pointer(ctx.db, "k1", "harness-sid-1", "created")
@@ -1651,6 +2076,26 @@ defmodule Tightbeam.AdapterHealTest do
         refreshing: false
       })
     end)
+  end
+
+  defp make_model_unknown(db, session_key) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    try do
+      :ok =
+        DB.execute(
+          db,
+          """
+          CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
+          DROP TABLE sessions;
+          ALTER TABLE sessions_with_unknown RENAME TO sessions;
+          CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
+          UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
+          """
+        )
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+    end
   end
 
   # Collapse the retry backoff so the next scheduler fire delivers it; the app

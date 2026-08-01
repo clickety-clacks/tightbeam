@@ -33,7 +33,7 @@ defmodule Tightbeam.Org do
           cli_token: String.t() | nil,
           harness: String.t(),
           provider: String.t(),
-          model: String.t(),
+          model: String.t() | nil,
           thinking_level: String.t() | nil,
           host: String.t(),
           cleared_through_seq: integer(),
@@ -417,7 +417,7 @@ defmodule Tightbeam.Org do
   @spec swap_model_in_txn(
           Txn.t(),
           String.t(),
-          {String.t(), String.t()},
+          {String.t() | nil, String.t()},
           {String.t(), String.t(), String.t()}
         ) :: {:ok, session()} | {:duplicate, session()} | :stale
   def swap_model_in_txn(
@@ -435,7 +435,7 @@ defmodule Tightbeam.Org do
         txn,
         """
         UPDATE sessions SET model=?4, harness=?5, provider=?6, updatedAt=?7
-        WHERE sessionKey=?1 AND model=?2 AND harness=?3
+        WHERE sessionKey=?1 AND model IS ?2 AND harness=?3
         """,
         [session_key, expected_model, expected_harness, model, harness, provider, now()]
       )

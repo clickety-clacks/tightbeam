@@ -337,6 +337,10 @@ defmodule Tightbeam.ArtifactCarrierTest do
     conn =
       conn(:post, "/agent/tool-call-observed", "{}")
       |> Plug.Conn.put_req_header("authorization", "Bearer tbc_carrier")
+      |> Plug.Conn.put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> Router.call(ctx.router_opts)
 
@@ -525,6 +529,10 @@ defmodule Tightbeam.ArtifactCarrierTest do
     conn =
       conn(:post, "/agent/dispatch", body)
       |> Plug.Conn.put_req_header("authorization", "Bearer #{ctx.coder.cli_token}")
+      |> Plug.Conn.put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> Router.call(ctx.router_opts)
 
@@ -535,6 +543,10 @@ defmodule Tightbeam.ArtifactCarrierTest do
   defp observe_over_wire(ctx) do
     conn(:post, "/agent/tool-call-observed", "{}")
     |> Plug.Conn.put_req_header("authorization", "Bearer #{ctx.coder.cli_token}")
+    |> Plug.Conn.put_req_header(
+      "x-tightbeam-cli-version",
+      Tightbeam.CliCompatibility.required_version()
+    )
     |> Plug.Conn.put_req_header("content-type", "application/json")
     |> Router.call(ctx.router_opts)
     |> Map.fetch!(:status)

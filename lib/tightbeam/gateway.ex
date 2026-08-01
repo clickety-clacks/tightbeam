@@ -219,8 +219,6 @@ defmodule Tightbeam.Gateway do
         ])
     end)
 
-    warn_cli_target_mismatches(db, config.base_dir)
-
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
     cli_token =
@@ -1171,14 +1169,14 @@ defmodule Tightbeam.Gateway do
             preferences -> preferences
           end
 
-        {base_model, effort} = Adapter.parse_model_ref(session.model)
+        {base_model, effort} = current_model_parts(session.model)
         {catalog, _health} = ModelCatalog.get(session.host, session.harness, ModelCatalog)
         unsupported = fn reason -> %{supported: false, reason: reason} end
 
         models_once = Enum.uniq_by(catalog, &base_ref(&1.ref))
 
         current_efforts =
-          case Enum.find(catalog, &(base_ref(&1.ref) == base_model)) do
+          case Enum.find(catalog, &(not is_nil(base_model) and base_ref(&1.ref) == base_model)) do
             nil -> []
             entry -> entry.efforts
           end
@@ -1186,7 +1184,12 @@ defmodule Tightbeam.Gateway do
         reasoning_capability =
           case current_efforts do
             [] ->
-              unsupported.("current model has no effort tiers")
+              reason =
+                if is_nil(base_model),
+                  do: "current model is unknown",
+                  else: "current model has no effort tiers"
+
+              unsupported.(reason)
 
             efforts ->
               %{
@@ -1205,7 +1208,7 @@ defmodule Tightbeam.Gateway do
             # it can't match a catalog row and matches it against the (now
             # base-ref) catalog rows for the current-model checkmark. The
             # effort qualifier is carried separately in reasoningLevel.
-            model: base_model,
+            model: base_model || "unknown",
             modelPreferences: model_preferences,
             provider: session.provider,
             harness: session.harness,
@@ -1269,6 +1272,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp current_model_parts(ref) when is_binary(ref), do: Adapter.parse_model_ref(ref)
+  defp current_model_parts(_unknown), do: {nil, nil}
+
+  defp base_ref(nil), do: nil
   defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
 
   # Which KIND of credential this session's turns actually run on — an API key or
@@ -1402,7 +1409,21 @@ defmodule Tightbeam.Gateway do
              {:ok, harness_session_id} <-
                stage(
                  :session,
-                 harness_session(config, db, adapter, generation, session, turn.seq)
+                 with_session_mutation_lock(turn.session_key, fn ->
+                   # Tune holds this same lock across adapter apply and record
+                   # commit. Re-read inside it so the push cannot use the
+                   # pre-checkout snapshot or interleave with that sequence.
+                   current = Org.get(db, turn.session_key)
+
+                   harness_session(
+                     config,
+                     db,
+                     adapter,
+                     generation,
+                     %{session | model: current.model},
+                     turn.seq
+                   )
+                 end)
                ),
              {:ok, result} <-
                stage(
@@ -1438,7 +1459,8 @@ defmodule Tightbeam.Gateway do
           {:error, {failed_stage, reason}} ->
             condition = Adjudication.classify(reason)
             cause = adjudication_cause(failed_stage, reason, adapter_key)
-            adjudication_prompt = adjudication_brief(session, condition, cause)
+            brief_inventories = adjudication_model_inventories(session)
+            current_model = session_model_display(Org.get(db, turn.session_key).model)
 
             failure_publish = fn _terminal ->
               # No assistant final will arrive to clear the indicator label —
@@ -1503,6 +1525,15 @@ defmodule Tightbeam.Gateway do
                   )
 
               if episode do
+                adjudication_prompt =
+                  adjudication_brief(
+                    session,
+                    condition,
+                    cause,
+                    current_model,
+                    brief_inventories
+                  )
+
                 Adjudication.notify_in_txn(
                   txn,
                   episode,
@@ -1558,29 +1589,24 @@ defmodule Tightbeam.Gateway do
 
   defp adjudication_cause(_stage, _reason, _key), do: nil
 
+  defp session_model_display(model) when is_binary(model), do: model
+  defp session_model_display(_unknown), do: "unknown"
+
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
   # `condition` is the coarse classification bucket the episode is keyed on;
   # `cause` is the precise reason the record already carries. The human reading
   # this decides from the cause, so it is the line that must be here — a brief
   # that only says `condition=other` tells them nothing they can act on.
-  defp adjudication_brief(session, condition, cause) do
+  defp adjudication_brief(session, condition, cause, current_model, inventories) do
     archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
-
-    # The affected session's OWN host: an adjudicator choosing a replacement model
-    # needs what that host can run, not what the gateway can.
-    inventories =
-      Map.new(Harness.all(), fn module ->
-        {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
-        {module.wire_name(), %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
-      end)
 
     """
     Model adjudication required.
     affected_session=#{session.session_key}
     condition=#{condition}
     cause=#{cause || "unclassified"}
-    current_model=#{session.model}
+    current_model=#{current_model}
     current_harness=#{session.harness}
     model_preferences=#{JSON.encode!(archetype.model_preferences)}
     live_catalog_host=#{session.host}
@@ -1588,6 +1614,16 @@ defmodule Tightbeam.Gateway do
 
     Reply with: tightbeam adjudicate --episode <correlationKey> --action park|swap|respawn|stop [--model <ref>] [--reason <text>]
     """
+  end
+
+  # The affected session's OWN host: an adjudicator choosing a replacement model
+  # needs what that host can run, not what the gateway can. Read this outside the
+  # ruling transaction; catalog refresh may consult the DB owner.
+  defp adjudication_model_inventories(session) do
+    Map.new(Harness.all(), fn module ->
+      {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
+      {module.wire_name(), %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
+    end)
   end
 
   # Wire publication for terminals that lost their runner closure: turns
@@ -1732,85 +1768,12 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp warn_cli_target_mismatches(db, base_dir) do
-    warn_cli_target_mismatches(db, base_dir, local_target_triple())
-  end
-
   @doc false
-  def warn_cli_target_mismatches(db, _base_dir, nil) do
-    EventLog.lifecycle(
-      db,
-      "cli_target_mismatch",
-      Placement.local_host_name(),
-      "gateway target unknown; remote CLI compatibility not checked"
-    )
-
-    :ok
-  end
-
-  def warn_cli_target_mismatches(db, base_dir, local) do
-    base_dir
-    |> Placement.hosts(db)
-    |> Enum.each(fn
-      {_name, %{ssh: nil}} ->
-        :ok
-
-      {name, %{ssh: dest}} ->
-        case System.cmd(
-               "ssh",
-               ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", dest, "uname", "-sm"],
-               stderr_to_stdout: true
-             ) do
-          {output, 0} ->
-            case target_from_probe(output) do
-              target when is_binary(target) and target != local ->
-                EventLog.lifecycle(
-                  db,
-                  "cli_target_mismatch",
-                  name,
-                  "gateway #{local}; host #{target}"
-                )
-
-              _ ->
-                :ok
-            end
-
-          _ ->
-            :ok
-        end
-    end)
-  end
-
-  defp local_target_triple do
-    local_target_triple(:os.type(), :erlang.system_info(:system_architecture) |> to_string())
-  end
-
-  @doc false
-  def local_target_triple(os_type, architecture) do
-    case {os_type, architecture} do
-      {{:unix, :darwin}, "aarch64" <> _} -> "aarch64-apple-darwin"
-      {{:unix, :darwin}, "x86_64" <> _} -> "x86_64-apple-darwin"
-      {{:unix, :linux}, "aarch64" <> _} -> "aarch64-unknown-linux-gnu"
-      {{:unix, :linux}, "x86_64" <> _} -> "x86_64-unknown-linux-gnu"
-      _ -> nil
-    end
-  end
-
-  defp target_from_probe(output) do
-    case String.split(String.trim(output)) do
-      ["Darwin", arch] when arch in ["arm64", "aarch64"] -> "aarch64-apple-darwin"
-      ["Darwin", "x86_64"] -> "x86_64-apple-darwin"
-      ["Linux", arch] when arch in ["arm64", "aarch64"] -> "aarch64-unknown-linux-gnu"
-      ["Linux", arch] when arch in ["x86_64", "amd64"] -> "x86_64-unknown-linux-gnu"
-      _ -> nil
-    end
-  end
-
-  defp mcp_servers_for_archetype(archetype_name) do
+  def mcp_servers_for_archetype(archetype_name, archetypes \\ Archetypes) do
     archetype_name
-    |> Archetypes.get()
-    |> Kernel.||(Archetypes.builtin_default())
-    |> Archetypes.acp_mcp_servers()
+    |> archetypes.get()
+    |> Kernel.||(archetypes.builtin_default())
+    |> archetypes.acp_mcp_servers()
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
@@ -1825,9 +1788,10 @@ defmodule Tightbeam.Gateway do
           snapshot = served_snapshot(config, session, harness, revision)
 
           with {:ok, sid} <-
-                 Adapter.new_session(
+                 new_harness_session(
+                   db,
                    adapter,
-                   session.model,
+                   session,
                    cwd,
                    mcp_servers,
                    snapshot.guidance
@@ -1842,15 +1806,9 @@ defmodule Tightbeam.Gateway do
           # generations reset across boots and can spuriously match.
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
             true ->
-              with {:ok, owner_model} <-
-                     Adapter.current_model(adapter, pointer.harness_session_id),
-                   :ok <-
-                     reconcile_model_projection(
-                       db,
-                       session.session_key,
-                       owner_model
-                     ) do
-                {:ok, pointer.harness_session_id}
+              case push_known_model(adapter, pointer.harness_session_id, session.model) do
+                :ok -> {:ok, pointer.harness_session_id}
+                {:error, _reason} = error -> error
               end
 
             false ->
@@ -1867,14 +1825,7 @@ defmodule Tightbeam.Gateway do
                        mcp_servers,
                        snapshot.guidance
                      ) do
-                  {:ok, owner_model} ->
-                    :ok =
-                      reconcile_model_projection(
-                        db,
-                        session.session_key,
-                        owner_model
-                      )
-
+                  {:ok, _pushed_or_unknown} ->
                     Org.append_pointer(
                       db,
                       session.session_key,
@@ -1886,9 +1837,6 @@ defmodule Tightbeam.Gateway do
                     {:ok, pointer.harness_session_id}
 
                   {:error, {:model_apply_failed, _reason}} = error ->
-                    error
-
-                  {:error, :model_readback_unavailable} = error ->
                     error
 
                   # An adapter that could not answer has NOT told us the harness
@@ -1911,9 +1859,10 @@ defmodule Tightbeam.Gateway do
                     )
 
                     with {:ok, sid} <-
-                           Adapter.new_session(
+                           new_harness_session(
+                             db,
                              adapter,
-                             session.model,
+                             session,
                              cwd,
                              mcp_servers,
                              snapshot.guidance
@@ -1973,6 +1922,31 @@ defmodule Tightbeam.Gateway do
   end
 
   defp enrich_adapter_unavailable(_config, result, _key, _generation), do: result
+
+  defp new_harness_session(db, adapter, session, cwd, mcp_servers, guidance) do
+    with {:ok, sid} <-
+           Adapter.new_session(adapter, session.model, cwd, mcp_servers, guidance),
+         :ok <- capture_created_model(db, adapter, session, sid) do
+      {:ok, sid}
+    end
+  end
+
+  defp capture_created_model(_db, _adapter, %{model: model}, _sid) when is_binary(model),
+    do: :ok
+
+  defp capture_created_model(db, adapter, session, sid) do
+    case Adapter.current_model(adapter, sid) do
+      {:ok, reported_model} when is_binary(reported_model) ->
+        _ = Org.set_model(db, session.session_key, reported_model, session.provider)
+        :ok
+
+      {:error, :model_readback_unavailable} ->
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   defp served_snapshot(config, session, harness, revision) do
     snapshot =
@@ -2235,7 +2209,7 @@ defmodule Tightbeam.Gateway do
          # something it has never heard of.
          true <- Adapter.knows_session?(adapter, pointer.harness_session_id),
          :ok <- Adapter.close_session(adapter, pointer.harness_session_id),
-         {:ok, owner_model} <-
+         {:ok, _pushed_or_unknown} <-
            Adapter.load_session(
              adapter,
              pointer.harness_session_id,
@@ -2243,8 +2217,7 @@ defmodule Tightbeam.Gateway do
              cwd,
              mcp_servers,
              snapshot.guidance
-           ),
-         :ok <- reconcile_model_projection(db, session.session_key, owner_model) do
+           ) do
       Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
       Org.set_identity_revision(db, session.session_key, snapshot.revision)
       :applied
@@ -3234,6 +3207,13 @@ defmodule Tightbeam.Gateway do
           nil ->
             %{ok: false, code: "not_found"}
 
+          %{model: model} when not is_binary(model) ->
+            %{
+              ok: false,
+              code: "model_unknown",
+              message: "reasoning cannot be changed while the current model is unknown"
+            }
+
           session ->
             new_ref = "#{base_ref(session.model)}[#{p.reasoningLevel}]"
             apply_model_change(config, db, call, session, new_ref)
@@ -3253,7 +3233,7 @@ defmodule Tightbeam.Gateway do
     if String.contains?(selected, "[") do
       selected
     else
-      {_current_base, current_effort} = Adapter.parse_model_ref(current_ref)
+      {_current_base, current_effort} = current_model_parts(current_ref)
 
       case efforts_for(host, harness, selected) do
         [] ->
@@ -3282,13 +3262,48 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp apply_model_change(config, db, call, session, new_ref) do
+  # Model changes, adjudication rulings, and adapter heals for one session share
+  # this high-tier lock. The supervised worker survives its wire caller, while
+  # the lock keeps each DB phase and Adapter phase ordered without nesting them.
+  defp run_session_mutation(session_key, fun) do
+    result =
+      Tightbeam.TurnTaskSupervisor
+      |> Task.Supervisor.async_nolink(fn ->
+        try do
+          {:returned, with_session_mutation_lock(session_key, fun)}
+        catch
+          kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+        end
+      end)
+      |> Task.await(:infinity)
+
+    case result do
+      {:returned, value} -> value
+      {:raised, kind, reason, stacktrace} -> :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  defp with_session_mutation_lock(session_key, fun) do
+    :global.trans({{__MODULE__, :session_mutation, session_key}, self()}, fun)
+  end
+
+  defp apply_model_change(config, db, _call, session, new_ref) do
     with :ok <- validate_catalog_model(session.host, session.harness, new_ref, false),
          {%{provider: provider}, _health} <-
            ModelCatalog.entry(session.host, session.harness, new_ref, ModelCatalog) do
-      case apply_tuned_model(config, db, session, new_ref) do
+      result =
+        run_session_mutation(session.session_key, fn ->
+          apply_tuned_model(
+            config,
+            db,
+            session,
+            new_ref,
+            Atom.to_string(provider)
+          )
+        end)
+
+      case result do
         :ok ->
-          Org.set_model(db, call.session_key, new_ref, Atom.to_string(provider))
           %{ok: true}
 
         {:error, reason} ->
@@ -3308,9 +3323,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp apply_tuned_model(config, db, session, new_ref) do
+  defp apply_tuned_model(config, db, session, new_ref, provider) do
     case Org.current_pointer(db, session.session_key) do
       nil ->
+        Org.set_model(db, session.session_key, new_ref, provider)
         :ok
 
       pointer ->
@@ -3325,14 +3341,21 @@ defmodule Tightbeam.Gateway do
                ) do
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
             true ->
-              Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
+              apply_and_project_tuned_model(
+                db,
+                session,
+                adapter,
+                pointer.harness_session_id,
+                new_ref,
+                provider
+              )
 
             false ->
               cwd = Placement.holder_workdir(config, session)
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
               snapshot = served_snapshot(config, session, harness, revision)
 
-              with {:ok, owner_model} <-
+              with {:ok, ^new_ref} <-
                      AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
                        Adapter.load_session(
                          adapter,
@@ -3342,14 +3365,15 @@ defmodule Tightbeam.Gateway do
                          mcp_servers_for_archetype(session.archetype),
                          snapshot.guidance
                        )
-                     end),
-                   :ok <-
-                     reconcile_model_projection(
-                       db,
-                       session.session_key,
-                       owner_model
-                     ) do
-                Adapter.apply_model(adapter, pointer.harness_session_id, new_ref)
+                     end) do
+                project_tuned_model(
+                  db,
+                  session,
+                  adapter,
+                  pointer.harness_session_id,
+                  new_ref,
+                  provider
+                )
               end
 
             {:error, _reason} = error ->
@@ -3359,6 +3383,50 @@ defmodule Tightbeam.Gateway do
           false -> {:error, :adapter_unavailable}
           {:error, reason} -> {:error, reason}
         end
+    end
+  end
+
+  defp apply_and_project_tuned_model(db, session, adapter, sid, new_ref, provider) do
+    # The per-session mutation lock is held by the caller. Adapter work finishes
+    # before the DB transaction begins; the DB owner never calls upward.
+    case Adapter.apply_model(adapter, sid, new_ref) do
+      :ok ->
+        project_tuned_model(db, session, adapter, sid, new_ref, provider)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp project_tuned_model(db, session, adapter, sid, new_ref, provider) do
+    result =
+      DB.transaction(db, fn txn ->
+        [[record_model, record_harness]] =
+          Txn.q(
+            txn,
+            "SELECT model, harness FROM sessions WHERE sessionKey=?1",
+            [session.session_key]
+          )
+
+        case Org.swap_model_in_txn(
+               txn,
+               session.session_key,
+               {record_model, record_harness},
+               {new_ref, record_harness, provider}
+             ) do
+          {:ok, _} -> :ok
+          {:duplicate, _} -> :ok
+          :stale -> raise("model mutation race inside serialized tune")
+        end
+      end)
+
+    case result do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        :ok = Adapter.forget_model_residency(adapter, sid)
+        raise error
     end
   end
 
@@ -3999,14 +4067,18 @@ defmodule Tightbeam.Gateway do
     # would have got a millisecond earlier. Swap closes this window separately by
     # rechecking the episode before touching the harness inside its one ruling
     # transaction.
-    try do
-      action.()
-    rescue
-      AdjudicationSuperseded ->
-        current =
-          Adjudication.get_by_correlation(db, episode.correlation_key) || episode
+    case run_session_mutation(episode.session_key, fn ->
+           try do
+             {:ok, action.()}
+           rescue
+             AdjudicationSuperseded -> :superseded
+           end
+         end) do
+      {:ok, result} ->
+        result
 
-        log_superseded(db, current, call.params[:action])
+      :superseded ->
+        log_superseded(db, episode, call.params[:action])
         %{code: "denied", message: "stale or unknown adjudication episode"}
     end
   end
@@ -4203,124 +4275,53 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # The DB owner executes the callback, so this whole apply→projection→ruling
-  # boundary survives the wire caller dying and excludes every competing ruling
-  # or heal transaction. The adapter independently fences the harness mutation
-  # against the model this transaction just read. The harness remains the owner:
-  # a stale adapter CAS projects the owner value into the row and never writes the
-  # request over it.
+  # The session-mutation worker owns this prepare → apply → commit sequence, so
+  # it survives the wire caller and excludes tune, competing rulings, and heal.
+  # Each DB transaction closes before the Adapter call begins.
   defp adjudicate_model_swap(db, call, episode, harness, provider, adapter, sid) do
-    result =
-      DB.transaction(db, fn txn ->
-        current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
+    with {:ok, {:prepared, prepared}} <- prepare_adjudicated_model_swap(db, episode),
+         {:ok, applied_model} <-
+           Adapter.apply_model_strict(
+             adapter,
+             sid,
+             call.params.model,
+             prepared.record_model
+           ) do
+      case commit_adjudicated_model_swap(
+             db,
+             prepared,
+             applied_model,
+             harness,
+             provider
+           ) do
+        {:ok, {:applied, delivery, wake_id}} ->
+          complete_delivery(db, delivery)
+          %{ok: true, action: "swap", model: applied_model, recovery_wake_id: wake_id}
 
-        if is_nil(current) or current.status != "notified" do
-          {:denied, current}
-        else
-          [[record_model, record_harness, record_provider]] =
-            Txn.q(
-              txn,
-              "SELECT model, harness, provider FROM sessions WHERE sessionKey=?1",
-              [current.session_key]
-            )
+        {:ok, {:denied, current}} ->
+          :ok = Adapter.forget_model_residency(adapter, sid)
 
-          case Adapter.apply_model_strict(
-                 adapter,
-                 sid,
-                 call.params.model,
-                 record_model
-               ) do
-            {:ok, applied_model} ->
-              case Org.swap_model_in_txn(
-                     txn,
-                     current.session_key,
-                     {record_model, record_harness},
-                     {applied_model, harness, provider}
-                   ) do
-                {:ok, _} -> :ok
-                {:duplicate, _} -> :ok
-                :stale -> raise("model mutation race inside serialized ruling")
-              end
+          if current && current.heal_token,
+            do: log_superseded(db, current, call.params[:action])
 
-              recovery_prompt =
-                "Your previous turn failed: #{current.condition}. You now run on #{applied_model}. Re-derive state from the facts and continue."
+          %{code: "denied", message: "stale or unknown adjudication episode"}
 
-              wake_id =
-                Adjudication.deterministic_wake_in_txn(
-                  txn,
-                  current,
-                  "recovery",
-                  current.session_key,
-                  recovery_prompt
-                )
+        {:ok, :model_commit_race} ->
+          :ok = Adapter.forget_model_residency(adapter, sid)
+          strict_apply_error(:model_readback_unavailable)
 
-              unless Adjudication.resolve_in_txn(txn, current, wake_id),
-                do: raise("adjudication changed inside serialized ruling")
-
-              delivery =
-                deliver_prompt_in_txn(
-                  txn,
-                  current.session_key,
-                  "process:tightbeam",
-                  recovery_prompt,
-                  wake_id: wake_id,
-                  sender: "process:tightbeam",
-                  fire_wake_in_txn: true
-                )
-
-              arm_hold_in_txn(txn, current.session_key, wake_id)
-
-              EventLog.lifecycle_in_txn(
-                txn,
-                "model_adjudication",
-                current.session_key,
-                JSON.encode!(%{
-                  from_model: record_model,
-                  to_model: applied_model,
-                  from_harness: record_harness,
-                  to_harness: harness,
-                  trigger: current.condition,
-                  adjudicated_by: current.owner_target,
-                  correlationKey: current.correlation_key,
-                  harness_crossed: false,
-                  context_discarded: false
-                })
-              )
-
-              {:applied, delivery, wake_id, applied_model}
-
-            {:error, {:stale_model, owner_model}} ->
-              case Org.swap_model_in_txn(
-                     txn,
-                     current.session_key,
-                     {record_model, record_harness},
-                     {owner_model, record_harness, record_provider}
-                   ) do
-                {:ok, _} -> :ok
-                {:duplicate, _} -> :ok
-                :stale -> raise("model reconciliation race inside serialized ruling")
-              end
-
-              {:not_applied, {:stale_model, owner_model}}
-
-            {:error, reason} ->
-              {:not_applied, reason}
-          end
-        end
-      end)
-
-    case result do
-      {:ok, {:applied, delivery, wake_id, applied_model}} ->
-        complete_delivery(db, delivery)
-        %{ok: true, action: "swap", model: applied_model, recovery_wake_id: wake_id}
-
+        {:error, error} ->
+          :ok = Adapter.forget_model_residency(adapter, sid)
+          raise error
+      end
+    else
       {:ok, {:denied, current}} ->
         if current && current.heal_token,
           do: log_superseded(db, current, call.params[:action])
 
         %{code: "denied", message: "stale or unknown adjudication episode"}
 
-      {:ok, {:not_applied, reason}} ->
+      {:error, reason} when is_atom(reason) ->
         strict_apply_error(reason)
 
       {:error, error} ->
@@ -4328,10 +4329,119 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp prepare_adjudicated_model_swap(db, episode) do
+    DB.transaction(db, fn txn ->
+      current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
+
+      if is_nil(current) or current.status != "notified" do
+        {:denied, current}
+      else
+        [[record_model, record_harness]] =
+          Txn.q(
+            txn,
+            "SELECT model, harness FROM sessions WHERE sessionKey=?1",
+            [current.session_key]
+          )
+
+        {:prepared,
+         %{
+           current: current,
+           record_model: record_model,
+           record_harness: record_harness
+         }}
+      end
+    end)
+  end
+
+  defp commit_adjudicated_model_swap(db, prepared, applied_model, harness, provider) do
+    DB.transaction(db, fn txn ->
+      current =
+        Adjudication.get_by_correlation_in_txn(
+          txn,
+          prepared.current.correlation_key
+        )
+
+      cond do
+        is_nil(current) or current.status != "notified" ->
+          {:denied, current}
+
+        true ->
+          [[record_model, record_harness]] =
+            Txn.q(
+              txn,
+              "SELECT model, harness FROM sessions WHERE sessionKey=?1",
+              [current.session_key]
+            )
+
+          if {record_model, record_harness} !=
+               {prepared.record_model, prepared.record_harness} do
+            :model_commit_race
+          else
+            case Org.swap_model_in_txn(
+                   txn,
+                   current.session_key,
+                   {record_model, record_harness},
+                   {applied_model, harness, provider}
+                 ) do
+              {:ok, _} -> :ok
+              {:duplicate, _} -> :ok
+              :stale -> raise("model mutation race inside serialized ruling")
+            end
+
+            recovery_prompt =
+              "Your previous turn failed: #{current.condition}. You now run on #{applied_model}. Re-derive state from the facts and continue."
+
+            wake_id =
+              Adjudication.deterministic_wake_in_txn(
+                txn,
+                current,
+                "recovery",
+                current.session_key,
+                recovery_prompt
+              )
+
+            unless Adjudication.resolve_in_txn(txn, current, wake_id),
+              do: raise("adjudication changed inside serialized ruling")
+
+            delivery =
+              deliver_prompt_in_txn(
+                txn,
+                current.session_key,
+                "process:tightbeam",
+                recovery_prompt,
+                wake_id: wake_id,
+                sender: "process:tightbeam",
+                fire_wake_in_txn: true
+              )
+
+            arm_hold_in_txn(txn, current.session_key, wake_id)
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "model_adjudication",
+              current.session_key,
+              JSON.encode!(%{
+                from_model: record_model,
+                to_model: applied_model,
+                from_harness: record_harness,
+                to_harness: harness,
+                trigger: current.condition,
+                adjudicated_by: current.owner_target,
+                correlationKey: current.correlation_key,
+                harness_crossed: false,
+                context_discarded: false
+              })
+            )
+
+            {:applied, delivery, wake_id}
+          end
+      end
+    end)
+  end
+
   defp strict_apply_error(reason) do
     code =
       case reason do
-        {:stale_model, _owner_model} -> "stale_model"
         atom when is_atom(atom) -> Atom.to_string(atom)
         _ -> "model_apply_failed"
       end
@@ -4586,64 +4696,68 @@ defmodule Tightbeam.Gateway do
   # longer matches and this transition loses cleanly.
   defp release_hold(config, db, session_key, condition, cause, encoded_token) do
     result =
-      DB.transaction(db, fn txn ->
-        # The DB is one serialized writer under BEGIN IMMEDIATE, so reading and
-        # then writing in the same transaction IS the compare-and-swap. BOTH
-        # guards are read before any write, so a loser leaves nothing behind:
-        # the session must still be held WIDE, and the episode must still be in a
-        # state a heal may take. A human ruling that resolved the episode is NOT
-        # such a state, and a delayed park leaves the hold wide while doing
-        # exactly that — so the hold alone is not a sufficient guard (F3).
-        held? =
-          Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [session_key])
+      with_session_mutation_lock(session_key, fn ->
+        DB.transaction(db, fn txn ->
+          # The DB is one serialized writer under BEGIN IMMEDIATE, so reading and
+          # then writing in the same transaction IS the compare-and-swap. BOTH
+          # guards are read before any write, so a loser leaves nothing behind:
+          # the session must still be held WIDE, and the episode must still be in a
+          # state a heal may take. A human ruling that resolved the episode is NOT
+          # such a state, and a delayed park leaves the hold wide while doing
+          # exactly that — so the hold alone is not a sufficient guard (F3).
+          held? =
+            Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [
+              session_key
+            ])
 
-        episode = Adjudication.get_in_txn(txn, session_key, condition)
+          episode = Adjudication.get_in_txn(txn, session_key, condition)
 
-        if held? == [["*"]] and is_map(episode) and Adjudication.heal_eligible?(episode) do
-          probe_wake_id = Adjudication.probe_wake_in_txn(txn, episode, encoded_token)
+          if held? == [["*"]] and is_map(episode) and Adjudication.heal_eligible?(episode) do
+            probe_wake_id = Adjudication.probe_wake_in_txn(txn, episode, encoded_token)
 
-          unless Adjudication.heal_resolve_in_txn(txn, episode, probe_wake_id, encoded_token),
-            do: raise(HealLost)
+            unless Adjudication.heal_resolve_in_txn(txn, episode, probe_wake_id, encoded_token),
+              do: raise(HealLost)
 
-          disposition = Adjudication.dispose_owner_wake_in_txn(txn, episode)
+            disposition = Adjudication.dispose_owner_wake_in_txn(txn, episode)
 
-          delivery =
-            deliver_prompt_in_txn(
+            delivery =
+              deliver_prompt_in_txn(
+                txn,
+                session_key,
+                "process:tightbeam",
+                Adjudication.probe_prompt(),
+                wake_id: probe_wake_id,
+                sender: "process:tightbeam",
+                fire_wake_in_txn: true
+              )
+
+            # No probe TURN means no probe terminal to clear the hold; refuse to
+            # narrow the hold rather than wedge the session on a wake that will
+            # never be answered.
+            unless match?({:appended, _target, _message, _opts}, delivery),
+              do: raise("heal probe was not enqueued: #{inspect(delivery)}")
+
+            arm_hold_in_txn(txn, session_key, probe_wake_id)
+
+            EventLog.lifecycle_in_txn(
               txn,
+              "adjudication_hold_healed",
               session_key,
-              "process:tightbeam",
-              Adjudication.probe_prompt(),
-              wake_id: probe_wake_id,
-              sender: "process:tightbeam",
-              fire_wake_in_txn: true
+              JSON.encode!(%{
+                cause: cause,
+                condition: condition,
+                episodeId: episode.episode_id,
+                healToken: encoded_token,
+                probeWakeId: probe_wake_id,
+                ownerWake: to_string(disposition)
+              })
             )
 
-          # No probe TURN means no probe terminal to clear the hold; refuse to
-          # narrow the hold rather than wedge the session on a wake that will
-          # never be answered.
-          unless match?({:appended, _target, _message, _opts}, delivery),
-            do: raise("heal probe was not enqueued: #{inspect(delivery)}")
-
-          arm_hold_in_txn(txn, session_key, probe_wake_id)
-
-          EventLog.lifecycle_in_txn(
-            txn,
-            "adjudication_hold_healed",
-            session_key,
-            JSON.encode!(%{
-              cause: cause,
-              condition: condition,
-              episodeId: episode.episode_id,
-              healToken: encoded_token,
-              probeWakeId: probe_wake_id,
-              ownerWake: to_string(disposition)
-            })
-          )
-
-          {:released, delivery}
-        else
-          :lost
-        end
+            {:released, delivery}
+          else
+            :lost
+          end
+        end)
       end)
 
     case result do
@@ -5043,31 +5157,12 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp reconcile_model_projection(db, session_key, owner_model) do
-    case DB.transaction(db, fn txn ->
-           case Txn.q(
-                  txn,
-                  "SELECT model, harness, provider FROM sessions WHERE sessionKey=?1",
-                  [session_key]
-                ) do
-             [[^owner_model, _harness, _provider]] ->
-               :ok
+  defp push_known_model(_adapter, _sid, model) when not is_binary(model), do: :ok
 
-             [[record_model, harness, provider]] ->
-               case Org.swap_model_in_txn(
-                      txn,
-                      session_key,
-                      {record_model, harness},
-                      {owner_model, harness, provider}
-                    ) do
-                 {:ok, _} -> :ok
-                 {:duplicate, _} -> :ok
-                 :stale -> raise("model reconciliation race inside serialized projection")
-               end
-           end
-         end) do
-      {:ok, :ok} -> :ok
-      {:error, error} -> {:error, error}
+  defp push_known_model(adapter, sid, model) do
+    case Adapter.apply_model(adapter, sid, model) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:model_apply_failed, reason}}
     end
   end
 

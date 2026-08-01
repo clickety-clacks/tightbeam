@@ -7,6 +7,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Assets,
     Archetypes,
     Assignments,
+    CliCompatibility,
     ConditionFacts,
     DB,
     Devices,
@@ -164,6 +165,59 @@ defmodule Tightbeam.CliIntegrationTest do
       workdir: workdir,
       outside: outside
     }
+  end
+
+  test "real CLI states its built version when it connects", ctx do
+    {version, 0} = System.cmd(ctx.binary, ["version"])
+    version = String.trim(version)
+
+    {listed, 0} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
+    assert version != ""
+    assert listed =~ "cli-holder"
+    assert_receive {:cli_call, %{verb: "inspect"}}
+  end
+
+  test "real CLI build is the exact gateway-required version", ctx do
+    {version, 0} = System.cmd(ctx.binary, ["version"])
+    version = String.trim(version)
+
+    assert version == CliCompatibility.required_version()
+  end
+
+  test "version refusal is distinguishable from auth and network failures", ctx do
+    session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
+
+    File.write!(
+      session_file,
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{ctx.port}",
+        token: "wrong-token",
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    {auth, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    assert auth =~ "auth_failed"
+    refute auth =~ "incompatible_cli"
+
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+    {:ok, {_address, unused_port}} = :inet.sockname(listener)
+    :ok = :gen_tcp.close(listener)
+
+    File.write!(
+      session_file,
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{unused_port}",
+        token: ctx.session.cli_token,
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    {network, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    refute network =~ "auth_failed"
+    refute network =~ "incompatible_cli"
+    assert network =~ "Connection refused" or network =~ "connection refused"
   end
 
   test "real CLI discovers a session token, dispatches, and loses access at retire", ctx do
@@ -776,6 +830,9 @@ defmodule Tightbeam.CliIntegrationTest do
   # the DB stayed green while every real caller of an escalating verb hard-failed.
   # That is why this one runs the REAL binary and asserts on what it PRINTS.
   test "real CLI renders an escalated verb as decision_pending instead of dying on EOF", ctx do
+    {cli_version, 0} = System.cmd(ctx.binary, ["version"])
+    cli_version = String.trim(cli_version)
+
     File.mkdir_p!(Path.join([ctx.base_dir, "identity", "rules"]))
 
     File.write!(
@@ -802,7 +859,10 @@ defmodule Tightbeam.CliIntegrationTest do
       :httpc.request(
         :post,
         {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
-         [{~c"authorization", ~c"Bearer #{ctx.session.cli_token}"}], ~c"application/json",
+         [
+           {~c"authorization", ~c"Bearer #{ctx.session.cli_token}"},
+           {~c"x-tightbeam-cli-version", String.to_charlist(cli_version)}
+         ], ~c"application/json",
          JSON.encode!(%{
            "verb" => "assignments",
            "params" => %{"sessionKey" => "cli-holder"}

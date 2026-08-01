@@ -704,6 +704,7 @@ defmodule Tightbeam.TranscriptTest do
   defp dispatch(opts, body) do
     conn(:post, "/agent/dispatch", JSON.encode!(body))
     |> put_req_header("authorization", "Bearer tbc_transcript")
+    |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(opts))
   end
 

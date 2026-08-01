@@ -77,6 +77,8 @@ defmodule Tightbeam.AttentionTierTest do
     def handle_call({:current_model, _sid}, _from, state),
       do: {:reply, {:ok, "claude-fable-5"}, state}
 
+    def handle_call({:apply_model, _sid, _model}, _from, state), do: {:reply, :ok, state}
+
     def handle_call({:load_session, _sid, model, _cwd, _mcp, _guidance}, _from, state),
       do: {:reply, {:ok, model}, state}
 

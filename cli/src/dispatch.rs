@@ -886,15 +886,7 @@ fn send_to_with_timeout(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
-    let url = format!("{}{}", endpoint.base, request.path);
-    let mut builder = ureq::AgentBuilder::new();
-    if let Some(timeout) = timeout {
-        builder = builder.timeout(timeout).timeout_connect(timeout);
-    }
-    let call = builder
-        .build()
-        .post(&url)
-        .set("authorization", &format!("Bearer {}", endpoint.token))
+    let call = gateway_request("POST", endpoint, request.path, timeout)
         .set("content-type", "application/json")
         .send_string(&request.body_json);
 
@@ -905,6 +897,23 @@ fn send_to_with_timeout(
     };
     let encoded = response.into_string().map_err(|error| error.to_string())?;
     parse_response(status, &encoded)
+}
+
+pub(crate) fn gateway_request(
+    method: &str,
+    endpoint: &Endpoint,
+    path: &str,
+    timeout: Option<Duration>,
+) -> ureq::Request {
+    let mut builder = ureq::AgentBuilder::new();
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout).timeout_connect(timeout);
+    }
+    builder
+        .build()
+        .request(method, &format!("{}{path}", endpoint.base))
+        .set("authorization", &format!("Bearer {}", endpoint.token))
+        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
 }
 
 fn ceremony_expired() -> String {
@@ -1117,6 +1126,30 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"harness-process-release","params":{"launchId":"launch-1","reason":"verified absent"}}"#
         );
+    }
+
+    #[test]
+    fn gateway_request_owns_authentication_and_cli_version_for_every_path() {
+        let endpoint = Endpoint {
+            base: "http://gateway.example:11373".to_owned(),
+            token: "tbc_org".to_owned(),
+            session_file: None,
+        };
+
+        for (method, path) in [
+            ("POST", "/agent/dispatch"),
+            ("POST", "/agent/tool-call-observed"),
+            ("GET", "/harnesses"),
+        ] {
+            let request = gateway_request(method, &endpoint, path, None);
+            assert_eq!(request.method(), method);
+            assert_eq!(request.url(), format!("http://gateway.example:11373{path}"));
+            assert_eq!(request.header("authorization"), Some("Bearer tbc_org"));
+            assert_eq!(
+                request.header("x-tightbeam-cli-version"),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+        }
     }
 
     #[test]
