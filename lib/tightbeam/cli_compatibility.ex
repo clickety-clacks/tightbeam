@@ -34,10 +34,11 @@ defmodule Tightbeam.CliCompatibility do
   defp compatible?(offered_version, required_version) do
     with {:ok, offered} <- Version.parse(offered_version),
          {:ok, required} <- Version.parse(required_version) do
-      if Version.compare(required, @stable_version) == :lt do
-        Version.compare(offered, required) == :eq
-      else
+      if Version.compare(offered, @stable_version) != :lt and
+           Version.compare(required, @stable_version) != :lt do
         offered.major == required.major
+      else
+        offered == required
       end
     else
       :error -> false
