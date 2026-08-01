@@ -1413,6 +1413,7 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
             &[
                 "-o".to_owned(),
                 "BatchMode=yes".to_owned(),
+                "--".to_owned(),
                 args.ssh_dest.clone(),
                 preflight::script(&requirements, &remote_path(&args.base_dir)),
             ],
@@ -1603,8 +1604,9 @@ fn ship_current_cli(
             &[
                 "-o".to_owned(),
                 "BatchMode=yes".to_owned(),
+                "--".to_owned(),
                 executable.display().to_string(),
-                format!("{ssh_dest}:{staged_cli}"),
+                format!("{ssh_dest}:{}", shell_quote(&staged_cli)),
             ],
         )?;
         ssh(
@@ -1681,6 +1683,7 @@ fn ssh(
         &[
             "-o".to_owned(),
             "BatchMode=yes".to_owned(),
+            "--".to_owned(),
             ssh_dest.to_owned(),
             script.to_owned(),
         ],
@@ -2291,6 +2294,49 @@ mod tests {
     }
 
     #[test]
+    fn update_clients_preserves_option_like_destinations_and_spaced_cli_paths() {
+        let current = env!("CARGO_PKG_VERSION");
+        let mut io = FakeIo {
+            responses: vec![
+                Ok("0.0.9\n".to_owned()),
+                Ok(format!("{}\n", local_platform())),
+                Ok(String::new()),
+                Ok(String::new()),
+                Ok(String::new()),
+                Ok(format!("{current}\n")),
+                Ok(String::new()),
+            ],
+            dispatch_responses: vec![Ok(Some(serde_json::json!({
+                "hosts": [
+                    {"name": "mistyped", "ssh": "-mistyped-host", "cliBin": "/srv/tight beam/bin"}
+                ]
+            })))],
+            ..FakeIo::default()
+        };
+
+        update_clients_with(&mut io, &Identity::Session).unwrap();
+
+        assert_eq!(
+            io.commands[0].1,
+            [
+                "-o",
+                "BatchMode=yes",
+                "--",
+                "-mistyped-host",
+                "'/srv/tight beam/bin/tightbeam' version",
+            ]
+        );
+        assert_eq!(io.commands[3].0, "scp");
+        assert_eq!(io.commands[3].1[2], "--");
+        assert_eq!(io.commands[3].1[3], "/tmp/tightbeam");
+        assert!(
+            io.commands[3].1[4]
+                .starts_with("-mistyped-host:'/srv/tight beam/bin/.tightbeam.update-")
+        );
+        assert!(io.commands[3].1[4].ends_with('\''));
+    }
+
+    #[test]
     fn chatty_version_answer_is_refused_as_ambiguous() {
         let current = env!("CARGO_PKG_VERSION");
         let mut io = one_update_host(vec![Ok(format!(
@@ -2641,8 +2687,8 @@ mod tests {
         );
         let probe = io.commands[0].1.last().unwrap();
         assert_eq!(
-            io.commands[0].1[..3],
-            ["-o", "BatchMode=yes", "flynn@work-1.local"]
+            io.commands[0].1[..4],
+            ["-o", "BatchMode=yes", "--", "flynn@work-1.local"]
         );
         for expected in [
             "uname -sm",
@@ -2659,7 +2705,7 @@ mod tests {
                 .1
                 .last()
                 .unwrap()
-                .contains(":/Users/remote/.tightbeam/bin/.tightbeam.update-")
+                .contains(":'/Users/remote/.tightbeam/bin/.tightbeam.update-")
         );
         let chmod = io.commands[6].1.last().unwrap();
         assert!(chmod.starts_with("chmod +x "));
