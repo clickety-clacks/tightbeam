@@ -412,9 +412,12 @@ defmodule Tightbeam.CliIntegrationTest do
   # and the review link, because `--reviews` reached the handler under a name no
   # handler read until the router learned to alias it (#112).
   test "real CLI walks the verification papertrail end to end (A1/A2)", ctx do
-    # A real bundle import, not a fixture copy: this is the arrival path §7
-    # describes, so the walk fails if learn stops delivering rules/.
+    # A real bundle import, not a fixture copy: under neutral-seed-v1 the org
+    # is born empty and the bundle arrives ONLY by an explicit learn — so this
+    # walk now exercises that real arrival path, and fails if learn stops
+    # delivering rules/.
     assert :initialized = Archetypes.init_identity!(ctx.base_dir)
+    assert {:ok, _revision} = Tightbeam.Identity.learn!(ctx.base_dir, "agentic-engineering", "operator")
     Archetypes.load!(ctx.base_dir)
 
     for file <- ["engineering.toml", "verification.toml"] do
