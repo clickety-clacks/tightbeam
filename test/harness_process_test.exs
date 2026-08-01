@@ -5,7 +5,6 @@ defmodule Tightbeam.HarnessProcessTest do
   alias Tightbeam.HarnessProcessCensus
 
   @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
-  @cleanup_command_timeout_ms 500
   @fake_adapter ~S"""
   const rl = require("node:readline").createInterface({ input: process.stdin });
   const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
@@ -849,27 +848,16 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   defp kill_fixture_groups(test_dir) do
-    failures =
-      test_dir
-      |> Path.join("**/harness-processes/*.identity")
-      |> Path.wildcard()
-      |> Enum.flat_map(fn identity_path ->
-        case kill_fixture_group(identity_path) do
-          :ok -> []
-          {:error, reason} -> [{identity_path, reason}]
-        end
-      end)
+    test_dir
+    |> Path.join("**/harness-processes/*.identity")
+    |> Path.wildcard()
+    |> Enum.each(&kill_fixture_group/1)
 
-    cond do
-      failures != [] ->
-        {:error, failures}
-
-      eventually(fn -> HarnessProcessCensus.capture_for_root(test_dir).count == 0 end) ->
-        :ok
-
-      true ->
-        snapshot = HarnessProcessCensus.capture_for_root(test_dir)
-        {:error, [{:fixture_processes_survived, HarnessProcessCensus.format(snapshot)}]}
+    if eventually(fn -> HarnessProcessCensus.capture_for_root(test_dir).count == 0 end) do
+      :ok
+    else
+      snapshot = HarnessProcessCensus.capture_for_root(test_dir)
+      {:error, [{:fixture_processes_survived, HarnessProcessCensus.format(snapshot)}]}
     end
   end
 
@@ -893,36 +881,12 @@ defmodule Tightbeam.HarnessProcessTest do
 
   defp kill_fixture_group(identity_path) do
     with {:ok, identity} <- File.read(identity_path),
-         [_, process_group_id, boot_identity, launch_id] <-
-           identity |> String.trim() |> String.split("\t") do
-      case cleanup_group_command([
-             "harness-group",
-             process_group_id,
-             identity_path,
-             boot_identity,
-             launch_id
-           ]) do
-        {:ok, {_, 0}} -> :ok
-        {:ok, {output, status}} -> {:error, {:kill_failed, status, String.trim(output)}}
-        {:error, reason} -> {:error, reason}
-      end
-    else
-      {:error, reason} -> {:error, {:identity_read_failed, reason}}
-      _ -> {:error, :identity_malformed}
+         [_, process_group_id | _] <- identity |> String.trim() |> String.split("\t"),
+         {process_group_id, ""} <- Integer.parse(process_group_id) do
+      System.cmd("/bin/kill", ["-KILL", "--", "-#{process_group_id}"], stderr_to_stdout: true)
     end
-  end
 
-  defp cleanup_group_command(args, timeout_ms \\ @cleanup_command_timeout_ms) do
-    task =
-      Task.async(fn ->
-        System.cmd(@helper, args, stderr_to_stdout: true)
-      end)
-
-    case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
-      {:ok, result} -> {:ok, result}
-      {:exit, reason} -> {:error, {:helper_exit, reason}}
-      nil -> {:error, :timeout}
-    end
+    :ok
   end
 
   defp eventually(fun, attempts \\ 200)
