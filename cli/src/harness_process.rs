@@ -1,12 +1,11 @@
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt as UnixMetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -32,26 +31,11 @@ pub fn session_exec(args: &[String]) -> Result<i32, String> {
     }
 
     let mut identity = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
         .open(identity_path)
         .map_err(|error| format!("harness identity could not be opened: {error}"))?;
-
-    if unsafe { libc::flock(identity.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(format!(
-            "harness identity lock could not be acquired: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    if unsafe { libc::fcntl(identity.as_raw_fd(), libc::F_SETFD, 0) } == -1 {
-        return Err(format!(
-            "harness identity lock could not cross exec: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
 
     match unsafe { libc::fork() } {
         -1 => {
@@ -184,26 +168,14 @@ fn authorize_group_signal(
         return Err("harness boot identity does not match the current boot".into());
     }
 
-    let identity = OpenOptions::new()
+    let mut identity = OpenOptions::new()
         .read(true)
-        .write(true)
         .open(path)
         .map_err(|error| format!("harness identity could not be opened: {error}"))?;
 
-    let lock_result = unsafe { libc::flock(identity.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if lock_result == 0 {
-        let _ = unsafe { libc::flock(identity.as_raw_fd(), libc::LOCK_UN) };
-        return Err("harness identity lock is not held".into());
-    }
-
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
-        return Err(format!(
-            "harness identity lock could not be checked: {error}"
-        ));
-    }
-
-    let recorded = fs::read_to_string(path)
+    let mut recorded = String::new();
+    identity
+        .read_to_string(&mut recorded)
         .map_err(|error| format!("harness identity could not be read: {error}"))?;
     if recorded.trim_end() != format!("{pgid}\t{pgid}\t{expected_boot_identity}\t{launch_id}") {
         return Err("harness identity does not match the requested process group".into());
@@ -215,6 +187,18 @@ fn authorize_group_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tightbeam-harness-process-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn group_rejects_non_positive_ids() {
@@ -251,5 +235,48 @@ mod tests {
             ]),
             Err("harness boot identity does not match the current boot".into())
         );
+    }
+
+    #[test]
+    fn session_exec_refuses_a_pre_existing_identity_file() {
+        let path = test_path("existing");
+        fs::write(&path, "existing identity").unwrap();
+
+        let result = session_exec(&[
+            path.to_string_lossy().into_owned(),
+            "launch".into(),
+            "--".into(),
+            "unused".into(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ref reason) if reason.starts_with("harness identity could not be opened:")
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing identity");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_exec_refuses_an_identity_symlink() {
+        let target = test_path("symlink-target");
+        let path = test_path("symlink");
+        fs::write(&target, "target identity").unwrap();
+        symlink(&target, &path).unwrap();
+
+        let result = session_exec(&[
+            path.to_string_lossy().into_owned(),
+            "launch".into(),
+            "--".into(),
+            "unused".into(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ref reason) if reason.starts_with("harness identity could not be opened:")
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target identity");
+        fs::remove_file(path).unwrap();
+        fs::remove_file(target).unwrap();
     }
 }

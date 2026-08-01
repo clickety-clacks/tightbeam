@@ -103,10 +103,17 @@ defmodule Tightbeam.HarnessProcessTest do
 
     assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
 
-    assert [%{state: "closed_gracefully", resolved_at: resolved_at}] =
+    assert [
+             %{
+               state: "closed_gracefully",
+               resolved_at: resolved_at,
+               identity_path: identity_path
+             }
+           ] =
              AdapterCoordinator.harness_processes(coordinator)
 
     assert is_integer(resolved_at)
+    refute File.exists?(identity_path)
   end
 
   test "boot reconciliation kills a recorded orphan without a live monitor", ctx do
@@ -115,6 +122,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert row.state == "running"
     assert :ok = HarnessProcess.reconcile(ctx.db)
     assert [%{state: "killed"}] = HarnessProcess.list(ctx.db)
+    refute File.exists?(row.identity_path)
   end
 
   test "the schema migration handles populated rows from the first branch schema", ctx do
@@ -379,6 +387,40 @@ defmodule Tightbeam.HarnessProcessTest do
     assert row.process_group_id > 0
   end
 
+  test "a helper refusal cannot resolve a launch without attempting the group kill", ctx do
+    key = {:claude, "shared", "testhost"}
+    {_port, row} = launch_stubborn(ctx, key)
+    refusing_helper = Path.join(ctx.test_dir, "refusing-helper")
+
+    File.write!(
+      refusing_helper,
+      "#!/bin/sh\necho 'harness identity lock is not held' >&2\nexit 1\n"
+    )
+
+    File.chmod!(refusing_helper, 0o755)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1",
+        [row.launch_id, refusing_helper]
+      )
+
+    assert {:error, {:kill_failed, {:signal_refused, "harness identity lock is not held"}}} =
+             HarnessProcess.reconcile_key(ctx.db, key)
+
+    assert [
+             %{
+               state: "kill_failed",
+               kill_attempted_at: attempted_at,
+               kill_sent_at: nil,
+               resolved_at: nil
+             }
+           ] = HarnessProcess.list(ctx.db)
+
+    assert is_integer(attempted_at)
+  end
+
   test "a mismatched boot identity refuses the signal and remains retryable", ctx do
     key = {:claude, "shared", "testhost"}
     {_port, row} = launch_stubborn(ctx, key)
@@ -404,6 +446,59 @@ defmodule Tightbeam.HarnessProcessTest do
         row.launch_id,
         row.boot_identity
       ])
+  end
+
+  test "planned close returns reconciliation failure and keeps the launch fenced", ctx do
+    path = Path.join(ctx.test_dir, "planned-close-adapter.js")
+    File.write!(path, @fake_adapter)
+    key = {:claude, "shared", "testhost"}
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, "planned-close.stderr"),
+             process_identity_dir: ctx.test_dir,
+             process_helper: @helper
+           ]
+         end,
+         park_grace_ms: 50,
+         db: ctx.db,
+         name: :failed_planned_close_coordinator}
+      )
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert Process.alive?(adapter)
+
+    assert eventually(fn ->
+             match?([%{state: "running"}], AdapterCoordinator.harness_processes(coordinator))
+           end)
+
+    [%{launch_id: launch_id}] = AdapterCoordinator.harness_processes(coordinator)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET bootIdentity = 'prior-boot' WHERE launchId = ?1",
+        [launch_id]
+      )
+
+    assert {:error,
+            {:kill_failed,
+             {:signal_refused, "harness boot identity does not match the current boot"}}} =
+             AdapterCoordinator.close_adapter(coordinator, key)
+
+    assert [%{state: "kill_failed", resolved_at: nil}] =
+             AdapterCoordinator.harness_processes(coordinator)
+
+    assert HarnessProcess.fenced?(ctx.db, key)
   end
 
   test "a park with no launch fences and cancels a pending checkout", ctx do

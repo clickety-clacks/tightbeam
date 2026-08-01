@@ -4,9 +4,9 @@ defmodule Tightbeam.HarnessProcess do
 
   A launch writes its row before opening the process. A small POSIX launcher
   creates a new session, records its leader PID, process-group ID, boot marker,
-  and per-launch token, then execs the harness while retaining an exclusive
-  kernel lock on its identity file. Parking authorizes that durable identity
-  immediately before signalling the minted group.
+  and per-launch token, then execs the harness. Parking authorizes that durable
+  identity immediately before signalling the minted group. The row owns the
+  identity file until the launch resolves to a terminal state.
   """
 
   alias Tightbeam.{DB, Id}
@@ -336,7 +336,7 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   @doc "Reconcile the latest unresolved launch for one adapter after its BEAM owner goes down."
-  @spec reconcile_key(DB.server(), tuple()) :: :ok
+  @spec reconcile_key(DB.server(), tuple()) :: :ok | {:error, term()}
   def reconcile_key(db, key) do
     case latest_unresolved(db, key) do
       nil ->
@@ -347,11 +347,10 @@ defmodule Tightbeam.HarnessProcess do
 
         terminal_state = if row.state == "park_requested", do: "closed_gracefully", else: "exited"
 
-        if reconcile_row(db, row, terminal_state) == :ok do
-          :ok = complete_park(db, key)
+        case reconcile_row(db, row, terminal_state) do
+          :ok -> complete_park(db, key)
+          {:error, _reason} = error -> error
         end
-
-        :ok
     end
   end
 
@@ -404,10 +403,6 @@ defmodule Tightbeam.HarnessProcess do
           ])
 
         resolve(db, row, terminal_state)
-
-      {:refused, "harness identity lock is not held" = reason}
-      when terminal_state in ["closed_gracefully", "exited"] ->
-        resolve_refusal(db, row, terminal_state, reason)
 
       {:refused, reason} ->
         kill_failed(db, row, {:signal_refused, reason})
@@ -749,33 +744,44 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp resolve(db, row, state) do
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        UPDATE harness_processes
-           SET state = ?2, resolvedAt = ?3, lastError = NULL
-         WHERE launchId = ?1
-        """,
-        [row.launch_id, state, now()]
-      )
+    case remove_identity(row) do
+      :ok ->
+        {:ok, _} =
+          DB.query(
+            db,
+            """
+            UPDATE harness_processes
+               SET state = ?2, resolvedAt = ?3, lastError = NULL
+             WHERE launchId = ?1
+            """,
+            [row.launch_id, state, now()]
+          )
 
-    :ok
+        :ok
+
+      {:error, reason} ->
+        kill_failed(db, row, reason)
+    end
   end
 
-  defp resolve_refusal(db, row, state, reason) do
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        UPDATE harness_processes
-           SET state = ?2, resolvedAt = ?3, lastError = ?4
-         WHERE launchId = ?1
-        """,
-        [row.launch_id, state, now(), "signal_refused: " <> reason]
-      )
+  defp remove_identity(%{ssh: nil, identity_path: path}) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:identity_remove_failed, reason}}
+    end
+  end
 
-    :ok
+  defp remove_identity(%{ssh: destination, identity_path: path}) do
+    case bounded_command(
+           "ssh",
+           @ssh_opts ++ [destination, "rm", "-f", "--", shell_quote(path)],
+           command_timeout_ms()
+         ) do
+      {_output, 0} -> :ok
+      {:error, :timeout} -> {:error, :identity_remove_timeout}
+      {output, status} -> {:error, {:identity_remove_failed, status, one_line(output)}}
+    end
   end
 
   defp kill_failed(db, row, reason) do
