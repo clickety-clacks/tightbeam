@@ -2143,12 +2143,32 @@ defmodule Tightbeam.GatewayTest do
 
     handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["update-clients"]
 
+    # A RESOLVED non-admin, not an unknown caller: an unknown origin is refused
+    # by resolution failing, which would keep this green even if every real
+    # non-admin were wrongly authorized. Pair a second user (the cold-start rule
+    # gives admin only to the first) and refuse THAT principal.
+    {:pending, _guest_device} =
+      Devices.pair(ctx.db, %{
+        device_id: "guest-device",
+        claimed_name: "Guest",
+        platform: nil,
+        model: nil
+      })
+
+    refute match?(%{is_admin: true}, Devices.user(ctx.db, "guest"))
+
     assert %{code: "forbidden", message: "admin required"} =
              handler.(%{
-               origin: "agent:operator:app",
+               origin: "user:guest",
                session_key: nil,
                params: %{}
              })
+
+    # Prove the admin BIT is what decided, not a resolution failure that
+    # produces the same refusal shape: the same principal, promoted, passes.
+    %{is_admin: true} = Devices.set_user_admin(ctx.db, "guest", true)
+    assert %{hosts: _} = handler.(%{origin: "user:guest", session_key: nil, params: %{}})
+    %{is_admin: false} = Devices.set_user_admin(ctx.db, "guest", false)
 
     assert %{
              hosts: [
