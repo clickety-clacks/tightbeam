@@ -85,7 +85,7 @@ where
         machine.as_deref(),
         None,
     );
-    let ready = begin_reply(send_request(endpoint, &begin, None))?;
+    let ready = send_request(endpoint, &begin, None)?;
     let deadline = ready.as_ref().map_or_else(
         || Instant::now() + CEREMONY_FALLBACK_TIMEOUT,
         |ready| lease_deadline(ready, Instant::now()),
@@ -183,20 +183,6 @@ where
         }
     }
     Ok(())
-}
-
-fn begin_reply(
-    reply: Result<Option<serde_json::Value>, String>,
-) -> Result<Option<serde_json::Value>, String> {
-    reply.map_err(|reason| {
-        if dispatch::accepted_response_was_unreadable(&reason) {
-            format!(
-                "onboarding begin was accepted by the gateway, but the CLI could not read its reply; an onboarding lease may be pending and will expire on its own. {reason}"
-            )
-        } else {
-            reason
-        }
-    })
 }
 
 fn cancel_after_begin<S>(
@@ -2140,18 +2126,11 @@ mod tests {
     }
 
     #[test]
-    fn an_undecodable_successful_begin_reports_the_self_expiring_pending_lease() {
-        let error = begin_reply(crate::dispatch::parse_response(200, "not json")).unwrap_err();
+    fn an_undecodable_successful_begin_is_an_ordinary_response_error() {
+        let error = crate::dispatch::parse_response(200, "not json").unwrap_err();
 
-        assert!(
-            error.contains("begin was accepted by the gateway"),
-            "{error}"
-        );
-        assert!(error.contains("lease may be pending"), "{error}");
-        assert!(error.contains("will expire on its own"), "{error}");
-
-        let transport = begin_reply(Err("connection refused".to_owned())).unwrap_err();
-        assert_eq!(transport, "connection refused");
+        assert!(error.contains("expected ident"), "{error}");
+        assert!(!error.contains("lease may be pending"), "{error}");
     }
 
     #[test]

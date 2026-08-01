@@ -42,7 +42,7 @@ needed.
 The ceremony is a three-phase conversation with the gateway, holding a lease
 keyed `{host, provider}`. Distinct hosts hold independent leases, so ceremonies
 on different machines may run concurrently; a second ceremony for the same
-provider on the same host is refused with `:onboarding_in_progress`.
+provider on the same host supersedes the first.
 
 **Budget the human, not the lease.** The onboarding lease is 30 minutes
 (`onboarding_lease_ms`), but a provider authorization code expires in roughly

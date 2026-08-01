@@ -415,40 +415,41 @@ defmodule Tightbeam.CredentialsTest do
     refute_receive {:forbidden_cancel_publish, _}
   end
 
-  test "an abandoned onboarding lease expires and the next begin succeeds", ctx do
+  test "a second begin supersedes the pending lease and its stale finish fails loudly", ctx do
     owner = self()
-    # A counter, not a sleep: the lease is compared at read seams against `now`,
-    # so a test can move time instead of spending it.
-    clock = :counters.new(1, [])
-    :counters.put(clock, 1, 1_000)
 
     {:ok, server} =
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
         machine: "eezo",
-        onboarding_lease_ms: 60_000,
-        now: fn -> :counters.get(clock, 1) end,
-        log_event: fn kind, subject, detail ->
-          send(owner, {:event, kind, subject, detail})
+        stop: fn provider ->
+          send(owner, {:stop, provider})
+          :ok
         end
       )
 
     assert {:ok, staging} = Credentials.begin_onboard(:openai, server)
+    File.write!(Path.join(staging, "auth.json"), ~S({"token":"stale"}))
+    assert_receive {:stop, :openai}
 
-    # The CLI dies here — it never calls finish, and never calls cancel. Cancel is
-    # client-driven, so nothing on this side has been told the ceremony is over.
-    assert {:error, :onboarding_in_progress} = Credentials.begin_onboard(:openai, server)
-    assert Credentials.status(:openai, server) == {:needs_onboarding, :in_progress}
-
-    :counters.add(clock, 1, 61)
-
-    # Past the TTL the provider is onboardable again without a gateway restart,
-    # and the expiry left the same trace an explicit cancel would have.
     assert {:ok, fresh} = Credentials.begin_onboard(:openai, server)
     assert fresh != staging
-    assert_received {:event, "credential_lease_expired", "openai@eezo", nil}
+    assert_receive {:stop, :openai}
     refute File.exists?(staging)
+
+    assert {:error, {:device_auth_failed, :enoent}} =
+             Credentials.finish_onboard(:openai, :subscription, server)
+  end
+
+  test "an operator whose CLI died can immediately begin again", ctx do
+    {:ok, server} =
+      Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    assert {:ok, abandoned} = Credentials.begin_onboard(:anthropic, server)
+    assert {:ok, fresh} = Credentials.begin_onboard(:anthropic, server)
+    assert fresh != abandoned
+    refute File.exists?(abandoned)
   end
 
   test "machine contexts never share credential bytes", ctx do

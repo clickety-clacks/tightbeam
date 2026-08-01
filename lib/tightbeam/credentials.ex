@@ -171,20 +171,16 @@ defmodule Tightbeam.Credentials do
        capture_sessions: Keyword.get(opts, :capture_sessions, fn _provider -> [] end),
        publish_sessions:
          Keyword.get(opts, :publish_sessions, fn _payload, _transition -> :ok end),
-       onboarding_lease_ms: Keyword.get(opts, :onboarding_lease_ms, 1_800_000),
-       log_event: Keyword.get(opts, :log_event, fn _kind, _subject, _detail -> :ok end),
        pending: %{}
      }}
   end
 
   @impl true
   def handle_call({:status, provider}, _from, state) do
-    state = expire_lease(state, provider)
     {:reply, credential_status(state, provider), state}
   end
 
   def handle_call({:kind, provider}, _from, state) do
-    state = expire_lease(state, provider)
     {:reply, credential_kind(state, provider), state}
   end
 
@@ -222,33 +218,23 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call({:begin_onboard, provider}, _from, state) do
-    state = expire_lease(state, provider)
+    {previous, pending} = Map.pop(state.pending, provider)
+    state = %{state | pending: pending}
 
-    case Map.fetch(state.pending, provider) do
-      {:ok, _lease} ->
-        {:reply, {:error, :onboarding_in_progress}, state}
+    if previous, do: cleanup_staging!(state, previous.path)
 
-      :error ->
-        with :ok <- state.gate.(provider),
-             :ok <- state.stop.(provider) do
-          path = onboarding_staging_path(state, provider)
-          :ok = prepare_staging!(state, path)
+    with :ok <- state.gate.(provider),
+         :ok <- state.stop.(provider) do
+      path = onboarding_staging_path(state, provider)
+      :ok = prepare_staging!(state, path)
 
-          lease = %{
-            path: path,
-            expires_at: state.now.() + div(state.onboarding_lease_ms, 1000)
-          }
-
-          {:reply, {:ok, path}, put_in(state.pending[provider], lease)}
-        else
-          {:error, _reason} = error -> {:reply, error, state}
-        end
+      {:reply, {:ok, path}, put_in(state.pending[provider], %{path: path})}
+    else
+      {:error, _reason} = error -> {:reply, error, state}
     end
   end
 
   def handle_call({:finish_onboard, provider, kind}, _from, state) do
-    state = expire_lease(state, provider)
-
     case Map.fetch(state.pending, provider) do
       {:ok, %{path: path}} ->
         result =
@@ -278,23 +264,6 @@ defmodule Tightbeam.Credentials do
         cleanup_staging!(state, path)
         record_onboarding_failure!(state, provider, reason)
         {:reply, :ok, %{state | pending: pending}}
-    end
-  end
-
-  # Leases expire at the READ seams only — no timer, no sweep, matching this
-  # module's stated posture ("expiry is compared only at read seams"). An expired
-  # lease is not a new state: it runs the cancel path, so a provider wedged by a
-  # CLI that died between `begin` and `cancel` heals into exactly the condition an
-  # explicit cancel would have left, without a gateway restart.
-  defp expire_lease(state, provider) do
-    with {:ok, %{path: path, expires_at: expires_at}} <- Map.fetch(state.pending, provider),
-         true <- expires_at <= state.now.() do
-      cleanup_staging!(state, path)
-      record_onboarding_failure!(state, provider, :lease_expired)
-      state.log_event.("credential_lease_expired", "#{provider}@#{state.machine}", nil)
-      update_in(state.pending, &Map.delete(&1, provider))
-    else
-      _ -> state
     end
   end
 
