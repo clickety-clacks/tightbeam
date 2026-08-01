@@ -24,7 +24,11 @@ defmodule Tightbeam.HarnessProcessTest do
       )
 
     File.mkdir_p!(test_dir)
-    on_exit(fn -> File.rm_rf!(test_dir) end)
+
+    on_exit(fn ->
+      kill_fixture_groups(test_dir)
+      File.rm_rf!(test_dir)
+    end)
 
     prior_timeout = Application.get_env(:tightbeam, :harness_process_command_timeout_ms)
 
@@ -50,12 +54,7 @@ defmodule Tightbeam.HarnessProcessTest do
     while :; do sleep 1; done
     """
 
-    {port, row} = launch(ctx, {:claude, "shared", "testhost"}, ["sh", "-c", script])
-
-    on_exit(fn ->
-      System.cmd("sh", ["-c", "kill -KILL -#{row.process_group_id}"], stderr_to_stdout: true)
-      close_port(port)
-    end)
+    {_port, row} = launch(ctx, {:claude, "shared", "testhost"}, ["sh", "-c", script])
 
     assert eventually(fn -> File.exists?(marker) and File.stat!(marker).size > 0 end)
 
@@ -168,8 +167,7 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   test "boot reconciliation kills a recorded orphan without a live monitor", ctx do
-    {port, row} = launch_stubborn(ctx, {:codex, "shared", "testhost"})
-    on_exit(fn -> close_port(port) end)
+    {_port, row} = launch_stubborn(ctx, {:codex, "shared", "testhost"})
 
     assert row.state == "running"
     assert :ok = HarnessProcess.reconcile(ctx.db)
@@ -250,8 +248,7 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   test "inspection failure is unconfirmed and retry uses the durable group", ctx do
-    {port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
-    on_exit(fn -> close_port(port) end)
+    {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
     failing_helper = System.find_executable("false")
 
@@ -281,8 +278,7 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   test "an accepted command that never returns is bounded and remains unconfirmed", ctx do
-    {port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
-    on_exit(fn -> close_port(port) end)
+    {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     hanging = Path.join(ctx.test_dir, "hanging-helper")
     File.write!(hanging, "#!/bin/sh\nexec sleep 30\n")
     File.chmod!(hanging, 0o755)
@@ -348,8 +344,7 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   test "continuous helper output cannot starve the absolute command deadline", ctx do
-    {port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
-    on_exit(fn -> close_port(port) end)
+    {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     noisy = Path.join(ctx.test_dir, "noisy-helper")
     File.write!(noisy, "#!/bin/sh\nwhile :; do printf x; done\n")
     File.chmod!(noisy, 0o755)
@@ -372,8 +367,7 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   test "every unresolved launch fences a replacement before DOWN reconciliation", ctx do
-    {port, _row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
-    on_exit(fn -> close_port(port) end)
+    {_port, _row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
 
     assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
 
@@ -440,16 +434,14 @@ defmodule Tightbeam.HarnessProcessTest do
       end)
 
     assert :ok = HarnessProcess.reconcile(ctx.db)
-    assert_receive {:delayed_port, port}
+    assert_receive {:delayed_port, _port}
     assert [%{state: "killed"}] = HarnessProcess.list(ctx.db)
     send(launcher.pid, :done)
     assert Task.await(launcher) == :ok
-    close_port(port)
   end
 
   test "a crash window after kill attempt is never labelled graceful", ctx do
-    {port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
-    on_exit(fn -> close_port(port) end)
+    {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     assert {:ok, _} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
 
     {:ok, _} =
@@ -593,10 +585,28 @@ defmodule Tightbeam.HarnessProcessTest do
     {port, row}
   end
 
-  defp close_port(port) do
-    if Port.info(port), do: Port.close(port)
-  catch
-    :error, :badarg -> :ok
+  defp kill_fixture_groups(test_dir) do
+    test_dir
+    |> Path.join("**/harness-processes/*.identity")
+    |> Path.wildcard()
+    |> Enum.each(fn identity_path ->
+      with {:ok, identity} <- File.read(identity_path),
+           [_, process_group_id, boot_identity, launch_id] <-
+             identity |> String.trim() |> String.split("\t") do
+        System.cmd(
+          @helper,
+          [
+            "harness-group",
+            "kill",
+            process_group_id,
+            identity_path,
+            boot_identity,
+            launch_id
+          ],
+          stderr_to_stdout: true
+        )
+      end
+    end)
   end
 
   defp group_args(row, action) do
