@@ -63,6 +63,31 @@ defmodule Tightbeam.HarnessProcessTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
+  test "an old harness process schema is refused without partial DDL" do
+    old_db = :"old_harness_process_db_#{System.unique_integer([:positive])}"
+
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: old_db}, id: old_db))
+
+    :ok =
+      DB.execute(old_db, """
+      CREATE TABLE harness_processes (
+        launchId TEXT PRIMARY KEY,
+        adapterKey TEXT NOT NULL,
+        state TEXT NOT NULL
+      )
+      """)
+
+    assert_raise DB.Error,
+                 ~r/pre-release harness_processes shape.*not upgraded by design.*Reset the database/,
+                 fn -> HarnessProcess.ensure_schema(old_db) end
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               old_db,
+               "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'harness_park_fences'"
+             )
+  end
+
   test "the coordinator records group identity during real adapter boot", ctx do
     path = Path.join(ctx.test_dir, "adapter.js")
     File.write!(path, @fake_adapter)

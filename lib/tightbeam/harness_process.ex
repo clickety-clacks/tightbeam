@@ -13,6 +13,7 @@ defmodule Tightbeam.HarnessProcess do
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @command_timeout_ms 5_000
+  @old_schema_refusal "The database carries a pre-release harness_processes shape; it is not upgraded by design. Reset the database and restart Tightbeam."
 
   @process_ddl """
   CREATE TABLE IF NOT EXISTS harness_processes (
@@ -74,15 +75,25 @@ defmodule Tightbeam.HarnessProcess do
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
-    :ok = DB.execute(db, @ddl)
+    case DB.transaction(db, fn txn ->
+           DB.Txn.exec(txn, @ddl)
 
-    :ok =
-      DB.execute(
-        db,
-        "CREATE INDEX IF NOT EXISTS harness_processes_adapter_launch_sequence ON harness_processes (adapterKey, state, launchSequence)"
-      )
+           DB.Txn.exec(
+             txn,
+             "CREATE INDEX IF NOT EXISTS harness_processes_adapter_launch_sequence ON harness_processes (adapterKey, state, launchSequence)"
+           )
 
-    :ok
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %MatchError{term: {:error, "no such column: launchSequence"}}} ->
+        raise DB.Error, message: @old_schema_refusal
+
+      {:error, error} ->
+        {:error, error}
+    end
   end
 
   @doc "Insert the durable launch event and wrap the target command to record its identity."
