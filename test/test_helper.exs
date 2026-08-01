@@ -176,7 +176,7 @@ ExUnit.start(assert_receive_timeout: 1_000)
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 
 ExUnit.after_suite(fn _result ->
-  leaked = Tightbeam.HarnessProcessCensus.capture_for_root(suite_tmp)
+  leaked = Tightbeam.HarnessProcessCensus.capture_for_suite(suite_tmp)
 
   if leaked.count != 0 do
     raise """
