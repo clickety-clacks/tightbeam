@@ -4,6 +4,8 @@ defmodule Tightbeam.HarnessProcessTest do
   alias Tightbeam.{AdapterCoordinator, DB, HarnessProcess}
 
   @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
+  @cleanup_command_timeout_ms 500
+  @cleanup_absence_timeout_ms 2_000
   @fake_adapter ~S"""
   const rl = require("node:readline").createInterface({ input: process.stdin });
   const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
@@ -19,15 +21,22 @@ defmodule Tightbeam.HarnessProcessTest do
 
     test_dir =
       Path.join(
-        System.tmp_dir!(),
-        "harness-process-#{System.unique_integer([:positive, :monotonic])}"
+        Path.dirname(System.tmp_dir!()),
+        "harness-process-#{System.pid()}-#{System.unique_integer([:positive, :monotonic])}"
       )
 
     File.mkdir_p!(test_dir)
 
     on_exit(fn ->
-      kill_fixture_groups(test_dir)
-      File.rm_rf!(test_dir)
+      case kill_fixture_groups(test_dir) do
+        :ok ->
+          File.rm_rf!(test_dir)
+
+        {:error, failures} ->
+          flunk(
+            "harness fixture cleanup could not confirm absence; preserving #{test_dir}: #{inspect(failures)}"
+          )
+      end
     end)
 
     prior_timeout = Application.get_env(:tightbeam, :harness_process_command_timeout_ms)
@@ -45,16 +54,26 @@ defmodule Tightbeam.HarnessProcessTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
-  test "park still sees and SIGKILLs a leaderless process group", ctx do
+  test "park never resolves a descriptor-closing leaderless group as absent", ctx do
     marker = Path.join(ctx.test_dir, "tool-writes")
 
-    script = """
-    trap '' HUP TERM
-    (trap '' HUP TERM; while :; do printf x >> #{marker}; sleep 0.02; done) &
-    while :; do sleep 1; done
+    script = ~S"""
+    const { spawn } = require("node:child_process");
+    spawn(process.execPath, [
+      "-e",
+      'const fs = require("node:fs"); setInterval(() => fs.appendFileSync(process.argv[1], "x"), 20)',
+      process.argv[1]
+    ], { stdio: "ignore" });
+    setInterval(() => {}, 1000);
     """
 
-    {_port, row} = launch(ctx, {:claude, "shared", "testhost"}, ["sh", "-c", script])
+    {_port, row} =
+      launch(ctx, {:claude, "shared", "testhost"}, [
+        System.find_executable("node"),
+        "-e",
+        script,
+        marker
+      ])
 
     assert eventually(fn -> File.exists?(marker) and File.stat!(marker).size > 0 end)
 
@@ -62,7 +81,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert is_binary(row.boot_identity)
     assert is_binary(row.identity_token)
 
-    assert {_, 3} =
+    assert {boot_output, 1} =
              System.cmd(
                @helper,
                [
@@ -76,7 +95,9 @@ defmodule Tightbeam.HarnessProcessTest do
                stderr_to_stdout: true
              )
 
-    assert {_, 3} =
+    assert boot_output =~ "harness boot identity does not match the current boot"
+
+    assert {token_output, 1} =
              System.cmd(
                @helper,
                [
@@ -89,6 +110,8 @@ defmodule Tightbeam.HarnessProcessTest do
                ],
                stderr_to_stdout: true
              )
+
+    assert token_output =~ "harness identity does not match the requested process group"
 
     assert {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(row.os_pid)])
 
@@ -106,19 +129,33 @@ defmodule Tightbeam.HarnessProcessTest do
     assert eventually(fn -> File.stat!(marker).size > leaderless_size end)
 
     assert {_, 0} = System.cmd(@helper, group_args(row, "status"), stderr_to_stdout: true)
+
+    assert {kill_output, 1} =
+             System.cmd(@helper, group_args(row, "kill"), stderr_to_stdout: true)
+
+    assert kill_output =~ "harness identity lock is not held"
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
-    assert :ok = HarnessProcess.park(ctx.db, fenced, 50)
-    assert :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "testhost"})
+    assert {:error, {:park_unconfirmed, {:sigkill_failed, 1, error}}} =
+             HarnessProcess.park(ctx.db, fenced, 50)
 
-    assert [%{state: "killed", kill_sent_at: sent_at, resolved_at: resolved_at}] =
-             HarnessProcess.list(ctx.db)
+    assert error =~ "harness identity lock is not held"
 
-    assert is_integer(sent_at)
-    assert is_integer(resolved_at)
-    size = File.stat!(marker).size
-    Process.sleep(100)
-    assert File.stat!(marker).size == size
-    refute HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
+    assert [%{state: "unconfirmed", resolved_at: nil}] = HarnessProcess.list(ctx.db)
+
+    unconfirmed_size = File.stat!(marker).size
+    assert eventually(fn -> File.stat!(marker).size > unconfirmed_size end)
+
+    assert {_, 0} =
+             System.cmd("sh", ["-c", "kill -KILL -#{row.process_group_id}"],
+               stderr_to_stdout: true
+             )
+
+    assert eventually(fn ->
+             match?(
+               {_, 3},
+               System.cmd(@helper, group_args(row, "status"), stderr_to_stdout: true)
+             )
+           end)
   end
 
   test "the coordinator records group identity during real adapter boot", ctx do
@@ -586,28 +623,74 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   defp kill_fixture_groups(test_dir) do
-    test_dir
-    |> Path.join("**/harness-processes/*.identity")
-    |> Path.wildcard()
-    |> Enum.each(fn identity_path ->
-      with {:ok, identity} <- File.read(identity_path),
-           [_, process_group_id, boot_identity, launch_id] <-
-             identity |> String.trim() |> String.split("\t") do
-        System.cmd(
-          @helper,
-          [
-            "harness-group",
-            "kill",
-            process_group_id,
-            identity_path,
-            boot_identity,
-            launch_id
-          ],
-          stderr_to_stdout: true
-        )
-      end
-    end)
+    failures =
+      test_dir
+      |> Path.join("**/harness-processes/*.identity")
+      |> Path.wildcard()
+      |> Enum.flat_map(fn identity_path ->
+        case kill_fixture_group(identity_path) do
+          :ok -> []
+          {:error, reason} -> [{identity_path, reason}]
+        end
+      end)
+
+    if failures == [], do: :ok, else: {:error, failures}
   end
+
+  defp kill_fixture_group(identity_path) do
+    with {:ok, identity} <- File.read(identity_path),
+         [_, process_group_id, boot_identity, launch_id] <-
+           identity |> String.trim() |> String.split("\t") do
+      args = [process_group_id, identity_path, boot_identity, launch_id]
+      kill_result = cleanup_group_command(["harness-group", "kill" | args])
+      confirm_fixture_absence(args, kill_result, cleanup_deadline())
+    else
+      {:error, reason} -> {:error, {:identity_read_failed, reason}}
+      _ -> {:error, :identity_malformed}
+    end
+  end
+
+  defp confirm_fixture_absence(args, kill_result, deadline) do
+    remaining_ms = deadline - System.monotonic_time(:millisecond)
+
+    if remaining_ms <= 0 do
+      {:error, {:absence_unconfirmed, kill_result}}
+    else
+      case cleanup_group_command(
+             ["harness-group", "status" | args],
+             min(@cleanup_command_timeout_ms, remaining_ms)
+           ) do
+        {:ok, {_, 3}} ->
+          :ok
+
+        {:ok, {_, 0}} ->
+          Process.sleep(min(20, max(deadline - System.monotonic_time(:millisecond), 0)))
+          confirm_fixture_absence(args, kill_result, deadline)
+
+        {:ok, {output, status}} ->
+          {:error, {:inspection_failed, status, String.trim(output), kill_result}}
+
+        {:error, reason} ->
+          {:error, {:inspection_failed, reason, kill_result}}
+      end
+    end
+  end
+
+  defp cleanup_group_command(args, timeout_ms \\ @cleanup_command_timeout_ms) do
+    task =
+      Task.async(fn ->
+        System.cmd(@helper, args, stderr_to_stdout: true)
+      end)
+
+    case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> {:ok, result}
+      {:exit, reason} -> {:error, {:helper_exit, reason}}
+      nil -> {:error, :timeout}
+    end
+  end
+
+  defp cleanup_deadline,
+    do: System.monotonic_time(:millisecond) + @cleanup_absence_timeout_ms
 
   defp group_args(row, action) do
     [

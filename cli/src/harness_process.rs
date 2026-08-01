@@ -137,21 +137,21 @@ pub fn group(args: &[String]) -> Result<i32, String> {
         .filter(|pgid| *pgid > 0)
         .ok_or_else(|| "process group id must be a positive integer".to_string())?;
 
-    if boot_identity()? != args[3]
-        || !identity_lock_held(Path::new(&args[2]), pgid, &args[3], &args[4])?
-    {
-        return Ok(ABSENT);
+    let group_status = signal_group(pgid, 0)?;
+
+    if group_status == ABSENT || args[0] == "status" {
+        return Ok(group_status);
     }
 
-    // Status and termination share this identity check in one helper invocation.
+    authorize_group_signal(Path::new(&args[2]), pgid, &args[3], &args[4])?;
+
     // POSIX has no conditional killpg primitive, so a group that exits and is
-    // recycled between the check above and this syscall remains the irreducible
-    // check-to-act window.
-    let signal = if args[0] == "status" {
-        0
-    } else {
-        libc::SIGKILL
-    };
+    // recycled between the liveness probe above and this syscall remains the
+    // irreducible check-to-act window.
+    signal_group(pgid, libc::SIGKILL)
+}
+
+fn signal_group(pgid: libc::pid_t, signal: libc::c_int) -> Result<i32, String> {
     let result = unsafe { libc::killpg(pgid, signal) };
 
     if result == 0 {
@@ -188,12 +188,16 @@ fn boot_identity() -> Result<String, String> {
     ))
 }
 
-fn identity_lock_held(
+fn authorize_group_signal(
     path: &Path,
     pgid: libc::pid_t,
-    boot_identity: &str,
+    expected_boot_identity: &str,
     launch_id: &str,
-) -> Result<bool, String> {
+) -> Result<(), String> {
+    if boot_identity()? != expected_boot_identity {
+        return Err("harness boot identity does not match the current boot".into());
+    }
+
     let identity = OpenOptions::new()
         .read(true)
         .write(true)
@@ -203,7 +207,7 @@ fn identity_lock_held(
     let lock_result = unsafe { libc::flock(identity.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if lock_result == 0 {
         let _ = unsafe { libc::flock(identity.as_raw_fd(), libc::LOCK_UN) };
-        return Ok(false);
+        return Err("harness identity lock is not held".into());
     }
 
     let error = std::io::Error::last_os_error();
@@ -215,7 +219,11 @@ fn identity_lock_held(
 
     let recorded = fs::read_to_string(path)
         .map_err(|error| format!("harness identity could not be read: {error}"))?;
-    Ok(recorded.trim_end() == format!("{pgid}\t{pgid}\t{boot_identity}\t{launch_id}"))
+    if recorded.trim_end() != format!("{pgid}\t{pgid}\t{expected_boot_identity}\t{launch_id}") {
+        return Err("harness identity does not match the requested process group".into());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -243,6 +251,22 @@ mod tests {
                 "start".into()
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn status_presence_comes_from_the_group_not_identity_proxies() {
+        let pgid = unsafe { libc::getpgrp() };
+
+        assert_eq!(
+            group(&[
+                "status".into(),
+                pgid.to_string(),
+                "/identity/path/that/does/not/exist".into(),
+                "wrong-boot".into(),
+                "wrong-launch".into()
+            ]),
+            Ok(0)
         );
     }
 }

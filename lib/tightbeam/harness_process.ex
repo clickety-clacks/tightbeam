@@ -6,9 +6,10 @@ defmodule Tightbeam.HarnessProcess do
   creates a new session, records its leader PID, process-group ID, boot marker,
   and per-launch token, then execs the harness while retaining an exclusive
   kernel lock on its identity file. Parking targets that minted group, not one
-  member of the tree. Status and termination verify the launch token and live
-  lock in the same helper invocation; POSIX exposes no conditional `killpg`, so
-  the helper still has an irreducible check-to-syscall reuse window.
+  member of the tree. Only a process-group probe may report absence. Termination
+  additionally verifies the launch token and live lock before signalling; POSIX
+  exposes no conditional `killpg`, so the helper still has an irreducible
+  check-to-syscall reuse window.
   """
 
   alias Tightbeam.{DB, Id}
