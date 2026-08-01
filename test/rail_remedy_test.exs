@@ -4,12 +4,9 @@ defmodule Tightbeam.RailRemedyTest do
   alias Tightbeam.{
     Archetypes,
     Assignments,
-    ConditionFacts,
     ConnRegistry,
     DB,
-    Devices,
     Dispatch,
-    Escalation,
     EventLog,
     Gateway,
     Idempotency,
@@ -18,35 +15,14 @@ defmodule Tightbeam.RailRemedyTest do
     RailRemedy,
     Roles,
     Rules,
-    Wakes,
-    WorkItems,
-    WorkState
+    Wakes
   }
 
   setup do
     db = :"rail_remedy_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          Idempotency,
-          ConditionFacts,
-          Wakes,
-          Org,
-          Roles,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          RailRemedy,
-          # A statute whose check renders a verdict asks whether it left a malfunction
-          # episode open, so the rail path reads this table on the healthy road too.
-          Escalation,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(

@@ -62,20 +62,14 @@ defmodule Tightbeam.ArtifactCarrierTest do
 
   alias Tightbeam.{
     Artifacts,
-    Assignments,
-    ConditionFacts,
     DB,
-    EventLog,
     Gateway,
     Ledger,
     Org,
     Projection,
     Roles,
     Rules,
-    TurnObservations,
-    Wakes,
-    WorkItems,
-    WorkState
+    TurnObservations
   }
 
   alias Tightbeam.ArtifactCarrierTest.PausingDb
@@ -85,27 +79,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
     db = :"artifact_carrier_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Tightbeam.Assets,
-          Tightbeam.Devices,
-          ConditionFacts,
-          Tightbeam.Idempotency,
-          Ledger,
-          Org,
-          Projection,
-          Roles,
-          Wakes,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          Tightbeam.Escalation,
-          Tightbeam.RailRemedy,
-          Tightbeam.Placement,
-          Artifacts
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-carrier-#{System.unique_integer([:positive])}")

@@ -3,17 +3,11 @@ defmodule Tightbeam.AssignmentsTest do
 
   alias Tightbeam.{
     Assignments,
-    ConditionFacts,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
     Projection,
-    Roles,
     Rules,
     Wakes,
     WorkItems,
@@ -24,27 +18,7 @@ defmodule Tightbeam.AssignmentsTest do
     db = :"assignments_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Tightbeam.Escalation,
-          Tightbeam.EffortCheckin,
-          Tightbeam.Artifacts,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          Org,
-          Projection,
-          Roles,
-          Wakes,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(
@@ -456,38 +430,6 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'not inserted'")
   end
 
-  test "attest-era database gains nullable workItemId additively and idempotently" do
-    db = :"assignment_migration_db_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: db,
-      start: {DB, :start_link, [[path: ":memory:", name: db]]}
-    })
-
-    :ok = WorkItems.ensure_schema(db)
-
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE assignments (
-        id TEXT PRIMARY KEY, subject TEXT NOT NULL, holderKey TEXT NOT NULL,
-        holderRole TEXT NULL, holderFallback INTEGER NOT NULL DEFAULT 0,
-        openedByUser TEXT NULL, openedBySession TEXT NULL, openedAt INTEGER NOT NULL,
-        state TEXT NOT NULL DEFAULT 'open', outcome TEXT NULL, closedAt INTEGER NULL,
-        closedByUser TEXT NULL, closedBySession TEXT NULL, closingAttestId TEXT NULL
-      )
-      """)
-
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_old', 'old', 'holder', 'flynn', 1)"
-      )
-
-    :ok = Assignments.ensure_schema(db)
-    :ok = Assignments.ensure_schema(db)
-    assert [%{id: "asg_old", workItemId: nil}] = Assignments.list(db, %{state: "all"})
-  end
-
   test "assign captures review links and immutable holder family stamps", ctx do
     reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "producer"))
 
@@ -632,76 +574,6 @@ defmodule Tightbeam.AssignmentsTest do
     refute Enum.any?(after_get.assignments, &(&1.id == review.id))
     assert after_get == before_get
     assert ctx.db |> WorkState.item_detail(item.id) |> JSON.encode!() == before_snapshot
-  end
-
-  test "attests rebuild reaches the full checked shape from every prior version" do
-    for starting_shape <- [:bare, :check_tier, :partial_p3] do
-      db = :"attests_#{starting_shape}_#{System.unique_integer([:positive])}"
-
-      start_supervised!(%{
-        id: db,
-        start: {DB, :start_link, [[path: ":memory:", name: db]]}
-      })
-
-      :ok = DB.execute(db, migration_base_ddl())
-      :ok = DB.execute(db, prior_attests_ddl(starting_shape))
-
-      {:ok, _} =
-        DB.query(
-          db,
-          prior_attest_insert(starting_shape)
-        )
-
-      :ok = WorkItems.ensure_schema(db)
-      :ok = Assignments.ensure_schema(db)
-      :ok = Assignments.ensure_schema(db)
-
-      assert [%{id: "att_old"} = old] = Assignments.list_attests(db, "asg_old")
-      assert old.byHarness == nil
-      assert old.byProvider == nil
-      assert old.producer == nil
-      assert old.producerCommand == nil
-      assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
-
-      {:ok, [[sql]]} =
-        DB.query(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attests'")
-
-      for fragment <- [
-            "producer TEXT NULL",
-            "producerCommand TEXT NULL",
-            "byHarness TEXT NULL",
-            "byProvider TEXT NULL",
-            "CHECK(producer IS NULL OR kind = 'verdict')",
-            "CHECK(producerCommand IS NULL OR producer IS NOT NULL)",
-            "CHECK(byHarness IS NULL OR kind = 'verdict')",
-            "CHECK(byProvider IS NULL OR kind = 'verdict')",
-            "CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000)"
-          ] do
-        assert sql =~ fragment
-      end
-
-      for {id, columns, values} <- [
-            {"bad_producer", "producer", "'build'"},
-            {"bad_harness", "byHarness", "'claude'"},
-            {"bad_provider", "byProvider", "'anthropic'"}
-          ] do
-        assert {:error, %DB.Error{message: message}} =
-                 DB.query(
-                   db,
-                   "INSERT INTO attests (id, assignmentId, kind, note, bySession, #{columns}, ts) VALUES ('#{id}', 'asg_old', 'progress', NULL, 'holder', #{values}, 2)"
-                 )
-
-        assert message =~ "CHECK constraint"
-      end
-
-      assert {:error, %DB.Error{message: message}} =
-               DB.query(
-                 db,
-                 "INSERT INTO attests (id, assignmentId, kind, verdictKind, bySession, producerCommand, ts) VALUES ('bad_command', 'asg_old', 'verdict', 'tests-passed', 'holder', 'mix test', 2)"
-               )
-
-      assert message =~ "CHECK constraint"
-    end
   end
 
   test "declared files dedupe silently and overlap is transactionally serialized", ctx do
@@ -1307,78 +1179,6 @@ defmodule Tightbeam.AssignmentsTest do
   defp origin({:user, user}), do: "user:#{user}"
   defp origin({:process, process}), do: "process:#{process}"
   defp origin(nil), do: "agent:declared"
-
-  defp migration_base_ddl do
-    """
-    CREATE TABLE users (userId TEXT PRIMARY KEY);
-    CREATE TABLE sessions (
-      sessionKey TEXT PRIMARY KEY, harness TEXT NOT NULL, provider TEXT NOT NULL,
-      state TEXT NOT NULL
-    );
-    INSERT INTO users (userId) VALUES ('flynn');
-    INSERT INTO sessions (sessionKey, harness, provider, state)
-      VALUES ('holder', 'claude', 'anthropic', 'active');
-    CREATE TABLE assignments (
-      id TEXT PRIMARY KEY, subject TEXT NOT NULL, holderKey TEXT NOT NULL,
-      holderRole TEXT NULL, holderFallback INTEGER NOT NULL DEFAULT 0,
-      openedByUser TEXT NULL, openedBySession TEXT NULL, openedAt INTEGER NOT NULL,
-      state TEXT NOT NULL DEFAULT 'open', outcome TEXT NULL, closedAt INTEGER NULL,
-      closedByUser TEXT NULL, closedBySession TEXT NULL, closingAttestId TEXT NULL
-    );
-    INSERT INTO assignments
-      (id, subject, holderKey, openedByUser, openedAt, state)
-      VALUES ('asg_old', 'old', 'holder', 'flynn', 1, 'open')
-    """
-  end
-
-  defp prior_attests_ddl(:bare) do
-    """
-    CREATE TABLE attests (
-      id TEXT PRIMARY KEY, assignmentId TEXT NOT NULL REFERENCES assignments(id),
-      kind TEXT NOT NULL, note TEXT NULL,
-      bySession TEXT NULL REFERENCES sessions(sessionKey), ts INTEGER NOT NULL
-    )
-    """
-  end
-
-  defp prior_attests_ddl(:check_tier) do
-    """
-    CREATE TABLE attests (
-      id TEXT PRIMARY KEY, assignmentId TEXT NOT NULL REFERENCES assignments(id),
-      kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
-      verdictKind TEXT NULL, note TEXT NULL,
-      bySession TEXT NULL REFERENCES sessions(sessionKey),
-      byUser TEXT NULL REFERENCES users(userId), ts INTEGER NOT NULL
-    )
-    """
-  end
-
-  defp prior_attests_ddl(:partial_p3) do
-    """
-    CREATE TABLE attests (
-      id TEXT PRIMARY KEY, assignmentId TEXT NOT NULL REFERENCES assignments(id),
-      kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
-      verdictKind TEXT NULL, note TEXT NULL,
-      bySession TEXT NULL REFERENCES sessions(sessionKey),
-      byUser TEXT NULL REFERENCES users(userId), producer TEXT NULL,
-      producerCommand TEXT NULL, ts INTEGER NOT NULL,
-      CHECK(producer IS NULL OR kind = 'verdict'),
-      CHECK(producerCommand IS NULL OR producer IS NOT NULL)
-    )
-    """
-  end
-
-  defp prior_attest_insert(:bare) do
-    "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_old', 'asg_old', 'progress', 'old', 'holder', 1)"
-  end
-
-  defp prior_attest_insert(:check_tier) do
-    "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts) VALUES ('att_old', 'asg_old', 'progress', NULL, 'old', 'holder', NULL, 1)"
-  end
-
-  defp prior_attest_insert(:partial_p3) do
-    "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, ts) VALUES ('att_old', 'asg_old', 'progress', NULL, 'old', 'holder', NULL, NULL, NULL, 1)"
-  end
 
   defp session(db, key, owner, overrides \\ %{}) do
     input = %{

@@ -117,32 +117,9 @@ defmodule Tightbeam.Org do
       |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
 
     result = DB.execute(db, ddl)
-    # Additive migration for pre-placement databases (incl. TS-created ones,
-    # adopt-in-place): a DEFAULT'd column is invisible to writers that name
-    # their columns. Duplicate-column error means already migrated.
-    for ddl <- [
-          "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT 'local'",
-          "ALTER TABLE sessions ADD COLUMN clearedThroughSeq INTEGER NOT NULL DEFAULT 0",
-          "ALTER TABLE sessions ADD COLUMN overrides TEXT",
-          "ALTER TABLE sessions ADD COLUMN identityName TEXT",
-          "ALTER TABLE sessions ADD COLUMN identityRevision TEXT",
-          "ALTER TABLE sessions ADD COLUMN cliToken TEXT",
-          "ALTER TABLE sessions ADD COLUMN adjudicationHold TEXT",
-          "ALTER TABLE harness_pointers ADD COLUMN sourceSessionRef TEXT",
-          "ALTER TABLE harness_pointers ADD COLUMN harness TEXT",
-          "ALTER TABLE harness_pointers ADD COLUMN machine TEXT"
-        ] do
-      case DB.query(db, ddl) do
-        {:ok, _} -> :ok
-        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-      end
-    end
 
     {:ok, _} =
       DB.query(db, "CREATE UNIQUE INDEX IF NOT EXISTS sessions_cli_token ON sessions(cliToken)")
-
-    {:ok, _} =
-      DB.query(db, "UPDATE sessions SET identityName = archetype WHERE identityName IS NULL")
 
     :ok =
       DB.execute(
@@ -528,6 +505,142 @@ defmodule Tightbeam.Org do
     ])
 
     must_get(txn, session_key)
+  end
+
+  @doc "Repoint a retired session to another archetype and its base identity."
+  @spec repoint_retired_archetype(db(), String.t(), String.t()) ::
+          {:ok, session()} | {:error, :not_found | :not_retired}
+  def repoint_retired_archetype(db \\ Tightbeam.DB, session_key, archetype) do
+    case transaction!(db, fn txn ->
+           repoint_archetype_in_txn(txn, session_key, archetype, false)
+         end) do
+      {:error, :not_repointable} -> {:error, :not_retired}
+      result -> result
+    end
+  end
+
+  @doc false
+  @spec repoint_archetype_in_txn(Txn.t(), String.t(), String.t()) ::
+          {:ok, session()} | {:error, :not_found | :not_repointable}
+  def repoint_archetype_in_txn(%Txn{} = txn, session_key, archetype) do
+    repoint_archetype_in_txn(txn, session_key, archetype, true)
+  end
+
+  defp repoint_archetype_in_txn(txn, session_key, archetype, allow_permanent?) do
+    case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
+      [] ->
+        {:error, :not_found}
+
+      [row] ->
+        session = to_session(row)
+
+        if session.state == "retired" or
+             (allow_permanent? and (session.kind == "main" or session.is_built_in)) do
+          Txn.q(
+            txn,
+            """
+            UPDATE sessions
+            SET archetype = ?2, overrides = NULL, identityName = ?2,
+                identityRevision = NULL, updatedAt = ?3
+            WHERE sessionKey = ?1
+            """,
+            [session_key, archetype, now()]
+          )
+
+          {:ok, must_get(txn, session_key)}
+        else
+          {:error, :not_repointable}
+        end
+    end
+  end
+
+  @doc """
+  Serialize release of a set of archetype names with every durable reference.
+
+  Each enumerated reference carries the supported command sequence that clears
+  it. The enumeration and its remedies therefore cannot acquire separate case
+  lists. `release` runs inside the DB owner's transaction when no references
+  remain, fencing every session and setting writer behind the publication.
+  """
+  @spec release_archetypes(db(), [String.t()], (-> result)) ::
+          {:referenced, [map()]} | {:released, result}
+        when result: term()
+  def release_archetypes(db \\ Tightbeam.DB, archetypes, release) when is_function(release, 0) do
+    transaction!(db, fn txn ->
+      case archetype_references_in_txn(txn, archetypes) do
+        [] -> {:released, release.()}
+        references -> {:referenced, references}
+      end
+    end)
+  end
+
+  defp archetype_references_in_txn(txn, archetypes) do
+    placeholders = Enum.map_join(archetypes, ",", fn _ -> "?" end)
+
+    sessions =
+      if archetypes == [] do
+        []
+      else
+        txn
+        |> Txn.q(
+          select_session_sql() <>
+            " WHERE archetype IN (#{placeholders}) ORDER BY createdAt, sessionKey",
+          archetypes
+        )
+        |> Enum.map(&session_archetype_reference/1)
+      end
+
+    setting =
+      case Txn.q(txn, "SELECT value FROM org_settings WHERE key = 'default-archetype'") do
+        [[archetype]] ->
+          if archetype in archetypes do
+            [
+              %{
+                kind: "setting",
+                setting: "default-archetype",
+                archetype: archetype,
+                clear_commands: [
+                  %{
+                    verb: "config",
+                    params: %{action: "set", setting: "default-archetype", value: "default"}
+                  }
+                ]
+              }
+            ]
+          else
+            []
+          end
+
+        _ ->
+          []
+      end
+
+    sessions ++ setting
+  end
+
+  defp session_archetype_reference(row) do
+    session = to_session(row)
+
+    repoint = %{
+      verb: "identity-repoint",
+      session_key: session.session_key,
+      params: %{archetype: "default"}
+    }
+
+    clear_commands =
+      if session.state == "active" and session.kind != "main" and not session.is_built_in do
+        [%{verb: "retire", session_key: session.session_key, params: %{}}, repoint]
+      else
+        [repoint]
+      end
+
+    %{
+      kind: "session",
+      session_key: session.session_key,
+      state: session.state,
+      archetype: session.archetype,
+      clear_commands: clear_commands
+    }
   end
 
   @doc """

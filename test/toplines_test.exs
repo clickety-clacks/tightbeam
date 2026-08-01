@@ -23,25 +23,12 @@ defmodule Tightbeam.ToplinesTest do
   import Plug.Conn
 
   alias Tightbeam.{
-    Adjudication,
     Assignments,
     CausalEvents,
-    ConditionFacts,
-    CriticalLeases,
     DB,
-    Devices,
     Dispatch,
-    EffortCheckin,
-    Escalation,
-    EventLog,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
-    Roles,
-    SubagentMarkers,
     Toplines,
-    Wakes,
     WorkItems,
     WorkState
   }
@@ -69,27 +56,6 @@ defmodule Tightbeam.ToplinesTest do
   # turn every proof into a coverage proof.
   defp at(offset), do: @default_created + offset
 
-  @schemas [
-    CausalEvents,
-    Devices,
-    ConditionFacts,
-    Idempotency,
-    Ledger,
-    EventLog,
-    Escalation,
-    Wakes,
-    Projection,
-    Org,
-    CriticalLeases,
-    Roles,
-    WorkItems,
-    Assignments,
-    WorkState,
-    EffortCheckin,
-    Adjudication,
-    SubagentMarkers
-  ]
-
   setup do
     db = :"toplines_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -100,7 +66,7 @@ defmodule Tightbeam.ToplinesTest do
   # The twin-world proof needs a SECOND database standing up identically, so
   # schema and org setup live in one place rather than only in `setup`.
   defp prepare!(db) do
-    for module <- @schemas, do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok =
       DB.execute(

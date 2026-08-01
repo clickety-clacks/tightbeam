@@ -4,48 +4,22 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   alias Tightbeam.{
     Archetypes,
     Assignments,
-    ConditionFacts,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
+    Identity,
     Org,
-    Projection,
     RailRemedy,
     Roles,
     Rules,
-    Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   setup do
     db = :"refix_diagnosis_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Tightbeam.Artifacts,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          Org,
-          Projection,
-          Roles,
-          Wakes,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          RailRemedy,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(
@@ -64,12 +38,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       )
 
     assert :initialized = Archetypes.init_identity!(base_dir)
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
     archetypes = Archetypes.load!(base_dir)
-
-    File.cp!(
-      "priv/kungfu/agentic-engineering/rules/engineering.toml",
-      Path.join([base_dir, "identity", "rules", "engineering.toml"])
-    )
 
     handlers = Gateway.handlers(%{db: db})
 

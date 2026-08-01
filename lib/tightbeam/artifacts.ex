@@ -17,19 +17,6 @@ defmodule Tightbeam.Artifacts do
     labelled as such.
   - `none` — neither. `recordedMessageId` is NULL.
 
-  A row migrated from before this column existed also reads `none`, and keeps
-  whatever `recordedMessageId` the old writer stored — nothing is nulled to make
-  the shapes agree, because that would destroy a recorded id to tidy a label.
-
-  That leaves migrated rows only PARTLY distinguishable, and the limit is worth
-  stating rather than glossing. A migrated row with a non-NULL id is
-  recognisable: `none` never writes an id, so the pair cannot occur otherwise,
-  and the id it carries makes no evidence claim. A migrated row whose id was
-  already NULL — what the old writer stored on the path clause 14 describes — is
-  `(NULL, 'none')`, byte-identical to a fresh record where the substrate looked
-  and found nothing. Those two are NOT separable in this table, and no reader
-  should be written as though they were.
-
   NO CONSUMER MAY TREAT `session-concurrent` OR `none` AS EXACT TURN PROOF. A
   reader that needs the strongest available edge filters on
   `recordedTurnEvidence = 'tool-call-observed'` and reads even that as an
@@ -38,7 +25,6 @@ defmodule Tightbeam.Artifacts do
   """
 
   alias Tightbeam.{DB, TurnObservations}
-  alias Tightbeam.DB.Txn
 
   @outside_workspace "artifact origin is outside its session workspace"
 
@@ -77,20 +63,9 @@ defmodule Tightbeam.Artifacts do
   #{Enum.join(@index_ddl, ";\n")};
   """
 
-  @rebuild_ddl """
-  CREATE TABLE artifacts_new (
-  #{@table_definition}
-  )
-  """
-
   @doc "Create the artifact registry schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB) do
-    with :ok <- DB.execute(db, @ddl),
-         :ok <- ensure_table_shape(db) do
-      :ok
-    end
-  end
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc """
   Record a deliberate artifact pointer for the authenticated calling session.
@@ -370,112 +345,6 @@ defmodule Tightbeam.Artifacts do
   defp remove_workspace(workspace_path) do
     if File.exists?(workspace_path), do: File.rm_rf!(workspace_path)
     :ok
-  end
-
-  defp ensure_table_shape(db) do
-    {:ok, columns} = DB.query(db, "PRAGMA table_info(artifacts)")
-    {:ok, foreign_keys} = DB.query(db, "PRAGMA foreign_key_list(artifacts)")
-
-    {:ok, [[table_sql]]} =
-      DB.query(
-        db,
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'"
-      )
-
-    if target_shape?(columns, foreign_keys, table_sql),
-      do: :ok,
-      else: rebuild_table(db, Enum.any?(columns, &(Enum.at(&1, 1) == "recordedTurnEvidence")))
-  end
-
-  defp target_shape?(columns, foreign_keys, table_sql) do
-    column_shape =
-      Map.new(columns, fn row ->
-        {Enum.at(row, 1), {Enum.at(row, 2), Enum.at(row, 3)}}
-      end)
-
-    expected_foreign_keys =
-      MapSet.new([
-        {"createdBySession", "sessions", "sessionKey"},
-        {"workItemId", "work_items", "id"},
-        {"parentSession", "sessions", "sessionKey"},
-        {"recordedMessageId", "messages", "id"}
-      ])
-
-    actual_foreign_keys =
-      MapSet.new(foreign_keys, fn row ->
-        {Enum.at(row, 3), Enum.at(row, 2), Enum.at(row, 4)}
-      end)
-
-    normalized_sql = String.replace(table_sql, ~r/\s+/, "")
-
-    column_shape["createdBySession"] == {"TEXT", 1} and
-      column_shape["workItemId"] == {"TEXT", 1} and
-      column_shape["parentSession"] == {"TEXT", 0} and
-      column_shape["recordedMessageId"] == {"TEXT", 0} and
-      column_shape["recordedTurnEvidence"] == {"TEXT", 1} and
-      actual_foreign_keys == expected_foreign_keys and
-      String.contains?(
-        normalized_sql,
-        "CHECK((state='archived')=(homeISNOTNULL))"
-      ) and
-      String.contains?(
-        normalized_sql,
-        "CHECK(recordedTurnEvidenceIN('tool-call-observed','session-concurrent','none'))"
-      )
-  end
-
-  # Rename-rebuild, not additive ALTERs: `recordedMessageId` drops its NOT NULL,
-  # which SQLite cannot do in place. No other table carries an FK INTO artifacts,
-  # so the DROP + RENAME leaves no dangling reference behind; the four OUTBOUND
-  # edges are what `foreign_key_check` re-proves before the transaction commits.
-  #
-  # A source table without `recordedTurnEvidence` predates the column, so its
-  # rows land `none` — the substrate never looked at them, exactly as C1's
-  # pre-existing rows land `known = 0`. Their `recordedMessageId` is copied
-  # through unchanged, including the NULLs the old writer stored that the NOT
-  # NULL shape used to reject outright.
-  defp rebuild_table(db, evidence_column?) do
-    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-
-    evidence_source = if evidence_column?, do: "recordedTurnEvidence", else: "'none'"
-
-    try do
-      case DB.transaction(db, fn txn ->
-             Txn.exec(txn, @rebuild_ddl)
-
-             Txn.q(
-               txn,
-               """
-               INSERT INTO artifacts_new
-                 (artifactId, kind, title, description, createdBySession, workItemId,
-                  parentSession, originPath, contentSha256, recordedMessageId,
-                  recordedTurnEvidence, state, home, createdAt, updatedAt)
-               SELECT
-                 artifactId, kind, title, description, createdBySession, workItemId,
-                 parentSession, originPath, contentSha256, recordedMessageId,
-                 #{evidence_source}, state, home, createdAt, updatedAt
-               FROM artifacts
-               """
-             )
-
-             Txn.exec(txn, "DROP TABLE artifacts")
-             Txn.exec(txn, "ALTER TABLE artifacts_new RENAME TO artifacts")
-             Enum.each(@index_ddl, &Txn.exec(txn, &1))
-
-             case Txn.q(txn, "PRAGMA foreign_key_check(artifacts)") do
-               [] ->
-                 :ok
-
-               rows ->
-                 raise DB.Error, message: "artifact foreign key check failed: #{inspect(rows)}"
-             end
-           end) do
-        {:ok, :ok} -> :ok
-        {:error, error} -> {:error, error}
-      end
-    after
-      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    end
   end
 
   defp archive_workspace!(workspace_path, archive_root, session_key) do

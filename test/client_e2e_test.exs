@@ -24,13 +24,8 @@ defmodule Tightbeam.ClientE2ETest do
   alias Tightbeam.{
     ConnRegistry,
     DB,
-    Devices,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
     Rules
   }
 
@@ -1430,8 +1425,7 @@ defmodule Tightbeam.ClientE2ETest do
     db = :"client_e2e_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: Path.join(base_dir, "state.db"), name: db})
 
-    for module <- [Devices, EventLog, Idempotency, Ledger, Org, Projection],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     start_supervised!(%{
       id: :client_e2e_conn_registry,

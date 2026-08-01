@@ -46,34 +46,10 @@ defmodule Tightbeam.Adjudication do
   );
   CREATE INDEX IF NOT EXISTS adjudication_open_deadline
     ON adjudication_episodes (status, deadlineAt);
+  CREATE INDEX IF NOT EXISTS adjudication_episode_id ON adjudication_episodes (episodeId);
   """
 
-  def ensure_schema(db \\ DB) do
-    result = DB.execute(db, @ddl)
-
-    # Additive, nullable, never backfilled by the migration: a NULL cause is a
-    # LEGACY (or unclassified) hold and is never swept by an adapter heal.
-    for ddl <- [
-          "ALTER TABLE adjudication_episodes ADD COLUMN episodeId TEXT",
-          "ALTER TABLE adjudication_episodes ADD COLUMN cause TEXT",
-          "ALTER TABLE adjudication_episodes ADD COLUMN healToken TEXT",
-          "ALTER TABLE adjudication_episodes ADD COLUMN assignmentId TEXT",
-          "ALTER TABLE adjudication_episodes ADD COLUMN jobRef TEXT"
-        ] do
-      case DB.query(db, ddl) do
-        {:ok, _} -> :ok
-        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-      end
-    end
-
-    :ok =
-      DB.execute(
-        db,
-        "CREATE INDEX IF NOT EXISTS adjudication_episode_id ON adjudication_episodes (episodeId);"
-      )
-
-    result
-  end
+  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
   @doc "The pinned cause encoding for an adapter fault on `key`."
   @spec adapter_fault_cause(AdapterCoordinator.adapter_key()) :: String.t()

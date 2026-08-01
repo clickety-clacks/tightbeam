@@ -63,3 +63,12 @@ everyone downstream.
   recorded real responses (re-capture fixtures) or a live gate. Any lane that touches the
   adapter seam runs the LIVE feature_smoke matrix (both harnesses, fresh org) as part of its
   own gates — before merge, not after.
+
+## Report dirt, never accommodate it
+
+Code that meets unexpected state — a database in an unknown shape, a missing table, a
+file an older version wrote — must REFUSE LOUDLY and name what it found, never guess
+and repair. Probing live state to deduce its shape (try-and-catch-duplicate ALTERs,
+sniffing stored DDL, existence guards) is the tell; ~2,000 lines of exactly that were
+deleted 2026-08-01. If a shape must be known, stamp it at write time; a missing or
+unknown stamp is a refusal and a bug report, never an inference.

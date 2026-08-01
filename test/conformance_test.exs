@@ -13,31 +13,25 @@ defmodule Tightbeam.ConformanceSupport do
   import Tightbeam.TestCase, only: [catalog_reply: 1]
 
   alias Tightbeam.{
-    Adjudication,
     Archetypes,
     Assignments,
-    ConditionFacts,
     ConnRegistry,
     DB,
-    Devices,
     Dispatch,
     Escalation,
     EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     ModelCatalog,
     Org,
     Placement,
-    Projection,
     RailRemedy,
     Rails,
     Roles,
     Rules,
     Supervision,
     Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   @fixture_keys MapSet.new(
@@ -2732,28 +2726,7 @@ defmodule Tightbeam.ConformanceSupport do
     name = :"conformance_db_#{System.unique_integer([:positive])}"
     {:ok, pid} = DB.start_link(path: ":memory:", name: name)
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          Idempotency,
-          Projection,
-          Org,
-          Roles,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          Ledger,
-          ConditionFacts,
-          Wakes,
-          Supervision,
-          Adjudication,
-          Escalation,
-          RailRemedy,
-          Placement
-        ] do
-      :ok = module.ensure_schema(name)
-    end
+    :ok = Tightbeam.Schema.ensure_all(name)
 
     {name, pid}
   end
@@ -3561,7 +3534,7 @@ defmodule Tightbeam.ConformanceTest do
   test "C5 timeout evidence names the layer from the class, never from the duration" do
     db = :"c5_timeout_evidence_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
-    :ok = Tightbeam.EventLog.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     budget = 2_000
     ctx = %{db: db, timeout_ms: budget}

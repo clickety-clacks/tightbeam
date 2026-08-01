@@ -37,14 +37,7 @@ defmodule Tightbeam.SubagentMarkers do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
     harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
-    result = DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
-
-    case DB.query(db, "ALTER TABLE subagent_markers ADD COLUMN assignmentId TEXT") do
-      {:ok, _} -> :ok
-      {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-    end
-
-    result
+    DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
   end
 
   @doc "Append one canonical marker and nudge a matching wake after commit."

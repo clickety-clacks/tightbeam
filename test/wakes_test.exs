@@ -3,17 +3,13 @@ defmodule Tightbeam.WakesTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Wakes}
+  alias Tightbeam.{DB, EventLog, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     scheduler = :"wake_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
-    :ok = ConditionFacts.ensure_schema(name)
-    :ok = Wakes.ensure_schema(name)
-    # The undeliverable/failed paths record best-effort, which SWALLOWS a missing
-    # table — without this the lifecycle assertions below would pass vacuously.
-    :ok = EventLog.ensure_schema(name)
+    :ok = ensure_all_schemas(name)
     %{db: name, scheduler: scheduler}
   end
 

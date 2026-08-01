@@ -64,7 +64,6 @@ defmodule Tightbeam.Gateway do
     Archetypes,
     Artifacts,
     Assignments,
-    CausalEvents,
     ConditionFacts,
     CriticalLeases,
     Placement,
@@ -82,10 +81,10 @@ defmodule Tightbeam.Gateway do
     ModelCatalog,
     Org,
     Projection,
-    RailRemedy,
     Rails,
     Rules,
     Roles,
+    Schema,
     Spinup,
     SubagentMarkers,
     Supervision,
@@ -135,9 +134,9 @@ defmodule Tightbeam.Gateway do
 
   @doc """
   The wire/adapter children to append after Tightbeam.Application's base
-  children (see moduledoc order). Also: ensure schemas for Devices/
-  Idempotency/Wakes/Projection/Org, mint + persist the cliToken and
-  gateway.json (mode 0600) in base_dir, install the CLI bin.
+  children (see moduledoc order). Also: ensure the complete production schema,
+  mint + persist the cliToken and gateway.json (mode 0600) in base_dir, and
+  install the CLI bin.
   """
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
@@ -157,35 +156,7 @@ defmodule Tightbeam.Gateway do
 
     File.mkdir_p!(config.base_dir)
 
-    for module <- [
-          Tightbeam.Assets,
-          Artifacts,
-          CausalEvents,
-          Adjudication,
-          Devices,
-          Idempotency,
-          ConditionFacts,
-          SubagentMarkers,
-          Escalation,
-          Wakes,
-          Projection,
-          Org,
-          CriticalLeases,
-          Roles,
-          WorkItems,
-          Assignments,
-          EffortCheckin,
-          Placement,
-          RailRemedy,
-          Supervision,
-          WorkState
-        ] do
-      :ok = module.ensure_schema(db)
-    end
-
-    # One-time: a pre-DB hosts.json becomes rows and the file is renamed aside
-    # (host-registry-v1). Idempotent — the rename is what retires it.
-    :ok = Placement.migrate_registry!(db, config.base_dir)
+    :ok = Schema.ensure_all(db)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
@@ -196,28 +167,6 @@ defmodule Tightbeam.Gateway do
         db,
         Map.get(config, :adjudication_response_window_ms, 86_400_000)
       )
-
-    migrate_handle_roles(db)
-
-    # Sessions created before real-hostname registration stored the retired
-    # "local" indexical; rewrite once so rows speak the org's vocabulary.
-    {:ok, _} =
-      DB.query(db, "UPDATE sessions SET host = ?1 WHERE host = 'local'", [
-        Placement.local_host_name()
-      ])
-
-    {:ok, rows} =
-      DB.query(db, "SELECT sessionKey FROM sessions WHERE state = 'active' AND cliToken IS NULL")
-
-    Enum.each(rows, fn [session_key] ->
-      token = "tbs_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
-
-      {:ok, _} =
-        DB.query(db, "UPDATE sessions SET cliToken = ?2 WHERE sessionKey = ?1", [
-          session_key,
-          token
-        ])
-    end)
 
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
@@ -247,13 +196,11 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:on_retired, on_retired)
       |> handlers()
 
-    Rules.load!(config.base_dir, Map.keys(handler_table))
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
-    Archetypes.load!(config.base_dir)
-    Rails.load!(config.base_dir)
+    reload_law!(config, Map.keys(handler_table))
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -424,7 +371,7 @@ defmodule Tightbeam.Gateway do
         ssh: host.ssh,
         gate: fn _provider -> :ok end,
         stop: fn provider -> stop_provider_runtime(provider, machine) end,
-        park: fn provider -> park_provider_runtime(provider, machine) end,
+        park_edge: Tightbeam.CommandEdge.request_to(Tightbeam.AdapterCoordinator),
         start: fn provider, kind -> start_provider_runtime(provider, kind, machine) end,
         resume: fn _provider -> :ok end,
         capture_sessions: fn provider ->
@@ -734,7 +681,7 @@ defmodule Tightbeam.Gateway do
           end
         end),
       "update-clients" =>
-        fn _call ->
+        admin_handler(db, fn _params ->
           hosts =
             config.base_dir
             |> Placement.hosts(db)
@@ -742,19 +689,24 @@ defmodule Tightbeam.Gateway do
               {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
                 [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
 
-              {_name, %{ssh: nil}} ->
-                []
-            end)
-            |> Enum.sort_by(& &1.name)
+            {_name, %{ssh: nil}} ->
+              []
+          end)
+          |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
-        end,
+        end),
       "identity-edit" =>
         admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
       "identity-status" =>
         admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
       "identity-relearn" =>
         admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
+      "identity-repoint" =>
+        admin_call_handler(db, fn call -> identity_repoint_result(config, db, call) end),
+      "learn" => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
+      "unlearn" =>
+        admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
       "identity-apply" =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
       "kungfu-scaffold" =>
@@ -774,6 +726,11 @@ defmodule Tightbeam.Gateway do
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
       "config" => admin_handler(db, fn p -> config_result(db, p) end),
+      "harness-processes" =>
+        admin_handler(db, fn _params ->
+          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+          %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
+        end),
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -991,21 +948,12 @@ defmodule Tightbeam.Gateway do
           [] -> {assignment_id, nil}
         end
 
-      table?(txn, "work_items") ->
+      true ->
         case DB.Txn.q(txn, "SELECT id FROM work_items WHERE routingWakeId = ?1", [wake_id]) do
           [[job_ref]] -> {nil, job_ref}
           [] -> {nil, nil}
         end
-
-      true ->
-        {nil, nil}
     end
-  end
-
-  defp table?(txn, name) do
-    DB.Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name]) == [
-      [1]
-    ]
   end
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
@@ -1746,6 +1694,18 @@ defmodule Tightbeam.Gateway do
         {:error,
          "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
            "(host unreachable or adapter failing); see /version"}
+
+      {:error, {:parked, detail}} ->
+        {:error,
+         "adapter for #{session.harness} on host #{session.host} is being parked: #{detail}"}
+
+      {:error, {:park_fenced, detail}} ->
+        {:error,
+         "adapter for #{session.harness} on host #{session.host} remains fenced by an incomplete park: #{inspect(detail)}"}
+
+      {:error, reason} ->
+        {:error,
+         "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is unavailable: #{inspect(reason)}"}
     end
   end
 
@@ -1992,14 +1952,14 @@ defmodule Tightbeam.Gateway do
 
   defp identity_relearn_result(config, %{params: %{action: "resolve"}} = call) do
     revision = Identity.resolve_relearn!(config.base_dir, call.origin)
-    Archetypes.load!(config.base_dir)
+    reload_law!(config)
     %{state: "published", live_revision: revision}
   end
 
   defp identity_relearn_result(config, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, revision} ->
-        Archetypes.load!(config.base_dir)
+        reload_law!(config)
         %{state: "published", live_revision: revision}
 
       {:conflict, paths} ->
@@ -2017,6 +1977,195 @@ defmodule Tightbeam.Gateway do
           live_revision: Identity.live_revision!(config.base_dir)
         }
     end
+  end
+
+  defp identity_learn_result(config, call) do
+    case Identity.learn!(config.base_dir, call.params.name, call.origin) do
+      {:ok, revision} ->
+        reload_law!(config)
+        %{state: "published", kungfu: call.params.name, live_revision: revision}
+
+      {:noop, revision} ->
+        reload_law!(config)
+        %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
+
+      {:conflict, paths} ->
+        %{
+          state: "relearn-conflicted",
+          kungfu: call.params.name,
+          conflicting_paths: paths,
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
+
+      {:error, message} ->
+        %{
+          state: "learn-failed",
+          code: "learn_failed",
+          message: message,
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
+    end
+  end
+
+  defp identity_unlearn_result(config, db, call) do
+    name = call.params.name
+    archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
+
+    case Org.release_archetypes(db, archetypes, fn ->
+           revision = Identity.unlearn!(config.base_dir, name, call.origin)
+           # Reload before releasing the DB owner. Every reference writer rechecks
+           # the archetype inside that same owner, so a writer queued behind this
+           # publication cannot commit from a pre-unlearn validation snapshot.
+           reload_law!(config)
+           revision
+         end) do
+      {:referenced, references} ->
+        unlearn_referenced_result(name, references)
+
+      {:released, revision} ->
+        %{state: "published", kungfu: name, live_revision: revision}
+    end
+  end
+
+  defp unlearn_referenced_result(name, references) do
+    sessions = Enum.filter(references, &(&1.kind == "session"))
+    setting = Enum.find(references, &(&1.kind == "setting"))
+    session_names = Enum.map(sessions, & &1.session_key)
+
+    descriptions =
+      [
+        if(session_names != [], do: "sessions: #{Enum.join(session_names, ", ")}"),
+        if(setting, do: "default-archetype setting: #{setting.archetype}")
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    %{
+      state: "referenced",
+      code: "kungfu_referenced",
+      message: "cannot unlearn #{name}; #{Enum.join(descriptions, "; ")}",
+      sessions:
+        Enum.map(
+          sessions,
+          &%{session_key: &1.session_key, state: &1.state, archetype: &1.archetype}
+        ),
+      setting: setting && setting.archetype,
+      references: references
+    }
+  end
+
+  defp identity_repoint_result(config, db, call) do
+    archetype = call.params.archetype
+
+    result =
+      case Org.get(db, call.session_key) do
+        nil ->
+          {:error, :not_found}
+
+        %{state: "retired"} ->
+          repoint_session_record(db, call.session_key, archetype)
+
+        %{kind: "main"} = session ->
+          repoint_main_session(config, db, session, archetype)
+
+        %{is_built_in: true} = session ->
+          repoint_main_session(config, db, session, archetype)
+
+        _session ->
+          {:error, :not_repointable}
+      end
+
+    case result do
+      {:ok, session} ->
+        %{
+          state: "repointed",
+          session_key: session.session_key,
+          archetype: session.archetype
+        }
+
+      {:error, :unknown_archetype} ->
+        %{code: "unknown_archetype", message: "unknown archetype: #{archetype}"}
+
+      {:error, :not_found} ->
+        %{code: "not_found", message: "unknown session: #{call.session_key}"}
+
+      {:error, :not_repointable} ->
+        %{
+          code: "session_not_retired",
+          message: "session #{call.session_key} must be retired before archetype repoint"
+        }
+
+      {:error, :turn_in_progress} ->
+        turn_in_progress([call.session_key])
+
+      {:error, reason} ->
+        %{
+          code: "identity_repoint_failed",
+          message: "session #{call.session_key} could not change archetype: #{inspect(reason)}"
+        }
+    end
+  end
+
+  defp repoint_main_session(config, db, session, archetype) do
+    lane_manager = config[:lane_manager] || LaneManager
+    LaneManager.ensure_lane_quiet(lane_manager, session.session_key)
+
+    case Tightbeam.SessionLane.at_turn_boundary(session.session_key, fn ->
+           run_session_mutation(session.session_key, fn ->
+             current = Org.get(db, session.session_key)
+
+             with :ok <- close_repointed_main_session(config, db, current) do
+               repoint_session_record(db, session.session_key, archetype)
+             end
+           end)
+         end) do
+      {:ok, result} -> result
+      :busy -> {:error, :turn_in_progress}
+      :no_lane -> {:error, :turn_in_progress}
+    end
+  end
+
+  defp close_repointed_main_session(config, db, session) do
+    pointer = Org.current_pointer(db, session.session_key)
+
+    if pointer do
+      close_resident_main_session(config, session, pointer)
+    else
+      :ok
+    end
+  end
+
+  defp close_resident_main_session(config, session, pointer) do
+    coordinator = config[:adapter_coordinator] || AdapterCoordinator
+    harness = Harness.parse!(session.harness).id()
+
+    with {:ok, adapter, _generation} <-
+           AdapterCoordinator.adapter_for(coordinator, {harness, "shared", session.host}) do
+      case Adapter.knows_session?(adapter, pointer.harness_session_id) do
+        true -> Adapter.close_session(adapter, pointer.harness_session_id)
+        false -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp repoint_session_record(db, session_key, archetype) do
+    case DB.transaction(db, fn txn ->
+           if Archetypes.get(archetype) do
+             Org.repoint_archetype_in_txn(txn, session_key, archetype)
+           else
+             {:error, :unknown_archetype}
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp reload_law!(config, verbs \\ nil) do
+    verbs = verbs || config |> handlers() |> Map.keys()
+    Archetypes.load!(config.base_dir)
+    Rails.load!(config.base_dir)
+    Rules.load!(config.base_dir, verbs)
   end
 
   defp identity_status_result(config, db, call) do
@@ -2451,26 +2600,6 @@ defmodule Tightbeam.Gateway do
 
   defp resolve_caller(_db, _origin), do: nil
 
-  defp migrate_handle_roles(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT handle, sessionKey, ownerUserId
-        FROM sessions WHERE handle IS NOT NULL ORDER BY createdAt, sessionKey
-        """
-      )
-
-    Enum.each(rows, fn [handle, session_key, owner_user_id] ->
-      if is_nil(Roles.get(db, handle)) do
-        case Roles.migrate_handle(db, handle, owner_user_id, session_key) do
-          {:error, error} -> raise error.message
-          _role -> :ok
-        end
-      end
-    end)
-  end
-
   defp admin_origin?(db, origin) do
     case resolve_caller(db, origin) do
       %{owner_user_id: user_id} -> match?(%{is_admin: true}, Devices.user(db, user_id))
@@ -2490,13 +2619,21 @@ defmodule Tightbeam.Gateway do
          setting: "default-archetype",
          value: archetype_name
        }) do
-    case Archetypes.get(archetype_name) do
-      nil ->
+    case DB.transaction(db, fn txn ->
+           if Archetypes.get(archetype_name) do
+             Org.put_setting_in_txn(txn, "default-archetype", archetype_name)
+           else
+             {:error, :unknown_archetype}
+           end
+         end) do
+      {:ok, :ok} ->
+        %{setting: "default-archetype", value: archetype_name}
+
+      {:ok, {:error, :unknown_archetype}} ->
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
 
-      _archetype ->
-        :ok = Org.put_setting(db, "default-archetype", archetype_name)
-        %{setting: "default-archetype", value: archetype_name}
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -2928,25 +3065,29 @@ defmodule Tightbeam.Gateway do
                  p.idempotency_key
                ) do
             nil ->
-              session = Org.create_in_txn(txn, input)
+              if Archetypes.get(archetype.name) do
+                session = Org.create_in_txn(txn, input)
 
-              if p[:handle] do
-                Roles.create_in_txn!(
-                  txn,
-                  p.handle,
-                  caller.owner_user_id,
-                  session.session_key
-                )
+                if p[:handle] do
+                  Roles.create_in_txn!(
+                    txn,
+                    p.handle,
+                    caller.owner_user_id,
+                    session.session_key
+                  )
+                end
+
+                Idempotency.put_in_txn(txn, %{
+                  owner_user_id: caller.owner_user_id,
+                  operation: "spawn",
+                  idempotency_key: p.idempotency_key,
+                  session_key: session.session_key
+                })
+
+                {:created, session}
+              else
+                {:error, :unknown_archetype}
               end
-
-              Idempotency.put_in_txn(txn, %{
-                owner_user_id: caller.owner_user_id,
-                operation: "spawn",
-                idempotency_key: p.idempotency_key,
-                session_key: session.session_key
-              })
-
-              {:created, session}
 
             prior ->
               {:replayed, prior.session_key}
@@ -2954,6 +3095,9 @@ defmodule Tightbeam.Gateway do
         end)
 
       case session_result do
+        {:ok, {:error, :unknown_archetype}} ->
+          %{code: "unknown_archetype", message: "no such archetype: #{archetype.name}"}
+
         {:error, %Roles.TransactionError{error: error}} ->
           classified_denial("config_denied", error)
 
@@ -3546,27 +3690,19 @@ defmodule Tightbeam.Gateway do
   defp stop_provider_runtime(provider, machine) do
     provider
     |> harnesses_for_provider()
-    |> Enum.each(fn module ->
-      AdapterCoordinator.close_adapter(
-        Tightbeam.AdapterCoordinator,
-        {module.id(), "shared", machine}
-      )
+    |> Enum.reduce(:ok, fn module, result ->
+      close_result =
+        AdapterCoordinator.close_adapter(
+          Tightbeam.AdapterCoordinator,
+          {module.id(), "shared", machine}
+        )
+
+      case {result, close_result} do
+        {:ok, :ok} -> :ok
+        {:ok, {:error, _reason} = error} -> error
+        {{:error, _reason} = error, _later_result} -> error
+      end
     end)
-
-    :ok
-  end
-
-  defp park_provider_runtime(provider, machine) do
-    provider
-    |> harnesses_for_provider()
-    |> Enum.each(fn module ->
-      AdapterCoordinator.request_close_adapter(
-        Tightbeam.AdapterCoordinator,
-        {module.id(), "shared", machine}
-      )
-    end)
-
-    :ok
   end
 
   defp capture_credential_sessions(db, provider, machine) do
@@ -4502,6 +4638,16 @@ defmodule Tightbeam.Gateway do
 
           current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
 
+          {archetype, overrides, identity_name} =
+            if Archetypes.get(old.archetype) do
+              {old.archetype, old.overrides, old.identity_name}
+            else
+              # Unlearn may have published while this respawn was queued after
+              # snapshotting `old`. Resolve at the DB-owner boundary exactly as
+              # repoint does, leaving no reference to the removed identity.
+              {"default", nil, "default"}
+            end
+
           new_session =
             Org.create_in_txn(txn, %{
               session_key: new_session_key,
@@ -4510,9 +4656,9 @@ defmodule Tightbeam.Gateway do
               owner_user_id: old.owner_user_id,
               origin: old.origin,
               spawned_by: old.spawned_by,
-              archetype: old.archetype,
-              overrides: old.overrides,
-              identity_name: old.identity_name,
+              archetype: archetype,
+              overrides: overrides,
+              identity_name: identity_name,
               host: old.host,
               harness: harness,
               provider: provider,
@@ -5000,7 +5146,14 @@ defmodule Tightbeam.Gateway do
           )
         end)
       else
-        AdapterCoordinator.close_adapter(coordinator, key)
+        case AdapterCoordinator.close_adapter(coordinator, key) do
+          :ok ->
+            :ok
+
+          {:error, reason} = error ->
+            EventLog.lifecycle(db, "adapter_park_failed", inspect(key), inspect(reason))
+            error
+        end
       end
     end
   rescue

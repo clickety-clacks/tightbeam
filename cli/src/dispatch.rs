@@ -558,6 +558,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 .map(|value| vec![string_field("action", value)])
                 .unwrap_or_default(),
         )),
+        Command::IdentityRepoint {
+            identity,
+            session_key,
+            archetype,
+        } => Ok(request(
+            identity,
+            "identity-repoint",
+            vec![string_field("sessionKey", session_key)],
+            vec![string_field("archetype", archetype)],
+        )),
+        Command::Learn { identity, name } => Ok(request(
+            identity,
+            "learn",
+            vec![],
+            vec![string_field("name", name)],
+        )),
+        Command::Unlearn { identity, name } => Ok(request(
+            identity,
+            "unlearn",
+            vec![],
+            vec![string_field("name", name)],
+        )),
         Command::IdentityApply {
             identity,
             session_key,
@@ -600,6 +622,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("value", value),
             ],
         )),
+        Command::HarnessProcesses { identity } => {
+            Ok(request(identity, "harness-processes", vec![], vec![]))
+        }
     }
 }
 
@@ -653,8 +678,13 @@ pub fn build_register_host_request(
     )
 }
 
-pub fn build_update_clients_request(identity: &Identity) -> RequestSpec {
-    request(identity, "update-clients", vec![], vec![])
+pub fn build_update_clients_request(as_user: &str) -> RequestSpec {
+    request(
+        &Identity::User(as_user.to_owned()),
+        "update-clients",
+        vec![],
+        vec![],
+    )
 }
 
 pub fn discover() -> Result<Endpoint, String> {
@@ -973,7 +1003,7 @@ where
             unreachable!("help is handled before dispatch")
         }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
-        Command::UpdateClients { identity } => crate::ceremonies::update_clients(&identity),
+        Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::Onboard {
             identity,
@@ -1054,16 +1084,20 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityEdit { identity, .. }
         | Command::IdentityStatus { identity, .. }
         | Command::IdentityRelearn { identity, .. }
+        | Command::IdentityRepoint { identity, .. }
+        | Command::Learn { identity, .. }
+        | Command::Unlearn { identity, .. }
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
         | Command::ConfigGet { identity, .. }
-        | Command::ConfigSet { identity, .. } => Some(identity),
+        | Command::ConfigSet { identity, .. }
+        | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
         | Command::ToolCallObserved
+        | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
-        Command::UpdateClients { identity } => Some(identity),
     }
 }
 
@@ -1080,6 +1114,14 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn builds_harness_process_list_request() {
+        assert_eq!(
+            body(&["harness-process", "list", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"harness-processes","params":{}}"#
+        );
     }
 
     #[test]
@@ -1527,6 +1569,25 @@ mod tests {
             (
                 &["identity", "apply", "agent:coder:app", "--as-user", "flynn"][..],
                 r#"{"asUser":"flynn","verb":"identity-apply","params":{"all":false,"sessionKey":"agent:coder:app"}}"#,
+            ),
+            (
+                &[
+                    "identity",
+                    "repoint",
+                    "agent:retired",
+                    "default",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"identity-repoint","sessionKey":"agent:retired","params":{"archetype":"default"}}"#,
+            ),
+            (
+                &["learn", "agentic-engineering", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"learn","params":{"name":"agentic-engineering"}}"#,
+            ),
+            (
+                &["unlearn", "agentic-engineering", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"unlearn","params":{"name":"agentic-engineering"}}"#,
             ),
         ] {
             assert_eq!(body(args), expected);

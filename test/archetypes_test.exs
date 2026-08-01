@@ -14,7 +14,7 @@ defmodule Tightbeam.ArchetypesTest do
     %{base_dir: base_dir}
   end
 
-  test "learning seeds the served identity tree once", ctx do
+  test "initialization seeds only the neutral served identity tree once", ctx do
     assert Archetypes.init_identity!(ctx.base_dir) == :initialized
     identity_dir = Path.join(ctx.base_dir, "identity")
 
@@ -23,19 +23,14 @@ defmodule Tightbeam.ArchetypesTest do
       assert String.trim(oid) != ""
     end
 
-    for name <- [
-          "default",
-          "orchestrator",
-          "spec-writer",
-          "coder",
-          "reviewer",
-          "recon",
-          "product-owner"
-        ] do
-      assert File.regular?(Path.join([identity_dir, "archetypes", "#{name}.toml"]))
-    end
+    assert Path.wildcard(Path.join(identity_dir, "archetypes/*.toml")) ==
+             [Path.join(identity_dir, "archetypes/default.toml")]
 
     assert File.regular?(Path.join([identity_dir, "guidance", "operating-model.md"]))
+
+    assert Path.wildcard(Path.join(identity_dir, "guidance/*.md")) ==
+             [Path.join(identity_dir, "guidance/operating-model.md")]
+
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
   end
@@ -44,10 +39,18 @@ defmodule Tightbeam.ArchetypesTest do
     manual = Archetypes.builtin_fragments()["operating-manual.md"]
     assert manual =~ "shell tool"
     assert manual =~ "PATH"
+    assert Map.keys(Archetypes.builtin_fragments()) == ["operating-manual.md"]
+    refute manual =~ "--role reviewer"
+    refute manual =~ "--role coder"
+    refute manual =~ "worktree-session"
   end
 
   test "the shipped bundle loads role guidance and elected shared skills", ctx do
     Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
@@ -103,6 +106,10 @@ defmodule Tightbeam.ArchetypesTest do
   @tag timeout: 180_000
   test "one composer delivers operating guidance to every archetype for both harnesses", ctx do
     Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -110,6 +117,8 @@ defmodule Tightbeam.ArchetypesTest do
       guidance = Identity.snapshot_at!(ctx.base_dir, revision, name, harness).guidance
 
       assert guidance =~ "tightbeam identity edit <archetype>"
+      assert guidance =~ "tightbeam learn <bundle>"
+      assert guidance =~ "tightbeam unlearn <bundle>"
       assert guidance =~ "tightbeam identity relearn"
       assert guidance =~ "tightbeam identity status"
       assert guidance =~ "tightbeam identity apply"
@@ -130,6 +139,10 @@ defmodule Tightbeam.ArchetypesTest do
   @tag timeout: 180_000
   test "every archetype's served snapshot carries the operating manual", ctx do
     Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
 

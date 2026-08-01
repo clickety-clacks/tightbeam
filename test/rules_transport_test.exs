@@ -4,7 +4,7 @@ defmodule Tightbeam.RulesTransportTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, EventLog, Org, Projection, Roles, Rules}
+  alias Tightbeam.{ConnRegistry, DB, Devices, EventLog, Org, Roles, Rules}
   alias Tightbeam.Wire.{Router, Socket}
 
   setup do
@@ -12,7 +12,7 @@ defmodule Tightbeam.RulesTransportTest do
     registry = :"rules_transport_registry_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: registry})
-    for module <- [Devices, EventLog, Org, Projection, Roles], do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     {:ok, _} = DB.query(db, "CREATE TABLE domain_mutations (transport TEXT NOT NULL)")
 
     base_dir =

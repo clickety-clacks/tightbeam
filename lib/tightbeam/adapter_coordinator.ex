@@ -54,7 +54,9 @@ defmodule Tightbeam.AdapterCoordinator do
   @type adapter_key :: Tightbeam.Placement.adapter_key()
 
   @typedoc "What a lane needs to run a turn: the adapter pid and the generation it belongs to."
-  @type checkout :: {:ok, pid(), generation :: pos_integer()} | {:error, :degraded}
+  @type checkout ::
+          {:ok, pid(), generation :: pos_integer()}
+          | {:error, term()}
 
   @doc """
   Start the coordinator. Opts: `:adapter_sup` (the DynamicSupervisor),
@@ -111,6 +113,10 @@ defmodule Tightbeam.AdapterCoordinator do
   def health(server \\ __MODULE__) do
     GenServer.call(server, :health)
   end
+
+  @doc "Durable launch ledger for operator diagnosis, newest launch first."
+  @spec harness_processes(GenServer.server()) :: [Tightbeam.HarnessProcess.row()]
+  def harness_processes(server \\ __MODULE__), do: GenServer.call(server, :harness_processes)
 
   @typedoc "Heal token: epoch-first, then generation (see the moduledoc)."
   @type heal_token :: {pos_integer(), non_neg_integer()}
@@ -176,9 +182,9 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   @doc """
-  The epoch counter's table. Created by the coordinator itself at init rather
-  than by the org schema sweep, because the coordinator is also started directly
-  (tests, tooling) and its epoch must be durable in every case.
+  The epoch counter's table. Created by the canonical schema bootstrap and
+  re-ensured by the coordinator itself because the coordinator is also started
+  directly (tests, tooling) and its epoch must be durable in every case.
   """
   @spec ensure_schema(GenServer.server()) :: :ok | {:error, term()}
   def ensure_schema(db) do
@@ -214,13 +220,11 @@ defmodule Tightbeam.AdapterCoordinator do
   Bumps the generation: the successor's ready token must outrank every token
   stamped against the closed process, exactly as after a crash.
   """
-  @spec close_adapter(GenServer.server(), adapter_key()) :: :ok
+  @spec close_adapter(GenServer.server(), adapter_key()) :: :ok | {:error, term()}
   def close_adapter(server \\ __MODULE__, key) do
-    GenServer.call(server, {:close_adapter, key})
-  rescue
-    _reason -> :ok
+    GenServer.call(server, {:close_adapter, key}, 30_000)
   catch
-    :exit, _reason -> :ok
+    :exit, reason -> {:error, {:coordinator_unavailable, reason}}
   end
 
   @doc """
@@ -236,16 +240,21 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def init(opts) do
+    db = Keyword.get(opts, :db, Tightbeam.DB)
+    :ok = Tightbeam.HarnessProcess.ensure_schema(db)
+    :ok = Tightbeam.HarnessProcess.reconcile(db)
+
     {:ok,
      %{
        adapter_sup: Keyword.fetch!(opts, :adapter_sup),
        adapter_context: Keyword.fetch!(opts, :adapter_context),
        adapter_opts: Keyword.fetch!(opts, :adapter_opts),
-       db: Keyword.get(opts, :db, Tightbeam.DB),
+       db: db,
+       park_grace_ms: Keyword.get(opts, :park_grace_ms, 10_000),
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
        load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
        failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
-       epoch: mint_epoch(Keyword.get(opts, :db, Tightbeam.DB)),
+       epoch: mint_epoch(db),
        on_adapter_ready: Keyword.get(opts, :on_adapter_ready, fn _key_name, _token -> :ok end),
        adapters: %{},
        monitors: %{},
@@ -260,11 +269,14 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
-      entry.circuit == :open ->
-        {:reply, {:error, :degraded}, state}
-
       live_entry?(entry) ->
         {:reply, checkout(entry), state}
+
+      Tightbeam.HarnessProcess.fenced?(state.db, key) ->
+        {:reply, {:error, {:park_fenced, key_name(key)}}, state}
+
+      entry.circuit == :open ->
+        {:reply, {:error, :degraded}, state}
 
       true ->
         {:noreply, capture_adapter_context(key, {:checkout, from}, state)}
@@ -323,24 +335,55 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, health, state}
   end
 
+  def handle_call(:harness_processes, _from, state) do
+    {:reply, Tightbeam.HarnessProcess.list(state.db), state}
+  end
+
+  def handle_call(
+        {:tightbeam_command, %Tightbeam.CommandEdge.CredentialPark{} = command},
+        _from,
+        state
+      ) do
+    command = Tightbeam.CommandEdge.validate_command!(command)
+
+    {result, state} =
+      Enum.reduce_while(command.adapter_keys, {:ok, state}, fn key, {:ok, state} ->
+        case do_close_adapter(key, state) do
+          {:ok, state} -> {:cont, {:ok, state}}
+          {{:error, _reason} = error, state} -> {:halt, {error, state}}
+        end
+      end)
+
+    {:reply, result, state}
+  end
+
   def handle_call({:close_adapter, key}, _from, state) do
-    {:reply, :ok, do_close_adapter(key, state)}
+    {result, state} = do_close_adapter(key, state)
+    {:reply, result, state}
   end
 
   defp adapter_for_reply(key, context, state, authoritative? \\ false) do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
-      entry.circuit == :open ->
-        {:reply, {:error, :degraded}, state}
-
       live_entry?(entry) and authoritative? and entry.context != normalize_context(context) ->
-        state = do_close_adapter(key, state)
-        {reply, state} = start_adapter(key, state.adapters[key], state, context)
-        {:reply, reply, state}
+        case do_close_adapter(key, state) do
+          {:ok, state} ->
+            {reply, state} = start_adapter(key, state.adapters[key], state, context)
+            {:reply, reply, state}
+
+          {{:error, _reason} = error, state} ->
+            {:reply, error, state}
+        end
 
       live_entry?(entry) ->
         {:reply, checkout(entry), state}
+
+      Tightbeam.HarnessProcess.fenced?(state.db, key) ->
+        {:reply, {:error, {:park_fenced, key_name(key)}}, state}
+
+      entry.circuit == :open ->
+        {:reply, {:error, :degraded}, state}
 
       true ->
         {reply, state} = start_adapter(key, entry, state, context)
@@ -350,7 +393,8 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def handle_cast({:close_adapter, key}, state) do
-    {:noreply, do_close_adapter(key, state)}
+    {_result, state} = do_close_adapter(key, state)
+    {:noreply, state}
   end
 
   def handle_cast({:release_load_slot, machine, slot}, state) do
@@ -358,36 +402,89 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp do_close_adapter(key, state) do
+    {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
+    state = cancel_pending_starts(key, state)
+
+    exited? =
+      case state.adapters[key] do
+        %{pid: pid, monitor: monitor} when is_pid(pid) and is_reference(monitor) ->
+          Tightbeam.Acp.Adapter.request_close(pid)
+          await_adapter_exit(monitor, pid, state.park_grace_ms)
+
+        %{pid: pid} when is_pid(pid) ->
+          Tightbeam.Acp.Adapter.request_close(pid)
+          false
+
+        _ ->
+          false
+      end
+
+    reconcile_result =
+      case process_row do
+        :no_launch -> :ok
+        _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+        row -> Tightbeam.HarnessProcess.park(state.db, row)
+      end
+
+    result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result
+    state = retire_adapter(key, state)
+    if result == :ok, do: Tightbeam.HarnessProcess.complete_park(state.db, key)
+
+    {result, state}
+  end
+
+  defp await_adapter_exit(monitor, pid, grace_ms) do
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> true
+    after
+      grace_ms -> false
+    end
+  end
+
+  defp cancel_pending_starts(key, state) do
+    requests =
+      Enum.reduce(state.context_requests, state.context_requests, fn
+        {request_ref, %{key: ^key, monitor: monitor, purpose: {:checkout, from}}}, requests ->
+          Process.demonitor(monitor, [:flush])
+          GenServer.reply(from, {:error, {:parked, key_name(key)}})
+          Map.delete(requests, request_ref)
+
+        {request_ref, %{key: ^key, monitor: monitor}}, requests ->
+          Process.demonitor(monitor, [:flush])
+          Map.delete(requests, request_ref)
+
+        _, requests ->
+          requests
+      end)
+
+    state = %{state | context_requests: requests}
+
     case state.adapters[key] do
-      %{pid: pid, monitor: ref} = entry when is_pid(pid) ->
-        Process.demonitor(ref, [:flush])
+      %{timer: timer} = entry ->
+        if is_reference(timer), do: Process.cancel_timer(timer)
+        put_in(state.adapters[key], %{entry | timer: nil, generation: entry.generation + 1})
 
-        try do
-          conn = Tightbeam.Acp.Adapter.conn(pid)
-          Tightbeam.Acp.Conn.close(conn)
-          GenServer.stop(conn)
-          GenServer.stop(pid)
-        catch
-          :exit, _reason -> :ok
-        end
+      _ ->
+        state
+    end
+  end
 
-        # A planned teardown IS a death in the token algebra: without the bump,
-        # the successor's ready re-mints the SAME {epoch, generation} token, and
-        # a session re-held on that token (a credential stop/start landing in
-        # its retry window) would never be swept (spec s4-operability-v1 §2).
-        entry = %{
-          entry
-          | pid: nil,
-            monitor: nil,
-            ready: false,
-            generation: entry.generation + 1,
-            context: nil
-        }
+  defp retire_adapter(key, state) do
+    case state.adapters[key] do
+      %{pid: pid, monitor: monitor} = entry ->
+        if is_reference(monitor), do: Process.demonitor(monitor, [:flush])
+        if is_pid(pid) and Process.alive?(pid), do: Process.exit(pid, :kill)
+
+        entry = %{entry | pid: nil, monitor: nil, ready: false, context: nil, timer: nil}
 
         %{
           state
           | adapters: Map.put(state.adapters, key, entry),
-            monitors: Map.delete(state.monitors, ref)
+            monitors:
+              if(is_reference(monitor),
+                do: Map.delete(state.monitors, monitor),
+                else: state.monitors
+              )
         }
 
       _ ->
@@ -422,14 +519,34 @@ defmodule Tightbeam.AdapterCoordinator do
           :ok =
             Tightbeam.EventLog.lifecycle(state.db, "adapter_down", key_name(key), inspect(reason))
 
+          case Tightbeam.HarnessProcess.reconcile_key(state.db, key) do
+            :ok ->
+              :ok
+
+            :already_resolved ->
+              :ok
+
+            {:error, reconcile_reason} ->
+              :ok =
+                Tightbeam.EventLog.lifecycle(
+                  state.db,
+                  "adapter_reconcile_failed",
+                  key_name(key),
+                  inspect(reconcile_reason)
+                )
+          end
+
           failures = entry.failures + 1
+
           circuit = if failures >= state.failure_circuit, do: :open, else: :closed
+
           # The death belongs to the generation that DIED, not to the bumped one
           # the replacement will carry — that is the generation a turn holding
           # this adapter checked out, and the only one it can ask about.
           died_at = entry.generation
           generation = entry.generation + 1
           delay = backoff(state, failures)
+
           timer = Process.send_after(self(), {:restart_adapter, key, generation}, delay)
 
           entry = %{
@@ -478,7 +595,12 @@ defmodule Tightbeam.AdapterCoordinator do
     case state.adapters[key] do
       %{generation: ^generation, pid: nil} = entry ->
         state = put_in(state.adapters[key], %{entry | timer: nil})
-        {:noreply, capture_adapter_context(key, {:restart, generation}, state)}
+
+        if Tightbeam.HarnessProcess.fenced?(state.db, key) do
+          {:noreply, state}
+        else
+          {:noreply, capture_adapter_context(key, {:restart, generation}, state)}
+        end
 
       _ ->
         {:noreply, state}
@@ -498,6 +620,14 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp start_adapter(key, entry, state, context) do
+    if Tightbeam.HarnessProcess.fenced?(state.db, key) do
+      {{:error, {:park_fenced, key_name(key)}}, state}
+    else
+      start_adapter_unfenced(key, entry, state, context)
+    end
+  end
+
+  defp start_adapter_unfenced(key, entry, state, context) do
     # Context is resolved before Adapter boot. Generic reads arrive from a
     # monitored worker; credential-lifecycle starts supply their known context.
     adapter_context = context
@@ -510,8 +640,16 @@ defmodule Tightbeam.AdapterCoordinator do
     coordinator = self()
 
     boot = fn ->
-      adapter_opts.(key, adapter_context) ++
-        [on_ready: fn -> send(coordinator, {:adapter_ready, key}) end]
+      opts = adapter_opts.(key, adapter_context) |> Keyword.put(:db, state.db)
+
+      opts =
+        if Keyword.has_key?(opts, :process_identity_dir) do
+          Tightbeam.HarnessProcess.prepare_launch(opts, state.db, key)
+        else
+          opts
+        end
+
+      Keyword.put(opts, :on_ready, fn -> send(coordinator, {:adapter_ready, key}) end)
     end
 
     child = %{
@@ -627,8 +765,12 @@ defmodule Tightbeam.AdapterCoordinator do
        ) do
     case state.adapters[key] do
       %{generation: ^generation, pid: nil} = entry ->
-        {_reply, state} = start_adapter(key, entry, state, context)
-        state
+        if Tightbeam.HarnessProcess.fenced?(state.db, key) do
+          state
+        else
+          {_reply, state} = start_adapter(key, entry, state, context)
+          state
+        end
 
       _ ->
         state
@@ -642,15 +784,20 @@ defmodule Tightbeam.AdapterCoordinator do
        ) do
     case state.adapters[key] do
       %{generation: ^generation, pid: nil} = entry ->
-        timer = Process.send_after(self(), {:restart_adapter, key, generation}, backoff(state, 1))
+        if Tightbeam.HarnessProcess.fenced?(state.db, key) do
+          state
+        else
+          timer =
+            Process.send_after(self(), {:restart_adapter, key, generation}, backoff(state, 1))
 
-        entry = %{
-          entry
-          | timer: timer,
-            last_failure: {generation, {:adapter_context_failed, reason}}
-        }
+          entry = %{
+            entry
+            | timer: timer,
+              last_failure: {generation, {:adapter_context_failed, reason}}
+          }
 
-        put_in(state.adapters[key], entry)
+          put_in(state.adapters[key], entry)
+        end
 
       _ ->
         state

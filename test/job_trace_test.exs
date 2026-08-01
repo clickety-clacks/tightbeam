@@ -3,17 +3,8 @@ defmodule Tightbeam.JobTraceTest do
 
   alias Tightbeam.{
     Assignments,
-    ConditionFacts,
     DB,
-    Devices,
-    Escalation,
-    EventLog,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
-    Roles,
-    Wakes,
     WorkItems
   }
 
@@ -21,24 +12,7 @@ defmodule Tightbeam.JobTraceTest do
     db = :"job_trace_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          EventLog,
-          Escalation,
-          Wakes,
-          Projection,
-          Org,
-          Roles,
-          WorkItems,
-          Assignments,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok =
       DB.execute(
