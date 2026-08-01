@@ -32,9 +32,14 @@ defmodule Tightbeam.Acp.Adapter do
   @gate_raw_log_limit 4_096
   @strict_model_call_timeout 30_000
   # Once Conn receives a response, only two local BEAM replies remain
-  # (Conn -> Adapter -> caller). Reserve 100ms for those mailbox hops so an
-  # operation timeout still reaches the caller as a structured error.
-  @strict_model_reply_margin 100
+  # (Conn -> Adapter -> caller). Those hops take microseconds when idle, but the
+  # margin must hold on a loaded scheduler where mailbox residence is real time:
+  # with a thin margin, an operation that times out right at its deadline loses
+  # the race and the caller exits instead of receiving the structured error --
+  # the exact defect this deadline exists to prevent. 2s buys that guarantee and
+  # costs only responses arriving in the final 2s of a 30s budget, which no
+  # working harness produces.
+  @strict_model_reply_margin 2_000
   @strict_model_operation_timeout @strict_model_call_timeout - @strict_model_reply_margin
   @strict_model_request_floor 1
 

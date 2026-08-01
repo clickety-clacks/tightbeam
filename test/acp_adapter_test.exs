@@ -152,7 +152,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "slow-apply-before-strict" &&
             m.params.configId === "model" &&
             m.params.value === "gpt-blocking") {
-          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 25100);
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 28600);
         }
         if (failMode === "slow-apply-before-strict" &&
             m.params.configId === "model" &&
@@ -825,10 +825,13 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, "gpt-new"} = Adapter.current_model(adapter, "sess-1")
   end
 
-  # FAIL-BEFORE: strict_apply/4 used to start its 25s deadline only after this
-  # preceding 25.1s request released the shared Adapter. Its fresh request then
-  # outlived the caller's 30s GenServer.call budget, so the caller exited instead
-  # of receiving the structured transport failure.
+  # FAIL-BEFORE: strict_apply/4 used to start its deadline only after the
+  # preceding blocked request released the shared Adapter, so queue time was
+  # free and its fresh request outlived the caller's 30s GenServer.call budget.
+  # The 28.6s blocker exceeds the derived operation deadline (30s call budget
+  # minus the 2s reply margin), so a correctly caller-stamped budget is
+  # exhausted at dequeue: nothing may be dispatched, and the structured error
+  # must still beat the caller's exit.
   @tag timeout: 40_000
   test "strict apply queue time spends the caller-owned operation budget" do
     {adapter, capture_path} =
