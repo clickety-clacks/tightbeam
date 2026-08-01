@@ -76,10 +76,84 @@ fn parse(encoded: &str) -> Result<HarnessCatalog, String> {
     Ok(HarnessCatalog { harnesses })
 }
 
+pub fn local_registry() -> Result<HarnessCatalog, String> {
+    parse(include_str!("../../priv/harness_registry.json"))
+}
+
+pub(crate) enum DoctorCatalog {
+    Live(HarnessCatalog),
+    Offline {
+        catalog: HarnessCatalog,
+        reason: String,
+    },
+    GatewayError(String),
+}
+
+pub(crate) fn load_for_doctor(base_dir: &Path) -> DoctorCatalog {
+    let cached = cached_catalog(base_dir);
+    let endpoint = match dispatch::discover_from(base_dir) {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            return offline_doctor_catalog(cached, unavailable(&reason));
+        }
+    };
+
+    match load_endpoint_for_doctor(&endpoint) {
+        Ok(live) => DoctorCatalog::Live(cached.unwrap_or(live)),
+        Err(DoctorLoadError::Offline(reason)) => offline_doctor_catalog(cached, reason),
+        Err(DoctorLoadError::Gateway(_reason)) if cached.is_some() => {
+            DoctorCatalog::Live(cached.expect("checked above"))
+        }
+        Err(DoctorLoadError::Gateway(reason)) => DoctorCatalog::GatewayError(reason),
+    }
+}
+
+fn cached_catalog(base_dir: &Path) -> Option<HarnessCatalog> {
+    fs::read_to_string(base_dir.join("harnesses.json"))
+        .ok()
+        .and_then(|encoded| parse(&encoded).ok())
+}
+
+fn offline_doctor_catalog(cached: Option<HarnessCatalog>, reason: String) -> DoctorCatalog {
+    match cached.map(Ok).unwrap_or_else(local_registry) {
+        Ok(catalog) => DoctorCatalog::Offline { catalog, reason },
+        Err(local_reason) => DoctorCatalog::GatewayError(format!(
+            "{reason}; local harness registry is invalid: {local_reason}"
+        )),
+    }
+}
+
+enum DoctorLoadError {
+    Offline(String),
+    Gateway(String),
+}
+
+fn load_endpoint_for_doctor(
+    endpoint: &dispatch::Endpoint,
+) -> Result<HarnessCatalog, DoctorLoadError> {
+    let response = match dispatch::gateway_request("GET", endpoint, "/harnesses", None).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Transport(error)) => {
+            return Err(DoctorLoadError::Offline(unavailable(&error.to_string())));
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let encoded = response
+                .into_string()
+                .unwrap_or_else(|_| format!("HTTP {status}"));
+            return Err(DoctorLoadError::Gateway(unavailable(&encoded)));
+        }
+    };
+    let encoded = response
+        .into_string()
+        .map_err(|error| DoctorLoadError::Gateway(unavailable(&error.to_string())))?;
+    parse(&encoded).map_err(|reason| DoctorLoadError::Gateway(unavailable(&reason)))
+}
+
 pub fn load() -> Result<HarnessCatalog, String> {
     load_from_with(&home_dir(), load_from_default_route)
 }
 
+#[cfg(test)]
 pub fn load_from(base_dir: &Path) -> Result<HarnessCatalog, String> {
     load_from_with(base_dir, || load_from_route(base_dir))
 }
@@ -101,6 +175,7 @@ fn load_from_with(
     fallback()
 }
 
+#[cfg(test)]
 fn load_from_route(base_dir: &Path) -> Result<HarnessCatalog, String> {
     let endpoint = dispatch::discover_from(base_dir).map_err(|reason| unavailable(&reason))?;
     load_endpoint(&endpoint)
@@ -226,6 +301,34 @@ mod tests {
         assert_eq!(catalog.harnesses[0].install_package, "pkg");
         assert_eq!(catalog.harnesses[0].cli_binary, "third-cli");
         assert_eq!(catalog.harnesses[0].process_markers, vec!["marker"]);
+    }
+
+    #[test]
+    fn shipped_local_registry_is_available_before_any_gateway_boot() {
+        let catalog = local_registry().unwrap();
+        assert_eq!(catalog.names(), vec!["claude", "codex"]);
+        assert_eq!(catalog.harnesses[0].cli_binary, "claude");
+        assert_eq!(catalog.harnesses[1].cli_binary, "codex");
+    }
+
+    #[test]
+    fn doctor_uses_the_local_registry_when_no_gateway_has_ever_run() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-doctor-no-gateway-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        match load_for_doctor(&root) {
+            DoctorCatalog::Offline { catalog, .. } => {
+                assert_eq!(catalog.names(), vec!["claude", "codex"]);
+            }
+            _ => panic!("an absent gateway must use the shipped local registry"),
+        }
+
+        assert!(!root.exists());
     }
 
     /// A projection with no `cli_binary` is rejected rather than treated as a harness

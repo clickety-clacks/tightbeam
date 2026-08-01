@@ -2,6 +2,14 @@ defmodule Tightbeam.Harness do
   @bundle_path Application.app_dir(:tightbeam, "priv/harness_bundle.json")
   @external_resource @bundle_path
   @bundle @bundle_path |> File.read!() |> JSON.decode!()
+  @registry_path Application.app_dir(:tightbeam, "priv/harness_registry.json")
+  @external_resource @registry_path
+  @production_registry @registry_path
+                       |> File.read!()
+                       |> JSON.decode!()
+                       |> Enum.map(fn row ->
+                         row["module"] |> String.split(".") |> Module.concat()
+                       end)
   @bundle_checklist Enum.map_join(@bundle["obligations"], "\n", fn obligation ->
                       "- `#{obligation["id"]}` — #{obligation["title"]}: " <>
                         obligation["description"]
@@ -18,7 +26,7 @@ defmodule Tightbeam.Harness do
   #{@bundle_checklist}
   """
 
-  alias Tightbeam.Harness.{Claude, Codex, Fixture}
+  alias Tightbeam.Harness.Fixture
 
   @type target :: map()
   @type launch_plan :: keyword()
@@ -69,7 +77,7 @@ defmodule Tightbeam.Harness do
               ]
             }
 
-  @registry [Claude, Codex] ++
+  @registry @production_registry ++
               if(Application.compile_env(:tightbeam, :fixture_harness, false),
                 do: [Fixture],
                 else: []

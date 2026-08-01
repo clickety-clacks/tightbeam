@@ -1,0 +1,18 @@
+[
+  {
+    "module": "Tightbeam.Harness.Claude",
+    "id": "claude",
+    "wire_name": "claude",
+    "install_package": "@agentclientprotocol/claude-agent-acp",
+    "cli_binary": "claude",
+    "process_markers": ["claude-agent-acp"]
+  },
+  {
+    "module": "Tightbeam.Harness.Codex",
+    "id": "codex",
+    "wire_name": "codex",
+    "install_package": "@agentclientprotocol/codex-acp",
+    "cli_binary": "codex",
+    "process_markers": ["codex-acp"]
+  }
+]

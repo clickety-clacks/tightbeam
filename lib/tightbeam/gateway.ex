@@ -347,12 +347,22 @@ defmodule Tightbeam.Gateway do
       ]
   end
 
-  @doc "Refuse an unusable harness or identity before the production store is created."
+  @doc "Check harness and identity readiness before the production store is created."
+  @spec preflight(config()) :: :ok | {:error, {:no_harness_cli, String.t()}}
+  def preflight(config) do
+    with :ok <- harness_binary_readiness(Path.join(config.base_dir, "bin")) do
+      Identity.init!(config.base_dir)
+      :ok
+    end
+  end
+
+  @doc "Raise for every preflight refusal; used by callers that require bang semantics."
   @spec preflight!(config()) :: :ok
   def preflight!(config) do
-    assert_harness_binary_ready!(Path.join(config.base_dir, "bin"))
-    Identity.init!(config.base_dir)
-    :ok
+    case preflight(config) do
+      :ok -> :ok
+      {:error, {:no_harness_cli, message}} -> raise message
+    end
   end
 
   defp credential_children(config, db) do
@@ -489,25 +499,38 @@ defmodule Tightbeam.Gateway do
     end)
   end
 
-  defp assert_harness_binary_ready!(cli_bin) do
+  defp harness_binary_readiness(cli_bin) do
     results =
       Enum.map(Harness.all(), fn module ->
         {module.id(), Placement.harness_binary_probe(module.id(), cli_bin)}
       end)
 
-    unless Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) do
-      detail =
-        Enum.map_join(results, "; ", fn {harness, result} ->
-          reason =
-            case result do
-              {:error, :not_found} -> "not found"
-              {:error, {:exec_failed, exec_detail}} -> "exec failed: #{exec_detail}"
-            end
+    cond do
+      Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) ->
+        :ok
 
-          "#{harness}: #{reason}"
-        end)
+      Enum.all?(results, fn {_harness, result} -> result == {:error, :not_found} end) ->
+        binaries = Enum.map_join(Harness.all(), " or ", &"`#{&1.cli_binary()}`")
 
-      raise "no usable harness CLI is installed (#{detail}). Install a registered harness CLI and ensure it is on PATH."
+        {:error,
+         {:no_harness_cli,
+          "Tight Beam cannot start because no registered harness CLI is installed. " <>
+            "That is expected on a fresh machine. Install #{binaries}, ensure it is on PATH, " <>
+            "then start Tight Beam again. Run `tightbeam doctor` to check this machine."}}
+
+      true ->
+        detail =
+          Enum.map_join(results, "; ", fn {harness, result} ->
+            reason =
+              case result do
+                {:error, :not_found} -> "not found"
+                {:error, {:exec_failed, exec_detail}} -> "exec failed: #{exec_detail}"
+              end
+
+            "#{harness}: #{reason}"
+          end)
+
+        raise "no usable harness CLI is installed (#{detail}). Install a registered harness CLI and ensure it is on PATH."
     end
   end
 
