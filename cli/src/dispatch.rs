@@ -622,6 +622,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("value", value),
             ],
         )),
+        Command::HarnessProcesses { identity } => {
+            Ok(request(identity, "harness-processes", vec![], vec![]))
+        }
     }
 }
 
@@ -1101,7 +1104,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
         | Command::ConfigGet { identity, .. }
-        | Command::ConfigSet { identity, .. } => Some(identity),
+        | Command::ConfigSet { identity, .. }
+        | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
@@ -1124,6 +1128,14 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn builds_harness_process_list_request() {
+        assert_eq!(
+            body(&["harness-process", "list", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"harness-processes","params":{}}"#
+        );
     }
 
     #[test]

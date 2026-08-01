@@ -22,7 +22,8 @@ defmodule Tightbeam.Credentials do
 
   use GenServer
 
-  alias Tightbeam.{Harness, Homes, Rails}
+  alias Tightbeam.{CommandEdge, Harness, Homes, Rails}
+  alias Tightbeam.CommandEdge.CredentialPark
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
@@ -98,7 +99,7 @@ defmodule Tightbeam.Credentials do
   @doc "Begin an interactive CLI onboarding lease after gate + runtime stop."
   @spec begin_onboard(provider(), GenServer.server()) :: {:ok, String.t()} | {:error, term()}
   def begin_onboard(provider, server \\ __MODULE__),
-    do: GenServer.call(server, {:begin_onboard, provider})
+    do: GenServer.call(server, {:begin_onboard, provider}, :infinity)
 
   @doc """
   Install the credential produced in the active onboarding lease, as `kind`.
@@ -123,9 +124,9 @@ defmodule Tightbeam.Credentials do
     do: GenServer.call(server, {:cancel_onboard, provider, reason})
 
   @doc "Record terminal evidence, gate new sessions, and park running sessions."
-  @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok
+  @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok | {:error, term()}
   def mark_terminal(provider, evidence, server \\ __MODULE__),
-    do: GenServer.call(server, {:mark_terminal, provider, evidence})
+    do: GenServer.call(server, {:mark_terminal, provider, evidence}, :infinity)
 
   @doc "Classify only pinned terminal evidence. Unknown is always non-terminal."
   @spec terminal_evidence?(provider(), term()) :: boolean()
@@ -154,18 +155,27 @@ defmodule Tightbeam.Credentials do
 
   @impl true
   def init(opts) do
+    machine = Keyword.fetch!(opts, :machine)
+
     {:ok,
      %{
        base_dir: Keyword.fetch!(opts, :base_dir),
        staging_base_dir: Keyword.get(opts, :staging_base_dir, Keyword.fetch!(opts, :base_dir)),
-       machine: Keyword.fetch!(opts, :machine),
+       machine: machine,
        ssh: Keyword.get(opts, :ssh),
        sh: Keyword.get(opts, :sh, &system_cmd/1),
        now: Keyword.get(opts, :now, fn -> System.system_time(:second) end),
        onboarders: Keyword.get(opts, :onboarders, default_onboarders()),
        gate: Keyword.get(opts, :gate, fn _provider -> :ok end),
        stop: Keyword.get(opts, :stop, fn _provider -> :ok end),
-       park: Keyword.get(opts, :park, fn _provider -> :ok end),
+       park_edge:
+         opts
+         |> Keyword.get(:park_edge, CommandEdge.request_to(Tightbeam.AdapterCoordinator))
+         |> CommandEdge.validate_request!(),
+       park_targets: Keyword.get(opts, :park_targets, default_park_targets(machine)),
+       park_requests: :gen_server.reqids_new(),
+       park_pending: %{},
+       park_deferred: %{},
        start: Keyword.get(opts, :start, fn _provider, _kind -> :ok end),
        resume: Keyword.get(opts, :resume, fn _provider -> :ok end),
        capture_sessions: Keyword.get(opts, :capture_sessions, fn _provider -> [] end),
@@ -188,37 +198,76 @@ defmodule Tightbeam.Credentials do
     {:reply, credential_kind(state, provider), state}
   end
 
-  def handle_call({:mark_terminal, provider, evidence}, _from, state) do
-    if terminal_evidence?(provider, evidence) do
-      metadata = read_metadata(state, provider)
+  def handle_call({:mark_terminal, provider, evidence}, from, state) do
+    cond do
+      not terminal_evidence?(provider, evidence) ->
+        {:reply, :ok, state}
 
-      if metadata["terminal"] != true do
-        state.gate.(provider)
-        captured = capture_sessions(state, provider)
-        park_result = state.park.(provider)
+      pending = state.park_pending[provider] ->
+        pending = update_in(pending.waiters, &[from | &1])
+        {:noreply, put_in(state.park_pending[provider], pending)}
 
-        write_metadata!(
-          state,
-          provider,
-          Map.merge(metadata, %{
-            "provider" => Atom.to_string(provider),
-            "onboarded" => true,
-            "terminal" => true,
-            "last_health" => "revoked"
-          })
-        )
+      true ->
+        metadata = read_metadata(state, provider)
+        first_transition? = metadata["terminal"] != true
+        recovery? = metadata["park_pending"] == true
 
-        if park_result == :ok do
-          publish_sessions(state, captured, :terminal)
+        if first_transition? or recovery? do
+          state.gate.(provider)
+          captured = capture_sessions(state, provider)
+
+          write_metadata!(
+            state,
+            provider,
+            Map.merge(metadata, %{
+              "provider" => Atom.to_string(provider),
+              "onboarded" => true,
+              "terminal" => true,
+              "last_health" => "revoked",
+              "park_pending" => true
+            })
+          )
+
+          command = %CredentialPark{
+            provider: provider,
+            machine: state.machine,
+            adapter_keys: Map.fetch!(state.park_targets, provider),
+            observed_at: System.system_time(:millisecond)
+          }
+
+          {:pending, park_requests} =
+            CommandEdge.request(state.park_edge, command, provider, state.park_requests)
+
+          pending = %{waiters: [from], captured: captured}
+
+          {:noreply,
+           %{
+             state
+             | park_requests: park_requests,
+               park_pending: Map.put(state.park_pending, provider, pending)
+           }}
+        else
+          {:reply, :ok, state}
         end
-      end
     end
+  end
 
-    {:reply, :ok, state}
+  def handle_call({:onboard, provider} = request, from, %{park_pending: pending} = state)
+      when is_map_key(pending, provider) do
+    defer_credential_call(provider, request, from, state)
   end
 
   def handle_call({:onboard, provider}, _from, state) do
     perform_onboard(provider, state)
+  end
+
+  def handle_call(
+        {:begin_onboard, provider} = request,
+        from,
+        %{park_pending: pending} = state
+      )
+      when is_map_key(pending, provider) do
+    defer_credential_call(provider, request, from, state)
   end
 
   def handle_call({:begin_onboard, provider}, _from, state) do
@@ -246,6 +295,15 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  def handle_call(
+        {:finish_onboard, provider, _kind} = request,
+        from,
+        %{park_pending: pending} = state
+      )
+      when is_map_key(pending, provider) do
+    defer_credential_call(provider, request, from, state)
+  end
+
   def handle_call({:finish_onboard, provider, kind}, _from, state) do
     state = expire_lease(state, provider)
 
@@ -269,6 +327,15 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  def handle_call(
+        {:cancel_onboard, provider, _reason} = request,
+        from,
+        %{park_pending: pending} = state
+      )
+      when is_map_key(pending, provider) do
+    defer_credential_call(provider, request, from, state)
+  end
+
   def handle_call({:cancel_onboard, provider, reason}, _from, state) do
     case Map.pop(state.pending, provider) do
       {nil, pending} ->
@@ -278,6 +345,26 @@ defmodule Tightbeam.Credentials do
         cleanup_staging!(state, path)
         record_onboarding_failure!(state, provider, reason)
         {:reply, :ok, %{state | pending: pending}}
+    end
+  end
+
+  @impl true
+  def handle_info(message, state) when map_size(state.park_pending) > 0 do
+    case CommandEdge.check_response(message, state.park_requests) do
+      {:answered, provider, result, park_requests} ->
+        finish_park(provider, result, %{state | park_requests: park_requests})
+
+      {:failed, provider, reason, park_requests} ->
+        finish_park(provider, {:error, {:park_request_failed, reason}}, %{
+          state
+          | park_requests: park_requests
+        })
+
+      :no_request ->
+        {:noreply, state}
+
+      :no_reply ->
+        {:noreply, state}
     end
   end
 
@@ -342,6 +429,52 @@ defmodule Tightbeam.Credentials do
     catch
       _, _ -> []
     end
+  end
+
+  defp finish_park(provider, result, state) do
+    pending = Map.fetch!(state.park_pending, provider)
+
+    if result == :ok do
+      metadata = read_metadata(state, provider)
+      write_metadata!(state, provider, Map.put(metadata, "park_pending", false))
+      publish_sessions(state, pending.captured, :terminal)
+    else
+      state.log_event.(
+        "credential_park_unconfirmed",
+        "#{provider}@#{state.machine}",
+        inspect(result)
+      )
+    end
+
+    Enum.each(pending.waiters, &GenServer.reply(&1, result))
+
+    state = update_in(state.park_pending, &Map.delete(&1, provider))
+    {:noreply, resume_credential_calls(provider, state)}
+  end
+
+  defp defer_credential_call(provider, request, from, state) do
+    deferred =
+      Map.update(state.park_deferred, provider, [{request, from}], &[{request, from} | &1])
+
+    {:noreply, %{state | park_deferred: deferred}}
+  end
+
+  defp resume_credential_calls(provider, state) do
+    {deferred, park_deferred} = Map.pop(state.park_deferred, provider, [])
+    state = %{state | park_deferred: park_deferred}
+
+    deferred
+    |> Enum.reverse()
+    |> Enum.reduce(state, fn {request, from}, state ->
+      case handle_call(request, from, state) do
+        {:reply, reply, state} ->
+          GenServer.reply(from, reply)
+          state
+
+        {:noreply, state} ->
+          state
+      end
+    end)
   end
 
   defp publish_sessions(state, captured, transition) do
@@ -491,6 +624,11 @@ defmodule Tightbeam.Credentials do
 
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
+
+  defp default_park_targets(machine) do
+    Harness.all()
+    |> Enum.group_by(& &1.credential_provider(), &{&1.id(), "shared", machine})
+  end
 
   defp mark_onboarded!(state, provider, kind, credential) do
     write_metadata!(state, provider, %{

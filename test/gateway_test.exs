@@ -128,6 +128,11 @@ defmodule Tightbeam.GatewayTest do
       {:reply, :ok, state}
     end
 
+    def handle_call(:harness_processes, _from, {_adapter, parent} = state) do
+      if is_pid(parent), do: send(parent, :harness_processes)
+      {:reply, [%{launch_id: "launch-1", state: "kill_failed"}], state}
+    end
+
     def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
 
     def handle_cast({:close_adapter, key}, {adapter, parent} = state) do
@@ -558,6 +563,18 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "permanent"
     assert Org.get(ctx.db, Org.personal_session_key("flynn")).state == "active"
+  end
+
+  test "admin operator handler lists durable harness launches", ctx do
+    adapter = start_supervised!({AdapterStub, self()})
+    coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
+    handlers = Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})
+    call = %{origin: "user:flynn", session_key: nil, params: %{}}
+
+    assert %{harness_processes: [%{launch_id: "launch-1", state: "kill_failed"}]} =
+             handlers["harness-processes"].(call)
+
+    assert_receive :harness_processes
   end
 
   test "retire atomically cascades parent-last, interrupts assignments, and removes every wire",
@@ -6081,10 +6098,12 @@ defmodule Tightbeam.GatewayTest do
       :ok
     end
 
+    {:ok, park_receiver} = Tightbeam.CredentialParkTestReceiver.start_link(park)
+
     opts =
       credential_opts
       |> Keyword.put(:name, nil)
-      |> Keyword.put(:park, park)
+      |> Keyword.put(:park_edge, Tightbeam.CommandEdge.request_to(park_receiver))
       |> Keyword.put(:stop, fn _provider -> :ok end)
       |> Keyword.put(:start, fn _provider, _kind -> :ok end)
       |> Keyword.put(:resume, fn _provider -> :ok end)
