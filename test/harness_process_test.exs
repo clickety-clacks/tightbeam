@@ -41,7 +41,7 @@ defmodule Tightbeam.HarnessProcessTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
-  test "park SIGKILLs the whole minted process group, including a tool subprocess", ctx do
+  test "park still sees and SIGKILLs a leaderless process group", ctx do
     marker = Path.join(ctx.test_dir, "tool-writes")
 
     script = """
@@ -51,7 +51,12 @@ defmodule Tightbeam.HarnessProcessTest do
     """
 
     {port, row} = launch(ctx, {:claude, "shared", "testhost"}, ["sh", "-c", script])
-    on_exit(fn -> close_port(port) end)
+
+    on_exit(fn ->
+      System.cmd("sh", ["-c", "kill -KILL -#{row.process_group_id}"], stderr_to_stdout: true)
+      close_port(port)
+    end)
+
     assert eventually(fn -> File.exists?(marker) and File.stat!(marker).size > 0 end)
 
     assert row.os_pid == row.process_group_id
@@ -85,6 +90,21 @@ defmodule Tightbeam.HarnessProcessTest do
                ],
                stderr_to_stdout: true
              )
+
+    assert {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(row.os_pid)])
+
+    assert eventually(fn ->
+             match?(
+               {_, status} when status != 0,
+               System.cmd("kill", ["-0", Integer.to_string(row.os_pid)], stderr_to_stdout: true)
+             )
+           end)
+
+    assert {_, 0} =
+             System.cmd("sh", ["-c", "kill -0 -#{row.process_group_id}"], stderr_to_stdout: true)
+
+    leaderless_size = File.stat!(marker).size
+    assert eventually(fn -> File.stat!(marker).size > leaderless_size end)
 
     assert {_, 0} = System.cmd(@helper, group_args(row, "status"), stderr_to_stdout: true)
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})

@@ -143,10 +143,6 @@ pub fn group(args: &[String]) -> Result<i32, String> {
         return Ok(ABSENT);
     }
 
-    if unsafe { libc::getpgid(pgid) } != pgid {
-        return Ok(ABSENT);
-    }
-
     // Status and termination share this identity check in one helper invocation.
     // POSIX has no conditional killpg primitive, so a group that exits and is
     // recycled between the check above and this syscall remains the irreducible
