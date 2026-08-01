@@ -51,13 +51,10 @@ defmodule Tightbeam.GatewayTest do
     Artifacts,
     Assignments,
     ConnRegistry,
-    ConditionFacts,
     Credentials,
-    CriticalLeases,
     DB,
     Devices,
     EventLog,
-    Escalation,
     EffortCheckin,
     Gateway,
     Identity,
@@ -73,8 +70,7 @@ defmodule Tightbeam.GatewayTest do
     Rules,
     SessionLane,
     Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   alias Tightbeam.Wire.Payloads
@@ -413,7 +409,7 @@ defmodule Tightbeam.GatewayTest do
     registry = :"gateway_registry_#{System.unique_integer([:positive])}"
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Placement.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     start_supervised!({ConnRegistry, name: registry})
     # Named globally, like CoordinatorStub: identity apply reaches its lane manager
     # through `config[:lane_manager] || Tightbeam.LaneManager`, so the default has
@@ -476,27 +472,6 @@ defmodule Tightbeam.GatewayTest do
     on_exit(fn ->
       File.rm_rf!(catalog_base)
     end)
-
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          Artifacts,
-          EventLog,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          Org,
-          CriticalLeases,
-          Projection,
-          Roles,
-          Wakes,
-          Escalation,
-          Adjudication,
-          WorkItems,
-          Assignments,
-          WorkState
-        ],
-        do: :ok = module.ensure_schema(db)
 
     {:paired, _device} =
       Devices.pair(db, %{

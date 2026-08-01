@@ -13,25 +13,16 @@ defmodule Tightbeam.AdapterHealTest do
   alias Tightbeam.{
     AdapterCoordinator,
     Adjudication,
-    Artifacts,
-    Assignments,
-    ConditionFacts,
     ConnRegistry,
-    CriticalLeases,
     DB,
     Devices,
     Escalation,
     EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     ModelCatalog,
     Org,
-    Projection,
-    Roles,
-    Wakes,
-    WorkItems,
-    WorkState
+    Wakes
   }
 
   @cause "adapter_fault:claude:shared@testhost"
@@ -322,7 +313,7 @@ defmodule Tightbeam.AdapterHealTest do
     db = :"heal_db_#{System.unique_integer([:positive])}"
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Tightbeam.Placement.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
     scheduler = start_supervised!({WakeSchedulerStub, self()})
@@ -342,27 +333,6 @@ defmodule Tightbeam.AdapterHealTest do
        claude_fetch: fn _, _ -> {:error, :offline} end,
        codex_read: fn _ -> {:error, :offline} end}
     )
-
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          Artifacts,
-          EventLog,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          Org,
-          CriticalLeases,
-          Projection,
-          Roles,
-          Wakes,
-          Escalation,
-          Adjudication,
-          WorkItems,
-          Assignments,
-          WorkState
-        ],
-        do: :ok = module.ensure_schema(db)
 
     {:paired, _device} =
       Devices.pair(db, %{

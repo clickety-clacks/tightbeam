@@ -15,24 +15,14 @@ defmodule Tightbeam.AttentionTierTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
-    Adjudication,
-    Artifacts,
     ConnRegistry,
-    CriticalLeases,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     ModelCatalog,
     Org,
-    Projection,
-    Roles,
-    Wakes,
-    WorkItems,
-    WorkState
+    Projection
   }
 
   alias Tightbeam.Wire.{Payloads, Router}
@@ -105,29 +95,7 @@ defmodule Tightbeam.AttentionTierTest do
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
 
-    for module <- [
-          Tightbeam.Assets,
-          Tightbeam.CausalEvents,
-          Artifacts,
-          Adjudication,
-          Devices,
-          Idempotency,
-          Tightbeam.ConditionFacts,
-          Tightbeam.SubagentMarkers,
-          Tightbeam.Escalation,
-          Wakes,
-          Projection,
-          Org,
-          CriticalLeases,
-          Roles,
-          WorkItems,
-          Tightbeam.Assignments,
-          EventLog,
-          Ledger,
-          WorkState,
-          Tightbeam.Placement
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
 

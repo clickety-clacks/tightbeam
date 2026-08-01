@@ -4,15 +4,12 @@ defmodule Tightbeam.Wire.RouterTest do
   import Plug.Conn
 
   alias Tightbeam.{
-    Assets,
     Assignments,
     DB,
     Devices,
-    EventLog,
     Gateway,
     Org,
     Roles,
-    Supervision,
     Wakes,
     WorkItems,
     WorkState
@@ -24,8 +21,7 @@ defmodule Tightbeam.Wire.RouterTest do
     db = :"router_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Assets, Devices, EventLog, Org, Roles, Wakes, Tightbeam.Placement],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-router-#{System.unique_integer([:positive])}")
@@ -227,8 +223,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "work and work-item device routes expose owner-scoped random-access snapshots", ctx do
-    for module <- [Tightbeam.CausalEvents, WorkItems, Assignments, Supervision, WorkState],
-        do: :ok = module.ensure_schema(ctx.db)
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
 
     create_session(ctx.db, "holder", ctx.device.user_id)
 

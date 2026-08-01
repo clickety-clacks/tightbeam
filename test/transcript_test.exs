@@ -15,19 +15,12 @@ defmodule Tightbeam.TranscriptTest do
   import Plug.Conn
 
   alias Tightbeam.{
-    Assets,
     ConnRegistry,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
-    Ledger,
     Org,
-    Projection,
-    Roles,
-    Transcript,
-    Wakes
+    Transcript
   }
 
   alias Tightbeam.Wire.Router
@@ -51,8 +44,7 @@ defmodule Tightbeam.TranscriptTest do
     db = :"transcript_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [Assets, Devices, EventLog, Ledger, Projection, Org, Roles, Wakes],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok =
       DB.execute(

@@ -3,17 +3,11 @@ defmodule Tightbeam.AssignmentsTest do
 
   alias Tightbeam.{
     Assignments,
-    ConditionFacts,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
     Projection,
-    Roles,
     Rules,
     Wakes,
     WorkItems,
@@ -24,27 +18,7 @@ defmodule Tightbeam.AssignmentsTest do
     db = :"assignments_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Tightbeam.Escalation,
-          Tightbeam.EffortCheckin,
-          Tightbeam.Artifacts,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          Org,
-          Projection,
-          Roles,
-          Wakes,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(

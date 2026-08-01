@@ -5,23 +5,16 @@ defmodule Tightbeam.EffortCheckinTest do
     Archetypes,
     Artifacts,
     Assignments,
-    ConditionFacts,
     ConnRegistry,
     DB,
-    Devices,
     EffortCheckin,
     Escalation,
-    EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     Org,
     Placement,
-    Projection,
-    Roles,
     Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   defmodule LaneDoorbell do
@@ -53,26 +46,7 @@ defmodule Tightbeam.EffortCheckinTest do
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          EventLog,
-          Escalation,
-          Wakes,
-          Projection,
-          Org,
-          Roles,
-          WorkItems,
-          WorkState,
-          Assignments,
-          Artifacts,
-          Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok =
       DB.execute(

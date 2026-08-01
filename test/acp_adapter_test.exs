@@ -1007,7 +1007,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     db = :"auth_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
-    :ok = Tightbeam.Placement.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
 
@@ -1112,20 +1112,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     db = :"subagent_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
-    :ok = Tightbeam.Placement.ensure_schema(db)
-
-    for module <- [
-          Tightbeam.EventLog,
-          Tightbeam.Idempotency,
-          Tightbeam.Ledger,
-          Tightbeam.Projection,
-          Tightbeam.Org,
-          Tightbeam.Roles,
-          Tightbeam.ConditionFacts,
-          Tightbeam.Wakes,
-          Tightbeam.SubagentMarkers
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
@@ -1230,20 +1217,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     db = :"subagent_failure_db_#{System.unique_integer([:positive])}"
     db_pid = start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
-    :ok = Tightbeam.Placement.ensure_schema(db)
-
-    for module <- [
-          Tightbeam.EventLog,
-          Tightbeam.Idempotency,
-          Tightbeam.Ledger,
-          Tightbeam.Projection,
-          Tightbeam.Org,
-          Tightbeam.Roles,
-          Tightbeam.ConditionFacts,
-          Tightbeam.Wakes,
-          Tightbeam.SubagentMarkers
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)

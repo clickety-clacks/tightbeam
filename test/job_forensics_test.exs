@@ -10,26 +10,16 @@ defmodule Tightbeam.JobForensicsTest do
 
   alias Tightbeam.{
     Adjudication,
-    Assignments,
     CausalEvents,
-    ConditionFacts,
-    CriticalLeases,
     DB,
-    Devices,
     EffortCheckin,
-    Escalation,
-    EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     Org,
-    Projection,
-    Roles,
     SubagentMarkers,
     Supervision,
     Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   alias Tightbeam.DB.Txn
@@ -54,28 +44,7 @@ defmodule Tightbeam.JobForensicsTest do
     lane =
       start_supervised!({LaneDoorbell, :"forensics_lane_#{System.unique_integer([:positive])}"})
 
-    for module <- [
-          CausalEvents,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          EventLog,
-          Escalation,
-          Wakes,
-          Projection,
-          Org,
-          CriticalLeases,
-          Roles,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EffortCheckin,
-          Adjudication,
-          Supervision,
-          SubagentMarkers
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok =
       DB.execute(

@@ -14,28 +14,15 @@ defmodule Tightbeam.EscalationDeliveryTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
-    Adjudication,
-    Artifacts,
     Assignments,
-    CausalEvents,
-    ConditionFacts,
-    CriticalLeases,
     DB,
-    Devices,
     EffortCheckin,
     Escalation,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
     Placement,
-    Projection,
-    Roles,
-    SubagentMarkers,
     Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   @origin "process:tightbeam"
@@ -68,30 +55,6 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # Work-state and work-item doorbells are not this proof's subject.
     def handle_call(_other, _from, state), do: {:reply, :ok, state}
   end
-
-  @schemas [
-    Tightbeam.Assets,
-    Artifacts,
-    CausalEvents,
-    Adjudication,
-    Devices,
-    Idempotency,
-    ConditionFacts,
-    SubagentMarkers,
-    Escalation,
-    Wakes,
-    Projection,
-    Org,
-    CriticalLeases,
-    Roles,
-    WorkItems,
-    Assignments,
-    EffortCheckin,
-    EventLog,
-    Ledger,
-    WorkState,
-    Tightbeam.Placement
-  ]
 
   setup do
     db = :"delivery_db_#{System.unique_integer([:positive])}"
@@ -664,7 +627,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
   end
 
   defp seed_world!(db) do
-    for module <- @schemas, do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok =
       DB.execute(

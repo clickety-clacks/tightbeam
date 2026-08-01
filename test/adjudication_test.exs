@@ -1,24 +1,13 @@
 defmodule Tightbeam.AdjudicationTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Adjudication, ConditionFacts, DB, EventLog, Idempotency, Ledger, Org, Wakes}
+  alias Tightbeam.{Adjudication, DB, Ledger, Org, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          EventLog,
-          Org,
-          Ledger,
-          Idempotency,
-          ConditionFacts,
-          Wakes,
-          Adjudication
-        ] do
-      :ok = module.ensure_schema(name)
-    end
+    :ok = Tightbeam.Schema.ensure_all(name)
 
     owner =
       Org.create(name, %{

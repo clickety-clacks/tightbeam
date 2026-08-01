@@ -9,24 +9,17 @@ defmodule Tightbeam.VerificationPapertrailTest do
   alias Tightbeam.{
     Archetypes,
     Assignments,
-    ConditionFacts,
     DB,
-    Devices,
     Dispatch,
-    Escalation,
     EventLog,
     Gateway,
     Identity,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
     RailRemedy,
     Roles,
     Rules,
     Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   @verification_rule "completion-requires-verification"
@@ -36,27 +29,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     db = :"verification_papertrail_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Tightbeam.Artifacts,
-          Devices,
-          ConditionFacts,
-          Escalation,
-          Idempotency,
-          Ledger,
-          Org,
-          Projection,
-          Roles,
-          Wakes,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          RailRemedy,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
