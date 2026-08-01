@@ -165,6 +165,7 @@ defmodule Tightbeam.Credentials do
      %{
        base_dir: Keyword.fetch!(opts, :base_dir),
        staging_base_dir: Keyword.get(opts, :staging_base_dir, Keyword.fetch!(opts, :base_dir)),
+       log_event: Keyword.get(opts, :log_event, fn _kind, _subject, _detail -> :ok end),
        machine: machine,
        ssh: Keyword.get(opts, :ssh),
        sh: Keyword.get(opts, :sh, &system_cmd/1),
