@@ -1581,7 +1581,6 @@ mod tests {
     fn help_uses_only_supplied_projection_names() {
         let catalog = HarnessCatalog {
             harnesses: vec![crate::harnesses::HarnessProjection {
-                id: "third".to_owned(),
                 wire_name: "third".to_owned(),
                 install_package: "third-package".to_owned(),
                 cli_binary: "third-cli".to_owned(),
@@ -1598,7 +1597,6 @@ mod tests {
     fn fixture_projection_drives_spawn_validation_and_assimilation_defaults() {
         let catalog = HarnessCatalog {
             harnesses: vec![crate::harnesses::HarnessProjection {
-                id: "fixture".to_owned(),
                 wire_name: "fixture".to_owned(),
                 install_package: "fixture-package".to_owned(),
                 cli_binary: "fixture".to_owned(),

@@ -9,7 +9,6 @@ use crate::args::{Command, Identity, Target, ToplineSelection};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
     pub path: &'static str,
-    pub headers_sans_token_value: [(&'static str, &'static str); 2],
     pub body_json: String,
 }
 
@@ -79,10 +78,6 @@ fn request(
     body.push(params_field(params));
     RequestSpec {
         path: "/agent/dispatch",
-        headers_sans_token_value: [
-            ("authorization", "Bearer <token>"),
-            ("content-type", "application/json"),
-        ],
         body_json: object(body),
     }
 }
@@ -161,10 +156,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         // command it observed has not run yet.
         Command::ToolCallObserved => Ok(RequestSpec {
             path: "/agent/tool-call-observed",
-            headers_sans_token_value: [
-                ("authorization", "Bearer <token>"),
-                ("content-type", "application/json"),
-            ],
             body_json: "{}".to_owned(),
         }),
         Command::Spawn {
@@ -875,7 +866,9 @@ fn send_to_with_timeout(
         Err(ureq::Error::Status(status, response)) => (status, response),
         Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
     };
-    let encoded = response.into_string().map_err(|error| error.to_string())?;
+    let encoded = response
+        .into_string()
+        .map_err(|error| response_read_error(status, error.to_string()))?;
     parse_response(status, &encoded)
 }
 
@@ -900,8 +893,24 @@ fn ceremony_expired() -> String {
     "gateway request refused because the onboarding lease expired".to_owned()
 }
 
-fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
-    let json: Value = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+const ACCEPTED_RESPONSE_UNREADABLE: &str =
+    "gateway accepted the request but its response was unreadable";
+
+fn response_read_error(status: u16, reason: String) -> String {
+    if (200..300).contains(&status) {
+        format!("{ACCEPTED_RESPONSE_UNREADABLE} (HTTP {status}): {reason}")
+    } else {
+        reason
+    }
+}
+
+pub(crate) fn accepted_response_was_unreadable(reason: &str) -> bool {
+    reason.starts_with(ACCEPTED_RESPONSE_UNREADABLE)
+}
+
+pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
+    let json: Value = serde_json::from_str(encoded)
+        .map_err(|error| response_read_error(status, error.to_string()))?;
 
     if !(200..300).contains(&status) {
         let code = json
@@ -1942,7 +1951,6 @@ mod tests {
                     .push((endpoint.base.clone(), deadline));
                 Ok(Some(crate::harnesses::HarnessCatalog {
                     harnesses: vec![crate::harnesses::HarnessProjection {
-                        id: "codex".to_owned(),
                         wire_name: "codex".to_owned(),
                         install_package: "codex-acp".to_owned(),
                         cli_binary: "true".to_owned(),
@@ -2059,9 +2067,6 @@ mod tests {
                     machine: Some("work-1".to_owned()),
                 },
             ),
-            // Written by a gateway from before `machine` was included. The name is not
-            // derivable here -- it is whatever `assimilate` registered -- so this must
-            // stay distinguishable from the gateway host, which legitimately has none.
             (
                 "stale_satellite",
                 r#"{"url":"http://gw:11373","cliToken":"t"}"#,

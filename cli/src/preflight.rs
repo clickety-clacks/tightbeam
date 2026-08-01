@@ -258,7 +258,6 @@ mod tests {
             harnesses: [("claude", "claude-cli"), ("codex", "codex-cli")]
                 .into_iter()
                 .map(|(name, cli_binary)| HarnessProjection {
-                    id: name.to_owned(),
                     wire_name: name.to_owned(),
                     install_package: format!("{name}-package"),
                     cli_binary: cli_binary.to_owned(),
