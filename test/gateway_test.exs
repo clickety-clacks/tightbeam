@@ -2131,7 +2131,7 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
-  test "update-clients enumerates satellites from the host registry", ctx do
+  test "update-clients enumerates satellites without an admin guard", ctx do
     register_hosts(ctx.db, %{
       "alpha" => %{
         ssh: "flynn@alpha.local",
@@ -2148,7 +2148,7 @@ defmodule Tightbeam.GatewayTest do
              ]
            } =
              Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["update-clients"].(%{
-               origin: "user:flynn",
+               origin: "agent:operator:app",
                session_key: nil,
                params: %{}
              })

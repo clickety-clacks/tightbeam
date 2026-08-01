@@ -1,13 +1,13 @@
 //! Interactive `setup` and `assimilate` ceremonies.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::args::{AssimilateArgs, Identity};
 use crate::dispatch::{self, Endpoint, RequestSpec};
@@ -1031,12 +1031,21 @@ struct ExecFailure {
     message: String,
     stdout: String,
     stderr: String,
+    status: Option<i32>,
+    timed_out: bool,
 }
+
+const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 trait CeremonyIo {
     fn log(&mut self, message: &str);
     fn warn(&mut self, message: &str);
-    fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure>;
+    fn exec(
+        &mut self,
+        file: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<String, ExecFailure>;
     fn dispatch(&mut self, request: &RequestSpec) -> Result<Option<serde_json::Value>, String>;
     fn current_exe(&self) -> Result<PathBuf, String>;
 }
@@ -1052,25 +1061,83 @@ impl CeremonyIo for SystemIo {
         eprintln!("{message}");
     }
 
-    fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure> {
-        let result = ProcessCommand::new(file)
+    fn exec(
+        &mut self,
+        file: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<String, ExecFailure> {
+        let mut child = ProcessCommand::new(file)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|error| ExecFailure {
                 message: error.to_string(),
                 stdout: String::new(),
                 stderr: String::new(),
+                status: None,
+                timed_out: false,
             })?;
-        if result.status.success() {
-            Ok(String::from_utf8_lossy(&result.stdout).into_owned())
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let mut stderr = child.stderr.take().expect("stderr was piped");
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        });
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < timeout => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stdout = stdout_reader.join().unwrap_or_default();
+                    let stderr = stderr_reader.join().unwrap_or_default();
+                    return Err(ExecFailure {
+                        message: format!("command timed out after {} seconds", timeout.as_secs()),
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        status: None,
+                        timed_out: true,
+                    });
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stdout = stdout_reader.join().unwrap_or_default();
+                    let stderr = stderr_reader.join().unwrap_or_default();
+                    return Err(ExecFailure {
+                        message: error.to_string(),
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        status: None,
+                        timed_out: false,
+                    });
+                }
+            }
+        };
+        let stdout = stdout_reader.join().unwrap_or_default();
+        let stderr = stderr_reader.join().unwrap_or_default();
+        if status.success() {
+            Ok(String::from_utf8_lossy(&stdout).into_owned())
         } else {
             Err(ExecFailure {
-                message: format!("process exited with status {}", result.status),
-                stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+                message: format!("process exited with status {status}"),
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                status: status.code(),
+                timed_out: false,
             })
         }
     }
@@ -1096,13 +1163,13 @@ struct ClientUpdateHost {
     cli_bin: Option<String>,
 }
 
-pub fn update_clients(as_user: &str) -> Result<(), String> {
+pub fn update_clients(identity: &Identity) -> Result<(), String> {
     let mut io = SystemIo;
-    update_clients_with(&mut io, as_user)
+    update_clients_with(&mut io, identity)
 }
 
-fn update_clients_with(io: &mut dyn CeremonyIo, as_user: &str) -> Result<(), String> {
-    let request = dispatch::build_update_clients_request(as_user);
+fn update_clients_with(io: &mut dyn CeremonyIo, identity: &Identity) -> Result<(), String> {
+    let request = dispatch::build_update_clients_request(identity);
     let response = io.dispatch(&request)?;
     let hosts = client_update_hosts(response)?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -1128,31 +1195,76 @@ fn update_clients_with(io: &mut dyn CeremonyIo, as_user: &str) -> Result<(), Str
         match asked {
             Err(error) => {
                 failed += 1;
+                let outcome = if error.timed_out {
+                    "timed out"
+                } else if error.status == Some(255) {
+                    "unreachable"
+                } else {
+                    "question failed"
+                };
                 io.log(&format!(
-                    "[update-clients] {}: unreachable — {}",
+                    "[update-clients] {}: {outcome} — {}",
                     host.name,
                     command_failure(&error)
                 ));
             }
-            Ok(answer) if answer.trim() == current_version => {
-                io.log(&format!(
-                    "[update-clients] {}: already current ({current_version})",
-                    host.name
-                ));
-            }
-            Ok(answer) => match ship_current_cli(io, false, &host.ssh, &cli_bin) {
-                Ok(()) => io.log(&format!(
-                    "[update-clients] {}: updated ({} -> {current_version})",
-                    host.name,
-                    answer.trim()
-                )),
-                Err(error) => {
+            Ok(answer) => match version_answer(&answer) {
+                None => {
                     failed += 1;
                     io.log(&format!(
-                        "[update-clients] {}: refused — {}",
-                        host.name,
-                        command_failure(&error)
+                        "[update-clients] {}: question failed — no unambiguous version answer",
+                        host.name
                     ));
+                }
+                Some(version) if version == current_version => io.log(&format!(
+                    "[update-clients] {}: already current ({current_version})",
+                    host.name
+                )),
+                Some(version) => {
+                    let asked_target = ssh(io, false, &host.ssh, "uname -sm");
+                    let remote_target = match asked_target {
+                        Ok(answer) => target_answer(&answer),
+                        Err(error) => {
+                            failed += 1;
+                            io.log(&format!(
+                                "[update-clients] {}: target check failed — {}",
+                                host.name,
+                                command_failure(&error)
+                            ));
+                            continue;
+                        }
+                    };
+                    let Some(remote_target) = remote_target else {
+                        failed += 1;
+                        io.log(&format!(
+                            "[update-clients] {}: target check failed — no unambiguous target answer",
+                            host.name
+                        ));
+                        continue;
+                    };
+                    if remote_target != local_target_triple() {
+                        failed += 1;
+                        io.log(&format!(
+                            "[update-clients] {}: incompatible — local target {} differs from satellite target {remote_target}",
+                            host.name,
+                            local_target_triple()
+                        ));
+                        continue;
+                    }
+                    match ship_current_cli(io, false, &host.ssh, &cli_bin) {
+                        Ok(()) => io.log(&format!(
+                            "[update-clients] {}: updated ({version} -> {current_version})",
+                            host.name
+                        )),
+                        Err(error) => {
+                            failed += 1;
+                            io.log(&format!(
+                                "[update-clients] {}: refused — {}",
+                                host.name,
+                                command_failure(&error)
+                            ));
+                        }
+                    }
                 }
             },
         }
@@ -1165,6 +1277,41 @@ fn update_clients_with(io: &mut dyn CeremonyIo, as_user: &str) -> Result<(), Str
             "update-clients failed for {failed} host(s); see per-host outcomes above"
         ))
     }
+}
+
+fn version_answer(output: &str) -> Option<&str> {
+    let mut answers = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_version(line));
+    let answer = answers.next()?;
+    answers
+        .all(|candidate| candidate == answer)
+        .then_some(answer)
+}
+
+fn is_version(value: &str) -> bool {
+    let core = value.split_once('+').map_or(value, |(core, _)| core);
+    let core = core.split_once('-').map_or(core, |(core, _)| core);
+    let mut parts = core.split('.');
+    let valid = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    });
+    valid && parts.next().is_none()
+}
+
+fn target_answer(output: &str) -> Option<String> {
+    let mut targets = output.lines().filter_map(|line| {
+        matches!(line.split_whitespace().next(), Some("Darwin" | "Linux"))
+            .then(|| target_from_probe(line))
+            .flatten()
+    });
+    let target = targets.next()?;
+    targets
+        .all(|candidate| candidate == target)
+        .then_some(target)
 }
 
 fn client_update_hosts(
@@ -1221,6 +1368,7 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
                 args.ssh_dest.clone(),
                 preflight::script(&requirements, &remote_path(&args.base_dir)),
             ],
+            REMOTE_COMMAND_TIMEOUT,
         )?;
         let observation = preflight::parse(&probe);
         for line in preflight::report(&observation) {
@@ -1231,6 +1379,8 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
                 message,
                 stdout: String::new(),
                 stderr: String::new(),
+                status: None,
+                timed_out: false,
             }
         })?;
         Ok(observation)
@@ -1369,7 +1519,7 @@ fn run_command(
         io.log(&format!("DRY {}", display_command(file, args)));
         Ok(String::new())
     } else {
-        io.exec(file, args)
+        io.exec(file, args, REMOTE_COMMAND_TIMEOUT)
     }
 }
 
@@ -1389,7 +1539,14 @@ fn ship_current_cli(
         message,
         stdout: String::new(),
         stderr: String::new(),
+        status: None,
+        timed_out: false,
     })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staged_cli = format!("{cli_bin}/.tightbeam.update-{}-{nonce}", std::process::id());
     run_command(
         io,
         dry_run,
@@ -1398,14 +1555,19 @@ fn ship_current_cli(
             "-o".to_owned(),
             "BatchMode=yes".to_owned(),
             executable.display().to_string(),
-            format!("{ssh_dest}:{cli_bin}/tightbeam"),
+            format!("{ssh_dest}:{staged_cli}"),
         ],
     )?;
     ssh(
         io,
         dry_run,
         ssh_dest,
-        &format!("chmod +x {}", remote_path(&format!("{cli_bin}/tightbeam"))),
+        &format!(
+            "chmod +x {} && mv -f {} {}",
+            remote_path(&staged_cli),
+            remote_path(&staged_cli),
+            remote_path(&format!("{cli_bin}/tightbeam"))
+        ),
     )?;
     Ok(())
 }
@@ -1878,7 +2040,12 @@ mod tests {
             self.warnings.push(message.to_owned());
         }
 
-        fn exec(&mut self, file: &str, args: &[String]) -> Result<String, ExecFailure> {
+        fn exec(
+            &mut self,
+            file: &str,
+            args: &[String],
+            _timeout: Duration,
+        ) -> Result<String, ExecFailure> {
             self.commands.push((file.to_owned(), args.to_vec()));
             if self.responses.is_empty() {
                 Ok(String::new())
@@ -1934,6 +2101,15 @@ mod tests {
             message: "process exited with status 1".to_owned(),
             stdout: String::new(),
             stderr: stderr.to_owned(),
+            status: Some(1),
+            timed_out: false,
+        }
+    }
+
+    fn unreachable(stderr: &str) -> ExecFailure {
+        ExecFailure {
+            status: Some(255),
+            ..exec_failure(stderr)
         }
     }
 
@@ -1944,12 +2120,11 @@ mod tests {
             responses: vec![
                 Ok(format!("{current}\n")),
                 Ok("0.0.9\n".to_owned()),
+                Ok(format!("{}\n", local_platform())),
                 Ok(String::new()),
                 Ok(String::new()),
                 Ok(String::new()),
-                Err(exec_failure("connection refused")),
-                Ok("0.0.8\n".to_owned()),
-                Ok(String::new()),
+                Err(unreachable("connection refused")),
                 Err(exec_failure("permission denied")),
             ],
             dispatch_responses: vec![Ok(Some(serde_json::json!({
@@ -1964,7 +2139,7 @@ mod tests {
             ..FakeIo::default()
         };
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap_err();
 
         assert_eq!(
             io.dispatched,
@@ -1980,9 +2155,7 @@ mod tests {
                 .iter()
                 .map(|(file, _args)| file.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "ssh", "ssh", "ssh", "scp", "ssh", "ssh", "ssh", "ssh", "scp"
-            ]
+            vec!["ssh", "ssh", "ssh", "ssh", "scp", "ssh", "ssh", "ssh"]
         );
         let transcript = io.logs.join("\n");
         assert!(transcript.contains(&format!(
@@ -1992,7 +2165,9 @@ mod tests {
             "[update-clients] b-old: updated (0.0.9 -> {current})"
         )));
         assert!(transcript.contains("[update-clients] c-down: unreachable — connection refused"));
-        assert!(transcript.contains("[update-clients] d-refused: refused — permission denied"));
+        assert!(
+            transcript.contains("[update-clients] d-refused: question failed — permission denied")
+        );
         assert!(
             transcript
                 .contains("[update-clients] e-unregistered-path: refused — no CLI path registered")
@@ -2001,6 +2176,90 @@ mod tests {
             error,
             "update-clients failed for 3 host(s); see per-host outcomes above"
         );
+    }
+
+    fn one_update_host(responses: Vec<Result<String, ExecFailure>>) -> FakeIo {
+        FakeIo {
+            responses,
+            dispatch_responses: vec![Ok(Some(serde_json::json!({
+                "hosts": [
+                    {"name": "satellite", "ssh": "satellite.local", "cliBin": "/srv/tightbeam/bin"}
+                ]
+            })))],
+            ..FakeIo::default()
+        }
+    }
+
+    #[test]
+    fn chatty_but_equal_version_answer_does_not_ship() {
+        let current = env!("CARGO_PKG_VERSION");
+        let mut io = one_update_host(vec![Ok(format!(
+            "Welcome to satellite.local\nmaintenance tonight\n{current}\n"
+        ))]);
+
+        update_clients_with(&mut io, &Identity::Role("operator".to_owned())).unwrap();
+
+        assert_eq!(
+            io.commands
+                .iter()
+                .map(|(file, _)| file.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ssh"]
+        );
+        assert!(io.logs[0].contains("already current"));
+    }
+
+    #[test]
+    fn failed_version_question_does_not_ship() {
+        let mut io = one_update_host(vec![Err(exec_failure("tightbeam: version refused"))]);
+
+        let error = update_clients_with(&mut io, &Identity::Session).unwrap_err();
+
+        assert_eq!(
+            io.commands
+                .iter()
+                .map(|(file, _)| file.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ssh"]
+        );
+        assert!(io.logs[0].contains("question failed"));
+        assert!(error.contains("failed for 1 host"));
+    }
+
+    #[test]
+    fn incompatible_target_does_not_ship() {
+        let remote = if local_target_triple().contains("apple") {
+            "Linux x86_64"
+        } else {
+            "Darwin arm64"
+        };
+        let mut io = one_update_host(vec![Ok("0.0.9\n".to_owned()), Ok(format!("{remote}\n"))]);
+
+        let error = update_clients_with(&mut io, &Identity::Session).unwrap_err();
+
+        assert_eq!(
+            io.commands
+                .iter()
+                .map(|(file, _)| file.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ssh", "ssh"]
+        );
+        assert!(io.logs[0].contains("incompatible"));
+        assert!(error.contains("failed for 1 host"));
+    }
+
+    #[test]
+    fn a_remote_process_that_exceeds_its_deadline_is_killed_and_reported() {
+        let mut io = SystemIo;
+        let started = Instant::now();
+
+        let error = io
+            .exec("/bin/sleep", &["5".to_owned()], Duration::from_millis(20))
+            .unwrap_err();
+
+        assert!(error.timed_out);
+        assert!(error.message.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     fn args() -> AssimilateArgs {
@@ -2118,8 +2377,12 @@ mod tests {
                 .1
                 .last()
                 .unwrap()
-                .ends_with(":/Users/remote/.tightbeam/bin/tightbeam")
+                .contains(":/Users/remote/.tightbeam/bin/.tightbeam.update-")
         );
+        let install = io.commands[6].1.last().unwrap();
+        assert!(install.contains("chmod +x"));
+        assert!(install.contains(" && mv -f "));
+        assert!(install.ends_with("'/Users/remote/.tightbeam/bin/tightbeam'"));
         let adapter_install = io.commands[3].1.last().unwrap();
         assert!(adapter_install.contains("claude-package"));
         assert!(adapter_install.contains("codex-package"));
@@ -2331,6 +2594,8 @@ mod tests {
             message: "npm is missing on satellite work-1.local".to_owned(),
             stdout: String::new(),
             stderr: String::new(),
+            status: None,
+            timed_out: false,
         };
         assert_eq!(
             probe_failure(&verdict),
@@ -2340,6 +2605,8 @@ mod tests {
             message: "probe failed".to_owned(),
             stdout: String::new(),
             stderr: "Permission denied (publickey).".to_owned(),
+            status: Some(255),
+            timed_out: false,
         };
         assert_eq!(
             probe_failure(&auth),
