@@ -41,18 +41,13 @@ defmodule Tightbeam.WorkItems do
     createdAt INTEGER NOT NULL,
     CHECK((specRefName IS NULL) = (specRefSha256 IS NULL)),
     CHECK((createdByUser IS NOT NULL) != (createdBySession IS NOT NULL))
-  )
+  );
+  CREATE INDEX IF NOT EXISTS work_items_created_in_turn ON work_items (createdInTurnSeq)
   """
 
-  @rebuild_ddl String.replace(@ddl, "IF NOT EXISTS work_items", "work_items_new")
-
-  @doc "Create the work-item schema (rebuilds pre-brackets tables)."
+  @doc "Create the work-item schema."
   @spec ensure_schema(DB.server()) :: :ok
-  def ensure_schema(db \\ Tightbeam.DB) do
-    :ok = DB.execute(db, @ddl)
-    :ok = ensure_work_items_shape(db)
-    ensure_creation_context_columns(db)
-  end
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc false
   def __handle__(db, "work-item-create", call), do: create_result(db, call)
@@ -766,127 +761,6 @@ defmodule Tightbeam.WorkItems do
       createdBySession: session,
       createdAt: created_at
     }
-  end
-
-  ## Migration — table rebuild adding owner/state/wake columns (gate F6)
-
-  defp ensure_work_items_shape(db) do
-    {:ok, [[sql]]} =
-      DB.query(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'")
-
-    has_brackets =
-      String.contains?(sql, "ownerUserId") and
-        String.contains?(sql, "state IN ('open','iceboxed','closed','failed')")
-
-    unless has_brackets, do: rebuild_work_items(db)
-    :ok
-  end
-
-  defp ensure_creation_context_columns(db) do
-    for ddl <- [
-          "ALTER TABLE work_items ADD COLUMN createdInTurnSeq INTEGER NULL",
-          "ALTER TABLE work_items ADD COLUMN createdContextKnown INTEGER NOT NULL DEFAULT 0"
-        ] do
-      case DB.query(db, ddl) do
-        {:ok, _} -> :ok
-        {:error, reason} -> if inspect(reason) =~ "duplicate column", do: :ok, else: raise(reason)
-      end
-    end
-
-    DB.execute(
-      db,
-      "CREATE INDEX IF NOT EXISTS work_items_created_in_turn ON work_items (createdInTurnSeq)"
-    )
-  end
-
-  defp rebuild_work_items(db) do
-    {:ok, table_info} = DB.query(db, "PRAGMA table_info(work_items)")
-    columns = MapSet.new(table_info, &Enum.at(&1, 1))
-    is_bug_expr = if MapSet.member?(columns, "isBug"), do: "isBug", else: "0"
-
-    {:ok, old_rows} =
-      DB.query(
-        db,
-        "SELECT id, title, specRefName, specRefSha256, #{is_bug_expr}, createdByUser, createdBySession, createdAt FROM work_items"
-      )
-
-    fallback_owner = deterministic_org_owner(db)
-
-    owned_rows =
-      Enum.map(old_rows, fn [id, title, name, sha, is_bug, cu, cs, created_at] ->
-        [
-          id,
-          title,
-          name,
-          sha,
-          is_bug,
-          cu,
-          cs,
-          created_at,
-          backfill_owner(db, cu, cs, fallback_owner, id)
-        ]
-      end)
-
-    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-
-    try do
-      {:ok, :ok} =
-        DB.transaction(db, fn txn ->
-          Txn.exec(txn, @rebuild_ddl)
-
-          Enum.each(owned_rows, fn [id, title, name, sha, is_bug, cu, cs, created_at, owner] ->
-            Txn.q(
-              txn,
-              """
-              INSERT INTO work_items_new
-                (id, title, specRefName, specRefSha256, isBug, ownerUserId, state,
-                 createdByUser, createdBySession, createdAt)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9)
-              """,
-              [id, title, name, sha, is_bug, owner, cu, cs, created_at]
-            )
-          end)
-
-          Txn.exec(txn, "DROP TABLE work_items")
-          Txn.exec(txn, "ALTER TABLE work_items_new RENAME TO work_items")
-
-          case Txn.q(txn, "PRAGMA foreign_key_check") do
-            [] -> :ok
-            rows -> raise DB.Error, message: "foreign key check failed: #{inspect(rows)}"
-          end
-        end)
-    after
-      :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    end
-  end
-
-  # The owner is always a user: user creators own directly; session creators
-  # anchor to their session's owning user. An orphan session (no longer
-  # resolvable) inherits the DETERMINISTIC org owner; with no admin the
-  # migration refuses rather than guessing (gate F6).
-  defp backfill_owner(_db, user, _session, _fallback, _id) when is_binary(user), do: user
-
-  defp backfill_owner(db, nil, session, fallback, id) when is_binary(session) do
-    case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session]) do
-      {:ok, [[owner]]} when is_binary(owner) -> owner
-      _ -> fallback || refuse_orphan(id, session)
-    end
-  end
-
-  defp backfill_owner(_db, nil, nil, fallback, id),
-    do: fallback || refuse_orphan(id, nil)
-
-  defp refuse_orphan(id, session) do
-    raise DB.Error,
-      message:
-        "work-item #{id} migration: creator session #{inspect(session)} does not resolve and no admin user exists to inherit ownership"
-  end
-
-  defp deterministic_org_owner(db) do
-    case DB.query(db, "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY userId ASC LIMIT 1") do
-      {:ok, [[user]]} -> user
-      _ -> nil
-    end
   end
 
   defp bool_to_int(true), do: 1

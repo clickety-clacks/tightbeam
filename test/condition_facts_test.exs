@@ -7,11 +7,7 @@ defmodule Tightbeam.ConditionFactsTest do
     DB,
     EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
-    Roles,
     Wakes
   }
 
@@ -47,8 +43,7 @@ defmodule Tightbeam.ConditionFactsTest do
     scheduler = :"condition_scheduler_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [EventLog, Idempotency, Ledger, Projection, Org, Roles, ConditionFacts, Wakes],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     session =
       Org.create(db, %{

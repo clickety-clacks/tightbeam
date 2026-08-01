@@ -93,14 +93,6 @@ defmodule Tightbeam.Escalation do
     ON escalation_waivers (raiserId, statuteName, revokedAt);
   """
 
-  @rebuild_ddl String.replace(
-                 @ddl
-                 |> String.split("CREATE INDEX IF NOT EXISTS decision_requests_owner")
-                 |> hd(),
-                 "IF NOT EXISTS decision_requests",
-                 "decision_requests_new"
-               )
-
   @request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
   expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
@@ -111,21 +103,7 @@ defmodule Tightbeam.Escalation do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB) do
-    {:ok, [[exists]]} =
-      DB.query(
-        db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'decision_requests'"
-      )
-
-    if exists == 0 do
-      DB.execute(db, @ddl)
-    else
-      ensure_request_shape(db)
-      :ok = DB.execute(db, indexes_ddl())
-      DB.execute(db, waivers_ddl())
-    end
-  end
+  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
   @doc "Effect-free consultation of waiver and current decision request."
   @spec resolve(DB.server(), map(), map()) ::
@@ -575,21 +553,13 @@ defmodule Tightbeam.Escalation do
   @doc "Boot backstop for retirement casts lost across a crash."
   @spec recover_retired(DB.server()) :: :ok
   def recover_retired(db \\ DB) do
-    {:ok, [[sessions_table]]} =
+    {:ok, rows} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
       )
 
-    if sessions_table == 1 do
-      {:ok, rows} =
-        DB.query(
-          db,
-          "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
-        )
-
-      Enum.each(rows, fn [key] -> withdraw_for_retired(db, key) end)
-    end
+    Enum.each(rows, fn [key] -> withdraw_for_retired(db, key) end)
 
     :ok
   end
@@ -676,7 +646,7 @@ defmodule Tightbeam.Escalation do
     owner_user_id = Keyword.get(opts, :owner_user_id)
     admin? = Keyword.get(opts, :admin, false)
 
-    if holds_available?(db) and (admin? or is_binary(owner_user_id)) do
+    if admin? or is_binary(owner_user_id) do
       {:ok, rows} =
         DB.query(
           db,
@@ -712,16 +682,6 @@ defmodule Tightbeam.Escalation do
     else
       []
     end
-  end
-
-  defp holds_available?(db) do
-    {:ok, [[count]]} =
-      DB.query(
-        db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('adjudication_episodes', 'sessions')"
-      )
-
-    count == 2
   end
 
   @doc "Canonical SHA-256 action fingerprint."
@@ -1264,71 +1224,4 @@ defmodule Tightbeam.Escalation do
 
   defp error(code, message), do: %{code: code, message: message}
   defp now, do: System.system_time(:millisecond)
-
-  defp ensure_request_shape(db) do
-    {:ok, [[sql]]} =
-      DB.query(
-        db,
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'decision_requests'"
-      )
-
-    unless String.contains?(sql, "kind") and String.contains?(sql, "superseded") and
-             String.contains?(sql, "effortGeneration") do
-      {:ok, columns} = DB.query(db, "PRAGMA table_info(decision_requests)")
-      names = Enum.map(columns, &Enum.at(&1, 1))
-
-      copied =
-        ~w(id raiserId raiserSessionKey ownerUserId assignmentId raisedAt deadlineAt statuteName actionKey question options context status decision rationale ruledBy ruledAt rulingFactId consumedAt parkWakeId withdrawnBy withdrawnReason withdrawnAt)
-        |> Enum.filter(&(&1 in names))
-
-      case DB.transaction(db, fn txn ->
-             Txn.exec(txn, @rebuild_ddl)
-             columns_sql = Enum.join(copied, ", ")
-
-             Txn.exec(
-               txn,
-               "INSERT INTO decision_requests_new (#{columns_sql}, kind) SELECT #{columns_sql}, 'statute' FROM decision_requests"
-             )
-
-             Txn.exec(txn, "DROP TABLE decision_requests")
-             Txn.exec(txn, "ALTER TABLE decision_requests_new RENAME TO decision_requests")
-           end) do
-        {:ok, _} -> :ok
-        {:error, error} -> raise error
-      end
-    end
-
-    :ok
-  end
-
-  defp indexes_ddl do
-    """
-    CREATE INDEX IF NOT EXISTS decision_requests_owner
-      ON decision_requests (ownerUserId, status);
-    CREATE INDEX IF NOT EXISTS decision_requests_key
-      ON decision_requests (raiserId, statuteName, actionKey);
-    CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_one_open
-      ON decision_requests (raiserId, statuteName, actionKey)
-      WHERE kind = 'statute' AND status = 'open';
-    CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_effort_generation
-      ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
-    """
-  end
-
-  defp waivers_ddl do
-    """
-    CREATE TABLE IF NOT EXISTS escalation_waivers (
-      id TEXT PRIMARY KEY,
-      raiserId TEXT NOT NULL,
-      statuteName TEXT NOT NULL,
-      grantedBy TEXT NOT NULL,
-      grantedAt INTEGER NOT NULL,
-      reason TEXT,
-      revokedBy TEXT,
-      revokedAt INTEGER
-    );
-    CREATE INDEX IF NOT EXISTS escalation_waivers_lookup
-      ON escalation_waivers (raiserId, statuteName, revokedAt);
-    """
-  end
 end

@@ -60,22 +60,7 @@ defmodule Tightbeam.Projection do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB) do
-    result = DB.execute(db, @ddl)
-
-    # Additive, nullable-by-default, never backfilled: `CREATE TABLE IF NOT
-    # EXISTS` is inert against a database that already has `messages`, so an
-    # existing store gets the column here. Every pre-existing row reads 0 —
-    # normal attention — which is the same answer as an agent electing nothing.
-    for ddl <- ["ALTER TABLE messages ADD COLUMN attentionTier INTEGER NOT NULL DEFAULT 0"] do
-      case DB.query(db, ddl) do
-        {:ok, _} -> :ok
-        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-      end
-    end
-
-    result
-  end
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc """
   Append a message, idempotently per client send. Dedupe scope is

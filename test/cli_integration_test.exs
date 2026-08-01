@@ -51,27 +51,10 @@ defmodule Tightbeam.CliIntegrationTest do
     File.mkdir_p!(outside)
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Tightbeam.Artifacts,
-          Assets,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          Org,
-          Projection,
-          Roles,
-          Wakes,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          Escalation,
-          Tightbeam.RailRemedy,
-          Tightbeam.Placement
-        ],
-        do: :ok = module.ensure_schema(db)
+    # Delegate to the ONE canonical schema list. A hand-kept copy here is how
+    # this test ran without adjudication_episodes: three lists had to agree and
+    # did not.
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(

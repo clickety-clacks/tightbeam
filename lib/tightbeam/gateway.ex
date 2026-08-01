@@ -64,7 +64,6 @@ defmodule Tightbeam.Gateway do
     Archetypes,
     Artifacts,
     Assignments,
-    CausalEvents,
     ConditionFacts,
     CriticalLeases,
     Placement,
@@ -82,10 +81,10 @@ defmodule Tightbeam.Gateway do
     ModelCatalog,
     Org,
     Projection,
-    RailRemedy,
     Rails,
     Rules,
     Roles,
+    Schema,
     Spinup,
     SubagentMarkers,
     Supervision,
@@ -135,9 +134,9 @@ defmodule Tightbeam.Gateway do
 
   @doc """
   The wire/adapter children to append after Tightbeam.Application's base
-  children (see moduledoc order). Also: ensure schemas for Devices/
-  Idempotency/Wakes/Projection/Org, mint + persist the cliToken and
-  gateway.json (mode 0600) in base_dir, install the CLI bin.
+  children (see moduledoc order). Also: ensure the complete production schema,
+  mint + persist the cliToken and gateway.json (mode 0600) in base_dir, and
+  install the CLI bin.
   """
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
@@ -157,35 +156,7 @@ defmodule Tightbeam.Gateway do
 
     File.mkdir_p!(config.base_dir)
 
-    for module <- [
-          Tightbeam.Assets,
-          Artifacts,
-          CausalEvents,
-          Adjudication,
-          Devices,
-          Idempotency,
-          ConditionFacts,
-          SubagentMarkers,
-          Escalation,
-          Wakes,
-          Projection,
-          Org,
-          CriticalLeases,
-          Roles,
-          WorkItems,
-          Assignments,
-          EffortCheckin,
-          Placement,
-          RailRemedy,
-          Supervision,
-          WorkState
-        ] do
-      :ok = module.ensure_schema(db)
-    end
-
-    # One-time: a pre-DB hosts.json becomes rows and the file is renamed aside
-    # (host-registry-v1). Idempotent — the rename is what retires it.
-    :ok = Placement.migrate_registry!(db, config.base_dir)
+    :ok = Schema.ensure_all(db)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
@@ -196,28 +167,6 @@ defmodule Tightbeam.Gateway do
         db,
         Map.get(config, :adjudication_response_window_ms, 86_400_000)
       )
-
-    migrate_handle_roles(db)
-
-    # Sessions created before real-hostname registration stored the retired
-    # "local" indexical; rewrite once so rows speak the org's vocabulary.
-    {:ok, _} =
-      DB.query(db, "UPDATE sessions SET host = ?1 WHERE host = 'local'", [
-        Placement.local_host_name()
-      ])
-
-    {:ok, rows} =
-      DB.query(db, "SELECT sessionKey FROM sessions WHERE state = 'active' AND cliToken IS NULL")
-
-    Enum.each(rows, fn [session_key] ->
-      token = "tbs_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
-
-      {:ok, _} =
-        DB.query(db, "UPDATE sessions SET cliToken = ?2 WHERE sessionKey = ?1", [
-          session_key,
-          token
-        ])
-    end)
 
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
@@ -740,10 +689,10 @@ defmodule Tightbeam.Gateway do
               {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
                 [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
 
-              {_name, %{ssh: nil}} ->
-                []
-            end)
-            |> Enum.sort_by(& &1.name)
+            {_name, %{ssh: nil}} ->
+              []
+          end)
+          |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
         end),
@@ -999,21 +948,12 @@ defmodule Tightbeam.Gateway do
           [] -> {assignment_id, nil}
         end
 
-      table?(txn, "work_items") ->
+      true ->
         case DB.Txn.q(txn, "SELECT id FROM work_items WHERE routingWakeId = ?1", [wake_id]) do
           [[job_ref]] -> {nil, job_ref}
           [] -> {nil, nil}
         end
-
-      true ->
-        {nil, nil}
     end
-  end
-
-  defp table?(txn, name) do
-    DB.Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name]) == [
-      [1]
-    ]
   end
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
@@ -2645,26 +2585,6 @@ defmodule Tightbeam.Gateway do
   end
 
   defp resolve_caller(_db, _origin), do: nil
-
-  defp migrate_handle_roles(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT handle, sessionKey, ownerUserId
-        FROM sessions WHERE handle IS NOT NULL ORDER BY createdAt, sessionKey
-        """
-      )
-
-    Enum.each(rows, fn [handle, session_key, owner_user_id] ->
-      if is_nil(Roles.get(db, handle)) do
-        case Roles.migrate_handle(db, handle, owner_user_id, session_key) do
-          {:error, error} -> raise error.message
-          _role -> :ok
-        end
-      end
-    end)
-  end
 
   defp admin_origin?(db, origin) do
     case resolve_caller(db, origin) do

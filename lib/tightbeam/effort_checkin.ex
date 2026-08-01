@@ -53,21 +53,7 @@ defmodule Tightbeam.EffortCheckin do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB) do
-    result = DB.execute(db, @ddl)
-
-    for column <- ~w(agentProdded artifactWatermark attestWatermark workItemWatermark) do
-      case DB.query(
-             db,
-             "ALTER TABLE effort_checkin_generations ADD COLUMN #{column} INTEGER NOT NULL DEFAULT 0"
-           ) do
-        {:ok, _} -> :ok
-        {:error, e} -> if inspect(e) =~ "duplicate column", do: :ok, else: raise(e)
-      end
-    end
-
-    result
-  end
+  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
   @spec valid_workdir_root(term()) :: :ok | {:error, map()}
   def valid_workdir_root(nil), do: :ok
@@ -762,23 +748,18 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp supersede_requests_in_txn(txn, assignment_id) do
-    if Txn.q(
-         txn,
-         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'decision_requests'"
-       ) == [[1]] do
-      Txn.q(
-        txn,
-        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-        [assignment_id]
-      )
-      |> Enum.each(fn [wake_id] -> Wakes.cancel_in_txn(txn, wake_id, @origin) end)
+    Txn.q(
+      txn,
+      "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
+    |> Enum.each(fn [wake_id] -> Wakes.cancel_in_txn(txn, wake_id, @origin) end)
 
-      Txn.q(
-        txn,
-        "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-        [assignment_id]
-      )
-    end
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
   end
 
   defp initial_expecter(txn, assignment) do

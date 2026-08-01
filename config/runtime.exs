@@ -60,12 +60,7 @@ if value = System.get_env("TIGHTBEAM_ADVERTISED_URL") do
   config :tightbeam, :advertised_url, value
 end
 
-# Hosts are NOT configured here. `tightbeam assimilate` registers them into
-# <base_dir>/hosts.json, which Placement.hosts/1 reads. A TIGHTBEAM_HOSTS env
-# var used to layer a second host store over that registry and WIN on collision,
-# so a stale entry silently overrode what assimilate had just recorded and the
-# resulting failure pointed at the satellite. Removed 2026-07-28: unrequested
-# surface, one authority, and the gateway's own machine is added by hosts/1.
+# Hosts are registered in the database by `tightbeam assimilate`.
 
 if value = System.get_env("TIGHTBEAM_DRAIN_TIMEOUT_MS") do
   config :tightbeam, :drain_timeout_ms, String.to_integer(value)

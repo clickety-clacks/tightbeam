@@ -5,10 +5,7 @@ defmodule Tightbeam.Wire.SocketTest do
     ConnRegistry,
     DB,
     Devices,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
     Projection,
     Rules
@@ -62,8 +59,7 @@ defmodule Tightbeam.Wire.SocketTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: registry})
 
-    for module <- [Devices, EventLog, Idempotency, Ledger, Org, Projection],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     deps = %{
       db: db,

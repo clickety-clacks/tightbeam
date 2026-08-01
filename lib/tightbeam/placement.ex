@@ -106,37 +106,6 @@ defmodule Tightbeam.Placement do
   def ensure_schema(db \\ DB), do: DB.execute(db, @hosts_ddl)
 
   @doc """
-  Migrate a pre-DB `hosts.json` into the table, once, and rename it aside.
-
-  Idempotent by construction: the rename is what retires the file, so a second
-  boot finds nothing to migrate. Rows already in the table win — a re-run can
-  only add hosts the registry knew and the table did not.
-  """
-  @spec migrate_registry!(DB.server(), String.t()) :: :ok
-  def migrate_registry!(db \\ DB, base_dir) do
-    path = registry_path(base_dir)
-
-    case read_registry(path) do
-      registry when map_size(registry) > 0 ->
-        {:ok, :ok} =
-          DB.transaction(db, fn txn ->
-            Enum.each(registry, fn {name, entry} ->
-              insert_host_if_absent_in_txn(txn, name, entry)
-            end)
-
-            :ok
-          end)
-
-        File.rename!(path, path <> ".migrated")
-        :ok
-
-      _empty ->
-        if File.exists?(path), do: File.rename!(path, path <> ".migrated")
-        :ok
-    end
-  end
-
-  @doc """
   The known hosts map with the gateway's own machine always present under
   `local_host_name/0` (ssh: nil, base_dir = the gateway's base_dir).
 
@@ -481,8 +450,6 @@ defmodule Tightbeam.Placement do
     :ok
   end
 
-  defp registry_path(base_dir), do: Path.join(base_dir, "hosts.json")
-
   # Portable shell: no git, no mktemp, no GNU-only find predicates. A vanished
   # file mid-walk is not a probe failure, so the walk's own stderr is dropped and
   # only the explicit preconditions (a readable root, a writable stamp) fail.
@@ -621,27 +588,6 @@ defmodule Tightbeam.Placement do
     )
   end
 
-  # Migration's insert, NOT the live upsert: the table is the authority, and a
-  # legacy file may only fill gaps. DO NOTHING is what keeps stale file bytes
-  # from overwriting a row that is already a table row.
-  defp insert_host_if_absent_in_txn(txn, name, entry) do
-    DB.Txn.q(
-      txn,
-      """
-      INSERT INTO hosts (name, ssh, baseDir, cliBin, adapterBinDir)
-      VALUES (?1, ?2, ?3, ?4, ?5)
-      ON CONFLICT(name) DO NOTHING
-      """,
-      [
-        name,
-        entry.ssh,
-        entry.base_dir,
-        Map.get(entry, :cli_bin),
-        Map.get(entry, :adapter_bin_dir)
-      ]
-    )
-  end
-
   # No missing-table fallback. A registry table that is not there is a broken
   # substrate, and reading it as "no hosts registered" would deny every spawn
   # while looking like an empty fleet.
@@ -651,24 +597,6 @@ defmodule Tightbeam.Placement do
     Map.new(rows, fn [name, ssh, base_dir, cli_bin, adapter_bin_dir] ->
       {name, %{ssh: ssh, base_dir: base_dir, cli_bin: cli_bin, adapter_bin_dir: adapter_bin_dir}}
     end)
-  end
-
-  defp read_registry(path) do
-    case File.read(path) do
-      {:ok, raw} ->
-        for {name, h} <- JSON.decode!(raw), into: %{} do
-          {name,
-           %{
-             ssh: h["ssh"],
-             base_dir: h["base_dir"],
-             cli_bin: h["cli_bin"],
-             adapter_bin_dir: h["adapter_bin_dir"]
-           }}
-        end
-
-      {:error, :enoent} ->
-        %{}
-    end
   end
 
   @doc "Ensure a session workdir and its converged credential file."

@@ -13,6 +13,7 @@ defmodule Tightbeam.HarnessProcess do
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @command_timeout_ms 5_000
+  @old_schema_refusal "The database carries a pre-release harness_processes shape; it is not upgraded by design. Reset the database and restart Tightbeam."
 
   @process_ddl """
   CREATE TABLE IF NOT EXISTS harness_processes (
@@ -74,67 +75,25 @@ defmodule Tightbeam.HarnessProcess do
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
-    :ok = DB.execute(db, @ddl)
+    case DB.transaction(db, fn txn ->
+           DB.Txn.exec(txn, @ddl)
 
-    {:ok, :ok} =
-      DB.transaction(db, fn txn ->
-        names = MapSet.new(DB.Txn.q(txn, "PRAGMA table_info(harness_processes)"), &Enum.at(&1, 1))
+           DB.Txn.exec(
+             txn,
+             "CREATE INDEX IF NOT EXISTS harness_processes_adapter_launch_sequence ON harness_processes (adapterKey, state, launchSequence)"
+           )
 
-        for {name, declaration} <- [
-              {"helperPath", "TEXT"},
-              {"processGroupId", "INTEGER"},
-              {"launchSequence", "INTEGER"},
-              {"bootIdentity", "TEXT"},
-              {"identityToken", "TEXT"},
-              {"killAttemptedAt", "INTEGER"}
-            ],
-            not MapSet.member?(names, name) do
-          DB.Txn.exec(txn, "ALTER TABLE harness_processes ADD COLUMN #{name} #{declaration}")
-        end
-
-        DB.Txn.q(
-          txn,
-          "UPDATE harness_processes SET launchSequence = rowid WHERE launchSequence IS NULL"
-        )
-
-        [[table_sql]] =
-          DB.Txn.q(txn, "SELECT sql FROM sqlite_master WHERE name = 'harness_processes'")
-
-        if String.contains?(table_sql, "'unconfirmed'") do
-          DB.Txn.exec(txn, "ALTER TABLE harness_processes RENAME TO harness_processes_previous")
-          DB.Txn.exec(txn, @process_ddl)
-
-          DB.Txn.exec(
-            txn,
-            """
-            INSERT INTO harness_processes
-              (launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
-               launchSequence, osPid, processGroupId, bootIdentity, identityToken,
-               state, createdAt, parkRequestedAt, killAttemptedAt, killSentAt, resolvedAt,
-               lastError)
-            SELECT launchId, adapterKey, harness, preset, host, ssh,
-                   COALESCE(helperPath, ''), identityPath, launchSequence, osPid, processGroupId,
-                   bootIdentity, identityToken,
-                   CASE state WHEN 'unconfirmed' THEN 'kill_failed' ELSE state END,
-                   createdAt, parkRequestedAt, killAttemptedAt, killSentAt, resolvedAt,
-                   lastError
-              FROM harness_processes_previous
-            """
-          )
-
-          DB.Txn.exec(txn, "DROP TABLE harness_processes_previous")
-        end
-
+           :ok
+         end) do
+      {:ok, :ok} ->
         :ok
-      end)
 
-    :ok =
-      DB.execute(
-        db,
-        "CREATE INDEX IF NOT EXISTS harness_processes_adapter_launch_sequence ON harness_processes (adapterKey, state, launchSequence)"
-      )
+      {:error, %MatchError{term: {:error, "no such column: launchSequence"}}} ->
+        raise DB.Error, message: @old_schema_refusal
 
-    :ok
+      {:error, error} ->
+        {:error, error}
+    end
   end
 
   @doc "Insert the durable launch event and wrap the target command to record its identity."

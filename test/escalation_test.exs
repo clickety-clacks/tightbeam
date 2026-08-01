@@ -9,10 +9,7 @@ defmodule Tightbeam.EscalationTest do
     Escalation,
     EventLog,
     Gateway,
-    Ledger,
     Org,
-    Projection,
-    Roles,
     Wakes
   }
 
@@ -35,18 +32,7 @@ defmodule Tightbeam.EscalationTest do
     scheduler = :"escalation_scheduler_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          EventLog,
-          Ledger,
-          Projection,
-          Org,
-          Roles,
-          Devices,
-          ConditionFacts,
-          Wakes,
-          Escalation
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = ensure_all_schemas(db)
 
     raiser = session(db, "raiser", "flynn")
 

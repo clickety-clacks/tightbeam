@@ -1,6 +1,6 @@
 defmodule Tightbeam.ApplicationTest do
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.{DB, Ledger, EventLog}
+  alias Tightbeam.{DB, Escalation, EventLog, Ledger}
 
   setup do
     base = Path.join(System.tmp_dir!(), "tb_app_#{System.unique_integer([:positive])}")
@@ -16,7 +16,7 @@ defmodule Tightbeam.ApplicationTest do
     %{sup: sup}
   end
 
-  test "supervised tree: DB alive, schemas present, boot epoch recorded" do
+  test "boot on a fresh database creates every schema before recovery" do
     assert Process.whereis(DB) |> is_pid()
     assert Process.whereis(Tightbeam.LaneRegistry) |> is_pid()
     assert Process.whereis(Tightbeam.LaneSupervisor) |> is_pid()
@@ -24,9 +24,23 @@ defmodule Tightbeam.ApplicationTest do
     assert {:ok, [[0]]} = DB.query(DB, "SELECT COUNT(*) FROM turns")
     assert {:ok, [[n]]} = DB.query(DB, "SELECT COUNT(*) FROM boot_epochs")
     assert n >= 1
+    assert {:ok, [[1]]} = DB.query(DB, "PRAGMA foreign_keys")
     assert is_integer(Application.get_env(:tightbeam, :boot_epoch))
     assert Ledger.pending_sessions(DB) == []
+    assert Escalation.recover_retired(DB) == :ok
     assert EventLog.events_after(DB, 0, 10) == []
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               DB,
+               "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               DB,
+               "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'harness_processes'"
+             )
 
     expected =
       "[" <> Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <> "]"

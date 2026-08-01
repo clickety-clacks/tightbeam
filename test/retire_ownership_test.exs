@@ -18,18 +18,10 @@ defmodule Tightbeam.RetireOwnershipTest do
     Assignments,
     ConnRegistry,
     DB,
-    Devices,
     EffortCheckin,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
-    Roles,
-    Wakes,
-    WorkItems,
-    WorkState
+    Roles
   }
 
   setup do
@@ -37,27 +29,7 @@ defmodule Tightbeam.RetireOwnershipTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          Tightbeam.ConditionFacts,
-          Idempotency,
-          Ledger,
-          EventLog,
-          Tightbeam.Escalation,
-          Wakes,
-          Projection,
-          Org,
-          Roles,
-          WorkItems,
-          Assignments,
-          Tightbeam.CriticalLeases,
-          Tightbeam.Adjudication,
-          Tightbeam.Artifacts,
-          WorkState,
-          Tightbeam.Placement
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok =
       DB.execute(

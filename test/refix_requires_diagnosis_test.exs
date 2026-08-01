@@ -4,49 +4,22 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   alias Tightbeam.{
     Archetypes,
     Assignments,
-    ConditionFacts,
     DB,
-    Devices,
     Dispatch,
-    EventLog,
     Gateway,
     Identity,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
     RailRemedy,
     Roles,
     Rules,
-    Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   setup do
     db = :"refix_diagnosis_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Tightbeam.Artifacts,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          Org,
-          Projection,
-          Roles,
-          Wakes,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EventLog,
-          RailRemedy,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(

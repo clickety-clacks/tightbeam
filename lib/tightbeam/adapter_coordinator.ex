@@ -182,9 +182,9 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   @doc """
-  The epoch counter's table. Created by the coordinator itself at init rather
-  than by the org schema sweep, because the coordinator is also started directly
-  (tests, tooling) and its epoch must be durable in every case.
+  The epoch counter's table. Created by the canonical schema bootstrap and
+  re-ensured by the coordinator itself because the coordinator is also started
+  directly (tests, tooling) and its epoch must be durable in every case.
   """
   @spec ensure_schema(GenServer.server()) :: :ok | {:error, term()}
   def ensure_schema(db) do

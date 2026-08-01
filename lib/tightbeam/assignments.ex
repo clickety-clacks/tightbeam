@@ -92,8 +92,6 @@ defmodule Tightbeam.Assignments do
   )
   """
 
-  @attests_rebuild_ddl String.replace(@attests_ddl, "IF NOT EXISTS attests", "attests_new")
-
   @assignment_files_ddl """
   CREATE TABLE IF NOT EXISTS assignment_files (
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
@@ -119,10 +117,6 @@ defmodule Tightbeam.Assignments do
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
-    ensure_attests_shape(db)
-    ensure_commit_refs_column(db)
-    ensure_work_item_column(db)
-    ensure_assignment_columns(db)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
@@ -1655,109 +1649,5 @@ defmodule Tightbeam.Assignments do
       commitRefs: commit_refs && JSON.decode!(commit_refs),
       ts: ts
     }
-  end
-
-  defp ensure_attests_shape(db) do
-    {:ok, [[sql]]} =
-      DB.query(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attests'")
-
-    target_fragments = [
-      "producer TEXT NULL",
-      "producerCommand TEXT NULL",
-      "byHarness TEXT NULL",
-      "byProvider TEXT NULL",
-      "CHECK(producer IS NULL OR kind = 'verdict')",
-      "CHECK(producerCommand IS NULL OR producer IS NOT NULL)",
-      "CHECK(byHarness IS NULL OR kind = 'verdict')",
-      "CHECK(byProvider IS NULL OR kind = 'verdict')",
-      "CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000)"
-    ]
-
-    unless Enum.all?(target_fragments, &String.contains?(sql, &1)) do
-      {:ok, table_info} = DB.query(db, "PRAGMA table_info(attests)")
-      existing = MapSet.new(table_info, &Enum.at(&1, 1))
-
-      final_columns = [
-        "id",
-        "assignmentId",
-        "kind",
-        "verdictKind",
-        "note",
-        "bySession",
-        "byUser",
-        "producer",
-        "producerCommand",
-        "byHarness",
-        "byProvider",
-        "commitRefs",
-        "ts"
-      ]
-
-      copied_columns = Enum.filter(final_columns, &MapSet.member?(existing, &1))
-      copied = Enum.join(copied_columns, ", ")
-
-      :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-
-      try do
-        {:ok, :ok} =
-          DB.transaction(db, fn txn ->
-            Txn.exec(txn, @attests_rebuild_ddl)
-
-            Txn.q(
-              txn,
-              "INSERT INTO attests_new (#{copied}) SELECT #{copied} FROM attests"
-            )
-
-            Txn.exec(txn, "DROP TABLE attests")
-            Txn.exec(txn, "ALTER TABLE attests_new RENAME TO attests")
-
-            case Txn.q(txn, "PRAGMA foreign_key_check") do
-              [] -> :ok
-              rows -> raise DB.Error, message: "foreign key check failed: #{inspect(rows)}"
-            end
-          end)
-      after
-        :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-      end
-    end
-
-    :ok
-  end
-
-  defp ensure_commit_refs_column(db) do
-    case DB.query(db, "ALTER TABLE attests ADD COLUMN commitRefs TEXT") do
-      {:ok, _} -> :ok
-      {:error, reason} -> if inspect(reason) =~ "duplicate column", do: :ok, else: raise(reason)
-    end
-  end
-
-  defp ensure_work_item_column(db) do
-    case DB.query(
-           db,
-           "ALTER TABLE assignments ADD COLUMN workItemId TEXT REFERENCES work_items(id)"
-         ) do
-      {:ok, _} ->
-        :ok
-
-      {:error, reason} ->
-        if inspect(reason) =~ "duplicate column",
-          do: :ok,
-          else: raise(reason)
-    end
-  end
-
-  defp ensure_assignment_columns(db) do
-    for ddl <- [
-          "ALTER TABLE assignments ADD COLUMN reviewsAssignmentId TEXT REFERENCES assignments(id)",
-          "ALTER TABLE assignments ADD COLUMN holderHarness TEXT",
-          "ALTER TABLE assignments ADD COLUMN holderProvider TEXT"
-        ] do
-      case DB.query(db, ddl) do
-        {:ok, _} -> :ok
-        {:error, reason} -> if inspect(reason) =~ "duplicate column", do: :ok, else: raise(reason)
-      end
-    end
-
-    :ok
   end
 end

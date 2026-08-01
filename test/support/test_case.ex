@@ -48,7 +48,13 @@ defmodule Tightbeam.TestCase do
   using do
     quote do
       import Tightbeam.TestCase,
-        only: [register_hosts: 2, catalog_reply: 1, catalog_reply: 2, catalog_probe_harness: 1]
+        only: [
+          register_hosts: 2,
+          catalog_reply: 1,
+          catalog_reply: 2,
+          catalog_probe_harness: 1,
+          ensure_all_schemas: 1
+        ]
     end
   end
 
@@ -72,6 +78,9 @@ defmodule Tightbeam.TestCase do
 
     :ok
   end
+
+  @doc "Create the complete production schema for a unit-test database."
+  def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
 
   @doc """
   Register satellite hosts the way the product does.

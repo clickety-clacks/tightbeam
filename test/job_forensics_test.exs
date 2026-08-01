@@ -10,26 +10,16 @@ defmodule Tightbeam.JobForensicsTest do
 
   alias Tightbeam.{
     Adjudication,
-    Assignments,
     CausalEvents,
-    ConditionFacts,
-    CriticalLeases,
     DB,
-    Devices,
     EffortCheckin,
-    Escalation,
-    EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     Org,
-    Projection,
-    Roles,
     SubagentMarkers,
     Supervision,
     Wakes,
-    WorkItems,
-    WorkState
+    WorkItems
   }
 
   alias Tightbeam.DB.Txn
@@ -54,28 +44,7 @@ defmodule Tightbeam.JobForensicsTest do
     lane =
       start_supervised!({LaneDoorbell, :"forensics_lane_#{System.unique_integer([:positive])}"})
 
-    for module <- [
-          CausalEvents,
-          Devices,
-          ConditionFacts,
-          Idempotency,
-          Ledger,
-          EventLog,
-          Escalation,
-          Wakes,
-          Projection,
-          Org,
-          CriticalLeases,
-          Roles,
-          WorkItems,
-          Assignments,
-          WorkState,
-          EffortCheckin,
-          Adjudication,
-          Supervision,
-          SubagentMarkers
-        ],
-        do: :ok = module.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     :ok =
       DB.execute(
@@ -86,15 +55,11 @@ defmodule Tightbeam.JobForensicsTest do
     %{db: db, registry: registry, lane: lane}
   end
 
-  ## Proof 9 — migration
+  ## Proof 9 — final schema
 
-  test "proof 9: every column is an additive ALTER, causal_events is fresh, rows survive", %{
+  test "proof 9: every final column and causal-event index is present", %{
     db: db
   } do
-    # A pre-v2 database: the tables exist, with rows, and none of the new
-    # columns. ensure_schema must widen them without touching the rows.
-    :ok = DB.execute(db, "DROP TABLE causal_events")
-
     for {table, column} <- [
           {"wakes", "assignmentId"},
           {"wakes", "canceledAt"},
@@ -105,16 +70,11 @@ defmodule Tightbeam.JobForensicsTest do
       assert column in columns(db, table), "#{table}.#{column} must exist after ensure_schema"
     end
 
-    wake = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "p", due_at: 1})
-
-    # Re-running the migration is a no-op that preserves the row (duplicate
-    # column errors are swallowed; anything else raises).
     :ok = Wakes.ensure_schema(db)
     :ok = Adjudication.ensure_schema(db)
     :ok = SubagentMarkers.ensure_schema(db)
     :ok = CausalEvents.ensure_schema(db)
 
-    assert Wakes.get(db, wake.wake_id).wake_id == wake.wake_id
     assert "causal_events" in tables(db)
 
     indexes = indexes(db, "causal_events")

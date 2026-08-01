@@ -20,22 +20,10 @@ defmodule Tightbeam.Wire.SeamTest do
   import Plug.Conn
 
   alias Tightbeam.{
-    Artifacts,
-    Assignments,
-    ConditionFacts,
     DB,
-    Devices,
-    EventLog,
     Gateway,
-    Idempotency,
-    Ledger,
     Org,
-    Projection,
-    Roles,
-    Rules,
-    Wakes,
-    WorkItems,
-    WorkState
+    Rules
   }
 
   alias Tightbeam.Wire.Router
@@ -44,27 +32,7 @@ defmodule Tightbeam.Wire.SeamTest do
     db = :"wire_seam_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Artifacts,
-          Assignments,
-          ConditionFacts,
-          Devices,
-          EventLog,
-          Idempotency,
-          Ledger,
-          Org,
-          Projection,
-          Roles,
-          Wakes,
-          WorkItems,
-          WorkState,
-          Tightbeam.CausalEvents,
-          Tightbeam.EffortCheckin,
-          Tightbeam.Escalation,
-          Tightbeam.Placement
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")

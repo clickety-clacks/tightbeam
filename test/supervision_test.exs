@@ -2,27 +2,19 @@ defmodule Tightbeam.SupervisionTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
-    Adjudication,
     Assignments,
     ConnRegistry,
-    ConditionFacts,
     DB,
-    Devices,
-    Escalation,
     EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     Org,
-    Placement,
     Projection,
     RailRemedy,
     Roles,
     Rules,
     Supervision,
-    Wakes,
-    WorkItems,
-    WorkState
+    Wakes
   }
 
   defmodule LaneDoorbell do
@@ -103,27 +95,7 @@ defmodule Tightbeam.SupervisionTest do
     db = :"supervision_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    for module <- [
-          Tightbeam.CausalEvents,
-          Devices,
-          EventLog,
-          Idempotency,
-          Projection,
-          Org,
-          Roles,
-          WorkItems,
-          Assignments,
-          Ledger,
-          ConditionFacts,
-          Wakes,
-          Escalation,
-          Supervision,
-          WorkState,
-          Adjudication,
-          RailRemedy
-        ] do
-      :ok = module.ensure_schema(db)
-    end
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
@@ -1309,7 +1281,7 @@ defmodule Tightbeam.SupervisionTest do
   defp stage_rail_wrapper(ctx, script) do
     # The rail resolves the holder's workdir through the host registry, so the table has
     # to exist; without it the resolution fails and the deny classes `script_error`.
-    :ok = Placement.ensure_schema(ctx.db)
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET host = 'testhost' WHERE sessionKey = ?1", [
