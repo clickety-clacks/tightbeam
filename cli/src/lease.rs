@@ -10,6 +10,12 @@ use std::time::Instant;
 /// deadline; a DNS lookup already running may finish in this detached worker
 /// afterward. Terminating the lookup itself would require the narrower hard
 /// isolation boundary of a child process that can be killed at the deadline.
+///
+/// Ceremony calls are serial and share one absolute deadline. If a worker reaches
+/// that deadline, its caller returns the ceremony failure; another call in that
+/// ceremony cannot start with time remaining. Concurrent CLI invocations live in
+/// separate processes, where an in-process abandonment counter could not coordinate
+/// them. A process-wide limiter therefore cannot guard a reachable second worker.
 pub(crate) fn until<T, F>(deadline: Instant, work: F) -> Result<T, ()>
 where
     T: Send + 'static,

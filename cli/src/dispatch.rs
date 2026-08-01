@@ -781,9 +781,10 @@ fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
 /// ceremony must name the satellite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provisioned {
-    /// A satellite's file. It names the gateway's advertised url and this host's
-    /// REGISTERED name.
-    Satellite { machine: String },
+    /// A satellite's file. It names the gateway's advertised url, and carries this
+    /// host's REGISTERED name unless an older gateway wrote it (`Placement.write_endpoint`
+    /// has included `machine` since 4dd0d39; a gateway restart rewrites every host's).
+    Satellite { machine: Option<String> },
     /// The gateway host's own file: a port, and no machine. The gateway defaults an
     /// unnamed onboarding machine to its own hostname, which is correct exactly here.
     GatewayHost,
@@ -812,10 +813,11 @@ fn provisioned_in(base_dir: &Path) -> Provisioned {
     };
     // The url/port split is the same one `endpoint_from_gateway_file` reads, and for the
     // same reason: only a satellite's file names a url.
-    match (text("url"), text("machine")) {
-        (Some(_), Some(machine)) => Provisioned::Satellite { machine },
-        (None, _) => Provisioned::GatewayHost,
-        _ => Provisioned::Absent,
+    match text("url") {
+        Some(_) => Provisioned::Satellite {
+            machine: text("machine"),
+        },
+        None => Provisioned::GatewayHost,
     }
 }
 
@@ -2037,13 +2039,13 @@ mod tests {
                 "satellite",
                 r#"{"url":"http://gw:11373","cliToken":"t","machine":"work-1"}"#,
                 Provisioned::Satellite {
-                    machine: "work-1".to_owned(),
+                    machine: Some("work-1".to_owned()),
                 },
             ),
             (
-                "invalid_satellite",
+                "stale_satellite",
                 r#"{"url":"http://gw:11373","cliToken":"t"}"#,
-                Provisioned::Absent,
+                Provisioned::Satellite { machine: None },
             ),
             (
                 "gateway_host",

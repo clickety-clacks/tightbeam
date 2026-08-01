@@ -32,12 +32,21 @@ fn staging_path(ready: &serde_json::Value) -> Result<&str, String> {
         .ok_or_else(|| "onboarding did not return a staging path".to_owned())
 }
 
-fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Result<Instant, String> {
+/// How long the gateway's lease on this ceremony runs, read off the same `begin` reply as
+/// the staging path (and camelCase for the same reason).
+///
+/// The ceremony watchdog and the server-side lease must expire together, so the TTL is one
+/// fact owned by `production_config` and carried on the wire. A gateway too old to send it
+/// falls back to the CLI's own bound rather than running unbounded.
+fn lease_timeout(ready: &serde_json::Value) -> Duration {
     ready
         .get("leaseTtlMs")
         .and_then(serde_json::Value::as_u64)
-        .map(|ttl| now + Duration::from_millis(ttl))
-        .ok_or_else(|| "onboarding did not return leaseTtlMs".to_owned())
+        .map_or(CEREMONY_FALLBACK_TIMEOUT, Duration::from_millis)
+}
+
+fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
+    now + lease_timeout(ready)
 }
 
 type HarnessLoader<'a> = dyn Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String> + 'a;
@@ -75,14 +84,46 @@ where
         machine.as_deref(),
         None,
     );
-    let ready = send_request(endpoint, &begin, None)?
-        .ok_or_else(|| "onboarding did not return a staging path".to_owned())?;
-    let deadline = lease_deadline(&ready, Instant::now())?;
-    let staging = staging_path(&ready)?;
+    let ready = send_request(endpoint, &begin, None)?;
+    let deadline = ready.as_ref().map_or_else(
+        || Instant::now() + CEREMONY_FALLBACK_TIMEOUT,
+        |ready| lease_deadline(ready, Instant::now()),
+    );
     let ceremony = Ceremony {
         endpoint,
         deadline,
         load_harnesses: &load_harnesses,
+    };
+    let ready = match ready {
+        Some(ready) => ready,
+        None => {
+            let reason = "onboarding did not return a staging path";
+            return Err(cancel_after_begin(
+                identity,
+                provider,
+                kind,
+                machine.as_deref(),
+                None,
+                reason,
+                &ceremony,
+                &send_request,
+            ));
+        }
+    };
+    let staging = match staging_path(&ready) {
+        Ok(staging) => staging,
+        Err(reason) => {
+            return Err(cancel_after_begin(
+                identity,
+                provider,
+                kind,
+                machine.as_deref(),
+                None,
+                &reason,
+                &ceremony,
+                &send_request,
+            ));
+        }
     };
 
     let staged = if api_key {
@@ -98,22 +139,16 @@ where
         } else {
             None
         };
-        let cancel = dispatch::build_onboard_phase_request(
+        return Err(cancel_after_begin(
             identity,
             provider,
-            "cancel",
             kind,
             machine.as_deref(),
             classified,
-        );
-        if let Err(cancel_reason) =
-            send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline))
-        {
-            if cancel_reason.contains("onboarding lease expired") {
-                return Err(format!("{reason}; {cancel_reason}"));
-            }
-        }
-        return Err(reason);
+            &reason,
+            &ceremony,
+            &send_request,
+        ));
     }
 
     let finish = dispatch::build_onboard_phase_request(
@@ -134,25 +169,43 @@ where
         Ok(None) => {}
         Err(reason) => {
             let _ = fs::remove_dir_all(staging);
-            let cancel = dispatch::build_onboard_phase_request(
+            return Err(cancel_after_begin(
                 identity,
                 provider,
-                "cancel",
                 kind,
                 machine.as_deref(),
                 None,
-            );
-            if let Err(cancel_reason) =
-                send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline))
-            {
-                if cancel_reason.contains("onboarding lease expired") {
-                    return Err(format!("{reason}; {cancel_reason}"));
-                }
-            }
-            return Err(reason);
+                &reason,
+                &ceremony,
+                &send_request,
+            ));
         }
     }
     Ok(())
+}
+
+fn cancel_after_begin<S>(
+    identity: &Identity,
+    provider: &str,
+    kind: &str,
+    machine: Option<&str>,
+    classified: Option<&str>,
+    reason: &str,
+    ceremony: &Ceremony<'_>,
+    send_request: &S,
+) -> String
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+{
+    let cancel = dispatch::build_onboard_phase_request(
+        identity, provider, "cancel", kind, machine, classified,
+    );
+    match send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline)) {
+        Err(cancel_reason) if cancel_reason.contains("onboarding lease expired") => {
+            format!("{reason}; {cancel_reason}")
+        }
+        _ => reason.to_owned(),
+    }
 }
 
 /// Which machine this ceremony acts on.
@@ -179,7 +232,13 @@ fn onboard_machine(
     }
     match provisioned {
         dispatch::Provisioned::GatewayHost => Ok(None),
-        dispatch::Provisioned::Satellite { machine: name } => Ok(Some(name)),
+        dispatch::Provisioned::Satellite {
+            machine: Some(name),
+        } => Ok(Some(name)),
+        dispatch::Provisioned::Satellite { machine: None } => Err(unnamed_machine(
+            "this satellite's gateway.json has a URL but does not name this machine; restarting \
+             the gateway rewrites it for every registered host",
+        )),
         dispatch::Provisioned::Absent => Err(unnamed_machine(
             "there is no gateway.json here, so this machine cannot say what it is \
              registered as",
@@ -195,6 +254,14 @@ fn unnamed_machine(because: &str) -> String {
          it the gateway would onboard ITSELF instead of this machine."
     )
 }
+
+/// How long a ceremony may hold the terminal before the watchdog reaps it.
+///
+/// The gateway's `begin` reply carries the lease TTL it just started, so the CLI bound and
+/// the server bound are one fact with one home. This fallback covers only a gateway too old
+/// to send the field; a permanent second constant here would drift from `production_config`
+/// the first time either side is tuned.
+const CEREMONY_FALLBACK_TIMEOUT: Duration = Duration::from_secs(1_800);
 
 /// Hands the controlling terminal to a child's process group, and takes it back on drop.
 ///
@@ -1632,10 +1699,50 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            lease_deadline(&ready, now).unwrap().duration_since(now),
+            lease_deadline(&ready, now).duration_since(now),
             Duration::from_millis(12_345)
         );
-        assert!(lease_deadline(&serde_json::json!({}), now).is_err());
+        assert_eq!(
+            lease_deadline(&serde_json::json!({}), now).duration_since(now),
+            CEREMONY_FALLBACK_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn a_failure_after_begin_sends_cancel_on_the_ceremony_deadline() {
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            session_file: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline,
+            load_harnesses: &|_, _| Ok(None),
+        };
+        let sent = std::cell::RefCell::new(Vec::new());
+
+        let reason = cancel_after_begin(
+            &Identity::User("flynn".to_owned()),
+            "anthropic",
+            "subscription",
+            Some("worker"),
+            None,
+            "malformed begin reply",
+            &ceremony,
+            &|_, request, request_deadline| {
+                sent.borrow_mut()
+                    .push((request.body_json.clone(), request_deadline));
+                Ok(None)
+            },
+        );
+
+        assert_eq!(reason, "malformed begin reply");
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].0.contains(r#""phase":"cancel""#), "{}", sent[0].0);
+        assert_eq!(sent[0].1, Some(deadline));
     }
 
     #[test]
@@ -2232,17 +2339,27 @@ mod tests {
             onboard_machine(
                 None,
                 dispatch::Provisioned::Satellite {
-                    machine: "work-1".to_owned()
+                    machine: Some("work-1".to_owned())
                 }
             ),
             Ok(Some("work-1".to_owned())),
             "a provisioned satellite needs no operator env"
         );
 
-        let reason = onboard_machine(None, dispatch::Provisioned::Absent).unwrap_err();
-        assert!(reason.contains("TIGHTBEAM_MACHINE"), "{reason}");
-        assert!(reason.contains("REGISTERED"), "{reason}");
-        assert!(reason.contains("onboard ITSELF"), "{reason}");
+        for invalid in [
+            dispatch::Provisioned::Satellite { machine: None },
+            dispatch::Provisioned::Absent,
+        ] {
+            let reason = onboard_machine(None, invalid).unwrap_err();
+            assert!(reason.contains("TIGHTBEAM_MACHINE"), "{reason}");
+            assert!(reason.contains("REGISTERED"), "{reason}");
+            assert!(reason.contains("onboard ITSELF"), "{reason}");
+        }
+
+        let stale =
+            onboard_machine(None, dispatch::Provisioned::Satellite { machine: None }).unwrap_err();
+        assert!(stale.contains("gateway.json has a URL"), "{stale}");
+        assert!(!stale.contains("there is no gateway.json"), "{stale}");
     }
 
     /// Both legs failed on a missing harness CLI and neither said so: openai surfaced a

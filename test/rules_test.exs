@@ -150,6 +150,16 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
+  test "subagent facts are refused by the observability-only registration boundary", ctx do
+    path = put_raw(ctx, rule("no-child-obligation", "post", "subagent_stop", "eq", "child"))
+
+    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+
+    assert error.message =~ path
+    assert error.message =~ "observability-only"
+    refute error.message =~ "unknown fact"
+  end
+
   test "duplicate names across tables and files identify file and rule", ctx do
     put_raw(ctx, rule("same", "post", "caller.origin_class", "eq", "user"), "a.toml")
     path = put_raw(ctx, rule("same", "post", "caller.origin_class", "eq", "agent"), "b.toml")

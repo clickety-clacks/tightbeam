@@ -64,6 +64,7 @@ fn parse(encoded: &str) -> Result<HarnessCatalog, String> {
                         .ok_or_else(|| "harness process marker is not a string".to_owned())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            string("id")?;
             Ok(HarnessProjection {
                 wire_name: string("wire_name")?,
                 install_package: string("install_package")?,
@@ -240,6 +241,29 @@ mod tests {
             .unwrap_err()
             .contains("missing cli_binary")
         );
+    }
+
+    #[test]
+    fn a_cached_projection_without_an_id_uses_the_live_route() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-missing-harness-id-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("harnesses.json"),
+            r#"[{"wire_name":"cached","install_package":"pkg","cli_binary":"cached-cli","process_markers":[]}]"#,
+        )
+        .unwrap();
+
+        let live = r#"[{"id":"live","wire_name":"live","install_package":"live-pkg","cli_binary":"live-cli","process_markers":[]}]"#;
+        let catalog = load_from_with(&root, || parse(live)).unwrap();
+
+        assert_eq!(catalog.names(), vec!["live"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
