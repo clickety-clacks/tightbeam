@@ -2131,7 +2131,7 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
-  test "update-clients enumerates satellites without an admin guard", ctx do
+  test "update-clients refuses non-admin callers and enumerates satellites for admins", ctx do
     register_hosts(ctx.db, %{
       "alpha" => %{
         ssh: "flynn@alpha.local",
@@ -2141,14 +2141,23 @@ defmodule Tightbeam.GatewayTest do
       "beta" => %{ssh: "beta.local", base_dir: "/srv/beta", cli_bin: nil}
     })
 
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["update-clients"]
+
+    assert %{code: "forbidden", message: "admin required"} =
+             handler.(%{
+               origin: "agent:operator:app",
+               session_key: nil,
+               params: %{}
+             })
+
     assert %{
              hosts: [
                %{name: "alpha", ssh: "flynn@alpha.local", cli_bin: "/srv/alpha/bin"},
                %{name: "beta", ssh: "beta.local", cli_bin: nil}
              ]
            } =
-             Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["update-clients"].(%{
-               origin: "agent:operator:app",
+             handler.(%{
+               origin: "user:flynn",
                session_key: nil,
                params: %{}
              })
