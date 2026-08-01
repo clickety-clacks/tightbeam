@@ -220,6 +220,9 @@ pub enum Command {
         setting: String,
         value: String,
     },
+    UpdateClients {
+        identity: Identity,
+    },
     Assimilate(AssimilateArgs),
 }
 
@@ -1238,6 +1241,14 @@ fn parse_with_optional_catalog(
         "identity" => parse_identity_command(&parsed, flags),
         "onboard" => parse_onboard(&parsed, flags),
         "config" => parse_config(&parsed, flags),
+        "update-clients" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam update-clients".to_owned());
+            }
+            Ok(Command::UpdateClients {
+                identity: identity(flags)?,
+            })
+        }
         "assimilate" => {
             let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
                 "usage: tightbeam assimilate <ssh-dest> --as-user <adminUserId>".to_owned()
@@ -1475,6 +1486,16 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
+            })
+        );
+    }
+
+    #[test]
+    fn update_clients_accepts_any_normal_identity() {
+        assert_eq!(
+            parse(strings(&["update-clients", "--as", "coder"])),
+            Ok(Command::UpdateClients {
+                identity: Identity::Role("coder".to_owned())
             })
         );
     }

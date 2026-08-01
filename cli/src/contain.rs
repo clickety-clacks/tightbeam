@@ -6,6 +6,8 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::child_process::{exited_without_reaping, reset_sigchld_before_spawn};
+
 const PASS: i32 = 0;
 const SCRIPT_ERROR: i32 = 10;
 const SCRIPT_TIMEOUT: i32 = 20;
@@ -126,46 +128,6 @@ fn spawn_contained(command: &mut std::process::Command) -> io::Result<std::proce
     unreachable!("the loop returns on the final attempt")
 }
 
-/// Has the leader exited? Asked WITHOUT reaping it.
-///
-/// A pid is a valid signal target only until it is reaped — that is a state transition,
-/// not a window, and no delay makes signalling a reaped pid safer. `try_wait` here would
-/// reap: `waitpid(WNOHANG)` returns the status and frees the pid in the same call. The
-/// wait loop below deliberately stays armed past the leader's exit, because a descendant
-/// may still hold stdout, so the pid it eventually hands to `killpg` would by then be a
-/// number the kernel was free to reissue — on a busy linux host, with `pid_max` at 32768,
-/// to an unrelated process group that then takes an unhandleable SIGKILL.
-///
-/// `WNOWAIT` is the one flag that separates the two things `waitpid` does at once: it
-/// reports the exit and leaves the child a zombie. A zombie still occupies its pid, and
-/// the pid is the group id, so the group the wrapper is holding a claim on cannot be
-/// reissued underneath it. The reap moves to after the signal.
-///
-/// `waitid` rather than `waitpid` because `WNOWAIT` is documented as a `waitid`-only
-/// option on both platforms — it is not in `waitpid`'s option set. The struct is zeroed
-/// first and read back through `si_signo`, which POSIX.1-2008 TC1 requires to be cleared
-/// when `WNOHANG` finds nothing, and which is a plain field on both linux and darwin (the
-/// `si_pid` the same paragraph names is behind an accessor on linux and a field on
-/// darwin, and would have cost a `cfg` to read for no additional guarantee).
-fn exited_without_reaping(child: &std::process::Child) -> io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id() as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(info.si_signo != 0)
-}
-
 fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
     // Staging happens before the fork so a containment that cannot be built is a fact
     // this process observes directly, rather than an exit code to be inferred from a
@@ -216,20 +178,7 @@ fn run_with_input(args: RailExecArgs, input: Vec<u8>) -> i32 {
         });
     }
 
-    // Whether a dead child becomes a zombie is decided by THIS process's SIGCHLD
-    // disposition, not the child's: with SIGCHLD ignored, the kernel reaps on our behalf
-    // the instant the child dies, there is nothing left to wait for, and the pid is
-    // released with no wait of ours involved. Everything below depends on the opposite —
-    // the leader's pid stays ours until we reap it, which is what makes the group id safe
-    // to signal at the deadline. `SIG_IGN` is inherited across `exec`, so the wrapper can
-    // arrive here already holding a disposition some ancestor chose, and the mechanism
-    // would be defeated by an environment rather than by anything in this file. Reset it
-    // before the fork, so what we inherit cannot decide it. Measured on both platforms —
-    // linux auto-reaps under the inherited ignore, darwin does not — in
-    // `tests/rail_exec_sigchld_ignored.rs`, which is red on linux without this line.
-    unsafe {
-        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-    }
+    reset_sigchld_before_spawn();
 
     // A failed spawn is read as a refusal on both platforms. On macOS that is exactly what
     // it means; on linux the script is the command, so an unexecutable script would land

@@ -733,6 +733,22 @@ defmodule Tightbeam.Gateway do
               %{code: to_string(reason), message: endpoint_failure_message(reason, p.name)}
           end
         end),
+      "update-clients" =>
+        fn _call ->
+          hosts =
+            config.base_dir
+            |> Placement.hosts(db)
+            |> Enum.flat_map(fn
+              {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
+                [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
+
+              {_name, %{ssh: nil}} ->
+                []
+            end)
+            |> Enum.sort_by(& &1.name)
+
+          %{hosts: hosts}
+        end,
       "identity-edit" =>
         admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
       "identity-status" =>

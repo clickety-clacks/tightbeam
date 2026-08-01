@@ -93,6 +93,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
@@ -657,6 +658,10 @@ pub fn build_register_host_request(
     )
 }
 
+pub fn build_update_clients_request(identity: &Identity) -> RequestSpec {
+    request(identity, "update-clients", vec![], vec![])
+}
+
 pub fn discover() -> Result<Endpoint, String> {
     #[allow(deprecated)]
     let home = std::env::home_dir().unwrap_or_default();
@@ -973,6 +978,7 @@ where
             unreachable!("help is handled before dispatch")
         }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
+        Command::UpdateClients { identity } => crate::ceremonies::update_clients(&identity),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::Onboard {
             identity,
@@ -1062,6 +1068,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Doctor { .. }
         | Command::ToolCallObserved
         | Command::Assimilate(_) => None,
+        Command::UpdateClients { identity } => Some(identity),
     }
 }
 

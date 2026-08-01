@@ -1,6 +1,7 @@
 mod args;
 mod base_dir;
 mod ceremonies;
+mod child_process;
 mod contain;
 mod dispatch;
 mod harnesses;
