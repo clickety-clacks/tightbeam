@@ -78,14 +78,25 @@ defmodule Tightbeam.ArchetypesTest do
   end
 
   test "the neutral default's elected baseline skills prescribe no bundle archetype before learn" do
-    default = Archetypes.builtin_default()
+    # Read the SEEDED default, not builtin_default() -- the latter carries skills: [],
+    # so looping over it iterates nothing and the assertion passes unconditionally. That
+    # is how bundle content ("spawn a product owner") shipped in an elected skill with
+    # this very test green.
+    default =
+      Application.app_dir(:tightbeam, "priv/seed/archetypes/default.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    assert default["skills"] != [],
+           "the seeded default elects no skills, so this test would prove nothing"
+
 
     bundle_archetypes =
       Application.app_dir(:tightbeam, "priv/kungfu/*/archetypes/*.toml")
       |> Path.wildcard()
       |> Enum.map(fn path -> path |> File.read!() |> Toml.decode!() |> Map.fetch!("name") end)
 
-    for skill <- default.skills do
+    for skill <- default["skills"] do
       body =
         Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
         |> File.read!()
