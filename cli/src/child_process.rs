@@ -1,7 +1,7 @@
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,20 +44,34 @@ pub(crate) fn reset_sigchld_before_spawn() {
 pub(crate) fn exited_without_reaping(child: &std::process::Child) -> io::Result<bool> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
 
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id() as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
+    // Retried on EINTR because POSIX explicitly permits `waitid` to be interrupted, and
+    // this process installs handlers for exactly the signals that would do it. An
+    // interrupted probe is not an answer about the child; callers that treat it as one
+    // decide something false about a live process. Bounded because a probe that cannot
+    // answer must eventually say so rather than spin.
+    for _ in 0..16 {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
 
-    if result == -1 {
-        return Err(io::Error::last_os_error());
+        if result == 0 {
+            return Ok(info.si_signo != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 
-    Ok(info.si_signo != 0)
+    Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "waitid was interrupted repeatedly and never reported the child's state",
+    ))
 }
 
 /// Signal the process group whose leader is still this waitable child.
@@ -110,13 +124,24 @@ pub(crate) fn terminate_process_group(
     Ok(())
 }
 
+/// A slot is not merely claimed or free — it is claimed, LISTENING, or done listening.
+///
+/// The third state is what makes an interrupt impossible to lose. Without it the only way
+/// to stop the handler recording into a slot is to free the slot, and a freed slot can be
+/// reclaimed by the next ceremony (or, in tests, a parallel one) before its former owner
+/// has read what was recorded. `FINISHED` stops the recording without releasing the
+/// identity, so the owner's last read cannot race a successor's first signal.
+const SLOT_FREE: u8 = 0;
+const SLOT_LISTENING: u8 = 1;
+const SLOT_FINISHED: u8 = 2;
+
 const SIGNAL_SLOT_COUNT: usize = 64;
 static ACTIVE_PROCESS_GROUPS: [AtomicI32; SIGNAL_SLOT_COUNT] =
     [const { AtomicI32::new(0) }; SIGNAL_SLOT_COUNT];
 static FORWARDED_SIGNALS: [AtomicI32; SIGNAL_SLOT_COUNT] =
     [const { AtomicI32::new(0) }; SIGNAL_SLOT_COUNT];
-static CLAIMED_SIGNAL_SLOTS: [AtomicBool; SIGNAL_SLOT_COUNT] =
-    [const { AtomicBool::new(false) }; SIGNAL_SLOT_COUNT];
+static SIGNAL_SLOT_STATES: [AtomicU8; SIGNAL_SLOT_COUNT] =
+    [const { AtomicU8::new(SLOT_FREE) }; SIGNAL_SLOT_COUNT];
 
 struct HandlerState {
     users: usize,
@@ -130,7 +155,7 @@ static SIGNAL_HANDLER_STATE: Mutex<HandlerState> = Mutex::new(HandlerState {
 
 extern "C" fn forward_to_active_group(signal: libc::c_int) {
     for (slot, active) in ACTIVE_PROCESS_GROUPS.iter().enumerate() {
-        if !CLAIMED_SIGNAL_SLOTS[slot].load(Ordering::Relaxed) {
+        if SIGNAL_SLOT_STATES[slot].load(Ordering::Relaxed) != SLOT_LISTENING {
             continue;
         }
         FORWARDED_SIGNALS[slot].store(signal, Ordering::Relaxed);
@@ -152,6 +177,7 @@ extern "C" fn forward_to_active_group(signal: libc::c_int) {
 /// orphan path without ever putting an unconfirmed numeric identity in the handler.
 pub(crate) struct SignalForwarding {
     slot: usize,
+    torn_down: bool,
 }
 
 impl SignalForwarding {
@@ -159,11 +185,16 @@ impl SignalForwarding {
         let mut state = SIGNAL_HANDLER_STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = CLAIMED_SIGNAL_SLOTS
+        let slot = SIGNAL_SLOT_STATES
             .iter()
-            .position(|claimed| {
-                claimed
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .position(|state| {
+                state
+                    .compare_exchange(
+                        SLOT_FREE,
+                        SLOT_LISTENING,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
                     .is_ok()
             })
             .ok_or_else(|| io::Error::other("too many simultaneous child process groups"))?;
@@ -187,7 +218,7 @@ impl SignalForwarding {
                             libc::sigaction(*installed, prior, std::ptr::null_mut());
                         }
                     }
-                    CLAIMED_SIGNAL_SLOTS[slot].store(false, Ordering::Relaxed);
+                    SIGNAL_SLOT_STATES[slot].store(SLOT_FREE, Ordering::Relaxed);
                     return Err(error);
                 }
                 previous.push((signal, old));
@@ -196,7 +227,10 @@ impl SignalForwarding {
         }
         state.users += 1;
 
-        Ok(Self { slot })
+        Ok(Self {
+            slot,
+            torn_down: false,
+        })
     }
 
     pub(crate) fn arm(&self, child: &std::process::Child) -> io::Result<()> {
@@ -224,24 +258,55 @@ impl SignalForwarding {
     }
 }
 
+impl SignalForwarding {
+    /// Stop forwarding and report, as ONE step, everything that was ever recorded.
+    ///
+    /// The order is the entire point, and it is the only order with no uncovered instant.
+    /// Marking the slot FINISHED stops the handler recording into it; restoring the
+    /// process's own dispositions stops the handler SWALLOWING signals at all. Only after
+    /// both is the record read. So a signal either arrived while we were listening -- and
+    /// is in the value returned here -- or arrives after the restore, when it acts on this
+    /// process normally and terminates it. There is no third case, which is what a plain
+    /// read-after-reap could not say: that one left an interval where a signal was caught
+    /// by a still-installed handler, recorded into a slot nobody would read again, and
+    /// forwarded nowhere. The caller was then free to bank a credential the operator had
+    /// interrupted -- the child had finished, but the ONBOARDING had not.
+    fn finish(&mut self) -> Option<libc::c_int> {
+        // Strictly once. A second pass would stamp FINISHED and then FREE onto a slot
+        // another ceremony may already have claimed in between, wiping ITS record.
+        if self.torn_down {
+            return None;
+        }
+        self.torn_down = true;
+        self.disarm();
+        SIGNAL_SLOT_STATES[self.slot].store(SLOT_FINISHED, Ordering::Relaxed);
+        let caught = match FORWARDED_SIGNALS[self.slot].swap(0, Ordering::Relaxed) {
+            0 => None,
+            signal => Some(signal),
+        };
+
+        {
+            let mut state = SIGNAL_HANDLER_STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.users -= 1;
+            if state.users == 0 {
+                for (signal, previous) in state.previous.iter().rev() {
+                    unsafe {
+                        libc::sigaction(*signal, previous, std::ptr::null_mut());
+                    }
+                }
+                state.previous.clear();
+            }
+        }
+        SIGNAL_SLOT_STATES[self.slot].store(SLOT_FREE, Ordering::Relaxed);
+        caught
+    }
+}
+
 impl Drop for SignalForwarding {
     fn drop(&mut self) {
-        self.disarm();
-        FORWARDED_SIGNALS[self.slot].store(0, Ordering::Relaxed);
-
-        let mut state = SIGNAL_HANDLER_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.users -= 1;
-        if state.users == 0 {
-            for (signal, previous) in state.previous.iter().rev() {
-                unsafe {
-                    libc::sigaction(*signal, previous, std::ptr::null_mut());
-                }
-            }
-            state.previous.clear();
-        }
-        CLAIMED_SIGNAL_SLOTS[self.slot].store(false, Ordering::Relaxed);
+        let _ = self.finish();
     }
 }
 
@@ -540,7 +605,7 @@ impl Supervised {
                         // that too means making the read atomic with the slot leaving the
                         // listening state -- a state machine inside async-signal-safe code,
                         // which is not worth buying a post-completion instant with.
-                        return match self.forwarding.caught() {
+                        return match self.forwarding.finish() {
                             None => Ok((value, status)),
                             Some(signal) => Err(RunError::interrupted(signal, &self.what)),
                         };
@@ -570,6 +635,13 @@ impl Supervised {
                 // But the other way to arrive here is a child we just FAILED to stop, and
                 // an unconditional wait on that one blocks forever: it turns a reported
                 // cleanup failure into a hang. The exit check is what separates them.
+                // `unwrap_or(false)` is safe here only because the probe now retries
+                // EINTR itself. That was the reachable hole: an exited leader gives
+                // killpg ESRCH, a caught signal interrupts the probe, the error reads as
+                // "still running", the reap is skipped, and `settled` is already true so
+                // Drop offers no second chance. What remains is ECHILD and EINVAL, where
+                // there is either nothing left to reap or nothing we could reap, and
+                // `false` is the answer rather than a guess.
                 if exited_without_reaping(&self.child).unwrap_or(false) {
                     let _ = self.child.wait();
                 }
@@ -766,6 +838,58 @@ mod tests {
         assert!(
             error.is_interrupted(),
             "a TERM landing during the reap reported: {error}"
+        );
+    }
+
+    /// The mechanism that closes the teardown residual, tested where it is reachable.
+    ///
+    /// Be honest about what this can and cannot do. The integration-level instant -- a
+    /// signal landing between `settle`'s last look and the handler being uninstalled -- is
+    /// a few instructions inside `settle` with no seam a test can aim at, and a test that
+    /// fired earlier would pass against BOTH designs while appearing to prove one. (One
+    /// did, before this replaced it.) So this tests the property the fix actually rests
+    /// on: `finish` stops the slot listening and reports what was recorded as one step,
+    /// and is safe against being run twice.
+    ///
+    /// Why that is the whole of it: after `finish` returns, this slot records nothing more
+    /// under our identity, and the process's own dispositions are back, so a later signal
+    /// terminates us instead of being swallowed. Recorded-and-reported, or fatal. There is
+    /// no third outcome left for one to fall into.
+    #[test]
+    fn finishing_forwarding_reports_what_it_recorded_and_then_records_nothing() {
+        if !alone("finishing_forwarding_reports_what_it_recorded_and_then_records_nothing") {
+            return;
+        }
+
+        let mut forwarding = SignalForwarding::install().unwrap();
+        let slot = forwarding.slot;
+
+        FORWARDED_SIGNALS[slot].store(libc::SIGTERM, Ordering::Relaxed);
+        assert_eq!(
+            forwarding.finish(),
+            Some(libc::SIGTERM),
+            "teardown dropped a signal that was recorded while it was listening"
+        );
+        assert_eq!(
+            SIGNAL_SLOT_STATES[slot].load(Ordering::Relaxed),
+            SLOT_FREE,
+            "a finished slot must be released for reuse"
+        );
+
+        // The handler can no longer attribute anything to the owner that just left.
+        forward_to_active_group(libc::SIGTERM);
+        assert_eq!(
+            FORWARDED_SIGNALS[slot].load(Ordering::Relaxed),
+            0,
+            "a released slot recorded a signal for its former owner"
+        );
+
+        // Run twice on purpose: `Drop` calls this after `settle` already has. A second
+        // pass that re-stamped the slot would wipe the record of whoever claimed it next.
+        assert_eq!(
+            forwarding.finish(),
+            None,
+            "teardown ran twice and reported a signal the second time"
         );
     }
 

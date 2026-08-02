@@ -973,10 +973,16 @@ pub(crate) fn gateway_request(
 /// its `_` arm, and the cancel failure silently vanishes from the operator's message. No
 /// test covers the transition, so nothing goes red.
 ///
-/// The phrase is doing the job of an error code while looking like an error message, in
-/// three modules at once — `child_process` and `harnesses` produce sentences containing it
-/// too, though neither reaches this guard. Eleven other sites assert on it. Making it a
-/// real variant is a change worth doing and is not this branch's to make.
+/// The phrase is doing the job of an error code while looking like an error message.
+/// Several sites across four modules produce it, tests in four modules assert on it (one
+/// of them NEGATIVELY, that a message must not contain it), and this guard is the only
+/// place it changes behaviour. Making it a real variant is a change worth doing and is not
+/// this branch's to make.
+///
+/// Deliberately no count. The first version of this comment carried one, and it was wrong
+/// before it reached review — restated from a message, never recounted against the file.
+/// A tally in a comment is stale the moment someone adds a test; what a reader needs is
+/// that exactly one site branches on it, and that survives.
 fn ceremony_expired() -> String {
     "gateway request refused because the onboarding lease expired".to_owned()
 }
