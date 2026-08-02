@@ -423,6 +423,7 @@ defmodule Tightbeam.Identity do
     File.rm!(Path.join(dir, receipt_path))
 
     try do
+      remove_empty_parent_dirs!(dir, [receipt_path | receipt.paths])
       validate_tree!(dir)
     rescue
       error ->
@@ -724,6 +725,39 @@ defmodule Tightbeam.Identity do
   end
 
   defp receipt_path(name), do: Path.join(["kungfu", name, "installed.toml"])
+
+  defp remove_empty_parent_dirs!(dir, paths) do
+    paths
+    |> Enum.flat_map(&parent_dirs/1)
+    |> Enum.uniq()
+    |> Enum.sort_by(&(length(Path.split(&1)) * -1))
+    |> Enum.each(fn relative ->
+      case File.rmdir(Path.join(dir, relative)) do
+        :ok ->
+          :ok
+
+        {:error, reason} when reason in [:enoent, :eexist, :enotempty] ->
+          :ok
+
+        {:error, reason} ->
+          raise File.Error, action: "remove directory", path: relative, reason: reason
+      end
+    end)
+  end
+
+  defp parent_dirs(relative) do
+    if Path.type(relative) == :relative and ".." not in Path.split(relative) do
+      parent_dirs(Path.dirname(relative), [])
+    else
+      []
+    end
+  end
+
+  defp parent_dirs(relative, parents) when relative in [".", ".."], do: parents
+
+  defp parent_dirs(relative, parents) do
+    parent_dirs(Path.dirname(relative), [relative | parents])
+  end
 
   defp receipt_at(dir, revision, name) do
     path = receipt_path(name)
