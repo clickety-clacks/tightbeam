@@ -107,24 +107,25 @@ defmodule Tightbeam.ArchetypesTest do
 
       pre_learn = body |> String.split("## AFTER LEARNING A KUNGFU", parts: 2) |> hd()
 
-      # BOUNDED BY DESIGN (reviewer-ruled): substring matching cannot catch every
-      # paraphrase -- "ask a delivery specialist to take ownership" gets through -- and
-      # that residual is acceptable for a guard against CARELESSNESS, not an adversary.
-      # The condition is that every signature stays narrowly bundle-specific: a broad one
-      # like "hand off to the" rejects legitimate neutral guidance ("hand off to the user
-      # for confirmation"), and blocking honest text is a real cost, not a free safety.
-      # Names alone are not the class: "hand this to the product owner agent" names no
+      # BOUNDED BY DESIGN (reviewer-ruled): this catches CARELESSNESS, not an adversary.
+      # Paraphrases get through ("ask a delivery specialist to take ownership") and that
+      # residual is acceptable. What is NOT acceptable is blocking honest text, and a
+      # hand-built verb list did exactly that: "spawn a product" rejected "spawn a
+      # production support session", "escalate to the product" rejected "escalate to the
+      # product support team", "hand off to the" rejected "hand off to the user". Those
+      # signatures are gone. Only full archetype NAMES remain, matched at word boundaries
+      # so a name can never match as the prefix of an ordinary word. "hand this to the product owner agent" names no
       # archetype token, and a bundle-only VERB is just as much a pre-learn instruction.
       # Both spellings of every archetype, plus the verbs that only make sense once a
       # bundle exists.
-      bundle_only_phrases =
-        Enum.flat_map(bundle_archetypes, &[&1, String.replace(&1, "-", " ")]) ++
-          ["spawn a product", "spawn a coder", "spawn a reviewer", "assign a coder",
-           "escalate to the product"]
+      bundle_only_names =
+        Enum.flat_map(bundle_archetypes, &[&1, String.replace(&1, "-", " ")])
 
-      for spelling <- bundle_only_phrases do
-        refute String.contains?(String.downcase(pre_learn), String.downcase(spelling)),
-               "neutral elected skill #{skill} prescribes bundle-only action #{inspect(spelling)} before learn"
+      for spelling <- bundle_only_names do
+        pattern = ~r/\b#{Regex.escape(String.downcase(spelling))}\b/
+
+        refute Regex.match?(pattern, String.downcase(pre_learn)),
+               "neutral elected skill #{skill} names bundle-only archetype #{inspect(spelling)} before learn"
       end
     end
   end
