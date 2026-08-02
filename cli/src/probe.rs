@@ -1378,7 +1378,9 @@ fn require_runnable_harness_cli(
     catalog: Option<&crate::harnesses::HarnessCatalog>,
 ) -> Result<(), String> {
     let Some(catalog) = catalog else {
-        return Ok(());
+        return Err(
+            "doctor: could not check harnesses; cannot establish that a harness can run".to_owned(),
+        );
     };
     let search_path = std::env::var("PATH").unwrap_or_default();
     if catalog
@@ -1398,7 +1400,13 @@ fn require_runnable_harness_cli(
 fn doctor_harness_catalog(
     base_dir: &Path,
 ) -> (Option<crate::harnesses::HarnessCatalog>, Vec<String>) {
-    match crate::harnesses::load_for_doctor(base_dir) {
+    doctor_harness_catalog_from(crate::harnesses::load_for_doctor(base_dir))
+}
+
+fn doctor_harness_catalog_from(
+    result: crate::harnesses::DoctorCatalog,
+) -> (Option<crate::harnesses::HarnessCatalog>, Vec<String>) {
+    match result {
         crate::harnesses::DoctorCatalog::Live(catalog) => (Some(catalog), Vec::new()),
         crate::harnesses::DoctorCatalog::GatewayError(reason) => (None, vec![reason]),
         crate::harnesses::DoctorCatalog::Offline { catalog, reason } => {
@@ -1491,6 +1499,23 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_harness_checks_are_named_and_fail_doctor() {
+        let reason = r#"harness checks unavailable: {"error":{"code":"auth_failed"}}"#;
+        let (catalog, notes) = doctor_harness_catalog_from(
+            crate::harnesses::DoctorCatalog::GatewayError(reason.to_owned()),
+        );
+
+        assert_eq!(notes, vec![reason]);
+        assert!(!notes[0].contains("run tightbeam doctor"));
+        let error = require_runnable_harness_cli(catalog.as_ref()).unwrap_err();
+        assert_eq!(
+            error,
+            "doctor: could not check harnesses; cannot establish that a harness can run"
+        );
+        assert!(!error.contains("no registered harness CLI is available"));
     }
 
     #[derive(Default)]

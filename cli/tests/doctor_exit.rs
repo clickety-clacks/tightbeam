@@ -34,6 +34,10 @@ fn doctor_exits_nonzero_when_no_registered_harness_cli_is_runnable() {
         !output.status.success(),
         "doctor exited zero even though PATH contained no registered harness CLI"
     );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("run tightbeam doctor"),
+        "doctor's own note pointed back to doctor"
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
