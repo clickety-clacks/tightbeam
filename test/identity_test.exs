@@ -50,6 +50,14 @@ defmodule Tightbeam.IdentityTest do
                name: "agentic-engineering",
                purpose:
                  "Give your organization a disciplined way to turn product ideas and bug reports into shipped software, with tracked work, independent review, and verification.",
+               phrases: [
+                 "I want my code reviewed before it merges.",
+                 "We keep shipping bugs that someone should have caught.",
+                 "I want a spec agreed before anyone starts writing code.",
+                 "My agents rewrite things I never asked them to touch.",
+                 "The same bug keeps coming back and nobody finds the cause.",
+                 "I want to know a change was actually tested, not just claimed."
+               ],
                root_archetype: "product-owner"
              }
            ]
@@ -74,6 +82,41 @@ defmodule Tightbeam.IdentityTest do
     end
 
     refute File.exists?(Path.join(ctx.base, "identity/.git"))
+  end
+
+  test "a manifest may omit phrases and projects an empty list", ctx do
+    File.write!(Path.join(ctx.source, "manifest.toml"), """
+    root_archetype = "product-owner"
+    purpose = "Help a team ship dependable work."
+    """)
+
+    assert [%{phrases: []}] = Identity.available_bundles()
+  end
+
+  test "a manifest with invalid phrases is refused before identity mutation", ctx do
+    for phrases <- [
+          ~s(phrases = "A useful signal."),
+          "phrases = []",
+          ~s(phrases = ["A useful signal.", " "])
+        ] do
+      assert_raise ArgumentError, ~r/phrases must be a non-empty list/, fn ->
+        Identity.scaffold!(
+          ctx.base,
+          "demo",
+          [
+            {"kungfu/demo/manifest.toml",
+             """
+             root_archetype = "demo-role"
+             purpose = "Help a team do demo work."
+             #{phrases}
+             """}
+          ],
+          "operator"
+        )
+      end
+
+      refute File.exists?(Path.join(ctx.base, "identity/.git"))
+    end
   end
 
   test "explicit learn installs the shipped bundle and committed receipt", ctx do

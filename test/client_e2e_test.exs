@@ -571,7 +571,11 @@ defmodule Tightbeam.ClientE2ETest do
       assert quoted =~ "NOT READY"
       assert quoted =~ "claude on testhost:"
       assert quoted =~ "ACP adapter missing at #{missing}"
-      assert quoted =~ "tightbeam assimilate --harness claude"
+
+      assert quoted =~
+               "install its pinned adapters automatically when the next session is spawned"
+
+      refute quoted =~ "tightbeam assimilate"
       assert quoted =~ "Diagnose further with: mix tightbeam.doctor"
     end
 

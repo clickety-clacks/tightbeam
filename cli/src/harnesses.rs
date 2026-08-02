@@ -94,7 +94,7 @@ pub(crate) fn load_for_doctor(base_dir: &Path) -> DoctorCatalog {
     let endpoint = match dispatch::discover_from(base_dir) {
         Ok(endpoint) => endpoint,
         Err(reason) => {
-            return offline_doctor_catalog(cached, unavailable(&reason));
+            return offline_doctor_catalog(cached, doctor_unavailable(&reason));
         }
     };
 
@@ -134,19 +134,21 @@ fn load_endpoint_for_doctor(
     let response = match dispatch::gateway_request("GET", endpoint, "/harnesses", None).call() {
         Ok(response) => response,
         Err(ureq::Error::Transport(error)) => {
-            return Err(DoctorLoadError::Offline(unavailable(&error.to_string())));
+            return Err(DoctorLoadError::Offline(doctor_unavailable(
+                &error.to_string(),
+            )));
         }
         Err(ureq::Error::Status(status, response)) => {
             let encoded = response
                 .into_string()
                 .unwrap_or_else(|_| format!("HTTP {status}"));
-            return Err(DoctorLoadError::Gateway(unavailable(&encoded)));
+            return Err(DoctorLoadError::Gateway(doctor_unavailable(&encoded)));
         }
     };
     let encoded = response
         .into_string()
-        .map_err(|error| DoctorLoadError::Gateway(unavailable(&error.to_string())))?;
-    parse(&encoded).map_err(|reason| DoctorLoadError::Gateway(unavailable(&reason)))
+        .map_err(|error| DoctorLoadError::Gateway(doctor_unavailable(&error.to_string())))?;
+    parse(&encoded).map_err(|reason| DoctorLoadError::Gateway(doctor_unavailable(&reason)))
 }
 
 pub fn load() -> Result<HarnessCatalog, String> {
@@ -285,6 +287,10 @@ fn unavailable(reason: &str) -> String {
     format!("harness checks unavailable: {reason}; run tightbeam doctor")
 }
 
+fn doctor_unavailable(reason: &str) -> String {
+    format!("harness checks unavailable: {reason}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +335,18 @@ mod tests {
         }
 
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn only_non_doctor_unavailability_points_to_doctor() {
+        assert_eq!(
+            doctor_unavailable("auth failed"),
+            "harness checks unavailable: auth failed"
+        );
+        assert_eq!(
+            unavailable("auth failed"),
+            "harness checks unavailable: auth failed; run tightbeam doctor"
+        );
     }
 
     /// A projection with no `cli_binary` is rejected rather than treated as a harness
