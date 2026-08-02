@@ -616,7 +616,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     File.rm_rf!(base_dir)
     File.mkdir_p!(Path.join([base_dir, "auth", "claude"]))
-    File.write!(Path.join([base_dir, "auth", "claude", "oauth-token"]), "test-token")
+    File.write!(Path.join([base_dir, "auth", "claude", ".credentials.json"]), "test-token")
 
     on_exit(fn ->
       File.rm_rf!(base_dir)

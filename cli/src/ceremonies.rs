@@ -899,10 +899,24 @@ fn run_anthropic_onboarding(
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), StageFailure> {
-    let token = read_setup_token(staging)?;
-    validate_setup_token(&token, machine, ceremony.deadline).map_err(StageFailure::from)?;
+    let challenge = crate::anthropic_oauth::begin();
+    let pasted = ask_for_code(&challenge.url)?;
+    let credential =
+        crate::anthropic_oauth::complete(&challenge, &pasted).map_err(StageFailure::from)?;
 
-    let path = PathBuf::from(staging).join("oauth-token");
+    // Validated with the access token before anything is staged, for the same reason a
+    // pasted token was: a credential that authenticates is the only evidence the exchange
+    // produced a usable one, and a refusal here must not be discovered by a turn failing a
+    // month later.
+    validate_setup_token(&credential.access_token, machine, ceremony.deadline)
+        .map_err(StageFailure::from)?;
+
+    // `credentials.json`, not `oauth-token`. The OAuth credential is an access token PLUS a
+    // refresh token, and only the file form has anywhere to put the second one -- an env
+    // var carries the access token alone, so it works until the token lapses and then dies
+    // with no way back. Claude Code refreshes this file itself, which is the same shape
+    // codex already has: the vendor maintains its own credential and we hold the directory.
+    let path = PathBuf::from(staging).join(".credentials.json");
     let mut file = fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -910,52 +924,33 @@ fn run_anthropic_onboarding(
         .mode(0o600)
         .open(path)
         .map_err(|error| StageFailure::from(error.to_string()))?;
-    writeln!(file, "{token}").map_err(|error| StageFailure::from(error.to_string()))?;
+    file.write_all(crate::anthropic_oauth::credentials_json(&credential).as_bytes())
+        .map_err(|error| StageFailure::from(error.to_string()))?;
 
     Ok(())
 }
 
-/// Ask for the token instead of running the login and reading it off the screen.
+/// Print the sign-in link and take back what the callback page shows.
 ///
-/// Tightbeam used to drive `claude setup-token` under its own pty and reconstruct the token
-/// from the TUI's repaints. Nothing else does that -- the previous tightbeam ran the command
-/// on the operator's terminal and told them to save what it printed, and openclaw takes the
-/// token as a configured value. The capture existed so an agent could install unattended,
-/// but the flow needs a human at a browser either way, and an agent doing the install
-/// already has a terminal of its own. We were rebuilding the caller's terminal inside the
-/// callee.
-///
-/// Whoever is installing -- person or agent -- runs the command and hands back what it
-/// prints. What is NOT given up: the token is still validated with one authenticated call
-/// before anything is staged, because a pasted token can be truncated by a bad copy exactly
-/// as a captured one could be by a bad read.
-fn read_setup_token(staging: &str) -> Result<String, StageFailure> {
-    // CLAUDE_CONFIG_DIR is not decoration. `claude setup-token` writes config into whatever
-    // config dir it is pointed at -- measured: it created `.claude.json` and a backup there
-    // -- so run bare it edits the operator's personal `~/.claude`, which on a dev box is the
-    // login they are using right now. Pointing it at our staging directory keeps everything
-    // the command produces inside Tightbeam's own home, and staging is thrown away after.
-    println!(
-        "Run this, complete the sign-in in your browser, and paste the token it prints \
-         here (then press enter):\n\n    CLAUDE_CONFIG_DIR={staging} claude setup-token\n"
-    );
+/// The operator may be on another machine -- that is the ordinary case for an install over
+/// ssh -- so this prints a link rather than opening a browser, and asks for the code the
+/// page displays rather than listening on localhost.
+fn ask_for_code(url: &str) -> Result<String, StageFailure> {
+    println!("\nOpen this and sign in:\n\n    {url}\n");
+    println!("Then paste the code it shows you (code#state) and press enter:");
 
-    let mut token = String::new();
+    let mut line = String::new();
     io::stdin()
-        .read_line(&mut token)
-        .map_err(|error| StageFailure::from(format!("could not read the token: {error}")))?;
-    let token = token.trim().to_owned();
-
-    if token.is_empty() {
-        return Err(
-            "no token was provided; onboarding needs the token `claude setup-token` prints"
-                .to_owned()
-                .into(),
-        );
+        .read_line(&mut line)
+        .map_err(|error| StageFailure::from(format!("could not read the code: {error}")))?;
+    let line = line.trim().to_owned();
+    if line.is_empty() {
+        return Err("no code was provided; onboarding needs the code the sign-in page shows"
+            .to_owned()
+            .into());
     }
-    Ok(token)
+    Ok(line)
 }
-
 /// The route and headers a SUBSCRIPTION credential is authenticated with.
 ///
 /// Not the api-key path's header. `validate_api_key` sends anthropic `x-api-key`, which

@@ -354,7 +354,7 @@ defmodule Tightbeam.AdapterHealTest do
       Path.join(System.tmp_dir!(), "heal-catalog-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join([catalog_base, "auth", "claude"]))
-    File.write!(Path.join([catalog_base, "auth", "claude", "oauth-token"]), "test-token")
+    File.write!(Path.join([catalog_base, "auth", "claude", ".credentials.json"]), "test-token")
     on_exit(fn -> File.rm_rf!(catalog_base) end)
 
     start_supervised!(

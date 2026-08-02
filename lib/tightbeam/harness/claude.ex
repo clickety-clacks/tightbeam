@@ -123,28 +123,42 @@ defmodule Tightbeam.Harness.Claude do
     })
   end
 
+  # A SUBSCRIPTION credential is not injected, and that is the difference between the two
+  # kinds rather than an omission. It is an OAuth record with a refresh token, and Claude
+  # Code refreshes it IN PLACE in its config dir -- so it is linked into the home and the
+  # harness owns its lifecycle, exactly as codex owns `auth.json`. Passing the access token
+  # through an environment variable would work until it lapsed and then fail with no way
+  # back, because an env var has nowhere to put the refresh token.
+  #
+  # An API key has no refresh and no expiry, so it stays an environment variable. Same
+  # provider, two shapes, because the credentials genuinely are two different things.
   @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
     common = Keyword.fetch!(opts, :common_env)
-    variable = credential_env_var(Keyword.fetch!(opts, :credential_kind))
+    kind = Keyword.fetch!(opts, :credential_kind)
     credential_path = credential_path(target.host_config.base_dir)
 
     if Support.local?(target) do
       credential_env =
-        case File.read(credential_path) do
-          {:ok, credential} -> [{variable, String.trim(credential)}]
-          _ -> []
+        case {kind, File.read(credential_path)} do
+          {:subscription, _} -> []
+          {:api_key, {:ok, credential}} -> [{credential_env_var(kind), String.trim(credential)}]
+          {:api_key, _} -> []
         end
 
       [cmd: [binary], env: [{"CLAUDE_CONFIG_DIR", home} | common ++ credential_env]]
     else
       remote_env =
-        [
-          "#{variable}=$(cat #{credential_path} 2>/dev/null)",
-          "CLAUDE_CONFIG_DIR=#{home}"
-          | Keyword.fetch!(opts, :remote_env)
-        ]
+        case kind do
+          :subscription -> ["CLAUDE_CONFIG_DIR=#{home}" | Keyword.fetch!(opts, :remote_env)]
+          :api_key ->
+            [
+              "#{credential_env_var(kind)}=$(cat #{credential_path} 2>/dev/null)",
+              "CLAUDE_CONFIG_DIR=#{home}"
+              | Keyword.fetch!(opts, :remote_env)
+            ]
+        end
 
       [
         cmd:
@@ -167,10 +181,19 @@ defmodule Tightbeam.Harness.Claude do
   defp credential_env_var(:subscription), do: "CLAUDE_CODE_OAUTH_TOKEN"
   defp credential_env_var(:api_key), do: "ANTHROPIC_API_KEY"
 
-  # ONE file per provider, holding whichever kind is active. The name is
-  # historical -- it predates API-key support -- and is deliberately NOT read as
-  # evidence of the kind by anything: `credential.json` is the authority.
-  defp credential_path(base_dir), do: Path.join([base_dir, "auth", "claude", "oauth-token"])
+  # ONE file per provider, holding whichever kind is active, and the name is Claude Code's
+  # own: the file is LINKED into the harness home, where the harness reads it directly.
+  # `Homes.reconcile` uses a single name for both the store and the home entry, so the store
+  # takes the harness's name rather than the harness taking ours.
+  #
+  # It is still deliberately NOT read as evidence of the kind -- `credential.json` is the
+  # authority. A subscription credential is the OAuth record Claude Code refreshes in place;
+  # an API key is a bare secret that never expires. Same path, different contents, and only
+  # the subscription one is ever handed to the harness as a file.
+  @credential_file ".credentials.json"
+
+  defp credential_path(base_dir),
+    do: Path.join([base_dir, "auth", "claude", @credential_file])
 
   @impl true
   def ensure_adapter(target) do
@@ -203,7 +226,7 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def owned_home_entries,
-    do: Support.owned_home_entries("oauth-token", "settings.json")
+    do: Support.owned_home_entries(@credential_file, "settings.json")
 
   @impl true
   def reconcile_home(target, home, desired) do
@@ -217,7 +240,7 @@ defmodule Tightbeam.Harness.Claude do
     desired = %{desired | rails: rails}
 
     Tightbeam.Homes.reconcile(target, home, desired,
-      credential_names: ["oauth-token"],
+      credential_names: [@credential_file],
       rails_filename: "settings.json"
     )
   end
@@ -240,12 +263,12 @@ defmodule Tightbeam.Harness.Claude do
         credential_provider()
       )
 
-    Tightbeam.Homes.credential_ready?(target, store, ["oauth-token"])
+    Tightbeam.Homes.credential_ready?(target, store, [@credential_file])
   end
 
   @impl true
   def harvest_credential(target, home) do
-    Tightbeam.Homes.harvest_credential(target, home, "oauth-token")
+    Tightbeam.Homes.harvest_credential(target, home, @credential_file)
   end
 
   @impl true
@@ -281,7 +304,7 @@ defmodule Tightbeam.Harness.Claude do
         "--no-warnings",
         "-e",
         script,
-        Path.join(home, "oauth-token"),
+        Path.join(home, @credential_file),
         header,
         scheme
       ]
@@ -491,7 +514,7 @@ defmodule Tightbeam.Harness.Claude do
       provider: credential_provider(),
       home_scope: wire_name(),
       home_env: "CLAUDE_CONFIG_DIR",
-      credential_file: "oauth-token",
+      credential_file: @credential_file,
       credential_live: %{
         live_fixture: Application.app_dir(:tightbeam, "priv/credential_live/claude-live.json"),
         dead_fixture: Application.app_dir(:tightbeam, "priv/credential_live/claude-dead.json")
@@ -499,16 +522,24 @@ defmodule Tightbeam.Harness.Claude do
       rails_file: "settings.json",
       rails: %{"hooks" => %{"PreToolUse" => []}},
       skills_path: Path.join([".claude", "skills"]),
+      # A subscription contributes NO credential env: the harness reads its own
+      # `.credentials.json` out of the home and refreshes it there.
       local_extra_env: %{
-        subscription: [{"CLAUDE_CODE_OAUTH_TOKEN", "vector-token"}],
+        subscription: [],
         api_key: [{"ANTHROPIC_API_KEY", "vector-token"}]
       },
       rails_env: nil,
       remote_prefix: fn base, home, kind ->
-        [
-          "#{credential_env_var(kind)}=$(cat #{Path.join([base, "auth", "claude", "oauth-token"])} 2>/dev/null)",
-          "CLAUDE_CONFIG_DIR=#{home}"
-        ]
+        case kind do
+          :subscription ->
+            ["CLAUDE_CONFIG_DIR=#{home}"]
+
+          :api_key ->
+            [
+              "#{credential_env_var(kind)}=$(cat #{Path.join([base, "auth", "claude", @credential_file])} 2>/dev/null)",
+              "CLAUDE_CONFIG_DIR=#{home}"
+            ]
+        end
       end,
       remote_rails_env: nil,
       railed_probe: false,
@@ -570,7 +601,7 @@ defmodule Tightbeam.Harness.Claude do
         "unavailable" => {:error, :unavailable}
       },
       catalog_state: fn case_name, base ->
-        token = Path.join([base, "auth", "claude", "oauth-token"])
+        token = Path.join([base, "auth", "claude", @credential_file])
         File.mkdir_p!(Path.dirname(token))
         File.write!(token, "vector-token")
 

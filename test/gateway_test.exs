@@ -423,7 +423,7 @@ defmodule Tightbeam.GatewayTest do
       Path.join(System.tmp_dir!(), "gateway-catalog-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join([catalog_base, "auth", "claude"]))
-    File.write!(Path.join([catalog_base, "auth", "claude", "oauth-token"]), "test-token")
+    File.write!(Path.join([catalog_base, "auth", "claude", ".credentials.json"]), "test-token")
 
     claude_models =
       JSON.encode!(%{
@@ -2872,7 +2872,7 @@ defmodule Tightbeam.GatewayTest do
 
     defp bank_into!(server, kind) do
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, "oauth-token"), "credential-bytes")
+      File.write!(Path.join(staging, ".credentials.json"), "credential-bytes")
       :ok = Credentials.finish_onboard(:anthropic, kind, lease_id, server)
     end
 
@@ -6407,7 +6407,7 @@ defmodule Tightbeam.GatewayTest do
     if ready? do
       auth_dir = Path.join([base_dir, "auth", "claude"])
       File.mkdir_p!(auth_dir)
-      File.write!(Path.join(auth_dir, "oauth-token"), "test-token")
+      File.write!(Path.join(auth_dir, ".credentials.json"), "test-token")
     end
 
     on_exit(fn ->

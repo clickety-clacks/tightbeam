@@ -146,7 +146,7 @@ defmodule Tightbeam.Credentials do
     path =
       case provider do
         :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
-        :anthropic -> Path.join([base_dir, "auth", "claude", "oauth-token"])
+        :anthropic -> Path.join([base_dir, "auth", "claude", ".credentials.json"])
         :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
       end
 
@@ -682,7 +682,7 @@ defmodule Tightbeam.Credentials do
     do: Path.join([state.base_dir, "auth", "codex", "auth.json"])
 
   defp credential_store_path(state, :anthropic),
-    do: Path.join([state.base_dir, "auth", "claude", "oauth-token"])
+    do: Path.join([state.base_dir, "auth", "claude", ".credentials.json"])
 
   defp credential_store_path(state, :fixture_provider),
     do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
@@ -737,8 +737,11 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  # `.credentials.json` -- Claude Code's own name, because this file is LINKED into the
+  # harness home and read by the harness directly. A subscription credential is the OAuth
+  # record it refreshes in place; an API key is a bare secret. Same path, two contents.
   defp staged_credential(:anthropic, kind, path) do
-    case File.read(Path.join(path, "oauth-token")) do
+    case File.read(Path.join(path, ".credentials.json")) do
       {:ok, bytes} -> {:ok, Map.put(installed_metadata(:anthropic, kind), :bytes, bytes)}
       {:error, reason} -> {:error, {:setup_token_failed, reason}}
     end
@@ -794,7 +797,7 @@ defmodule Tightbeam.Credentials do
   defp installed_metadata(_provider, :subscription), do: %{expires_at: nil}
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
-  defp staged_path(:anthropic, path), do: Path.join(path, "oauth-token")
+  defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")
   defp staged_path(:fixture_provider, path), do: Path.join(path, "fixture.json")
 
   defp onboarding_staging_path(%{ssh: nil}, provider) do

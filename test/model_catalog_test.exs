@@ -16,7 +16,7 @@ defmodule Tightbeam.ModelCatalogTest do
     :ok = Placement.ensure_schema(db)
     token_dir = Path.join([base_dir, "auth", "claude"])
     File.mkdir_p!(token_dir)
-    File.write!(Path.join(token_dir, "oauth-token"), "fixture-token")
+    File.write!(Path.join(token_dir, ".credentials.json"), "fixture-token")
 
     claude_json = fixture_body("claude_models.jsonc")
     claude_detail_json = fixture_body("claude_model_detail.jsonc")
@@ -553,7 +553,7 @@ defmodule Tightbeam.ModelCatalogTest do
       satellite_base = Path.join(ctx.base_dir, "satellite-root")
       File.mkdir_p!(Path.join([satellite_base, "auth", "claude"]))
       File.mkdir_p!(Path.join([satellite_base, "auth", "codex"]))
-      File.write!(Path.join([satellite_base, "auth", "claude", "oauth-token"]), @claude_secret)
+      File.write!(Path.join([satellite_base, "auth", "claude", ".credentials.json"]), @claude_secret)
 
       File.write!(
         Path.join([satellite_base, "auth", "codex", "auth.json"]),
@@ -615,7 +615,7 @@ defmodule Tightbeam.ModelCatalogTest do
       refute claude_line =~ @claude_secret
 
       assert claude_line =~
-               "credential=$(cat #{Path.join([ctx.satellite_base, "auth", "claude", "oauth-token"])})"
+               "credential=$(cat #{Path.join([ctx.satellite_base, "auth", "claude", ".credentials.json"])})"
 
       assert claude_line =~ ~s(-H "authorization: Bearer $credential")
       assert ["ssh" | claude_rest] = claude

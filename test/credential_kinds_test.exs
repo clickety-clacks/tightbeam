@@ -56,7 +56,7 @@ defmodule Tightbeam.CredentialKindsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, "oauth-token"), "sk-ant-api03-staged")
+      File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
       assert :ok = Credentials.finish_onboard(:anthropic, :api_key, lease_id, server)
 
       metadata =
@@ -82,7 +82,7 @@ defmodule Tightbeam.CredentialKindsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, "oauth-token"), "sk-ant-oat01-staged")
+      File.write!(Path.join(staging, ".credentials.json"), "sk-ant-oat01-staged")
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata =
@@ -109,7 +109,7 @@ defmodule Tightbeam.CredentialKindsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(claude_staging, "oauth-token"), "sk-ant-api03-staged")
+      File.write!(Path.join(claude_staging, ".credentials.json"), "sk-ant-api03-staged")
       :ok = Credentials.finish_onboard(:anthropic, :api_key, claude_lease_id, server)
 
       {:ok, codex_staging, codex_lease_id} = Credentials.begin_onboard(:openai, server)
@@ -150,7 +150,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a local api-key host gets ANTHROPIC_API_KEY and nothing else", ctx do
-      stage!(ctx.base, "claude", "oauth-token", "sk-ant-api03-local\n")
+      stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-local\n")
 
       plan = Claude.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:api_key))
       env = Keyword.fetch!(plan, :env)
@@ -164,19 +164,23 @@ defmodule Tightbeam.CredentialKindsTest do
       assert length(Enum.filter(env, fn {name, _} -> credential_variable?(name) end)) == 1
     end
 
-    test "a local subscription host gets CLAUDE_CODE_OAUTH_TOKEN and nothing else", ctx do
-      stage!(ctx.base, "claude", "oauth-token", "sk-ant-oat01-local\n")
+    # A subscription credential is NOT injected, and that is the contract rather than an
+    # omission. It is an OAuth record carrying a refresh token, and Claude Code refreshes it
+    # in place in its config dir -- so it is linked into the home and the harness owns it.
+    # An environment variable has nowhere to put a refresh token, so injecting the access
+    # token would work until it lapsed and then fail with no way back.
+    test "a local subscription host gets no credential in its environment at all", ctx do
+      stage!(ctx.base, "claude", ".credentials.json", ~s({"claudeAiOauth":{"accessToken":"a"}}))
 
       plan = Claude.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:subscription))
       env = Keyword.fetch!(plan, :env)
 
-      assert {"CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-local"} in env
-      refute Enum.any?(env, fn {name, _value} -> name == "ANTHROPIC_API_KEY" end)
-      assert length(Enum.filter(env, fn {name, _} -> credential_variable?(name) end)) == 1
+      assert Enum.filter(env, fn {name, _} -> credential_variable?(name) end) == []
+      assert {"CLAUDE_CONFIG_DIR", "/home"} in env
     end
 
     test "a remote host expands its own credential and puts no secret in any argv", ctx do
-      stage!(ctx.base, "claude", "oauth-token", "sk-ant-api03-remote\n")
+      stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-remote\n")
 
       plan =
         Claude.prepare_launch(
@@ -231,7 +235,7 @@ defmodule Tightbeam.CredentialKindsTest do
                  })
 
     test "an api-key claude host sends x-api-key on the same route", ctx do
-      stage!(ctx.base, "claude", "oauth-token", "sk-ant-api03-catalog")
+      stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-catalog")
       owner = self()
 
       fetch = fn path, headers ->
@@ -254,7 +258,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a subscription claude host still sends a bearer token", ctx do
-      stage!(ctx.base, "claude", "oauth-token", "sk-ant-oat01-catalog")
+      stage!(ctx.base, "claude", ".credentials.json", "sk-ant-oat01-catalog")
       owner = self()
 
       fetch = fn _path, headers ->
@@ -431,7 +435,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert %{status: "ready", staging_path: staging, lease_id: lease_id} =
                onboard.(put_in(call.params[:phase], "begin"))
 
-      File.write!(Path.join(staging, "oauth-token"), "sk-ant-api03-ceremony")
+      File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-ceremony")
 
       assert %{provider: :anthropic, credential_kind: "apiKey", status: "onboarded"} =
                onboard.(

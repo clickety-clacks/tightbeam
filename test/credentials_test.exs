@@ -592,7 +592,7 @@ defmodule Tightbeam.CredentialsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, "oauth-token"), "sk-ant-api03-staged")
+      File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
       assert :ok = Credentials.finish_onboard(:anthropic, :api_key, lease_id, server)
 
       metadata = credential_metadata(ctx.base, "claude")
@@ -615,7 +615,7 @@ defmodule Tightbeam.CredentialsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, "oauth-token"), "sk-ant-oat01-staged")
+      File.write!(Path.join(staging, ".credentials.json"), "sk-ant-oat01-staged")
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata = credential_metadata(ctx.base, "claude")
@@ -638,7 +638,7 @@ defmodule Tightbeam.CredentialsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(claude_staging, "oauth-token"), "sk-ant-api03-staged")
+      File.write!(Path.join(claude_staging, ".credentials.json"), "sk-ant-api03-staged")
       :ok = Credentials.finish_onboard(:anthropic, :api_key, claude_lease_id, server)
 
       {:ok, codex_staging, codex_lease_id} = Credentials.begin_onboard(:openai, server)
