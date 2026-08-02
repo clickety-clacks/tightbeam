@@ -1119,11 +1119,11 @@ fn unvalidated_api_key(provider: &str, error: &str, host: &str) -> String {
 /// cancel phase off that exact phrase, and this is not that.
 fn rejected_setup_token(status: u16, body: &str, host: &str) -> String {
     format!(
-        "the captured Anthropic setup token was rejected on {host}: HTTP {status} {body}. \
+        "the Anthropic setup token was rejected on {host}: HTTP {status} {body}. \
          claude prints a token only to an account that has a subscription, so the likely \
-         fault is the CAPTURE rather than the account: the token is read off a replayed \
-         terminal screen and a truncated read is well-formed. Nothing was banked -- the \
-         anthropic credential on {host} is unchanged. Re-run the ceremony."
+         fault is the TOKEN rather than the account -- a partial copy is still well-formed \
+         and fails exactly like this. Nothing was banked; the anthropic credential on \
+         {host} is unchanged. Run `claude setup-token` again and paste the whole token."
     )
 }
 
@@ -1132,7 +1132,7 @@ fn rejected_setup_token(status: u16, body: &str, host: &str) -> String {
 /// operator re-authorizing an account that was never the problem.
 fn unvalidated_setup_token(error: &str, host: &str) -> String {
     format!(
-        "could not reach anthropic from {host} to validate the captured setup token: \
+        "could not reach anthropic from {host} to validate the setup token: \
          {error}. The token was NOT validated. Nothing was banked -- the anthropic \
          credential on {host} is unchanged. This is a network failure on {host}, not a \
          verdict on the token or the subscription."
@@ -1976,7 +1976,7 @@ mod tests {
         assert!(message.contains("not a verdict"), "{message}");
         assert!(
             !message.contains("CAPTURE"),
-            "a network failure does not implicate the capture: {message}"
+            "a network failure does not implicate the token: {message}"
         );
     }
 
