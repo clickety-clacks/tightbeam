@@ -30,10 +30,10 @@
 //! Measured headlessly (`stty size` = 0 0, TERM unset) it banked 79 characters of a
 //! 108-character token and reported success.
 //!
-//! So the token is reassembled from its OWN rows: consecutive rows made only of token
-//! characters, terminated by the blank row that claude's `gap:1` panel always leaves
-//! after it. The single inferred width still does the prose, and no longer decides the
-//! credential.
+//! So the token is reassembled from its OWN rows, bounded by the blank rows that claude's
+//! `gap:1` panel leaves around it, and identified by the one thing a credential cannot
+//! change: it carries no whitespace. The single inferred width still does the prose, and
+//! no longer decides the credential.
 //!
 //! The ceremony now owns the pty and sets its geometry directly. Replay still derives
 //! the rendered width from bytes, so capture does not smuggle a width or token-length
@@ -221,7 +221,7 @@ pub fn displayed_lines(transcript: &[u8]) -> Vec<String> {
 /// One reading, shared by `capture_setup_token`, `capture_note`, and `refusal_reason`,
 /// so the capture and the explanation can never describe two different screens.
 enum Reading {
-    /// The non-empty panel body between the token heading and its blank-row boundary.
+    /// The one unbroken run standing below the token heading, rejoined from its rows.
     Token { token: String, rows: usize },
     /// No token panel heading was visible on the replayed screen.
     Absent { lines: usize },
@@ -232,12 +232,25 @@ enum Reading {
 
 /// Read the credential off the replayed token panel by screen structure.
 ///
-/// The provider is free to change the credential's prefix, length, and alphabet. The
-/// stable thing the ceremony exposes is a labelled panel: a heading naming an OAuth
-/// token, a blank row, one non-empty body (possibly wrapped), then a blank row or the end
-/// of the screen. We therefore capture the whole body and never mine a prefix-shaped
-/// substring out of it. If those boundaries are absent, capture refuses without placing
-/// any candidate bytes in its diagnostic.
+/// The provider is free to change the credential's prefix, length, and alphabet, so none
+/// of those may be a rule here. Two things the credential cannot change, because the
+/// things that consume it forbid it:
+///
+///   * It contains no whitespace. It is sent as an HTTP header value (`Authorization:
+///     Bearer ...`), which is what makes joining wrapped rows exact rather than lossy --
+///     the row breaks are the terminal's, not the credential's, and trimming them back
+///     off cannot remove a character the credential had.
+///   * It is therefore distinguishable from the panel's prose. The heading and the "store
+///     this token securely" footer are sentences; the credential is one unbroken run.
+///
+/// So the body is the ONE unbroken run standing immediately after the heading, and a
+/// screen showing a second unbroken run after it is refused rather than resolved. That
+/// second run is the shape both silent-truncation defects take: a credential split by a
+/// blank row reads as two runs, and so does a panel that painted two candidates. Taking
+/// the first of them is how a well-formed fragment gets banked (#80). There is nothing on
+/// the screen that says which one is the credential, so the screen does not get to decide.
+///
+/// Refusals never carry candidate bytes into their diagnostic.
 fn read_token(lines: &[String]) -> Reading {
     let runs = lines
         .split(|line| line.trim().is_empty())
@@ -258,14 +271,27 @@ fn read_token(lines: &[String]) -> Reading {
     }) else {
         return Reading::Absent { lines: lines.len() };
     };
-    let Some((token, rows)) = runs.get(heading + 1) else {
+
+    let body = &runs[heading + 1..];
+    let unbroken = body
+        .iter()
+        .filter(|(run, _)| !run.is_empty() && !run.chars().any(char::is_whitespace))
+        .count();
+    if unbroken > 1 {
+        return Reading::Ambiguous {
+            reason: "more than one unbroken credential body stood below the OAuth-token heading, \
+                     and nothing on the screen says which of them is the token",
+        };
+    }
+    let Some((token, rows)) = body.first() else {
         return Reading::Ambiguous {
             reason: "the OAuth-token panel contained no non-empty credential body",
         };
     };
-    if token.to_ascii_lowercase().contains("store this token") {
+    if unbroken == 0 || token.chars().any(char::is_whitespace) {
         return Reading::Ambiguous {
-            reason: "the token body ran into the panel footer without a blank separator",
+            reason: "the run below the OAuth-token heading carried whitespace, so it is prose or \
+                     a credential welded to the panel footer, not a credential on its own",
         };
     }
 
@@ -657,10 +683,7 @@ mod tests {
             if stale_tail == 3 {
                 assert_eq!(capture_setup_token(screen.as_bytes()), None);
                 let reason = refusal_reason(screen.as_bytes());
-                assert!(
-                    reason.contains("footer without a blank separator"),
-                    "{reason}"
-                );
+                assert!(reason.contains("carried whitespace"), "{reason}");
                 assert!(
                     !reason.contains(TOKEN),
                     "refusal leaked candidate: {reason}"
@@ -1079,10 +1102,7 @@ mod tests {
             "Your OAuth token (valid for 1 year):\r\n\r\n{TOKEN}\r\nStore this token securely.\r\n"
         );
         let ambiguous = refusal_reason(welded.as_bytes());
-        assert!(
-            ambiguous.contains("footer without a blank separator"),
-            "{ambiguous}"
-        );
+        assert!(ambiguous.contains("carried whitespace"), "{ambiguous}");
         assert!(
             !ambiguous.contains(TOKEN),
             "refusal leaked the candidate: {ambiguous}"
@@ -1132,6 +1152,54 @@ mod tests {
         }
     }
 
+    /// Two runs where one credential belongs, in the two ways it happens.
+    ///
+    /// A panel painting two candidates, and a credential the renderer split across a blank
+    /// row. Both used to return the FIRST run: well-formed, wrong, and -- until validation
+    /// went in ahead of banking -- banked. Nothing on either screen says which run is the
+    /// token, so the screen does not get to answer.
+    #[test]
+    fn a_second_candidate_body_makes_the_panel_undecidable() {
+        let two = format!(
+            "Your OAuth token (valid for 1 year):\r\n\r\n{TOKEN}\r\n\r\n{TOKEN}\r\n\r\nStore this token securely.\r\n"
+        );
+        assert_eq!(capture_setup_token(two.as_bytes()), None);
+        let reason = refusal_reason(two.as_bytes());
+        assert!(
+            reason.contains("more than one unbroken credential body"),
+            "{reason}"
+        );
+        assert!(!reason.contains(TOKEN), "refusal leaked a candidate: {reason}");
+        assert!(reason.contains("Re-run"), "{reason}");
+
+        let (head, tail) = TOKEN.split_at(60);
+        let split = format!(
+            "Your OAuth token (valid for 1 year):\r\n\r\n{head}\r\n\r\n{tail}\r\n\r\nStore this token securely.\r\n"
+        );
+        assert_eq!(
+            capture_setup_token(split.as_bytes()),
+            None,
+            "a blank row inside the credential has to refuse, not truncate at it"
+        );
+    }
+
+    /// Prose where the credential belongs is not a credential.
+    ///
+    /// The old rule took whatever stood below the heading and only recognised the footer
+    /// by the words `store this token` -- provider wording, and therefore a rule with a
+    /// shelf life. Whitespace is the durable discriminator: the credential travels in an
+    /// `Authorization` header and cannot contain any.
+    #[test]
+    fn a_body_carrying_whitespace_is_prose_however_it_is_worded() {
+        let reworded = format!(
+            "Your OAuth token (valid for 1 year):\r\n\r\n{TOKEN}\r\nKeep it somewhere safe.\r\n"
+        );
+        assert_eq!(capture_setup_token(reworded.as_bytes()), None);
+        let reason = refusal_reason(reworded.as_bytes());
+        assert!(reason.contains("carried whitespace"), "{reason}");
+        assert!(!reason.contains(TOKEN), "refusal leaked a candidate: {reason}");
+    }
+
     /// The refusal has to fire on a screen that is genuinely undecidable. Tonight proved
     /// it can silently not fire: capture returned a truncated token, so nothing refused,
     /// no failure log was written, and a dead credential was banked as onboarded.
@@ -1146,10 +1214,7 @@ mod tests {
 
         // And the operator is told which situation it was.
         let reason = refusal_reason(welded.as_bytes());
-        assert!(
-            reason.contains("footer without a blank separator"),
-            "{reason}"
-        );
+        assert!(reason.contains("carried whitespace"), "{reason}");
         assert!(
             !reason.contains(TOKEN),
             "refusal leaked the candidate: {reason}"

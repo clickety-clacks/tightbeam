@@ -1,4 +1,5 @@
 use std::io;
+use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
@@ -244,29 +245,363 @@ impl Drop for SignalForwarding {
     }
 }
 
+/// Take a descriptor off the blocking path for good.
+pub(crate) fn nonblocking(fd: libc::c_int) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+/// A descriptor we did not open, made non-blocking for as long as we hold it.
+///
+/// The operator's terminal outlives this process, so the flag it arrives with is the flag
+/// it leaves with; only the writes this ceremony makes are non-blocking.
+pub(crate) struct NonblockingFd {
+    fd: libc::c_int,
+    flags: libc::c_int,
+}
+
+impl NonblockingFd {
+    pub(crate) fn new(fd: libc::c_int) -> Result<Self, String> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        Ok(Self { fd, flags })
+    }
+}
+
+impl Drop for NonblockingFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fcntl(self.fd, libc::F_SETFL, self.flags);
+        }
+    }
+}
+
+/// How a supervised run ended other than by the child finishing on its own.
+///
+/// `Interrupted` is not a flavour of failure: the operator asked for the ceremony to
+/// stop, and a caller that banks a credential on the way out of one is doing the thing
+/// the interrupt forbade.
+#[derive(Debug)]
+pub(crate) enum RunError {
+    Failed(String),
+    Interrupted {
+        signal: libc::c_int,
+        message: String,
+    },
+}
+
+impl RunError {
+    fn interrupted(signal: libc::c_int, what: &str) -> Self {
+        Self::Interrupted {
+            signal,
+            message: format!("{what} was interrupted by signal {signal}"),
+        }
+    }
+
+    fn with_cleanup_failure(self, cleanup: String) -> Self {
+        match self {
+            Self::Failed(message) => {
+                Self::Failed(format!("{message}; cleanup also failed: {cleanup}"))
+            }
+            Self::Interrupted { signal, message } => Self::Interrupted {
+                signal,
+                message: format!("{message}; cleanup also failed: {cleanup}"),
+            },
+        }
+    }
+
+    pub(crate) fn is_interrupted(&self) -> bool {
+        matches!(self, Self::Interrupted { .. })
+    }
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) | Self::Interrupted { message, .. } => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+/// Spawn a child, drive it, and end it — in one place that every exit path goes through.
+///
+/// The three defects this shape exists to make unrepresentable, each of which was fixed
+/// individually twice and came back somewhere else:
+///
+///   1. A post-spawn setup step that fails with `?` and abandons a live child. There is
+///      no `?` between the spawn and [`Supervised::settle`]: everything the caller does
+///      after the fork happens inside `drive`, whose error becomes a VALUE that settle
+///      terminates on. Arming is inside the funnel for the same reason.
+///   2. A late TERM observed just before a normal return and then discarded. Only settle
+///      decides a run completed, and it disarms BEFORE it reads the signal for the last
+///      time — after that store no signal can reach this group, so the read that follows
+///      it is final rather than a sample with a window behind it.
+///   3. A blocking write that outlives the lease. Every write a driver makes goes through
+///      [`Supervised::write_all`], which is bounded by the same deadline and the same
+///      signal as the loop around it.
+///
+/// `command` must put the child at the head of its own process group -- `setpgid` in a
+/// `pre_exec`, or the `setsid` a pty ceremony needs anyway. Ending a ceremony means ending
+/// the tree it spawned, and the leader's pid is the only safe handle on that tree.
+pub(crate) fn supervise<T>(
+    mut command: Command,
+    what: &str,
+    deadline: Instant,
+    drive: impl FnOnce(&mut Supervised) -> Result<T, RunError>,
+) -> Result<(T, ExitStatus), RunError> {
+    if Instant::now() >= deadline {
+        return Err(RunError::Failed(format!(
+            "{what} refused to start because its onboarding lease already expired"
+        )));
+    }
+
+    let forwarding = SignalForwarding::install().map_err(|error| error.to_string())?;
+    reset_sigchld_before_spawn();
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    // The parent's copies of whatever stdio the caller configured close here, before the
+    // driver waits for the child's end of them to report EOF.
+    drop(command);
+
+    let mut supervised = Supervised {
+        child,
+        forwarding,
+        what: what.to_owned(),
+        deadline,
+        settled: false,
+    };
+    let outcome = supervised
+        .forwarding
+        .arm(&supervised.child)
+        .map_err(|error| RunError::Failed(error.to_string()))
+        .and_then(|()| drive(&mut supervised));
+    supervised.settle(outcome)
+}
+
+/// A spawned child and the signal registry entry that owns its group.
+pub(crate) struct Supervised {
+    child: Child,
+    forwarding: SignalForwarding,
+    what: String,
+    deadline: Instant,
+    settled: bool,
+}
+
+impl Supervised {
+    pub(crate) fn child(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    /// The child leads its own group, so its pid IS the group id. Valid only while the
+    /// leader is unreaped, which every caller of this is.
+    pub(crate) fn pgid(&self) -> libc::pid_t {
+        self.child.id() as libc::pid_t
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub(crate) fn what(&self) -> &str {
+        &self.what
+    }
+
+    /// Has the leader exited? Asked without reaping — see [`exited_without_reaping`].
+    pub(crate) fn exited(&self) -> Result<bool, RunError> {
+        exited_without_reaping(&self.child)
+            .map_err(|error| RunError::Failed(format!("wait for {} failed: {error}", self.what)))
+    }
+
+    /// The signal an operator sent us, if one has arrived. The handler has already
+    /// forwarded it to the group; this is how the driver learns to stop.
+    pub(crate) fn interrupted(&self) -> Option<RunError> {
+        self.forwarding
+            .caught()
+            .map(|signal| RunError::interrupted(signal, &self.what))
+    }
+
+    pub(crate) fn expired(&self) -> Option<RunError> {
+        (Instant::now() >= self.deadline).then(|| self.deadline_failure())
+    }
+
+    fn deadline_failure(&self) -> RunError {
+        RunError::Failed(format!(
+            "{} did not finish before its onboarding lease expired; terminated it and its \
+             process group ({})",
+            self.what,
+            self.pgid()
+        ))
+    }
+
+    /// Write every byte, or stop — bounded by the lease and by the operator's signal.
+    ///
+    /// The consumer on the other side of `fd` belongs to somebody else: a terminal
+    /// nobody is reading, a pipe whose reader has stalled. A blocking write to it hands
+    /// that party control of when this ceremony ends. Waiting on the fd rather than on a
+    /// fixed sleep is what keeps the alternative from being a spin, and no byte is
+    /// dropped on the way: a short write resumes where it stopped.
+    pub(crate) fn write_all(&self, fd: libc::c_int, mut bytes: &[u8]) -> Result<(), RunError> {
+        while !bytes.is_empty() {
+            if let Some(error) = self.interrupted() {
+                return Err(error);
+            }
+            if let Some(error) = self.expired() {
+                return Err(error);
+            }
+
+            let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if count > 0 {
+                bytes = &bytes[count as usize..];
+                continue;
+            }
+            if count == 0 {
+                return Err(RunError::Failed(format!(
+                    "{} could not write to fd {fd}: the write made no progress",
+                    self.what
+                )));
+            }
+
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => self.wait(Some(libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                })),
+                _ => return Err(RunError::Failed(error.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Block until the fd is ready, the lease is nearly up, or a signal lands.
+    ///
+    /// `None` waits on nothing at all, which is how a driver with no fd to watch idles:
+    /// unlike a sleep, `poll` returns on EINTR, so a TERM is acted on when it arrives
+    /// rather than at the end of the current nap.
+    pub(crate) fn wait(&self, watched: Option<libc::pollfd>) {
+        let mut polls = watched.into_iter().collect::<Vec<_>>();
+        let timeout = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(50))
+            .as_millis() as libc::c_int;
+        unsafe {
+            libc::poll(polls.as_mut_ptr(), polls.len() as _, timeout);
+        }
+    }
+
+    /// The ONLY code that ends a supervised child.
+    ///
+    /// A driver that returns `Ok` is claiming the child finished on its own; everything
+    /// else — its own failure, the deadline, a signal — arrives here as an error and is
+    /// terminated identically. The disarm-then-read on the success path is the ordering
+    /// that closes the lost-TERM window: after the disarm the handler can no longer
+    /// signal this group, so a signal read after it either arrived while the group was
+    /// still armed (and was delivered) or arrived after the child was already done.
+    fn settle<T>(mut self, outcome: Result<T, RunError>) -> Result<(T, ExitStatus), RunError> {
+        let cause = match outcome {
+            Ok(value) => {
+                self.forwarding.disarm();
+                match self.forwarding.caught() {
+                    None => {
+                        self.settled = true;
+                        let status = self.child.wait().map_err(|error| error.to_string())?;
+                        return Ok((value, status));
+                    }
+                    Some(signal) => RunError::interrupted(signal, &self.what),
+                }
+            }
+            Err(cause) => cause,
+        };
+
+        self.settled = true;
+        match terminate_process_group(&mut self.child, Duration::from_secs(2)) {
+            Ok(()) => {
+                self.forwarding.disarm();
+                match self.child.wait() {
+                    Ok(_) => Err(cause),
+                    Err(error) => Err(cause.with_cleanup_failure(format!(
+                        "could not reap {}: {error}",
+                        self.what
+                    ))),
+                }
+            }
+            Err(error) => {
+                self.forwarding.disarm();
+                Err(cause.with_cleanup_failure(format!(
+                    "could not terminate {}: {error}; process group left unsignalled",
+                    self.what
+                )))
+            }
+        }
+    }
+}
+
+/// The backstop for the one exit `settle` cannot be on: an unwinding panic in a driver.
+impl Drop for Supervised {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let terminated = terminate_process_group(&mut self.child, Duration::from_secs(2));
+        self.forwarding.disarm();
+        if terminated.is_ok() {
+            let _ = self.child.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
+
+    /// Run `body` in a test process of its own, and answer whether it passed.
+    ///
+    /// `forward_to_active_group` is the only way to exercise the handler deterministically,
+    /// and it fires at EVERY armed slot -- including the groups of whatever other tests are
+    /// running in parallel. Isolation is what keeps a signal regression from terminating
+    /// its neighbours.
+    fn alone(test: &str) -> bool {
+        let variable = format!("TIGHTBEAM_ISOLATED_{}", test.to_ascii_uppercase());
+        if std::env::var_os(&variable).is_some() {
+            return true;
+        }
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("child_process::tests::{test}"),
+                "--nocapture",
+            ])
+            .env(&variable, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated regression {test} failed");
+        false
+    }
 
     #[test]
     fn a_signal_caught_before_arming_is_forwarded_when_the_group_becomes_known() {
-        const INNER: &str = "TIGHTBEAM_EARLY_SIGNAL_INNER";
-        if std::env::var_os(INNER).is_none() {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "child_process::tests::a_signal_caught_before_arming_is_forwarded_when_the_group_becomes_known",
-                    "--nocapture",
-                ])
-                .env(INNER, "1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "isolated early-signal regression failed");
+        if !alone("a_signal_caught_before_arming_is_forwarded_when_the_group_becomes_known") {
             return;
         }
 
@@ -305,5 +640,114 @@ mod tests {
         );
         forwarding.disarm();
         child.wait().unwrap();
+    }
+
+    /// The window a TERM used to vanish into: it lands after the loop's last look at the
+    /// signal and before the run is called a success.
+    ///
+    /// What made it worth a regression rather than a shrug is what the caller does next.
+    /// The ceremony above this reads a year-long credential out of a successful run and
+    /// banks it -- so a discarded TERM does not merely lose an exit code, it completes an
+    /// operation the operator interrupted.
+    #[test]
+    fn a_term_arriving_as_the_child_finishes_is_not_reported_as_success() {
+        if !alone("a_term_arriving_as_the_child_finishes_is_not_reported_as_success") {
+            return;
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let error = supervise(
+            command,
+            "a finishing ceremony",
+            Instant::now() + Duration::from_secs(5),
+            |supervised| {
+                while !supervised.exited()? {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // The child is done and the driver is one statement away from saying so.
+                forward_to_active_group(libc::SIGTERM);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.is_interrupted(),
+            "a run interrupted at the finish reported: {error}"
+        );
+        assert!(error.to_string().contains("a finishing ceremony"), "{error}");
+    }
+
+    /// A setup step that fails after the fork -- the flag on a descriptor, the pipe the
+    /// key goes down -- used to `?` its way out and leave the child running against a
+    /// ceremony nobody was watching any more.
+    ///
+    /// The driver here waits for the child to record its own identity before failing, so
+    /// the assertion below names a process that certainly existed. That wait is also why
+    /// this cannot pass by accident: a child killed before it ever ran would leave no
+    /// marker to check.
+    #[test]
+    fn a_post_spawn_setup_failure_leaves_no_running_child() {
+        let marker = std::env::temp_dir().join(format!(
+            "tightbeam-post-spawn-failure-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    "printf '%s' \"$$\" > '{}'; while :; do sleep 1; done",
+                    marker.display()
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let error = supervise(command, "a stub ceremony", deadline, |_| -> Result<(), RunError> {
+            while std::fs::read_to_string(&marker).unwrap_or_default().is_empty() {
+                assert!(Instant::now() < deadline, "the stub never recorded its pid");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(RunError::Failed(
+                "a post-spawn setup step failed".to_owned(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("a post-spawn setup step failed"));
+        assert!(!error.to_string().contains("cleanup"), "{error}");
+
+        let child = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_file(&marker);
+        // Absence from the process table, not elapsed time -- the same reason as the
+        // watchdog's grandchild check.
+        let listed = Command::new("ps")
+            .args(["-o", "pid=", "-p", child.trim()])
+            .output()
+            .expect("ps must run, or this test learned nothing");
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+            "the abandoned child {child} is still running"
+        );
     }
 }

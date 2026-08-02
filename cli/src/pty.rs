@@ -6,9 +6,9 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::child_process::{
-    SignalForwarding, exited_without_reaping, reset_sigchld_before_spawn, terminate_process_group,
-};
+use crate::child_process::{NonblockingFd, Supervised, nonblocking, supervise};
+
+pub(crate) use crate::child_process::RunError;
 
 /// The current provider token's observed width. At 109 columns it arrives whole and its
 /// repaint reaches the row edge, so an older frame cannot leave a suffix beside it. This
@@ -23,56 +23,24 @@ pub(crate) struct Output {
     pub(crate) transcript: Vec<u8>,
 }
 
-#[derive(Debug)]
-pub(crate) enum RunError {
-    Failed(String),
-    Interrupted {
-        signal: libc::c_int,
-        message: String,
-    },
-}
-
-impl RunError {
-    fn interrupted(signal: libc::c_int, what: &str) -> Self {
-        Self::Interrupted {
-            signal,
-            message: format!("{what} was interrupted by signal {signal}"),
-        }
-    }
-
-    fn with_cleanup_failure(self, cleanup: String) -> Self {
-        match self {
-            Self::Failed(message) => {
-                Self::Failed(format!("{message}; cleanup also failed: {cleanup}"))
-            }
-            Self::Interrupted { signal, message } => Self::Interrupted {
-                signal,
-                message: format!("{message}; cleanup also failed: {cleanup}"),
-            },
-        }
-    }
-
-    pub(crate) fn is_interrupted(&self) -> bool {
-        matches!(self, Self::Interrupted { .. })
-    }
-}
-
-impl From<String> for RunError {
-    fn from(message: String) -> Self {
-        Self::Failed(message)
-    }
-}
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Failed(message) | Self::Interrupted { message, .. } => {
-                formatter.write_str(message)
-            }
-        }
-    }
-}
-
+/// Run a ceremony under a pty and READ a credential off it.
+///
+/// This is a capture stream, and a capture stream is never mirrored. The bytes come back
+/// in `Output::transcript` for the screen reader and go nowhere else: not one child byte
+/// is written to the operator's terminal, whatever the child prints.
+///
+/// That is a property of the STREAM, not a rule about its content, and it replaces one
+/// that could not hold. The previous shape forwarded everything until it recognised the
+/// heading `claude` prints above the token — so a reworded heading, which the provider
+/// is free to ship at any time, put a year-long credential on stdout and into whatever
+/// was capturing it. Any rule of the form "forward until it looks secret" has that
+/// failure mode, because the parent cannot know a credential by looking at it. What the
+/// parent does know is which stream it is about to read a credential OUT of; on that
+/// stream, silence is the only safe default.
+///
+/// The operator is not left blind: what they need — the authorization URL — is extracted
+/// from the replayed screen and printed by the parent in its own words. Their keystrokes
+/// still reach the child, so pasting an authorization code works exactly as before.
 pub(crate) fn run(command: Command, what: &str, deadline: Instant) -> Result<Output, RunError> {
     run_with_fds(
         command,
@@ -90,66 +58,57 @@ fn run_with_fds(
     input_fd: libc::c_int,
     output_fd: libc::c_int,
 ) -> Result<Output, RunError> {
-    if Instant::now() >= deadline {
-        return Err(format!(
-            "{what} refused to start because its onboarding lease already expired"
-        )
-        .into());
-    }
-
-    let forwarding = SignalForwarding::install().map_err(|error| error.to_string())?;
     let (master, slave) = open_pty()?;
     configure_command(&mut command, &slave)?;
 
-    reset_sigchld_before_spawn();
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    drop(command);
-    drop(slave);
-    forwarding.arm(&child).map_err(|error| error.to_string())?;
-    if let Err(error) = nonblocking(master.as_raw_fd()) {
-        return abort_group(&mut child, what, &forwarding, error);
-    }
-
     let mut transcript = Vec::new();
+    let (_, status) = supervise(command, what, deadline, |supervised| {
+        // The parent's copies of the pty slave close HERE, before anything waits on the
+        // master. While any copy of the slave is still open in this process the master
+        // never reports EOF, and the loop below waits for an end that cannot arrive --
+        // which is what hung four tests on linux, where the timing exposes it.
+        drop(slave);
+        nonblocking(master.as_raw_fd())?;
+        let _output_flags = NonblockingFd::new(output_fd)?;
+        relay(supervised, &master, input_fd, output_fd, &mut transcript)
+    })?;
+
+    Ok(Output { status, transcript })
+}
+
+/// Carry the operator's keystrokes to the child and its bytes into the transcript.
+///
+/// It writes to `output_fd` only in its own words. Every way this returns -- completion,
+/// the lease, a signal, an I/O failure -- is a value handed back to `supervise`, which
+/// owns ending the child.
+fn relay(
+    supervised: &mut Supervised,
+    master: &OwnedFd,
+    input_fd: libc::c_int,
+    output_fd: libc::c_int,
+    transcript: &mut Vec<u8>,
+) -> Result<(), RunError> {
     let mut pending_input = Vec::new();
     let mut input_eof = false;
     let mut sent_eof = false;
     let mut master_eof = false;
     let mut printed_url = None;
-    let mut secret_screen = false;
-    let _output_flags = match NonblockingFd::new(output_fd) {
-        Ok(flags) => flags,
-        Err(error) => return abort_group(&mut child, what, &forwarding, error),
-    };
 
     loop {
-        let leader_exited = exited_without_reaping(&child).map_err(|error| {
-            format!("wait for {what} failed: {error}; process group left unsignalled")
-        })?;
+        // Asked before the signal is read, so that a child which exited and a TERM which
+        // arrived in the same instant are both known to the same iteration.
+        let leader_exited = supervised.exited()?;
 
-        if let Some(signal) = forwarding.caught() {
-            return abort_group(
-                &mut child,
-                what,
-                &forwarding,
-                RunError::interrupted(signal, what),
-            );
+        if let Some(error) = supervised.interrupted() {
+            return Err(error);
         }
 
         if leader_exited && master_eof {
-            forwarding.disarm();
-            let status = child.wait().map_err(|error| error.to_string())?;
-            return Ok(Output { status, transcript });
+            return Ok(());
         }
 
-        if Instant::now() >= deadline {
-            terminate_group(&mut child, what, &forwarding)?;
-            return Err(format!(
-                "{what} did not finish before its onboarding lease expired; terminated it and \
-                 its process group ({})",
-                child.id()
-            )
-            .into());
+        if let Some(error) = supervised.expired() {
+            return Err(error);
         }
 
         if input_eof && !sent_eof && pending_input.is_empty() && !master_eof {
@@ -173,7 +132,8 @@ fn run_with_fds(
                 revents: 0,
             },
         ];
-        let timeout_ms = deadline
+        let timeout_ms = supervised
+            .deadline()
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(50))
             .as_millis() as libc::c_int;
@@ -181,7 +141,7 @@ fn run_with_fds(
         if polled == -1 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
-                return abort_group(&mut child, what, &forwarding, error.to_string());
+                return Err(error.to_string().into());
             }
             continue;
         }
@@ -196,7 +156,7 @@ fn run_with_fds(
             } else {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
-                    return abort_group(&mut child, what, &forwarding, error.to_string());
+                    return Err(error.to_string().into());
                 }
             }
         }
@@ -217,7 +177,7 @@ fn run_with_fds(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) {
-                    return abort_group(&mut child, what, &forwarding, error.to_string());
+                    return Err(error.to_string().into());
                 }
             }
         }
@@ -227,33 +187,11 @@ fn run_with_fds(
             let count =
                 unsafe { libc::read(master.as_raw_fd(), output.as_mut_ptr().cast(), output.len()) };
             if count > 0 {
-                let bytes = &output[..count as usize];
-                transcript.extend_from_slice(bytes);
-                if crate::screen::displayed_lines(&transcript)
-                    .join("\n")
-                    .to_ascii_lowercase()
-                    .contains("your oauth token")
-                    || crate::screen::capture_setup_token(&transcript).is_some()
-                {
-                    secret_screen = true;
-                }
-                if !secret_screen {
-                    if let Err(error) = write_all(output_fd, bytes, what, deadline, &forwarding) {
-                        return abort_group(&mut child, what, &forwarding, error);
-                    }
-                }
-                if let Some(url) = crate::screen::authorization_url(&transcript)
+                transcript.extend_from_slice(&output[..count as usize]);
+                if let Some(url) = crate::screen::authorization_url(transcript)
                     && printed_url.as_deref() != Some(url.as_str())
                 {
-                    if let Err(error) = write_all(
-                        output_fd,
-                        format!("\r\nAuthorization URL: {url}\r\n").as_bytes(),
-                        what,
-                        deadline,
-                        &forwarding,
-                    ) {
-                        return abort_group(&mut child, what, &forwarding, error);
-                    }
+                    supervised.write_all(output_fd, announcement(&url).as_bytes())?;
                     printed_url = Some(url);
                 }
             } else if count == 0 {
@@ -266,11 +204,24 @@ fn run_with_fds(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) {
-                    return abort_group(&mut child, what, &forwarding, error.to_string());
+                    return Err(error.to_string().into());
                 }
             }
         }
     }
+}
+
+/// Everything the operator is told, in the parent's words.
+///
+/// The second sentence is here because the silence is otherwise indistinguishable from a
+/// hang: the ceremony deliberately shows nothing the child prints, and an operator who
+/// expects to see `claude` needs to know that, and needs to know that pasting still works.
+fn announcement(url: &str) -> String {
+    format!(
+        "\r\nAuthorization URL: {url}\r\nSign in there, then paste the authorization code here \
+         if you are asked for one. What claude prints is not shown, because the credential \
+         appears in it.\r\n"
+    )
 }
 
 fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
@@ -334,103 +285,6 @@ fn duplicate(fd: &OwnedFd) -> Result<OwnedFd, String> {
         return Err(io::Error::last_os_error().to_string());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
-}
-
-fn nonblocking(fd: libc::c_int) -> Result<(), String> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    Ok(())
-}
-
-struct NonblockingFd {
-    fd: libc::c_int,
-    flags: libc::c_int,
-}
-
-impl NonblockingFd {
-    fn new(fd: libc::c_int) -> Result<Self, String> {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
-        {
-            return Err(io::Error::last_os_error().to_string());
-        }
-        Ok(Self { fd, flags })
-    }
-}
-
-impl Drop for NonblockingFd {
-    fn drop(&mut self) {
-        unsafe {
-            libc::fcntl(self.fd, libc::F_SETFL, self.flags);
-        }
-    }
-}
-
-fn write_all(
-    fd: libc::c_int,
-    mut bytes: &[u8],
-    what: &str,
-    deadline: Instant,
-    forwarding: &SignalForwarding,
-) -> Result<(), RunError> {
-    while !bytes.is_empty() {
-        if let Some(signal) = forwarding.caught() {
-            return Err(RunError::interrupted(signal, what));
-        }
-        if Instant::now() >= deadline {
-            return Err(
-                format!("{what} did not finish before its onboarding lease expired").into(),
-            );
-        }
-        let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if count > 0 {
-            bytes = &bytes[count as usize..];
-        } else {
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::Interrupted => {
-                    if let Some(signal) = forwarding.caught() {
-                        return Err(RunError::interrupted(signal, what));
-                    }
-                }
-                io::ErrorKind::WouldBlock => std::thread::sleep(
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(10)),
-                ),
-                _ => return Err(error.to_string().into()),
-            }
-        }
-    }
-    Ok(())
-}
-
-fn terminate_group(
-    child: &mut std::process::Child,
-    what: &str,
-    forwarding: &SignalForwarding,
-) -> Result<(), String> {
-    terminate_process_group(child, Duration::from_secs(2)).map_err(|error| {
-        format!("could not terminate {what}: {error}; process group left unsignalled")
-    })?;
-    forwarding.disarm();
-    child.wait().map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-fn abort_group<T>(
-    child: &mut std::process::Child,
-    what: &str,
-    forwarding: &SignalForwarding,
-    cause: impl Into<RunError>,
-) -> Result<T, RunError> {
-    let cause = cause.into();
-    match terminate_group(child, what, forwarding) {
-        Ok(()) => Err(cause),
-        Err(cleanup) => Err(cause.with_cleanup_failure(cleanup)),
-    }
 }
 
 #[cfg(test)]
@@ -554,6 +408,56 @@ mod tests {
         assert!(
             rendered.contains("Authorization URL: https://example.test/authorize?code=fixture"),
             "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains("Opening browser"),
+            "the child's own output reached the terminal: {rendered:?}"
+        );
+    }
+
+    /// The failure that made "forward until it looks secret" untenable.
+    ///
+    /// `claude` renames the heading above its token -- a thing it is free to do in any
+    /// release -- and the recognition rule never fires: capture correctly refuses, and the
+    /// credential is on stdout anyway, because the parent forwarded the panel while
+    /// deciding it was not one. The assertion is on the BYTES the parent wrote, not on
+    /// what it returned; the return value was already right when this leaked.
+    #[test]
+    fn an_unreadable_credential_panel_reaches_neither_stdout_nor_capture() {
+        const TOKEN: &str = "sk-ant-oat01-SYNTHETIC-NOT-A-CREDENTIAL-0123456789";
+        let input = pipe_with(b"");
+        let (path, file) = output_file("unreadable-panel");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!(
+                "printf 'Your API credential (valid for 1 year):\\n\\n{TOKEN}\\n\\nStore it somewhere safe.\\n'"
+            ),
+        ]);
+
+        let result = run_with_fds(
+            command,
+            "unreadable panel fixture",
+            Instant::now() + Duration::from_secs(5),
+            input.as_raw_fd(),
+            file.as_raw_fd(),
+        )
+        .unwrap();
+        assert!(
+            crate::screen::capture_setup_token(&result.transcript).is_none(),
+            "the fixture has to be a panel capture cannot read, or it proves nothing"
+        );
+        drop(file);
+
+        let rendered = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(path);
+        assert!(
+            !rendered.contains(TOKEN),
+            "parent stdout leaked the credential: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("API credential"),
+            "parent stdout mirrored the child: {rendered:?}"
         );
     }
 

@@ -16,7 +16,37 @@ pub struct RequestSpec {
 pub struct Endpoint {
     pub base: String,
     pub token: String,
-    pub session_file: Option<PathBuf>,
+    pub origin: Origin,
+}
+
+/// WHERE the endpoint came from, kept because it answers a question its VALUES cannot.
+///
+/// "Is this request aimed at the gateway running on this machine?" was answered by
+/// comparing an endpoint's token to the local one -- so a deliberately remote `--url`
+/// that happened to carry the same token was classified local, and an operator adding a
+/// user to another org got a row inserted into this machine's database instead. Value
+/// equality was never the question. An endpoint is local when it was RESOLVED from this
+/// machine's own provisioning, and that is decided once, where the resolution happens,
+/// and then carried rather than re-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// A `.tightbeam-session` file found walking up from the working directory.
+    Session(PathBuf),
+    /// `TIGHTBEAM_URL` and `TIGHTBEAM_TOKEN` named a gateway outright. Explicit, and
+    /// therefore never this machine's own affair even when the two coincide.
+    Named,
+    /// This machine's provisioned `gateway.json`.
+    Provisioned,
+}
+
+impl Endpoint {
+    /// The session file this endpoint came from, for the callers that report it.
+    pub fn session_file(&self) -> Option<&Path> {
+        match &self.origin {
+            Origin::Session(path) => Some(path),
+            _ => None,
+        }
+    }
 }
 
 fn quoted(value: &str) -> String {
@@ -737,7 +767,7 @@ where
         return Ok(Endpoint {
             base,
             token,
-            session_file: None,
+            origin: Origin::Named,
         });
     }
 
@@ -767,7 +797,7 @@ fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
         return Ok(Some(Endpoint {
             base: base.to_owned(),
             token: token.to_owned(),
-            session_file: Some(path),
+            origin: Origin::Session(path),
         }));
     }
 
@@ -822,7 +852,7 @@ fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
     Ok(Endpoint {
         base,
         token,
-        session_file: None,
+        origin: Origin::Provisioned,
     })
 }
 
@@ -1026,7 +1056,7 @@ where
             // explicit remote endpoint must not get a user inserted into whichever
             // empty state.db happens to exist on this machine.
             let endpoint = discover_endpoint()?;
-            let first_user = first_user_for_target(add_user_target_is_local(&endpoint)?, || {
+            let first_user = first_user_for_target(add_user_target_is_local(&endpoint), || {
                 crate::users::create_first_if_local(&user_id, admin)
             })?;
             match first_user {
@@ -1104,17 +1134,8 @@ where
     }
 }
 
-fn add_user_target_is_local(endpoint: &Endpoint) -> Result<bool, String> {
-    let provisioned = provisioned();
-    if !matches!(provisioned, Provisioned::GatewayHost) {
-        return Ok(false);
-    }
-    let local = discover_from(&crate::base_dir::resolve())?;
-    Ok(add_user_endpoint_matches_local(
-        endpoint,
-        &provisioned,
-        &local,
-    ))
+fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
+    add_user_endpoint_matches_local(endpoint, &provisioned())
 }
 
 fn first_user_for_target<F>(local: bool, create: F) -> Result<crate::users::FirstUser, String>
@@ -1128,18 +1149,20 @@ where
     }
 }
 
-fn add_user_endpoint_matches_local(
-    endpoint: &Endpoint,
-    provisioned: &Provisioned,
-    local: &Endpoint,
-) -> bool {
+/// The one case that may create a user without asking a gateway: this machine IS the
+/// gateway host, and the request resolved to it because nothing else was named.
+///
+/// Both halves are provenance, not comparison. `Origin::Named` and `Origin::Session` each
+/// say an endpoint was chosen deliberately, and a deliberate choice is honoured as made
+/// even when it resolves to the same address and the same token as the local gateway --
+/// which is precisely the case that used to fall through to a local mutation.
+fn add_user_endpoint_matches_local(endpoint: &Endpoint, provisioned: &Provisioned) -> bool {
     matches!(provisioned, Provisioned::GatewayHost)
-        && endpoint.session_file.is_none()
-        && endpoint.token == local.token
+        && matches!(endpoint.origin, Origin::Provisioned)
 }
 
 fn require_session_endpoint(identity: &Identity, endpoint: &Endpoint) -> Result<(), String> {
-    if matches!(identity, Identity::Session) && endpoint.session_file.is_none() {
+    if matches!(identity, Identity::Session) && endpoint.session_file().is_none() {
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
         return Err(identity_required(&cwd));
     }
@@ -1234,35 +1257,52 @@ mod tests {
         );
     }
 
+    /// The case the value comparison could not see.
+    ///
+    /// `--url` naming a remote gateway that happens to share the local token -- one org's
+    /// token deployed on two hosts, or a satellite pointed back at its own gateway -- was
+    /// classified LOCAL and inserted a user into whatever `state.db` this machine had.
+    /// The comparison that shipped could not distinguish it because there is nothing in
+    /// the values to distinguish; the fixtures below share base AND token deliberately,
+    /// so nothing here can pass by comparing them.
     #[test]
     fn an_explicit_remote_add_user_target_cannot_use_the_local_empty_org_exception() {
-        let local = Endpoint {
-            base: "http://127.0.0.1:11373".to_owned(),
-            token: "tbc_local".to_owned(),
-            session_file: None,
+        let base = "http://127.0.0.1:11373".to_owned();
+        let token = "tbc_local".to_owned();
+        let provisioned = Endpoint {
+            base: base.clone(),
+            token: token.clone(),
+            origin: Origin::Provisioned,
         };
-        let remote = Endpoint {
-            base: "https://remote-gateway.test".to_owned(),
-            token: "tbc_remote".to_owned(),
-            session_file: None,
+        let named = Endpoint {
+            base: base.clone(),
+            token: token.clone(),
+            origin: Origin::Named,
+        };
+        let session = Endpoint {
+            base,
+            token,
+            origin: Origin::Session(PathBuf::from("/work/.tightbeam-session")),
         };
 
-        assert!(!add_user_endpoint_matches_local(
-            &remote,
-            &Provisioned::GatewayHost,
-            &local
-        ));
         assert!(add_user_endpoint_matches_local(
-            &local,
-            &Provisioned::GatewayHost,
-            &local
+            &provisioned,
+            &Provisioned::GatewayHost
+        ));
+        assert!(
+            !add_user_endpoint_matches_local(&named, &Provisioned::GatewayHost),
+            "an endpoint named on the command line is the operator's choice of target, \
+             whatever it resolves to"
+        );
+        assert!(!add_user_endpoint_matches_local(
+            &session,
+            &Provisioned::GatewayHost
         ));
         assert!(!add_user_endpoint_matches_local(
-            &remote,
+            &provisioned,
             &Provisioned::Satellite {
                 machine: Some("worker".to_owned())
-            },
-            &remote
+            }
         ));
         assert_eq!(
             first_user_for_target(false, || panic!("remote target attempted local mutation")),
@@ -1275,7 +1315,7 @@ mod tests {
         let endpoint = Endpoint {
             base: "http://gateway.example:11373".to_owned(),
             token: "tbc_org".to_owned(),
-            session_file: None,
+            origin: Origin::Provisioned,
         };
 
         for (method, path) in [
@@ -1771,7 +1811,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
                 token: "configured".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
 
@@ -1788,7 +1828,7 @@ mod tests {
             Ok(Endpoint {
                 base: "https://gateway".to_owned(),
                 token: "env-token".to_owned(),
-                session_file: None,
+                origin: Origin::Named,
             })
         );
 
@@ -1813,7 +1853,7 @@ mod tests {
                 Ok(Endpoint {
                     base: "http://127.0.0.1:4321".to_owned(),
                     token: "configured".to_owned(),
-                    session_file: None,
+                    origin: Origin::Provisioned,
                 })
             );
         }
@@ -1827,7 +1867,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
                 token: "configured".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
 
@@ -1849,7 +1889,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
                 token: "configured".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
 
@@ -1858,7 +1898,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:9876".to_owned(),
                 token: "default".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
         let env = HashMap::from([("TIGHTBEAM_HOME".to_owned(), String::new())]);
@@ -1902,7 +1942,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://gateway.example:11373".to_owned(),
                 token: "tbc_org".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
         assert_eq!(
@@ -1910,7 +1950,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:11373".to_owned(),
                 token: "tbc_org".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
         fs::remove_dir_all(root).unwrap();
@@ -1973,7 +2013,7 @@ mod tests {
                 Ok(Endpoint {
                     base: expected.to_owned(),
                     token: "tbc_org".to_owned(),
-                    session_file: None,
+                    origin: Origin::Provisioned,
                 }),
                 "{name}"
             );
@@ -2023,7 +2063,7 @@ mod tests {
             Ok(Endpoint {
                 base: "https://nearest-session".to_owned(),
                 token: "nearest-token".to_owned(),
-                session_file: Some(ancestor.join("work").join(".tightbeam-session")),
+                origin: Origin::Session(ancestor.join("work").join(".tightbeam-session")),
             })
         );
 
@@ -2055,7 +2095,7 @@ mod tests {
                 Ok(Endpoint {
                     base: "https://session-gateway".to_owned(),
                     token: "tbs_discovered".to_owned(),
-                    session_file: Some(PathBuf::from("/work/.tightbeam-session")),
+                    origin: Origin::Session(PathBuf::from("/work/.tightbeam-session")),
                 })
             },
             |endpoint, request, deadline| {
@@ -2072,7 +2112,7 @@ mod tests {
         let endpoint = Endpoint {
             base: "http://127.0.0.1:1".to_owned(),
             token: "tbc_test".to_owned(),
-            session_file: None,
+            origin: Origin::Provisioned,
         };
         let error = run_with(
             Command::List {
@@ -2121,7 +2161,7 @@ mod tests {
                 Ok(Endpoint {
                     base: gateway.clone(),
                     token: "tbc_one".to_owned(),
-                    session_file: None,
+                    origin: Origin::Provisioned,
                 })
             },
             |endpoint, request, deadline| {
@@ -2184,7 +2224,7 @@ mod tests {
         let endpoint = Endpoint {
             base: "http://127.0.0.1:1".to_owned(),
             token: "tbc_test".to_owned(),
-            session_file: None,
+            origin: Origin::Provisioned,
         };
         let request = build_onboard_phase_request(
             &Identity::User("flynn".to_owned()),
