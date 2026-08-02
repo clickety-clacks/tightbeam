@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::args::{AssimilateArgs, Identity};
 use crate::child_process::{
-    NonblockingFd, RunError, Supervised, exited_without_reaping, nonblocking,
-    reset_sigchld_before_spawn, supervise,
+    RunError, Supervised, exited_without_reaping, nonblocking, reset_sigchld_before_spawn,
+    supervise,
 };
 use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
@@ -442,24 +442,7 @@ fn run_bounded(
     deadline: Instant,
     stdin: Option<&[u8]>,
 ) -> Result<ExitStatus, String> {
-    run_bounded_inner(command, what, deadline, stdin, None).map_err(|error| error.to_string())
-}
-
-/// Run a ceremony that reports a URL, MIRRORING its output to the operator.
-///
-/// The mirror is only ever pointed at a stream this process does not read a credential
-/// out of. `codex login --device-auth` delivers its credential into `CODEX_HOME`, and
-/// nothing here parses its output for one; what the operator needs from it -- the device
-/// code and the verification URL -- is only visible if it is shown. Where the credential
-/// DOES travel over the child's own output, capture and mirror are mutually exclusive and
-/// the mirror loses: a capture stream is read, never echoed, and writes not
-/// one child byte to the terminal.
-fn run_bounded_reporting_url(
-    command: ProcessCommand,
-    what: &str,
-    deadline: Instant,
-) -> Result<ExitStatus, RunError> {
-    run_bounded_inner(command, what, deadline, None, Some(libc::STDOUT_FILENO))
+    run_bounded_inner(command, what, deadline, stdin).map_err(|error| error.to_string())
 }
 
 fn run_bounded_inner(
@@ -467,12 +450,7 @@ fn run_bounded_inner(
     what: &str,
     deadline: Instant,
     stdin: Option<&[u8]>,
-    url_output_fd: Option<libc::c_int>,
 ) -> Result<ExitStatus, RunError> {
-    if url_output_fd.is_some() {
-        command.stdout(Stdio::piped());
-    }
-
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -483,7 +461,7 @@ fn run_bounded_inner(
     }
 
     let (_, status) = supervise(command, what, deadline, |supervised| {
-        attend(supervised, stdin, url_output_fd)
+        attend(supervised, stdin)
     })?;
     Ok(status)
 }
@@ -493,19 +471,7 @@ fn run_bounded_inner(
 /// Every way out of here is a returned value, including the setup steps at the top: a
 /// child whose stdout cannot be made non-blocking, or whose stdin will not take the key,
 /// is terminated by `supervise` rather than left running behind a `?`.
-fn attend(
-    supervised: &mut Supervised,
-    stdin: Option<&[u8]>,
-    url_output_fd: Option<libc::c_int>,
-) -> Result<(), RunError> {
-    let _output_flags = url_output_fd.map(NonblockingFd::new).transpose()?;
-    let mut captured_stdout = supervised.child().stdout.take();
-    if let Some(stdout) = &captured_stdout {
-        nonblocking(stdout.as_raw_fd())?;
-    }
-    let stdout_fd = captured_stdout.as_ref().map(AsRawFd::as_raw_fd);
-    let mut output_eof = captured_stdout.is_none();
-
+fn attend(supervised: &mut Supervised, stdin: Option<&[u8]>) -> Result<(), RunError> {
     // Set the group on this side too: the child may not have reached its own setpgid yet,
     // and the terminal handoff below needs the group to exist. Both sides racing to set the
     // same value is the standard job-control fix; the redundant call is harmless.
@@ -532,46 +498,7 @@ fn attend(
         deliver(supervised, bytes)?;
     }
 
-    let mut output = Vec::new();
-    let mut printed_url: Option<String> = None;
-
     loop {
-        if let Some(stdout) = &mut captured_stdout {
-            let mut bytes = [0u8; 8192];
-            loop {
-                if let Some(error) = supervised.interrupted() {
-                    return Err(error);
-                }
-                if let Some(error) = supervised.expired() {
-                    return Err(error);
-                }
-                match stdout.read(&mut bytes) {
-                    Ok(0) => {
-                        output_eof = true;
-                        break;
-                    }
-                    Ok(count) => {
-                        let bytes = &bytes[..count];
-                        output.extend_from_slice(bytes);
-                        let fd = url_output_fd.expect("a mirrored run has an output fd");
-                        supervised.write_all(fd, bytes)?;
-                        if let Some(url) = crate::screen::authorization_url(&output)
-                            && printed_url.as_deref() != Some(url.as_str())
-                        {
-                            supervised.write_all(
-                                fd,
-                                format!("\nAuthorization URL: {url}\n").as_bytes(),
-                            )?;
-                            printed_url = Some(url);
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error.to_string().into()),
-                }
-            }
-        }
-
         // Asked before the signal is read, so that a child which exited and a TERM which
         // arrived in the same instant are both known to the same iteration.
         let leader_exited = supervised.exited()?;
@@ -580,7 +507,7 @@ fn attend(
             return Err(error);
         }
 
-        if leader_exited && output_eof {
+        if leader_exited {
             return Ok(());
         }
 
@@ -588,11 +515,8 @@ fn attend(
             return Err(error);
         }
 
-        supervised.wait(stdout_fd.map(|fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        }));
+        // Nothing to poll now that stdout is the operator's: just sleep to the next look.
+        supervised.wait(None);
     }
 }
 
@@ -938,7 +862,16 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = run_bounded_reporting_url(command, "codex device-code login", ceremony.deadline)
+    // stdout is INHERITED, not captured. codex prints the sign-in link and the one-time
+    // code itself, more usefully than we did: we used to pipe its output, replay it through
+    // a terminal emulator to strip ANSI, scan for a URL, and echo back a line the operator
+    // could already see four lines above. Reading a stream we have no reason to read is the
+    // same mistake the anthropic leg was deleted for.
+    // `run_bounded_inner` rather than `run_bounded`: the latter flattens its error to a
+    // String, which discards the INTERRUPTED classification. An interrupt must stay
+    // distinguishable from an ordinary failure all the way up, because `onboard` skips the
+    // gateway cancel on one and not the other.
+    let status = run_bounded_inner(command, "codex device-code login", ceremony.deadline, None)
         .map_err(StageFailure::from)?;
 
     codex_staged_a_credential(status, staging, "OpenAI device-code onboarding")
@@ -966,7 +899,7 @@ fn run_anthropic_onboarding(
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), StageFailure> {
-    let token = read_setup_token()?;
+    let token = read_setup_token(staging)?;
     validate_setup_token(&token, machine, ceremony.deadline).map_err(StageFailure::from)?;
 
     let path = PathBuf::from(staging).join("oauth-token");
@@ -996,10 +929,15 @@ fn run_anthropic_onboarding(
 /// prints. What is NOT given up: the token is still validated with one authenticated call
 /// before anything is staged, because a pasted token can be truncated by a bad copy exactly
 /// as a captured one could be by a bad read.
-fn read_setup_token() -> Result<String, StageFailure> {
+fn read_setup_token(staging: &str) -> Result<String, StageFailure> {
+    // CLAUDE_CONFIG_DIR is not decoration. `claude setup-token` writes config into whatever
+    // config dir it is pointed at -- measured: it created `.claude.json` and a backup there
+    // -- so run bare it edits the operator's personal `~/.claude`, which on a dev box is the
+    // login they are using right now. Pointing it at our staging directory keeps everything
+    // the command produces inside Tightbeam's own home, and staging is thrown away after.
     println!(
-        "Run `claude setup-token`, complete the sign-in in your browser, and paste the token \
-         it prints here (then press enter):"
+        "Run this, complete the sign-in in your browser, and paste the token it prints \
+         here (then press enter):\n\n    CLAUDE_CONFIG_DIR={staging} claude setup-token\n"
     );
 
     let mut token = String::new();
@@ -2254,87 +2192,6 @@ mod tests {
         assert!(!cancel_entered, "TERM entered the lease-cancellation wait");
         assert!(!alive, "codex descendant {grandchild} survived TERM");
         assert!(!staging_survived, "TERM left codex staging behind");
-    }
-
-    #[test]
-    fn openai_device_flow_url_is_reprinted_by_tightbeam() {
-        let path = std::env::temp_dir().join(format!(
-            "tightbeam-openai-url-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_file(&path);
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let mut command = ProcessCommand::new("/bin/sh");
-        command
-            .args([
-                "-c",
-                "printf 'Open this URL: https://auth.openai.test/device?code=fixture\\n'",
-            ])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
-
-        let status = run_bounded_inner(
-            command,
-            "openai URL fixture",
-            Instant::now() + Duration::from_secs(5),
-            None,
-            Some(file.as_raw_fd()),
-        )
-        .unwrap();
-        assert!(status.success());
-        drop(file);
-
-        let rendered = fs::read_to_string(&path).unwrap();
-        let _ = fs::remove_file(path);
-        assert!(
-            rendered.contains("Authorization URL: https://auth.openai.test/device?code=fixture"),
-            "{rendered:?}"
-        );
-    }
-
-    #[test]
-    fn a_blocked_output_consumer_cannot_hold_codex_past_its_deadline() {
-        use std::os::fd::{FromRawFd, OwnedFd};
-
-        let mut fds = [-1, -1];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let _reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        let mut command = ProcessCommand::new("/bin/sh");
-        command
-            .args([
-                "-c",
-                "while :; do printf 'continuous child output\\n'; done",
-            ])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
-        let started = Instant::now();
-
-        let error = run_bounded_inner(
-            command,
-            "blocked codex output fixture",
-            Instant::now() + Duration::from_millis(100),
-            None,
-            Some(writer.as_raw_fd()),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("onboarding lease expired"),
-            "{error}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "blocked output held the codex loop for {:?}",
-            started.elapsed()
-        );
     }
 
     /// A child that never reads the key it was handed used to own the lease.
