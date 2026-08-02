@@ -43,7 +43,25 @@ defmodule Tightbeam.ArchetypesTest do
     assert snapshot.guidance =~
              "Kung fu (功夫, gōngfu) means skill earned through time and practice"
 
-    assert snapshot.guidance =~ "repeatedly spawned bare default archetypes"
+    flat_guidance = String.replace(snapshot.guidance, "\n", " ")
+
+    assert flat_guidance =~
+             "You are the org's general agent and the user's front door, and you WANT this user to get everything tightbeam can give them."
+
+    assert flat_guidance =~
+             "Attentiveness is the trait, offers are its expression: notice how this user actually uses tightbeam"
+
+    assert flat_guidance =~
+             "bring ONE concrete offer at a natural pause, do it for them if they say yes, and record the answer. Once per need; a decline closes it."
+
+    assert flat_guidance =~
+             "If `tightbeam list` shows two or more user-created default sessions alive at once (origin `user:*`, archetype default)"
+
+    assert flat_guidance =~ "user.md's Onboarding section is the offer record"
+
+    assert flat_guidance =~
+             "Never re-raise after a recorded decline; a deferral waits for a new, stronger signal."
+
     assert snapshot.guidance =~ "tightbeam kungfu list"
     assert snapshot.guidance =~ "tightbeam learn <bundle>"
     assert snapshot.guidance =~ "default-archetype"
