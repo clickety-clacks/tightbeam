@@ -4775,7 +4775,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "kungfu list reports shipped bundles and their declared root archetypes", ctx do
-    list = Gateway.handlers(gateway_config(ctx.base_dir, ctx.db, 0))["kungfu-list"]
+    base_dir = role_test_base("kungfu-list")
+    list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-list"]
 
     assert %{bundles: [%{name: "agentic-engineering", root_archetype: "product-owner"}]} =
              list.(%{origin: "agent:k1", params: %{}})

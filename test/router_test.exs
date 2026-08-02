@@ -239,7 +239,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body) == %{
              "result" => %{
                "bundles" => [
-                 %{"name" => "agentic-engineering", "root_archetype" => "product-owner"}
+                 %{"name" => "agentic-engineering", "rootArchetype" => "product-owner"}
                ]
              }
            }
