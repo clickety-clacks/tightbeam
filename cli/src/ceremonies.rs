@@ -1937,7 +1937,7 @@ mod tests {
     /// subscription. And it must not collide with the `unsupported (no subscription)`
     /// phrase, which `onboard` matches to classify the cancel phase.
     #[test]
-    fn a_rejected_capture_blames_capture_and_banks_nothing() {
+    fn a_rejected_token_blames_the_token_and_banks_nothing() {
         let message = rejected_setup_token(
             401,
             "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\
@@ -1947,7 +1947,10 @@ mod tests {
 
         assert!(message.contains("Invalid bearer token"), "{message}");
         assert!(message.contains("401"), "{message}");
-        assert!(message.contains("CAPTURE"), "{message}");
+        assert!(message.contains("TOKEN"), "{message}");
+        // Must not read as a subscription problem: `onboard` classifies the cancel
+        // phase off that exact phrase, and a rejected paste is not that.
+        assert!(!message.contains("no subscription"), "{message}");
         assert!(message.contains("shrdlu"), "{message}");
         assert!(
             message.contains("Nothing was banked"),
