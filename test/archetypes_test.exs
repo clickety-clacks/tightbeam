@@ -95,6 +95,10 @@ defmodule Tightbeam.ArchetypesTest do
       Application.app_dir(:tightbeam, "priv/kungfu/*/archetypes/*.toml")
       |> Path.wildcard()
       |> Enum.map(fn path -> path |> File.read!() |> Toml.decode!() |> Map.fetch!("name") end)
+    # The same empty-iteration trap one level down: with no bundle archetypes the
+    # refutations below execute zero times and this passes proving nothing.
+    assert bundle_archetypes != [],
+           "no bundle archetypes found, so the refutations below would check nothing"
 
     for skill <- default["skills"] do
       body =
@@ -103,10 +107,18 @@ defmodule Tightbeam.ArchetypesTest do
 
       pre_learn = body |> String.split("## AFTER LEARNING A KUNGFU", parts: 2) |> hd()
 
-      for archetype <- bundle_archetypes,
-          spelling <- [archetype, String.replace(archetype, "-", " ")] do
+      # Names alone are not the class: "hand this to the product owner agent" names no
+      # archetype token, and a bundle-only VERB is just as much a pre-learn instruction.
+      # Both spellings of every archetype, plus the verbs that only make sense once a
+      # bundle exists.
+      bundle_only_phrases =
+        Enum.flat_map(bundle_archetypes, &[&1, String.replace(&1, "-", " ")]) ++
+          ["spawn a product", "spawn a coder", "spawn a reviewer", "assign a coder",
+           "hand off to the", "escalate to the product"]
+
+      for spelling <- bundle_only_phrases do
         refute String.contains?(String.downcase(pre_learn), String.downcase(spelling)),
-               "neutral elected skill #{skill} prescribes bundle-only archetype #{archetype} before learn"
+               "neutral elected skill #{skill} prescribes bundle-only action #{inspect(spelling)} before learn"
       end
     end
   end
