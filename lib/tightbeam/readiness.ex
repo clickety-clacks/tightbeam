@@ -289,16 +289,18 @@ defmodule Tightbeam.Readiness do
   defp adapter_line(%{adapter: :present}), do: nil
   defp adapter_line(%{adapter: {:unknown, _reason}}), do: nil
 
-  # The fallback command is PINNED and `--no-save`, exactly like the one `assimilate`
-  # runs. An operator who follows a remedy verbatim gets whatever it says, so a bare
-  # package name here installs npm's latest and floats the adapter off its pin — the
-  # drift the install site was fixed to prevent, reintroduced by the sentence that
-  # tells someone how to do it by hand (#47).
+  # The fallback command is PINNED and `--no-save`. An operator who follows a remedy
+  # verbatim gets whatever it says, so a bare package name here installs npm's latest
+  # and floats the adapter off its pin — the drift the install site was fixed to prevent,
+  # reintroduced by the sentence that tells someone how to do it by hand (#47).
   defp adapter_line(%{harness: wire, adapter: {:missing, path}}) do
-    "ACP adapter missing at #{path} — no turn can start. " <>
-      "Install it with: tightbeam assimilate --harness #{wire} (or npm install " <>
-      "--prefix #{path |> Path.dirname() |> Path.dirname() |> Path.dirname()} --no-save " <>
-      "#{package_for(wire)}@#{version_for(wire)})"
+    install_dir = path |> Path.dirname() |> Path.dirname() |> Path.dirname()
+
+    "ACP adapter missing at #{path}. Boot only checks readiness; it does not install " <>
+      "adapters. Tightbeam will install its pinned adapters automatically when the next " <>
+      "session is spawned. Manual fallback: npm install --prefix " <>
+      "#{Tightbeam.Harness.Support.shell_quote(install_dir)} --no-save " <>
+      "#{package_for(wire)}@#{version_for(wire)}"
   end
 
   defp credential_line(%{credential: :live}), do: nil
