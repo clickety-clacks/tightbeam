@@ -106,11 +106,13 @@ defmodule Tightbeam.Wire.RouterTest do
       end,
       "kungfu-list" => fn call ->
         send(parent, {:call, call})
+
         %{
           bundles: [
             %{
               name: "agentic-engineering",
               purpose: "Turn ideas into reviewed software.",
+              phrases: ["I want someone to check the work before it goes out."],
               root_archetype: "product-owner"
             }
           ]
@@ -250,6 +252,7 @@ defmodule Tightbeam.Wire.RouterTest do
                  %{
                    "name" => "agentic-engineering",
                    "purpose" => "Turn ideas into reviewed software.",
+                   "phrases" => ["I want someone to check the work before it goes out."],
                    "rootArchetype" => "product-owner"
                  }
                ]

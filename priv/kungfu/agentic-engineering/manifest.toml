@@ -1,2 +1,10 @@
 root_archetype = "product-owner"
 purpose = "Give your organization a disciplined way to turn product ideas and bug reports into shipped software, with tracked work, independent review, and verification."
+phrases = [
+  "I keep losing track of what I asked for.",
+  "I want someone to check the work before it goes out.",
+  "Things get called finished before anyone verifies they actually work.",
+  "I'm tired of coordinating everyone by hand.",
+  "When something breaks again, I want the cause investigated before another fix.",
+  "My requests keep growing into more than I asked for."
+]

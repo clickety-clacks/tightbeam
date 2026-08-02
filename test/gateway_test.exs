@@ -4792,7 +4792,7 @@ defmodule Tightbeam.GatewayTest do
     assert :persistent_term.get(Rules, []) == []
   end
 
-  test "kungfu list reports shipped bundles and their declared purposes and root archetypes",
+  test "kungfu list reports shipped bundles and their offer metadata",
        ctx do
     base_dir = role_test_base("kungfu-list")
     list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-list"]
@@ -4802,6 +4802,7 @@ defmodule Tightbeam.GatewayTest do
                %{
                  name: "agentic-engineering",
                  purpose: purpose,
+                 phrases: phrases,
                  root_archetype: "product-owner"
                }
              ]
@@ -4809,6 +4810,8 @@ defmodule Tightbeam.GatewayTest do
              list.(%{origin: "agent:k1", params: %{}})
 
     assert purpose =~ "turn product ideas and bug reports into shipped software"
+    assert "I keep losing track of what I asked for." in phrases
+    assert "I want someone to check the work before it goes out." in phrases
   end
 
   test "every unlearn reference kind supplies supported commands that clear it", ctx do

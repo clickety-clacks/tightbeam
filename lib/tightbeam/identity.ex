@@ -463,9 +463,14 @@ defmodule Tightbeam.Identity do
     |> Enum.sort()
   end
 
-  @doc "Kungfu bundles shipped with this Tightbeam build and their intended roots."
+  @doc "Kungfu bundles shipped with this Tightbeam build and their offer metadata."
   @spec available_bundles() :: [
-          %{name: String.t(), purpose: String.t(), root_archetype: String.t()}
+          %{
+            name: String.t(),
+            purpose: String.t(),
+            phrases: [String.t()],
+            root_archetype: String.t()
+          }
         ]
   def available_bundles do
     available_bundle_names()
@@ -479,6 +484,7 @@ defmodule Tightbeam.Identity do
       %{
         name: name,
         purpose: manifest.purpose,
+        phrases: manifest.phrases,
         root_archetype: manifest.root_archetype
       }
     end)
@@ -492,7 +498,22 @@ defmodule Tightbeam.Identity do
       raise ArgumentError, "kungfu manifest purpose must be non-empty prose: #{path}"
     end
 
-    %{purpose: purpose, root_archetype: Map.fetch!(manifest, "root_archetype")}
+    phrases =
+      case Map.fetch(manifest, "phrases") do
+        :error ->
+          []
+
+        {:ok, phrases} ->
+          unless is_list(phrases) and phrases != [] and
+                   Enum.all?(phrases, &(is_binary(&1) and String.trim(&1) != "")) do
+            raise ArgumentError,
+                  "kungfu manifest phrases must be a non-empty list of non-empty prose: #{path}"
+          end
+
+          phrases
+      end
+
+    %{purpose: purpose, phrases: phrases, root_archetype: Map.fetch!(manifest, "root_archetype")}
   end
 
   @doc "Import the current seed and learned bundle snapshots, then merge them into main."
