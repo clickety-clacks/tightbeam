@@ -236,10 +236,13 @@ enum Reading {
 /// of those may be a rule here. Two things the credential cannot change, because the
 /// things that consume it forbid it:
 ///
-///   * It contains no whitespace. It is sent as an HTTP header value (`Authorization:
-///     Bearer ...`), which is what makes joining wrapped rows exact rather than lossy --
-///     the row breaks are the terminal's, not the credential's, and trimming them back
-///     off cannot remove a character the credential had.
+///   * It contains no whitespace. It travels as the credentials component of an
+///     `Authorization: Bearer <token>` header -- the token68 production of RFC 9110, whose
+///     alphabet has no space in it. (The header VALUE does contain a space, after
+///     `Bearer`; it is the token itself that cannot, and that is the part read here.) This
+///     is what makes joining wrapped rows exact rather than lossy: the row breaks are the
+///     terminal's, not the credential's, so trimming them back off cannot remove a
+///     character the credential had.
 ///   * It is therefore distinguishable from the panel's prose. The heading and the "store
 ///     this token securely" footer are sentences; the credential is one unbroken run.
 ///
@@ -249,6 +252,13 @@ enum Reading {
 /// blank row reads as two runs, and so does a panel that painted two candidates. Taking
 /// the first of them is how a well-formed fragment gets banked (#80). There is nothing on
 /// the screen that says which one is the credential, so the screen does not get to decide.
+///
+/// What this does NOT do, stated plainly so nobody rests weight on it: it does not make
+/// same-run ambiguity impossible. A run that is genuinely one unbroken sequence but carries
+/// a stale suffix -- a previous paint the replay did not clear -- still reads as one
+/// candidate and is returned. The screen cannot tell those apart, and the thing that
+/// actually catches them is provider validation before banking. That is a real defence, but
+/// it lives elsewhere, so do not read the rule above as making capture self-sufficient.
 ///
 /// Refusals never carry candidate bytes into their diagnostic.
 fn read_token(lines: &[String]) -> Reading {
@@ -1169,7 +1179,10 @@ mod tests {
             reason.contains("more than one unbroken credential body"),
             "{reason}"
         );
-        assert!(!reason.contains(TOKEN), "refusal leaked a candidate: {reason}");
+        assert!(
+            !reason.contains(TOKEN),
+            "refusal leaked a candidate: {reason}"
+        );
         assert!(reason.contains("Re-run"), "{reason}");
 
         let (head, tail) = TOKEN.split_at(60);
@@ -1197,7 +1210,10 @@ mod tests {
         assert_eq!(capture_setup_token(reworded.as_bytes()), None);
         let reason = refusal_reason(reworded.as_bytes());
         assert!(reason.contains("carried whitespace"), "{reason}");
-        assert!(!reason.contains(TOKEN), "refusal leaked a candidate: {reason}");
+        assert!(
+            !reason.contains(TOKEN),
+            "refusal leaked a candidate: {reason}"
+        );
     }
 
     /// The refusal has to fire on a screen that is genuinely undecidable. Tonight proved

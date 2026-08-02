@@ -514,8 +514,10 @@ fn attend(
                         if let Some(url) = crate::screen::authorization_url(&output)
                             && printed_url.as_deref() != Some(url.as_str())
                         {
-                            supervised
-                                .write_all(fd, format!("\nAuthorization URL: {url}\n").as_bytes())?;
+                            supervised.write_all(
+                                fd,
+                                format!("\nAuthorization URL: {url}\n").as_bytes(),
+                            )?;
                             printed_url = Some(url);
                         }
                     }
@@ -565,7 +567,6 @@ fn deliver(supervised: &mut Supervised, bytes: &[u8]) -> Result<(), RunError> {
     nonblocking(pipe.as_raw_fd())?;
     supervised.write_all(pipe.as_raw_fd(), bytes)
 }
-
 
 fn run_provider_onboarding(
     provider: &str,
@@ -746,11 +747,58 @@ fn bank_openai_api_key(staging: &str, key: &str, ceremony: &Ceremony<'_>) -> Res
         Some(key.as_bytes()),
     )?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("`codex login --with-api-key` failed: {status}"))
+    codex_staged_a_credential(status, staging, "`codex login --with-api-key`")
+}
+
+/// The verdict on a codex leg: its exit status AND the file it was supposed to leave
+/// behind, because for codex the first does not imply the second.
+///
+/// Measured against codex-cli 0.146.0: ctrl-c at the device-code prompt exits ZERO and
+/// writes nothing. Cancelling is a normal exit for codex -- its own screen offers cancel
+/// as the expected move -- so an exit code cannot distinguish "logged in" from "the
+/// operator changed their mind". Trusting it staged an empty home, ran on to `finish`, and
+/// let the GATEWAY be the first thing to notice: the operator's ctrl-c came back as
+/// `device_auth_failed`, a message blaming the device authorization for something they
+/// did deliberately. The same misattribution "not captured" used to make on the anthropic
+/// side, which is what that leg's refusal reasons exist to prevent.
+///
+/// The anthropic leg has never had this hole because it validates what it captured before
+/// staging it. This is the same check on the same axis. It reads a file rather than making
+/// a live call because for openai the credential is codex's to write and ours only to hand
+/// on -- so the question here is not "does this credential work" but "is there one".
+///
+/// The name is not ours to choose. `Tightbeam.Credentials.staged_path(:openai, path)`
+/// (credentials.ex:796) reads exactly this path out of the staging directory when it
+/// installs, so checking anything else would be a second opinion about the same fact.
+fn codex_staged_a_credential(
+    status: ExitStatus,
+    staging: &str,
+    what: &str,
+) -> Result<(), String> {
+    if !status.success() {
+        return Err(format!("{what} failed: {status}"));
     }
+
+    let path = std::path::Path::new(staging).join("auth.json");
+    let staged = match fs::metadata(&path) {
+        Ok(metadata) if metadata.len() > 0 => return Ok(()),
+        Ok(_) => "left an empty credential file".to_owned(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            "wrote no credential".to_owned()
+        }
+        Err(error) => format!("left a credential this host cannot read ({error})"),
+    };
+
+    // Named as the LIKELY cause, not the cause. A cancelled login and a codex that failed
+    // while exiting zero are indistinguishable from here, and inventing a way to tell them
+    // apart would mean guessing at codex's exit codes -- the thing that produced this bug.
+    Err(format!(
+        "{what} reported success but {staged} at {}. codex exits zero when a device-code \
+         login is cancelled, so the likely cause is that the login was interrupted or \
+         declined; a codex failure that also exits zero looks the same from here. Nothing \
+         was banked -- the openai credential on this host is unchanged. Re-run the ceremony.",
+        path.display()
+    ))
 }
 
 /// Claude has no equivalent CLI affordance -- it takes its credential from the
@@ -851,11 +899,8 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
     let status = run_bounded_reporting_url(command, "codex device-code login", ceremony.deadline)
         .map_err(StageFailure::from)?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("OpenAI device-code onboarding failed: {status}").into())
-    }
+    codex_staged_a_credential(status, staging, "OpenAI device-code onboarding")
+        .map_err(StageFailure::from)
 }
 
 fn anthropic_setup_token_command(claude: &str) -> ProcessCommand {
@@ -2473,6 +2518,69 @@ mod tests {
             "the blocking write held the lease for {:?}",
             started.elapsed()
         );
+    }
+
+    /// codex reporting success is not codex having produced a credential.
+    ///
+    /// Measured, not supposed: `codex login --device-auth` (codex-cli 0.146.0) exits ZERO
+    /// 0.00s after a terminal ctrl-c and writes nothing, because cancelling is a normal
+    /// exit for it. The staging directory it leaves behind holds `log/` and `tmp/` and no
+    /// credential, which is what this fixture reproduces. Before this check the leg
+    /// returned Ok and the gateway was the first thing to notice, reporting
+    /// `device_auth_failed` for an operator who had simply changed their mind.
+    #[test]
+    fn a_codex_leg_that_exits_zero_without_a_credential_is_a_failure() {
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-codex-artifact-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        // What a cancelled device-code login actually leaves behind.
+        fs::create_dir_all(staging.join("log")).unwrap();
+        fs::create_dir_all(staging.join("tmp")).unwrap();
+        let staging_path = staging.display().to_string();
+
+        let exited_zero = ProcessCommand::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .unwrap();
+
+        let error =
+            codex_staged_a_credential(exited_zero, &staging_path, "OpenAI device-code onboarding")
+                .unwrap_err();
+        assert!(error.contains("wrote no credential"), "{error}");
+        assert!(error.contains("cancelled"), "the likely cause is unnamed: {error}");
+        assert!(error.contains("Nothing was banked"), "{error}");
+        assert!(error.contains("auth.json"), "the path looked for is unnamed: {error}");
+
+        // An empty file is not a credential either, and says which of the two it was.
+        fs::write(staging.join("auth.json"), b"").unwrap();
+        let empty =
+            codex_staged_a_credential(exited_zero, &staging_path, "OpenAI device-code onboarding")
+                .unwrap_err();
+        assert!(empty.contains("empty credential file"), "{empty}");
+
+        // The name is the one the gateway installs from -- credentials.ex staged_path/2.
+        fs::write(staging.join("auth.json"), b"{\"tokens\":{}}").unwrap();
+        assert_eq!(
+            codex_staged_a_credential(exited_zero, &staging_path, "OpenAI device-code onboarding"),
+            Ok(())
+        );
+
+        // A non-zero exit still reports the STATUS. The artifact check must not take over
+        // the message for a failure the exit code already explained.
+        let exited_three = ProcessCommand::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .status()
+            .unwrap();
+        let failed =
+            codex_staged_a_credential(exited_three, &staging_path, "OpenAI device-code onboarding")
+                .unwrap_err();
+        assert!(failed.contains("failed: exit status: 3"), "{failed}");
+        assert!(!failed.contains("cancelled"), "{failed}");
+
+        let _ = fs::remove_dir_all(&staging);
     }
 
     #[test]

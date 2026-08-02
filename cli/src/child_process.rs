@@ -509,10 +509,12 @@ impl Supervised {
     ///
     /// A driver that returns `Ok` is claiming the child finished on its own; everything
     /// else — its own failure, the deadline, a signal — arrives here as an error and is
-    /// terminated identically. The disarm-then-read on the success path is the ordering
-    /// that closes the lost-TERM window: after the disarm the handler can no longer
-    /// signal this group, so a signal read after it either arrived while the group was
-    /// still armed (and was delivered) or arrived after the child was already done.
+    /// terminated identically. The success path disarms, reads, reaps, then reads ONCE
+    /// MORE. Disarming stops the handler reaching the group but does not uninstall it, so
+    /// a single read proves only that no signal had arrived by that instant -- one landing
+    /// during the reap would be swallowed. The second read is what makes "no signal" a
+    /// statement about the whole run, and it is placed after the reap because the reap is
+    /// the only thing between the two that can block.
     fn settle<T>(mut self, outcome: Result<T, RunError>) -> Result<(T, ExitStatus), RunError> {
         let cause = match outcome {
             Ok(value) => {
@@ -521,7 +523,27 @@ impl Supervised {
                     None => {
                         self.settled = true;
                         let status = self.child.wait().map_err(|error| error.to_string())?;
-                        return Ok((value, status));
+                        // Read AGAIN, after the reap. `disarm` stops the handler reaching
+                        // the group, but the handler stays installed and keeps recording,
+                        // so a signal landing during the `wait` above is absorbed by this
+                        // process, forwarded to nothing, and -- without this second read --
+                        // never seen again: the operator's interrupt disappears and we
+                        // report the success it was trying to prevent.
+                        //
+                        // Precisely what this buys, since shortening a window is not
+                        // closing one: the reap is the only call between the two reads that
+                        // BLOCKS, and it can block for as long as the child has left to
+                        // live. Bracketing it removes the whole of that interval. What
+                        // remains is the few instructions between this read and the handler
+                        // being uninstalled in `Drop`, and a signal there arrives after the
+                        // child is already reaped and the work is already done. Closing
+                        // that too means making the read atomic with the slot leaving the
+                        // listening state -- a state machine inside async-signal-safe code,
+                        // which is not worth buying a post-completion instant with.
+                        return match self.forwarding.caught() {
+                            None => Ok((value, status)),
+                            Some(signal) => Err(RunError::interrupted(signal, &self.what)),
+                        };
                     }
                     Some(signal) => RunError::interrupted(signal, &self.what),
                 }
@@ -535,14 +557,22 @@ impl Supervised {
                 self.forwarding.disarm();
                 match self.child.wait() {
                     Ok(_) => Err(cause),
-                    Err(error) => Err(cause.with_cleanup_failure(format!(
-                        "could not reap {}: {error}",
-                        self.what
-                    ))),
+                    Err(error) => Err(cause
+                        .with_cleanup_failure(format!("could not reap {}: {error}", self.what))),
                 }
             }
             Err(error) => {
                 self.forwarding.disarm();
+                // Reap ONLY an already-exited leader. The commonest way to arrive here is
+                // an ESRCH from the first killpg -- the leader had already exited and its
+                // group is empty -- leaving a zombie that holds its pid, and the pid IS the
+                // group id, so that identity stays occupied for the life of the process.
+                // But the other way to arrive here is a child we just FAILED to stop, and
+                // an unconditional wait on that one blocks forever: it turns a reported
+                // cleanup failure into a hang. The exit check is what separates them.
+                if exited_without_reaping(&self.child).unwrap_or(false) {
+                    let _ = self.child.wait();
+                }
                 Err(cause.with_cleanup_failure(format!(
                     "could not terminate {}: {error}; process group left unsignalled",
                     self.what
@@ -681,7 +711,56 @@ mod tests {
             error.is_interrupted(),
             "a run interrupted at the finish reported: {error}"
         );
-        assert!(error.to_string().contains("a finishing ceremony"), "{error}");
+        assert!(
+            error.to_string().contains("a finishing ceremony"),
+            "{error}"
+        );
+    }
+
+    /// The window the test above does NOT cover: a signal landing during the reap.
+    ///
+    /// That test fires before the driver returns, so it is caught by settle's FIRST read
+    /// and passed even while the defect was live. This one fires after that read, while
+    /// `wait` is blocking -- where `disarm` has already stopped the signal reaching the
+    /// group, so nothing kills the child and nothing re-reads the record. The interrupt
+    /// simply ceased to exist, and the run it was trying to stop reported success.
+    ///
+    /// The driver returns before the child does, which is what makes the reap slow enough
+    /// to aim at: a already-exited child is reaped instantly and there is no window to hit.
+    #[test]
+    fn a_term_arriving_during_the_reap_is_not_reported_as_success() {
+        if !alone("a_term_arriving_during_the_reap_is_not_reported_as_success") {
+            return;
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let error = supervise(
+            command,
+            "a ceremony being reaped",
+            Instant::now() + Duration::from_secs(10),
+            |_supervised| {
+                // Fired from a thread because the driver has to RETURN for the reap to
+                // start; 250ms into a child that lives a full second lands squarely
+                // inside `wait`, with most of a second of margin on either side.
+                thread::spawn(|| {
+                    thread::sleep(Duration::from_millis(250));
+                    forward_to_active_group(libc::SIGTERM);
+                });
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.is_interrupted(),
+            "a TERM landing during the reap reported: {error}"
+        );
     }
 
     /// A setup step that fails after the fork -- the flag on a descriptor, the pipe the
@@ -723,15 +802,23 @@ mod tests {
         }
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        let error = supervise(command, "a stub ceremony", deadline, |_| -> Result<(), RunError> {
-            while std::fs::read_to_string(&marker).unwrap_or_default().is_empty() {
-                assert!(Instant::now() < deadline, "the stub never recorded its pid");
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(RunError::Failed(
-                "a post-spawn setup step failed".to_owned(),
-            ))
-        })
+        let error = supervise(
+            command,
+            "a stub ceremony",
+            deadline,
+            |_| -> Result<(), RunError> {
+                while std::fs::read_to_string(&marker)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    assert!(Instant::now() < deadline, "the stub never recorded its pid");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(RunError::Failed(
+                    "a post-spawn setup step failed".to_owned(),
+                ))
+            },
+        )
         .unwrap_err();
 
         assert!(error.to_string().contains("a post-spawn setup step failed"));

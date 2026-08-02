@@ -94,6 +94,15 @@ fn relay(
     let mut master_eof = false;
     let mut printed_url = None;
 
+    // Said BEFORE the child can print anything, because the case that needs it most is the
+    // one where nothing ever arrives. If claude asks something first -- consent, an account
+    // to use, an update prompt -- the operator sees an unexplained empty screen, and the
+    // url announcement below would never fire to explain it. Do not be tempted to solve
+    // that by showing the child's pre-url bytes: "the credential cannot appear before the
+    // url" is an assumption about provider behaviour, and assuming provider behaviour is
+    // what cost a real operator a real credential.
+    supervised.write_all(output_fd, PREFACE.as_bytes())?;
+
     loop {
         // Asked before the signal is read, so that a child which exited and a TERM which
         // arrived in the same instant are both known to the same iteration.
@@ -108,7 +117,7 @@ fn relay(
         }
 
         if let Some(error) = supervised.expired() {
-            return Err(error);
+            return Err(format!("{error}. {}", expiry_advice()).into());
         }
 
         if input_eof && !sent_eof && pending_input.is_empty() && !master_eof {
@@ -213,14 +222,36 @@ fn relay(
 
 /// Everything the operator is told, in the parent's words.
 ///
-/// The second sentence is here because the silence is otherwise indistinguishable from a
-/// hang: the ceremony deliberately shows nothing the child prints, and an operator who
-/// expects to see `claude` needs to know that, and needs to know that pasting still works.
+/// The claim these make is "no UNEXAMINED child byte reaches the terminal", not "no child
+/// byte" -- the url below is child-derived, extracted from the transcript and validated as
+/// a url before it is repeated. That distinction is the whole safety argument, so state it
+/// accurately: a rule defended by an overstatement is a rule someone later relaxes.
+const PREFACE: &str = "\r\nWaiting for claude to produce an authorization URL. What claude \
+     prints is not shown, because the credential appears in it -- so this may look idle for \
+     a few seconds.\r\n";
+
+/// Named in the lease-expiry message so a silent wait ends with something to DO.
+pub(crate) const MANUAL_FALLBACK: &str = "claude setup-token";
+
 fn announcement(url: &str) -> String {
     format!(
         "\r\nAuthorization URL: {url}\r\nSign in there, then paste the authorization code here \
          if you are asked for one. What claude prints is not shown, because the credential \
          appears in it.\r\n"
+    )
+}
+
+/// What a lease expiry means to the operator, as opposed to what it means to the code.
+///
+/// The ceremony hides the child's output, so an expiry has a cause the operator cannot see:
+/// claude may be sitting on a prompt. The deadline error says what happened; this says what
+/// to DO about it, and is APPENDED to that error rather than replacing it -- the lease
+/// wording is what callers and tests recognise an expiry by, and an operator-friendly
+/// rewrite that quietly changes an error's identity is a different bug.
+fn expiry_advice() -> String {
+    format!(
+        "Because the harness's output is deliberately not shown, it may have been waiting \
+         on a prompt. Run `{MANUAL_FALLBACK}` yourself to see what it is asking."
     )
 }
 
@@ -302,6 +333,41 @@ mod tests {
         writer.write_all(bytes).unwrap();
         drop(writer);
         reader
+    }
+
+    /// The operator has to be told about the silence BEFORE the silence.
+    ///
+    /// A child that prompts for something and waits prints no url, so the announcement
+    /// keyed on a url never fires -- and the one case where the explanation is load-bearing
+    /// was the one case that had none. What the operator saw was an empty screen for the
+    /// length of the lease, with nothing to distinguish it from a hang.
+    #[test]
+    fn a_child_that_prompts_before_any_url_still_explains_the_silence() {
+        let input = pipe_with(b"");
+        let (path, file) = output_file("prompt-before-url");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'Select an account to use:\\n'; sleep 0.3"]);
+
+        let _ = run_with_fds(
+            command,
+            "prompting fixture",
+            Instant::now() + Duration::from_secs(5),
+            input.as_raw_fd(),
+            file.as_raw_fd(),
+        )
+        .unwrap();
+        drop(file);
+
+        let rendered = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(path);
+        assert!(
+            rendered.contains("not shown, because the credential appears in it"),
+            "the operator was left with unexplained silence: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("Select an account"),
+            "explaining the silence must not start forwarding the child: {rendered:?}"
+        );
     }
 
     fn output_file(name: &str) -> (std::path::PathBuf, std::fs::File) {

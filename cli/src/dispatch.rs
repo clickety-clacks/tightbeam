@@ -2141,6 +2141,12 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&staging);
         fs::create_dir_all(&staging).unwrap();
+        // The stub codex below is `true`: it exits zero and writes nothing, which is the
+        // shape of a CANCELLED device-code login, and the openai leg now refuses it. This
+        // test is about endpoints rather than credentials, so it stages the credential the
+        // real ceremony would have produced and lets the phases run. Do not delete this as
+        // setup noise -- without it the run cancels and never reaches `finish`.
+        fs::write(staging.join("auth.json"), br#"{"tokens":{}}"#).unwrap();
         let prior_machine = std::env::var_os("TIGHTBEAM_MACHINE");
         unsafe {
             std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
