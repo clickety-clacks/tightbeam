@@ -9,6 +9,7 @@ mod harnesses;
 mod lease;
 mod preflight;
 mod probe;
+mod pty;
 mod screen;
 
 fn main() {

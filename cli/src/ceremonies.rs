@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -10,7 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::args::{AssimilateArgs, Identity};
-use crate::child_process::{exited_without_reaping, reset_sigchld_before_spawn};
+use crate::child_process::{
+    SignalForwarding, exited_without_reaping, reset_sigchld_before_spawn, terminate_process_group,
+};
 use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
 use crate::preflight;
@@ -360,15 +363,39 @@ fn set_terminal_group(fd: libc::c_int, pgid: libc::pid_t) -> bool {
 /// exactly as the caller configured it -- the interactive ceremonies inherit the
 /// terminal and must keep doing so.
 fn run_bounded(
+    command: ProcessCommand,
+    what: &str,
+    deadline: Instant,
+    stdin: Option<&[u8]>,
+) -> Result<ExitStatus, String> {
+    run_bounded_inner(command, what, deadline, stdin, None)
+}
+
+fn run_bounded_reporting_url(
+    command: ProcessCommand,
+    what: &str,
+    deadline: Instant,
+) -> Result<ExitStatus, String> {
+    run_bounded_inner(command, what, deadline, None, Some(libc::STDOUT_FILENO))
+}
+
+fn run_bounded_inner(
     mut command: ProcessCommand,
     what: &str,
     deadline: Instant,
     stdin: Option<&[u8]>,
+    url_output_fd: Option<libc::c_int>,
 ) -> Result<ExitStatus, String> {
     if Instant::now() >= deadline {
         return Err(format!(
             "{what} refused to start because its onboarding lease already expired"
         ));
+    }
+
+    let forwarding = SignalForwarding::install().map_err(|error| error.to_string())?;
+
+    if url_output_fd.is_some() {
+        command.stdout(Stdio::piped());
     }
 
     unsafe {
@@ -380,15 +407,41 @@ fn run_bounded(
         });
     }
 
+    reset_sigchld_before_spawn();
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let pgid = child.id() as libc::pid_t;
+    forwarding.arm(&child).map_err(|error| error.to_string())?;
+    let mut captured_stdout = child.stdout.take();
+    if let Some(stdout) = &captured_stdout {
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == -1
+        {
+            return abort_bounded(
+                &mut child,
+                what,
+                &forwarding,
+                io::Error::last_os_error().to_string(),
+            );
+        }
+    }
+    let mut output = Vec::new();
+    let mut output_eof = captured_stdout.is_none();
+    let mut printed_url = None;
 
     if let Some(bytes) = stdin {
-        let mut pipe = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("{what} did not accept stdin"))?;
-        pipe.write_all(bytes).map_err(|error| error.to_string())?;
+        let Some(mut pipe) = child.stdin.take() else {
+            return abort_bounded(
+                &mut child,
+                what,
+                &forwarding,
+                format!("{what} did not accept stdin"),
+            );
+        };
+        if let Err(error) = pipe.write_all(bytes) {
+            return abort_bounded(&mut child, what, &forwarding, error.to_string());
+        }
         // Dropped here on purpose -- see the doc comment.
     }
 
@@ -412,25 +465,73 @@ fn run_bounded(
     }
 
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(error) => return Err(error.to_string()),
+        if let Some(stdout) = &mut captured_stdout {
+            let mut bytes = [0u8; 8192];
+            loop {
+                match stdout.read(&mut bytes) {
+                    Ok(0) => {
+                        output_eof = true;
+                        break;
+                    }
+                    Ok(count) => {
+                        let bytes = &bytes[..count];
+                        output.extend_from_slice(bytes);
+                        if let Err(error) =
+                            write_fd(url_output_fd.expect("capture has output fd"), bytes)
+                        {
+                            return abort_bounded(&mut child, what, &forwarding, error);
+                        }
+                        if let Some(url) = crate::screen::authorization_url(&output)
+                            && printed_url.as_deref() != Some(url.as_str())
+                        {
+                            if let Err(error) = write_fd(
+                                url_output_fd.expect("capture has output fd"),
+                                format!("\nAuthorization URL: {url}\n").as_bytes(),
+                            ) {
+                                return abort_bounded(&mut child, what, &forwarding, error);
+                            }
+                            printed_url = Some(url);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        return abort_bounded(&mut child, what, &forwarding, error.to_string());
+                    }
+                }
+            }
+        }
+
+        match exited_without_reaping(&child) {
+            Ok(true) if output_eof => {
+                forwarding.disarm();
+                return child.wait().map_err(|error| error.to_string());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "wait for {what} failed: {error}; process group left unsignalled"
+                ));
+            }
+        }
+
+        if let Some(signal) = forwarding.caught() {
+            terminate_process_group(&mut child, Duration::from_secs(2)).map_err(|error| {
+                format!("could not terminate {what}: {error}; process group left unsignalled")
+            })?;
+            forwarding.disarm();
+            child.wait().map_err(|error| error.to_string())?;
+            return Err(format!(
+                "{what} was interrupted by signal {signal}; terminated it and its process group"
+            ));
         }
 
         if Instant::now() >= deadline {
-            // TERM the group, give it a moment to clean up, then KILL what ignored it.
-            // These children are RUNNING, so TERM is delivered at once -- the
-            // TERM-before-CONT ordering would matter only for an already-STOPped
-            // process, which none of these are.
-            unsafe {
-                libc::killpg(pgid, libc::SIGTERM);
-            }
-            thread::sleep(Duration::from_secs(2));
-            unsafe {
-                libc::killpg(pgid, libc::SIGKILL);
-            }
-            let _ = child.wait();
+            terminate_process_group(&mut child, Duration::from_secs(2)).map_err(|error| {
+                format!("could not terminate {what}: {error}; process group left unsignalled")
+            })?;
+            forwarding.disarm();
+            child.wait().map_err(|error| error.to_string())?;
 
             return Err(format!(
                 "{what} did not finish before its onboarding lease expired; terminated it and \
@@ -443,6 +544,43 @@ fn run_bounded(
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(50)),
         );
+    }
+}
+
+fn write_fd(fd: libc::c_int, mut bytes: &[u8]) -> Result<(), String> {
+    while !bytes.is_empty() {
+        let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if count > 0 {
+            bytes = &bytes[count as usize..];
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn abort_bounded<T>(
+    child: &mut std::process::Child,
+    what: &str,
+    forwarding: &SignalForwarding,
+    cause: String,
+) -> Result<T, String> {
+    if let Err(error) = terminate_process_group(child, Duration::from_secs(2)) {
+        forwarding.disarm();
+        return Err(format!(
+            "{cause}; cleanup also failed: could not terminate {what}: {error}; process group \
+             left unsignalled"
+        ));
+    }
+    forwarding.disarm();
+    match child.wait() {
+        Ok(_) => Err(cause),
+        Err(error) => Err(format!(
+            "{cause}; cleanup also failed: could not reap {what}: {error}"
+        )),
     }
 }
 
@@ -725,10 +863,9 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
         .args(["login", "--device-auth"])
         .env("CODEX_HOME", staging)
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = run_bounded(command, "codex device-code login", ceremony.deadline, None)?;
+    let status = run_bounded_reporting_url(command, "codex device-code login", ceremony.deadline)?;
 
     if status.success() {
         Ok(())
@@ -737,82 +874,10 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
     }
 }
 
-/// The pty height the ceremony pins alongside the width. Tall enough that the whole
-/// setup-token screen fits without scrolling; unlike the width, the exact value is not
-/// load-bearing — the replay in `screen` is unbounded — it only has to be sane and
-/// nonzero (headless, the pty is otherwise 0x0).
-const SETUP_TOKEN_PTY_ROWS: usize = 50;
-
-/// Pin the slave pty's geometry before claude starts, then exec it.
-///
-/// The ceremony's correctness must not depend on the operator's terminal width (issue
-/// #5): claude's TUI repaints without erase sequences, so at a terminal a little wider
-/// than the token a stale cell from an earlier frame can survive on the token's row and
-/// fuse to it. The pty belongs to this ceremony, so its geometry is pinned at exactly
-/// [`crate::screen::SETUP_TOKEN_LENGTH`] columns — the token's own length. At that
-/// width the hazard is unreachable by construction: no row can be wider than the token,
-/// so no stale cell can survive past its end (the token's repaint covers its row edge
-/// to edge), and the token never wraps (it fills exactly one row; the `gap:1` blank row
-/// after it keeps that decidable, as `screen` documents).
-///
-/// `stty` on the slave is the ONE mechanism claude's TUI honors, verified empirically
-/// against claude 2.1.220 on eezo (2026-07-28) with throwaway `setup-token` first
-/// screens: bare `script` headless leaves the pty 0x0 and the TUI falls back to 80
-/// columns; `COLUMNS` in the environment is ignored entirely (still 0x0/80); after
-/// `stty rows 50 cols N` on the slave, `stty size` reports the pin and the TUI
-/// hard-wraps at exactly N (N=97 and N=108 both verified). Inside the wrapper stdin IS
-/// the slave, so `stty` needs no arguments beyond the geometry. `;` rather than `&&`:
-/// if `stty` somehow fails, claude still runs unpinned, and the length-aware capture in
-/// `screen` remains the guard.
-fn pinned_pty_command(claude_argument: &str) -> String {
-    format!(
-        "stty rows {SETUP_TOKEN_PTY_ROWS} cols {}; exec {claude_argument} setup-token",
-        crate::screen::SETUP_TOKEN_LENGTH
-    )
-}
-
-/// `script(1)` argument order, which is NOT portable.
-///
-/// The wrapper exists only to give `claude setup-token` a TTY (it refuses to run
-/// without one), to pin that TTY's geometry, and to capture the transcript
-/// `capture_setup_token` parses. The two implementations take the command in
-/// incompatible ways:
-///
-/// - BSD/macOS: `script [-q] <file> <command> [args...]`
-/// - util-linux: `script [-q] -c "<command>" <file>` — extra trailing args are an
-///   error, so the BSD form fails with "unexpected number of arguments"
-///
-/// Shipping only the BSD form made the entire Anthropic credential path unreachable
-/// on every Linux host: it failed before contacting Anthropic, so no credential or
-/// network fix could help, and the openai path worked because it execs `codex`
-/// directly with no wrapper. Found on shrdlu during the production-install smoke.
-///
-/// Dispatched at COMPILE time, like the containment seam: a platform with no named
-/// form fails to build rather than failing at a customer's terminal.
-///
-/// Both forms run the pinned-geometry wrapper through `sh`. util-linux already takes a
-/// shell string; on BSD the command is `sh -c '<wrapper>' <claude>`, with the claude
-/// path as `$0` so it needs no quoting.
-#[cfg(target_os = "macos")]
-fn script_args(transcript: &str, claude: &str) -> Vec<String> {
-    vec![
-        "-q".to_owned(),
-        transcript.to_owned(),
-        "/bin/sh".to_owned(),
-        "-c".to_owned(),
-        pinned_pty_command("\"$0\""),
-        claude.to_owned(),
-    ]
-}
-
-#[cfg(target_os = "linux")]
-fn script_args(transcript: &str, claude: &str) -> Vec<String> {
-    vec![
-        "-q".to_owned(),
-        "-c".to_owned(),
-        pinned_pty_command(claude),
-        transcript.to_owned(),
-    ]
+fn anthropic_setup_token_command(claude: &str) -> ProcessCommand {
+    let mut command = ProcessCommand::new(claude);
+    command.arg("setup-token");
+    command
 }
 
 /// The subscription ceremony: `claude setup-token` under a pty, the token read off the
@@ -831,53 +896,13 @@ fn run_anthropic_onboarding(
     ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
     let claude = harness_cli("anthropic", ceremony)?;
-    require_on_path(
-        "script",
-        &search_path(),
-        &preflight::missing_system_tool(
-            "script",
-            "`claude setup-token` refuses to run without a TTY, so onboarding runs it under \
-             script(1) and reads the token off the transcript.",
-            &this_host(),
-            &search_path(),
-        ),
-    )?;
-
-    let transcript = PathBuf::from(staging).join("setup-token.log");
-    let transcript_path = transcript
-        .to_str()
-        .ok_or_else(|| "invalid onboarding staging path".to_owned())?;
-
-    // Create the transcript owner-only BEFORE `script` does. It opens the file
-    // O_WRONLY|O_CREAT|O_TRUNC and leaves the mode of a file that already exists
-    // alone, so this is the only place 0600 can be established -- and on a successful
-    // run this file holds a live year-long credential in cleartext.
-    fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&transcript)
-        .map_err(|error| error.to_string())?;
-
-    let mut command = ProcessCommand::new("script");
-    command
-        .args(script_args(transcript_path, &claude))
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let status = run_bounded(
-        command,
-        "claude setup-token (under script(1))",
+    let output = crate::pty::run(
+        anthropic_setup_token_command(&claude),
+        "claude setup-token",
         ceremony.deadline,
-        None,
     )?;
-
-    // Bytes, not `read_to_string`: one invalid UTF-8 byte anywhere in a pty transcript
-    // made that call fail, and `unwrap_or_default` turned the failure into an empty
-    // string -- indistinguishable from claude having printed nothing at all.
-    let raw = fs::read(&transcript).unwrap_or_default();
+    let status = output.status;
+    let raw = output.transcript;
 
     if !status.success() {
         // Read the SCREEN, not the byte stream. The TUI positions each word with a
@@ -912,8 +937,6 @@ fn run_anthropic_onboarding(
         .map_err(|error| error.to_string())?;
     writeln!(file, "{token}").map_err(|error| error.to_string())?;
 
-    // The preserved evidence is only worth keeping while a failure is unexplained.
-    let _ = fs::remove_file(preserved_transcript());
     Ok(())
 }
 
@@ -1022,9 +1045,7 @@ fn rejected_setup_token(status: u16, body: &str, host: &str) -> String {
          claude prints a token only to an account that has a subscription, so the likely \
          fault is the CAPTURE rather than the account: the token is read off a replayed \
          terminal screen and a truncated read is well-formed. Nothing was banked -- the \
-         anthropic credential on {host} is unchanged. Re-run the ceremony; the transcript \
-         from a failed capture is preserved at {}.",
-        preserved_transcript().display()
+         anthropic credential on {host} is unchanged. Re-run the ceremony."
     )
 }
 
@@ -1040,53 +1061,17 @@ fn unvalidated_setup_token(error: &str, host: &str) -> String {
     )
 }
 
-/// Where a transcript is kept when the token could not be read out of it.
+/// Say what was looked for without serializing the capture.
 ///
-/// One fixed path, so at most one such file exists: the next attempt overwrites it and
-/// a successful capture deletes it. It is not a log to accumulate -- it can contain a
-/// live credential, which is why it is written 0600 and why it does not linger.
-fn preserved_transcript() -> PathBuf {
-    crate::base_dir::resolve().join("setup-token-failure.log")
-}
-
-/// Say what was looked for, and keep the evidence needed to work out why it was absent.
-///
-/// The transcript used to be destroyed on this path by BOTH sides: `onboard` removes
-/// the staging directory before cancelling, and the gateway's `cancel_onboard` does its
-/// own `File.rm_rf!` on it (`Tightbeam.Credentials`). So merely declining to delete it
-/// here would not have been enough -- it has to be copied out before the cancel. Two of
-/// the operator's single-use authorization codes were spent with nothing left to
-/// diagnose from, and the message blamed token parsing without saying what it parsed.
+/// A failed setup-token capture can still contain a valid year-long credential. The old
+/// path copied those bytes to `setup-token-failure.log`, turning the most sensitive
+/// output of the ceremony into a durable diagnostic. The screen reader explains the
+/// shape it found; the bytes themselves stay only in memory and are dropped on refusal.
 fn capture_failed(raw: &[u8]) -> String {
-    let destination = preserved_transcript();
-    let kept = fs::create_dir_all(destination.parent().unwrap_or(&destination))
-        .and_then(|()| {
-            fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .open(&destination)
-        })
-        .and_then(|mut file| file.write_all(raw));
-
-    let evidence = match kept {
-        Ok(()) => format!(
-            "The transcript is preserved at {} (mode 0600, replaced by the next attempt \
-             and removed after a successful capture). Treat it as a credential: if claude \
-             displayed a token, it is in there.",
-            destination.display()
-        ),
-        Err(error) => format!(
-            "The transcript could NOT be preserved ({}), and the staging directory is \
-             about to be removed, so this attempt leaves nothing to diagnose from.",
-            error
-        ),
-    };
-
     format!(
         "Anthropic setup-token was not captured: claude ran and exited successfully, but \
-         {}. {evidence}",
+         {}. Nothing was banked, and the capture was not written to a log because it may \
+         contain a live credential.",
         crate::screen::refusal_reason(raw)
     )
 }
@@ -1906,13 +1891,26 @@ mod tests {
             "the api-key path's promise, verbatim: {message}"
         );
         assert!(
-            message.contains("setup-token-failure.log"),
-            "the preserved transcript is the operator's next step: {message}"
+            !message.contains("setup-token-failure.log"),
+            "a live credential must not be written to a diagnostic log: {message}"
         );
         assert!(
             !message.contains("unsupported (no subscription)"),
             "must not be classified as a missing subscription: {message}"
         );
+    }
+
+    #[test]
+    fn a_capture_failure_never_prints_or_persists_the_candidate() {
+        let candidate = "sk-ant-oat01-SYNTHETIC-NOT-A-CREDENTIAL-0123456789";
+        let message = capture_failed(candidate.as_bytes());
+
+        assert!(
+            !message.contains(candidate),
+            "candidate leaked in {message}"
+        );
+        assert!(message.contains("not written to a log"), "{message}");
+        assert!(!message.contains("setup-token-failure.log"), "{message}");
     }
 
     /// Unreachable is not invalid. A network failure during validation must implicate
@@ -2062,6 +2060,122 @@ mod tests {
             .map(|out| !out.stdout.trim_ascii().is_empty())
             .expect("could not determine whether the grandchild is alive: `ps` did not run");
         assert!(!alive, "grandchild {grandchild} outlived the group kill");
+    }
+
+    /// Terminating the CLI itself must have the same tree semantics as expiry. This is a
+    /// re-exec because installing SIGTERM in the cargo test process would affect unrelated
+    /// tests running beside it.
+    #[test]
+    fn killing_the_ceremony_parent_leaves_no_surviving_child() {
+        const INNER: &str = "TIGHTBEAM_CEREMONY_SIGNAL_INNER";
+        const MARKER: &str = "TIGHTBEAM_CEREMONY_SIGNAL_MARKER";
+        const SURVIVED: &str = "TIGHTBEAM_CEREMONY_SIGNAL_SURVIVED";
+
+        if std::env::var_os(INNER).is_some() {
+            let marker = std::env::var(MARKER).expect("outer supplied marker");
+            let survived = std::env::var(SURVIVED).expect("outer supplied survivor marker");
+            let mut command = ProcessCommand::new("/bin/sh");
+            command.args([
+                "-c",
+                &format!(
+                    "(sleep 1; printf survived > '{survived}') & printf '%s' \"$!\" > \
+                     '{marker}'; wait"
+                ),
+            ]);
+            let result = crate::pty::run(
+                command,
+                "signal-forwarding fixture",
+                Instant::now() + Duration::from_secs(300),
+            );
+            panic!("the outer process should terminate this run, got {result:?}");
+        }
+
+        let marker = std::env::temp_dir().join(format!(
+            "tightbeam-ceremony-signal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let survived = marker.with_extension("survived");
+        let _ = fs::remove_file(&marker);
+        let _ = fs::remove_file(&survived);
+        let mut inner = ProcessCommand::new(std::env::current_exe().unwrap());
+        inner
+            .args([
+                "--exact",
+                "ceremonies::tests::killing_the_ceremony_parent_leaves_no_surviving_child",
+                "--nocapture",
+            ])
+            .env(INNER, "1")
+            .env(MARKER, &marker)
+            .env(SURVIVED, &survived)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut inner = inner.spawn().unwrap();
+
+        let ready_by = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < ready_by {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild = fs::read_to_string(&marker).expect("fixture recorded its descendant");
+
+        assert_eq!(
+            unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let _ = inner.wait().unwrap();
+        thread::sleep(Duration::from_millis(1_200));
+
+        let wrote_after_parent_death = survived.exists();
+        let _ = fs::remove_file(marker);
+        let _ = fs::remove_file(survived);
+        assert!(
+            !wrote_after_parent_death,
+            "descendant {grandchild} continued running after its ceremony parent died"
+        );
+    }
+
+    #[test]
+    fn openai_device_flow_url_is_reprinted_by_tightbeam() {
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-openai-url-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&path);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf 'Open this URL: https://auth.openai.test/device?code=fixture\\n'",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+
+        let status = run_bounded_inner(
+            command,
+            "openai URL fixture",
+            Instant::now() + Duration::from_secs(5),
+            None,
+            Some(file.as_raw_fd()),
+        )
+        .unwrap();
+        assert!(status.success());
+        drop(file);
+
+        let rendered = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(path);
+        assert!(
+            rendered.contains("Authorization URL: https://auth.openai.test/device?code=fixture"),
+            "{rendered:?}"
+        );
     }
 
     #[test]
@@ -3070,56 +3184,32 @@ mod tests {
         );
     }
 
-    /// The BSD and util-linux forms are mutually incompatible, and shipping only the
-    /// BSD one made Anthropic onboarding impossible on every Linux host. Each arm is
-    /// asserted on its own platform, so the CI matrix proves both rather than proving
-    /// whichever one the developer happens to be sitting on.
-    /// The binary is passed in rather than baked in, so the name checked for on PATH is
-    /// the name actually run. `renamed-claude` is used here for exactly that reason: a
-    /// literal would let the two drift apart without any test noticing.
+    /// The provider binary is now the direct child on both platforms. Keeping one
+    /// assertion in each platform CI leg prevents `script(1)` portability machinery from
+    /// creeping back into either one.
     #[test]
     #[cfg(target_os = "macos")]
-    fn script_args_use_the_bsd_form_on_macos() {
-        assert_eq!(
-            script_args("/tmp/t.log", "renamed-claude"),
-            vec![
-                "-q",
-                "/tmp/t.log",
-                "/bin/sh",
-                "-c",
-                "stty rows 50 cols 108; exec \"$0\" setup-token",
-                "renamed-claude"
-            ]
-        );
+    fn anthropic_is_invoked_directly_on_macos() {
+        let command = anthropic_setup_token_command("renamed-claude");
+        assert_eq!(command.get_program(), "renamed-claude");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["setup-token"]);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn script_args_use_the_util_linux_form_on_linux() {
-        // util-linux takes the command via -c and allows at most one file argument;
-        // trailing args are "unexpected number of arguments" and exit 1.
-        assert_eq!(
-            script_args("/tmp/t.log", "renamed-claude"),
-            vec![
-                "-q",
-                "-c",
-                "stty rows 50 cols 108; exec renamed-claude setup-token",
-                "/tmp/t.log"
-            ]
-        );
+    fn anthropic_is_invoked_directly_on_linux() {
+        let command = anthropic_setup_token_command("renamed-claude");
+        assert_eq!(command.get_program(), "renamed-claude");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["setup-token"]);
     }
 
-    /// The pinned width is not a number that happens to work: it is the token's exact
-    /// length, which is what makes the issue-#5 stale-cell geometry unreachable (no
-    /// row can be wider than the token, so nothing survives past its end) and keeps
-    /// the token on exactly one row. One home for the number, asserted here so the pin
-    /// and the capture gate can never drift apart.
+    /// The width deliberately fits the current 109-character token, but is not a capture
+    /// gate. Capture owns provider shape; the pty owns presentation.
     #[test]
-    fn the_pinned_width_is_the_token_length() {
-        assert!(
-            pinned_pty_command("claude")
-                .contains(&format!("cols {}", crate::screen::SETUP_TOKEN_LENGTH))
-        );
+    fn the_pinned_width_keeps_the_observed_token_whole_without_encoding_its_length() {
+        assert_eq!(crate::pty::CEREMONY_COLUMNS, 109);
+        assert!(usize::from(crate::pty::CEREMONY_COLUMNS) >= 109);
+        assert_ne!(crate::pty::CEREMONY_COLUMNS, 108);
     }
 
     #[test]
@@ -3238,17 +3328,6 @@ mod tests {
                 "neither old message may survive: {reason}"
             );
         }
-
-        // script(1) is not a vendor CLI, so it says why onboarding needs it rather than
-        // whose job the software is.
-        let reason = preflight::missing_system_tool(
-            "script",
-            "`claude setup-token` refuses to run without a TTY.",
-            "eurisko",
-            &empty,
-        );
-        assert!(reason.contains("without a TTY"), "{reason}");
-        assert!(!reason.contains("vendors' software"), "{reason}");
 
         std::fs::remove_dir_all(&root).unwrap();
     }

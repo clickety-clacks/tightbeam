@@ -35,9 +35,9 @@
 //! after it. The single inferred width still does the prose, and no longer decides the
 //! credential.
 //!
-//! Taking the width from `ioctl(TIOCGWINSZ)` was the obvious alternative and is worse:
-//! it assumes how `script(1)` sizes the child pty, which differs between BSD and
-//! util-linux, and it cannot be exercised by a unit test.
+//! The ceremony now owns the pty and sets its geometry directly. Replay still derives
+//! the rendered width from bytes, so capture does not smuggle a width or token-length
+//! assumption back into the read side.
 
 use vte::{Params, Parser, Perform};
 
@@ -216,60 +216,35 @@ pub fn displayed_lines(transcript: &[u8]) -> Vec<String> {
     lines
 }
 
-/// The exact length of a `sk-ant-oat…` setup token, in characters.
-///
-/// An observed invariant of the vendor, not a contract: every setup token claude has
-/// minted here has been exactly 108 characters (live captures on 2026-07-26 and -28,
-/// the report on issue #5, docs/ONBOARDING.md), and the fixture below asserts it. The
-/// length is what makes a stale repaint cell separable from the credential it sits
-/// against: exactly this many token characters followed by anything outside the token
-/// alphabet is the token plus debris, and an unbroken run of any other length is
-/// nothing nameable. If claude ever changes its token length, capture refuses with
-/// both numbers in the message rather than guessing where the token ends — change this
-/// constant and the fixture together. `ceremonies` also pins the setup-token pty to
-/// exactly this many columns, which is what makes the debris case unreachable there.
-pub(crate) const SETUP_TOKEN_LENGTH: usize = 108;
+const SETUP_TOKEN_PREFIX: &str = "sk-ant-oat01-";
 
 /// What the replayed screen holds where a token should be.
 ///
 /// One reading, shared by `capture_setup_token`, `capture_note`, and `refusal_reason`,
 /// so the capture and the explanation can never describe two different screens.
 enum Reading {
-    /// Exactly [`SETUP_TOKEN_LENGTH`] token characters, with whatever a repaint left
-    /// beside them set aside — `discarded` names those cells when there were any.
+    /// One provider-shaped token run, with whatever followed its alphabet boundary set
+    /// aside — `discarded` names those cells when there were any.
     Token {
         token: String,
         discarded: Option<String>,
     },
-    /// No line on the screen begins `sk-ant-oat` at all.
+    /// No line on the screen begins with the provider's `sk-ant-oat01-` prefix.
     Absent { lines: usize },
-    /// An unbroken token-alphabet run of the wrong length. One character over is the
-    /// dangerous shape: a stale cell that happens to sit in the token alphabet, fused
-    /// to the token with nothing to mark the seam.
-    WrongLength { length: usize },
-    /// The candidate line left the token alphabet before reaching full length, so it
-    /// carries something that is not the credential inside the token's own columns.
-    Broken { run: usize, length: usize },
     /// Token-alphabet rows ran straight into other text with no blank row between,
     /// where claude's `gap:1` panel always leaves one — the reconstruction cannot be
     /// trusted end to end.
     Ungapped { length: usize },
 }
 
-/// Read the token off the replayed lines, length-aware.
+/// Read the token off the replayed lines by provider shape.
 ///
 /// The token starts a displayed line — claude renders it as its own Text node — but the
 /// line is NOT required to be the token alone, because the TUI repaints without erase
-/// sequences and a prior frame's cells past the new content can survive on the token's
-/// row (issue #5: a 108-char token at 110 columns came back as a 109-char line, one
-/// stale cell fused to it). The token alphabet plus the fixed length decide instead:
-///
-///   - exactly [`SETUP_TOKEN_LENGTH`] token characters, then a character OUTSIDE the
-///     alphabet: the token, plus stale cells — extract the token, set the debris aside;
-///   - a longer unbroken run: a stale cell INSIDE the alphabet, indistinguishable from
-///     the credential — refuse, never guess where the token ends;
-///   - a shorter run against a longer line, or rows that end without the `gap:1` blank
-///     row: a reconstruction that cannot be trusted — refuse.
+/// sequences and a prior frame's cells can survive past the token. The provider format
+/// decides the candidate: `sk-ant-oat01-` followed by one contiguous run of its token
+/// alphabet. No character count participates; the live 2026-08-01 ceremony proved that
+/// the previously observed 108-character length is not a provider contract.
 ///
 /// ONE CASE RESTS ON AN OBSERVED PROPERTY OF THE VENDOR BINARY, not on a contract. A
 /// token exactly as wide as the terminal is indistinguishable, in a transcript, from one
@@ -284,7 +259,7 @@ enum Reading {
 fn read_token(lines: &[String]) -> Reading {
     let Some(start) = lines
         .iter()
-        .rposition(|line| line.trim().starts_with("sk-ant-oat"))
+        .rposition(|line| line.trim().starts_with(SETUP_TOKEN_PREFIX))
     else {
         return Reading::Absent { lines: lines.len() };
     };
@@ -296,17 +271,14 @@ fn read_token(lines: &[String]) -> Reading {
     let length = line.chars().count();
 
     if run < length {
-        // The line leaves the token alphabet somewhere. The alphabet boundary decides
-        // which side of it the credential is on.
-        return if run == SETUP_TOKEN_LENGTH {
+        let token: String = line.chars().take(run).collect();
+        return if provider_token_shape(&token) {
             Reading::Token {
-                token: line.chars().take(SETUP_TOKEN_LENGTH).collect(),
-                discarded: Some(line.chars().skip(SETUP_TOKEN_LENGTH).collect()),
+                token,
+                discarded: Some(line.chars().skip(run).collect()),
             }
-        } else if run > SETUP_TOKEN_LENGTH {
-            Reading::WrongLength { length: run }
         } else {
-            Reading::Broken { run, length }
+            Reading::Absent { lines: lines.len() }
         };
     }
 
@@ -339,15 +311,13 @@ fn read_token(lines: &[String]) -> Reading {
         }
     }
 
-    if assembled_length == SETUP_TOKEN_LENGTH {
+    if provider_token_shape(&assembled) {
         Reading::Token {
             token: assembled,
             discarded: None,
         }
     } else {
-        Reading::WrongLength {
-            length: assembled_length,
-        }
+        Reading::Absent { lines: lines.len() }
     }
 }
 
@@ -375,8 +345,8 @@ pub fn capture_note(transcript: &[u8]) -> Option<String> {
         } => Some(format!(
             "the token's row carried {} stale cell(s) after the token ({cells:?}), left \
              there by an earlier frame that claude's repaint never cleared; they are \
-             outside the token alphabet, so the {SETUP_TOKEN_LENGTH}-character token \
-             before them was captured and they were discarded",
+             outside the provider token alphabet, so the provider-shaped run before \
+             them was captured and they were discarded",
             cells.chars().count(),
         )),
         _ => None,
@@ -393,33 +363,12 @@ pub fn refusal_reason(transcript: &[u8]) -> String {
     match read_token(&displayed_lines(transcript)) {
         Reading::Token { .. } => "the token was captured; nothing was refused".to_owned(),
         Reading::Absent { lines } => {
-            format!("no line of the {lines} line(s) on the replayed screen began with sk-ant-oat")
+            format!(
+                "no line of the {lines} line(s) on the replayed screen began with sk-ant-oat01-"
+            )
         }
-        Reading::WrongLength { length } if length > SETUP_TOKEN_LENGTH => format!(
-            "a line beginning sk-ant-oat was an unbroken run of {length} token-alphabet \
-             characters, where a claude setup token is exactly {SETUP_TOKEN_LENGTH}. The \
-             likeliest cause is a stale cell from an earlier frame surviving right after \
-             the token — claude's TUI repaints without erasing, and a leftover cell that \
-             happens to sit in the token alphabet cannot be told from the credential — \
-             so this refuses rather than guessing which {} character(s) are not the \
-             token. Re-running the ceremony lays the screen out afresh; if every run \
-             refuses with this same arithmetic, claude has changed its token length and \
-             SETUP_TOKEN_LENGTH needs updating",
-            length - SETUP_TOKEN_LENGTH
-        ),
-        Reading::WrongLength { length } => format!(
-            "a line beginning sk-ant-oat held only {length} token characters, where a \
-             claude setup token is exactly {SETUP_TOKEN_LENGTH} — an incomplete \
-             reconstruction, not a credential. Re-run the ceremony"
-        ),
-        Reading::Broken { run, length } => format!(
-            "a line beginning sk-ant-oat was {length} characters long but left the token \
-             alphabet after {run}, where a claude setup token is exactly \
-             {SETUP_TOKEN_LENGTH} unbroken token characters — something that is not the \
-             credential sits inside the token's own columns. Re-run the ceremony"
-        ),
         Reading::Ungapped { length } => format!(
-            "a line beginning sk-ant-oat was found ({length} token characters with its \
+            "a line beginning sk-ant-oat01- was found ({length} token characters with its \
              adjacent rows), but it ran straight into other text with no blank row \
              between, where claude's token panel always leaves one — the reconstruction \
              cannot be trusted end to end. Re-run the ceremony"
@@ -437,6 +386,54 @@ fn is_token_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
 }
 
+fn provider_token_shape(candidate: &str) -> bool {
+    candidate.starts_with(SETUP_TOKEN_PREFIX)
+        && candidate.len() > SETUP_TOKEN_PREFIX.len()
+        && candidate.chars().all(is_token_character)
+}
+
+/// The authorization URL visible on the replayed screen.
+///
+/// Both provider CLIs may decorate or hard-wrap their browser URL. Reading the screen
+/// recovers the operator-visible URL without treating OSC hyperlink payloads as text.
+pub fn authorization_url(transcript: &[u8]) -> Option<String> {
+    let raw = String::from_utf8_lossy(transcript);
+    for escape in raw.split("\x1b]8;").skip(1) {
+        let Some(end) = escape.find('\x07') else {
+            continue;
+        };
+        let payload = &escape[..end];
+        let Some((_, url)) = payload.split_once(';') else {
+            continue;
+        };
+        if url.starts_with("https://") || url.starts_with("http://") {
+            return Some(url.to_owned());
+        }
+    }
+
+    // A pipe/line-oriented CLI such as `codex login --device-auth` terminates the URL
+    // with a newline. Do not report an in-flight prefix merely because the latest read
+    // happened to end in the middle of the write.
+    if !transcript.ends_with(b"\n") {
+        return None;
+    }
+
+    displayed_lines(transcript)
+        .into_iter()
+        .flat_map(|line| {
+            line.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|word| {
+            let url = word
+                .trim_matches(|character| matches!(character, '<' | '>' | '"' | '\''))
+                .trim_end_matches(|character| matches!(character, '.' | ',' | ')' | ']'));
+            (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_owned())
+        })
+        .next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,21 +441,16 @@ mod tests {
     /// A FABRICATED token. Not derived from any real credential, and self-evidently so:
     /// it says what it is, and the tail is a repeating digit run.
     ///
-    /// Only two things about it are real, and both are public: the `sk-ant-oat01-` prefix,
-    /// and the LENGTH. 108 characters is what claude issues, and the length is what the
-    /// tests turn on -- the whole defect is about characters going missing, so a fixture
-    /// of the wrong length would exercise wrapping at the wrong boundaries and could pass
-    /// while the real thing failed. If claude's token length ever changes, change this and
-    /// keep it exact.
+    /// Only its provider prefix and alphabet are real and public. Its former 108-character
+    /// length remains useful for replaying the historical wrap fixtures, but is no longer
+    /// an acceptance rule: the 2026-08-01 live ceremony produced 109 characters.
     const TOKEN: &str = "sk-ant-oat01-SYNTHETIC-FIXTURE-NOT-A-REAL-TOKEN-012345678901234567890123456789012345678901234567890123456789";
 
-    /// The length is load-bearing, so it is asserted rather than trusted.
     #[test]
-    fn the_fixture_token_is_the_length_claude_issues() {
-        assert_eq!(TOKEN.chars().count(), SETUP_TOKEN_LENGTH);
-        assert_eq!(SETUP_TOKEN_LENGTH, 108);
+    fn the_fixture_is_provider_shaped_and_synthetic() {
+        assert_eq!(TOKEN.chars().count(), 108);
         assert!(TOKEN.starts_with("sk-ant-oat01-"));
-        assert!(TOKEN.chars().all(is_token_character));
+        assert!(provider_token_shape(TOKEN));
         assert!(
             TOKEN.contains("SYNTHETIC"),
             "this fixture must stay provably fabricated: it lives in a public repo"
@@ -660,28 +652,22 @@ mod tests {
         }
     }
 
-    /// The same sweep under the no-erase renderer. Under it, capture cannot promise
-    /// the exact token at every width -- a stale cell that lands in the token alphabet
-    /// is indistinguishable from the credential, and refusing IS the correct outcome
-    /// -- so the property here is safety: every width yields either the exact token or
-    /// a refusal that explains itself. No width may ever yield wrong bytes, which is
-    /// the failure worth more than all the others (it banks, then 401s a month later).
+    /// The production geometry under the harsher no-erase renderer. The current
+    /// 109-character shape reaches the row edge, so no stale suffix survives.
     #[test]
-    fn under_repaint_without_erase_no_width_yields_a_wrong_token() {
-        let stale = stale_frame();
-        for width in SWEEP_WIDTHS {
-            let transcript = ceremony_transcript(width, Erase::LeavesStaleCells, &stale);
-            match capture_setup_token(transcript.as_bytes()) {
-                Some(token) => assert_eq!(token, TOKEN, "width {width}: wrong bytes captured"),
-                None => {
-                    let reason = refusal_reason(transcript.as_bytes());
-                    assert!(
-                        reason.contains("Re-run") || reason.contains("no line"),
-                        "width {width}: refusal must explain itself: {reason}"
-                    );
-                }
-            }
-        }
+    fn configured_width_recovers_the_token_under_repaint_without_erase() {
+        let current = format!("{TOKEN}Z");
+        let width = crate::pty::CEREMONY_COLUMNS as usize;
+        let label = "Your OAuth token (valid for 1 year):";
+        let mut tui = Tui::without_erase(width);
+        tui.render(&[label, "", &"Z".repeat(width)])
+            .render(&[label, "", &current]);
+        assert_eq!(
+            capture_setup_token(tui.transcript().as_bytes()).as_deref(),
+            Some(current.as_str()),
+            "configured width {width}: {}",
+            refusal_reason(tui.transcript().as_bytes())
+        );
     }
 
     // --------------------------------------------------------------------------------
@@ -754,21 +740,16 @@ mod tests {
 
     /// Issue #5's flagged near-miss: the stale cell holds a token-ALPHABET character,
     /// so the 109-char line is an unbroken run and nothing marks where the token ends.
-    /// Capturing 109 bytes here is the wrong-token hazard; the length gate refuses and
-    /// the refusal does the arithmetic and names the stale-repaint cause.
+    /// A provider-shaped 109-character run is accepted by shape, not rejected because an
+    /// older vendor version happened to mint 108-character tokens. Live validation is the
+    /// authority for whether those bytes are a credential.
     #[test]
-    fn issue_5_near_miss_in_the_token_alphabet_refuses_with_the_arithmetic() {
+    fn a_109_character_provider_shaped_run_is_captured() {
         let stale = format!("{}Z", "#".repeat(108)); // column 109 holds 'Z'
         let screen = issue_5_screen(110, &stale);
-        assert_eq!(
-            capture_setup_token(screen.as_bytes()),
-            None,
-            "an unbroken 109-char run must never be banked as a token"
-        );
-        let reason = refusal_reason(screen.as_bytes());
-        assert!(reason.contains("109"), "{reason}");
-        assert!(reason.contains("exactly 108"), "{reason}");
-        assert!(reason.contains("stale cell"), "{reason}");
+        let captured = capture_setup_token(screen.as_bytes()).expect("provider-shaped run");
+        assert_eq!(captured.chars().count(), 109);
+        assert!(captured.starts_with("sk-ant-oat01-"));
     }
 
     /// Control: the same layout with NO stale tail, at the boundary widths -- shows
@@ -786,47 +767,33 @@ mod tests {
         }
     }
 
-    /// The ceremony pins its pty at exactly [`SETUP_TOKEN_LENGTH`] columns (see
-    /// `ceremonies::script_args`). At that width the issue-#5 mechanism is unreachable
-    /// even under the no-erase renderer: no row can be wider than the token, so no
-    /// stale cell can survive past its end -- the token's repaint covers its row edge
-    /// to edge. A full row of token-alphabet junk under the token, the worst stale
-    /// content there is, must still yield a clean exact capture with nothing to
-    /// discard.
+    /// The CLI-owned 109-column pty keeps the observed token on one row.
+    /// The width is presentation geometry only; capture remains shape-based.
     #[test]
-    fn at_the_pinned_width_the_token_row_cannot_carry_stale_cells() {
-        let stale = "Z".repeat(SETUP_TOKEN_LENGTH);
-        let screen = issue_5_screen(SETUP_TOKEN_LENGTH, &stale);
+    fn the_chosen_pty_width_keeps_the_observed_longer_token_whole() {
+        let longer = format!("{TOKEN}Z");
+        let mut tui = Tui::new(crate::pty::CEREMONY_COLUMNS as usize);
+        tui.render(&["Your OAuth token (valid for 1 year):", "", &longer]);
         assert_eq!(
-            capture_setup_token(screen.as_bytes()).as_deref(),
-            Some(TOKEN),
+            capture_setup_token(tui.transcript().as_bytes()).as_deref(),
+            Some(longer.as_str()),
             "{}",
-            refusal_reason(screen.as_bytes())
-        );
-        assert_eq!(
-            capture_note(screen.as_bytes()),
-            None,
-            "nothing may need discarding at the pinned width"
+            refusal_reason(tui.transcript().as_bytes())
         );
     }
 
-    /// The pinned width protects the token's ROW; it cannot promise the rest of the
-    /// screen. If a no-erase repaint ever leaves token-alphabet junk standing on the
-    /// gap row BELOW the token, the reconstruction is undecidable and must refuse --
-    /// safely, never by extending the token.
+    /// Token-alphabet cells directly adjacent to a wrapped token are indistinguishable
+    /// from the provider-shaped run without a length contract. Capture returns the whole
+    /// shape; authenticated validation remains the gate that prevents banking wrong bytes.
     #[test]
-    fn stale_content_on_the_gap_row_refuses_rather_than_extending_the_token() {
+    fn adjacent_token_alphabet_cells_remain_part_of_the_shape() {
         let label = "Your OAuth token (valid for 1 year):";
-        let mut tui = Tui::without_erase(SETUP_TOKEN_LENGTH);
+        let mut tui = Tui::without_erase(TOKEN.chars().count());
         tui.render(&[label, "", &stale_frame(), "0123456789abcdef"])
             .render(&[label, "", TOKEN, ""]);
-        assert_eq!(
-            capture_setup_token(tui.transcript().as_bytes()),
-            None,
-            "junk on the gap row must refuse, not weld onto the token"
-        );
-        let reason = refusal_reason(tui.transcript().as_bytes());
-        assert!(reason.contains("Re-run"), "{reason}");
+        let captured = capture_setup_token(tui.transcript().as_bytes()).unwrap();
+        assert!(captured.starts_with(TOKEN));
+        assert!(captured.ends_with("0123456789abcdef"));
     }
 
     /// The shape reported from shrdlu: characters inside the token were never emitted,
@@ -865,8 +832,7 @@ mod tests {
     /// A shorter frame painted over a longer one WITHOUT clearing the tail: the
     /// leftover cells sit on the token's row and the rejoin welds them onto it. The
     /// welded tail here leaves the token alphabet immediately (`/` at the seam), so the
-    /// length gate can name the boundary: exactly [`SETUP_TOKEN_LENGTH`] token
-    /// characters, then debris — the token is extracted, the debris is discarded, and
+    /// provider alphabet marks the boundary: the token is extracted, the debris is discarded, and
     /// `capture_note` says so out loud. Issue #5 is this exact shape in the wild.
     #[test]
     fn an_uncleared_tail_outside_the_alphabet_is_discarded_legibly() {
@@ -940,8 +906,7 @@ mod tests {
 
     /// A token displayed plainly, with no repaint and no wrapping -- the shape the old
     /// whitespace scan handled, kept so the fix is not narrower than what it replaces.
-    /// The token is the full-length fixture: capture is length-gated, so a token-shaped
-    /// string of any other length is not a token.
+    /// Capture is provider-shape-based rather than tied to this fixture's length.
     #[test]
     fn captures_the_non_rotating_claude_setup_token() {
         let plain = format!("browser output\n{TOKEN}\r\n");
@@ -952,15 +917,15 @@ mod tests {
         assert_eq!(capture_setup_token(b"no token here"), None);
     }
 
-    /// The length gate itself: a plausible `sk-ant-oat…` line of the WRONG length is
-    /// refused, and the refusal does the arithmetic for the operator.
+    /// A shorter provider-shaped run is still extracted; the authenticated validation
+    /// call, not a locally remembered vendor length, decides whether it is genuine.
     #[test]
-    fn a_token_shaped_run_of_the_wrong_length_is_refused_with_both_numbers() {
+    fn provider_shape_does_not_assume_a_token_length() {
         let short = b"sk-ant-oat01-example\r\n";
-        assert_eq!(capture_setup_token(short), None);
-        let reason = refusal_reason(short);
-        assert!(reason.contains("only 20 token characters"), "{reason}");
-        assert!(reason.contains("exactly 108"), "{reason}");
+        assert_eq!(
+            capture_setup_token(short).as_deref(),
+            Some("sk-ant-oat01-example")
+        );
     }
 
     /// An OSC 8 hyperlink's payload must be consumed as an escape, never printed. The
@@ -1041,6 +1006,22 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(&expected)),
             "the replayed screen must show it whole"
+        );
+        assert_eq!(
+            authorization_url(RECORDED).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn an_unterminated_url_prefix_is_not_printed_as_the_authorization_url() {
+        let partial = b"Opening browser\nhttps://example.test/authorize?code=part";
+        assert_eq!(authorization_url(partial), None);
+
+        let complete = b"Opening browser\nhttps://example.test/authorize?code=part\n";
+        assert_eq!(
+            authorization_url(complete).as_deref(),
+            Some("https://example.test/authorize?code=part")
         );
     }
 
@@ -1155,23 +1136,10 @@ mod tests {
         assert!(empty.contains("no line"), "{empty}");
         assert!(empty.contains("sk-ant-oat"), "{empty}");
 
-        // One token-alphabet cell fused to the token: the near-miss. The refusal must
-        // do the arithmetic and name the stale-repaint cause, not tell the operator to
-        // resize a terminal the ceremony controls.
-        let fused = refusal_reason(format!("{TOKEN}Z\r\n").as_bytes());
-        assert!(fused.contains("109 token-alphabet characters"), "{fused}");
-        assert!(fused.contains("exactly 108"), "{fused}");
-        assert!(fused.contains("stale cell"), "{fused}");
-        assert!(fused.contains("repaints without erasing"), "{fused}");
-
-        // A non-token cell INSIDE the token's columns: the reconstruction is broken,
-        // not merely dirty at the edge.
-        let broken = refusal_reason(b"sk-ant-oat01-abc&def\r\n");
-        assert!(
-            broken.contains("left the token alphabet after 16"),
-            "{broken}"
-        );
-        assert!(broken.contains("exactly 108"), "{broken}");
+        let welded = format!("{TOKEN}\r\n0123456789abcdef\r\nStore this token securely.\r\n");
+        let ambiguous = refusal_reason(welded.as_bytes());
+        assert!(ambiguous.contains("no blank row"), "{ambiguous}");
+        assert!(ambiguous.contains("Re-run"), "{ambiguous}");
     }
 
     /// A screen that wraps at TWO widths, which is what a real headless ceremony renders.

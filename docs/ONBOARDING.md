@@ -60,9 +60,9 @@ process groups — names what it killed, and leaves the credential store
 untouched. It does not write a failure log on that path; the watchdog line in
 the gateway log is the record.
 
-**A failed capture preserves its transcript** at
-`<base_dir>/setup-token-failure.log`, and the refusal says why. Report the
-refusal reason before re-arming; codes are single-use.
+**A failed capture is not persisted.** The transcript can contain a live year-long
+credential, so the refusal explains the screen shape without copying the bytes to a log.
+Report that refusal before re-arming; codes are single-use.
 
 **Scanning a ceremony's working directory for leaked secrets: match regular
 files only** (`find … -type f`, or exclude non-regular files). A ceremony's
@@ -112,9 +112,9 @@ Credentials are store rows, not loose files. Each provider needs all three:
 
 The KIND is what every credential seam dispatches on; a row without one is not
 usable, because nothing infers it from the file. The claude backing file holds
-whichever kind is active — a full 108-character `sk-ant-oat…` setup token under
-a subscription, an `sk-ant-api…` key under the other. That filename is
-historical and is NOT evidence of the kind.
+whichever kind is active — an `sk-ant-oat…` setup token under a subscription,
+an `sk-ant-api…` key under the other. Token length is not part of the contract.
+That filename is historical and is NOT evidence of the kind.
 
 The openai path does not populate `expires_at` or `subscription_status` even on
 a fresh write; they are null by design there, not stale.
