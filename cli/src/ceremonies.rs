@@ -92,6 +92,56 @@ impl From<crate::pty::RunError> for StageFailure {
     }
 }
 
+#[derive(Debug)]
+enum BoundedRunError {
+    Failed(String),
+    Interrupted { message: String },
+}
+
+impl BoundedRunError {
+    fn interrupted(signal: libc::c_int, what: &str) -> Self {
+        Self::Interrupted {
+            message: format!("{what} was interrupted by signal {signal}"),
+        }
+    }
+
+    fn is_interrupted(&self) -> bool {
+        matches!(self, Self::Interrupted { .. })
+    }
+
+    fn with_cleanup_failure(self, cleanup: String) -> Self {
+        match self {
+            Self::Failed(message) => Self::Failed(format!("{message}; {cleanup}")),
+            Self::Interrupted { message } => Self::Interrupted {
+                message: format!("{message}; {cleanup}"),
+            },
+        }
+    }
+}
+
+impl From<String> for BoundedRunError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for BoundedRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) | Self::Interrupted { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<BoundedRunError> for StageFailure {
+    fn from(error: BoundedRunError) -> Self {
+        Self {
+            interrupted: error.is_interrupted(),
+            reason: error.to_string(),
+        }
+    }
+}
+
 pub fn onboard<S, H>(
     identity: &Identity,
     provider: &str,
@@ -397,14 +447,14 @@ fn run_bounded(
     deadline: Instant,
     stdin: Option<&[u8]>,
 ) -> Result<ExitStatus, String> {
-    run_bounded_inner(command, what, deadline, stdin, None)
+    run_bounded_inner(command, what, deadline, stdin, None).map_err(|error| error.to_string())
 }
 
 fn run_bounded_reporting_url(
     command: ProcessCommand,
     what: &str,
     deadline: Instant,
-) -> Result<ExitStatus, String> {
+) -> Result<ExitStatus, BoundedRunError> {
     run_bounded_inner(command, what, deadline, None, Some(libc::STDOUT_FILENO))
 }
 
@@ -414,11 +464,12 @@ fn run_bounded_inner(
     deadline: Instant,
     stdin: Option<&[u8]>,
     url_output_fd: Option<libc::c_int>,
-) -> Result<ExitStatus, String> {
+) -> Result<ExitStatus, BoundedRunError> {
     if Instant::now() >= deadline {
         return Err(format!(
             "{what} refused to start because its onboarding lease already expired"
-        ));
+        )
+        .into());
     }
 
     let forwarding = SignalForwarding::install().map_err(|error| error.to_string())?;
@@ -451,13 +502,17 @@ fn run_bounded_inner(
                 &mut child,
                 what,
                 &forwarding,
-                io::Error::last_os_error().to_string(),
+                io::Error::last_os_error().to_string().into(),
             );
         }
     }
     let mut output = Vec::new();
     let mut output_eof = captured_stdout.is_none();
     let mut printed_url = None;
+    let _output_flags = url_output_fd
+        .map(NonblockingFd::new)
+        .transpose()
+        .map_err(|error| error.to_string())?;
 
     if let Some(bytes) = stdin {
         let Some(mut pipe) = child.stdin.take() else {
@@ -465,11 +520,11 @@ fn run_bounded_inner(
                 &mut child,
                 what,
                 &forwarding,
-                format!("{what} did not accept stdin"),
+                format!("{what} did not accept stdin").into(),
             );
         };
         if let Err(error) = pipe.write_all(bytes) {
-            return abort_bounded(&mut child, what, &forwarding, error.to_string());
+            return abort_bounded(&mut child, what, &forwarding, error.to_string().into());
         }
         // Dropped here on purpose -- see the doc comment.
     }
@@ -497,6 +552,22 @@ fn run_bounded_inner(
         if let Some(stdout) = &mut captured_stdout {
             let mut bytes = [0u8; 8192];
             loop {
+                if let Some(signal) = forwarding.caught() {
+                    return abort_bounded(
+                        &mut child,
+                        what,
+                        &forwarding,
+                        BoundedRunError::interrupted(signal, what),
+                    );
+                }
+                if Instant::now() >= deadline {
+                    return abort_bounded(
+                        &mut child,
+                        what,
+                        &forwarding,
+                        deadline_failure(what, pgid),
+                    );
+                }
                 match stdout.read(&mut bytes) {
                     Ok(0) => {
                         output_eof = true;
@@ -505,9 +576,13 @@ fn run_bounded_inner(
                     Ok(count) => {
                         let bytes = &bytes[..count];
                         output.extend_from_slice(bytes);
-                        if let Err(error) =
-                            write_fd(url_output_fd.expect("capture has output fd"), bytes)
-                        {
+                        if let Err(error) = write_fd(
+                            url_output_fd.expect("capture has output fd"),
+                            bytes,
+                            what,
+                            deadline,
+                            &forwarding,
+                        ) {
                             return abort_bounded(&mut child, what, &forwarding, error);
                         }
                         if let Some(url) = crate::screen::authorization_url(&output)
@@ -516,6 +591,9 @@ fn run_bounded_inner(
                             if let Err(error) = write_fd(
                                 url_output_fd.expect("capture has output fd"),
                                 format!("\nAuthorization URL: {url}\n").as_bytes(),
+                                what,
+                                deadline,
+                                &forwarding,
                             ) {
                                 return abort_bounded(&mut child, what, &forwarding, error);
                             }
@@ -525,47 +603,42 @@ fn run_bounded_inner(
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
-                        return abort_bounded(&mut child, what, &forwarding, error.to_string());
+                        return abort_bounded(
+                            &mut child,
+                            what,
+                            &forwarding,
+                            error.to_string().into(),
+                        );
                     }
                 }
             }
         }
 
+        if let Some(signal) = forwarding.caught() {
+            return abort_bounded(
+                &mut child,
+                what,
+                &forwarding,
+                BoundedRunError::interrupted(signal, what),
+            );
+        }
+
         match exited_without_reaping(&child) {
             Ok(true) if output_eof => {
                 forwarding.disarm();
-                return child.wait().map_err(|error| error.to_string());
+                return child.wait().map_err(|error| error.to_string().into());
             }
             Ok(_) => {}
             Err(error) => {
                 return Err(format!(
                     "wait for {what} failed: {error}; process group left unsignalled"
-                ));
+                )
+                .into());
             }
         }
 
-        if let Some(signal) = forwarding.caught() {
-            terminate_process_group(&mut child, Duration::from_secs(2)).map_err(|error| {
-                format!("could not terminate {what}: {error}; process group left unsignalled")
-            })?;
-            forwarding.disarm();
-            child.wait().map_err(|error| error.to_string())?;
-            return Err(format!(
-                "{what} was interrupted by signal {signal}; terminated it and its process group"
-            ));
-        }
-
         if Instant::now() >= deadline {
-            terminate_process_group(&mut child, Duration::from_secs(2)).map_err(|error| {
-                format!("could not terminate {what}: {error}; process group left unsignalled")
-            })?;
-            forwarding.disarm();
-            child.wait().map_err(|error| error.to_string())?;
-
-            return Err(format!(
-                "{what} did not finish before its onboarding lease expired; terminated it and \
-                 its process group ({pgid})"
-            ));
+            return abort_bounded(&mut child, what, &forwarding, deadline_failure(what, pgid));
         }
 
         thread::sleep(
@@ -576,40 +649,97 @@ fn run_bounded_inner(
     }
 }
 
-fn write_fd(fd: libc::c_int, mut bytes: &[u8]) -> Result<(), String> {
+fn write_fd(
+    fd: libc::c_int,
+    mut bytes: &[u8],
+    what: &str,
+    deadline: Instant,
+    forwarding: &SignalForwarding,
+) -> Result<(), BoundedRunError> {
     while !bytes.is_empty() {
+        if let Some(signal) = forwarding.caught() {
+            return Err(BoundedRunError::interrupted(signal, what));
+        }
+        if Instant::now() >= deadline {
+            return Err(deadline_failure(what, 0));
+        }
         let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
         if count > 0 {
             bytes = &bytes[count as usize..];
         } else {
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error.to_string());
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {
+                    thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(10)),
+                    );
+                }
+                _ => return Err(error.to_string().into()),
             }
         }
     }
     Ok(())
 }
 
+fn deadline_failure(what: &str, pgid: libc::pid_t) -> BoundedRunError {
+    let group = if pgid > 0 {
+        format!(" ({pgid})")
+    } else {
+        String::new()
+    };
+    format!(
+        "{what} did not finish before its onboarding lease expired; terminated it and its \
+         process group{group}"
+    )
+    .into()
+}
+
+struct NonblockingFd {
+    fd: libc::c_int,
+    flags: libc::c_int,
+}
+
+impl NonblockingFd {
+    fn new(fd: libc::c_int) -> io::Result<Self> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd, flags })
+    }
+}
+
+impl Drop for NonblockingFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fcntl(self.fd, libc::F_SETFL, self.flags);
+        }
+    }
+}
+
 fn abort_bounded<T>(
     child: &mut std::process::Child,
     what: &str,
     forwarding: &SignalForwarding,
-    cause: String,
-) -> Result<T, String> {
+    cause: BoundedRunError,
+) -> Result<T, BoundedRunError> {
     if let Err(error) = terminate_process_group(child, Duration::from_secs(2)) {
         forwarding.disarm();
-        return Err(format!(
-            "{cause}; cleanup also failed: could not terminate {what}: {error}; process group \
-             left unsignalled"
-        ));
+        return Err(cause.with_cleanup_failure(format!(
+            "cleanup also failed: could not terminate {what}: {error}; process group left \
+             unsignalled"
+        )));
     }
     forwarding.disarm();
     match child.wait() {
         Ok(_) => Err(cause),
-        Err(error) => Err(format!(
-            "{cause}; cleanup also failed: could not reap {what}: {error}"
-        )),
+        Err(error) => Err(cause.with_cleanup_failure(format!(
+            "cleanup also failed: could not reap {what}: {error}"
+        ))),
     }
 }
 
@@ -620,7 +750,7 @@ fn run_provider_onboarding(
     ceremony: &Ceremony<'_>,
 ) -> Result<(), StageFailure> {
     match provider {
-        "openai" => run_openai_onboarding(staging, ceremony).map_err(StageFailure::from),
+        "openai" => run_openai_onboarding(staging, ceremony),
         "anthropic" => run_anthropic_onboarding(staging, machine, ceremony),
         #[cfg(test)]
         "fixture-provider" => std::fs::write(
@@ -885,8 +1015,8 @@ fn this_host() -> String {
         .unwrap_or_else(|| "this machine".to_owned())
 }
 
-fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), String> {
-    let codex = harness_cli("openai", ceremony)?;
+fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), StageFailure> {
+    let codex = harness_cli("openai", ceremony).map_err(StageFailure::from)?;
     let mut command = ProcessCommand::new(&codex);
     command
         .args(["login", "--device-auth"])
@@ -894,12 +1024,13 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = run_bounded_reporting_url(command, "codex device-code login", ceremony.deadline)?;
+    let status = run_bounded_reporting_url(command, "codex device-code login", ceremony.deadline)
+        .map_err(StageFailure::from)?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(format!("OpenAI device-code onboarding failed: {status}"))
+        Err(format!("OpenAI device-code onboarding failed: {status}").into())
     }
 }
 
@@ -1934,12 +2065,19 @@ mod tests {
 
     #[test]
     fn a_capture_failure_never_prints_or_persists_the_candidate() {
-        let candidate = "sk-ant-oat01-SYNTHETIC-NOT-A-CREDENTIAL-0123456789";
-        let message = capture_failed(candidate.as_bytes());
+        let candidate = "future:v2+SYNTHETIC/NOT-A-CREDENTIAL==";
+        let transcript = format!(
+            "Your OAuth token (valid for 1 year):\r\n\r\n{candidate}\r\nStore this token securely.\r\n"
+        );
+        let message = capture_failed(transcript.as_bytes());
 
         assert!(
             !message.contains(candidate),
             "candidate leaked in {message}"
+        );
+        assert!(
+            message.contains("credential boundary cannot be trusted"),
+            "{message}"
         );
         assert!(message.contains("not written to a log"), "{message}");
         assert!(!message.contains("setup-token-failure.log"), "{message}");
@@ -2257,6 +2395,147 @@ mod tests {
         assert!(!staging_survived, "TERM left onboarding staging behind");
     }
 
+    /// Codex uses the pipe-backed bounded runner rather than the Anthropic pty runner.
+    /// Its signal has to retain the same interrupted classification all the way through
+    /// onboarding, or `onboard` mistakes TERM for a staging failure and waits on cancel.
+    #[test]
+    fn term_during_codex_onboarding_kills_the_tree_without_entering_cancel() {
+        const INNER: &str = "TIGHTBEAM_CODEX_SIGNAL_INNER";
+        const MARKER: &str = "TIGHTBEAM_CODEX_SIGNAL_MARKER";
+        const STAGING: &str = "TIGHTBEAM_CODEX_SIGNAL_STAGING";
+        const CANCEL: &str = "TIGHTBEAM_CODEX_SIGNAL_CANCEL";
+
+        if std::env::var_os(INNER).is_some() {
+            let marker = std::env::var(MARKER).expect("outer supplied marker");
+            let staging = std::env::var(STAGING).expect("outer supplied staging path");
+            let cancel = std::env::var(CANCEL).expect("outer supplied cancel marker");
+            let endpoint = Endpoint {
+                base: "http://signal-fixture.invalid".to_owned(),
+                token: "signal-fixture-token".to_owned(),
+                session_file: None,
+            };
+            let result = onboard(
+                &Identity::User("signal-fixture".to_owned()),
+                "openai",
+                false,
+                &endpoint,
+                |_, request, _| {
+                    let request: serde_json::Value =
+                        serde_json::from_str(&request.body_json).unwrap();
+                    match request
+                        .pointer("/params/phase")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("begin") => Ok(Some(serde_json::json!({
+                            "stagingPath": staging,
+                            "leaseId": "signal-fixture-lease",
+                            "leaseTtlMs": 300_000
+                        }))),
+                        Some("cancel") => {
+                            fs::write(&cancel, "entered").unwrap();
+                            thread::sleep(Duration::from_secs(300));
+                            Ok(None)
+                        }
+                        phase => panic!("unexpected onboarding phase: {phase:?}"),
+                    }
+                },
+                |_, _| Ok(None),
+            );
+            let error = result.expect_err("TERM must abort codex onboarding");
+            assert!(error.contains("interrupted by signal"), "{error}");
+            assert!(!std::path::Path::new(&staging).exists());
+            assert!(std::path::Path::new(&marker).exists());
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-codex-signal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let marker = root.join("descendant.pid");
+        let staging = root.join("staging");
+        let cancel = root.join("cancel-entered");
+        let bin = root.join("bin");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nsleep 300 & printf '%s' \"$!\" > '{}'\nwait\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut inner = ProcessCommand::new(std::env::current_exe().unwrap());
+        inner
+            .args([
+                "--exact",
+                "ceremonies::tests::term_during_codex_onboarding_kills_the_tree_without_entering_cancel",
+                "--nocapture",
+            ])
+            .env(INNER, "1")
+            .env(MARKER, &marker)
+            .env(STAGING, &staging)
+            .env(CANCEL, &cancel)
+            .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut inner = inner.spawn().unwrap();
+
+        let ready_by = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < ready_by {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild = fs::read_to_string(&marker).expect("codex fixture recorded descendant");
+        assert_eq!(
+            unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+
+        let mut stdout = inner.stdout.take().unwrap();
+        let drain = thread::spawn(move || {
+            let mut discarded = Vec::new();
+            let _ = stdout.read_to_end(&mut discarded);
+        });
+        let exit_by = Instant::now() + Duration::from_secs(5);
+        let mut status = None;
+        while status.is_none() && Instant::now() < exit_by {
+            status = inner.try_wait().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let required_kill = status.is_none();
+        if required_kill {
+            assert_eq!(
+                unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGKILL) },
+                0
+            );
+            let _ = inner.wait();
+        }
+        drain.join().unwrap();
+
+        let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
+        let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
+            || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        let cancel_entered = cancel.exists();
+        let staging_survived = staging.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !required_kill,
+            "TERM did not promptly exit codex onboarding; cancel={cancel_entered}, \
+             staging={staging_survived}, descendant_alive={alive}"
+        );
+        assert!(!cancel_entered, "TERM entered the lease-cancellation wait");
+        assert!(!alive, "codex descendant {grandchild} survived TERM");
+        assert!(!staging_survived, "TERM left codex staging behind");
+    }
+
     #[test]
     fn openai_device_flow_url_is_reprinted_by_tightbeam() {
         let path = std::env::temp_dir().join(format!(
@@ -2297,6 +2576,44 @@ mod tests {
         assert!(
             rendered.contains("Authorization URL: https://auth.openai.test/device?code=fixture"),
             "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_output_consumer_cannot_hold_codex_past_its_deadline() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let _reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "while :; do printf 'continuous child output\\n'; done",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+
+        let error = run_bounded_inner(
+            command,
+            "blocked codex output fixture",
+            Instant::now() + Duration::from_millis(100),
+            None,
+            Some(writer.as_raw_fd()),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("onboarding lease expired"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "blocked output held the codex loop for {:?}",
+            started.elapsed()
         );
     }
 

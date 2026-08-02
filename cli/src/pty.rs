@@ -117,6 +117,10 @@ fn run_with_fds(
     let mut master_eof = false;
     let mut printed_url = None;
     let mut secret_screen = false;
+    let _output_flags = match NonblockingFd::new(output_fd) {
+        Ok(flags) => flags,
+        Err(error) => return abort_group(&mut child, what, &forwarding, error),
+    };
 
     loop {
         let leader_exited = exited_without_reaping(&child).map_err(|error| {
@@ -234,7 +238,7 @@ fn run_with_fds(
                     secret_screen = true;
                 }
                 if !secret_screen {
-                    if let Err(error) = write_all(output_fd, bytes, what, &forwarding) {
+                    if let Err(error) = write_all(output_fd, bytes, what, deadline, &forwarding) {
                         return abort_group(&mut child, what, &forwarding, error);
                     }
                 }
@@ -245,6 +249,7 @@ fn run_with_fds(
                         output_fd,
                         format!("\r\nAuthorization URL: {url}\r\n").as_bytes(),
                         what,
+                        deadline,
                         &forwarding,
                     ) {
                         return abort_group(&mut child, what, &forwarding, error);
@@ -339,27 +344,63 @@ fn nonblocking(fd: libc::c_int) -> Result<(), String> {
     Ok(())
 }
 
+struct NonblockingFd {
+    fd: libc::c_int,
+    flags: libc::c_int,
+}
+
+impl NonblockingFd {
+    fn new(fd: libc::c_int) -> Result<Self, String> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        Ok(Self { fd, flags })
+    }
+}
+
+impl Drop for NonblockingFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fcntl(self.fd, libc::F_SETFL, self.flags);
+        }
+    }
+}
+
 fn write_all(
     fd: libc::c_int,
     mut bytes: &[u8],
     what: &str,
+    deadline: Instant,
     forwarding: &SignalForwarding,
 ) -> Result<(), RunError> {
     while !bytes.is_empty() {
         if let Some(signal) = forwarding.caught() {
             return Err(RunError::interrupted(signal, what));
         }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("{what} did not finish before its onboarding lease expired").into(),
+            );
+        }
         let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
         if count > 0 {
             bytes = &bytes[count as usize..];
         } else {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                if let Some(signal) = forwarding.caught() {
-                    return Err(RunError::interrupted(signal, what));
+            match error.kind() {
+                io::ErrorKind::Interrupted => {
+                    if let Some(signal) = forwarding.caught() {
+                        return Err(RunError::interrupted(signal, what));
+                    }
                 }
-            } else {
-                return Err(error.to_string().into());
+                io::ErrorKind::WouldBlock => std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                ),
+                _ => return Err(error.to_string().into()),
             }
         }
     }
@@ -424,6 +465,14 @@ mod tests {
             .open(&path)
             .unwrap();
         (path, file)
+    }
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
+            OwnedFd::from_raw_fd(fds[1])
+        })
     }
 
     #[test]
@@ -514,7 +563,12 @@ mod tests {
         let input = pipe_with(b"");
         let (path, file) = output_file("token-redaction");
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", &format!("printf '{TOKEN}\\n'")]);
+        command.args([
+            "-c",
+            &format!(
+                "printf 'Your OAuth token (valid for 1 year):\\n\\n{TOKEN}\\n\\nStore this token securely.\\n'"
+            ),
+        ]);
 
         let result = run_with_fds(
             command,
@@ -535,6 +589,37 @@ mod tests {
         assert!(
             !rendered.contains(TOKEN),
             "parent stdout leaked {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_output_consumer_cannot_hold_the_pty_past_its_deadline() {
+        let input = pipe_with(b"");
+        let (_output_reader, output_writer) = pipe();
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "while :; do printf 'continuous child output\\n'; done",
+        ]);
+        let started = Instant::now();
+
+        let error = run_with_fds(
+            command,
+            "blocked pty output fixture",
+            Instant::now() + Duration::from_millis(100),
+            input.as_raw_fd(),
+            output_writer.as_raw_fd(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("onboarding lease expired"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "blocked output held the pty loop for {:?}",
+            started.elapsed()
         );
     }
 }

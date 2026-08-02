@@ -129,12 +129,15 @@ static SIGNAL_HANDLER_STATE: Mutex<HandlerState> = Mutex::new(HandlerState {
 
 extern "C" fn forward_to_active_group(signal: libc::c_int) {
     for (slot, active) in ACTIVE_PROCESS_GROUPS.iter().enumerate() {
+        if !CLAIMED_SIGNAL_SLOTS[slot].load(Ordering::Relaxed) {
+            continue;
+        }
+        FORWARDED_SIGNALS[slot].store(signal, Ordering::Relaxed);
         let pgid = active.load(Ordering::Relaxed);
         if pgid > 0 {
             unsafe {
                 libc::killpg(pgid, signal);
             }
-            FORWARDED_SIGNALS[slot].store(signal, Ordering::Relaxed);
         }
     }
 }
@@ -197,7 +200,14 @@ impl SignalForwarding {
 
     pub(crate) fn arm(&self, child: &std::process::Child) -> io::Result<()> {
         exited_without_reaping(child)?;
-        ACTIVE_PROCESS_GROUPS[self.slot].store(child.id() as libc::pid_t, Ordering::Relaxed);
+        let pgid = child.id() as libc::pid_t;
+        ACTIVE_PROCESS_GROUPS[self.slot].store(pgid, Ordering::Relaxed);
+        if let Some(signal) = self.caught() {
+            let result = unsafe { libc::killpg(pgid, signal) };
+            if result == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         Ok(())
     }
 
@@ -231,5 +241,69 @@ impl Drop for SignalForwarding {
             state.previous.clear();
         }
         CLAIMED_SIGNAL_SLOTS[self.slot].store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn a_signal_caught_before_arming_is_forwarded_when_the_group_becomes_known() {
+        const INNER: &str = "TIGHTBEAM_EARLY_SIGNAL_INNER";
+        if std::env::var_os(INNER).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "child_process::tests::a_signal_caught_before_arming_is_forwarded_when_the_group_becomes_known",
+                    "--nocapture",
+                ])
+                .env(INNER, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated early-signal regression failed");
+            return;
+        }
+
+        let forwarding = SignalForwarding::install().unwrap();
+
+        // Exercise the handler deterministically without delivering TERM to the cargo
+        // test process. Before the fix this call saw no active pgid and discarded TERM.
+        forward_to_active_group(libc::SIGTERM);
+        assert_eq!(forwarding.caught(), Some(libc::SIGTERM));
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "while :; do sleep 1; done"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        reset_sigchld_before_spawn();
+        let mut child = command.spawn().unwrap();
+        forwarding.arm(&child).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !exited_without_reaping(&child).unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            exited_without_reaping(&child).unwrap(),
+            "the early TERM was recorded but never delivered after arming"
+        );
+        forwarding.disarm();
+        child.wait().unwrap();
     }
 }

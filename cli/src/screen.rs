@@ -216,112 +216,66 @@ pub fn displayed_lines(transcript: &[u8]) -> Vec<String> {
     lines
 }
 
-const SETUP_TOKEN_PREFIX: &str = "sk-ant-oat01-";
-
 /// What the replayed screen holds where a token should be.
 ///
 /// One reading, shared by `capture_setup_token`, `capture_note`, and `refusal_reason`,
 /// so the capture and the explanation can never describe two different screens.
 enum Reading {
-    /// One provider-shaped token run, with whatever followed its alphabet boundary set
-    /// aside — `discarded` names those cells when there were any.
-    Token {
-        token: String,
-        discarded: Option<String>,
-    },
-    /// No line on the screen begins with the provider's `sk-ant-oat01-` prefix.
+    /// The non-empty panel body between the token heading and its blank-row boundary.
+    Token { token: String, rows: usize },
+    /// No token panel heading was visible on the replayed screen.
     Absent { lines: usize },
-    /// Token-alphabet rows ran straight into other text with no blank row between,
-    /// where claude's `gap:1` panel always leaves one — the reconstruction cannot be
-    /// trusted end to end.
-    Ungapped { length: usize },
+    /// A token panel was visible, but its boundaries did not make one credential
+    /// candidate decidable.
+    Ambiguous { reason: &'static str },
 }
 
-/// Read the token off the replayed lines by provider shape.
+/// Read the credential off the replayed token panel by screen structure.
 ///
-/// The token starts a displayed line — claude renders it as its own Text node — but the
-/// line is NOT required to be the token alone, because the TUI repaints without erase
-/// sequences and a prior frame's cells can survive past the token. The provider format
-/// decides the candidate: `sk-ant-oat01-` followed by one contiguous run of its token
-/// alphabet. No character count participates; the live 2026-08-01 ceremony proved that
-/// the previously observed 108-character length is not a provider contract.
-///
-/// ONE CASE RESTS ON AN OBSERVED PROPERTY OF THE VENDOR BINARY, not on a contract. A
-/// token exactly as wide as the terminal is indistinguishable, in a transcript, from one
-/// that wrapped: both are a full-width row followed by another row. What separates them
-/// is that claude's token panel carries `gap:1`, so a blank row always follows the token
-/// and rejoining a full-width row with a blank one changes nothing. That was read out of
-/// the claude 2.1.220 bundle and confirmed against a live capture on 2026-07-27.
-/// CLAUDE.md's standing warning applies: harness CLIs update underneath us. If a future
-/// claude drops that gap, this case stops being decidable — and it then fails CLOSED,
-/// with `refusal_reason` saying exactly that, rather than welding the next line onto the
-/// token.
+/// The provider is free to change the credential's prefix, length, and alphabet. The
+/// stable thing the ceremony exposes is a labelled panel: a heading naming an OAuth
+/// token, a blank row, one non-empty body (possibly wrapped), then a blank row or the end
+/// of the screen. We therefore capture the whole body and never mine a prefix-shaped
+/// substring out of it. If those boundaries are absent, capture refuses without placing
+/// any candidate bytes in its diagnostic.
 fn read_token(lines: &[String]) -> Reading {
-    let Some(start) = lines
-        .iter()
-        .rposition(|line| line.trim().starts_with(SETUP_TOKEN_PREFIX))
-    else {
+    let runs = lines
+        .split(|line| line.trim().is_empty())
+        .filter(|run| !run.is_empty())
+        .map(|run| {
+            (
+                run.iter()
+                    .map(|line| line.trim())
+                    .collect::<Vec<_>>()
+                    .join(""),
+                run.len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let Some(heading) = runs.iter().rposition(|run| {
+        let heading = run.0.to_ascii_lowercase();
+        heading.contains("oauth") && heading.contains("token")
+    }) else {
         return Reading::Absent { lines: lines.len() };
     };
-    let line = lines[start].trim();
-    let run = line
-        .chars()
-        .take_while(|character| is_token_character(*character))
-        .count();
-    let length = line.chars().count();
-
-    if run < length {
-        let token: String = line.chars().take(run).collect();
-        return if provider_token_shape(&token) {
-            Reading::Token {
-                token,
-                discarded: Some(line.chars().skip(run).collect()),
-            }
-        } else {
-            Reading::Absent { lines: lines.len() }
+    let Some((token, rows)) = runs.get(heading + 1) else {
+        return Reading::Ambiguous {
+            reason: "the OAuth-token panel contained no non-empty credential body",
+        };
+    };
+    if token.to_ascii_lowercase().contains("store this token") {
+        return Reading::Ambiguous {
+            reason: "the token body ran into the panel footer without a blank separator",
         };
     }
 
-    // A pure token-alphabet line: the token itself, possibly wrapped across rows.
-    // `displayed_lines` rejoins on ONE width -- the widest row anywhere -- so it only
-    // reunites the token when the token wrapped at that same width. When the panel
-    // wraps narrower than the widest row on screen, the token's first row is short of
-    // that width, no rejoin happens, and the orphaned first row is ITSELF a well-formed
-    // bare prefix. Continuing across adjacent token-character rows closes that: they
-    // are the remainder, and gap:1 means nothing else is ever adjacent.
-    let mut end = start;
-    while lines
-        .get(end + 1)
-        .is_some_and(|line| is_token_run(line.trim()))
-    {
-        end += 1;
-    }
-    let assembled: String = lines[start..=end].iter().map(|line| line.trim()).collect();
-    let assembled_length = assembled.chars().count();
-
-    // gap:1 as a COMPLETENESS check: a whole token is always followed by a blank row,
-    // or by the end of the screen.
-    match lines.get(end + 1) {
-        None => {}
-        Some(next) if next.trim().is_empty() => {}
-        Some(_) => {
-            return Reading::Ungapped {
-                length: assembled_length,
-            };
-        }
-    }
-
-    if provider_token_shape(&assembled) {
-        Reading::Token {
-            token: assembled,
-            discarded: None,
-        }
-    } else {
-        Reading::Absent { lines: lines.len() }
+    Reading::Token {
+        token: token.to_owned(),
+        rows: *rows,
     }
 }
 
-/// The `sk-ant-oat…` token the TUI displayed, or None if it never displayed one whole.
+/// The complete token-panel body, or None if the panel did not make one body decidable.
 ///
 /// Refusing on anything unexplained is the point: a captured token that is wrong by one
 /// character banks successfully and fails later as an auth error nobody traces back
@@ -334,20 +288,13 @@ pub fn capture_setup_token(transcript: &[u8]) -> Option<String> {
     }
 }
 
-/// What capture set aside on its way to the token, when it succeeded by discarding
-/// stale cells — None when it discarded nothing (or refused). Surfaced to the operator
-/// so a screen that needed interpreting is never interpreted silently.
+/// Name the only interpretation capture performs: joining multiple displayed rows.
+/// Candidate bytes are deliberately absent from the note.
 pub fn capture_note(transcript: &[u8]) -> Option<String> {
     match read_token(&displayed_lines(transcript)) {
-        Reading::Token {
-            discarded: Some(cells),
-            ..
-        } => Some(format!(
-            "the token's row carried {} stale cell(s) after the token ({cells:?}), left \
-             there by an earlier frame that claude's repaint never cleared; they are \
-             outside the provider token alphabet, so the provider-shaped run before \
-             them was captured and they were discarded",
-            cells.chars().count(),
+        Reading::Token { rows, .. } if rows > 1 => Some(format!(
+            "the OAuth-token panel wrapped across {rows} displayed rows; the complete panel body \
+             was rejoined before validation"
         )),
         _ => None,
     }
@@ -362,34 +309,13 @@ pub fn capture_note(transcript: &[u8]) -> Option<String> {
 pub fn refusal_reason(transcript: &[u8]) -> String {
     match read_token(&displayed_lines(transcript)) {
         Reading::Token { .. } => "the token was captured; nothing was refused".to_owned(),
-        Reading::Absent { lines } => {
-            format!(
-                "no line of the {lines} line(s) on the replayed screen began with sk-ant-oat01-"
-            )
-        }
-        Reading::Ungapped { length } => format!(
-            "a line beginning sk-ant-oat01- was found ({length} token characters with its \
-             adjacent rows), but it ran straight into other text with no blank row \
-             between, where claude's token panel always leaves one — the reconstruction \
-             cannot be trusted end to end. Re-run the ceremony"
+        Reading::Absent { lines } => format!(
+            "no OAuth-token panel heading appeared in the {lines} line(s) on the replayed screen"
         ),
+        Reading::Ambiguous { reason } => {
+            format!("{reason}, so the credential boundary cannot be trusted. Re-run the ceremony")
+        }
     }
-}
-
-/// A row that could be the tail of a token split across rows: token characters and
-/// nothing else. Blank is excluded — a blank row is the gap that ENDS the token.
-fn is_token_run(line: &str) -> bool {
-    !line.is_empty() && line.chars().all(is_token_character)
-}
-
-fn is_token_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-}
-
-fn provider_token_shape(candidate: &str) -> bool {
-    candidate.starts_with(SETUP_TOKEN_PREFIX)
-        && candidate.len() > SETUP_TOKEN_PREFIX.len()
-        && candidate.chars().all(is_token_character)
 }
 
 /// The authorization URL visible on the replayed screen.
@@ -446,11 +372,16 @@ mod tests {
     /// an acceptance rule: the 2026-08-01 live ceremony produced 109 characters.
     const TOKEN: &str = "sk-ant-oat01-SYNTHETIC-FIXTURE-NOT-A-REAL-TOKEN-012345678901234567890123456789012345678901234567890123456789";
 
+    fn token_panel(token: &str) -> String {
+        format!(
+            "Your OAuth token (valid for 1 year):\r\n\r\n{token}\r\n\r\nStore this token securely.\r\n"
+        )
+    }
+
     #[test]
     fn the_fixture_is_provider_shaped_and_synthetic() {
         assert_eq!(TOKEN.chars().count(), 108);
         assert!(TOKEN.starts_with("sk-ant-oat01-"));
-        assert!(provider_token_shape(TOKEN));
         assert!(
             TOKEN.contains("SYNTHETIC"),
             "this fixture must stay provably fabricated: it lives in a public repo"
@@ -694,8 +625,8 @@ mod tests {
     }
 
     /// Issue #5 EXACTLY: 110 columns, token line 109 characters -- the 108-char token
-    /// plus one stale non-token cell at column 109. The token is extracted and the
-    /// stale cell is named, not silently eaten.
+    /// plus one stale cell at column 109. Capture keeps the entire structurally bounded
+    /// candidate; it must never truncate at a guessed alphabet boundary.
     #[test]
     fn issue_5_a_stale_cell_after_the_token_is_discarded_and_named() {
         let stale = format!("{}%", "#".repeat(108)); // 109 wide; column 109 holds '%'
@@ -709,32 +640,41 @@ mod tests {
             "fixture must reproduce the 109-char token line; lines {lines:?}"
         );
 
-        assert_eq!(
-            capture_setup_token(screen.as_bytes()).as_deref(),
-            Some(TOKEN),
-            "issue-5 geometry must capture; refusal was: {}",
-            refusal_reason(screen.as_bytes())
-        );
-        let note = capture_note(screen.as_bytes()).expect("the stale cell must be named");
-        assert!(note.contains("1 stale cell"), "{note}");
-        assert!(note.contains('%'), "{note}");
+        let captured = capture_setup_token(screen.as_bytes()).expect("bounded panel body");
+        assert_eq!(captured, format!("{TOKEN}%"));
+        assert!(!capture_note(screen.as_bytes()).is_some_and(|note| note.contains(&captured)));
     }
 
     /// Boundaries around the reported geometry: the stale tail makes the token line
     /// exactly the terminal width (so it rejoins as a full-width row), at 110 and 109
     /// columns, and one past the width (so one stale cell wraps to the next row and
-    /// the rejoin welds it back). All must extract the exact token.
+    /// the rejoin welds it back). All must retain the complete panel body.
     #[test]
     fn issue_5_boundaries_extract_the_exact_token() {
         for (width, stale_tail) in [(110usize, 2usize), (109, 1), (110, 3)] {
             let stale = format!("{}{}", "#".repeat(108), "%".repeat(stale_tail));
             let screen = issue_5_screen(width, &stale);
-            assert_eq!(
-                capture_setup_token(screen.as_bytes()).as_deref(),
-                Some(TOKEN),
-                "width {width}, stale tail {stale_tail}: {}",
-                refusal_reason(screen.as_bytes())
-            );
+            if stale_tail == 3 {
+                assert_eq!(capture_setup_token(screen.as_bytes()), None);
+                let reason = refusal_reason(screen.as_bytes());
+                assert!(
+                    reason.contains("footer without a blank separator"),
+                    "{reason}"
+                );
+                assert!(
+                    !reason.contains(TOKEN),
+                    "refusal leaked candidate: {reason}"
+                );
+            } else {
+                let captured = capture_setup_token(screen.as_bytes()).unwrap_or_else(|| {
+                    panic!(
+                        "width {width}, stale tail {stale_tail}: {}",
+                        refusal_reason(screen.as_bytes())
+                    )
+                });
+                assert!(captured.starts_with(TOKEN));
+                assert!(captured.ends_with(&"%".repeat(stale_tail)));
+            }
         }
     }
 
@@ -815,9 +755,9 @@ mod tests {
         assert_eq!(characters[7], 'o', "column 7 must sit inside sk-ant-oat");
 
         let mut tui = Tui::new(characters.len());
-        tui.render(&[&stale]);
+        tui.render(&["Your OAuth token (valid for 1 year):", "", &stale]);
         let before = tui.transcript().len();
-        tui.render(&[TOKEN]);
+        tui.render(&["Your OAuth token (valid for 1 year):", "", TOKEN]);
 
         assert!(
             !tui.transcript()[before..].contains("sk-ant-oat"),
@@ -832,13 +772,13 @@ mod tests {
     /// A shorter frame painted over a longer one WITHOUT clearing the tail: the
     /// leftover cells sit on the token's row and the rejoin welds them onto it. The
     /// welded tail here leaves the token alphabet immediately (`/` at the seam), so the
-    /// provider alphabet marks the boundary: the token is extracted, the debris is discarded, and
-    /// `capture_note` says so out loud. Issue #5 is this exact shape in the wild.
+    /// capture keeps the whole bounded panel body instead of guessing where a future
+    /// credential alphabet ends.
     #[test]
     fn an_uncleared_tail_outside_the_alphabet_is_discarded_legibly() {
         let width = 40;
         let previous: String = URL.chars().take(width).collect();
-        let mut screen = String::new();
+        let mut screen = "Your OAuth token (valid for 1 year):\r\n\r\n".to_owned();
         for chunk in TOKEN
             .chars()
             .collect::<Vec<_>>()
@@ -861,13 +801,10 @@ mod tests {
             "the fixture must actually weld a tail onto the token, got {rejoined:?}"
         );
 
-        assert_eq!(
-            capture_setup_token(screen.as_bytes()).as_deref(),
-            Some(TOKEN)
-        );
-        let note = capture_note(screen.as_bytes()).expect("discarded cells must be named");
-        assert!(note.contains("stale cell"), "{note}");
-        assert!(note.contains("discarded"), "{note}");
+        screen.push_str("\r\nStore this token securely.\r\n");
+        let captured = capture_setup_token(screen.as_bytes()).unwrap();
+        assert!(captured.starts_with(TOKEN));
+        assert!(captured.len() > TOKEN.len());
     }
 
     /// The two corruptions at once, stated rather than stumbled into: the wrap boundary
@@ -909,7 +846,7 @@ mod tests {
     /// Capture is provider-shape-based rather than tied to this fixture's length.
     #[test]
     fn captures_the_non_rotating_claude_setup_token() {
-        let plain = format!("browser output\n{TOKEN}\r\n");
+        let plain = token_panel(TOKEN);
         assert_eq!(
             capture_setup_token(plain.as_bytes()),
             Some(TOKEN.to_owned())
@@ -921,10 +858,10 @@ mod tests {
     /// call, not a locally remembered vendor length, decides whether it is genuine.
     #[test]
     fn provider_shape_does_not_assume_a_token_length() {
-        let short = b"sk-ant-oat01-example\r\n";
+        let short = token_panel("future:v2+example/credential");
         assert_eq!(
-            capture_setup_token(short).as_deref(),
-            Some("sk-ant-oat01-example")
+            capture_setup_token(short.as_bytes()).as_deref(),
+            Some("future:v2+example/credential")
         );
     }
 
@@ -934,8 +871,10 @@ mod tests {
     /// row the token is read from. This is the case that decided the `vte` dependency.
     #[test]
     fn a_hyperlink_payload_never_reaches_the_screen() {
-        let transcript =
-            format!("\x1b]8;id=7655xh;{URL}\x07visible text\x1b]8;;\x07\r\n{TOKEN}\r\n");
+        let transcript = format!(
+            "\x1b]8;id=7655xh;{URL}\x07visible text\x1b]8;;\x07\r\n{}",
+            token_panel(TOKEN)
+        );
         let lines = displayed_lines(transcript.as_bytes());
         assert_eq!(lines[0], "visible text");
         assert_eq!(
@@ -950,7 +889,7 @@ mod tests {
     #[test]
     fn an_invalid_byte_does_not_discard_the_rest_of_the_screen() {
         let mut transcript = vec![0xff, b'\r', b'\n'];
-        transcript.extend_from_slice(TOKEN.as_bytes());
+        transcript.extend_from_slice(token_panel(TOKEN).as_bytes());
         assert_eq!(capture_setup_token(&transcript), Some(TOKEN.to_owned()));
     }
 
@@ -1098,7 +1037,8 @@ mod tests {
             .collect();
 
         let mut tui = Tui::new(200);
-        tui.render(&[&stale]).render(&[TOKEN]);
+        tui.render(&["Your OAuth token (valid for 1 year):", "", &stale])
+            .render(&["Your OAuth token (valid for 1 year):", "", TOKEN]);
         let transcript = tui.transcript();
 
         let naive = strip_ansi_then_match(transcript).expect("the naive fix finds something");
@@ -1133,12 +1073,20 @@ mod tests {
     #[test]
     fn a_refusal_says_why_it_refused() {
         let empty = refusal_reason(b"nothing token-shaped here\r\n");
-        assert!(empty.contains("no line"), "{empty}");
-        assert!(empty.contains("sk-ant-oat"), "{empty}");
+        assert!(empty.contains("no OAuth-token panel"), "{empty}");
 
-        let welded = format!("{TOKEN}\r\n0123456789abcdef\r\nStore this token securely.\r\n");
+        let welded = format!(
+            "Your OAuth token (valid for 1 year):\r\n\r\n{TOKEN}\r\nStore this token securely.\r\n"
+        );
         let ambiguous = refusal_reason(welded.as_bytes());
-        assert!(ambiguous.contains("no blank row"), "{ambiguous}");
+        assert!(
+            ambiguous.contains("footer without a blank separator"),
+            "{ambiguous}"
+        );
+        assert!(
+            !ambiguous.contains(TOKEN),
+            "refusal leaked the candidate: {ambiguous}"
+        );
         assert!(ambiguous.contains("Re-run"), "{ambiguous}");
     }
 
@@ -1164,6 +1112,7 @@ mod tests {
                 screen.push_str("\r\r\n");
             }
             screen.push_str("\r\r\n");
+            screen.push_str("Your OAuth token (valid for 1 year):\r\r\n\r\r\n");
             for chunk in TOKEN.chars().collect::<Vec<_>>().chunks(content) {
                 screen.push_str(&chunk.iter().collect::<String>());
                 screen.push_str("\r\r\n");
@@ -1190,13 +1139,21 @@ mod tests {
     fn an_ambiguous_screen_refuses_rather_than_banking_something_token_shaped() {
         // Token characters continue past the token with no gap row: the reconstruction
         // cannot say where the credential ended, so it must not guess.
-        let welded = format!("{TOKEN}\r\n0123456789abcdef\r\nStore this token securely.\r\n");
+        let welded = format!(
+            "Your OAuth token (valid for 1 year):\r\n\r\n{TOKEN}\r\nStore this token securely.\r\n"
+        );
         assert_eq!(capture_setup_token(welded.as_bytes()), None);
 
         // And the operator is told which situation it was.
         let reason = refusal_reason(welded.as_bytes());
-        assert!(reason.contains("sk-ant-oat"), "{reason}");
-        assert!(reason.contains("no blank row"), "{reason}");
+        assert!(
+            reason.contains("footer without a blank separator"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(TOKEN),
+            "refusal leaked the candidate: {reason}"
+        );
         assert!(reason.contains("Re-run"), "{reason}");
     }
 }

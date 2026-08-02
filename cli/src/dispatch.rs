@@ -1021,46 +1021,54 @@ where
             identity,
             user_id,
             admin,
-        } => match crate::users::create_first_if_local(&user_id, admin)? {
-            crate::users::FirstUser::Created {
-                user_id,
-                is_admin,
-                created_at,
-            } => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "user": {
-                            "userId": user_id,
-                            "isAdmin": is_admin,
-                            "createdAt": created_at
-                        }
-                    }))
-                    .expect("JSON value serializes")
-                );
-                Ok(())
-            }
-            crate::users::FirstUser::Dispatch => {
-                let endpoint = discover_endpoint()?;
-                require_session_endpoint(&identity, &endpoint)?;
-                let request = request(
-                    &identity,
-                    "add-user",
-                    vec![],
-                    vec![
-                        string_field("userId", &user_id),
-                        format!("\"isAdmin\":{admin}"),
-                    ],
-                );
-                if let Some(result) = send_request(&endpoint, &request, None)? {
+        } => {
+            // Resolve the requested org before inspecting or mutating local state. An
+            // explicit remote endpoint must not get a user inserted into whichever
+            // empty state.db happens to exist on this machine.
+            let endpoint = discover_endpoint()?;
+            let first_user = first_user_for_target(add_user_target_is_local(&endpoint)?, || {
+                crate::users::create_first_if_local(&user_id, admin)
+            })?;
+            match first_user {
+                crate::users::FirstUser::Created {
+                    user_id,
+                    is_admin,
+                    created_at,
+                } => {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "user": {
+                                "userId": user_id,
+                                "isAdmin": is_admin,
+                                "createdAt": created_at
+                            }
+                        }))
+                        .expect("JSON value serializes")
                     );
+                    Ok(())
                 }
-                Ok(())
+                crate::users::FirstUser::Dispatch => {
+                    require_session_endpoint(&identity, &endpoint)?;
+                    let request = request(
+                        &identity,
+                        "add-user",
+                        vec![],
+                        vec![
+                            string_field("userId", &user_id),
+                            format!("\"isAdmin\":{admin}"),
+                        ],
+                    );
+                    if let Some(result) = send_request(&endpoint, &request, None)? {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                        );
+                    }
+                    Ok(())
+                }
             }
-        },
+        }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::Onboard {
@@ -1094,6 +1102,40 @@ where
             Ok(())
         }
     }
+}
+
+fn add_user_target_is_local(endpoint: &Endpoint) -> Result<bool, String> {
+    let provisioned = provisioned();
+    if !matches!(provisioned, Provisioned::GatewayHost) {
+        return Ok(false);
+    }
+    let local = discover_from(&crate::base_dir::resolve())?;
+    Ok(add_user_endpoint_matches_local(
+        endpoint,
+        &provisioned,
+        &local,
+    ))
+}
+
+fn first_user_for_target<F>(local: bool, create: F) -> Result<crate::users::FirstUser, String>
+where
+    F: FnOnce() -> Result<crate::users::FirstUser, String>,
+{
+    if local {
+        create()
+    } else {
+        Ok(crate::users::FirstUser::Dispatch)
+    }
+}
+
+fn add_user_endpoint_matches_local(
+    endpoint: &Endpoint,
+    provisioned: &Provisioned,
+    local: &Endpoint,
+) -> bool {
+    matches!(provisioned, Provisioned::GatewayHost)
+        && endpoint.session_file.is_none()
+        && endpoint.token == local.token
 }
 
 fn require_session_endpoint(identity: &Identity, endpoint: &Endpoint) -> Result<(), String> {
@@ -1189,6 +1231,42 @@ mod tests {
         assert_eq!(
             body(&["add-user", "guest", "--admin", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"add-user","params":{"userId":"guest","isAdmin":true}}"#
+        );
+    }
+
+    #[test]
+    fn an_explicit_remote_add_user_target_cannot_use_the_local_empty_org_exception() {
+        let local = Endpoint {
+            base: "http://127.0.0.1:11373".to_owned(),
+            token: "tbc_local".to_owned(),
+            session_file: None,
+        };
+        let remote = Endpoint {
+            base: "https://remote-gateway.test".to_owned(),
+            token: "tbc_remote".to_owned(),
+            session_file: None,
+        };
+
+        assert!(!add_user_endpoint_matches_local(
+            &remote,
+            &Provisioned::GatewayHost,
+            &local
+        ));
+        assert!(add_user_endpoint_matches_local(
+            &local,
+            &Provisioned::GatewayHost,
+            &local
+        ));
+        assert!(!add_user_endpoint_matches_local(
+            &remote,
+            &Provisioned::Satellite {
+                machine: Some("worker".to_owned())
+            },
+            &remote
+        ));
+        assert_eq!(
+            first_user_for_target(false, || panic!("remote target attempted local mutation")),
+            Ok(crate::users::FirstUser::Dispatch)
         );
     }
 
