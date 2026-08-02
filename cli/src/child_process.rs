@@ -1,7 +1,7 @@
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -124,24 +124,41 @@ pub(crate) fn terminate_process_group(
     Ok(())
 }
 
-/// A slot is not merely claimed or free — it is claimed, LISTENING, or done listening.
+/// ONE atomic per slot, holding the slot's whole state: free, listening, done, or the
+/// signal it caught.
 ///
-/// The third state is what makes an interrupt impossible to lose. Without it the only way
-/// to stop the handler recording into a slot is to free the slot, and a freed slot can be
-/// reclaimed by the next ceremony (or, in tests, a parallel one) before its former owner
-/// has read what was recorded. `FINISHED` stops the recording without releasing the
-/// identity, so the owner's last read cannot race a successor's first signal.
-const SLOT_FREE: u8 = 0;
-const SLOT_LISTENING: u8 = 1;
-const SLOT_FINISHED: u8 = 2;
+/// Two atomics could not express this no matter how they were ordered, and three rounds of
+/// review went into learning that. Recording a signal and being entitled to record it are
+/// the same decision, so they have to be the same instruction: a handler already executing
+/// on another thread can be descheduled between reading a separate "am I listening" flag
+/// and storing into a separate record, and teardown fits entirely inside that gap. With one
+/// atomic the handler's compare-exchange either happens before the owner's swap or after
+/// it, and there is no third possibility to reason about.
+///
+/// Negative values are states and positive values are signal numbers, which is safe
+/// because there is no signal 0 (`kill(pid, 0)` is the existence probe, never delivered).
+const SLOT_FREE: libc::c_int = 0;
+const SLOT_LISTENING: libc::c_int = -1;
+const SLOT_FINISHED: libc::c_int = -2;
 
 const SIGNAL_SLOT_COUNT: usize = 64;
 static ACTIVE_PROCESS_GROUPS: [AtomicI32; SIGNAL_SLOT_COUNT] =
     [const { AtomicI32::new(0) }; SIGNAL_SLOT_COUNT];
-static FORWARDED_SIGNALS: [AtomicI32; SIGNAL_SLOT_COUNT] =
-    [const { AtomicI32::new(0) }; SIGNAL_SLOT_COUNT];
-static SIGNAL_SLOT_STATES: [AtomicU8; SIGNAL_SLOT_COUNT] =
-    [const { AtomicU8::new(SLOT_FREE) }; SIGNAL_SLOT_COUNT];
+static SIGNAL_SLOTS: [AtomicI32; SIGNAL_SLOT_COUNT] =
+    [const { AtomicI32::new(SLOT_FREE) }; SIGNAL_SLOT_COUNT];
+
+/// The signals this process forwards, and what its disposition for each was BEFORE the
+/// first ceremony installed anything.
+///
+/// Kept lock-free and beside the `Mutex`-held copy on purpose: the orderly restore in
+/// `finish` can take a lock, and the handler cannot. A handler that must hand a signal
+/// back needs the prior disposition immediately and without allocating.
+const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+static PRIOR_DISPOSITIONS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+
+fn forwarded_index(signal: libc::c_int) -> Option<usize> {
+    FORWARDED.iter().position(|forwarded| *forwarded == signal)
+}
 
 struct HandlerState {
     users: usize,
@@ -153,17 +170,54 @@ static SIGNAL_HANDLER_STATE: Mutex<HandlerState> = Mutex::new(HandlerState {
     previous: Vec::new(),
 });
 
+/// Record the signal against every ceremony that can answer for it -- and if none can,
+/// give it back to the process rather than eating it.
+///
+/// The compare-exchange is the design. It succeeds only against `SLOT_LISTENING`, so a
+/// slot whose owner has already taken the record cannot be written to afterwards; the
+/// handler and the teardown cannot both believe they own this signal.
+///
+/// The hand-back is what makes that safe rather than merely tidy. A handler that consumed
+/// a signal it could not record used to be the end of the signal: not reported, not
+/// forwarded, not acted on. Restoring the disposition this process had before any ceremony
+/// existed and re-raising means the outcome set is exactly two -- some ceremony reports it,
+/// or it meets the disposition the operator's own process would have met. `signal` and
+/// `raise` are both on POSIX's async-signal-safe list. Note the restored disposition may be
+/// `SIG_IGN`, in which case the signal is ignored, which is precisely what would have
+/// happened without us; this deliberately does not force `SIG_DFL` and kill a process that
+/// was launched under an ignore.
 extern "C" fn forward_to_active_group(signal: libc::c_int) {
-    for (slot, active) in ACTIVE_PROCESS_GROUPS.iter().enumerate() {
-        if SIGNAL_SLOT_STATES[slot].load(Ordering::Relaxed) != SLOT_LISTENING {
+    let mut answered = false;
+
+    for (slot, state) in SIGNAL_SLOTS.iter().enumerate() {
+        let held = match state.compare_exchange(
+            SLOT_LISTENING,
+            signal,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => signal,
+            Err(current) => current,
+        };
+        // Positive means this slot now holds a signal -- either the one just recorded, or
+        // one an owner has yet to report. Either way somebody will account for it.
+        if held <= 0 {
             continue;
         }
-        FORWARDED_SIGNALS[slot].store(signal, Ordering::Relaxed);
-        let pgid = active.load(Ordering::Relaxed);
+        answered = true;
+
+        let pgid = ACTIVE_PROCESS_GROUPS[slot].load(Ordering::SeqCst);
         if pgid > 0 {
             unsafe {
                 libc::killpg(pgid, signal);
             }
+        }
+    }
+
+    if !answered && let Some(index) = forwarded_index(signal) {
+        unsafe {
+            libc::signal(signal, PRIOR_DISPOSITIONS[index].load(Ordering::SeqCst));
+            libc::raise(signal);
         }
     }
 }
@@ -185,20 +239,21 @@ impl SignalForwarding {
         let mut state = SIGNAL_HANDLER_STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = SIGNAL_SLOT_STATES
+        // Claiming the slot IS clearing it: one atomic cannot be published as listening
+        // and still hold a previous owner's signal, because the same store does both.
+        let slot = SIGNAL_SLOTS
             .iter()
             .position(|state| {
                 state
                     .compare_exchange(
                         SLOT_FREE,
                         SLOT_LISTENING,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
                     )
                     .is_ok()
             })
             .ok_or_else(|| io::Error::other("too many simultaneous child process groups"))?;
-        FORWARDED_SIGNALS[slot].store(0, Ordering::Relaxed);
 
         if state.users == 0 {
             let mut previous = Vec::new();
@@ -218,8 +273,13 @@ impl SignalForwarding {
                             libc::sigaction(*installed, prior, std::ptr::null_mut());
                         }
                     }
-                    SIGNAL_SLOT_STATES[slot].store(SLOT_FREE, Ordering::Relaxed);
+                    SIGNAL_SLOTS[slot].store(SLOT_FREE, Ordering::SeqCst);
                     return Err(error);
+                }
+                // The handler's copy, readable without a lock. Captured here because
+                // this is the only moment the pre-ceremony disposition is knowable.
+                if let Some(index) = forwarded_index(signal) {
+                    PRIOR_DISPOSITIONS[index].store(old.sa_sigaction, Ordering::SeqCst);
                 }
                 previous.push((signal, old));
             }
@@ -247,9 +307,9 @@ impl SignalForwarding {
     }
 
     pub(crate) fn caught(&self) -> Option<libc::c_int> {
-        match FORWARDED_SIGNALS[self.slot].load(Ordering::Relaxed) {
-            0 => None,
-            signal => Some(signal),
+        match SIGNAL_SLOTS[self.slot].load(Ordering::SeqCst) {
+            signal if signal > 0 => Some(signal),
+            _ => None,
         }
     }
 
@@ -261,16 +321,20 @@ impl SignalForwarding {
 impl SignalForwarding {
     /// Stop forwarding and report, as ONE step, everything that was ever recorded.
     ///
-    /// The order is the entire point, and it is the only order with no uncovered instant:
-    /// restore the process's own dispositions FIRST, then stop the slot listening, then
-    /// read. Restoring stops the handler swallowing signals at all; marking the slot
-    /// FINISHED stops it recording into a record nobody will read again. Do them the other
-    /// way round and the interval between them belongs to neither mechanism.
+    /// It is ONE instruction, and that is the entire point. Earlier versions tried to buy
+    /// the same guarantee by ordering two atomics -- FINISHED then read, or restore then
+    /// FINISHED then read -- and review picked over the order twice, correctly, because no
+    /// order can work. A handler already executing on another thread lives between whatever
+    /// two instructions are chosen, and teardown fits inside that gap.
     ///
-    /// So a signal either arrived while we were listening -- and is in the value returned
-    /// here -- or arrives after the restore, when it acts on this process normally and
-    /// terminates it. There is no third case, which is what a plain read-after-reap could
-    /// not say: that one left an interval where a signal was caught by a still-installed
+    /// So a signal is either in the value returned here, or the handler's exchange lost to
+    /// this swap and it hands the signal back to the process, where it meets the
+    /// disposition that was in place before any ceremony existed. There is no third case.
+    /// Note the second outcome is not necessarily death: the prior disposition can be
+    /// `SIG_IGN`, and then the signal is ignored -- which is exactly what would have
+    /// happened had this process never installed a handler at all.
+    ///
+    /// What that replaces: an interval where a signal was caught by a still-installed
     /// handler, recorded into a slot nobody would read again, and forwarded nowhere. The
     /// caller was then free to bank a credential the operator had interrupted -- the child
     /// had finished, but the ONBOARDING had not.
@@ -290,17 +354,26 @@ impl SignalForwarding {
         self.torn_down = true;
         self.disarm();
 
-        // Give the process its own dispositions back BEFORE this slot stops listening.
-        // That order is the whole correctness argument and it is easy to get backwards:
-        // between marking the slot FINISHED and restoring, a handler is still installed
-        // and still swallowing while the slot no longer records, so a signal in that gap
-        // is neither reported nor acted on -- and this gap would contain a mutex
-        // acquisition, so it is as long as lock contention makes it, not a few
-        // instructions. Restoring first leaves no such gap. While we are still LISTENING a
-        // signal is recorded, and the swap below collects it; once restored, a signal
-        // either reaches a sibling ceremony's slot or, if we were the last user, meets the
-        // process's own disposition and kills us. A live sibling keeps the handler
-        // installed by construction, because `users` and the restore share this mutex.
+        // ONE instruction ends the run: it stops the recording and takes the record
+        // together. Everything after it is bookkeeping.
+        //
+        // Two earlier versions of this tried to get the same guarantee by ordering two
+        // separate atomics, and the order was picked over twice by review -- correctly
+        // both times, because no order can work. A handler already running on another
+        // thread sits between whatever two instructions are chosen. Here it does not
+        // matter where the handler is: its compare-exchange either lands before this swap,
+        // in which case the signal is in the value returned, or after it, in which case
+        // the swap has already published FINISHED, the exchange fails, and the handler
+        // gives the signal back to the process instead of eating it.
+        //
+        // That is also why the disposition restore below no longer has to be ordered
+        // against this. A signal arriving between them finds no slot able to answer and
+        // takes its natural course.
+        let caught = match SIGNAL_SLOTS[self.slot].swap(SLOT_FINISHED, Ordering::SeqCst) {
+            signal if signal > 0 => Some(signal),
+            _ => None,
+        };
+
         {
             let mut state = SIGNAL_HANDLER_STATE
                 .lock()
@@ -316,12 +389,9 @@ impl SignalForwarding {
             }
         }
 
-        SIGNAL_SLOT_STATES[self.slot].store(SLOT_FINISHED, Ordering::Relaxed);
-        let caught = match FORWARDED_SIGNALS[self.slot].swap(0, Ordering::Relaxed) {
-            0 => None,
-            signal => Some(signal),
-        };
-        SIGNAL_SLOT_STATES[self.slot].store(SLOT_FREE, Ordering::Relaxed);
+        // Released only now. FINISHED held the identity across the read so no successor
+        // could claim the slot while its record was still being taken.
+        SIGNAL_SLOTS[self.slot].store(SLOT_FREE, Ordering::SeqCst);
         caught
     }
 }
@@ -873,7 +943,7 @@ mod tests {
     /// Why that is the whole of it: after `finish` returns, this slot records nothing more
     /// under our identity, and the process's own dispositions are back, so a later signal
     /// terminates us instead of being swallowed. Recorded-and-reported, or fatal. There is
-    /// no third outcome left for one to fall into.
+    /// Teardown reports what it recorded, releases the slot, and cannot reach back into it.
     #[test]
     fn finishing_forwarding_reports_what_it_recorded_and_then_records_nothing() {
         if !alone("finishing_forwarding_reports_what_it_recorded_and_then_records_nothing") {
@@ -883,38 +953,42 @@ mod tests {
         let mut forwarding = SignalForwarding::install().unwrap();
         let slot = forwarding.slot;
 
-        FORWARDED_SIGNALS[slot].store(libc::SIGTERM, Ordering::Relaxed);
+        SIGNAL_SLOTS[slot].store(libc::SIGTERM, Ordering::SeqCst);
         assert_eq!(
             forwarding.finish(),
             Some(libc::SIGTERM),
             "teardown dropped a signal that was recorded while it was listening"
         );
         assert_eq!(
-            SIGNAL_SLOT_STATES[slot].load(Ordering::Relaxed),
+            SIGNAL_SLOTS[slot].load(Ordering::SeqCst),
             SLOT_FREE,
             "a finished slot must be released for reuse"
         );
 
-        // The handler can no longer attribute anything to the owner that just left.
-        forward_to_active_group(libc::SIGTERM);
-        assert_eq!(
-            FORWARDED_SIGNALS[slot].load(Ordering::Relaxed),
-            0,
-            "a released slot recorded a signal for its former owner"
-        );
-
-        // Run twice on purpose: `Drop` calls this after `settle` already has. The claim is
-        // that a second pass must not disturb whoever holds the slot NOW, so the successor
-        // has to exist for the assertion to mean anything -- an earlier version of this
-        // test asserted only the return value and passed with or without the guard, which
-        // is the shape of a test that looks like proof and is not.
+        // Claiming a slot must clear it -- the round 3 defect, where the record was
+        // cleared AFTER the slot was published as listening. Stated plainly: with one
+        // atomic this assertion CANNOT fail, because the claim and the clear are the same
+        // store. It is here as a guard against a future refactor splitting them apart
+        // again, not as a test of the current logic, and it should be read that way rather
+        // than counted as evidence the current code was checked.
         let successor = SignalForwarding::install().unwrap();
         assert_eq!(
             successor.slot, slot,
             "the released slot must be the one reissued, or this proves nothing"
         );
-        FORWARDED_SIGNALS[successor.slot].store(libc::SIGINT, Ordering::Relaxed);
+        assert_eq!(
+            successor.caught(),
+            None,
+            "a claimed slot still held its predecessor's signal"
+        );
 
+        // The handler now answers for the successor, and only the successor.
+        forward_to_active_group(libc::SIGINT);
+        assert_eq!(successor.caught(), Some(libc::SIGINT));
+
+        // Run the departed owner's teardown again: `Drop` does exactly this after `settle`
+        // already has. The claim is that it must not disturb whoever holds the slot NOW,
+        // so the successor has to exist for the assertion to mean anything.
         assert_eq!(
             forwarding.finish(),
             None,
@@ -925,10 +999,54 @@ mod tests {
             Some(libc::SIGINT),
             "a stale teardown wiped the record of the ceremony now holding its slot"
         );
+    }
+
+    static HANDED_BACK: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn record_hand_back(signal: libc::c_int) {
+        HANDED_BACK.store(signal, Ordering::SeqCst);
+    }
+
+    /// A signal no ceremony can answer for is handed back, not eaten.
+    ///
+    /// This is the half of the design that makes the compare-exchange safe rather than
+    /// merely narrow. When a handler already executing on another thread loses the race to
+    /// teardown, its exchange fails and it holds a signal it cannot record. Before the hand
+    /// back that was the end of it: not reported, not forwarded, not acted on -- the
+    /// operator's interrupt ceased to exist and onboarding banked the credential it was
+    /// meant to stop.
+    ///
+    /// No barrier is needed to observe it. The state an in-flight handler LOSES the race
+    /// into is just "the slot no longer answers", which teardown reaches on its own, so the
+    /// property is reachable deterministically by finishing first and calling the handler
+    /// after. The prior disposition is set to a recording handler because the real one is
+    /// `SIG_DFL`, and a correct hand-back would then kill the test -- which is the point,
+    /// and unobservable.
+    #[test]
+    fn a_signal_no_ceremony_can_answer_for_is_handed_back_not_eaten() {
+        if !alone("a_signal_no_ceremony_can_answer_for_is_handed_back_not_eaten") {
+            return;
+        }
+
+        HANDED_BACK.store(0, Ordering::SeqCst);
+        let mut prior: libc::sigaction = unsafe { std::mem::zeroed() };
+        prior.sa_sigaction = record_hand_back as *const () as usize;
+        unsafe {
+            libc::sigemptyset(&mut prior.sa_mask);
+            libc::sigaction(libc::SIGTERM, &prior, std::ptr::null_mut());
+        }
+
+        let mut forwarding = SignalForwarding::install().unwrap();
+        // The ceremony is over. This is exactly the state a descheduled handler wakes up
+        // into when teardown got there first.
+        forwarding.finish();
+
+        forward_to_active_group(libc::SIGTERM);
+
         assert_eq!(
-            SIGNAL_SLOT_STATES[slot].load(Ordering::Relaxed),
-            SLOT_LISTENING,
-            "a stale teardown took the successor's slot out of listening"
+            HANDED_BACK.load(Ordering::SeqCst),
+            libc::SIGTERM,
+            "a signal no slot could answer for was swallowed instead of handed back"
         );
     }
 

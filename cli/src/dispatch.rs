@@ -2148,6 +2148,14 @@ mod tests {
         ));
     }
 
+    /// Serialises the tests that mutate `TIGHTBEAM_MACHINE`.
+    ///
+    /// The environment is process-global and cargo runs tests in threads, so two tests
+    /// setting and restoring the same variable interleave: one restores while the other is
+    /// mid-run, and the loser reads a value it never set. Neither test is wrong on its own,
+    /// which is why this failed only under parallelism and only sometimes.
+    static MACHINE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn onboarding_discovers_once_and_keeps_every_phase_on_that_endpoint() {
         use std::cell::{Cell, RefCell};
@@ -2165,6 +2173,9 @@ mod tests {
         // real ceremony would have produced and lets the phases run. Do not delete this as
         // setup noise -- without it the run cancels and never reaches `finish`.
         fs::write(staging.join("auth.json"), br#"{"tokens":{}}"#).unwrap();
+        let _env = MACHINE_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior_machine = std::env::var_os("TIGHTBEAM_MACHINE");
         unsafe {
             std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
@@ -2272,6 +2283,9 @@ mod tests {
         let _ = fs::remove_dir_all(&staging);
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("auth.json"), br#"{"tokens":{}}"#).unwrap();
+        let _env = MACHINE_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior_machine = std::env::var_os("TIGHTBEAM_MACHINE");
         unsafe {
             std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
