@@ -265,6 +265,11 @@ where
         identity, provider, "cancel", kind, machine, lease_id, classified,
     );
     match send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline)) {
+        // Matching on a SENTENCE, which makes `dispatch::ceremony_expired`'s wording part
+        // of this behaviour rather than part of its presentation. If that string is ever
+        // improved, this arm stops matching and the fall-through below drops the cancel
+        // failure from the operator's message without failing anything. Both ends are
+        // commented; neither is enforced.
         Err(cancel_reason) if cancel_reason.contains("onboarding lease expired") => {
             format!("{reason}; {cancel_reason}")
         }
@@ -767,14 +772,14 @@ fn bank_openai_api_key(staging: &str, key: &str, ceremony: &Ceremony<'_>) -> Res
 /// a live call because for openai the credential is codex's to write and ours only to hand
 /// on -- so the question here is not "does this credential work" but "is there one".
 ///
-/// The name is not ours to choose. `Tightbeam.Credentials.staged_path(:openai, path)`
-/// (credentials.ex:796) reads exactly this path out of the staging directory when it
-/// installs, so checking anything else would be a second opinion about the same fact.
-fn codex_staged_a_credential(
-    status: ExitStatus,
-    staging: &str,
-    what: &str,
-) -> Result<(), String> {
+/// The filename is DUPLICATED, not shared, and that is worth knowing before someone
+/// changes it. The gateway installs from `auth.json` in the staging directory by writing
+/// that literal out twice -- credentials.ex:734 for a local install and :796, reached from
+/// :762, for an ssh one -- and neither is reachable from here: `staged_path/2` is `defp`.
+/// So this is a third copy of a name three places already hardcode, and the only thing
+/// keeping them honest is that they agree. Making it one fact is a real change with its
+/// own review, not a comment.
+fn codex_staged_a_credential(status: ExitStatus, staging: &str, what: &str) -> Result<(), String> {
     if !status.success() {
         return Err(format!("{what} failed: {status}"));
     }
@@ -783,9 +788,7 @@ fn codex_staged_a_credential(
     let staged = match fs::metadata(&path) {
         Ok(metadata) if metadata.len() > 0 => return Ok(()),
         Ok(_) => "left an empty credential file".to_owned(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            "wrote no credential".to_owned()
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "wrote no credential".to_owned(),
         Err(error) => format!("left a credential this host cannot read ({error})"),
     };
 
@@ -2550,9 +2553,15 @@ mod tests {
             codex_staged_a_credential(exited_zero, &staging_path, "OpenAI device-code onboarding")
                 .unwrap_err();
         assert!(error.contains("wrote no credential"), "{error}");
-        assert!(error.contains("cancelled"), "the likely cause is unnamed: {error}");
+        assert!(
+            error.contains("cancelled"),
+            "the likely cause is unnamed: {error}"
+        );
         assert!(error.contains("Nothing was banked"), "{error}");
-        assert!(error.contains("auth.json"), "the path looked for is unnamed: {error}");
+        assert!(
+            error.contains("auth.json"),
+            "the path looked for is unnamed: {error}"
+        );
 
         // An empty file is not a credential either, and says which of the two it was.
         fs::write(staging.join("auth.json"), b"").unwrap();

@@ -965,6 +965,18 @@ pub(crate) fn gateway_request(
         .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
 }
 
+/// LOAD-BEARING WORDING. This sentence is control flow, not just prose.
+///
+/// `ceremonies::cancel_after_begin` matches `contains("onboarding lease expired")` on
+/// whatever a failed cancel dispatch returns, and this is the only thing that produces
+/// that substring on that route. Reword it and the guard stops matching, falls through to
+/// its `_` arm, and the cancel failure silently vanishes from the operator's message. No
+/// test covers the transition, so nothing goes red.
+///
+/// The phrase is doing the job of an error code while looking like an error message, in
+/// three modules at once — `child_process` and `harnesses` produce sentences containing it
+/// too, though neither reaches this guard. Eleven other sites assert on it. Making it a
+/// real variant is a change worth doing and is not this branch's to make.
 fn ceremony_expired() -> String {
     "gateway request refused because the onboarding lease expired".to_owned()
 }

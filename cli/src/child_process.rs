@@ -727,6 +727,12 @@ mod tests {
     ///
     /// The driver returns before the child does, which is what makes the reap slow enough
     /// to aim at: a already-exited child is reaped instantly and there is no window to hit.
+    ///
+    /// The child outlives the shot by a wide margin ON PURPOSE. If the signal lands after
+    /// the child has already exited, this test passes for the wrong reason -- a false PASS,
+    /// not a flake, which is the worse failure because it is silent. eezo runs near load 44
+    /// with parallel lanes going, so a scheduler delay of a second is ordinary; five seconds
+    /// of headroom in a test that already re-execs in isolation costs nothing worth having.
     #[test]
     fn a_term_arriving_during_the_reap_is_not_reported_as_success() {
         if !alone("a_term_arriving_during_the_reap_is_not_reported_as_success") {
@@ -735,7 +741,7 @@ mod tests {
 
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "sleep 1"])
+            .args(["-c", "sleep 5"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -746,8 +752,8 @@ mod tests {
             Instant::now() + Duration::from_secs(10),
             |_supervised| {
                 // Fired from a thread because the driver has to RETURN for the reap to
-                // start; 250ms into a child that lives a full second lands squarely
-                // inside `wait`, with most of a second of margin on either side.
+                // start; 250ms into a child that lives five seconds lands inside `wait`
+                // with margin no plausible scheduler delay on a loaded box eats.
                 thread::spawn(|| {
                     thread::sleep(Duration::from_millis(250));
                     forward_to_active_group(libc::SIGTERM);

@@ -231,6 +231,12 @@ const PREFACE: &str = "\r\nWaiting for claude to produce an authorization URL. W
      a few seconds.\r\n";
 
 /// Named in the lease-expiry message so a silent wait ends with something to DO.
+///
+/// Both this and `PREFACE` name `claude` outright, inside a module that is otherwise
+/// generic over `what`. That is deliberate, not an oversight: the pty leg is anthropic's
+/// alone. Its credential travels over the child's own output, which is what forces the
+/// capture-and-do-not-mirror shape here; codex writes to CODEX_HOME instead and keeps its
+/// mirror. A second caller would need its own operator wording, not a generic one.
 pub(crate) const MANUAL_FALLBACK: &str = "claude setup-token";
 
 fn announcement(url: &str) -> String {
@@ -247,7 +253,16 @@ fn announcement(url: &str) -> String {
 /// claude may be sitting on a prompt. The deadline error says what happened; this says what
 /// to DO about it, and is APPENDED to that error rather than replacing it -- the lease
 /// wording is what callers and tests recognise an expiry by, and an operator-friendly
-/// rewrite that quietly changes an error's identity is a different bug.
+/// rewrite that quietly changes an error's identity is a different bug. (`ceremonies.rs`
+/// branches on that substring in production, not just in tests.)
+///
+/// This is appended HERE and deliberately not on the `write_all` expiry path, which
+/// returns the lease error bare. The two are different failures: this one means the child
+/// went quiet and may be sitting on a prompt we are not showing, while that one means our
+/// own terminal would not accept bytes -- not a hidden prompt, and not fixed by running
+/// the command by hand. Making the wording uniform would mean printing a plausible wrong
+/// diagnosis for the sake of consistency, which is the same defect as an error blaming
+/// device authorization for an operator's ctrl-c.
 fn expiry_advice() -> String {
     format!(
         "Because the harness's output is deliberately not shown, it may have been waiting \
