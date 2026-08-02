@@ -44,6 +44,36 @@ defmodule Tightbeam.IdentityTest do
     assert snapshot.skills == %{}
     assert snapshot.guidance =~ "tightbeam learn <bundle>"
     refute snapshot.guidance =~ "role-v1"
+
+    assert Identity.available_bundles() == [
+             %{
+               name: "agentic-engineering",
+               purpose:
+                 "Give your organization a disciplined way to turn product ideas and bug reports into shipped software, with tracked work, independent review, and verification.",
+               root_archetype: "product-owner"
+             }
+           ]
+  end
+
+  test "a shipped bundle manifest without purpose is refused when bundles are read", ctx do
+    File.write!(Path.join(ctx.source, "manifest.toml"), ~s(root_archetype = "product-owner"\n))
+
+    assert_raise KeyError, ~r/key "purpose" not found/, fn ->
+      Identity.available_bundles()
+    end
+  end
+
+  test "a scaffold manifest without purpose is refused before identity mutation", ctx do
+    assert_raise KeyError, ~r/key "purpose" not found/, fn ->
+      Identity.scaffold!(
+        ctx.base,
+        "demo",
+        [{"kungfu/demo/manifest.toml", ~s(root_archetype = "demo-role"\n)}],
+        "operator"
+      )
+    end
+
+    refute File.exists?(Path.join(ctx.base, "identity/.git"))
   end
 
   test "explicit learn installs the shipped bundle and committed receipt", ctx do
@@ -484,6 +514,34 @@ defmodule Tightbeam.IdentityTest do
     refute File.exists?(receipt_path)
   end
 
+  test "unlearn restores the pre-learn identity tree without empty directories", ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    before = identity_tree(dir)
+
+    assert {:ok, _revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
+    assert Identity.unlearn!(ctx.base, "agentic-engineering", "operator")
+
+    assert identity_tree(dir) == before
+  end
+
+  test "unlearn keeps a bundle-created directory populated by the org", ctx do
+    guard_base = Path.join(ctx.root, "guard")
+    guard_dir = Path.join(guard_base, "identity")
+    org_relative = "skills/role-skill/org.md"
+    org_path = Path.join(guard_dir, org_relative)
+
+    Identity.init!(guard_base)
+    assert {:ok, _revision} = Identity.learn!(guard_base, "agentic-engineering", "operator")
+    File.write!(org_path, "org-authored")
+    git!(guard_dir, ["add", "--", org_relative])
+    git!(guard_dir, ["commit", "-m", "identity: add org file"], "operator")
+
+    assert Identity.unlearn!(guard_base, "agentic-engineering", "operator")
+    assert File.read!(org_path) == "org-authored"
+    assert File.dir?(Path.dirname(org_path))
+  end
+
   test "unlearn tolerates a receipted path that is already absent", ctx do
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
@@ -720,6 +778,29 @@ defmodule Tightbeam.IdentityTest do
     |> Path.wildcard(match_dot: true)
     |> Enum.filter(&File.regular?/1)
     |> Enum.map(&{Path.relative_to(&1, path), File.read!(&1)})
+  end
+
+  defp identity_tree(root), do: identity_tree(root, "")
+
+  defp identity_tree(root, relative) do
+    root
+    |> Path.join(relative)
+    |> File.ls!()
+    |> Enum.sort()
+    |> Enum.flat_map(fn entry ->
+      if relative == "" and entry == ".git" do
+        []
+      else
+        child_relative = if relative == "", do: entry, else: Path.join(relative, entry)
+        child = Path.join(root, child_relative)
+
+        if File.dir?(child) do
+          [{child_relative, :directory} | identity_tree(root, child_relative)]
+        else
+          [{child_relative, {:file, File.read!(child)}}]
+        end
+      end
+    end)
   end
 
   defp git!(dir, args, author \\ nil) do

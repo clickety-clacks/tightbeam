@@ -347,12 +347,22 @@ defmodule Tightbeam.Gateway do
       ]
   end
 
-  @doc "Refuse an unusable harness or identity before the production store is created."
+  @doc "Check harness and identity readiness before the production store is created."
+  @spec preflight(config()) :: :ok | {:error, {:no_harness_cli, String.t()}}
+  def preflight(config) do
+    with :ok <- harness_binary_readiness(Path.join(config.base_dir, "bin")) do
+      Identity.init!(config.base_dir)
+      :ok
+    end
+  end
+
+  @doc "Raise for every preflight refusal; used by callers that require bang semantics."
   @spec preflight!(config()) :: :ok
   def preflight!(config) do
-    assert_harness_binary_ready!(Path.join(config.base_dir, "bin"))
-    Identity.init!(config.base_dir)
-    :ok
+    case preflight(config) do
+      :ok -> :ok
+      {:error, {:no_harness_cli, message}} -> raise message
+    end
   end
 
   defp credential_children(config, db) do
@@ -489,25 +499,38 @@ defmodule Tightbeam.Gateway do
     end)
   end
 
-  defp assert_harness_binary_ready!(cli_bin) do
+  defp harness_binary_readiness(cli_bin) do
     results =
       Enum.map(Harness.all(), fn module ->
         {module.id(), Placement.harness_binary_probe(module.id(), cli_bin)}
       end)
 
-    unless Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) do
-      detail =
-        Enum.map_join(results, "; ", fn {harness, result} ->
-          reason =
-            case result do
-              {:error, :not_found} -> "not found"
-              {:error, {:exec_failed, exec_detail}} -> "exec failed: #{exec_detail}"
-            end
+    cond do
+      Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) ->
+        :ok
 
-          "#{harness}: #{reason}"
-        end)
+      Enum.all?(results, fn {_harness, result} -> result == {:error, :not_found} end) ->
+        binaries = Enum.map_join(Harness.all(), " or ", &"`#{&1.cli_binary()}`")
 
-      raise "no usable harness CLI is installed (#{detail}). Install a registered harness CLI and ensure it is on PATH."
+        {:error,
+         {:no_harness_cli,
+          "Tight Beam cannot start because no registered harness CLI is installed. " <>
+            "That is expected on a fresh machine. Install #{binaries}, ensure it is on PATH, " <>
+            "then start Tight Beam again. Run `tightbeam doctor` to check this machine."}}
+
+      true ->
+        detail =
+          Enum.map_join(results, "; ", fn {harness, result} ->
+            reason =
+              case result do
+                {:error, :not_found} -> "not found"
+                {:error, {:exec_failed, exec_detail}} -> "exec failed: #{exec_detail}"
+              end
+
+            "#{harness}: #{reason}"
+          end)
+
+        raise "no usable harness CLI is installed (#{detail}). Install a registered harness CLI and ensure it is on PATH."
     end
   end
 
@@ -707,6 +730,7 @@ defmodule Tightbeam.Gateway do
       "learn" => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
       "unlearn" =>
         admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
+      "kungfu-list" => fn _call -> %{bundles: Identity.available_bundles()} end,
       "identity-apply" =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
       "kungfu-scaffold" =>
@@ -715,6 +739,7 @@ defmodule Tightbeam.Gateway do
             Archetypes.scaffold_kungfu!(
               config.base_dir,
               call.params.name,
+              call.params.purpose,
               call.origin
             )
 
@@ -3037,7 +3062,7 @@ defmodule Tightbeam.Gateway do
     # Placement resolved the host FIRST, so the ref is judged against the account
     # that will actually run the turn (#88) — not the gateway's.
     with :ok <- validate_credential(config, harness_string, host),
-         :ok <- validate_catalog_model(host, harness_string, model, is_nil(p[:model])),
+         :ok <- validate_catalog_model(config, host, harness_string, model, is_nil(p[:model])),
          :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
       input = %{
         display_name: p.display_name,
@@ -3184,7 +3209,13 @@ defmodule Tightbeam.Gateway do
 
             with :ok <- validate_credential(config, harness, session.host),
                  :ok <-
-                   validate_catalog_model(session.host, harness, model, is_nil(p[:model])),
+                   validate_catalog_model(
+                     config,
+                     session.host,
+                     harness,
+                     model,
+                     is_nil(p[:model])
+                   ),
                  :ok <-
                    Spinup.ensure_ready(
                      config,
@@ -3427,7 +3458,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp apply_model_change(config, db, _call, session, new_ref) do
-    with :ok <- validate_catalog_model(session.host, session.harness, new_ref, false),
+    with :ok <- validate_catalog_model(config, session.host, session.harness, new_ref, false),
          {%{provider: provider}, _health} <-
            ModelCatalog.entry(session.host, session.harness, new_ref, ModelCatalog) do
       result =
@@ -3573,7 +3604,7 @@ defmodule Tightbeam.Gateway do
   # repair ON THAT HOST. The catalog belongs to the account that will run the
   # turn, so sending an operator to the gateway to fix a satellite's grant — as
   # this did before per-host catalogs — sent them to the wrong machine.
-  defp validate_catalog_model(host, harness, model, configured_default?) do
+  defp validate_catalog_model(config, host, harness, model, configured_default?) do
     case is_binary(model) && ModelCatalog.member?(host, harness, model) do
       %{present?: true, health: :fresh} ->
         :ok
@@ -3593,15 +3624,22 @@ defmodule Tightbeam.Gateway do
         warn_dead_default(host, harness, model, configured_default?)
         provider = Harness.parse!(harness).credential_provider()
 
+        message =
+          if reason == :missing do
+            "cannot validate model #{inspect(model)} for #{harness} on host #{host}: " <>
+              missing_credential_message(config, provider, harness, host)
+          else
+            "cannot validate model #{inspect(model)} for #{harness} on host #{host}: no " <>
+              "#{harness} model catalog there, because #{provider} has no usable credential " <>
+              "on #{host} (#{inspect(reason)}). A catalog is derived on the host that runs " <>
+              "the turn, so this is #{host}'s grant to fix; run tightbeam onboard " <>
+              "#{provider} on #{host}"
+          end
+
         {:error,
          %{
            code: "catalog_unavailable",
-           message:
-             "cannot validate model #{inspect(model)} for #{harness} on host #{host}: no " <>
-               "#{harness} model catalog there, because #{provider} has no usable credential " <>
-               "on #{host} (#{inspect(reason)}). A catalog is derived on the host that runs " <>
-               "the turn, so this is #{host}'s grant to fix; run tightbeam onboard " <>
-               "#{provider} on #{host}"
+           message: message
          }}
 
       # The codex models endpoint filters by the caller's client_version and says
@@ -3660,14 +3698,34 @@ defmodule Tightbeam.Gateway do
         :ok
 
       {:needs_onboarding, reason} ->
+        message =
+          if reason == :missing do
+            missing_credential_message(config, provider, harness, machine)
+          else
+            "#{harness} on #{machine} needs onboarding: " <>
+              "#{inspect(reason)}; run tightbeam onboard #{provider} on #{machine}"
+          end
+
         {:error,
          %{
            code: "needs_onboarding",
-           message:
-             "#{harness} on #{machine} needs onboarding: " <>
-               "#{inspect(reason)}; run tightbeam onboard #{provider} on #{machine}"
+           message: message
          }}
     end
+  end
+
+  defp missing_credential_message(config, provider, harness, machine) do
+    auth_dir =
+      config.base_dir
+      |> Placement.hosts(gateway_db(config))
+      |> Map.fetch!(machine)
+      |> Map.fetch!(:base_dir)
+      |> Path.join("auth")
+
+    "Tightbeam has no credential for #{provider} on #{machine}. It does not use or " <>
+      "import your normal #{harness} CLI login; Tightbeam keeps its own credential " <>
+      "under #{auth_dir}. Run on #{machine}: tightbeam onboard #{provider} " <>
+      "--as-user <userId>"
   end
 
   defp credential_status(%{credential_status: status}, provider, _machine)

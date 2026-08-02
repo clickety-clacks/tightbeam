@@ -21,6 +21,21 @@ defmodule Tightbeam.HarnessSeamTest do
     assert get_in(config, [:tightbeam, :default_harness]) == :fixture
   end
 
+  test "the shipped offline registry is the production registry projection" do
+    rows =
+      Application.app_dir(:tightbeam, "priv/harness_registry.json")
+      |> File.read!()
+      |> JSON.decode!()
+
+    modules = Enum.map(rows, &(&1["module"] |> String.split(".") |> Module.concat()))
+    assert modules == Enum.reject(Harness.all(), &(&1 == Harness.Fixture))
+
+    Enum.zip(rows, modules)
+    |> Enum.each(fn {row, module} ->
+      assert Map.delete(row, "module") == JSON.decode!(module.wire_projection())
+    end)
+  end
+
   test "fixture fetches a catalog and reconciles its home through the shared seam" do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-fixture-seam-#{System.unique_integer([:positive])}")

@@ -21,15 +21,11 @@ The arc (adapt freely to the conversation):
    curiosity are all valid paths. Record it in user.md in their own words.
 3. FIRST WIN, immediately if possible: do one real thing for them now that serves the
    goal they just named — answer a hard question, narrate their org (`tightbeam
-   list`), file their first work item, or spawn a product owner for the thing they
-   care about. Value before any optional setup.
+   list`), or file their first work item. Value before any optional setup.
 4. ESSENTIAL SETUP, only where needed: if you are running, the org already meets
-   minimum viability. Run `tightbeam list` and read its model catalog — the models
-   this org can use right now, listed per harness, derived live from each harness's
-   signed-in account. Degradation worth fixing NOW: a harness listing NO models (its
-   sign-in is dead — agents on that harness cannot run); a default model that does
-   not appear in the catalog; a missing advertised URL (clients cannot connect).
-   Offer to fix each — one at a time, doing it for them.
+   minimum viability. Run `tightbeam list` and use only the fields it actually
+   returns; do not turn an absent field into a setup verdict. Offer to fix each
+   observed problem — one at a time, doing it for them.
 5. CAPABILITIES AS QUESTIONS, not features: e.g. machines — "tightbeam can run agents
    across several machines; do you have others you'd want it using?" If yes: add them
    to network-map.md, explain ssh in layman's terms (one machine securely letting
@@ -38,14 +34,21 @@ The arc (adapt freely to the conversation):
    leave it be.
 5b. KUNGFU, at the right moment only. Two moments qualify: during onboarding, when
    the goal they named maps to something in the org's library; or later, when the
-   repeated-default-sessions signal fires (see the kernel). The pitch, conversational:
+   live org has two or more user-created default sessions alive at once (origin
+   `user:*`, archetype default). Do not lead with it on first contact or nag. The pitch,
+   conversational:
    kungfu (功夫, gōngfu) literally means skill earned through time and practice —
    mastery as cultivated discipline, nothing to do with fighting. Here a kungfu is
    exactly that: a practiced way-of-working an org adopts — guidance, skills, and
-   rules bundled so agents work in a discipline instead of improvising. Offer to show
-   what this org's library has (`tightbeam skill list`) and to set one up for them —
-   today that means electing from the library into the archetypes they use; say so
-   plainly. Record the outcome (adopted/declined/deferred) in user.md's Onboarding.
+   rules bundled so agents work in a discipline instead of improvising. Read the
+   installed bundle library and its declared root archetypes before making an offer.
+   Record the outcome (adopted/declined/deferred) in user.md's Onboarding.
+
+## AFTER LEARNING A KUNGFU
+
+Only after the user has learned a kungfu may a first win include spawning one of that
+bundle's installed archetypes. Before learning, never prescribe or imitate an archetype
+that exists only inside a bundle.
 
 6. RECORD as you go — user.md is the artifact of this conversation (template below):
    create `${TIGHTBEAM_HOME:-$HOME/.tightbeam}/state/users/<userId>/user.md` on first contact, fill it as answers arrive, mark

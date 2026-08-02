@@ -580,6 +580,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("name", name)],
         )),
+        Command::KungfuList { identity } => Ok(request(identity, "kungfu-list", vec![], vec![])),
         Command::IdentityApply {
             identity,
             session_key,
@@ -1087,6 +1088,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityRepoint { identity, .. }
         | Command::Learn { identity, .. }
         | Command::Unlearn { identity, .. }
+        | Command::KungfuList { identity }
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
         | Command::ConfigGet { identity, .. }
@@ -1580,6 +1582,10 @@ mod tests {
                     "flynn",
                 ][..],
                 r#"{"asUser":"flynn","verb":"identity-repoint","sessionKey":"agent:retired","params":{"archetype":"default"}}"#,
+            ),
+            (
+                &["kungfu", "list", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"kungfu-list","params":{}}"#,
             ),
             (
                 &["learn", "agentic-engineering", "--as-user", "flynn"][..],

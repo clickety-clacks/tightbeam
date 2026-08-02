@@ -24,21 +24,27 @@ defmodule Tightbeam.Application do
   def start(_type, _args) do
     if Application.get_env(:tightbeam, :autostart, true) do
       config = production_config()
-      Tightbeam.Gateway.preflight!(config)
 
-      with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
-        Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
-          {:ok, _pid} = Supervisor.start_child(supervisor, child)
-        end)
+      case Tightbeam.Gateway.preflight(config) do
+        :ok ->
+          with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
+            Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
+              {:ok, _pid} = Supervisor.start_child(supervisor, child)
+            end)
 
-        # LAST, deliberately: Bandit's "Running ... (http)" has already been
-        # logged by now, and that line reads as a verdict. On an org that cannot
-        # run a single turn it was the wrong one, so the real verdict goes after
-        # it. Assembled from what boot already knows; it starts nothing and
-        # cannot fail the boot.
-        report_readiness(config)
+            # LAST, deliberately: Bandit's "Running ... (http)" has already been
+            # logged by now, and that line reads as a verdict. On an org that cannot
+            # run a single turn it was the wrong one, so the real verdict goes after
+            # it. Assembled from what boot already knows; it starts nothing and
+            # cannot fail the boot.
+            report_readiness(config)
 
-        {:ok, supervisor}
+            {:ok, supervisor}
+          end
+
+        {:error, {:no_harness_cli, message}} ->
+          Logger.error(message)
+          {:error, message}
       end
     else
       # Test env: unit tests own their supervision; boot the tree explicitly.

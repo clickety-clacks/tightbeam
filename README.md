@@ -25,8 +25,10 @@ from the failure — see `mix tightbeam.doctor` and the notes below.
   documented step, onboarding a credential, *is* that binary. You would get a
   gateway that looks healthy, cannot be onboarded, cannot run a turn, and
   reports its problem as missing credentials rather than a missing CLI.
-- **A harness CLI per harness you intend to use** — `claude` and/or `codex` — on
-  PATH. `mix tightbeam.doctor` reports each as `harness_binary:<harness>`.
+- **A registered harness CLI** — `claude` and/or `codex` — installed and on
+  PATH before you clone or build Tightbeam. Boot refuses by name when it cannot
+  find a usable registered harness. `mix tightbeam.doctor` reports each as
+  `harness_binary:<harness>`.
 - **node + npm.** The ACP adapters are npm packages, and the gateway installs
   them into `<base_dir>/adapters` itself on first spawn. Without npm that
   install fails and no turn can start.
@@ -41,6 +43,23 @@ from the failure — see `mix tightbeam.doctor` and the notes below.
 
 ## Install
 
+Install at least one harness first. These are the vendors' install commands;
+install both if you want both harnesses:
+
+```sh
+npm install -g @anthropic-ai/claude-code
+claude --version
+```
+
+and/or:
+
+```sh
+npm install -g @openai/codex
+codex --version
+```
+
+Only after a harness is on PATH, install Tightbeam:
+
 ```sh
 git clone https://github.com/clickety-clacks/tightbeam.git
 cd tightbeam
@@ -53,24 +72,29 @@ mix compile
 cargo build --release --manifest-path cli/Cargo.toml
 
 mix tightbeam.init                 # creates <base_dir>/identity
-mix run --no-halt                  # boots the gateway; creates state.db, homes, bin/
+mix run --no-halt                  # boots the gateway; creates state.db and bin/
 ```
 
-`base_dir` is `TIGHTBEAM_BASE_DIR`, else `TIGHTBEAM_HOME`, else `~/.tightbeam` —
-the same precedence in the gateway and in the `tightbeam` CLI, which finds the
-gateway through `<base_dir>/gateway.json`. `TIGHTBEAM_PORT` overrides the port.
-Whatever you set for the service, set for the shell you run the CLI from: if they
-disagree, the CLI looks for its gateway in a directory that does not have one.
+Set `TIGHTBEAM_BASE_DIR` to choose `base_dir`; the gateway otherwise uses
+`TIGHTBEAM_HOME`, then `~/.tightbeam`. The CLI uses the same fallback order. The
+CLI finds the gateway through `<base_dir>/gateway.json`. `TIGHTBEAM_PORT`
+overrides the port. Whatever you set for the service, set for the shell you run
+the CLI from: if they disagree, the CLI looks for its gateway in a directory
+that does not have one.
 
-The first boot creates the base dir and serves, but **cannot run a turn yet**:
-it has no credentials, so it prints a NOT READY summary naming every gap.
+With at least one usable harness through preflight, the first boot creates the
+base dir and serves, but **cannot run a turn yet**: it has no credentials, so it
+prints a NOT READY summary naming every gap. Harness homes are projected per
+machine and harness during reconciliation or launch, not necessarily at boot.
+Leave this process running and complete the remaining steps from another
+terminal.
 
 ### Connect your first client — do this BEFORE onboarding
 
 A fresh org has no users. **The first client to connect is auto-approved and its
-user becomes the admin** (the cold-start rule, `Devices.pair/2`): point your
-client at `TIGHTBEAM_ADVERTISED_URL`, pair with a claimed name, and it succeeds
-instantly — no approval step, because there is nobody yet to approve it.
+user becomes the admin**: point your client at `TIGHTBEAM_ADVERTISED_URL`, pair
+with a claimed name, and it succeeds instantly — no approval step, because
+there is nobody yet to approve it.
 
 Do this first. Onboarding is admin-only, so running it before any client has
 paired fails with `forbidden: admin required` and there is no other way to
@@ -80,12 +104,33 @@ Every client after this one pairs as `pending` and must be approved by the admin
 
 ### Then onboard a credential, per provider
 
+An existing vendor CLI login is invisible to Tightbeam; Tightbeam keeps its own
+credential. This command is the only supported credential path — running the
+vendor's own `login` does not onboard Tightbeam:
+
 ```sh
 <base_dir>/bin/tightbeam onboard <provider> --as-user <userId>
 ```
 
 `<provider>` is the credential provider — **`anthropic`** or **`openai`** — not
 the harness name. `<userId>` is the admin created by that first pairing.
+
+### Then learn the working identity
+
+```sh
+<base_dir>/bin/tightbeam learn agentic-engineering --as-user <userId>
+```
+
+`<base_dir>/bin/tightbeam unlearn agentic-engineering --as-user <userId>` is its
+inverse. Credentials are per provider/harness per machine, while harness homes
+are per machine and harness; learning or unlearning changes neither, so it
+never requires onboarding again.
+
+### Then run a real turn
+
+In the connected client, open Main and send `hello, who are you?`. Installation
+has reached its end only when the assistant reply arrives and the typing
+indicator clears.
 
 You do not install the ACP adapters by hand. `<base_dir>/adapters` stays empty
 until the first session spawns, at which point the gateway installs both
@@ -107,21 +152,15 @@ gaps below are closed.
   claude:
     ACP adapter missing at <base_dir>/adapters/node_modules/.bin/claude-agent-acp
       — no turn can start.
-    no credential (:missing) — the model catalog is empty, so no model can
-      be selected. Onboard it with: tightbeam onboard claude --as-user <userId>
+    Tightbeam has no credential for anthropic on <host>. It does not use or
+      import your normal claude CLI login; Tightbeam keeps its own credential
+      under <base_dir>/auth. Run on <host>:
+      tightbeam onboard anthropic --as-user <userId>
 ```
 
-The summary is assembled from state the gateway already has plus one file
-check; it starts nothing and probes nothing. It reports **UNKNOWN** — never a
-failure — for anything it could not look at, such as a credential whose refresh
-had not landed yet, and offers no repair advice for those. A row saying UNKNOWN
-is not a claim that the credential is bad.
-
-`mix tightbeam.doctor` diagnoses further, with one documented limitation: it
-runs as a bare mix task, where the Credentials server is not running, so **it
-cannot determine credential state at all**. Those rows say so rather than
-guessing. To check credentials for real, read the boot summary above or the
-running gateway's catalog.
+A row saying UNKNOWN is not a claim that the credential is bad. Use
+`mix tightbeam.doctor` for additional diagnostics; check credential liveness in
+the boot summary or the running gateway's catalog.
 
 ## Installing as a service
 
@@ -132,9 +171,6 @@ An install that leaves you with a foreground process is not finished.
 
 The service must **start with no interactive login**, **survive logout**,
 **survive reboot**, and **restart on failure**.
-
-This same procedure is what runs on a test machine. There is no separate test
-install — the only difference is which machine you point it at.
 
 ### The environment that matters
 
@@ -153,14 +189,8 @@ needs write access to `TIGHTBEAM_BASE_DIR` and read access to the harness CLIs o
 `PATH`. No dedicated service account is required: run it as the account that
 installed it.
 
-**On credentials, because earlier guidance here was wrong.** A service that starts
-before any login still reaches the harness credentials. Tight Beam does not rely on
-the invoking user's keychain or `~/.claude` / `~/.codex`: it stores tokens under
-`<base_dir>/auth/<harness>/`, projects a harness home under
-`<base_dir>/homes/<machine>/<harness>/`, and hands both to the CLI explicitly at
-spawn (`CLAUDE_CONFIG_DIR` + `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_HOME`). That is what
-makes a boot-time service viable at all, and it is why `base_dir` must live
-somewhere durable rather than inside a home directory you might discard.
+Keep `base_dir` somewhere durable; it holds the org's credentials, identity,
+sessions, and work.
 
 ### macOS — launchd
 
@@ -309,7 +339,7 @@ cannot run a single turn.
 
 ## Operating
 
-- `docs/SMOKE.md` — the manual acceptance runbook, and the authority on
-  fresh-org provisioning.
+- `docs/SMOKE.md` — the manual acceptance runbook; it follows this README's
+  authoritative fresh-org install path.
 - `docs/ARCHITECTURE.md` — the substrate's shape.
 - `docs/SATELLITE.md` — adding a machine to an existing org.

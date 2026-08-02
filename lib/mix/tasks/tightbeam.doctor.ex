@@ -36,6 +36,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
           Application.get_env(:tightbeam, :advertised_url),
       hosts: org_hosts(base_dir),
       local_host_name: Placement.local_host_name(),
+      credential_state: &local_credential_state(base_dir, &1),
       cli_bin: Path.join(base_dir, "bin")
     ]
 
@@ -61,7 +62,14 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     local_host_name = Keyword.fetch!(inputs, :local_host_name)
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
     binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
+    credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
     harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
+
+    credential_states =
+      Map.new(harnesses, fn harness ->
+        provider = Tightbeam.Harness.parse!(harness).credential_provider()
+        {harness, credential_probe.(provider)}
+      end)
 
     harness_checks =
       Map.new(harnesses, fn harness ->
@@ -71,7 +79,13 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
              binary_probe.(Tightbeam.Harness.parse!(harness).id(), cli_bin),
              harness
            ),
-           harness_auth_check(catalog, harness)
+           harness_auth_check(
+             catalog,
+             harness,
+             Map.fetch!(credential_states, harness),
+             base_dir,
+             local_host_name
+           )
          ]}
       end)
 
@@ -94,7 +108,14 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       end)
 
     non_harness_checks = [
-      default_model_check(catalog, default_harness, default_model),
+      default_model_check(
+        catalog,
+        default_harness,
+        default_model,
+        Map.fetch!(credential_states, default_harness),
+        base_dir,
+        local_host_name
+      ),
       identity_check(base_dir),
       advertised_url_check(advertised_url),
       hosts_check(hosts, local_host_name)
@@ -126,7 +147,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     |> Enum.join("\n")
   end
 
-  defp default_model_check(catalog, harness, model) do
+  defp default_model_check(catalog, harness, model, credential_state, base_dir, host) do
     fix =
       "Set TIGHTBEAM_DEFAULT_MODEL to a live id[effort] ref; see mix tightbeam.catalog.diff."
 
@@ -136,6 +157,22 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
       not effort_qualified?(model) ->
         check("default_model", false, "#{inspect(model)} is not an effort-qualified ref", fix)
+
+      credential_state == :missing ->
+        module = Tightbeam.Harness.parse!(harness)
+
+        check(
+          "default_model",
+          false,
+          "#{model} cannot be verified because " <>
+            missing_credential_message(
+              module.credential_provider(),
+              harness,
+              host,
+              base_dir
+            ),
+          onboard_command(module.credential_provider(), host)
+        )
 
       true ->
         case catalog do
@@ -182,30 +219,40 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     end
   end
 
-  defp harness_auth_check({:ok, inventories}, harness) do
-    harness_auth_inventory_check(inventories, %{}, harness)
+  defp harness_auth_check(_catalog, harness, :missing, base_dir, host) do
+    auth_check(harness, false, :missing, 0, base_dir, host)
   end
 
-  defp harness_auth_check({:ok, inventories, degraded}, harness) do
-    harness_auth_inventory_check(inventories, degraded, harness)
+  defp harness_auth_check({:ok, inventories}, harness, _credential_state, base_dir, host) do
+    harness_auth_inventory_check(inventories, %{}, harness, base_dir, host)
   end
 
-  defp harness_auth_check({:error, degraded}, harness) do
+  defp harness_auth_check(
+         {:ok, inventories, degraded},
+         harness,
+         _credential_state,
+         base_dir,
+         host
+       ) do
+    harness_auth_inventory_check(inventories, degraded, harness, base_dir, host)
+  end
+
+  defp harness_auth_check({:error, degraded}, harness, _credential_state, base_dir, host) do
     reason = Map.get(degraded, harness, {:catalog_fetch_aborted, degraded})
 
-    auth_check(harness, false, reason)
+    auth_check(harness, false, reason, 0, base_dir, host)
   end
 
-  defp harness_auth_inventory_check(inventories, degraded, harness) do
+  defp harness_auth_inventory_check(inventories, degraded, harness, base_dir, host) do
     entries = Map.get(inventories, harness, [])
     ok = entries != []
 
     reason = Map.get(degraded, harness, :empty_inventory)
 
-    auth_check(harness, ok, reason, length(entries))
+    auth_check(harness, ok, reason, length(entries), base_dir, host)
   end
 
-  defp auth_check(harness, ok, reason, live_refs \\ 0) do
+  defp auth_check(harness, ok, reason, live_refs, base_dir, host) do
     cond do
       ok ->
         check("harness_auth:#{harness}", true, "#{harness} fetched #{live_refs} live refs", "")
@@ -213,16 +260,16 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       unverifiable_credential?(reason) ->
         unverifiable(
           "harness_auth:#{harness}",
-          auth_detail(harness, reason),
-          auth_fix(harness, reason)
+          auth_detail(harness, reason, base_dir, host),
+          auth_fix(harness, reason, host)
         )
 
       true ->
         check(
           "harness_auth:#{harness}",
           false,
-          auth_detail(harness, reason),
-          auth_fix(harness, reason)
+          auth_detail(harness, reason, base_dir, host),
+          auth_fix(harness, reason, host)
         )
     end
   end
@@ -244,23 +291,66 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   defp unverifiable_credential?(:credential_server_unavailable), do: true
   defp unverifiable_credential?(_reason), do: false
 
-  defp auth_detail(harness, reason) do
-    if unverifiable_credential?(reason) do
-      "not verified here: the credential server does not run inside a bare mix " <>
-        "task, so #{harness} credential state is UNKNOWN from this command"
-    else
-      "dead_sign_in: harness=#{harness} reason=#{inspect(reason)}"
+  defp auth_detail(harness, reason, base_dir, host) do
+    cond do
+      missing_credential?(reason) ->
+        module = Tightbeam.Harness.parse!(harness)
+
+        missing_credential_message(module.credential_provider(), harness, host, base_dir)
+
+      unverifiable_credential?(reason) ->
+        "not verified here: the credential server does not run inside a bare mix " <>
+          "task, so #{harness} credential state is UNKNOWN from this command"
+
+      true ->
+        "dead_sign_in: harness=#{harness} reason=#{inspect(reason)}"
     end
   end
 
-  defp auth_fix(harness, reason) do
-    if unverifiable_credential?(reason) do
-      "Not a credential verdict — do not re-onboard on the strength of this row. " <>
-        "Verify for real with Tightbeam.ClientE2E.preflight/2 for #{harness} " <>
-        "against this base_dir, or read the running gateway's catalog."
-    else
-      "Re-onboard the #{harness} harness credential."
+  defp auth_fix(harness, reason, host) do
+    cond do
+      missing_credential?(reason) ->
+        onboard_command(Tightbeam.Harness.parse!(harness).credential_provider(), host)
+
+      unverifiable_credential?(reason) ->
+        "Not a credential verdict — do not re-onboard on the strength of this row. " <>
+          "Verify for real with Tightbeam.ClientE2E.preflight/2 for #{harness} " <>
+          "against this base_dir, or read the running gateway's catalog."
+
+      true ->
+        "Re-onboard the #{harness} harness credential."
     end
+  end
+
+  defp missing_credential?({:unavailable, reason}), do: missing_credential?(reason)
+  defp missing_credential?({:needs_onboarding, reason}), do: missing_credential?(reason)
+  defp missing_credential?(:missing), do: true
+  defp missing_credential?(_reason), do: false
+
+  defp missing_credential_message(provider, harness, host, base_dir) do
+    "Tightbeam has no credential for #{provider} on #{host}. It does not use or import " <>
+      "your normal #{harness} CLI login; Tightbeam keeps its own credential under " <>
+      "#{Path.join(base_dir, "auth")}. Run on #{host}: #{onboard_command(provider, host)}"
+  end
+
+  defp onboard_command(provider, _host),
+    do: "tightbeam onboard #{provider} --as-user <userId>"
+
+  defp local_credential_state(base_dir, provider) do
+    host = Placement.local_host_name()
+    host_config = %{ssh: nil, base_dir: base_dir, cli_bin: nil}
+    target = %{base_dir: base_dir, host_name: host, host_config: host_config}
+
+    present? =
+      Tightbeam.Credentials.kind_at(base_dir, provider) != :none and
+        Tightbeam.Harness.all()
+        |> Enum.filter(&(&1.credential_provider() == provider))
+        |> Enum.any?(fn module ->
+          home = Tightbeam.Homes.home_path(base_dir, host, module.id())
+          module.credential_ready?(target, home)
+        end)
+
+    if present?, do: :present, else: :missing
   end
 
   defp harness_binary_check({:ok, %{version: version}}, harness) do

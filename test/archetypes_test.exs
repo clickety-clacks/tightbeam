@@ -1,7 +1,7 @@
 defmodule Tightbeam.ArchetypesTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Archetypes, Identity}
+  alias Tightbeam.{Archetypes, Identity, Rails, Rules}
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-archetypes-#{System.unique_integer([:positive])}")
@@ -31,8 +31,103 @@ defmodule Tightbeam.ArchetypesTest do
     assert Path.wildcard(Path.join(identity_dir, "guidance/*.md")) ==
              [Path.join(identity_dir, "guidance/operating-model.md")]
 
+    assert %{"default" => default} = Archetypes.load!(ctx.base_dir)
+    assert default.skills == ["tightbeam-onboarding"]
+
+    snapshot = Identity.snapshot!(ctx.base_dir, "default", :codex)
+    assert snapshot.skills == %{}
+    assert snapshot.guidance =~ "expert on Tightbeam, setting it up on this machine"
+    assert snapshot.guidance =~ "tightbeam doctor"
+    assert snapshot.guidance =~
+             "tightbeam assimilate <ssh-dest> --as-user <adminUserId> --harness <harness>"
+
+    assert snapshot.guidance =~
+             "Kung fu (功夫, gōngfu) means skill earned through time and practice"
+
+    flat_guidance = String.replace(snapshot.guidance, "\n", " ")
+
+    assert flat_guidance =~
+             "You are the org's general agent and the user's front door, and you WANT this user to get everything tightbeam can give them."
+
+    assert flat_guidance =~
+             "Attentiveness is the trait, offers are its expression: notice how this user actually uses tightbeam"
+
+    assert flat_guidance =~
+             "bring ONE concrete offer at a natural pause, do it for them if they say yes, and record the answer. Once per need; a decline closes it."
+
+    assert flat_guidance =~
+             "If two or more user-created default sessions are alive at once (origin `user:*`, archetype default)"
+
+    assert flat_guidance =~ "user.md's Onboarding section is the offer record"
+
+    assert flat_guidance =~
+             "Never re-raise after a recorded decline; a deferral waits for a new, stronger signal."
+
+    assert snapshot.guidance =~ "default-archetype"
+    refute snapshot.guidance =~ "agentic-engineering"
+    refute snapshot.guidance =~ "tightbeam learn __list__"
+
+    assert Rails.load!(ctx.base_dir) == []
+    assert Rules.load!(ctx.base_dir, []) == []
+    refute File.exists?(Path.join(identity_dir, "skills"))
+    refute File.exists?(Path.join(identity_dir, "rails"))
+    refute File.exists?(Path.join(identity_dir, "rules"))
+
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+  end
+
+  test "the neutral default's elected baseline skills prescribe no bundle archetype before learn" do
+    # Read the SEEDED default, not builtin_default() -- the latter carries skills: [],
+    # so looping over it iterates nothing and the assertion passes unconditionally. That
+    # is how bundle content ("spawn a product owner") shipped in an elected skill with
+    # this very test green.
+    default =
+      Application.app_dir(:tightbeam, "priv/seed/archetypes/default.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    assert default["skills"] != [],
+           "the seeded default elects no skills, so this test would prove nothing"
+
+
+    bundle_archetypes =
+      Application.app_dir(:tightbeam, "priv/kungfu/*/archetypes/*.toml")
+      |> Path.wildcard()
+      |> Enum.map(fn path -> path |> File.read!() |> Toml.decode!() |> Map.fetch!("name") end)
+    # The same empty-iteration trap one level down: with no bundle archetypes the
+    # refutations below execute zero times and this passes proving nothing.
+    assert bundle_archetypes != [],
+           "no bundle archetypes found, so the refutations below would check nothing"
+
+    for skill <- default["skills"] do
+      body =
+        Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
+        |> File.read!()
+
+      pre_learn = body |> String.split("## AFTER LEARNING A KUNGFU", parts: 2) |> hd()
+
+      # BOUNDED BY DESIGN (reviewer-ruled): this catches CARELESSNESS, not an adversary.
+      # Paraphrases get through ("ask a delivery specialist to take ownership") and that
+      # residual is acceptable. What is NOT acceptable is blocking honest text, and a
+      # hand-built verb list did exactly that: "spawn a product" rejected "spawn a
+      # production support session", "escalate to the product" rejected "escalate to the
+      # product support team", "hand off to the" rejected "hand off to the user". Those
+      # signatures are gone. Only full archetype NAMES remain, matched at word boundaries
+      # so a name can never match as the prefix of an ordinary word. "hand this to the product owner agent" names no
+      # archetype token, and a bundle-only VERB is just as much a pre-learn instruction.
+      # Both spellings of every archetype, plus the verbs that only make sense once a
+      # bundle exists.
+      bundle_only_names =
+        Enum.flat_map(bundle_archetypes, &[&1, String.replace(&1, "-", " ")])
+
+      for spelling <- bundle_only_names do
+        pattern = ~r/\b#{Regex.escape(String.downcase(spelling))}\b/
+
+        refute Regex.match?(pattern, String.downcase(pre_learn)),
+               "neutral elected skill #{skill} names bundle-only archetype #{inspect(spelling)} before learn"
+      end
+    end
   end
 
   test "the operating manual names the shell as the path to every substrate verb" do
@@ -204,7 +299,17 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
     for name <- ["", "-demo", "Demo", "demo_name", "demo--name", "demo-"] do
       assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
-        Archetypes.scaffold_kungfu!(ctx.base_dir, name, "user:flynn")
+        Archetypes.scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:flynn")
+      end
+
+      refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
+    end
+  end
+
+  test "kungfu scaffold requires purpose before identity mutation", ctx do
+    for purpose <- [nil, "", "  "] do
+      assert_raise ArgumentError, "kungfu purpose is required", fn ->
+        Archetypes.scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:flynn")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -227,7 +332,12 @@ defmodule Tightbeam.ArchetypesTest do
       assert_raise ArgumentError,
                    "kungfu scaffold target already exists: identity/#{occupied_relative}",
                    fn ->
-                     Archetypes.scaffold_kungfu!(base_dir, name, "user:flynn")
+                     Archetypes.scaffold_kungfu!(
+                       base_dir,
+                       name,
+                       "A useful capability.",
+                       "user:flynn"
+                     )
                    end
 
       assert File.read!(occupied) == "operator-owned"
@@ -240,7 +350,13 @@ defmodule Tightbeam.ArchetypesTest do
   end
 
   test "kungfu scaffold commits on main and publishes live through the identity seam", ctx do
-    paths = Archetypes.scaffold_kungfu!(ctx.base_dir, "demo", "user:flynn")
+    paths =
+      Archetypes.scaffold_kungfu!(
+        ctx.base_dir,
+        "demo",
+        ~s(Help teams turn "ideas" into shipped work.\nKeep it accountable.),
+        "user:flynn"
+      )
     identity_dir = Path.join(ctx.base_dir, "identity")
 
     assert Enum.map(paths, &Path.relative_to(&1, identity_dir)) == scaffold_paths("demo")
@@ -464,6 +580,7 @@ defmodule Tightbeam.ArchetypesTest do
       "kungfu/<name>/capabilities.md",
       "kungfu/<name>/preferred-models.md",
       "kungfu/<name>/intake.md",
+      "kungfu/<name>/manifest.toml",
       "kungfu/<name>/README.md"
     ]
   end

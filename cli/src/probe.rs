@@ -1354,17 +1354,13 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let monotonic = Instant::now();
     let io = SystemIo;
     let resolved_base_dir = resolve_base_dir(base_dir);
-    let harness_result = crate::harnesses::load_from(&resolved_base_dir);
-    let harness_error = harness_result.as_ref().err().cloned();
-    let harness_catalog = harness_result.as_ref().ok();
+    let (harness_catalog, harness_notes) = doctor_harness_catalog(&resolved_base_dir);
     let mut raw = match std::env::consts::OS {
-        "linux" => collect_linux(&io, std::process::id(), harness_catalog)?,
-        "macos" => collect_darwin(&io, std::process::id(), harness_catalog)?,
+        "linux" => collect_linux(&io, std::process::id(), harness_catalog.as_ref())?,
+        "macos" => collect_darwin(&io, std::process::id(), harness_catalog.as_ref())?,
         _ => return Err("probe: unsupported platform".to_owned()),
     };
-    if let Some(reason) = harness_error {
-        raw.notes.push(reason);
-    }
+    raw.notes.extend(harness_notes);
     add_elapsed(&io, &mut raw);
     let hostname = hostname(&io, &mut raw.notes);
     let base_dir = inspect_base_dir(&io, &resolved_base_dir, &mut raw.notes);
@@ -1375,12 +1371,74 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     } else {
         println!("{}", human(&report));
     }
-    Ok(())
+    require_runnable_harness_cli(harness_catalog.as_ref())
+}
+
+fn require_runnable_harness_cli(
+    catalog: Option<&crate::harnesses::HarnessCatalog>,
+) -> Result<(), String> {
+    let Some(catalog) = catalog else {
+        return Ok(());
+    };
+    let search_path = std::env::var("PATH").unwrap_or_default();
+    if catalog
+        .harnesses
+        .iter()
+        .any(|harness| crate::preflight::on_path(&harness.cli_binary, &search_path).is_some())
+    {
+        Ok(())
+    } else {
+        Err(
+            "doctor: no registered harness CLI is available on PATH; no harness can run a turn"
+                .to_owned(),
+        )
+    }
+}
+
+fn doctor_harness_catalog(
+    base_dir: &Path,
+) -> (Option<crate::harnesses::HarnessCatalog>, Vec<String>) {
+    match crate::harnesses::load_for_doctor(base_dir) {
+        crate::harnesses::DoctorCatalog::Live(catalog) => (Some(catalog), Vec::new()),
+        crate::harnesses::DoctorCatalog::GatewayError(reason) => (None, vec![reason]),
+        crate::harnesses::DoctorCatalog::Offline { catalog, reason } => {
+            let search_path = std::env::var("PATH").unwrap_or_default();
+            let notes = offline_harness_notes(&catalog, reason, &search_path);
+            (Some(catalog), notes)
+        }
+    }
+}
+
+fn offline_harness_notes(
+    catalog: &crate::harnesses::HarnessCatalog,
+    reason: String,
+    search_path: &str,
+) -> Vec<String> {
+    let mut notes = vec![
+        "gateway is not running; local registered harness checks still ran".to_owned(),
+        reason,
+    ];
+    notes.extend(catalog.harnesses.iter().map(|harness| {
+        match crate::preflight::on_path(&harness.cli_binary, search_path) {
+            Some(path) => format!(
+                "harness {}: {} is present at {}",
+                harness.wire_name,
+                harness.cli_binary,
+                path.display()
+            ),
+            None => format!(
+                "harness {}: {} is missing from PATH; install it and run Tight Beam again",
+                harness.wire_name, harness.cli_binary
+            ),
+        }
+    }));
+    notes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn stat(ppid: u32, pgid: u32, start: u64) -> Vec<u8> {
         let mut fields = vec!["S".to_owned(), ppid.to_string(), pgid.to_string()];
@@ -1394,6 +1452,45 @@ mod tests {
             seconds,
             microseconds: 123,
         }
+    }
+
+    #[test]
+    fn offline_doctor_reports_gateway_and_each_registered_cli_from_path() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-offline-doctor-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let codex = root.join("codex");
+        fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&codex, permissions).unwrap();
+
+        let catalog = crate::harnesses::local_registry().unwrap();
+        let notes = offline_harness_notes(
+            &catalog,
+            "gateway route unavailable".to_owned(),
+            root.to_str().unwrap(),
+        );
+
+        assert_eq!(
+            notes[0],
+            "gateway is not running; local registered harness checks still ran"
+        );
+        assert!(notes.iter().any(|note| note
+            == "harness claude: claude is missing from PATH; install it and run Tight Beam again"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note
+                    == &format!("harness codex: codex is present at {}", codex.display()))
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[derive(Default)]

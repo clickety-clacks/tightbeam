@@ -1266,7 +1266,7 @@ defmodule Tightbeam.GatewayTest do
 
     System.put_env("PATH", missing_bin)
 
-    assert_raise RuntimeError, ~r/no usable harness CLI/, fn ->
+    assert_raise RuntimeError, ~r/no registered harness CLI is installed/, fn ->
       Gateway.children(gateway_config(missing_base, ctx.db, 0))
     end
 
@@ -1913,7 +1913,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     assert %{code: "placement_denied", detail: %{code: "host_unready"}, message: message} = result
-    assert message =~ "no claude credentials"
+    assert message =~ "Tightbeam has no credential for anthropic on testhost"
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
     assert Roles.get(ctx.db, "unready") == nil
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
@@ -2065,13 +2065,10 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:credential_command, second_command}
     assert Enum.join(second_command, " ") =~ "/remote/new-tb"
 
-    expected_message =
-      "claude on #{machine} needs onboarding: :missing; run tightbeam onboard anthropic on #{machine}"
-
     assert %{
              code: "placement_denied",
              detail: %{code: "needs_onboarding"},
-             message: ^expected_message
+             message: message
            } =
              handlers["spawn"].(%{
                origin: "user:flynn",
@@ -2082,6 +2079,13 @@ defmodule Tightbeam.GatewayTest do
                  idempotency_key: "spawn-fresh-remote"
                }
              })
+
+    assert message =~ "Tightbeam has no credential for anthropic on #{machine}"
+    assert message =~ "normal claude CLI login"
+    assert message =~ "under /remote/new-tb/auth"
+
+    assert message =~
+             "Run on #{machine}: tightbeam onboard anthropic --as-user <userId>"
   end
 
   test "update-clients refuses non-admin callers and enumerates satellites for admins", ctx do
@@ -2552,7 +2556,10 @@ defmodule Tightbeam.GatewayTest do
     scaffold = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-scaffold"]
 
     assert %{code: "forbidden", message: "admin required"} =
-             scaffold.(%{origin: "user:not-admin", params: %{name: "demo"}})
+             scaffold.(%{
+               origin: "user:not-admin",
+               params: %{name: "demo", purpose: "Help a team do demo work."}
+             })
 
     refute File.exists?(Path.join(base_dir, "identity"))
 
@@ -2564,11 +2571,15 @@ defmodule Tightbeam.GatewayTest do
       "kungfu/demo/capabilities.md",
       "kungfu/demo/preferred-models.md",
       "kungfu/demo/intake.md",
+      "kungfu/demo/manifest.toml",
       "kungfu/demo/README.md"
     ]
 
     assert %{kungfu: "demo", paths: paths} =
-             scaffold.(%{origin: "user:flynn", params: %{name: "demo"}})
+             scaffold.(%{
+               origin: "user:flynn",
+               params: %{name: "demo", purpose: "Help a team do demo work."}
+             })
 
     identity_dir = Path.join(base_dir, "identity")
 
@@ -2599,6 +2610,14 @@ defmodule Tightbeam.GatewayTest do
     assert intake =~ "Destination: `identity/kungfu/demo/preferred-models.md`"
     assert intake =~ "`tightbeam config set default-archetype demo-role`"
 
+    bundle_manifest =
+      Toml.decode!(File.read!(Path.join(identity_dir, "kungfu/demo/manifest.toml")))
+
+    assert bundle_manifest == %{
+             "purpose" => "Help a team do demo work.",
+             "root_archetype" => "demo-role"
+           }
+
     readme = File.read!(Path.join(identity_dir, "kungfu/demo/README.md"))
     assert readme =~ "tightbeam-kungfu-crafting"
     assert readme =~ "identity/archetypes"
@@ -2625,7 +2644,10 @@ defmodule Tightbeam.GatewayTest do
     assert_raise ArgumentError,
                  "kungfu scaffold target already exists: identity/archetypes/demo-role.toml",
                  fn ->
-                   scaffold.(%{origin: "user:flynn", params: %{name: "demo"}})
+                   scaffold.(%{
+                     origin: "user:flynn",
+                     params: %{name: "demo", purpose: "Help a team do demo work."}
+                   })
                  end
 
     assert Map.new(expected_relatives, &{&1, File.read!(Path.join(identity_dir, &1))}) == before
@@ -3518,7 +3540,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_host", host: "worker"}
              })
 
-    assert message =~ "no claude credentials"
+    assert message =~ "Tightbeam has no credential for anthropic on worker"
     assert Org.get(ctx.db, "k1").host == "testhost"
   end
 
@@ -3765,7 +3787,7 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "no codex credentials"
+    assert message =~ "Tightbeam has no credential for openai on testhost"
     assert Org.get(ctx.db, "k1") == before
   end
 
@@ -4768,6 +4790,25 @@ defmodule Tightbeam.GatewayTest do
     assert Archetypes.get("coder") == nil
     refute Rails.statutes?()
     assert :persistent_term.get(Rules, []) == []
+  end
+
+  test "kungfu list reports shipped bundles and their declared purposes and root archetypes",
+       ctx do
+    base_dir = role_test_base("kungfu-list")
+    list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-list"]
+
+    assert %{
+             bundles: [
+               %{
+                 name: "agentic-engineering",
+                 purpose: purpose,
+                 root_archetype: "product-owner"
+               }
+             ]
+           } =
+             list.(%{origin: "agent:k1", params: %{}})
+
+    assert purpose =~ "turn product ideas and bug reports into shipped software"
   end
 
   test "every unlearn reference kind supplies supported commands that clear it", ctx do

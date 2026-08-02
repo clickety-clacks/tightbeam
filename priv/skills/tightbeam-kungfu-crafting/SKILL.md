@@ -24,9 +24,23 @@ A complete bundle ships:
    answer, each naming where its answer lands (preferred-models rows, producer
    commands, workspace roots, stances). Learning the bundle = install + walking the
    operator through intake; not operational until complete-or-deferred.
-7. **root_archetype** — the archetype everyday sessions should default to once this
-   kungfu is the org's way of life. Name it in capabilities.md and intake.md, then
-   apply it with `tightbeam config set default-archetype <name>-role`.
+7. **`manifest.toml`** — what the general agent reads to know this bundle exists and
+   whether to offer it. Two required fields, and they are the two things nobody can see
+   by looking at the folder:
+   - **purpose** — what capability adopting this bundle gives an org, in plain language
+     a user would recognize from describing their own work. Not an inventory of the
+     bundle's parts: "turn product ideas and bug reports into shipped software, with
+     tracked work, independent review, and verification" is a purpose; "7 archetypes,
+     13 guidance fragments" is a contents listing. The general agent matches a user's
+     stated goal against this, so write it the way a user would say it.
+   - **root_archetype** — the archetype everyday sessions should default to once this
+     kungfu is the org's way of life. Name it in capabilities.md and intake.md, then
+     apply it with `tightbeam config set default-archetype <name>-role`.
+   Everything else about the bundle is DISCOVERABLE BY LOOKING — archetypes/, skills/,
+   rails/, rules/ are right there on disk. Do not restate contents in the manifest;
+   a list that can drift from what shipped is worse than no list. If the agent needs to
+   know something it cannot see by looking, add that field here and document it in this
+   step.
 
 Audit rule: a bundle missing any of 4-7 is not adoptable law, it is a folder of
 opinions — the general agent cannot offer it, learn cannot intake it, and its

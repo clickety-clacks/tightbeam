@@ -322,6 +322,10 @@ defmodule Tightbeam.Identity do
   @spec scaffold!(String.t(), String.t(), [{String.t(), binary()}], String.t()) ::
           [String.t()]
   def scaffold!(base_dir, name, entries, author) do
+    manifest_relative = Path.join(["kungfu", name, "manifest.toml"])
+    manifest = entries |> Map.new() |> Map.fetch!(manifest_relative)
+    _purpose = bundle_manifest!(manifest, manifest_relative).purpose
+
     init!(base_dir)
     dir = identity_dir(base_dir)
 
@@ -419,6 +423,7 @@ defmodule Tightbeam.Identity do
     File.rm!(Path.join(dir, receipt_path))
 
     try do
+      remove_empty_parent_dirs!(dir, [receipt_path | receipt.paths])
       validate_tree!(dir)
     rescue
       error ->
@@ -456,6 +461,38 @@ defmodule Tightbeam.Identity do
     |> File.ls!()
     |> Enum.filter(&File.dir?(Path.join(bundle_root_dir(), &1)))
     |> Enum.sort()
+  end
+
+  @doc "Kungfu bundles shipped with this Tightbeam build and their intended roots."
+  @spec available_bundles() :: [
+          %{name: String.t(), purpose: String.t(), root_archetype: String.t()}
+        ]
+  def available_bundles do
+    available_bundle_names()
+    |> Enum.map(fn name ->
+      manifest =
+        name
+        |> bundle_dir()
+        |> Path.join("manifest.toml")
+        |> then(&bundle_manifest!(File.read!(&1), &1))
+
+      %{
+        name: name,
+        purpose: manifest.purpose,
+        root_archetype: manifest.root_archetype
+      }
+    end)
+  end
+
+  defp bundle_manifest!(content, path) do
+    manifest = Toml.decode!(content)
+    purpose = Map.fetch!(manifest, "purpose")
+
+    unless is_binary(purpose) and String.trim(purpose) != "" do
+      raise ArgumentError, "kungfu manifest purpose must be non-empty prose: #{path}"
+    end
+
+    %{purpose: purpose, root_archetype: Map.fetch!(manifest, "root_archetype")}
   end
 
   @doc "Import the current seed and learned bundle snapshots, then merge them into main."
@@ -576,6 +613,9 @@ defmodule Tightbeam.Identity do
   end
 
   defp bundle_entries(name, bundle) do
+    manifest_path = Path.join(bundle, "manifest.toml")
+    _manifest = bundle_manifest!(File.read!(manifest_path), manifest_path)
+
     bundle
     |> source_entries()
     |> Enum.map(fn
@@ -685,6 +725,39 @@ defmodule Tightbeam.Identity do
   end
 
   defp receipt_path(name), do: Path.join(["kungfu", name, "installed.toml"])
+
+  defp remove_empty_parent_dirs!(dir, paths) do
+    paths
+    |> Enum.flat_map(&parent_dirs/1)
+    |> Enum.uniq()
+    |> Enum.sort_by(&(length(Path.split(&1)) * -1))
+    |> Enum.each(fn relative ->
+      case File.rmdir(Path.join(dir, relative)) do
+        :ok ->
+          :ok
+
+        {:error, reason} when reason in [:enoent, :eexist, :enotempty] ->
+          :ok
+
+        {:error, reason} ->
+          raise File.Error, action: "remove directory", path: relative, reason: reason
+      end
+    end)
+  end
+
+  defp parent_dirs(relative) do
+    if Path.type(relative) == :relative and ".." not in Path.split(relative) do
+      parent_dirs(Path.dirname(relative), [])
+    else
+      []
+    end
+  end
+
+  defp parent_dirs(relative, parents) when relative in [".", ".."], do: parents
+
+  defp parent_dirs(relative, parents) do
+    parent_dirs(Path.dirname(relative), [relative | parents])
+  end
 
   defp receipt_at(dir, revision, name) do
     path = receipt_path(name)

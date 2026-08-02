@@ -115,6 +115,49 @@ defmodule Tightbeam.ApplicationTest do
     refute File.exists?(base)
   end
 
+  test "production entry names a fresh machine with no harness without crashing" do
+    base =
+      Path.join(System.tmp_dir!(), "tb_app_no_harness_#{System.unique_integer([:positive])}")
+
+    bin_dir =
+      Path.join(System.tmp_dir!(), "tb_app_empty_bin_#{System.unique_integer([:positive])}")
+
+    crash_dump = Path.join(bin_dir, "erl_crash.dump")
+    File.mkdir_p!(bin_dir)
+
+    previous_base = Application.fetch_env!(:tightbeam, :base_dir)
+    previous_autostart = Application.fetch_env!(:tightbeam, :autostart)
+    previous_path = System.get_env("PATH")
+    previous_crash_dump = System.get_env("ERL_CRASH_DUMP")
+
+    Application.put_env(:tightbeam, :base_dir, base)
+    Application.put_env(:tightbeam, :autostart, true)
+    System.put_env("PATH", bin_dir)
+    System.put_env("ERL_CRASH_DUMP", crash_dump)
+
+    on_exit(fn ->
+      Application.put_env(:tightbeam, :base_dir, previous_base)
+      Application.put_env(:tightbeam, :autostart, previous_autostart)
+      restore_path(previous_path)
+
+      if previous_crash_dump,
+        do: System.put_env("ERL_CRASH_DUMP", previous_crash_dump),
+        else: System.delete_env("ERL_CRASH_DUMP")
+
+      File.rm_rf!(base)
+      File.rm_rf!(bin_dir)
+    end)
+
+    assert {:error, message} = Tightbeam.Application.start(:normal, [])
+    assert message =~ "no registered harness CLI is installed"
+    assert message =~ "expected on a fresh machine"
+    assert message =~ "Install `claude` or `codex`"
+    assert message =~ "Run `tightbeam doctor`"
+    refute message =~ "** ("
+    refute File.exists?(crash_dump)
+    refute File.exists?(base)
+  end
+
   test "production entry refuses a broken identity before creating store artifacts" do
     base =
       Path.join(
