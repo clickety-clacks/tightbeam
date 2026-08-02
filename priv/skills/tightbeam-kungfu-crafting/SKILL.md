@@ -25,14 +25,22 @@ A complete bundle ships:
    commands, workspace roots, stances). Learning the bundle = install + walking the
    operator through intake; not operational until complete-or-deferred.
 7. **`manifest.toml`** — what the general agent reads to know this bundle exists and
-   whether to offer it. Two required fields, and they are the two things nobody can see
-   by looking at the folder:
+   whether to offer it. It carries two required fields and one optional field: the
+   things nobody can see by looking at the folder.
    - **purpose** — what capability adopting this bundle gives an org, in plain language
      a user would recognize from describing their own work. Not an inventory of the
      bundle's parts: "turn product ideas and bug reports into shipped software, with
      tracked work, independent review, and verification" is a purpose; "7 archetypes,
      13 guidance fragments" is a contents listing. The general agent matches a user's
      stated goal against this, so write it the way a user would say it.
+   - **phrases** — short, natural things a USER would say that mean this bundle would
+     help. Written from their side, describing the problem or the wish, never our
+     feature names. THEY MUST DISCRIMINATE: if a bundle from a different domain could
+     honestly claim the same phrase, it is too generic and buys nothing. "I keep losing
+     track of what I asked for" fits every bundle ever written; "I want my code reviewed
+     before it merges" could only be this one. Test each phrase by asking whether a
+     biosciences or legal kungfu could claim it — if yes, rewrite it.
+
    - **root_archetype** — the archetype everyday sessions should default to once this
      kungfu is the org's way of life. Name it in capabilities.md and intake.md, then
      apply it with `tightbeam config set default-archetype <name>-role`.
