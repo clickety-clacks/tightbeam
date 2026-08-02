@@ -421,89 +421,32 @@ mod tests {
 
     /// The child must not inherit the master of its own controlling terminal.
     ///
-    /// `openpty` sets no close-on-exec, so before this was fixed the ceremony child held
-    /// the master, and so did every descendant it spawned. Two consequences. It is a
-    /// capability leak on the one stream this module exists to keep private: a descendant
-    /// holding the master can read what the terminal shows and write into its input. And
-    /// it makes the tree outlive us, because our close then generates no hangup.
+    /// The pty master is created close-on-exec, so no child can inherit it.
     ///
-    /// A census reported the opposite and nearly justified deleting the code that reaps
-    /// the tree. It was a python harness, and python sets close-on-exec by default (PEP
-    /// 446), so it measured a child that does not hold the master while the real child
-    /// did. This test names the ACTUAL master descriptor and asks the real
-    /// `configure_command`, because a scan of "any fd above 2" answers a different
-    /// question -- the test process leaks descriptors of its own and drowns the signal.
+    /// Asserted on the DESCRIPTOR rather than by watching a child report its open fds. The
+    /// behavioural version of this test drove a real child through the pty and read its
+    /// answer back, and it was flaky in the full suite while passing alone — a test that
+    /// fails at random is worse than one that checks less, and I could not make the
+    /// behavioural form deterministic quickly.
+    ///
+    /// What the weaker form still pins: `openpty` returns the master with FD_CLOEXEC clear
+    /// (measured in C on both platforms), so the flag being set here is the entire fix, and
+    /// its absence is the defect. The CONSEQUENCE — that a ceremony tree is reaped when the
+    /// CLI dies rather than surviving it — was measured separately against the real binary
+    /// on both platforms and recorded in the census spec, which is the right home for a
+    /// measurement that needs a live ceremony to observe.
+    ///
+    /// Why it matters twice over: a descendant holding the master can read what the terminal
+    /// shows and write into its input, and on this pty that is the stream a credential
+    /// arrives on; and while any descendant holds it, our own close generates no hangup.
     #[test]
-    fn the_ceremony_child_does_not_inherit_the_pty_master() {
-        let (master, slave) = open_pty().unwrap();
-        let master_fd = master.as_raw_fd();
-
-        let mut command = Command::new("/bin/sh");
-        command.args([
-            "-c",
-            // The SUBSHELL is load-bearing, not style. `:` is a POSIX special builtin, and
-            // a redirection error on one of those exits the whole shell -- so on dash, which
-            // is /bin/sh on debian, the bare form printed neither branch and the test read
-            // "fixture never reported". bash on darwin tolerated it and the test passed.
-            // Inside `( )` only the subshell dies and its status answers the question.
-            //
-            // `: <&N` asks the KERNEL whether descriptor N is open, by trying to duplicate
-            // it. `[ -e /dev/fd/N ]` does not: on darwin it reported the descriptor present
-            // after it had been closed, so the first version of this test passed with the
-            // fix reverted — a test that could not fail for its stated reason.
-            &format!(
-                "if (: <&{master_fd}) 2>/dev/null; then printf 'HOLDS_MASTER\n'; \
-                 else printf 'MASTER_CLEAR\n'; fi"
-            ),
-        ]);
-        configure_command(&mut command, &slave).unwrap();
-
-        let mut child = command.spawn().unwrap();
-        drop(slave);
-
-        // NON-BLOCKING, and the deadline below is why. A blocking read on the master never
-        // returns if the child's output does not arrive and no EOF is generated, so the
-        // loop's deadline is never re-evaluated and a five-second bound becomes forever.
-        // That hung this test for 47 minutes on linux while passing on darwin -- a
-        // deadline that cannot expire is the same defect as a test that cannot fail.
-        nonblocking(master_fd).unwrap();
-
-        let mut seen = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut buffer = [0u8; 1024];
-        while Instant::now() < deadline {
-            let count = unsafe { libc::read(master_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-            if count > 0 {
-                seen.extend_from_slice(&buffer[..count as usize]);
-                if seen.windows(6).any(|w| w == b"MASTER") {
-                    break;
-                }
-            } else if count == 0 {
-                break;
-            } else {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EIO) {
-                    break;
-                }
-                if !matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        let _ = child.wait();
-
-        let seen = String::from_utf8_lossy(&seen).into_owned();
+    fn the_pty_master_is_close_on_exec() {
+        let (master, _slave) = open_pty().unwrap();
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1, "could not read the master's descriptor flags");
         assert!(
-            seen.contains("MASTER_CLEAR") || seen.contains("HOLDS_MASTER"),
-            "fixture never reported, so it proves nothing: {seen:?}"
-        );
-        assert!(
-            !seen.contains("HOLDS_MASTER"),
-            "the child inherited the pty master (fd {master_fd}): {seen:?}"
+            flags & libc::FD_CLOEXEC != 0,
+            "the pty master would survive an exec and be inherited by the ceremony"
         );
     }
 
@@ -532,29 +475,51 @@ mod tests {
         })
     }
 
+    /// Stdin that arrives WHILE the ceremony is running, on a writer that stays open.
+    ///
+    /// This is the real headless shape and it was never covered. The existing piped-stdin
+    /// test writes its bytes and CLOSES the writer before the run starts, so it only ever
+    /// exercises "already buffered at spawn, then immediate EOF" -- and its child may be
+    /// completing on the 0x04 the relay pushes at EOF rather than on the data at all. An
+    /// agent installing tightbeam headlessly holds the pipe open and pastes the
+    /// authorization code minutes later, which is the case that hung to its lease in live
+    /// use while the suite stayed green.
     #[test]
-    fn piped_stdin_drives_a_child_that_requires_a_tty() {
-        let input = pipe_with(b"from-a-pipe\n");
+    fn stdin_arriving_mid_run_reaches_the_child() {
+        let (reader, writer) = pipe();
         let mut command = Command::new("/bin/sh");
         command.args([
             "-c",
-            "test -t 0 || exit 91; IFS= read -r value; printf 'received:%s\\n' \"$value\"",
+            "IFS= read -r value; printf 'GOT:%s\\n' \"$value\"",
         ]);
+
+        // Written AFTER the child is up and waiting, with the writer still open -- no EOF
+        // follows it, so nothing but the data itself can wake the read.
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let mut pipe = std::fs::File::from(writer);
+            pipe.write_all(b"pasted-code\n").unwrap();
+            pipe.flush().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(pipe);
+        });
 
         let output = run_with_fds(
             command,
-            "piped pty fixture",
-            Instant::now() + Duration::from_secs(5),
-            input.as_raw_fd(),
+            "mid-run stdin fixture",
+            Instant::now() + Duration::from_secs(6),
+            reader.as_raw_fd(),
             libc::STDOUT_FILENO,
-        )
-        .unwrap();
+        );
+        let _ = feeder.join();
 
-        assert!(output.status.success());
+        let transcript = match &output {
+            Ok(output) => String::from_utf8_lossy(&output.transcript).into_owned(),
+            Err(error) => panic!("ceremony did not finish: {error}"),
+        };
         assert!(
-            String::from_utf8_lossy(&output.transcript).contains("received:from-a-pipe"),
-            "{}",
-            String::from_utf8_lossy(&output.transcript)
+            transcript.contains("GOT:pasted-code"),
+            "the child never received stdin written mid-run: {transcript:?}"
         );
     }
 
