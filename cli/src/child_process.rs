@@ -1212,7 +1212,10 @@ mod tests {
 
         let ours = forward_to_active_group as *const () as usize;
         let before = installed_handler(libc::SIGTERM);
-        assert_ne!(before, ours, "a previous test left the ceremony handler behind");
+        assert_ne!(
+            before, ours,
+            "a previous test left the ceremony handler behind"
+        );
 
         let mut forwarding = SignalForwarding::install().unwrap();
         assert_eq!(

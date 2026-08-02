@@ -267,7 +267,9 @@ where
 ///
 /// One condition only. No retry, no negotiation, no version sniffing: the CLI either was
 /// told the credential is installed, or it was not.
-pub(crate) fn onboarded_outcome(reply: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+pub(crate) fn onboarded_outcome(
+    reply: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let Some(result) = reply else {
         return Err(FINISH_UNCONFIRMED.to_owned());
     };
@@ -279,8 +281,7 @@ pub(crate) fn onboarded_outcome(reply: Option<serde_json::Value>) -> Result<serd
 
 /// Deliberately silent about what the gateway DID send. The reply is unrecognised, so any
 /// reading of it here would be a guess printed with the authority of a diagnosis.
-const FINISH_UNCONFIRMED: &str =
-    "the gateway accepted the finish request but did not confirm the credential was \
+const FINISH_UNCONFIRMED: &str = "the gateway accepted the finish request but did not confirm the credential was \
      installed: its reply did not say `status: \"onboarded\"`. Nothing about this host's \
      credential can be assumed either way -- run `tightbeam doctor` to see what is \
      actually installed, and re-run the ceremony if it is not there.";

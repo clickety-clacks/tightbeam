@@ -288,6 +288,25 @@ fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
 
     let master = unsafe { OwnedFd::from_raw_fd(master) };
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+
+    // The MASTER must not survive an exec. `openpty` sets no close-on-exec and this process
+    // passes only slave dups as the child's stdio, so without this the child inherits an
+    // open master by fd number -- and so does everything it spawns. Two consequences, and
+    // the second is why this is not a tidiness fix:
+    //
+    //   * A capability leak. A descendant holding the master can read what the terminal
+    //     shows and write into its input, which on THIS pty is the stream a credential
+    //     arrives on.
+    //   * The master then never fully closes when this process dies, so no hangup is
+    //     generated and the ceremony tree outlives its parent. A census reported the
+    //     opposite because its harness was python, which sets close-on-exec by default
+    //     (PEP 446); it modelled a child that does not hold the master. The real one did.
+    //
+    // Set HERE rather than closed in a `pre_exec`, because the flag belongs to the
+    // descriptor and covers every exec while it is open. A `pre_exec` close covers only
+    // the spawn site that remembers to do it, and this process spawns other children --
+    // `uname`, harness probes -- that have no idea a pty master exists.
+    close_on_exec(&master)?;
     let geometry = libc::winsize {
         ws_row: CEREMONY_ROWS,
         ws_col: CEREMONY_COLUMNS,
@@ -303,6 +322,20 @@ fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
     Ok((master, slave))
 }
 
+/// Mark a descriptor as not surviving `exec`.
+///
+/// Read-modify-write rather than a bare set: `F_SETFD` replaces the whole flag word, and
+/// clobbering flags we did not put there is how a fix becomes the next defect.
+fn close_on_exec(fd: &OwnedFd) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags == -1
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
 fn configure_command(command: &mut Command, slave: &OwnedFd) -> Result<(), String> {
     let stdin = duplicate(slave)?;
     let stdout = duplicate(slave)?;
@@ -311,6 +344,7 @@ fn configure_command(command: &mut Command, slave: &OwnedFd) -> Result<(), Strin
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -382,6 +416,94 @@ mod tests {
         assert!(
             !rendered.contains("Select an account"),
             "explaining the silence must not start forwarding the child: {rendered:?}"
+        );
+    }
+
+    /// The child must not inherit the master of its own controlling terminal.
+    ///
+    /// `openpty` sets no close-on-exec, so before this was fixed the ceremony child held
+    /// the master, and so did every descendant it spawned. Two consequences. It is a
+    /// capability leak on the one stream this module exists to keep private: a descendant
+    /// holding the master can read what the terminal shows and write into its input. And
+    /// it makes the tree outlive us, because our close then generates no hangup.
+    ///
+    /// A census reported the opposite and nearly justified deleting the code that reaps
+    /// the tree. It was a python harness, and python sets close-on-exec by default (PEP
+    /// 446), so it measured a child that does not hold the master while the real child
+    /// did. This test names the ACTUAL master descriptor and asks the real
+    /// `configure_command`, because a scan of "any fd above 2" answers a different
+    /// question -- the test process leaks descriptors of its own and drowns the signal.
+    #[test]
+    fn the_ceremony_child_does_not_inherit_the_pty_master() {
+        let (master, slave) = open_pty().unwrap();
+        let master_fd = master.as_raw_fd();
+
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            // The SUBSHELL is load-bearing, not style. `:` is a POSIX special builtin, and
+            // a redirection error on one of those exits the whole shell -- so on dash, which
+            // is /bin/sh on debian, the bare form printed neither branch and the test read
+            // "fixture never reported". bash on darwin tolerated it and the test passed.
+            // Inside `( )` only the subshell dies and its status answers the question.
+            //
+            // `: <&N` asks the KERNEL whether descriptor N is open, by trying to duplicate
+            // it. `[ -e /dev/fd/N ]` does not: on darwin it reported the descriptor present
+            // after it had been closed, so the first version of this test passed with the
+            // fix reverted — a test that could not fail for its stated reason.
+            &format!(
+                "if (: <&{master_fd}) 2>/dev/null; then printf 'HOLDS_MASTER\n'; \
+                 else printf 'MASTER_CLEAR\n'; fi"
+            ),
+        ]);
+        configure_command(&mut command, &slave).unwrap();
+
+        let mut child = command.spawn().unwrap();
+        drop(slave);
+
+        // NON-BLOCKING, and the deadline below is why. A blocking read on the master never
+        // returns if the child's output does not arrive and no EOF is generated, so the
+        // loop's deadline is never re-evaluated and a five-second bound becomes forever.
+        // That hung this test for 47 minutes on linux while passing on darwin -- a
+        // deadline that cannot expire is the same defect as a test that cannot fail.
+        nonblocking(master_fd).unwrap();
+
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buffer = [0u8; 1024];
+        while Instant::now() < deadline {
+            let count = unsafe { libc::read(master_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if count > 0 {
+                seen.extend_from_slice(&buffer[..count as usize]);
+                if seen.windows(6).any(|w| w == b"MASTER") {
+                    break;
+                }
+            } else if count == 0 {
+                break;
+            } else {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EIO) {
+                    break;
+                }
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let _ = child.wait();
+
+        let seen = String::from_utf8_lossy(&seen).into_owned();
+        assert!(
+            seen.contains("MASTER_CLEAR") || seen.contains("HOLDS_MASTER"),
+            "fixture never reported, so it proves nothing: {seen:?}"
+        );
+        assert!(
+            !seen.contains("HOLDS_MASTER"),
+            "the child inherited the pty master (fd {master_fd}): {seen:?}"
         );
     }
 
