@@ -739,6 +739,7 @@ defmodule Tightbeam.Gateway do
             Archetypes.scaffold_kungfu!(
               config.base_dir,
               call.params.name,
+              call.params.purpose,
               call.origin
             )
 

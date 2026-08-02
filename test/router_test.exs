@@ -106,7 +106,15 @@ defmodule Tightbeam.Wire.RouterTest do
       end,
       "kungfu-list" => fn call ->
         send(parent, {:call, call})
-        %{bundles: [%{name: "agentic-engineering", root_archetype: "product-owner"}]}
+        %{
+          bundles: [
+            %{
+              name: "agentic-engineering",
+              purpose: "Turn ideas into reviewed software.",
+              root_archetype: "product-owner"
+            }
+          ]
+        }
       end
     }
 
@@ -212,7 +220,7 @@ defmodule Tightbeam.Wire.RouterTest do
       dispatch_cli(ctx, "tbc_test", %{
         verb: "kungfu-scaffold",
         asUser: "flynn",
-        params: %{name: "demo"}
+        params: %{name: "demo", purpose: "Help a team do demo work."}
       })
 
     assert response.status == 200
@@ -222,7 +230,7 @@ defmodule Tightbeam.Wire.RouterTest do
                     %{
                       verb: "kungfu-scaffold",
                       origin: "user:flynn",
-                      params: %{name: "demo"}
+                      params: %{name: "demo", purpose: "Help a team do demo work."}
                     }}
   end
 
@@ -239,7 +247,11 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body) == %{
              "result" => %{
                "bundles" => [
-                 %{"name" => "agentic-engineering", "rootArchetype" => "product-owner"}
+                 %{
+                   "name" => "agentic-engineering",
+                   "purpose" => "Turn ideas into reviewed software.",
+                   "rootArchetype" => "product-owner"
+                 }
                ]
              }
            }

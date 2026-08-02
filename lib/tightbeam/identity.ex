@@ -322,6 +322,10 @@ defmodule Tightbeam.Identity do
   @spec scaffold!(String.t(), String.t(), [{String.t(), binary()}], String.t()) ::
           [String.t()]
   def scaffold!(base_dir, name, entries, author) do
+    manifest_relative = Path.join(["kungfu", name, "manifest.toml"])
+    manifest = entries |> Map.new() |> Map.fetch!(manifest_relative)
+    _purpose = bundle_manifest!(manifest, manifest_relative).purpose
+
     init!(base_dir)
     dir = identity_dir(base_dir)
 
@@ -459,19 +463,35 @@ defmodule Tightbeam.Identity do
   end
 
   @doc "Kungfu bundles shipped with this Tightbeam build and their intended roots."
-  @spec available_bundles() :: [%{name: String.t(), root_archetype: String.t()}]
+  @spec available_bundles() :: [
+          %{name: String.t(), purpose: String.t(), root_archetype: String.t()}
+        ]
   def available_bundles do
     available_bundle_names()
     |> Enum.map(fn name ->
       manifest =
-        bundle_root_dir()
-        |> Path.join(name)
+        name
+        |> bundle_dir()
         |> Path.join("manifest.toml")
-        |> File.read!()
-        |> Toml.decode!()
+        |> then(&bundle_manifest!(File.read!(&1), &1))
 
-      %{name: name, root_archetype: Map.fetch!(manifest, "root_archetype")}
+      %{
+        name: name,
+        purpose: manifest.purpose,
+        root_archetype: manifest.root_archetype
+      }
     end)
+  end
+
+  defp bundle_manifest!(content, path) do
+    manifest = Toml.decode!(content)
+    purpose = Map.fetch!(manifest, "purpose")
+
+    unless is_binary(purpose) and String.trim(purpose) != "" do
+      raise ArgumentError, "kungfu manifest purpose must be non-empty prose: #{path}"
+    end
+
+    %{purpose: purpose, root_archetype: Map.fetch!(manifest, "root_archetype")}
   end
 
   @doc "Import the current seed and learned bundle snapshots, then merge them into main."
@@ -592,6 +612,9 @@ defmodule Tightbeam.Identity do
   end
 
   defp bundle_entries(name, bundle) do
+    manifest_path = Path.join(bundle, "manifest.toml")
+    _manifest = bundle_manifest!(File.read!(manifest_path), manifest_path)
+
     bundle
     |> source_entries()
     |> Enum.map(fn

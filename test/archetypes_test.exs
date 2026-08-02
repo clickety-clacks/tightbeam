@@ -247,7 +247,17 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
     for name <- ["", "-demo", "Demo", "demo_name", "demo--name", "demo-"] do
       assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
-        Archetypes.scaffold_kungfu!(ctx.base_dir, name, "user:flynn")
+        Archetypes.scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:flynn")
+      end
+
+      refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
+    end
+  end
+
+  test "kungfu scaffold requires purpose before identity mutation", ctx do
+    for purpose <- [nil, "", "  "] do
+      assert_raise ArgumentError, "kungfu purpose is required", fn ->
+        Archetypes.scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:flynn")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -270,7 +280,12 @@ defmodule Tightbeam.ArchetypesTest do
       assert_raise ArgumentError,
                    "kungfu scaffold target already exists: identity/#{occupied_relative}",
                    fn ->
-                     Archetypes.scaffold_kungfu!(base_dir, name, "user:flynn")
+                     Archetypes.scaffold_kungfu!(
+                       base_dir,
+                       name,
+                       "A useful capability.",
+                       "user:flynn"
+                     )
                    end
 
       assert File.read!(occupied) == "operator-owned"
@@ -283,7 +298,13 @@ defmodule Tightbeam.ArchetypesTest do
   end
 
   test "kungfu scaffold commits on main and publishes live through the identity seam", ctx do
-    paths = Archetypes.scaffold_kungfu!(ctx.base_dir, "demo", "user:flynn")
+    paths =
+      Archetypes.scaffold_kungfu!(
+        ctx.base_dir,
+        "demo",
+        ~s(Help teams turn "ideas" into shipped work.\nKeep it accountable.),
+        "user:flynn"
+      )
     identity_dir = Path.join(ctx.base_dir, "identity")
 
     assert Enum.map(paths, &Path.relative_to(&1, identity_dir)) == scaffold_paths("demo")
@@ -507,6 +528,7 @@ defmodule Tightbeam.ArchetypesTest do
       "kungfu/<name>/capabilities.md",
       "kungfu/<name>/preferred-models.md",
       "kungfu/<name>/intake.md",
+      "kungfu/<name>/manifest.toml",
       "kungfu/<name>/README.md"
     ]
   end

@@ -46,8 +46,34 @@ defmodule Tightbeam.IdentityTest do
     refute snapshot.guidance =~ "role-v1"
 
     assert Identity.available_bundles() == [
-             %{name: "agentic-engineering", root_archetype: "product-owner"}
+             %{
+               name: "agentic-engineering",
+               purpose:
+                 "Give your organization a disciplined way to turn product ideas and bug reports into shipped software, with tracked work, independent review, and verification.",
+               root_archetype: "product-owner"
+             }
            ]
+  end
+
+  test "a shipped bundle manifest without purpose is refused when bundles are read", ctx do
+    File.write!(Path.join(ctx.source, "manifest.toml"), ~s(root_archetype = "product-owner"\n))
+
+    assert_raise KeyError, ~r/key "purpose" not found/, fn ->
+      Identity.available_bundles()
+    end
+  end
+
+  test "a scaffold manifest without purpose is refused before identity mutation", ctx do
+    assert_raise KeyError, ~r/key "purpose" not found/, fn ->
+      Identity.scaffold!(
+        ctx.base,
+        "demo",
+        [{"kungfu/demo/manifest.toml", ~s(root_archetype = "demo-role"\n)}],
+        "operator"
+      )
+    end
+
+    refute File.exists?(Path.join(ctx.base, "identity/.git"))
   end
 
   test "explicit learn installs the shipped bundle and committed receipt", ctx do

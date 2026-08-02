@@ -505,6 +505,7 @@ defmodule Tightbeam.Archetypes do
     "kungfu/<name>/capabilities.md",
     "kungfu/<name>/preferred-models.md",
     "kungfu/<name>/intake.md",
+    "kungfu/<name>/manifest.toml",
     "kungfu/<name>/README.md"
   ]
 
@@ -529,9 +530,10 @@ defmodule Tightbeam.Archetypes do
   def init_identity!(base_dir), do: Tightbeam.Identity.init!(base_dir)
 
   @doc "Create a valid, unelected kungfu starter through the served-identity seam."
-  @spec scaffold_kungfu!(String.t(), String.t(), String.t()) :: [String.t()]
-  def scaffold_kungfu!(base_dir, name, author) do
+  @spec scaffold_kungfu!(String.t(), String.t(), String.t(), String.t()) :: [String.t()]
+  def scaffold_kungfu!(base_dir, name, purpose, author) do
     name = validate_kungfu_name!(name)
+    purpose = validate_kungfu_purpose!(purpose)
 
     entries =
       Enum.map(@kungfu_template_paths, fn template_relative ->
@@ -542,6 +544,7 @@ defmodule Tightbeam.Archetypes do
           |> Application.app_dir(Path.join("priv/kungfu-template", template_relative))
           |> File.read!()
           |> String.replace("<name>", name)
+          |> String.replace("<purpose>", toml_basic_string(purpose))
 
         {relative, content}
       end)
@@ -773,6 +776,28 @@ defmodule Tightbeam.Archetypes do
 
     unless valid?, do: raise(ArgumentError, "invalid kungfu name: #{inspect(name)}")
     name
+  end
+
+  defp validate_kungfu_purpose!(purpose) do
+    unless is_binary(purpose) and String.trim(purpose) != "" do
+      raise ArgumentError, "kungfu purpose is required"
+    end
+
+    purpose
+  end
+
+  defp toml_basic_string(value) do
+    escaped =
+      value
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+      |> String.replace("\b", "\\b")
+      |> String.replace("\t", "\\t")
+      |> String.replace("\n", "\\n")
+      |> String.replace("\f", "\\f")
+      |> String.replace("\r", "\\r")
+
+    ~s("#{escaped}")
   end
 
   defp maybe_put(map, _key, nil), do: map

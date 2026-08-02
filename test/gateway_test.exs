@@ -2556,7 +2556,10 @@ defmodule Tightbeam.GatewayTest do
     scaffold = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-scaffold"]
 
     assert %{code: "forbidden", message: "admin required"} =
-             scaffold.(%{origin: "user:not-admin", params: %{name: "demo"}})
+             scaffold.(%{
+               origin: "user:not-admin",
+               params: %{name: "demo", purpose: "Help a team do demo work."}
+             })
 
     refute File.exists?(Path.join(base_dir, "identity"))
 
@@ -2568,11 +2571,15 @@ defmodule Tightbeam.GatewayTest do
       "kungfu/demo/capabilities.md",
       "kungfu/demo/preferred-models.md",
       "kungfu/demo/intake.md",
+      "kungfu/demo/manifest.toml",
       "kungfu/demo/README.md"
     ]
 
     assert %{kungfu: "demo", paths: paths} =
-             scaffold.(%{origin: "user:flynn", params: %{name: "demo"}})
+             scaffold.(%{
+               origin: "user:flynn",
+               params: %{name: "demo", purpose: "Help a team do demo work."}
+             })
 
     identity_dir = Path.join(base_dir, "identity")
 
@@ -2603,6 +2610,14 @@ defmodule Tightbeam.GatewayTest do
     assert intake =~ "Destination: `identity/kungfu/demo/preferred-models.md`"
     assert intake =~ "`tightbeam config set default-archetype demo-role`"
 
+    bundle_manifest =
+      Toml.decode!(File.read!(Path.join(identity_dir, "kungfu/demo/manifest.toml")))
+
+    assert bundle_manifest == %{
+             "purpose" => "Help a team do demo work.",
+             "root_archetype" => "demo-role"
+           }
+
     readme = File.read!(Path.join(identity_dir, "kungfu/demo/README.md"))
     assert readme =~ "tightbeam-kungfu-crafting"
     assert readme =~ "identity/archetypes"
@@ -2629,7 +2644,10 @@ defmodule Tightbeam.GatewayTest do
     assert_raise ArgumentError,
                  "kungfu scaffold target already exists: identity/archetypes/demo-role.toml",
                  fn ->
-                   scaffold.(%{origin: "user:flynn", params: %{name: "demo"}})
+                   scaffold.(%{
+                     origin: "user:flynn",
+                     params: %{name: "demo", purpose: "Help a team do demo work."}
+                   })
                  end
 
     assert Map.new(expected_relatives, &{&1, File.read!(Path.join(identity_dir, &1))}) == before
@@ -4774,12 +4792,23 @@ defmodule Tightbeam.GatewayTest do
     assert :persistent_term.get(Rules, []) == []
   end
 
-  test "kungfu list reports shipped bundles and their declared root archetypes", ctx do
+  test "kungfu list reports shipped bundles and their declared purposes and root archetypes",
+       ctx do
     base_dir = role_test_base("kungfu-list")
     list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-list"]
 
-    assert %{bundles: [%{name: "agentic-engineering", root_archetype: "product-owner"}]} =
+    assert %{
+             bundles: [
+               %{
+                 name: "agentic-engineering",
+                 purpose: purpose,
+                 root_archetype: "product-owner"
+               }
+             ]
+           } =
              list.(%{origin: "agent:k1", params: %{}})
+
+    assert purpose =~ "turn product ideas and bug reports into shipped software"
   end
 
   test "every unlearn reference kind supplies supported commands that clear it", ctx do
