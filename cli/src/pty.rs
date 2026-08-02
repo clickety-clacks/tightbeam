@@ -23,7 +23,57 @@ pub(crate) struct Output {
     pub(crate) transcript: Vec<u8>,
 }
 
-pub(crate) fn run(command: Command, what: &str, deadline: Instant) -> Result<Output, String> {
+#[derive(Debug)]
+pub(crate) enum RunError {
+    Failed(String),
+    Interrupted {
+        signal: libc::c_int,
+        message: String,
+    },
+}
+
+impl RunError {
+    fn interrupted(signal: libc::c_int, what: &str) -> Self {
+        Self::Interrupted {
+            signal,
+            message: format!("{what} was interrupted by signal {signal}"),
+        }
+    }
+
+    fn with_cleanup_failure(self, cleanup: String) -> Self {
+        match self {
+            Self::Failed(message) => {
+                Self::Failed(format!("{message}; cleanup also failed: {cleanup}"))
+            }
+            Self::Interrupted { signal, message } => Self::Interrupted {
+                signal,
+                message: format!("{message}; cleanup also failed: {cleanup}"),
+            },
+        }
+    }
+
+    pub(crate) fn is_interrupted(&self) -> bool {
+        matches!(self, Self::Interrupted { .. })
+    }
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) | Self::Interrupted { message, .. } => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+pub(crate) fn run(command: Command, what: &str, deadline: Instant) -> Result<Output, RunError> {
     run_with_fds(
         command,
         what,
@@ -39,11 +89,12 @@ fn run_with_fds(
     deadline: Instant,
     input_fd: libc::c_int,
     output_fd: libc::c_int,
-) -> Result<Output, String> {
+) -> Result<Output, RunError> {
     if Instant::now() >= deadline {
         return Err(format!(
             "{what} refused to start because its onboarding lease already expired"
-        ));
+        )
+        .into());
     }
 
     let forwarding = SignalForwarding::install().map_err(|error| error.to_string())?;
@@ -71,17 +122,19 @@ fn run_with_fds(
             format!("wait for {what} failed: {error}; process group left unsignalled")
         })?;
 
+        if let Some(signal) = forwarding.caught() {
+            return abort_group(
+                &mut child,
+                what,
+                &forwarding,
+                RunError::interrupted(signal, what),
+            );
+        }
+
         if leader_exited && master_eof {
             forwarding.disarm();
             let status = child.wait().map_err(|error| error.to_string())?;
             return Ok(Output { status, transcript });
-        }
-
-        if let Some(signal) = forwarding.caught() {
-            terminate_group(&mut child, what, &forwarding)?;
-            return Err(format!(
-                "{what} was interrupted by signal {signal}; terminated it and its process group"
-            ));
         }
 
         if Instant::now() >= deadline {
@@ -90,7 +143,8 @@ fn run_with_fds(
                 "{what} did not finish before its onboarding lease expired; terminated it and \
                  its process group ({})",
                 child.id()
-            ));
+            )
+            .into());
         }
 
         if input_eof && !sent_eof && pending_input.is_empty() && !master_eof {
@@ -179,7 +233,7 @@ fn run_with_fds(
                     secret_screen = true;
                 }
                 if !secret_screen {
-                    if let Err(error) = write_all(output_fd, bytes) {
+                    if let Err(error) = write_all(output_fd, bytes, what, &forwarding) {
                         return abort_group(&mut child, what, &forwarding, error);
                     }
                 }
@@ -189,6 +243,8 @@ fn run_with_fds(
                     if let Err(error) = write_all(
                         output_fd,
                         format!("\r\nAuthorization URL: {url}\r\n").as_bytes(),
+                        what,
+                        &forwarding,
                     ) {
                         return abort_group(&mut child, what, &forwarding, error);
                     }
@@ -282,15 +338,27 @@ fn nonblocking(fd: libc::c_int) -> Result<(), String> {
     Ok(())
 }
 
-fn write_all(fd: libc::c_int, mut bytes: &[u8]) -> Result<(), String> {
+fn write_all(
+    fd: libc::c_int,
+    mut bytes: &[u8],
+    what: &str,
+    forwarding: &SignalForwarding,
+) -> Result<(), RunError> {
     while !bytes.is_empty() {
+        if let Some(signal) = forwarding.caught() {
+            return Err(RunError::interrupted(signal, what));
+        }
         let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
         if count > 0 {
             bytes = &bytes[count as usize..];
         } else {
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error.to_string());
+            if error.kind() == io::ErrorKind::Interrupted {
+                if let Some(signal) = forwarding.caught() {
+                    return Err(RunError::interrupted(signal, what));
+                }
+            } else {
+                return Err(error.to_string().into());
             }
         }
     }
@@ -314,11 +382,12 @@ fn abort_group<T>(
     child: &mut std::process::Child,
     what: &str,
     forwarding: &SignalForwarding,
-    cause: String,
-) -> Result<T, String> {
+    cause: impl Into<RunError>,
+) -> Result<T, RunError> {
+    let cause = cause.into();
     match terminate_group(child, what, forwarding) {
         Ok(()) => Err(cause),
-        Err(cleanup) => Err(format!("{cause}; cleanup also failed: {cleanup}")),
+        Err(cleanup) => Err(cause.with_cleanup_failure(cleanup)),
     }
 }
 

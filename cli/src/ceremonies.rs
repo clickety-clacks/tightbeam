@@ -68,6 +68,30 @@ struct Ceremony<'a> {
     load_harnesses: &'a HarnessLoader<'a>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StageFailure {
+    reason: String,
+    interrupted: bool,
+}
+
+impl From<String> for StageFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            interrupted: false,
+        }
+    }
+}
+
+impl From<crate::pty::RunError> for StageFailure {
+    fn from(error: crate::pty::RunError) -> Self {
+        Self {
+            interrupted: error.is_interrupted(),
+            reason: error.to_string(),
+        }
+    }
+}
+
 pub fn onboard<S, H>(
     identity: &Identity,
     provider: &str,
@@ -156,14 +180,19 @@ where
         }
     };
 
-    let staged = if api_key {
+    let staged: Result<(), StageFailure> = if api_key {
         run_api_key_onboarding(provider, staging, machine.as_deref(), &ceremony)
+            .map_err(StageFailure::from)
     } else {
         run_provider_onboarding(provider, staging, machine.as_deref(), &ceremony)
     };
 
-    if let Err(reason) = staged {
+    if let Err(failure) = staged {
         let _ = fs::remove_dir_all(staging);
+        if failure.interrupted {
+            return Err(failure.reason);
+        }
+        let reason = failure.reason;
         let classified = if reason.contains("unsupported (no subscription)") {
             Some("unsupported_no_subscription")
         } else {
@@ -589,17 +618,17 @@ fn run_provider_onboarding(
     staging: &str,
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
-) -> Result<(), String> {
+) -> Result<(), StageFailure> {
     match provider {
-        "openai" => run_openai_onboarding(staging, ceremony),
+        "openai" => run_openai_onboarding(staging, ceremony).map_err(StageFailure::from),
         "anthropic" => run_anthropic_onboarding(staging, machine, ceremony),
         #[cfg(test)]
         "fixture-provider" => std::fs::write(
             std::path::Path::new(staging).join("fixture.json"),
             "fixture-provider-credential",
         )
-        .map_err(|error| error.to_string()),
-        _ => Err(format!("unsupported provider: {provider}")),
+        .map_err(|error| StageFailure::from(error.to_string())),
+        _ => Err(format!("unsupported provider: {provider}").into()),
     }
 }
 
@@ -894,13 +923,14 @@ fn run_anthropic_onboarding(
     staging: &str,
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
-) -> Result<(), String> {
-    let claude = harness_cli("anthropic", ceremony)?;
+) -> Result<(), StageFailure> {
+    let claude = harness_cli("anthropic", ceremony).map_err(StageFailure::from)?;
     let output = crate::pty::run(
         anthropic_setup_token_command(&claude),
         "claude setup-token",
         ceremony.deadline,
-    )?;
+    )
+    .map_err(StageFailure::from)?;
     let status = output.status;
     let raw = output.transcript;
 
@@ -910,14 +940,16 @@ fn run_anthropic_onboarding(
         // reliably contiguous once the transcript has been replayed.
         let screen = crate::screen::displayed_lines(&raw).join("\n");
         if screen.to_ascii_lowercase().contains("subscription") {
-            return Err("needs_onboarding: unsupported (no subscription)".to_owned());
+            return Err("needs_onboarding: unsupported (no subscription)"
+                .to_owned()
+                .into());
         }
-        return Err(format!("Anthropic setup-token onboarding failed: {status}"));
+        return Err(format!("Anthropic setup-token onboarding failed: {status}").into());
     }
 
     let token = match crate::screen::capture_setup_token(&raw) {
         Some(token) => token,
-        None => return Err(capture_failed(&raw)),
+        None => return Err(capture_failed(&raw).into()),
     };
     // A screen that needed interpreting is never interpreted silently: when capture
     // discarded stale repaint cells to reach the token, the operator is told which.
@@ -925,7 +957,7 @@ fn run_anthropic_onboarding(
         println!("{note}");
     }
 
-    validate_setup_token(&token, machine, ceremony.deadline)?;
+    validate_setup_token(&token, machine, ceremony.deadline).map_err(StageFailure::from)?;
 
     let path = PathBuf::from(staging).join("oauth-token");
     let mut file = fs::OpenOptions::new()
@@ -934,8 +966,8 @@ fn run_anthropic_onboarding(
         .write(true)
         .mode(0o600)
         .open(path)
-        .map_err(|error| error.to_string())?;
-    writeln!(file, "{token}").map_err(|error| error.to_string())?;
+        .map_err(|error| StageFailure::from(error.to_string()))?;
+    writeln!(file, "{token}").map_err(|error| StageFailure::from(error.to_string()))?;
 
     Ok(())
 }
@@ -2070,34 +2102,83 @@ mod tests {
         const INNER: &str = "TIGHTBEAM_CEREMONY_SIGNAL_INNER";
         const MARKER: &str = "TIGHTBEAM_CEREMONY_SIGNAL_MARKER";
         const SURVIVED: &str = "TIGHTBEAM_CEREMONY_SIGNAL_SURVIVED";
+        const STAGING: &str = "TIGHTBEAM_CEREMONY_SIGNAL_STAGING";
+        const CANCEL: &str = "TIGHTBEAM_CEREMONY_SIGNAL_CANCEL";
 
         if std::env::var_os(INNER).is_some() {
             let marker = std::env::var(MARKER).expect("outer supplied marker");
-            let survived = std::env::var(SURVIVED).expect("outer supplied survivor marker");
-            let mut command = ProcessCommand::new("/bin/sh");
-            command.args([
-                "-c",
-                &format!(
-                    "(sleep 1; printf survived > '{survived}') & printf '%s' \"$!\" > \
-                     '{marker}'; wait"
-                ),
-            ]);
-            let result = crate::pty::run(
-                command,
-                "signal-forwarding fixture",
-                Instant::now() + Duration::from_secs(300),
+            let staging = std::env::var(STAGING).expect("outer supplied staging path");
+            let cancel = std::env::var(CANCEL).expect("outer supplied cancel marker");
+            let endpoint = Endpoint {
+                base: "http://signal-fixture.invalid".to_owned(),
+                token: "signal-fixture-token".to_owned(),
+                session_file: None,
+            };
+            let result = onboard(
+                &Identity::User("signal-fixture".to_owned()),
+                "anthropic",
+                false,
+                &endpoint,
+                |_, request, _| {
+                    let request: serde_json::Value =
+                        serde_json::from_str(&request.body_json).unwrap();
+                    match request
+                        .pointer("/params/phase")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("begin") => Ok(Some(serde_json::json!({
+                            "stagingPath": staging,
+                            "leaseId": "signal-fixture-lease",
+                            "leaseTtlMs": 300_000
+                        }))),
+                        Some("cancel") => {
+                            fs::write(&cancel, "entered").unwrap();
+                            thread::sleep(Duration::from_secs(300));
+                            Ok(None)
+                        }
+                        phase => panic!("unexpected onboarding phase: {phase:?}"),
+                    }
+                },
+                |_, _| Ok(None),
             );
-            panic!("the outer process should terminate this run, got {result:?}");
+            let error = result.expect_err("TERM must abort onboarding");
+            assert!(error.contains("interrupted by signal"), "{error}");
+            assert!(
+                !std::path::Path::new(&staging).exists(),
+                "interrupted onboarding left staging behind at {staging}"
+            );
+            assert!(
+                std::path::Path::new(&marker).exists(),
+                "provider fixture never started"
+            );
+            return;
         }
 
-        let marker = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "tightbeam-ceremony-signal-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
+        let marker = root.join("descendant.pid");
         let survived = marker.with_extension("survived");
-        let _ = fs::remove_file(&marker);
-        let _ = fs::remove_file(&survived);
+        let staging = root.join("staging");
+        let cancel = root.join("cancel-entered");
+        let bin = root.join("bin");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\n(sleep 1; printf survived > '{}') &\nprintf '%s' \"$!\" > \
+                 '{}'\nwhile :; do printf '%04096d\\n' 0; done\n",
+                survived.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
         let mut inner = ProcessCommand::new(std::env::current_exe().unwrap());
         inner
             .args([
@@ -2108,8 +2189,12 @@ mod tests {
             .env(INNER, "1")
             .env(MARKER, &marker)
             .env(SURVIVED, &survived)
+            .env(STAGING, &staging)
+            .env(CANCEL, &cancel)
+            .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut inner = inner.spawn().unwrap();
 
@@ -2123,16 +2208,53 @@ mod tests {
             unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGTERM) },
             0
         );
-        let _ = inner.wait().unwrap();
+        thread::sleep(Duration::from_millis(250));
+        let mut inner_stdout = inner.stdout.take().unwrap();
+        let drain = thread::spawn(move || {
+            let mut discarded = Vec::new();
+            let _ = inner_stdout.read_to_end(&mut discarded);
+        });
+        let exit_by = Instant::now() + Duration::from_secs(5);
+        let mut status = None;
+        while status.is_none() && Instant::now() < exit_by {
+            status = inner.try_wait().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let required_kill = status.is_none();
+        if required_kill {
+            assert_eq!(
+                unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGKILL) },
+                0
+            );
+            status = Some(inner.wait().unwrap());
+        }
+        drain.join().unwrap();
         thread::sleep(Duration::from_millis(1_200));
 
         let wrote_after_parent_death = survived.exists();
-        let _ = fs::remove_file(marker);
-        let _ = fs::remove_file(survived);
+        let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
+        let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
+            || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        let staging_survived = staging.exists();
+        let cancel_entered = cancel.exists();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            !required_kill,
+            "TERM left ceremony {} alive; SIGKILL was required ({:?}); cancel entered: {}",
+            inner.id(),
+            status.unwrap(),
+            cancel_entered
+        );
+        assert!(
+            !cancel_entered,
+            "TERM entered the lease-bounded cancellation wait instead of unwinding"
+        );
         assert!(
             !wrote_after_parent_death,
             "descendant {grandchild} continued running after its ceremony parent died"
         );
+        assert!(!alive, "descendant {grandchild} survived TERM");
+        assert!(!staging_survived, "TERM left onboarding staging behind");
     }
 
     #[test]
