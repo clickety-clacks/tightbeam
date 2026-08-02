@@ -103,6 +103,7 @@ fn run_with_fds(
 
     reset_sigchld_before_spawn();
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    drop(command);
     drop(slave);
     forwarding.arm(&child).map_err(|error| error.to_string())?;
     if let Err(error) = nonblocking(master.as_raw_fd()) {
