@@ -275,12 +275,15 @@ impl SignalForwarding {
     /// caller was then free to bank a credential the operator had interrupted -- the child
     /// had finished, but the ONBOARDING had not.
     fn finish(&mut self) -> Option<libc::c_int> {
-        // Strictly once, and it guards two different failures. The one that shows up in a
-        // test: a second pass stamps FINISHED and then FREE onto a slot another ceremony
-        // may already have claimed, wiping ITS record. The one that does not: `users` is a
-        // `usize`, so a second decrement underflows -- panicking in debug, and in release
-        // wrapping to a value that can never reach zero again, after which this process
-        // NEVER restores its signal dispositions for the rest of its life.
+        // Strictly once, and the worse of the two failures it prevents is the one no test
+        // will show you: `users` is a `usize`, so a second decrement underflows. Debug
+        // panics; release wraps to a value that can never reach zero again, and from that
+        // moment this process NEVER restores its signal dispositions -- the ceremony's
+        // handler stands over the operator's shell for the life of the run.
+        //
+        // The lesser one, which the test does cover: a second pass stamps FINISHED and
+        // then FREE onto a slot another ceremony may already have claimed, wiping ITS
+        // record.
         if self.torn_down {
             return None;
         }
