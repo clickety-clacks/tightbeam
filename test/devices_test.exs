@@ -33,6 +33,13 @@ defmodule Tightbeam.DevicesTest do
     assert Devices.by_token(db, second.token).device_id == "dev-1"
   end
 
+  test "the shared cold-start rule makes a directly added first user admin", %{db: db} do
+    assert %{user_id: "installer", is_admin: true} =
+             Devices.add_user(db, "installer", false)
+
+    assert %{user_id: "guest", is_admin: false} = Devices.add_user(db, "guest", false)
+  end
+
   test "pending and denied flows preserve the approval queue", %{db: db} do
     assert {:paired, _} = pair(db, "admin", "Admin")
     assert {:pending, pending} = pair(db, "dev-2", "Guest")

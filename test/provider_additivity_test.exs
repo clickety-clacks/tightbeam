@@ -29,12 +29,8 @@ defmodule Tightbeam.ProviderAdditivityTest do
     :ok = Devices.ensure_schema(db)
     :ok = Tightbeam.Placement.ensure_schema(db)
 
-    {:ok, _rows} =
-      DB.query(
-        db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
-        ["fixture-admin", System.system_time(:second)]
-      )
+    assert %{user_id: "fixture-admin", is_admin: true} =
+             Devices.add_user(db, "fixture-admin", false)
 
     start_supervised!({Credentials, name: Credentials, base_dir: base, machine: "testhost"})
 

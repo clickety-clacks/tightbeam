@@ -750,6 +750,10 @@ defmodule Tightbeam.Gateway do
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
+      "add-user" =>
+        admin_handler(db, fn p ->
+          %{user: Devices.add_user(db, p.user_id, Map.get(p, :is_admin, false))}
+        end),
       "config" => admin_handler(db, fn p -> config_result(db, p) end),
       "harness-processes" =>
         admin_handler(db, fn _params ->

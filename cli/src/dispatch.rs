@@ -600,6 +600,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("provider", provider)],
         )),
+        Command::AddUser {
+            identity,
+            user_id,
+            admin,
+        } => Ok(request(
+            identity,
+            "add-user",
+            vec![],
+            vec![
+                string_field("userId", user_id),
+                format!("\"isAdmin\":{admin}"),
+            ],
+        )),
         Command::ConfigGet { identity, setting } => Ok(request(
             identity,
             "config",
@@ -1004,6 +1017,50 @@ where
             unreachable!("help is handled before dispatch")
         }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
+        Command::AddUser {
+            identity,
+            user_id,
+            admin,
+        } => match crate::users::create_first_if_local(&user_id, admin)? {
+            crate::users::FirstUser::Created {
+                user_id,
+                is_admin,
+                created_at,
+            } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "user": {
+                            "userId": user_id,
+                            "isAdmin": is_admin,
+                            "createdAt": created_at
+                        }
+                    }))
+                    .expect("JSON value serializes")
+                );
+                Ok(())
+            }
+            crate::users::FirstUser::Dispatch => {
+                let endpoint = discover_endpoint()?;
+                require_session_endpoint(&identity, &endpoint)?;
+                let request = request(
+                    &identity,
+                    "add-user",
+                    vec![],
+                    vec![
+                        string_field("userId", &user_id),
+                        format!("\"isAdmin\":{admin}"),
+                    ],
+                );
+                if let Some(result) = send_request(&endpoint, &request, None)? {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                    );
+                }
+                Ok(())
+            }
+        },
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::Onboard {
@@ -1091,6 +1148,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::KungfuList { identity }
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
+        | Command::AddUser { identity, .. }
         | Command::ConfigGet { identity, .. }
         | Command::ConfigSet { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
@@ -1123,6 +1181,14 @@ mod tests {
         assert_eq!(
             body(&["harness-process", "list", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"harness-processes","params":{}}"#
+        );
+    }
+
+    #[test]
+    fn add_user_builds_the_ordinary_authenticated_gateway_request() {
+        assert_eq!(
+            body(&["add-user", "guest", "--admin", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"add-user","params":{"userId":"guest","isAdmin":true}}"#
         );
     }
 
