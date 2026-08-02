@@ -76,11 +76,11 @@ mix run --no-halt                  # boots the gateway; creates state.db and bin
 ```
 
 Set `TIGHTBEAM_BASE_DIR` to choose `base_dir`; the gateway otherwise uses
-`~/.tightbeam`. The CLI also accepts `TIGHTBEAM_HOME` as a fallback, but the
-gateway does not, so do not use it to select an org. The CLI finds the gateway
-through `<base_dir>/gateway.json`. `TIGHTBEAM_PORT` overrides the port. Whatever
-you set for the service, set for the shell you run the CLI from: if they
-disagree, the CLI looks for its gateway in a directory that does not have one.
+`TIGHTBEAM_HOME`, then `~/.tightbeam`. The CLI uses the same fallback order. The
+CLI finds the gateway through `<base_dir>/gateway.json`. `TIGHTBEAM_PORT`
+overrides the port. Whatever you set for the service, set for the shell you run
+the CLI from: if they disagree, the CLI looks for its gateway in a directory
+that does not have one.
 
 With at least one usable harness through preflight, the first boot creates the
 base dir and serves, but **cannot run a turn yet**: it has no credentials, so it

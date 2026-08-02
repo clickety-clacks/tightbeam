@@ -427,6 +427,10 @@ COMMANDS:
       Cancel a pending (scheduled) wake by its id (from the wake command's
       output).
 
+  kungfu list
+      List the kungfu bundles shipped with this Tightbeam build and each
+      bundle's declared root archetype.
+
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
   identity edit <archetype> [--manifest | --skill <name> [--rm]]
                 [--file <path>]
@@ -441,9 +445,6 @@ COMMANDS:
       under priv/kungfu/; learning an installed bundle is a no-op.
   unlearn <bundle>
       Remove a learned kungfu bundle by its committed receipt.
-  kungfu list
-      List the kungfu bundles shipped with this Tightbeam build and each
-      bundle's declared root archetype.
   identity status [<archetype>]
       Report the live revision, session revisions, staleness, and conflicts.
   identity apply (<session> | --all)
@@ -1597,6 +1598,10 @@ mod tests {
     #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
+        assert!(
+            help.find("  kungfu list").unwrap() < help.find("  ADMIN (").unwrap(),
+            "kungfu list is ungated discovery and must not appear under ADMIN"
+        );
         let command_section = help
             .split_once("COMMANDS:\n")
             .unwrap()

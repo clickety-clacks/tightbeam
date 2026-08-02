@@ -38,7 +38,8 @@ defmodule Tightbeam.ArchetypesTest do
     assert snapshot.skills == %{}
     assert snapshot.guidance =~ "expert on Tightbeam, setting it up on this machine"
     assert snapshot.guidance =~ "tightbeam doctor"
-    assert snapshot.guidance =~ "tightbeam onboard <provider> --as-user <userId>"
+    assert snapshot.guidance =~
+             "tightbeam assimilate <ssh-dest> --as-user <adminUserId> --harness <harness>"
 
     assert snapshot.guidance =~
              "Kung fu (功夫, gōngfu) means skill earned through time and practice"
@@ -55,15 +56,13 @@ defmodule Tightbeam.ArchetypesTest do
              "bring ONE concrete offer at a natural pause, do it for them if they say yes, and record the answer. Once per need; a decline closes it."
 
     assert flat_guidance =~
-             "If `tightbeam list` shows two or more user-created default sessions alive at once (origin `user:*`, archetype default)"
+             "If two or more user-created default sessions are alive at once (origin `user:*`, archetype default)"
 
     assert flat_guidance =~ "user.md's Onboarding section is the offer record"
 
     assert flat_guidance =~
              "Never re-raise after a recorded decline; a deferral waits for a new, stronger signal."
 
-    assert snapshot.guidance =~ "tightbeam kungfu list"
-    assert snapshot.guidance =~ "tightbeam learn <bundle>"
     assert snapshot.guidance =~ "default-archetype"
     refute snapshot.guidance =~ "agentic-engineering"
     refute snapshot.guidance =~ "tightbeam learn __list__"
@@ -76,6 +75,29 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+  end
+
+  test "the neutral default's elected baseline skills prescribe no bundle archetype before learn" do
+    default = Archetypes.builtin_default()
+
+    bundle_archetypes =
+      Application.app_dir(:tightbeam, "priv/kungfu/*/archetypes/*.toml")
+      |> Path.wildcard()
+      |> Enum.map(fn path -> path |> File.read!() |> Toml.decode!() |> Map.fetch!("name") end)
+
+    for skill <- default.skills do
+      body =
+        Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
+        |> File.read!()
+
+      pre_learn = body |> String.split("## AFTER LEARNING A KUNGFU", parts: 2) |> hd()
+
+      for archetype <- bundle_archetypes,
+          spelling <- [archetype, String.replace(archetype, "-", " ")] do
+        refute String.contains?(String.downcase(pre_learn), String.downcase(spelling)),
+               "neutral elected skill #{skill} prescribes bundle-only archetype #{archetype} before learn"
+      end
+    end
   end
 
   test "the operating manual names the shell as the path to every substrate verb" do

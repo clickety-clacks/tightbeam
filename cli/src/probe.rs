@@ -1371,7 +1371,28 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     } else {
         println!("{}", human(&report));
     }
-    Ok(())
+    require_runnable_harness_cli(harness_catalog.as_ref())
+}
+
+fn require_runnable_harness_cli(
+    catalog: Option<&crate::harnesses::HarnessCatalog>,
+) -> Result<(), String> {
+    let Some(catalog) = catalog else {
+        return Ok(());
+    };
+    let search_path = std::env::var("PATH").unwrap_or_default();
+    if catalog
+        .harnesses
+        .iter()
+        .any(|harness| crate::preflight::on_path(&harness.cli_binary, &search_path).is_some())
+    {
+        Ok(())
+    } else {
+        Err(
+            "doctor: no registered harness CLI is available on PATH; no harness can run a turn"
+                .to_owned(),
+        )
+    }
 }
 
 fn doctor_harness_catalog(
