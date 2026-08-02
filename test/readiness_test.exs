@@ -105,21 +105,48 @@ defmodule Tightbeam.ReadinessTest do
 
   ## Naming the gap and the fix — the identity-check standard
 
-  test "a missing adapter names the exact path and a command that installs it", ctx do
+  test "a missing adapter names self-healing and only an executable manual command", ctx do
     [module | _] = Harness.all()
+    base = Path.join(ctx.base, "operator's base")
+    config = %{ctx.config | base_dir: base}
     catalog = catalog!(%{module.wire_name() => live("m[medium]")})
 
     line =
-      ctx.config
+      config
       |> Readiness.summary(catalog)
-      |> Readiness.render(ctx.config)
+      |> Readiness.render(config)
       |> Enum.find(&(&1 =~ "adapter missing"))
 
-    assert line =~ ctx.base, "must name the REAL path, not a placeholder"
+    assert line =~ base, "must name the REAL path, not a placeholder"
     assert line =~ Path.basename(module.install_package())
-    assert line =~ "npm install --prefix"
-    assert line =~ module.install_package()
-    assert line =~ "no turn can start"
+    assert line =~ "Boot only checks readiness; it does not install adapters"
+    assert line =~ "install its pinned adapters automatically when the next session is spawned"
+    refute line =~ "tightbeam assimilate"
+
+    [_, command] = String.split(line, "Manual fallback: ", parts: 2)
+    fake_bin = Path.join(ctx.base, "fake-bin")
+    args_file = Path.join(ctx.base, "npm-args")
+    File.mkdir_p!(fake_bin)
+
+    npm = Path.join(fake_bin, "npm")
+    File.write!(npm, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$TIGHTBEAM_TEST_ARGS\"\n")
+    File.chmod!(npm, 0o755)
+
+    assert {"", 0} =
+             System.cmd("sh", ["-c", command],
+               env: [
+                 {"PATH", fake_bin <> ":" <> System.fetch_env!("PATH")},
+                 {"TIGHTBEAM_TEST_ARGS", args_file}
+               ]
+             )
+
+    assert File.read!(args_file) |> String.split("\n", trim: true) == [
+             "install",
+             "--prefix",
+             Path.join(base, "adapters"),
+             "--no-save",
+             "#{module.install_package()}@#{module.adapter_version()}"
+           ]
   end
 
   test "a missing credential names the separate login, auth root, and onboard command", ctx do
