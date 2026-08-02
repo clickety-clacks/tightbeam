@@ -4810,8 +4810,11 @@ defmodule Tightbeam.GatewayTest do
              list.(%{origin: "agent:k1", params: %{}})
 
     assert purpose =~ "turn product ideas and bug reports into shipped software"
-    assert "I keep losing track of what I asked for." in phrases
-    assert "I want someone to check the work before it goes out." in phrases
+    assert "I want my code reviewed before it merges." in phrases
+
+    # The point of phrases is DISCRIMINATION: a phrase another domain's bundle could
+    # honestly claim buys nothing. This one could only be a software-engineering bundle.
+    refute Enum.any?(phrases, &(&1 == "I keep losing track of what I asked for."))
   end
 
   test "every unlearn reference kind supplies supported commands that clear it", ctx do
