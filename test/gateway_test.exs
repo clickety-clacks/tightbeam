@@ -4774,6 +4774,13 @@ defmodule Tightbeam.GatewayTest do
     assert :persistent_term.get(Rules, []) == []
   end
 
+  test "kungfu list reports shipped bundles and their declared root archetypes", ctx do
+    list = Gateway.handlers(gateway_config(ctx.base_dir, ctx.db, 0))["kungfu-list"]
+
+    assert %{bundles: [%{name: "agentic-engineering", root_archetype: "product-owner"}]} =
+             list.(%{origin: "agent:k1", params: %{}})
+  end
+
   test "every unlearn reference kind supplies supported commands that clear it", ctx do
     ensure_global_registry()
     base_dir = role_test_base("unlearn-reference-property")

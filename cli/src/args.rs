@@ -214,6 +214,9 @@ pub enum Command {
         identity: Identity,
         name: String,
     },
+    KungfuList {
+        identity: Identity,
+    },
     IdentityApply {
         identity: Identity,
         session_key: Option<String>,
@@ -438,6 +441,9 @@ COMMANDS:
       under priv/kungfu/; learning an installed bundle is a no-op.
   unlearn <bundle>
       Remove a learned kungfu bundle by its committed receipt.
+  kungfu list
+      List the kungfu bundles shipped with this Tightbeam build and each
+      bundle's declared root archetype.
   identity status [<archetype>]
       Report the live revision, session revisions, staleness, and conflicts.
   identity apply (<session> | --all)
@@ -1266,6 +1272,14 @@ fn parse_with_optional_catalog(
             })
         }
         "identity" => parse_identity_command(&parsed, flags),
+        "kungfu" => {
+            if parsed.positional.as_slice() != ["kungfu", "list"] {
+                return Err("usage: tightbeam kungfu list".to_owned());
+            }
+            Ok(Command::KungfuList {
+                identity: identity(flags)?,
+            })
+        }
         "learn" | "unlearn" => {
             if parsed.positional.len() != 2 {
                 return Err(format!(
@@ -1325,7 +1339,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -1624,6 +1638,7 @@ mod tests {
                 "effort-rule",
                 "harness-process",
                 "identity",
+                "kungfu",
                 "learn",
                 "list",
                 "onboard",
@@ -1657,6 +1672,7 @@ mod tests {
             "config get default-archetype",
             "config set default-archetype <name>",
             "harness-process list",
+            "kungfu list",
         ] {
             assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
         }
@@ -1942,7 +1958,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -2223,6 +2239,12 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     session_key: "agent:retired".to_owned(),
                     archetype: "default".to_owned(),
+                },
+            ),
+            (
+                strings(&["kungfu", "list", "--as-user", "flynn"]),
+                Command::KungfuList {
+                    identity: Identity::User("flynn".to_owned()),
                 },
             ),
             (

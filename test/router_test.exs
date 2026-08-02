@@ -103,6 +103,10 @@ defmodule Tightbeam.Wire.RouterTest do
       "kungfu-scaffold" => fn call ->
         send(parent, {:call, call})
         %{kungfu: call.params.name}
+      end,
+      "kungfu-list" => fn call ->
+        send(parent, {:call, call})
+        %{bundles: [%{name: "agentic-engineering", root_archetype: "product-owner"}]}
       end
     }
 
@@ -219,6 +223,32 @@ defmodule Tightbeam.Wire.RouterTest do
                       verb: "kungfu-scaffold",
                       origin: "user:flynn",
                       params: %{name: "demo"}
+                    }}
+  end
+
+  test "kungfu listing crosses the closed CLI verb router", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "kungfu-list",
+        asUser: "flynn",
+        params: %{}
+      })
+
+    assert response.status == 200
+
+    assert JSON.decode!(response.resp_body) == %{
+             "result" => %{
+               "bundles" => [
+                 %{"name" => "agentic-engineering", "root_archetype" => "product-owner"}
+               ]
+             }
+           }
+
+    assert_receive {:call,
+                    %{
+                      verb: "kungfu-list",
+                      origin: "user:flynn",
+                      params: %{}
                     }}
   end
 

@@ -44,6 +44,10 @@ defmodule Tightbeam.IdentityTest do
     assert snapshot.skills == %{}
     assert snapshot.guidance =~ "tightbeam learn <bundle>"
     refute snapshot.guidance =~ "role-v1"
+
+    assert Identity.available_bundles() == [
+             %{name: "agentic-engineering", root_archetype: "product-owner"}
+           ]
   end
 
   test "explicit learn installs the shipped bundle and committed receipt", ctx do

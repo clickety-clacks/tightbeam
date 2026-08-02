@@ -458,6 +458,22 @@ defmodule Tightbeam.Identity do
     |> Enum.sort()
   end
 
+  @doc "Kungfu bundles shipped with this Tightbeam build and their intended roots."
+  @spec available_bundles() :: [%{name: String.t(), root_archetype: String.t()}]
+  def available_bundles do
+    available_bundle_names()
+    |> Enum.map(fn name ->
+      manifest =
+        bundle_root_dir()
+        |> Path.join(name)
+        |> Path.join("manifest.toml")
+        |> File.read!()
+        |> Toml.decode!()
+
+      %{name: name, root_archetype: Map.fetch!(manifest, "root_archetype")}
+    end)
+  end
+
   @doc "Import the current seed and learned bundle snapshots, then merge them into main."
   @spec relearn!(String.t(), String.t()) ::
           {:ok, String.t()} | {:conflict, [String.t()]} | {:error, String.t()}

@@ -730,6 +730,7 @@ defmodule Tightbeam.Gateway do
       "learn" => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
       "unlearn" =>
         admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
+      "kungfu-list" => fn _call -> %{bundles: Identity.available_bundles()} end,
       "identity-apply" =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
       "kungfu-scaffold" =>

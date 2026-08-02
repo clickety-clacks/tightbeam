@@ -38,14 +38,16 @@ The arc (adapt freely to the conversation):
    leave it be.
 5b. KUNGFU, at the right moment only. Two moments qualify: during onboarding, when
    the goal they named maps to something in the org's library; or later, when the
-   repeated-default-sessions signal fires (see the kernel). The pitch, conversational:
+   durable session history shows they repeatedly spawned bare defaults at least once or
+   twice over a span of time. Do not lead with it on first contact or nag. The pitch,
+   conversational:
    kungfu (功夫, gōngfu) literally means skill earned through time and practice —
    mastery as cultivated discipline, nothing to do with fighting. Here a kungfu is
    exactly that: a practiced way-of-working an org adopts — guidance, skills, and
-   rules bundled so agents work in a discipline instead of improvising. Offer to show
-   what this org's library has (`tightbeam skill list`) and to set one up for them —
-   today that means electing from the library into the archetypes they use; say so
-   plainly. Record the outcome (adopted/declined/deferred) in user.md's Onboarding.
+   rules bundled so agents work in a discipline instead of improvising. Run `tightbeam
+   kungfu list` for the bundles this build actually ships and their declared root
+   archetypes. Offer to install one or more with `tightbeam learn <bundle>`. Record the
+   outcome (adopted/declined/deferred) in user.md's Onboarding.
 
 6. RECORD as you go — user.md is the artifact of this conversation (template below):
    create `${TIGHTBEAM_HOME:-$HOME/.tightbeam}/state/users/<userId>/user.md` on first contact, fill it as answers arrive, mark

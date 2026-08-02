@@ -1,7 +1,7 @@
 defmodule Tightbeam.ArchetypesTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Archetypes, Identity}
+  alias Tightbeam.{Archetypes, Identity, Rails, Rules}
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-archetypes-#{System.unique_integer([:positive])}")
@@ -30,6 +30,31 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert Path.wildcard(Path.join(identity_dir, "guidance/*.md")) ==
              [Path.join(identity_dir, "guidance/operating-model.md")]
+
+    assert %{"default" => default} = Archetypes.load!(ctx.base_dir)
+    assert default.skills == ["tightbeam-onboarding"]
+
+    snapshot = Identity.snapshot!(ctx.base_dir, "default", :codex)
+    assert snapshot.skills == %{}
+    assert snapshot.guidance =~ "expert on Tightbeam, setting it up on this machine"
+    assert snapshot.guidance =~ "tightbeam doctor"
+    assert snapshot.guidance =~ "tightbeam onboard <provider> --as-user <userId>"
+
+    assert snapshot.guidance =~
+             "Kung fu (功夫, gōngfu) means skill earned through time and practice"
+
+    assert snapshot.guidance =~ "repeatedly spawned bare default archetypes"
+    assert snapshot.guidance =~ "tightbeam kungfu list"
+    assert snapshot.guidance =~ "tightbeam learn <bundle>"
+    assert snapshot.guidance =~ "default-archetype"
+    refute snapshot.guidance =~ "agentic-engineering"
+    refute snapshot.guidance =~ "tightbeam learn __list__"
+
+    assert Rails.load!(ctx.base_dir) == []
+    assert Rules.load!(ctx.base_dir, []) == []
+    refute File.exists?(Path.join(identity_dir, "skills"))
+    refute File.exists?(Path.join(identity_dir, "rails"))
+    refute File.exists?(Path.join(identity_dir, "rules"))
 
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
