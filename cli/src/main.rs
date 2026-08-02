@@ -9,7 +9,6 @@ mod harnesses;
 mod lease;
 mod preflight;
 mod probe;
-mod pty;
 mod screen;
 mod users;
 

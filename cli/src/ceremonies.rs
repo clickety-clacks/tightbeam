@@ -452,7 +452,7 @@ fn run_bounded(
 /// nothing here parses its output for one; what the operator needs from it -- the device
 /// code and the verification URL -- is only visible if it is shown. Where the credential
 /// DOES travel over the child's own output, capture and mirror are mutually exclusive and
-/// the mirror loses: see [`crate::pty::run`], which returns a transcript and writes not
+/// the mirror loses: a capture stream is read, never echoed, and writes not
 /// one child byte to the terminal.
 fn run_bounded_reporting_url(
     command: ProcessCommand,
@@ -533,7 +533,7 @@ fn attend(
     }
 
     let mut output = Vec::new();
-    let mut printed_url = None;
+    let mut printed_url: Option<String> = None;
 
     loop {
         if let Some(stdout) = &mut captured_stdout {
@@ -966,39 +966,7 @@ fn run_anthropic_onboarding(
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), StageFailure> {
-    let claude = harness_cli("anthropic", ceremony).map_err(StageFailure::from)?;
-    let output = crate::pty::run(
-        anthropic_setup_token_command(&claude),
-        "claude setup-token",
-        ceremony.deadline,
-    )
-    .map_err(StageFailure::from)?;
-    let status = output.status;
-    let raw = output.transcript;
-
-    if !status.success() {
-        // Read the SCREEN, not the byte stream. The TUI positions each word with a
-        // cursor jump instead of writing the spaces between them, so a phrase is only
-        // reliably contiguous once the transcript has been replayed.
-        let screen = crate::screen::displayed_lines(&raw).join("\n");
-        if screen.to_ascii_lowercase().contains("subscription") {
-            return Err("needs_onboarding: unsupported (no subscription)"
-                .to_owned()
-                .into());
-        }
-        return Err(format!("Anthropic setup-token onboarding failed: {status}").into());
-    }
-
-    let token = match crate::screen::capture_setup_token(&raw) {
-        Some(token) => token,
-        None => return Err(capture_failed(&raw).into()),
-    };
-    // A screen that needed interpreting is never interpreted silently: when capture
-    // discarded stale repaint cells to reach the token, the operator is told which.
-    if let Some(note) = crate::screen::capture_note(&raw) {
-        println!("{note}");
-    }
-
+    let token = read_setup_token()?;
     validate_setup_token(&token, machine, ceremony.deadline).map_err(StageFailure::from)?;
 
     let path = PathBuf::from(staging).join("oauth-token");
@@ -1012,6 +980,42 @@ fn run_anthropic_onboarding(
     writeln!(file, "{token}").map_err(|error| StageFailure::from(error.to_string()))?;
 
     Ok(())
+}
+
+/// Ask for the token instead of running the login and reading it off the screen.
+///
+/// Tightbeam used to drive `claude setup-token` under its own pty and reconstruct the token
+/// from the TUI's repaints. Nothing else does that -- the previous tightbeam ran the command
+/// on the operator's terminal and told them to save what it printed, and openclaw takes the
+/// token as a configured value. The capture existed so an agent could install unattended,
+/// but the flow needs a human at a browser either way, and an agent doing the install
+/// already has a terminal of its own. We were rebuilding the caller's terminal inside the
+/// callee.
+///
+/// Whoever is installing -- person or agent -- runs the command and hands back what it
+/// prints. What is NOT given up: the token is still validated with one authenticated call
+/// before anything is staged, because a pasted token can be truncated by a bad copy exactly
+/// as a captured one could be by a bad read.
+fn read_setup_token() -> Result<String, StageFailure> {
+    println!(
+        "Run `claude setup-token`, complete the sign-in in your browser, and paste the token \
+         it prints here (then press enter):"
+    );
+
+    let mut token = String::new();
+    io::stdin()
+        .read_line(&mut token)
+        .map_err(|error| StageFailure::from(format!("could not read the token: {error}")))?;
+    let token = token.trim().to_owned();
+
+    if token.is_empty() {
+        return Err(
+            "no token was provided; onboarding needs the token `claude setup-token` prints"
+                .to_owned()
+                .into(),
+        );
+    }
+    Ok(token)
 }
 
 /// The route and headers a SUBSCRIPTION credential is authenticated with.
@@ -1132,21 +1136,6 @@ fn unvalidated_setup_token(error: &str, host: &str) -> String {
          {error}. The token was NOT validated. Nothing was banked -- the anthropic \
          credential on {host} is unchanged. This is a network failure on {host}, not a \
          verdict on the token or the subscription."
-    )
-}
-
-/// Say what was looked for without serializing the capture.
-///
-/// A failed setup-token capture can still contain a valid year-long credential. The old
-/// path copied those bytes to `setup-token-failure.log`, turning the most sensitive
-/// output of the ceremony into a durable diagnostic. The screen reader explains the
-/// shape it found; the bytes themselves stay only in memory and are dropped on refusal.
-fn capture_failed(raw: &[u8]) -> String {
-    format!(
-        "Anthropic setup-token was not captured: claude ran and exited successfully, but \
-         {}. Nothing was banked, and the capture was not written to a log because it may \
-         contain a live credential.",
-        crate::screen::refusal_reason(raw)
     )
 }
 
@@ -1974,26 +1963,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_capture_failure_never_prints_or_persists_the_candidate() {
-        let candidate = "future:v2+SYNTHETIC/NOT-A-CREDENTIAL==";
-        let transcript = format!(
-            "Your OAuth token (valid for 1 year):\r\n\r\n{candidate}\r\nStore this token securely.\r\n"
-        );
-        let message = capture_failed(transcript.as_bytes());
-
-        assert!(
-            !message.contains(candidate),
-            "candidate leaked in {message}"
-        );
-        assert!(
-            message.contains("credential boundary cannot be trusted"),
-            "{message}"
-        );
-        assert!(message.contains("not written to a log"), "{message}");
-        assert!(!message.contains("setup-token-failure.log"), "{message}");
-    }
-
     /// Unreachable is not invalid. A network failure during validation must implicate
     /// neither the capture nor the account, or the operator burns a single-use
     /// authorization re-authorizing something that was never broken.
@@ -2141,169 +2110,6 @@ mod tests {
             .map(|out| !out.stdout.trim_ascii().is_empty())
             .expect("could not determine whether the grandchild is alive: `ps` did not run");
         assert!(!alive, "grandchild {grandchild} outlived the group kill");
-    }
-
-    /// Terminating the CLI itself must have the same tree semantics as expiry. This is a
-    /// re-exec because installing SIGTERM in the cargo test process would affect unrelated
-    /// tests running beside it.
-    #[test]
-    fn killing_the_ceremony_parent_leaves_no_surviving_child() {
-        const INNER: &str = "TIGHTBEAM_CEREMONY_SIGNAL_INNER";
-        const MARKER: &str = "TIGHTBEAM_CEREMONY_SIGNAL_MARKER";
-        const SURVIVED: &str = "TIGHTBEAM_CEREMONY_SIGNAL_SURVIVED";
-        const STAGING: &str = "TIGHTBEAM_CEREMONY_SIGNAL_STAGING";
-        const CANCEL: &str = "TIGHTBEAM_CEREMONY_SIGNAL_CANCEL";
-
-        if std::env::var_os(INNER).is_some() {
-            let marker = std::env::var(MARKER).expect("outer supplied marker");
-            let staging = std::env::var(STAGING).expect("outer supplied staging path");
-            let cancel = std::env::var(CANCEL).expect("outer supplied cancel marker");
-            let endpoint = Endpoint {
-                base: "http://signal-fixture.invalid".to_owned(),
-                token: "signal-fixture-token".to_owned(),
-                origin: crate::dispatch::Origin::Provisioned,
-            };
-            let result = onboard(
-                &Identity::User("signal-fixture".to_owned()),
-                "anthropic",
-                false,
-                &endpoint,
-                |_, request, _| {
-                    let request: serde_json::Value =
-                        serde_json::from_str(&request.body_json).unwrap();
-                    match request
-                        .pointer("/params/phase")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        Some("begin") => Ok(Some(serde_json::json!({
-                            "stagingPath": staging,
-                            "leaseId": "signal-fixture-lease",
-                            "leaseTtlMs": 300_000
-                        }))),
-                        Some("cancel") => {
-                            fs::write(&cancel, "entered").unwrap();
-                            thread::sleep(Duration::from_secs(300));
-                            Ok(None)
-                        }
-                        phase => panic!("unexpected onboarding phase: {phase:?}"),
-                    }
-                },
-                |_, _| Ok(None),
-            );
-            let error = result.expect_err("TERM must abort onboarding");
-            assert!(error.contains("interrupted by signal"), "{error}");
-            assert!(
-                !std::path::Path::new(&staging).exists(),
-                "interrupted onboarding left staging behind at {staging}"
-            );
-            assert!(
-                std::path::Path::new(&marker).exists(),
-                "provider fixture never started"
-            );
-            return;
-        }
-
-        let root = std::env::temp_dir().join(format!(
-            "tightbeam-ceremony-signal-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let marker = root.join("descendant.pid");
-        let survived = marker.with_extension("survived");
-        let staging = root.join("staging");
-        let cancel = root.join("cancel-entered");
-        let bin = root.join("bin");
-        fs::create_dir_all(&staging).unwrap();
-        fs::create_dir_all(&bin).unwrap();
-        let claude = bin.join("claude");
-        fs::write(
-            &claude,
-            format!(
-                "#!/bin/sh\n(sleep 1; printf survived > '{}') &\nprintf '%s' \"$!\" > \
-                 '{}'\nwhile :; do printf '%04096d\\n' 0; done\n",
-                survived.display(),
-                marker.display()
-            ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut inner = ProcessCommand::new(std::env::current_exe().unwrap());
-        inner
-            .args([
-                "--exact",
-                "ceremonies::tests::killing_the_ceremony_parent_leaves_no_surviving_child",
-                "--nocapture",
-            ])
-            .env(INNER, "1")
-            .env(MARKER, &marker)
-            .env(SURVIVED, &survived)
-            .env(STAGING, &staging)
-            .env(CANCEL, &cancel)
-            .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut inner = inner.spawn().unwrap();
-
-        let ready_by = Instant::now() + Duration::from_secs(5);
-        while !marker.exists() && Instant::now() < ready_by {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let grandchild = fs::read_to_string(&marker).expect("fixture recorded its descendant");
-
-        assert_eq!(
-            unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGTERM) },
-            0
-        );
-        thread::sleep(Duration::from_millis(250));
-        let mut inner_stdout = inner.stdout.take().unwrap();
-        let drain = thread::spawn(move || {
-            let mut discarded = Vec::new();
-            let _ = inner_stdout.read_to_end(&mut discarded);
-        });
-        let exit_by = Instant::now() + Duration::from_secs(5);
-        let mut status = None;
-        while status.is_none() && Instant::now() < exit_by {
-            status = inner.try_wait().unwrap();
-            thread::sleep(Duration::from_millis(10));
-        }
-        let required_kill = status.is_none();
-        if required_kill {
-            assert_eq!(
-                unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGKILL) },
-                0
-            );
-            status = Some(inner.wait().unwrap());
-        }
-        drain.join().unwrap();
-        thread::sleep(Duration::from_millis(1_200));
-
-        let wrote_after_parent_death = survived.exists();
-        let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
-        let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
-            || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
-        let staging_survived = staging.exists();
-        let cancel_entered = cancel.exists();
-        fs::remove_dir_all(&root).unwrap();
-        assert!(
-            !required_kill,
-            "TERM left ceremony {} alive; SIGKILL was required ({:?}); cancel entered: {}",
-            inner.id(),
-            status.unwrap(),
-            cancel_entered
-        );
-        assert!(
-            !cancel_entered,
-            "TERM entered the lease-bounded cancellation wait instead of unwinding"
-        );
-        assert!(
-            !wrote_after_parent_death,
-            "descendant {grandchild} continued running after its ceremony parent died"
-        );
-        assert!(!alive, "descendant {grandchild} survived TERM");
-        assert!(!staging_survived, "TERM left onboarding staging behind");
     }
 
     /// Codex uses the pipe-backed bounded runner rather than the Anthropic pty runner.
@@ -3658,12 +3464,6 @@ mod tests {
 
     /// The width deliberately fits the current 109-character token, but is not a capture
     /// gate. Capture owns provider shape; the pty owns presentation.
-    #[test]
-    fn the_pinned_width_keeps_the_observed_token_whole_without_encoding_its_length() {
-        assert_eq!(crate::pty::CEREMONY_COLUMNS, 109);
-        assert!(usize::from(crate::pty::CEREMONY_COLUMNS) >= 109);
-        assert_ne!(crate::pty::CEREMONY_COLUMNS, 108);
-    }
 
     #[test]
     fn staging_path_reads_the_wire_shape_the_gateway_actually_sends() {
