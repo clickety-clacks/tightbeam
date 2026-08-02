@@ -609,7 +609,10 @@ defmodule Tightbeam.PlacementTest do
   } do
     token_dir = Path.join([base_dir, "auth", "claude"])
     File.mkdir_p!(token_dir)
-    File.write!(Path.join(token_dir, ".credentials.json"), "sk-ant-oat01-test\n")
+    File.write!(
+      Path.join(token_dir, ".credentials.json"),
+      ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-test"}})
+    )
 
     config = %{
       base_dir: base_dir,

@@ -423,7 +423,7 @@ defmodule Tightbeam.GatewayTest do
       Path.join(System.tmp_dir!(), "gateway-catalog-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join([catalog_base, "auth", "claude"]))
-    File.write!(Path.join([catalog_base, "auth", "claude", ".credentials.json"]), "test-token")
+    File.write!(Path.join([catalog_base, "auth", "claude", ".credentials.json"]), ~s({"claudeAiOauth":{"accessToken":"test-token"}}))
 
     claude_models =
       JSON.encode!(%{
@@ -6407,7 +6407,7 @@ defmodule Tightbeam.GatewayTest do
     if ready? do
       auth_dir = Path.join([base_dir, "auth", "claude"])
       File.mkdir_p!(auth_dir)
-      File.write!(Path.join(auth_dir, ".credentials.json"), "test-token")
+      File.write!(Path.join(auth_dir, ".credentials.json"), ~s({"claudeAiOauth":{"accessToken":"test-token"}}))
     end
 
     on_exit(fn ->

@@ -16,7 +16,10 @@ defmodule Tightbeam.ModelCatalogTest do
     :ok = Placement.ensure_schema(db)
     token_dir = Path.join([base_dir, "auth", "claude"])
     File.mkdir_p!(token_dir)
-    File.write!(Path.join(token_dir, ".credentials.json"), "fixture-token")
+    File.write!(
+      Path.join(token_dir, ".credentials.json"),
+      ~s({"claudeAiOauth":{"accessToken":"fixture-token"}})
+    )
 
     claude_json = fixture_body("claude_models.jsonc")
     claude_detail_json = fixture_body("claude_model_detail.jsonc")
@@ -553,7 +556,10 @@ defmodule Tightbeam.ModelCatalogTest do
       satellite_base = Path.join(ctx.base_dir, "satellite-root")
       File.mkdir_p!(Path.join([satellite_base, "auth", "claude"]))
       File.mkdir_p!(Path.join([satellite_base, "auth", "codex"]))
-      File.write!(Path.join([satellite_base, "auth", "claude", ".credentials.json"]), @claude_secret)
+      File.write!(
+        Path.join([satellite_base, "auth", "claude", ".credentials.json"]),
+        ~s({"claudeAiOauth":{"accessToken":"#{@claude_secret}"}})
+      )
 
       File.write!(
         Path.join([satellite_base, "auth", "codex", "auth.json"]),
@@ -614,8 +620,14 @@ defmodule Tightbeam.ModelCatalogTest do
       claude_line = Enum.join(claude, " ")
       refute claude_line =~ @claude_secret
 
-      assert claude_line =~
-               "credential=$(cat #{Path.join([ctx.satellite_base, "auth", "claude", ".credentials.json"])})"
+      # A subscription credential is Claude Code's OAuth record, so the far host PARSES it
+      # rather than cat-ing it -- but the property this test exists for is unchanged and
+      # asserted above: the secret is captured into a shell variable on the owning host and
+      # never appears in any argv. `python3` is handed the PATH, not the token.
+      credential_file = Path.join([ctx.satellite_base, "auth", "claude", ".credentials.json"])
+      assert claude_line =~ "credential=$(python3 -c "
+      assert claude_line =~ credential_file
+      assert claude_line =~ "accessToken"
 
       assert claude_line =~ ~s(-H "authorization: Bearer $credential")
       assert ["ssh" | claude_rest] = claude

@@ -1,4 +1,5 @@
 defmodule Tightbeam.Credentials do
+  require Logger
   @moduledoc """
   Per-machine credential onboarding and lifecycle.
 
@@ -559,9 +560,11 @@ defmodule Tightbeam.Credentials do
     target = credential_target(state)
 
     Enum.each(harnesses_for_provider(provider), fn module ->
+      home = Homes.home_path(state.base_dir, state.machine, module.id())
+
       module.reconcile_home(
         target,
-        Homes.home_path(state.base_dir, state.machine, module.id()),
+        home,
         %{
           harness: module.id(),
           machine: state.machine,
@@ -570,7 +573,34 @@ defmodule Tightbeam.Credentials do
           harvest_auth: false
         }
       )
+
+      warm_home(module, target, home)
     end)
+  end
+
+  # Give the harness one run before anyone asks it what it can do.
+  #
+  # Some harnesses learn an account's entitlements only by asking the server and cache the
+  # answer in their home; a catalog derived from a cold home reports a subset as the truth.
+  # It does not recover on its own -- an incomplete catalog means nothing can be placed, so
+  # no session spawns, so the cache never fills. Warming here, where the credential has just
+  # been proven, is what breaks that circle.
+  #
+  # Best effort by construction: a harness need not implement it, and a warm that fails must
+  # not fail an onboarding whose credential already validated.
+  defp warm_home(module, target, home) do
+    if function_exported?(module, :warm_home, 2) do
+      case module.warm_home(target, home) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.info(
+            "#{module.id()} home was not warmed on #{inspect(target.host_name)}: " <>
+              "#{inspect(reason)} — its catalog will fill in on first use"
+          )
+      end
+    end
   end
 
   defp credential_target(state),

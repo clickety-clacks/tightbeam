@@ -615,7 +615,10 @@ defmodule Tightbeam.CredentialsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, ".credentials.json"), "sk-ant-oat01-staged")
+      File.write!(
+        Path.join(staging, ".credentials.json"),
+        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-staged"}})
+      )
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata = credential_metadata(ctx.base, "claude")
