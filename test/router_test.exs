@@ -164,6 +164,38 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
   end
 
+  test "an empty org cannot use the local first-user exception over the wire", ctx do
+    db = :"empty_wire_add_user_db_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: db,
+      start: {DB, :start_link, [[path: ":memory:", name: db]]}
+    })
+
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    opts =
+      Keyword.merge(ctx.opts,
+        db: db,
+        handlers: Gateway.handlers(%{db: db, base_dir: ctx.base_dir})
+      )
+
+    response =
+      dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
+        verb: "add-user",
+        asUser: "first",
+        params: %{userId: "first", isAdmin: true}
+      })
+
+    assert response.status == 403
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "forbidden", "message" => "admin required"}
+           }
+
+    assert Devices.user(db, "first") == nil
+  end
+
   test "authenticated harness projection route returns the registry bytes", ctx do
     request =
       conn(:get, "/harnesses")

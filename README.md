@@ -91,14 +91,26 @@ terminal.
 
 ### Connect your first client — do this BEFORE onboarding
 
-A fresh org has no users. **The first client to connect is auto-approved and its
-user becomes the admin**: point your client at `TIGHTBEAM_ADVERTISED_URL`, pair
-with a claimed name, and it succeeds instantly — no approval step, because
-there is nobody yet to approve it.
+A fresh org has no users. The first user becomes the admin through either of
+these bootstrap paths:
 
-Do this first. Onboarding is admin-only, so running it before any client has
-paired fails with `forbidden: admin required` and there is no other way to
-create that first admin.
+- For an agent-driven install on the box, create the user locally:
+
+  ```sh
+  <base_dir>/bin/tightbeam add-user <userId>
+  ```
+
+  This empty-org exception is local to the box. After the first user exists,
+  the same command uses ordinary admin authentication, for example
+  `tightbeam add-user <userId> --as-user <adminUserId>`; pass `--admin` when the
+  new user should also be an admin.
+- For a human with a client, point it at `TIGHTBEAM_ADVERTISED_URL` and pair
+  with a claimed name. The first client is auto-approved and its user becomes
+  the admin immediately, with no approval step because nobody exists to
+  approve it yet.
+
+Do one of these first. Onboarding is admin-only, so it fails with
+`forbidden: admin required` until the first admin exists.
 
 Every client after this one pairs as `pending` and must be approved by the admin.
 

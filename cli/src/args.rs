@@ -227,6 +227,11 @@ pub enum Command {
         provider: String,
         api_key: bool,
     },
+    AddUser {
+        identity: Identity,
+        user_id: String,
+        admin: bool,
+    },
     ConfigGet {
         identity: Identity,
         setting: String,
@@ -457,6 +462,11 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+
+  add-user <userId> [--admin]
+      Add a user, optionally as an admin. An existing admin may run this over
+      the ordinary gateway path. On an empty local org, the first user is
+      created directly and becomes admin by the existing cold-start rule.
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
   harness-process list
@@ -542,7 +552,8 @@ fn opens_entry(line: &str, command: &str) -> bool {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
-    "abort", "all", "api-key", "dry-run", "help", "json", "manifest", "resolve", "rm", "tree",
+    "abort", "admin", "all", "api-key", "dry-run", "help", "json", "manifest", "resolve", "rm",
+    "tree",
 ];
 
 #[derive(Debug)]
@@ -1297,6 +1308,21 @@ fn parse_with_optional_catalog(
             }
         }
         "onboard" => parse_onboard(&parsed, flags),
+        "add-user" => {
+            let user_id = parsed
+                .positional
+                .get(1)
+                .cloned()
+                .ok_or_else(|| "usage: tightbeam add-user <userId> [--admin]".to_owned())?;
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam add-user <userId> [--admin]".to_owned());
+            }
+            Ok(Command::AddUser {
+                identity: identity(flags)?,
+                user_id,
+                admin: flags.contains_key("admin"),
+            })
+        }
         "config" => parse_config(&parsed, flags),
         "update-clients" => {
             if parsed.positional.len() != 1 {
@@ -1340,7 +1366,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -1596,6 +1622,32 @@ mod tests {
     }
 
     #[test]
+    fn add_user_names_the_target_separately_from_the_caller() {
+        assert_eq!(
+            parse(strings(&[
+                "add-user",
+                "guest",
+                "--admin",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::AddUser {
+                identity: Identity::User("flynn".to_owned()),
+                user_id: "guest".to_owned(),
+                admin: true
+            })
+        );
+        assert_eq!(
+            parse(strings(&["add-user", "guest"])),
+            Ok(Command::AddUser {
+                identity: Identity::Session,
+                user_id: "guest".to_owned(),
+                admin: false
+            })
+        );
+    }
+
+    #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
         assert!(
@@ -1635,6 +1687,7 @@ mod tests {
                 "artifacts",
                 "attest",
                 "attests",
+                "add-user",
                 "cancel-wake",
                 "config",
                 "decision-requests",
@@ -1674,6 +1727,7 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
+            "add-user <userId> [--admin]",
             "config get default-archetype",
             "config set default-archetype <name>",
             "harness-process list",
@@ -1963,7 +2017,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, artifact-record, artifacts, config, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, doctor, assimilate, harness-process".to_owned())
         );
     }
 

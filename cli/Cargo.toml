@@ -11,6 +11,7 @@ rust-version = "1.85"
 
 [dependencies]
 libc = "0.2"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde_json = "1"
 ureq = { version = "2", default-features = true }
 vte = "0.15"

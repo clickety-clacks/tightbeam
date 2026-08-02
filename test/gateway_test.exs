@@ -2140,6 +2140,33 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "add-user lets an admin add admins and non-admins but refuses a non-admin", ctx do
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["add-user"]
+
+    assert %{user: %{user_id: "second-admin", is_admin: true}} =
+             handler.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{user_id: "second-admin", is_admin: true}
+             })
+
+    assert %{user: %{user_id: "guest", is_admin: false}} =
+             handler.(%{
+               origin: "user:second-admin",
+               session_key: nil,
+               params: %{user_id: "guest", is_admin: false}
+             })
+
+    assert %{code: "forbidden", message: "admin required"} =
+             handler.(%{
+               origin: "user:guest",
+               session_key: nil,
+               params: %{user_id: "blocked", is_admin: false}
+             })
+
+    assert Devices.user(ctx.db, "blocked") == nil
+  end
+
   test "a crash-recovered turn warns that side effects are unknown, not undone", ctx do
     # Boot recovery terminalizes an interrupted turn as "outcome unknown". The
     # in-chat marker must tell the agent to VERIFY before repeating anything
