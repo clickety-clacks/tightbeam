@@ -7,6 +7,9 @@ have a CLI fallback (marked ⌥). Every step names its PASS condition — an
 observable frame, bubble, or row. The DB checks use
 `sqlite3 <base_dir>/state.db`.
 
+`README.md` is the authority for the fresh-org install path. This runbook
+follows that path verbatim rather than restating it.
+
 Conventions: GATEWAY = the gateway under test (fresh base_dir unless the run
 says otherwise). First device to pair becomes the admin user. `tb` = the
 reference CLI with TIGHTBEAM_URL/TIGHTBEAM_TOKEN pointed at GATEWAY (token
