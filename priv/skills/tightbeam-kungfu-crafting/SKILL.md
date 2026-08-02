@@ -33,12 +33,14 @@ A complete bundle ships:
      tracked work, independent review, and verification" is a purpose; "7 archetypes,
      13 guidance fragments" is a contents listing. The general agent matches a user's
      stated goal against this, so write it the way a user would say it.
-   - **phrases** (optional) — 4-8 short, natural things a user might say when the
-     bundle would help. Write from the user's side, describing their problem or wish:
-     "I keep losing track of what I asked for" or "I want someone to check the work
-     before it goes out." Never use feature names or bundle jargon, and do not pad the
-     list. The general agent decides whether the user's words resemble one; the
-     substrate only records and projects them.
+   - **phrases** — short, natural things a USER would say that mean this bundle would
+     help. Written from their side, describing the problem or the wish, never our
+     feature names. THEY MUST DISCRIMINATE: if a bundle from a different domain could
+     honestly claim the same phrase, it is too generic and buys nothing. "I keep losing
+     track of what I asked for" fits every bundle ever written; "I want my code reviewed
+     before it merges" could only be this one. Test each phrase by asking whether a
+     biosciences or legal kungfu could claim it — if yes, rewrite it.
+
    - **root_archetype** — the archetype everyday sessions should default to once this
      kungfu is the org's way of life. Name it in capabilities.md and intake.md, then
      apply it with `tightbeam config set default-archetype <name>-role`.
