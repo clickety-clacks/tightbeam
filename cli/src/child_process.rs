@@ -186,7 +186,28 @@ static SIGNAL_HANDLER_STATE: Mutex<HandlerState> = Mutex::new(HandlerState {
 /// `SIG_IGN`, in which case the signal is ignored, which is precisely what would have
 /// happened without us; this deliberately does not force `SIG_DFL` and kill a process that
 /// was launched under an ignore.
+/// The address of this thread's `errno`, which POSIX defines as a per-thread lvalue and
+/// each platform exposes under its own name.
+unsafe fn errno_slot() -> *mut libc::c_int {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::__errno_location()
+    }
+}
+
 extern "C" fn forward_to_active_group(signal: libc::c_int) {
+    // A handler runs BETWEEN two instructions of ordinary code, and the code it interrupted
+    // may be about to read `errno` for a call that already failed. `killpg`, `signal` and
+    // `raise` below all set it. Saving and restoring is what keeps this handler from
+    // rewriting the result of a syscall it had nothing to do with -- the interrupted code
+    // sees a failure with the wrong reason, or a success with a stale one, and nothing
+    // connects it back to here.
+    let errno = unsafe { *errno_slot() };
+
     let mut answered = false;
 
     for (slot, state) in SIGNAL_SLOTS.iter().enumerate() {
@@ -219,6 +240,10 @@ extern "C" fn forward_to_active_group(signal: libc::c_int) {
             libc::signal(signal, PRIOR_DISPOSITIONS[index].load(Ordering::SeqCst));
             libc::raise(signal);
         }
+    }
+
+    unsafe {
+        *errno_slot() = errno;
     }
 }
 
@@ -276,10 +301,26 @@ impl SignalForwarding {
                     SIGNAL_SLOTS[slot].store(SLOT_FREE, Ordering::SeqCst);
                     return Err(error);
                 }
-                // The handler's copy, readable without a lock. Captured here because
-                // this is the only moment the pre-ceremony disposition is knowable.
+                // The handler's copy, readable without a lock. Captured here because this
+                // is the only moment the pre-ceremony disposition is knowable -- and the
+                // only place its FLAGS are visible, which is why the SA_SIGINFO decision
+                // belongs here rather than in the handler.
+                //
+                // An SA_SIGINFO handler takes three arguments. Re-installing its address
+                // through `signal`, which is all a handler can safely call, would invoke it
+                // through the one-argument convention: undefined behaviour that we would
+                // have caused, on a path whose entire purpose is to behave correctly. We
+                // cannot faithfully put that disposition back, so we do not pretend to --
+                // the hand-back uses SIG_DFL instead and this comment is the record of the
+                // choice. SIG_DFL and SIG_IGN carry no such ambiguity and are restored
+                // exactly, which is the case that actually occurs.
                 if let Some(index) = forwarded_index(signal) {
-                    PRIOR_DISPOSITIONS[index].store(old.sa_sigaction, Ordering::SeqCst);
+                    let restorable = if old.sa_flags & libc::SA_SIGINFO != 0 {
+                        libc::SIG_DFL
+                    } else {
+                        old.sa_sigaction
+                    };
+                    PRIOR_DISPOSITIONS[index].store(restorable, Ordering::SeqCst);
                 }
                 previous.push((signal, old));
             }
@@ -1007,6 +1048,98 @@ mod tests {
         HANDED_BACK.store(signal, Ordering::SeqCst);
     }
 
+    extern "C" fn three_argument_handler(
+        _signal: libc::c_int,
+        _info: *mut libc::siginfo_t,
+        _context: *mut libc::c_void,
+    ) {
+    }
+
+    extern "C" fn one_argument_handler(_signal: libc::c_int) {}
+
+    /// A predecessor we cannot faithfully re-install is not re-installed.
+    ///
+    /// The hand-back can only call `signal`, which installs a ONE-argument handler. An
+    /// SA_SIGINFO predecessor takes three. Putting its address back through `signal` would
+    /// call it through the wrong convention -- undefined behaviour caused by the very path
+    /// whose job is to behave correctly. So the decision is made at capture, where the
+    /// flags are visible, and it is asserted here rather than in the handler: a behavioural
+    /// test would need the hand-back to run, and a correct hand-back to SIG_DFL kills the
+    /// test process, which is the point and is unobservable.
+    ///
+    /// The second half matters as much as the first. Without it this passes by always
+    /// storing SIG_DFL, which would throw away the SIG_IGN case that actually occurs.
+    #[test]
+    fn a_predecessor_we_cannot_re_install_is_not_re_installed() {
+        if !alone("a_predecessor_we_cannot_re_install_is_not_re_installed") {
+            return;
+        }
+
+        let index = forwarded_index(libc::SIGTERM).expect("SIGTERM is forwarded");
+
+        let mut three: libc::sigaction = unsafe { std::mem::zeroed() };
+        three.sa_sigaction = three_argument_handler as *const () as usize;
+        three.sa_flags = libc::SA_SIGINFO;
+        unsafe {
+            libc::sigemptyset(&mut three.sa_mask);
+            libc::sigaction(libc::SIGTERM, &three, std::ptr::null_mut());
+        }
+        let forwarding = SignalForwarding::install().unwrap();
+        assert_eq!(
+            PRIOR_DISPOSITIONS[index].load(Ordering::SeqCst),
+            libc::SIG_DFL,
+            "an SA_SIGINFO predecessor was captured for re-installation through `signal`"
+        );
+        drop(forwarding);
+
+        let mut one: libc::sigaction = unsafe { std::mem::zeroed() };
+        one.sa_sigaction = one_argument_handler as *const () as usize;
+        unsafe {
+            libc::sigemptyset(&mut one.sa_mask);
+            libc::sigaction(libc::SIGTERM, &one, std::ptr::null_mut());
+        }
+        let forwarding = SignalForwarding::install().unwrap();
+        assert_eq!(
+            PRIOR_DISPOSITIONS[index].load(Ordering::SeqCst),
+            one_argument_handler as *const () as usize,
+            "a predecessor we CAN re-install was discarded; SIG_IGN would be lost the same way"
+        );
+        drop(forwarding);
+    }
+
+    /// The handler must not rewrite the errno of the code it interrupted.
+    ///
+    /// A handler runs between two instructions of ordinary code, and everything it does
+    /// here -- `killpg`, `signal`, `raise` -- sets errno. The interrupted code may be one
+    /// instruction away from reading it. This sets errno to a value nothing here would
+    /// naturally leave, runs the handler over it, and checks it comes back: a corruption
+    /// would otherwise surface as some unrelated syscall reporting the wrong reason, with
+    /// nothing pointing here.
+    #[test]
+    fn the_handler_leaves_errno_exactly_as_it_found_it() {
+        if !alone("the_handler_leaves_errno_exactly_as_it_found_it") {
+            return;
+        }
+
+        // A live slot, so the handler takes its longest path: record, then killpg against
+        // a group that does not exist, which is what sets errno on the way through.
+        let forwarding = SignalForwarding::install().unwrap();
+        ACTIVE_PROCESS_GROUPS[forwarding.slot].store(i32::MAX, Ordering::SeqCst);
+
+        const SENTINEL: libc::c_int = libc::EDOM;
+        unsafe {
+            *errno_slot() = SENTINEL;
+        }
+
+        forward_to_active_group(libc::SIGTERM);
+
+        assert_eq!(
+            unsafe { *errno_slot() },
+            SENTINEL,
+            "the handler overwrote the errno of whatever it interrupted"
+        );
+    }
+
     /// A signal no ceremony can answer for is handed back, not eaten.
     ///
     /// This is the half of the design that makes the compare-exchange safe rather than
@@ -1060,15 +1193,17 @@ mod tests {
         action.sa_sigaction
     }
 
-    /// Teardown hands the process's signals back, and does it before it stops listening.
+    /// Teardown hands the process's signals back.
     ///
-    /// The ORDER is not directly observable -- the difference between restoring before and
-    /// after the slot leaves LISTENING is an interval between two statements, and a test
-    /// that claimed to aim at it would be decoration. What IS observable is that the
-    /// restore happens at all, and this pins it, because the reorder that put it in the
-    /// right place also made it the easiest thing in the file to lose silently: nothing
-    /// else fails if a ceremony leaves its own handler installed over the operator's
-    /// process for the rest of its life.
+    /// It no longer matters WHEN, relative to the slot leaving LISTENING: the single-atomic
+    /// swap plus the hand-back means a signal arriving between the two is accounted for
+    /// either way. This pins only that the restore happens at all -- the easiest thing in
+    /// the file to lose silently, because nothing else fails if a ceremony leaves its own
+    /// handler standing over the operator's process for the rest of its life.
+    ///
+    /// (The previous version of this comment described restoring BEFORE the slot stops
+    /// listening as load-bearing ordering. That was true of a design that no longer
+    /// exists.)
     #[test]
     fn the_last_teardown_gives_the_process_its_dispositions_back() {
         if !alone("the_last_teardown_gives_the_process_its_dispositions_back") {
