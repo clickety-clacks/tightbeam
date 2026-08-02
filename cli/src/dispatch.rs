@@ -2206,7 +2206,15 @@ mod tests {
                         "leaseTtlMs": 60_000
                     })))
                 } else {
-                    Ok(None)
+                    // What the gateway actually answers a finish with
+                    // (gateway.ex:2495). This used to be `Ok(None)`, which the CLI read as
+                    // success -- so this test asserted, and protected, the defect that a
+                    // transport 2xx counts as the gateway confirming an install.
+                    Ok(Some(serde_json::json!({
+                        "provider": "openai",
+                        "credentialKind": "subscription",
+                        "status": "onboarded"
+                    })))
                 }
             },
             |endpoint, deadline| {
@@ -2239,6 +2247,118 @@ mod tests {
             calls.into_inner(),
             vec![(gateway.clone(), "begin", false), (gateway, "finish", true),]
         );
+    }
+
+    /// A 2xx is the transport saying it arrived, not the gateway saying it installed.
+    ///
+    /// The same mistake as reading a codex exit code as "a credential was produced", one
+    /// layer out. `parse_response` answers `Ok(None)` for a success with no `result`, so
+    /// before this every 2xx reached `Ok(())` and the CLI reported a completed onboarding
+    /// the gateway had never confirmed. The stub here returns exactly that: a finish that
+    /// succeeds at the transport and says nothing.
+    ///
+    /// Today's gateway cannot send it. It is checked because the CLI and the gateway are
+    /// versioned and shipped separately, and the CLI is the half that has to survive
+    /// meeting a version of the other that answers differently.
+    #[test]
+    fn a_finish_the_gateway_never_confirmed_is_refused_and_cancelled() {
+        use std::cell::RefCell;
+
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-onboard-unconfirmed-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("auth.json"), br#"{"tokens":{}}"#).unwrap();
+        let prior_machine = std::env::var_os("TIGHTBEAM_MACHINE");
+        unsafe {
+            std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
+        }
+
+        let phases = RefCell::new(Vec::new());
+        let result = run_with(
+            Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "openai".to_owned(),
+                api_key: false,
+            },
+            || {
+                Ok(Endpoint {
+                    base: "https://gateway.test".to_owned(),
+                    token: "tbc_one".to_owned(),
+                    origin: Origin::Provisioned,
+                })
+            },
+            |_, request, _| {
+                let phase = if request.body_json.contains(r#""phase":"begin""#) {
+                    "begin"
+                } else if request.body_json.contains(r#""phase":"finish""#) {
+                    "finish"
+                } else {
+                    "cancel"
+                };
+                phases.borrow_mut().push(phase);
+                match phase {
+                    "begin" => Ok(Some(serde_json::json!({
+                        "stagingPath": staging,
+                        "leaseId": "lease-7",
+                        "leaseTtlMs": 60_000
+                    }))),
+                    // 2xx, no result. The transport succeeded and the gateway said nothing.
+                    _ => Ok(None),
+                }
+            },
+            |_, _| {
+                Ok(Some(crate::harnesses::HarnessCatalog {
+                    harnesses: vec![crate::harnesses::HarnessProjection {
+                        wire_name: "codex".to_owned(),
+                        install_package: "codex-acp".to_owned(),
+                        cli_binary: "true".to_owned(),
+                        process_markers: vec!["codex".to_owned()],
+                    }],
+                }))
+            },
+        );
+
+        match prior_machine {
+            Some(value) => unsafe { std::env::set_var("TIGHTBEAM_MACHINE", value) },
+            None => unsafe { std::env::remove_var("TIGHTBEAM_MACHINE") },
+        }
+        let _ = fs::remove_dir_all(&staging);
+
+        let error = result.unwrap_err();
+        assert!(error.contains("did not confirm"), "{error}");
+        assert!(error.contains("doctor"), "no way forward offered: {error}");
+        assert_eq!(
+            phases.into_inner(),
+            vec!["begin", "finish", "cancel"],
+            "an unconfirmed finish must release the lease rather than leave it open"
+        );
+    }
+
+    /// The one condition, at the seam, without the ceremony around it.
+    #[test]
+    fn only_an_onboarded_status_counts_as_a_finished_onboarding() {
+        use crate::ceremonies::onboarded_outcome;
+
+        let confirmed = serde_json::json!({"provider": "openai", "status": "onboarded"});
+        assert_eq!(onboarded_outcome(Some(confirmed.clone())), Ok(confirmed));
+
+        for unconfirmed in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!({"status": "pending"})),
+            Some(serde_json::json!({"provider": "openai"})),
+        ] {
+            let error = onboarded_outcome(unconfirmed.clone()).unwrap_err();
+            assert!(
+                error.contains("did not confirm"),
+                "{unconfirmed:?} was accepted as a finished onboarding"
+            );
+        }
     }
 
     #[test]

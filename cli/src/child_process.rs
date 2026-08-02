@@ -1,7 +1,7 @@
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -261,30 +261,43 @@ impl SignalForwarding {
 impl SignalForwarding {
     /// Stop forwarding and report, as ONE step, everything that was ever recorded.
     ///
-    /// The order is the entire point, and it is the only order with no uncovered instant.
-    /// Marking the slot FINISHED stops the handler recording into it; restoring the
-    /// process's own dispositions stops the handler SWALLOWING signals at all. Only after
-    /// both is the record read. So a signal either arrived while we were listening -- and
-    /// is in the value returned here -- or arrives after the restore, when it acts on this
-    /// process normally and terminates it. There is no third case, which is what a plain
-    /// read-after-reap could not say: that one left an interval where a signal was caught
-    /// by a still-installed handler, recorded into a slot nobody would read again, and
-    /// forwarded nowhere. The caller was then free to bank a credential the operator had
-    /// interrupted -- the child had finished, but the ONBOARDING had not.
+    /// The order is the entire point, and it is the only order with no uncovered instant:
+    /// restore the process's own dispositions FIRST, then stop the slot listening, then
+    /// read. Restoring stops the handler swallowing signals at all; marking the slot
+    /// FINISHED stops it recording into a record nobody will read again. Do them the other
+    /// way round and the interval between them belongs to neither mechanism.
+    ///
+    /// So a signal either arrived while we were listening -- and is in the value returned
+    /// here -- or arrives after the restore, when it acts on this process normally and
+    /// terminates it. There is no third case, which is what a plain read-after-reap could
+    /// not say: that one left an interval where a signal was caught by a still-installed
+    /// handler, recorded into a slot nobody would read again, and forwarded nowhere. The
+    /// caller was then free to bank a credential the operator had interrupted -- the child
+    /// had finished, but the ONBOARDING had not.
     fn finish(&mut self) -> Option<libc::c_int> {
-        // Strictly once. A second pass would stamp FINISHED and then FREE onto a slot
-        // another ceremony may already have claimed in between, wiping ITS record.
+        // Strictly once, and it guards two different failures. The one that shows up in a
+        // test: a second pass stamps FINISHED and then FREE onto a slot another ceremony
+        // may already have claimed, wiping ITS record. The one that does not: `users` is a
+        // `usize`, so a second decrement underflows -- panicking in debug, and in release
+        // wrapping to a value that can never reach zero again, after which this process
+        // NEVER restores its signal dispositions for the rest of its life.
         if self.torn_down {
             return None;
         }
         self.torn_down = true;
         self.disarm();
-        SIGNAL_SLOT_STATES[self.slot].store(SLOT_FINISHED, Ordering::Relaxed);
-        let caught = match FORWARDED_SIGNALS[self.slot].swap(0, Ordering::Relaxed) {
-            0 => None,
-            signal => Some(signal),
-        };
 
+        // Give the process its own dispositions back BEFORE this slot stops listening.
+        // That order is the whole correctness argument and it is easy to get backwards:
+        // between marking the slot FINISHED and restoring, a handler is still installed
+        // and still swallowing while the slot no longer records, so a signal in that gap
+        // is neither reported nor acted on -- and this gap would contain a mutex
+        // acquisition, so it is as long as lock contention makes it, not a few
+        // instructions. Restoring first leaves no such gap. While we are still LISTENING a
+        // signal is recorded, and the swap below collects it; once restored, a signal
+        // either reaches a sibling ceremony's slot or, if we were the last user, meets the
+        // process's own disposition and kills us. A live sibling keeps the handler
+        // installed by construction, because `users` and the restore share this mutex.
         {
             let mut state = SIGNAL_HANDLER_STATE
                 .lock()
@@ -299,6 +312,12 @@ impl SignalForwarding {
                 state.previous.clear();
             }
         }
+
+        SIGNAL_SLOT_STATES[self.slot].store(SLOT_FINISHED, Ordering::Relaxed);
+        let caught = match FORWARDED_SIGNALS[self.slot].swap(0, Ordering::Relaxed) {
+            0 => None,
+            signal => Some(signal),
+        };
         SIGNAL_SLOT_STATES[self.slot].store(SLOT_FREE, Ordering::Relaxed);
         caught
     }
@@ -588,23 +607,20 @@ impl Supervised {
                     None => {
                         self.settled = true;
                         let status = self.child.wait().map_err(|error| error.to_string())?;
-                        // Read AGAIN, after the reap. `disarm` stops the handler reaching
-                        // the group, but the handler stays installed and keeps recording,
-                        // so a signal landing during the `wait` above is absorbed by this
-                        // process, forwarded to nothing, and -- without this second read --
-                        // never seen again: the operator's interrupt disappears and we
-                        // report the success it was trying to prevent.
+                        // The verdict comes from `finish`, not from a second `caught`.
+                        // `disarm` stops the handler reaching the group but leaves it
+                        // installed and recording, so a signal landing during the `wait`
+                        // above is absorbed by this process and forwarded to nothing. A
+                        // plain read here would be one more sample with an interval behind
+                        // it; `finish` instead stops the recording and reports what was
+                        // recorded as one step, so "no signal" becomes a statement about
+                        // the whole run rather than about the instant it was asked.
                         //
-                        // Precisely what this buys, since shortening a window is not
-                        // closing one: the reap is the only call between the two reads that
-                        // BLOCKS, and it can block for as long as the child has left to
-                        // live. Bracketing it removes the whole of that interval. What
-                        // remains is the few instructions between this read and the handler
-                        // being uninstalled in `Drop`, and a signal there arrives after the
-                        // child is already reaped and the work is already done. Closing
-                        // that too means making the read atomic with the slot leaving the
-                        // listening state -- a state machine inside async-signal-safe code,
-                        // which is not worth buying a post-completion instant with.
+                        // This was first declined as a post-completion instant not worth
+                        // buying. That pricing was wrong: only the CHILD is done here.
+                        // `onboard` goes on to validate, stage and finish, so an interrupt
+                        // dropped at this point is followed by banking the very credential
+                        // the operator tried to stop.
                         return match self.forwarding.finish() {
                             None => Ok((value, status)),
                             Some(signal) => Err(RunError::interrupted(signal, &self.what)),
@@ -884,12 +900,76 @@ mod tests {
             "a released slot recorded a signal for its former owner"
         );
 
-        // Run twice on purpose: `Drop` calls this after `settle` already has. A second
-        // pass that re-stamped the slot would wipe the record of whoever claimed it next.
+        // Run twice on purpose: `Drop` calls this after `settle` already has. The claim is
+        // that a second pass must not disturb whoever holds the slot NOW, so the successor
+        // has to exist for the assertion to mean anything -- an earlier version of this
+        // test asserted only the return value and passed with or without the guard, which
+        // is the shape of a test that looks like proof and is not.
+        let successor = SignalForwarding::install().unwrap();
+        assert_eq!(
+            successor.slot, slot,
+            "the released slot must be the one reissued, or this proves nothing"
+        );
+        FORWARDED_SIGNALS[successor.slot].store(libc::SIGINT, Ordering::Relaxed);
+
         assert_eq!(
             forwarding.finish(),
             None,
             "teardown ran twice and reported a signal the second time"
+        );
+        assert_eq!(
+            successor.caught(),
+            Some(libc::SIGINT),
+            "a stale teardown wiped the record of the ceremony now holding its slot"
+        );
+        assert_eq!(
+            SIGNAL_SLOT_STATES[slot].load(Ordering::Relaxed),
+            SLOT_LISTENING,
+            "a stale teardown took the successor's slot out of listening"
+        );
+    }
+
+    /// What the process's own SIGTERM disposition is right now.
+    fn installed_handler(signal: libc::c_int) -> usize {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) },
+            0
+        );
+        action.sa_sigaction
+    }
+
+    /// Teardown hands the process's signals back, and does it before it stops listening.
+    ///
+    /// The ORDER is not directly observable -- the difference between restoring before and
+    /// after the slot leaves LISTENING is an interval between two statements, and a test
+    /// that claimed to aim at it would be decoration. What IS observable is that the
+    /// restore happens at all, and this pins it, because the reorder that put it in the
+    /// right place also made it the easiest thing in the file to lose silently: nothing
+    /// else fails if a ceremony leaves its own handler installed over the operator's
+    /// process for the rest of its life.
+    #[test]
+    fn the_last_teardown_gives_the_process_its_dispositions_back() {
+        if !alone("the_last_teardown_gives_the_process_its_dispositions_back") {
+            return;
+        }
+
+        let ours = forward_to_active_group as *const () as usize;
+        let before = installed_handler(libc::SIGTERM);
+        assert_ne!(before, ours, "a previous test left the ceremony handler behind");
+
+        let mut forwarding = SignalForwarding::install().unwrap();
+        assert_eq!(
+            installed_handler(libc::SIGTERM),
+            ours,
+            "install did not take SIGTERM, so this test would prove nothing"
+        );
+
+        forwarding.finish();
+        assert_eq!(
+            installed_handler(libc::SIGTERM),
+            before,
+            "teardown left the ceremony's handler standing over the operator's process"
         );
     }
 

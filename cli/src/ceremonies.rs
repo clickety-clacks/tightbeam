@@ -221,14 +221,17 @@ where
         Some(lease_id),
         None,
     );
-    match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
-        Ok(Some(result)) => {
+    let outcome = match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
+        Ok(reply) => onboarded_outcome(reply),
+        Err(reason) => Err(reason),
+    };
+    match outcome {
+        Ok(result) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&result).expect("JSON value serializes")
             );
         }
-        Ok(None) => {}
         Err(reason) => {
             let _ = fs::remove_dir_all(staging);
             return Err(cancel_after_begin(
@@ -246,6 +249,41 @@ where
     }
     Ok(())
 }
+
+/// The gateway has to SAY it onboarded. A 2xx only says the request arrived.
+///
+/// This is the artifact check one layer out, and the same mistake it was: an exit code was
+/// read as "codex produced a credential", and here a transport success was read as "the
+/// gateway installed one". Every 2xx reached `Ok(())`, including a body with no `result`
+/// at all -- `dispatch::parse_response` answers `Ok(None)` for that -- so a gateway that
+/// returned `{}` would have the CLI report a completed onboarding it had never been told
+/// about.
+///
+/// The current gateway cannot emit that shape; it answers `status: "onboarded"`
+/// (gateway.ex:2495) or an error envelope. That is not a reason to skip the check. The CLI
+/// and the gateway are versioned and deployed separately -- there is a fleet updater
+/// because they drift -- so "the peer would never send that" is a statement about one
+/// version of the peer, and the CLI is the half that has to survive meeting another.
+///
+/// One condition only. No retry, no negotiation, no version sniffing: the CLI either was
+/// told the credential is installed, or it was not.
+pub(crate) fn onboarded_outcome(reply: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let Some(result) = reply else {
+        return Err(FINISH_UNCONFIRMED.to_owned());
+    };
+    match result.get("status").and_then(serde_json::Value::as_str) {
+        Some("onboarded") => Ok(result),
+        _ => Err(FINISH_UNCONFIRMED.to_owned()),
+    }
+}
+
+/// Deliberately silent about what the gateway DID send. The reply is unrecognised, so any
+/// reading of it here would be a guess printed with the authority of a diagnosis.
+const FINISH_UNCONFIRMED: &str =
+    "the gateway accepted the finish request but did not confirm the credential was \
+     installed: its reply did not say `status: \"onboarded\"`. Nothing about this host's \
+     credential can be assumed either way -- run `tightbeam doctor` to see what is \
+     actually installed, and re-run the ceremony if it is not there.";
 
 fn cancel_after_begin<S>(
     identity: &Identity,
