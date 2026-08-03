@@ -666,11 +666,11 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     session_key = seed_session!(ctx.db)
 
-    # An idle session is not "halted"; a session with a turn RUNNING on this
-    # adapter is what the death actually stopped. This one is unstamped, which
-    # pins the NULL-adapterGen arm: it checked the adapter out and died before
-    # Ledger.stamp_adapter/3 ran.
-    _seq = running_turn!(ctx.db, session_key)
+    # An idle session is not "halted"; a session with a turn RUNNING against
+    # THIS adapter generation is what the death actually stopped. The stamp is
+    # what makes that a fact rather than a guess.
+    seq = running_turn!(ctx.db, session_key)
+    :ok = Tightbeam.Ledger.stamp_adapter(ctx.db, seq, 1)
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     Process.exit(adapter, :kill)
@@ -688,6 +688,28 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert marker.attention_tier == 0
 
     assert Tightbeam.Wire.Payloads.server_message(marker)["attentionTier"] == 0
+  end
+
+  test "an UNSTAMPED running turn is not told its turn stopped", ctx do
+    key = {:claude, "shared", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"unstamped_#{System.unique_integer([:positive])}")
+
+    session_key = seed_session!(ctx.db)
+    # No stamp: Ledger.stamp_adapter/3 runs only once session establishment
+    # succeeds, so a NULL adapterGen covers BOTH "checked this adapter out"
+    # and "has not reached checkout at all". Claiming the death stopped this
+    # turn would be a false statement in someone's chat whenever it is the
+    # second. The turn's own "[turn failed]" marker still reaches this reader
+    # if it really did die; only the cause sentence is withheld.
+    _seq = running_turn!(ctx.db, session_key)
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    Process.exit(adapter, :kill)
+
+    assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
+
+    assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
+    assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
   end
 
   test "a death with no turn running on it halts nobody and messages nobody", ctx do

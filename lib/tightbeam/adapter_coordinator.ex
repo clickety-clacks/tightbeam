@@ -501,21 +501,31 @@ defmodule Tightbeam.AdapterCoordinator do
   defp halted_sessions(_db, _key, _entry, true = _absorbed?), do: []
 
   # Which sessions this death halted: those resident on this adapter with a
-  # turn RUNNING against the generation that just died. Sessions reach a key
-  # the way the gateway builds one — harness and host, shared archetype — so a
-  # key of any other shape holds no sessions and halted nobody. A NULL
-  # `adapterGen` is a turn that checked this adapter out and died before
-  # `Ledger.stamp_adapter/3` ran; it was on this key and this key had exactly
-  # one adapter, so it counts.
+  # turn RUNNING that is STAMPED against the generation that just died.
+  # Sessions reach a key the way the gateway builds one — harness and host,
+  # shared archetype — so a key of any other shape holds no sessions and halted
+  # nobody.
   #
-  # KNOWN GAP, stated rather than papered over: the lane learns its prompt
-  # failed from the same death, so it can finalize the turn before this handler
-  # runs, and then the turn is no longer 'running' and this returns nobody. The
-  # session is not left silent — its own "[turn failed]" marker still lands —
-  # it loses the sentence naming the CAUSE. Widening to recently-failed turns
-  # would need a time window, which is a proxy for an edge this query does not
-  # have; the real home for the cause line is the failure path, which knows
-  # both the session and the adapter key already.
+  # An unstamped (`adapterGen IS NULL`) running turn is deliberately NOT
+  # counted. `Ledger.stamp_adapter/3` runs only once session establishment
+  # succeeds (gateway.ex), so NULL covers two unlike states at once — a turn
+  # that had checked this adapter out and one that has not reached checkout at
+  # all — and treating the pair as one would tell a session still running
+  # happily that its turn stopped. That is the absence-as-success shape, and
+  # this message is a factual claim about somebody's turn.
+  #
+  # THE STANDING RULE HERE IS: prefer saying nothing to saying something false.
+  # Two known cases say nothing.
+  #   - The lane learns its prompt failed from the same death and can finalize
+  #     the turn before this handler runs; it is then no longer 'running'.
+  #   - An ABSORBED death (see the clause above) cannot be attributed at all.
+  # In BOTH the session still receives its own "[turn failed]" marker, so
+  # nobody is left staring at silence — what is lost is the sentence naming the
+  # cause. Closing them for real means making an adapter INSTANCE
+  # distinguishable from its replacement, which today it is not: generation is
+  # the only stamp and `start_adapter_unfenced/4` reuses it. That is a change to
+  # the generation algebra the moduledoc calls binding, and it feeds the heal
+  # token's ordering, so it is its own change and not this one.
   #
   # This reads `turns` directly because a `Ledger` reader is the right home and
   # ledger.ex belongs to another lane right now (reported, not edited).
@@ -528,8 +538,7 @@ defmodule Tightbeam.AdapterCoordinator do
         FROM sessions AS s
         JOIN turns AS t ON t.sessionKey = s.sessionKey
         WHERE s.state = 'active' AND s.harness = ?1 AND s.host = ?2
-          AND t.status = 'running'
-          AND (t.adapterGen = ?3 OR t.adapterGen IS NULL)
+          AND t.status = 'running' AND t.adapterGen = ?3
         """,
         [Atom.to_string(harness), host, entry.generation]
       )
