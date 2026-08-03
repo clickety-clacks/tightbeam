@@ -205,7 +205,7 @@ defmodule Tightbeam.Placement do
   @doc "Materialize one already-resolved identity snapshot at the session's exact cwd."
   @spec materialize_identity(map(), map(), Identity.snapshot(), keyword()) :: Identity.snapshot()
   def materialize_identity(config, session, snapshot, opts \\ []) do
-    host = Map.fetch!(hosts_for(config), session.host)
+    host = fetch_session_host!(config, session)
     cwd = holder_workdir(config, session)
     materialize_identity(config, host, session, snapshot, cwd, opts)
   end
@@ -259,7 +259,7 @@ defmodule Tightbeam.Placement do
   @spec effort_observation(map(), map(), String.t(), term()) ::
           {:ok, map()} | {:error, String.t()}
   def effort_observation(config, session, root, baseline \\ nil) do
-    host = Map.fetch!(hosts_for(config), session.host)
+    host = fetch_session_host!(config, session)
     stamp_dir = Path.join(workdir_path(config, session), @effort_stamp_dir)
     stamp = Path.join(stamp_dir, "#{Tightbeam.Id.uuid4()}.stamp")
     command = effort_observation_command(root, stamp_dir, stamp, prior_stamp(baseline))

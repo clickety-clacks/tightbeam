@@ -180,6 +180,53 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join(base_dir, "work"))
   end
 
+  test "materialize_identity names a disappeared session host", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    session = %{
+      session_key: "vanished-materialization",
+      host: "eurisko",
+      harness: "codex",
+      cli_token: "secret"
+    }
+
+    expected =
+      "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
+        "--name eurisko --as-user <adminUserId>"
+
+    error =
+      assert_raise Placement.Refusal, fn ->
+        Placement.materialize_identity(
+          %{base_dir: base_dir, db: db},
+          session,
+          %{revision: "abc", skills: %{}}
+        )
+      end
+
+    assert error.code == "unknown_host"
+    assert error.message == expected
+  end
+
+  test "effort_observation names a disappeared session host", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    session = %{session_key: "vanished-effort", host: "eurisko", harness: "claude"}
+
+    expected =
+      "host eurisko is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
+        "--name eurisko --as-user <adminUserId>"
+
+    error =
+      assert_raise Placement.Refusal, fn ->
+        Placement.effort_observation(%{base_dir: base_dir, db: db}, session, "/work")
+      end
+
+    assert error.code == "unknown_host"
+    assert error.message == expected
+  end
+
   test "move_workdir copies local to local", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-local")
     new_base = Path.join(base_dir, "new-local")
@@ -665,7 +712,6 @@ defmodule Tightbeam.PlacementTest do
       cli_bin: cli_bin,
       default_model: Model.new("fable")
     }
-
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
@@ -688,7 +734,6 @@ defmodule Tightbeam.PlacementTest do
   } do
     token_dir = Path.join([base_dir, "auth", "claude"])
     File.mkdir_p!(token_dir)
-
     File.write!(
       Path.join(token_dir, ".credentials.json"),
       ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-test"}})

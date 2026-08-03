@@ -241,13 +241,13 @@ defmodule Tightbeam.SessionLane do
 
         {:error, %{reason: reason, terminal_publish: fun, adjudicate_in_txn: action} = attrs}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"failed", inspect(reason), fun, action, Map.get(attrs, :post_commit)}
+          {"failed", error_text(reason), fun, action, Map.get(attrs, :post_commit)}
 
         {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
-          {"failed", inspect(reason), fun, nil, nil}
+          {"failed", error_text(reason), fun, nil, nil}
 
         {:error, reason} ->
-          {"failed", inspect(reason), nil, nil, nil}
+          {"failed", error_text(reason), nil, nil, nil}
       end
 
     finish_result =
@@ -295,4 +295,7 @@ defmodule Tightbeam.SessionLane do
   # row is marked published. The publisher hook is injected by the composition
   # root; in E1 the ledger's publishedAt marking is the observable seam.
   defp publish_terminal(state, seq), do: Ledger.mark_published(state.db, seq)
+
+  defp error_text(reason) when is_binary(reason), do: reason
+  defp error_text(reason), do: inspect(reason)
 end

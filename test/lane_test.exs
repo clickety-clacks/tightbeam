@@ -138,6 +138,10 @@ defmodule Tightbeam.LaneTest do
     parent = self()
     seq = enqueue!(ctx.db, "k1", "vanished host")
 
+    expected =
+      "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
+        "--name eurisko --as-user <adminUserId>"
+
     {:ok, _mgr} =
       LaneManager.start_link(
         db: ctx.db,
@@ -148,8 +152,7 @@ defmodule Tightbeam.LaneTest do
             code: "unknown_host",
             host: "eurisko",
             harness: "codex",
-            message:
-              "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>"
+            message: expected
         end,
         interval: 60_000,
         terminal_publisher: fn payload -> send(parent, {:turn_payload, payload}) end,
@@ -165,15 +168,13 @@ defmodule Tightbeam.LaneTest do
                       session_key: "k1"
                     }}
 
-    assert error =~ "host eurisko is not configured for codex"
-    assert error =~ "tightbeam assimilate <ssh-dest> --name eurisko"
-    refute error =~ "task_crash"
+    assert error == expected
 
     {:ok, [[status, stored_error]]} =
       DB.query(ctx.db, "SELECT status, error FROM turns WHERE seq=?1", [seq])
 
     assert status == "failed"
-    assert stored_error == error
+    assert stored_error == expected
   end
 
   defp eventually(fun, tries \\ 60) do

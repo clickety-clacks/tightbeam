@@ -2094,6 +2094,92 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, session_key).host == "racter"
   end
 
+  test "spawn stops after the first ready where host and probes it once", ctx do
+    base_dir = placement_test_base("first-ready-once", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("eurisko", "codex")
+    await_host_catalog("racter", "codex")
+    parent = self()
+
+    sh = fn command ->
+      if List.last(command) == "true" do
+        host = Enum.find(["eurisko", "racter"], &Enum.member?(command, &1))
+        send(parent, {:spinup_probe, host})
+      end
+
+      {"", 0}
+    end
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
+      |> Map.put(:sh, sh)
+
+    assert %{session_key: session_key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "First ready once",
+                 idempotency_key: "spawn-first-ready-once"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "eurisko"
+    assert_receive {:spinup_probe, "eurisko"}
+    refute_receive {:spinup_probe, _host}
+  end
+
+  test "spawn acts on the routed answer from the candidate decision", ctx do
+    base_dir = placement_test_base("one-route-answer", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("eurisko", "codex")
+    await_host_catalog("racter", "codex")
+    degraded = :atomics.new(1, [])
+
+    sh = fn command ->
+      if List.last(command) == "true" and Enum.member?(command, "eurisko") and
+           :atomics.compare_exchange(degraded, 1, 0, 1) == :ok do
+        degrade_host_catalog("eurisko", "codex", :catalog_refreshed)
+      end
+
+      {"", 0}
+    end
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
+      |> Map.put(:sh, sh)
+
+    assert %{session_key: session_key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "One route answer",
+                 idempotency_key: "spawn-one-route-answer"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "eurisko"
+  end
+
   test "spawn refusal gives an unconfigured where host its assimilation remedy", ctx do
     base_dir = placement_test_base("missing-host-remedy", ["eurisko"])
 
@@ -3458,7 +3544,6 @@ defmodule Tightbeam.GatewayTest do
     assert wide.model == "claude-fable-5"
     assert wide.context == "1m"
     assert wide.efforts == ["low", "high"]
-
     assert Enum.any?(
              status.modelCatalog.models,
              &(&1.model == "claude-fable-5" and is_nil(&1.context))
@@ -4852,6 +4937,10 @@ defmodule Tightbeam.GatewayTest do
 
     Org.set_host(ctx.db, "k1", "eurisko")
 
+    expected =
+      "host eurisko is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
+        "--name eurisko --as-user <adminUserId>"
+
     assert :appended =
              Gateway.deliver_prompt("k1", "user:flynn", "try vanished host",
                db: ctx.db,
@@ -4876,13 +4965,12 @@ defmodule Tightbeam.GatewayTest do
           false
       end)
 
-    assert failed["payload"]["error"] =~ "host eurisko is not configured for claude"
-    assert failed["payload"]["error"] =~ "tightbeam assimilate <ssh-dest> --name eurisko"
-    refute failed["payload"]["error"] =~ "task_crash"
+    assert failed["payload"]["error"] == expected
 
     assert Enum.any?(frames, fn
-             %{"type" => "message", "content" => "[turn failed]\n" <> reason} ->
-               reason =~ "host eurisko is not configured for claude"
+             %{"type" => "message", "content" => content} ->
+               content ==
+                 "[turn failed]\n\nThe agent could not answer the message above: " <> expected
 
              _ ->
                false

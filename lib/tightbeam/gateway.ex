@@ -714,10 +714,10 @@ defmodule Tightbeam.Gateway do
               {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
                 [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
 
-              {_name, %{ssh: nil}} ->
-                []
-            end)
-            |> Enum.sort_by(& &1.name)
+            {_name, %{ssh: nil}} ->
+              []
+          end)
+          |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
         end),
@@ -1790,7 +1790,6 @@ defmodule Tightbeam.Gateway do
   defp adjudication_model_inventories(session) do
     Map.new(Harness.all(), fn module ->
       {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
-
       {module.wire_name(),
        %{health: inspect(health), models: Enum.map(models, &ModelCatalog.describe_entry/1)}}
     end)
@@ -3231,9 +3230,9 @@ defmodule Tightbeam.Gateway do
 
             default_model = archetype.defaults[:model] || defaults.model
 
-            with {:ok, host} <-
+            with {:ok, placement} <-
                    resolve_spawn_host(config, db, archetype, p, module, default_model) do
-              create_spawn(config, db, call, caller, archetype, host, overrides)
+              create_spawn(config, db, call, caller, archetype, placement, overrides)
             else
               {:error, denial} ->
                 classified_spawn_denial(denial, "config_denied", "placement_denied")
@@ -3247,7 +3246,9 @@ defmodule Tightbeam.Gateway do
 
   defp resolve_spawn_host(config, db, archetype, %{host: host}, _module, _default_model)
        when is_binary(host) do
-    Placement.resolve(archetype, host, Placement.hosts(config.base_dir, db))
+    with {:ok, resolved} <-
+           Placement.resolve(archetype, host, Placement.hosts(config.base_dir, db)),
+         do: {:ok, %{host: resolved}}
   end
 
   defp resolve_spawn_host(
@@ -3258,7 +3259,9 @@ defmodule Tightbeam.Gateway do
          _module,
          _default_model
        ) do
-    Placement.resolve(archetype, nil, Placement.hosts(config.base_dir, db))
+    with {:ok, resolved} <-
+           Placement.resolve(archetype, nil, Placement.hosts(config.base_dir, db)),
+         do: {:ok, %{host: resolved}}
   end
 
   defp resolve_spawn_host(config, db, archetype, p, module, default_model) do
@@ -3267,7 +3270,7 @@ defmodule Tightbeam.Gateway do
 
     case archetype.where do
       [host] when is_map_key(hosts, host) ->
-        {:ok, host}
+        {:ok, %{host: host}}
 
       _multiple_or_missing ->
         resolve_spawn_host_candidates(
@@ -3293,33 +3296,38 @@ defmodule Tightbeam.Gateway do
          hosts,
          harness
        ) do
-    results =
-      Enum.map(archetype.where, fn host ->
-        result =
+    result =
+      Enum.reduce_while(archetype.where, [], fn host, failures ->
+        candidate =
           with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
                :ok <- validate_credential(config, harness, host),
                model = spawn_model_selection(host, harness, p, default_model),
-               {:ok, _routed} <- route_spawn_candidate(host, harness, model),
+               {:ok, routed} <- route_spawn_candidate(host, harness, model),
                :ok <- Spinup.ensure_ready(config, module.id(), host, spinup_opts(config, db)) do
-            :ok
+            {:ok, %{host: host, model: model, routed: routed}}
           end
 
-        result =
-          case result do
-            {:error, %Unroutable{} = unroutable} -> {:error, routing_error(unroutable)}
-            other -> other
-          end
+        case candidate do
+          {:ok, placement} ->
+            {:halt, {:ok, placement}}
 
-        {host, result}
+          {:error, %Unroutable{} = unroutable} ->
+            {:cont, [{host, {:error, routing_error(unroutable)}} | failures]}
+
+          {:error, denial} ->
+            {:cont, [{host, {:error, denial}} | failures]}
+        end
       end)
 
-    case Enum.find(results, fn {_host, result} -> result == :ok end) do
-      {host, :ok} ->
-        {:ok, host}
+    case result do
+      {:ok, placement} ->
+        {:ok, placement}
 
-      nil ->
+      failures when is_list(failures) ->
         causes =
-          Enum.map_join(results, "\n", fn {host, {:error, denial}} ->
+          failures
+          |> Enum.reverse()
+          |> Enum.map_join("\n", fn {host, {:error, denial}} ->
             "  #{host}: #{denial.message}"
           end)
 
@@ -3338,8 +3346,9 @@ defmodule Tightbeam.Gateway do
   defp route_spawn_candidate(_host, _harness, _model),
     do: {:error, %{code: "model_unavailable", message: "model must be specified"}}
 
-  defp create_spawn(config, db, call, caller, archetype, host, overrides) do
+  defp create_spawn(config, db, call, caller, archetype, placement, overrides) do
     p = call.params
+    host = placement.host
     defaults = defaults(config, db)
     harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
     module = if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
@@ -3351,15 +3360,26 @@ defmodule Tightbeam.Gateway do
     # not name is composed against what the chosen model actually offers.
     default_model = archetype.defaults[:model] || defaults.model
 
-    model = spawn_model_selection(host, harness_string, p, default_model)
-
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
+
+    prepared =
+      case placement do
+        %{model: %Model{} = model, routed: routed} ->
+          {:ok, {model, routed}}
+
+        %{host: ^host} ->
+          model = spawn_model_selection(host, harness_string, p, default_model)
+
+          with :ok <- validate_credential(config, harness_string, host),
+               {:ok, routed} <-
+                 validate_catalog_model(host, harness_string, model, from_default?(p)),
+               :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)),
+               do: {:ok, {model, routed}}
+      end
 
     # Placement resolved the host FIRST, so the ref is judged against the account
     # that will actually run the turn (#88) — not the gateway's.
-    with :ok <- validate_credential(config, harness_string, host),
-         {:ok, routed} <- validate_catalog_model(host, harness_string, model, from_default?(p)),
-         :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
+    with {:ok, {model, routed}} <- prepared do
       input = %{
         display_name: p.display_name,
         kind: "custom",
@@ -4752,7 +4772,6 @@ defmodule Tightbeam.Gateway do
            ) do
         {:ok, {:applied, delivery, wake_id}} ->
           complete_delivery(db, delivery)
-
           Map.merge(published_identity(applied_model), %{
             ok: true,
             action: "swap",
