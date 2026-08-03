@@ -4,9 +4,11 @@ defmodule Tightbeam.Credentials do
   Per-machine credential onboarding and lifecycle.
 
   This process is deliberately not a refresher. Codex owns and rotates the
-  live home `auth.json` while its runtime is running; Claude uses one
-  non-rotating setup-token through `CLAUDE_CODE_OAUTH_TOKEN`. Expiry is
-  compared only at read seams—there is no timer or sweep.
+  live home `auth.json` while its runtime is running. A Claude subscription is
+  Claude Code's own `.credentials.json`: an OAuth record with a refresh token,
+  linked into the harness home and rotated there by Claude Code. A Claude API
+  key is a bare secret in the same filename and remains environment-injected.
+  Expiry is compared only at read seams—there is no timer or sweep.
 
   A host holds ONE active credential per provider, of either KIND: an API key or
   a subscription token. The kind is recorded in that provider's
@@ -17,8 +19,8 @@ defmodule Tightbeam.Credentials do
 
   Rotation posture is a property of the kind, not of the provider: API keys are
   static, so they have no refresh and no single-writer constraint. Subscription
-  is claude-static (a year-long setup-token) and codex-self-rotating (in place,
-  single writer).
+  credentials are self-rotating in place and therefore single-writer for both
+  Claude and Codex.
   """
 
   use GenServer

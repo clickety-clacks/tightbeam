@@ -9,6 +9,7 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_version "0.59.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
+  @warm_timeout_ms 30_000
 
   @api_base "https://api.anthropic.com"
 
@@ -272,9 +273,9 @@ defmodule Tightbeam.Harness.Claude do
   # `claude-fable-5[1m]` appears only after the home has been used once.
   #
   # `-p` with a trivial prompt because the CHEAPEST real turn is the point: we are not
-  # checking the answer, only that the harness has spoken to the server once. Its exit code
-  # is ignored deliberately -- a failed warm must not fail an onboarding whose credential
-  # already validated, and the only cost of a cold home is a catalog that fills in later.
+  # checking the answer, only that the harness has spoken to the server once. Failure is
+  # returned to the onboarding caller, which logs it and continues because the credential
+  # has already validated.
   @impl true
   def warm_home(target, home) do
     # Through the target's injected runner, never `System.cmd` directly. This callback
@@ -284,16 +285,31 @@ defmodule Tightbeam.Harness.Claude do
     sh = Map.get(target, :sh, &Support.system_cmd_out/1)
 
     if Support.local?(target) do
-      _ = sh.([cli_binary(), "-p", "ok", "--model", "sonnet", "--config-dir", home])
-      :ok
+      timeout = Map.get(target, :warm_timeout_ms, @warm_timeout_ms)
+
+      case Support.bounded_run(
+             sh,
+             [cli_binary(), "-p", "ok", "--model", "sonnet", "--config-dir", home],
+             timeout
+           ) do
+        {:ok, {_output, 0}} ->
+          :ok
+
+        {:ok, {output, status}} when is_integer(status) ->
+          {:error, {:warm_failed, status, String.trim(to_string(output))}}
+
+        {:ok, {:error, reason}} ->
+          {:error, reason}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     else
       # Remote homes warm on the host that owns them, through the same ssh path a launch
       # uses. Not attempted here: the cold-home cost is a catalog that fills in on first
       # use, which is a delay rather than a failure.
       :ok
     end
-  rescue
-    _ -> :ok
   end
 
   @impl true

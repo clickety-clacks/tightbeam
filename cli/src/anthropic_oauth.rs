@@ -208,6 +208,12 @@ fn parse_credential(body: &str) -> Result<Credential, String> {
         Some(scope) => scope.split_whitespace().map(str::to_owned).collect(),
         None => Vec::new(),
     };
+    const REQUIRED_SCOPE: &str = "user:sessions:claude_code";
+    if !scopes.iter().any(|scope| scope == REQUIRED_SCOPE) {
+        return Err(format!(
+            "token exchange did not grant required scope {REQUIRED_SCOPE}; credential was NOT banked"
+        ));
+    }
 
     Ok(Credential {
         access_token,
@@ -375,6 +381,29 @@ mod tests {
             parse_credential(missing_expiry)
                 .unwrap_err()
                 .contains("expires_in")
+        );
+    }
+
+    #[test]
+    fn a_token_response_must_grant_the_claude_code_session_scope() {
+        let missing = parse_credential(
+            r#"{"access_token":"at","refresh_token":"rt","expires_in":60,
+                "scope":"user:file_upload user:inference user:profile"}"#,
+        )
+        .unwrap_err();
+        assert!(missing.contains("user:sessions:claude_code"), "{missing}");
+        assert!(missing.contains("NOT banked"), "{missing}");
+
+        let complete = parse_credential(
+            r#"{"access_token":"at","refresh_token":"rt","expires_in":60,
+                "scope":"user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code"}"#,
+        )
+        .unwrap();
+        assert!(
+            complete
+                .scopes
+                .iter()
+                .any(|scope| scope == "user:sessions:claude_code")
         );
     }
 

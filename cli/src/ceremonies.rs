@@ -878,12 +878,6 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
         .map_err(StageFailure::from)
 }
 
-fn anthropic_setup_token_command(claude: &str) -> ProcessCommand {
-    let mut command = ProcessCommand::new(claude);
-    command.arg("setup-token");
-    command
-}
-
 /// The subscription ceremony: `claude setup-token` under a pty, the token read off the
 /// replayed screen, one live validation call, then the staged install.
 ///
@@ -3311,25 +3305,6 @@ mod tests {
             probe_failure(&auth),
             "ssh authentication failed; set up ssh keys for non-interactive access"
         );
-    }
-
-    /// The provider binary is now the direct child on both platforms. Keeping one
-    /// assertion in each platform CI leg prevents `script(1)` portability machinery from
-    /// creeping back into either one.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn anthropic_is_invoked_directly_on_macos() {
-        let command = anthropic_setup_token_command("renamed-claude");
-        assert_eq!(command.get_program(), "renamed-claude");
-        assert_eq!(command.get_args().collect::<Vec<_>>(), ["setup-token"]);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn anthropic_is_invoked_directly_on_linux() {
-        let command = anthropic_setup_token_command("renamed-claude");
-        assert_eq!(command.get_program(), "renamed-claude");
-        assert_eq!(command.get_args().collect::<Vec<_>>(), ["setup-token"]);
     }
 
     /// The width deliberately fits the current 109-character token, but is not a capture
