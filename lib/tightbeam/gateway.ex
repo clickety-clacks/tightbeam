@@ -714,10 +714,10 @@ defmodule Tightbeam.Gateway do
               {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
                 [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
 
-            {_name, %{ssh: nil}} ->
-              []
-          end)
-          |> Enum.sort_by(& &1.name)
+              {_name, %{ssh: nil}} ->
+                []
+            end)
+            |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
         end),
@@ -1790,6 +1790,7 @@ defmodule Tightbeam.Gateway do
   defp adjudication_model_inventories(session) do
     Map.new(Harness.all(), fn module ->
       {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
+
       {module.wire_name(),
        %{health: inspect(health), models: Enum.map(models, &ModelCatalog.describe_entry/1)}}
     end)
@@ -3221,37 +3222,92 @@ defmodule Tightbeam.Gateway do
             {:ok, nil}
           end
 
-        harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
-        module = if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
+        case override_result do
+          {:ok, overrides} ->
+            harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
 
-        with {:ok, overrides} <- override_result,
-             {:ok, host} <-
-               resolve_spawn_host(config, db, archetype, p, module.wire_name()) do
-          create_spawn(config, db, call, caller, archetype, host, overrides)
-        else
-          {:error, denial} -> classified_spawn_denial(denial, "config_denied", "placement_denied")
+            module =
+              if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
+
+            default_model = archetype.defaults[:model] || defaults.model
+
+            with {:ok, host} <-
+                   resolve_spawn_host(config, db, archetype, p, module, default_model) do
+              create_spawn(config, db, call, caller, archetype, host, overrides)
+            else
+              {:error, denial} ->
+                classified_spawn_denial(denial, "config_denied", "placement_denied")
+            end
+
+          {:error, denial} ->
+            classified_spawn_denial(denial, "config_denied", "placement_denied")
         end
     end
   end
 
-  defp resolve_spawn_host(config, db, archetype, %{host: host}, _harness)
+  defp resolve_spawn_host(config, db, archetype, %{host: host}, _module, _default_model)
        when is_binary(host) do
     Placement.resolve(archetype, host, Placement.hosts(config.base_dir, db))
   end
 
-  defp resolve_spawn_host(config, db, %{where: ["*"]} = archetype, _p, _harness) do
+  defp resolve_spawn_host(
+         config,
+         db,
+         %{where: ["*"]} = archetype,
+         _p,
+         _module,
+         _default_model
+       ) do
     Placement.resolve(archetype, nil, Placement.hosts(config.base_dir, db))
   end
 
-  defp resolve_spawn_host(config, db, archetype, _p, harness) do
+  defp resolve_spawn_host(config, db, archetype, p, module, default_model) do
     hosts = Placement.hosts(config.base_dir, db)
+    harness = module.wire_name()
 
+    case archetype.where do
+      [host] when is_map_key(hosts, host) ->
+        {:ok, host}
+
+      _multiple_or_missing ->
+        resolve_spawn_host_candidates(
+          config,
+          db,
+          archetype,
+          p,
+          module,
+          default_model,
+          hosts,
+          harness
+        )
+    end
+  end
+
+  defp resolve_spawn_host_candidates(
+         config,
+         db,
+         archetype,
+         p,
+         module,
+         default_model,
+         hosts,
+         harness
+       ) do
     results =
       Enum.map(archetype.where, fn host ->
         result =
           with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
-               :ok <- validate_credential(config, harness, host) do
+               :ok <- validate_credential(config, harness, host),
+               model = spawn_model_selection(host, harness, p, default_model),
+               {:ok, _routed} <- route_spawn_candidate(host, harness, model),
+               :ok <- Spinup.ensure_ready(config, module.id(), host, spinup_opts(config, db)) do
             :ok
+          end
+
+        result =
+          case result do
+            {:error, %Unroutable{} = unroutable} -> {:error, routing_error(unroutable)}
+            other -> other
           end
 
         {host, result}
@@ -3276,6 +3332,12 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp route_spawn_candidate(host, harness, %Model{} = model),
+    do: ModelCatalog.route(host, harness, model, ModelCatalog)
+
+  defp route_spawn_candidate(_host, _harness, _model),
+    do: {:error, %{code: "model_unavailable", message: "model must be specified"}}
+
   defp create_spawn(config, db, call, caller, archetype, host, overrides) do
     p = call.params
     defaults = defaults(config, db)
@@ -3289,13 +3351,7 @@ defmodule Tightbeam.Gateway do
     # not name is composed against what the chosen model actually offers.
     default_model = archetype.defaults[:model] || defaults.model
 
-    model =
-      compose_model_selection(
-        host,
-        harness_string,
-        default_model,
-        resolve_selection(host, harness_string, p, default_model)
-      )
+    model = spawn_model_selection(host, harness_string, p, default_model)
 
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
 
@@ -3379,6 +3435,15 @@ defmodule Tightbeam.Gateway do
       {:error, denial} ->
         classified_denial("placement_denied", denial)
     end
+  end
+
+  defp spawn_model_selection(host, harness, params, default_model) do
+    compose_model_selection(
+      host,
+      harness,
+      default_model,
+      resolve_selection(host, harness, params, default_model)
+    )
   end
 
   defp classified_spawn_denial(denial, config_code, placement_code) do
@@ -4687,6 +4752,7 @@ defmodule Tightbeam.Gateway do
            ) do
         {:ok, {:applied, delivery, wake_id}} ->
           complete_delivery(db, delivery)
+
           Map.merge(published_identity(applied_model), %{
             ok: true,
             action: "swap",

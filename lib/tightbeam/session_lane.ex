@@ -18,7 +18,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, Ledger, EventLog}
+  alias Tightbeam.{DB, EventLog, Ledger, Placement}
 
   defstruct [
     :session_key,
@@ -176,7 +176,7 @@ defmodule Tightbeam.SessionLane do
       )
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
-    finalize(state, seq, {:error, :task_crash})
+    finalize(state, seq, crash_outcome(reason))
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -187,6 +187,11 @@ defmodule Tightbeam.SessionLane do
   def handle_info(_msg, state), do: {:noreply, state}
 
   ## Internals
+
+  defp crash_outcome({%Placement.Refusal{} = refusal, _stacktrace}),
+    do: {:error, refusal.message}
+
+  defp crash_outcome(_reason), do: {:error, :task_crash}
 
   defp maybe_start(%{task_ref: ref} = state) when not is_nil(ref), do: state
 
