@@ -1,5 +1,6 @@
 defmodule Tightbeam.Credentials do
   require Logger
+
   @moduledoc """
   Per-machine credential onboarding and lifecycle.
 
@@ -212,46 +213,51 @@ defmodule Tightbeam.Credentials do
         {:noreply, put_in(state.park_pending[provider], pending)}
 
       true ->
-        metadata = read_metadata(state, provider)
-        first_transition? = metadata["terminal"] != true
-        recovery? = metadata["park_pending"] == true
+        case read_metadata(state, provider) do
+          {:ok, metadata} ->
+            first_transition? = metadata["terminal"] != true
+            recovery? = metadata["park_pending"] == true
 
-        if first_transition? or recovery? do
-          state.gate.(provider)
-          captured = capture_sessions(state, provider)
+            if first_transition? or recovery? do
+              state.gate.(provider)
+              captured = capture_sessions(state, provider)
 
-          write_metadata!(
-            state,
-            provider,
-            Map.merge(metadata, %{
-              "provider" => Atom.to_string(provider),
-              "onboarded" => true,
-              "terminal" => true,
-              "last_health" => "revoked",
-              "park_pending" => true
-            })
-          )
+              write_metadata!(
+                state,
+                provider,
+                Map.merge(metadata, %{
+                  "provider" => Atom.to_string(provider),
+                  "onboarded" => true,
+                  "terminal" => true,
+                  "last_health" => "revoked",
+                  "park_pending" => true
+                })
+              )
 
-          command = %CredentialPark{
-            provider: provider,
-            machine: state.machine,
-            adapter_keys: Map.fetch!(state.park_targets, provider),
-            observed_at: System.system_time(:millisecond)
-          }
+              command = %CredentialPark{
+                provider: provider,
+                machine: state.machine,
+                adapter_keys: Map.fetch!(state.park_targets, provider),
+                observed_at: System.system_time(:millisecond)
+              }
 
-          {:pending, park_requests} =
-            CommandEdge.request(state.park_edge, command, provider, state.park_requests)
+              {:pending, park_requests} =
+                CommandEdge.request(state.park_edge, command, provider, state.park_requests)
 
-          pending = %{waiters: [from], captured: captured}
+              pending = %{waiters: [from], captured: captured}
 
-          {:noreply,
-           %{
-             state
-             | park_requests: park_requests,
-               park_pending: Map.put(state.park_pending, provider, pending)
-           }}
-        else
-          {:reply, :ok, state}
+              {:noreply,
+               %{
+                 state
+                 | park_requests: park_requests,
+                   park_pending: Map.put(state.park_pending, provider, pending)
+               }}
+            else
+              {:reply, :ok, state}
+            end
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
         end
     end
   end
@@ -413,11 +419,22 @@ defmodule Tightbeam.Credentials do
   defp finish_park(provider, result, state) do
     pending = Map.fetch!(state.park_pending, provider)
 
-    if result == :ok do
-      metadata = read_metadata(state, provider)
-      write_metadata!(state, provider, Map.put(metadata, "park_pending", false))
-      publish_sessions(state, pending.captured, :terminal)
-    else
+    result =
+      if result == :ok do
+        case read_metadata(state, provider) do
+          {:ok, metadata} ->
+            write_metadata!(state, provider, Map.put(metadata, "park_pending", false))
+            publish_sessions(state, pending.captured, :terminal)
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      else
+        result
+      end
+
+    if result != :ok do
       state.log_event.(
         "credential_park_unconfirmed",
         "#{provider}@#{state.machine}",
@@ -480,36 +497,45 @@ defmodule Tightbeam.Credentials do
   defp record_onboarding_failure!(_state, _provider, _reason), do: :ok
 
   defp credential_status(state, provider) do
-    metadata = read_metadata(state, provider)
+    if Map.has_key?(state.pending, provider) do
+      {:needs_onboarding, :in_progress}
+    else
+      case read_metadata(state, provider) do
+        {:ok, metadata} ->
+          cond do
+            metadata["subscription_status"] == "unsupported" ->
+              {:needs_onboarding, {:unsupported, :no_subscription}}
 
-    cond do
-      Map.has_key?(state.pending, provider) ->
-        {:needs_onboarding, :in_progress}
+            metadata["terminal"] == true ->
+              {:needs_onboarding, :revoked}
 
-      metadata["subscription_status"] == "unsupported" ->
-        {:needs_onboarding, {:unsupported, :no_subscription}}
+            expired?(metadata["expires_at"], state.now.()) ->
+              {:needs_onboarding, :expired}
 
-      metadata["terminal"] == true ->
-        {:needs_onboarding, :revoked}
+            metadata["onboarded"] == true and credential_present?(state, provider) ->
+              :onboarded
 
-      expired?(metadata["expires_at"], state.now.()) ->
-        {:needs_onboarding, :expired}
+            true ->
+              {:needs_onboarding, :missing}
+          end
 
-      metadata["onboarded"] == true and credential_present?(state, provider) ->
-        :onboarded
-
-      true ->
-        {:needs_onboarding, :missing}
+        {:error, reason} ->
+          {:needs_onboarding, reason}
+      end
     end
   end
 
   defp credential_kind(state, provider) do
-    metadata = read_metadata(state, provider)
+    case read_metadata(state, provider) do
+      {:ok, metadata} ->
+        if metadata["onboarded"] == true and credential_present?(state, provider) do
+          decode_kind(metadata["kind"])
+        else
+          :none
+        end
 
-    if metadata["onboarded"] == true and credential_present?(state, provider) do
-      decode_kind(metadata["kind"])
-    else
-      :none
+      {:error, _reason} ->
+        :none
     end
   end
 
@@ -670,29 +696,101 @@ defmodule Tightbeam.Credentials do
   end
 
   defp read_metadata(%{ssh: nil} = state, provider) do
-    case File.read(metadata_path(state, provider)) do
-      {:ok, bytes} ->
-        case JSON.decode(bytes) do
-          {:ok, metadata} -> metadata
-          {:error, _reason} -> %{}
-        end
+    store = store_dir(state.base_dir, provider)
 
-      {:error, _reason} ->
-        %{}
+    case File.lstat(store) do
+      {:ok, %{type: :directory}} -> read_local_metadata(state, provider)
+      {:ok, %{type: type}} -> unreadable_store(store, type, :directory)
+      {:error, :enoent} -> {:ok, %{}}
+      {:error, reason} -> unreadable_store(store, {:unreadable, reason}, :directory)
     end
   end
 
   defp read_metadata(state, provider) do
-    case remote_command(state, ["cat", metadata_path(state, provider)]) do
-      {bytes, 0} ->
-        case JSON.decode(bytes) do
-          {:ok, metadata} -> metadata
-          {:error, _reason} -> %{}
+    store = store_dir(state.base_dir, provider)
+
+    case remote_test(state, "-L", store) do
+      true ->
+        unreadable_store(store, :symlink, :directory)
+
+      false ->
+        read_remote_store(state, provider, store)
+
+      {:error, reason} ->
+        unreadable_store(store, reason, :directory)
+    end
+  end
+
+  defp read_local_metadata(state, provider) do
+    path = metadata_path(state, provider)
+
+    case File.read(path) do
+      {:ok, bytes} -> decode_metadata(bytes, path)
+      {:error, :enoent} -> unreadable_store(path, :missing, :readable_file)
+      {:error, reason} -> unreadable_store(path, {:unreadable, reason}, :readable_file)
+    end
+  end
+
+  defp read_remote_store(state, provider, store) do
+    case remote_test(state, "-d", store) do
+      true ->
+        read_remote_metadata(state, provider)
+
+      false ->
+        classify_remote_non_directory(state, store)
+
+      {:error, reason} ->
+        unreadable_store(store, reason, :directory)
+    end
+  end
+
+  defp classify_remote_non_directory(state, store) do
+    case remote_test(state, "-f", store) do
+      true ->
+        unreadable_store(store, :regular, :directory)
+
+      false ->
+        case remote_test(state, "-e", store) do
+          true -> unreadable_store(store, :other, :directory)
+          false -> {:ok, %{}}
+          {:error, reason} -> unreadable_store(store, reason, :directory)
         end
 
-      {_bytes, _status} ->
-        %{}
+      {:error, reason} ->
+        unreadable_store(store, reason, :directory)
     end
+  end
+
+  defp read_remote_metadata(state, provider) do
+    path = metadata_path(state, provider)
+
+    case remote_command(state, ["cat", path]) do
+      {bytes, 0} ->
+        decode_metadata(bytes, path)
+
+      {output, status} ->
+        unreadable_store(path, {:read_failed, status, String.trim(output)}, :readable_file)
+    end
+  end
+
+  defp remote_test(state, operator, path) do
+    case remote_command(state, ["test", operator, path]) do
+      {_output, 0} -> true
+      {_output, 1} -> false
+      {output, status} -> {:error, {:probe_failed, status, String.trim(output)}}
+    end
+  end
+
+  defp decode_metadata(bytes, path) do
+    case JSON.decode(bytes) do
+      {:ok, metadata} when is_map(metadata) -> {:ok, metadata}
+      {:ok, _other} -> unreadable_store(path, :invalid_json, :valid_json_object)
+      {:error, _reason} -> unreadable_store(path, :invalid_json, :valid_json_object)
+    end
+  end
+
+  defp unreadable_store(path, found, expected) do
+    {:error, {:credential_store_unreadable, %{path: path, found: found, expected: expected}}}
   end
 
   defp write_metadata!(%{ssh: nil} = state, provider, metadata) do

@@ -99,6 +99,46 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
   end
 
+  test "an absent credential store is missing rather than unreadable", ctx do
+    store = Path.join([ctx.base, "auth", "codex"])
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    refute File.exists?(store)
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+  end
+
+  test "a symlinked credential store refuses with its path and actual shape", ctx do
+    store = Path.join([ctx.base, "auth", "codex"])
+    target = Path.join(ctx.base, "symlink-target")
+    metadata = Path.join([target, ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(Path.join(target, "auth.json"), ~S({"token":"present"}))
+    File.write!(metadata, ~S({"provider":"openai","onboarded":true}))
+    File.mkdir_p!(Path.dirname(store))
+    File.ln_s!(target, store)
+
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    assert Credentials.status(:openai, server) ==
+             {:needs_onboarding,
+              {:credential_store_unreadable,
+               %{path: store, found: :symlink, expected: :directory}}}
+  end
+
+  test "corrupt credential metadata refuses with its path and expected shape", ctx do
+    store = Path.join([ctx.base, "auth", "codex"])
+    metadata = Path.join([store, ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(metadata, "not json")
+
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    assert Credentials.status(:openai, server) ==
+             {:needs_onboarding,
+              {:credential_store_unreadable,
+               %{path: metadata, found: :invalid_json, expected: :valid_json_object}}}
+  end
+
   test "Codex credential is never written while stop cannot confirm runtime exit", ctx do
     store = Path.join([ctx.base, "auth", "codex", "auth.json"])
     File.mkdir_p!(Path.dirname(store))
@@ -615,10 +655,12 @@ defmodule Tightbeam.CredentialsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
+
       File.write!(
         Path.join(staging, ".credentials.json"),
         ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-staged"}})
       )
+
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata = credential_metadata(ctx.base, "claude")
