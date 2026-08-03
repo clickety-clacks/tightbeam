@@ -1696,7 +1696,8 @@ defmodule FeatureSmoke do
       "sessionKey" => session_key,
       "setting" => "set_harness",
       "harness" => state.leg.wire_name,
-      "model" => state.leg.model
+      "model" => state.leg.model,
+      "effort" => state.leg.effort
     })
   end
 

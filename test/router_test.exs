@@ -1,5 +1,6 @@
 defmodule Tightbeam.Wire.RouterTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
   import Plug.Test
   import Plug.Conn
 
@@ -704,7 +705,7 @@ defmodule Tightbeam.Wire.RouterTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(ctx.db, "orchestrator:demo", "flynn", actor.session_key)
@@ -843,7 +844,7 @@ defmodule Tightbeam.Wire.RouterTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     assert dispatch_wake(ctx, %{"userId" => "mike"}).status == 200
@@ -878,7 +879,7 @@ defmodule Tightbeam.Wire.RouterTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     assert dispatch_wake(ctx, %{"sessionKey" => key.session_key}).status == 200
@@ -897,7 +898,7 @@ defmodule Tightbeam.Wire.RouterTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     Roles.create!(ctx.db, "mike", "flynn", "role-session")
@@ -1109,7 +1110,7 @@ defmodule Tightbeam.Wire.RouterTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(ctx.db, "held", "flynn", holder.session_key)
@@ -1139,7 +1140,7 @@ defmodule Tightbeam.Wire.RouterTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-sonnet-5"
+      model: Model.new("claude-sonnet-5")
     })
 
     opts =
@@ -1292,7 +1293,7 @@ defmodule Tightbeam.Wire.RouterTest do
         db: ctx.db,
         base_dir: ctx.base_dir,
         default_harness: :claude,
-        default_model: "fable",
+        default_model: Model.new("fable"),
         max_live_sessions_per_user: 50,
         onboarding_lease_ms: 1_800_000,
         sh: fn _command -> {"", 0} end
@@ -1629,7 +1630,7 @@ defmodule Tightbeam.Wire.RouterTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable",
+      model: Model.new("fable"),
       is_built_in: Keyword.get(extra, :is_built_in, false),
       kind: Keyword.get(extra, :kind, "custom")
     })

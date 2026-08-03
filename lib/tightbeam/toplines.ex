@@ -40,6 +40,7 @@ defmodule Tightbeam.Toplines do
      than through any item-attributed carrier.
   """
 
+  alias Tightbeam.Model
   alias Tightbeam.{CausalEvents, DB}
 
   @edge_basis "concurrent_turn"
@@ -451,10 +452,10 @@ defmodule Tightbeam.Toplines do
   # no mind: a fully-null pair is the absence of a stamp, not a mind.
   defp minds(union) do
     union
-    |> Enum.map(&%{model: &1.model, harness: &1.harness})
+    |> Enum.map(&%{model: &1.model, effort: &1.effort, harness: &1.harness})
     |> Enum.reject(&(is_nil(&1.model) and is_nil(&1.harness)))
     |> Enum.uniq()
-    |> Enum.sort_by(&{&1.model || "", &1.harness || ""})
+    |> Enum.sort_by(&{&1.model || "", &1.effort || "", &1.harness || ""})
   end
 
   defp fan_out(world, set) do
@@ -775,17 +776,29 @@ defmodule Tightbeam.Toplines do
   defp all_turns(db) do
     {:ok, rows} =
       DB.query(db, """
-      SELECT seq, assignmentId, jobRef, status, model, harness, endedAt
+      SELECT seq, assignmentId, jobRef, status, model, thinkingLevel, modelContext,
+             harness, endedAt
       FROM turns
       """)
 
-    Enum.map(rows, fn [seq, assignment_id, job_ref, status, model, harness, ended_at] ->
+    Enum.map(rows, fn [
+                        seq,
+                        assignment_id,
+                        job_ref,
+                        status,
+                        model,
+                        effort,
+                        model_context,
+                        harness,
+                        ended_at
+                      ] ->
       %{
         seq: seq,
         assignment_id: assignment_id,
         job_ref: job_ref,
         status: status,
-        model: model,
+        model: model && Model.to_ref(%Model{family: model, context: model_context}),
+        effort: effort,
         harness: harness,
         ended_at: ended_at
       }

@@ -17,7 +17,7 @@ defmodule Tightbeam.Archetypes do
           name: String.t(),
           skills: [String.t()],
           where: [String.t()],
-          defaults: %{optional(:harness) => atom(), optional(:model) => String.t()},
+          defaults: %{optional(:harness) => atom(), optional(:model) => Tightbeam.Model.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [String.t()],
           containment: %{fs: :off, network: :open},
@@ -655,10 +655,14 @@ defmodule Tightbeam.Archetypes do
 
     if is_binary(harness), do: Tightbeam.Harness.parse!(harness)
 
+    # A stored default is FIELDS, not a rendering: `model` names the model,
+    # `effort` and `context` are their own keys. A packed default could not
+    # express a field the vendor added after it was written, and would put a
+    # context variant and a reasoning level in one slot.
     defaults =
       %{}
       |> maybe_put(:harness, harness && Tightbeam.Harness.parse!(harness).id())
-      |> maybe_put(:model, raw_defaults["model"])
+      |> maybe_put(:model, Tightbeam.Model.from_params(raw_defaults))
 
     references =
       manifest

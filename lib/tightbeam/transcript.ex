@@ -21,6 +21,7 @@ defmodule Tightbeam.Transcript do
   `id` is random and `timestamp` can tie or regress, so neither may order a page.
   """
 
+  alias Tightbeam.Model
   alias Tightbeam.{DB, Org}
 
   @default_limit 50
@@ -193,7 +194,8 @@ defmodule Tightbeam.Transcript do
         db,
         """
         SELECT m.id, m.timestamp, m.role, m.sender, m.content, m.attachments,
-               m.replyToMessageId, t.seq, t.model, t.harness, t.assignmentId, t.jobRef
+               m.replyToMessageId, t.seq, t.model, t.thinkingLevel, t.modelContext,
+               t.harness, t.assignmentId, t.jobRef
         FROM messages AS m
         LEFT JOIN turns AS t
           ON t.messageId = CASE m.role WHEN 'user' THEN m.id ELSE m.replyToMessageId END
@@ -215,6 +217,8 @@ defmodule Tightbeam.Transcript do
          reply_to_message_id,
          turn_seq,
          model,
+         effort,
+         model_context,
          harness,
          assignment_id,
          job_ref
@@ -228,7 +232,8 @@ defmodule Tightbeam.Transcript do
       attachments: JSON.decode!(attachments),
       reply_to_message_id: reply_to_message_id,
       turn_seq: turn_seq,
-      model: model,
+      model: model && Model.to_ref(%Model{family: model, context: model_context}),
+      effort: effort,
       harness: harness,
       assignment_id: assignment_id,
       job_ref: job_ref

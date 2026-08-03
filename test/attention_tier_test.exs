@@ -13,6 +13,7 @@ defmodule Tightbeam.AttentionTierTest do
   restatement of the seam instead of the seam.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     ConnRegistry,
@@ -108,7 +109,7 @@ defmodule Tightbeam.AttentionTierTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-fable-5"
+      model: Model.new("claude-fable-5")
     })
 
     base_dir = Path.join(System.tmp_dir!(), "attention_#{System.unique_integer([:positive])}")
@@ -130,7 +131,7 @@ defmodule Tightbeam.AttentionTierTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
       onboarding_lease_ms: 1_800_000,
@@ -184,7 +185,7 @@ defmodule Tightbeam.AttentionTierTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-fable-5"
+      model: Model.new("claude-fable-5")
     })
 
     # k1's turn elects NOTHING, and while it is running — before its reply is

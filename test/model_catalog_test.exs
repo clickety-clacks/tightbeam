@@ -1,7 +1,7 @@
 defmodule Tightbeam.ModelCatalogTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Archetypes, Gateway, ModelCatalog, Placement}
+  alias Tightbeam.{Archetypes, Gateway, Model, ModelCatalog, Placement}
   alias Tightbeam.Harness.Support
 
   @fixtures Path.join(__DIR__, "fixtures/model_catalog")
@@ -59,32 +59,97 @@ defmodule Tightbeam.ModelCatalogTest do
     {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
     {codex, :fresh} = ModelCatalog.get(@host, "codex", catalog)
 
-    opus = Enum.find(claude, &(&1.ref == "claude-opus-5[low]"))
+    opus = Enum.find(claude, &(&1.family == "claude-opus-5"))
     assert opus.display_name == "Claude Opus 5"
     assert opus.max_input_tokens == 1_000_000
+    assert opus.context == nil
     assert MapSet.new(opus.efforts) == MapSet.new(["low", "medium", "high", "xhigh", "max"])
 
-    assert Enum.map(codex, & &1.ref) == [
-             "gpt-5.6-sol[low]",
-             "gpt-5.6-sol[medium]",
-             "gpt-5.6-sol[high]",
-             "gpt-5.6-sol[xhigh]",
-             "gpt-5.6-sol[max]",
-             "gpt-5.6-sol[ultra]"
-           ]
+    # ONE entry per vendor model. The effort tiers are a PROPERTY of the entry,
+    # not five identities — an identity is a family and a context variant.
+    assert Enum.map(codex, & &1.family) == ["gpt-5.6-sol"]
 
-    codex_medium = Enum.find(codex, &(&1.ref == "gpt-5.6-sol[medium]"))
-    assert codex_medium.display_name == "GPT-5.6-Sol"
-    assert codex_medium.max_input_tokens == 272_000
+    codex_sol = Enum.find(codex, &(&1.family == "gpt-5.6-sol"))
+    assert codex_sol.display_name == "GPT-5.6-Sol"
+    assert codex_sol.max_input_tokens == 272_000
+    assert codex_sol.efforts == ["low", "medium", "high", "xhigh", "max", "ultra"]
 
-    assert get_in(codex_medium.capabilities, [
+    assert get_in(codex_sol.capabilities, [
              "supported_reasoning_levels",
              Access.at(1),
              "effort"
            ]) ==
              "medium"
 
-    refute Enum.any?(claude ++ codex, &String.contains?(&1.ref, "[1m]"))
+    refute Enum.any?(claude ++ codex, &(&1.context != nil))
+  end
+
+  # THE DEFECT, at the catalog. Anthropic spells a context-window variant
+  # `claude-fable-5[1m]`; Tightbeam used to spell a reasoning level the same
+  # way. The catalog read the vendor's bracket as ours — it stripped `[1m]`,
+  # discarded that it existed, and re-attached our five effort levels — so the
+  # 1M-context model silently ceased to exist and no operator could ask for it.
+  test "a vendor context variant is its own model, with our efforts attached to it", ctx do
+    fetch = fn "/v1/models?limit=100", _headers ->
+      {:ok,
+       JSON.encode!(%{
+         "data" => [
+           context_variant_model("claude-fable-5"),
+           context_variant_model("claude-fable-5[1m]")
+         ]
+       })}
+    end
+
+    catalog = start_catalog(ctx, claude_fetch: fetch)
+    await_fresh(catalog, "claude")
+    {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
+
+    assert Enum.map(claude, &{&1.family, &1.context}) == [
+             {"claude-fable-5", nil},
+             {"claude-fable-5", "1m"}
+           ]
+
+    # The context variant carries OUR efforts, and `1m` is not one of them.
+    wide = Enum.find(claude, &(&1.context == "1m"))
+    assert MapSet.new(wide.efforts) == MapSet.new(["low", "high"])
+
+    assert ModelCatalog.member?(
+             @host,
+             "claude",
+             Model.new("claude-fable-5", context: "1m", effort: "high"),
+             catalog
+           ) == %{present?: true, health: :fresh}
+
+    # …and it is a DIFFERENT model from the default-window one, not a synonym.
+    assert ModelCatalog.member?(
+             @host,
+             "claude",
+             Model.new("claude-fable-5", effort: "high"),
+             catalog
+           ) == %{present?: true, health: :fresh}
+
+    refute ModelCatalog.member?(
+             @host,
+             "claude",
+             Model.new("claude-fable-5", effort: "1m"),
+             catalog
+           ).present?
+  end
+
+  defp context_variant_model(id) do
+    %{
+      "type" => "model",
+      "id" => id,
+      "display_name" => "Claude Fable 5",
+      "max_input_tokens" => 1_000_000,
+      "capabilities" => %{
+        "effort" => %{
+          "supported" => true,
+          "low" => %{"supported" => true},
+          "high" => %{"supported" => true}
+        }
+      }
+    }
   end
 
   test "fills a summary row from the captured Claude detail body", ctx do
@@ -106,7 +171,7 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx, claude_fetch: claude_fetch)
     await_fresh(catalog, "claude")
 
-    assert {[%{ref: "claude-haiku-4-5-20251001"} = entry], :fresh} =
+    assert {[%{family: "claude-haiku-4-5-20251001", context: nil} = entry], :fresh} =
              ModelCatalog.get(@host, "claude", catalog)
 
     assert entry.display_name == "Claude Haiku 4.5"
@@ -143,13 +208,15 @@ defmodule Tightbeam.ModelCatalogTest do
 
     {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
 
-    assert Enum.map(claude, & &1.ref) == [
-             "claude-sort-test[high]",
-             "claude-sort-test[low]",
-             "claude-sort-test[max]",
-             "claude-sort-test[medium]",
-             "claude-sort-test[ultra]",
-             "claude-sort-test[xhigh]"
+    assert Enum.map(claude, & &1.family) == ["claude-sort-test"]
+
+    assert Enum.sort(hd(claude).efforts) == [
+             "high",
+             "low",
+             "max",
+             "medium",
+             "ultra",
+             "xhigh"
            ]
   end
 
@@ -183,10 +250,8 @@ defmodule Tightbeam.ModelCatalogTest do
 
     {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
 
-    assert Enum.map(claude, & &1.ref) == [
-             "claude-live-shape[low]",
-             "claude-live-shape[medium]"
-           ]
+    assert Enum.map(claude, & &1.family) == ["claude-live-shape"]
+    assert Enum.sort(hd(claude).efforts) == ["low", "medium"]
   end
 
   test "codex preserves provider-reported effort order without tier presentation logic", ctx do
@@ -214,14 +279,16 @@ defmodule Tightbeam.ModelCatalogTest do
 
     {codex, :fresh} = ModelCatalog.get(@host, "codex", catalog)
 
-    assert Enum.map(codex, & &1.ref) == [
-             "gpt-sort-test[mega]",
-             "gpt-sort-test[xhigh]",
-             "gpt-sort-test[max]",
-             "gpt-sort-test[low]",
-             "gpt-sort-test[ultra]",
-             "gpt-sort-test[high]",
-             "gpt-sort-test[medium]"
+    assert Enum.map(codex, & &1.family) == ["gpt-sort-test"]
+
+    assert hd(codex).efforts == [
+             "mega",
+             "xhigh",
+             "max",
+             "low",
+             "ultra",
+             "high",
+             "medium"
            ]
   end
 
@@ -340,12 +407,14 @@ defmodule Tightbeam.ModelCatalogTest do
 
     await_fresh(catalog, "claude")
 
-    assert ModelCatalog.member?(@host, "claude", "claude-opus-5[high]", catalog) == %{
+    opus_high = Model.new("claude-opus-5", effort: "high")
+
+    assert ModelCatalog.member?(@host, "claude", opus_high, catalog) == %{
              present?: true,
              health: :fresh
            }
 
-    assert ModelCatalog.member?(@host, "claude", "absent", catalog) == %{
+    assert ModelCatalog.member?(@host, "claude", Model.new("absent"), catalog) == %{
              present?: false,
              health: :fresh
            }
@@ -353,7 +422,7 @@ defmodule Tightbeam.ModelCatalogTest do
     Agent.update(clock, fn _ -> 11 end)
     Agent.update(failures, fn _ -> true end)
 
-    assert ModelCatalog.member?(@host, "claude", "claude-opus-5[high]", catalog) == %{
+    assert ModelCatalog.member?(@host, "claude", opus_high, catalog) == %{
              present?: true,
              health: :stale
            }
@@ -372,7 +441,7 @@ defmodule Tightbeam.ModelCatalogTest do
     )
 
     await(fn ->
-      ModelCatalog.member?(@host, "claude", "anything", missing).health ==
+      ModelCatalog.member?(@host, "claude", Model.new("anything"), missing).health ==
         {:unavailable, :missing_token}
     end)
   end
@@ -400,7 +469,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
     for harness <- ["claude", "codex"] do
       await(fn ->
-        ModelCatalog.member?(@host, harness, "anything", gated).health ==
+        ModelCatalog.member?(@host, harness, Model.new("anything"), gated).health ==
           {:unavailable, {:needs_onboarding, :credential_server_unavailable}}
       end)
     end
@@ -426,7 +495,7 @@ defmodule Tightbeam.ModelCatalogTest do
       catalog = start_catalog(ctx, Keyword.put(opts, :name, name))
 
       await(fn -> ModelCatalog.get(@host, harness, catalog) == {[], {:unavailable, reason}} end)
-      assert is_map(ModelCatalog.member?(@host, harness, "absent", catalog))
+      assert is_map(ModelCatalog.member?(@host, harness, Model.new("absent"), catalog))
     end
 
     Archetypes.load!(ctx.base_dir)
@@ -519,17 +588,22 @@ defmodule Tightbeam.ModelCatalogTest do
     await_fresh(catalog, "codex")
 
     for harness <- ["claude", "codex"],
-        entry <- ModelCatalog.get(catalog)[{@host, harness}] do
-      assert ModelCatalog.member?(@host, harness, entry.ref, catalog) == %{
+        entry <- ModelCatalog.get(catalog)[{@host, harness}],
+        effort <- entry.efforts do
+      selection = Model.new(entry.family, context: entry.context, effort: effort)
+
+      assert ModelCatalog.member?(@host, harness, selection, catalog) == %{
                present?: true,
                health: :fresh
              }
     end
 
-    assert ModelCatalog.member?(@host, "claude", "opus[1m]", catalog) == %{
-             present?: false,
-             health: :fresh
-           }
+    refute ModelCatalog.member?(
+             @host,
+             "claude",
+             Model.new("opus", context: "1m", effort: "low"),
+             catalog
+           ).present?
 
     source =
       [Path.expand("../lib", __DIR__), Path.expand("../config", __DIR__)]
@@ -606,11 +680,11 @@ defmodule Tightbeam.ModelCatalogTest do
 
       # The satellite's account, not the gateway's — and the gateway's entry is
       # untouched by the satellite's answer.
-      assert {[%{ref: "satellite-only"}], :fresh} =
+      assert {[%{family: "satellite-only"}], :fresh} =
                ModelCatalog.get("satellite", "claude", catalog)
 
       {local, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-      refute Enum.any?(local, &(&1.ref == "satellite-only"))
+      refute Enum.any?(local, &(&1.family == "satellite-only"))
 
       # The eurisko method: the credential is read by the shell ON the owning
       # host, so no byte of it is in the argv, and each script says so literally.
@@ -890,36 +964,50 @@ defmodule Tightbeam.ModelCatalogTest do
 
       await_fresh(catalog, "claude")
       {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-      refs = Enum.map(claude, & &1.ref)
-      bases = refs |> Enum.map(&String.replace(&1, ~r/\[.*\]$/, "")) |> Enum.uniq()
+      families = claude |> Enum.map(& &1.family) |> Enum.uniq()
 
-      # Only selectable bases survive, and the fixture's refused ones are gone.
-      assert "claude-haiku-4-5-20251001" in bases
-      refute "claude-opus-5" in bases
-      refute "claude-fable-5" in bases
-      refute "claude-sonnet-4-6" in bases
+      # Only selectable models survive, and the fixture's refused ones are gone.
+      assert "claude-haiku-4-5-20251001" in families
+      refute "claude-opus-5" in families
+      refute "claude-fable-5" in families
+      refute "claude-sonnet-4-6" in families
 
-      assert Enum.all?(bases, &(&1 in Tightbeam.Harness.Claude.adapter_selectable_models())),
-             "catalog offered a base the adapter refuses: #{inspect(bases)}"
+      assert Enum.all?(families, &(&1 in Tightbeam.Harness.Claude.adapter_selectable_models())),
+             "catalog offered a model the adapter refuses: #{inspect(families)}"
 
-      # The filter matches the BASE ref, so effort suffixes are preserved, not eaten.
-      assert Enum.any?(refs, &String.contains?(&1, "["))
+      # The filter matches the vendor IDENTITY. Efforts are a property of the
+      # kept entry, not part of what is matched, so they survive intact.
+      assert Enum.all?(claude, &is_list(&1.efforts))
     end
 
-    # Where a substitution WOULD live: parse_model_ref is the only transform between a
-    # requested ref and what reaches session/set_config_option. If someone maps a
-    # refused model onto an accepted one, it happens here, and this goes red.
-    test "the only ref transform strips effort and never rewrites the model" do
+    # Where a substitution WOULD live: `Model.parse_ref/1` is the only transform
+    # between a vendor identifier and what reaches session/set_config_option. If
+    # someone maps a refused model onto an accepted one, it happens here, and
+    # this goes red.
+    #
+    # It also pins the rule that made the two suffix vocabularies collide: a
+    # bracket in a VENDOR identifier is a context variant, never one of our
+    # reasoning levels. Read as an effort, `claude-fable-5[1m]` would lose its
+    # 1M window and send `1m` to the effort control.
+    test "the vendor ref transform splits context, never effort, and never rewrites the model" do
       for refused <- ~w(claude-fable-5 claude-opus-5 fable) do
-        assert Tightbeam.Acp.Adapter.parse_model_ref(refused) == {refused, nil},
+        assert Model.parse_ref(refused) == Model.new(refused),
                "#{refused} was rewritten — a substitution has been introduced"
 
-        assert Tightbeam.Acp.Adapter.parse_model_ref("#{refused}[medium]") == {refused, "medium"},
-               "#{refused}[medium] did not pass through with only its effort split off"
+        assert Model.parse_ref("#{refused}[1m]") == Model.new(refused, context: "1m"),
+               "#{refused}[1m] did not pass through with only its context split off"
       end
 
-      assert Tightbeam.Acp.Adapter.parse_model_ref("claude-sonnet-5[high]") ==
-               {"claude-sonnet-5", "high"}
+      # A bracket that happens to spell one of our effort levels is STILL the
+      # vendor's field, not ours. Reading it as an effort is the whole defect.
+      assert Model.parse_ref("claude-sonnet-5[high]") ==
+               Model.new("claude-sonnet-5", context: "high")
+
+      assert Model.parse_ref("claude-sonnet-5[high]").effort == nil
+
+      # And nothing renders our effort back into the vendor identifier.
+      assert "claude-sonnet-5" ==
+               Model.to_ref(Model.new("claude-sonnet-5", effort: "high"))
     end
   end
 

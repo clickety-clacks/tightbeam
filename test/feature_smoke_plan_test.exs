@@ -13,8 +13,16 @@ defmodule Tightbeam.FeatureSmokePlanTest do
           value
 
         :error ->
-          if String.starts_with?(key, "TIGHTBEAM_SMOKE_MODEL_"),
-            do: "model-for-" <> String.downcase(key)
+          cond do
+            String.starts_with?(key, "TIGHTBEAM_SMOKE_MODEL_") ->
+              "model-for-" <> String.downcase(key)
+
+            String.starts_with?(key, "TIGHTBEAM_SMOKE_EFFORT_") ->
+              "medium"
+
+            true ->
+              nil
+          end
       end
     end
   end
@@ -32,6 +40,9 @@ defmodule Tightbeam.FeatureSmokePlanTest do
 
       assert params["harness"] == leg.wire_name
       assert params["model"] == leg.model
+      # Fields, not one packed string: the effort rides its own key.
+      assert params["effort"] == "medium"
+      refute Map.has_key?(params, "context")
       assert params["displayName"] == "Smoke"
     end)
   end

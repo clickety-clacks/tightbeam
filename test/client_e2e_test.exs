@@ -20,6 +20,7 @@ defmodule Tightbeam.ClientE2ETest do
   """
 
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     ConnRegistry,
@@ -1453,7 +1454,7 @@ defmodule Tightbeam.ClientE2ETest do
           host: "testhost",
           harness: :claude,
           provider: fn -> :anthropic end,
-          model: "fable"
+          model: Model.new("fable")
         }
       )
 

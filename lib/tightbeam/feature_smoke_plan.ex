@@ -18,14 +18,22 @@ defmodule Tightbeam.FeatureSmokePlan do
     |> select(getenv)
     |> Enum.map(fn harness ->
       wire_name = harness.wire_name()
-      model_env = "TIGHTBEAM_SMOKE_MODEL_" <> String.upcase(wire_name)
+      suffix = String.upcase(wire_name)
+      model_env = "TIGHTBEAM_SMOKE_MODEL_" <> suffix
 
       model =
         getenv.(model_env) ||
           raise ArgumentError,
                 "missing #{model_env}; feature_smoke requires one compatible model per selected leg"
 
-      %{harness: harness, wire_name: wire_name, model: model, model_env: model_env}
+      %{
+        harness: harness,
+        wire_name: wire_name,
+        model: model,
+        effort: getenv.("TIGHTBEAM_SMOKE_EFFORT_" <> suffix),
+        context: getenv.("TIGHTBEAM_SMOKE_CONTEXT_" <> suffix),
+        model_env: model_env
+      }
     end)
   end
 
@@ -89,5 +97,10 @@ defmodule Tightbeam.FeatureSmokePlan do
     params
     |> Map.put("harness", leg.wire_name)
     |> Map.put("model", leg.model)
+    |> put_unless_nil("effort", leg.effort)
+    |> put_unless_nil("context", leg.context)
   end
+
+  defp put_unless_nil(params, _key, nil), do: params
+  defp put_unless_nil(params, key, value), do: Map.put(params, key, value)
 end

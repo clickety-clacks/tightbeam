@@ -47,6 +47,8 @@ defmodule Tightbeam.Ledger do
     assignmentId TEXT,
     jobRef     TEXT,
     model      TEXT,
+    thinkingLevel TEXT,
+    modelContext  TEXT,
     harness    TEXT,
     replyAttention INTEGER NOT NULL DEFAULT 0,
     status     TEXT NOT NULL DEFAULT 'queued'
@@ -154,11 +156,14 @@ defmodule Tightbeam.Ledger do
             selected_mind =
               case Txn.q(
                      txn,
-                     "SELECT model, harness FROM sessions WHERE sessionKey = ?1",
+                     """
+                     SELECT model, thinkingLevel, modelContext, harness
+                     FROM sessions WHERE sessionKey = ?1
+                     """,
                      [session_key]
                    ) do
-                [[model, harness]] -> {model, harness}
-                [] -> {nil, nil}
+                [[model, effort, context, harness]] -> {model, effort, context, harness}
+                [] -> {nil, nil, nil, nil}
               end
 
             Txn.q(
@@ -166,7 +171,7 @@ defmodule Tightbeam.Ledger do
               """
                 UPDATE turns
                 SET status = 'running', owner = ?2, startedAt = ?3,
-                    model = ?4, harness = ?5
+                    model = ?4, harness = ?5, thinkingLevel = ?6, modelContext = ?7
                 WHERE seq = (SELECT t.seq FROM turns AS t
                              WHERE t.sessionKey = ?1 AND t.status = 'queued'
                                AND EXISTS (
@@ -178,7 +183,15 @@ defmodule Tightbeam.Ledger do
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
               """,
-              [session_key, owner, now, elem(selected_mind, 0), elem(selected_mind, 1)]
+              [
+                session_key,
+                owner,
+                now,
+                elem(selected_mind, 0),
+                elem(selected_mind, 3),
+                elem(selected_mind, 1),
+                elem(selected_mind, 2)
+              ]
             )
 
             if Txn.changes(txn) == 1 do

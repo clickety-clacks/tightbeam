@@ -16,8 +16,15 @@ if value = System.get_env("TIGHTBEAM_DEFAULT_HARNESS") do
   config :tightbeam, :default_harness, Tightbeam.Harness.parse!(value).id()
 end
 
+# The default selection is FIELDS, not one packed string: a packed default is one
+# vendor collision away from reading a context variant as a reasoning level.
 if value = System.get_env("TIGHTBEAM_DEFAULT_MODEL") do
-  config :tightbeam, :default_model, value
+  config :tightbeam,
+         :default_model,
+         Tightbeam.Model.new(value,
+           effort: System.get_env("TIGHTBEAM_DEFAULT_EFFORT"),
+           context: System.get_env("TIGHTBEAM_DEFAULT_CONTEXT")
+         )
 end
 
 if value = System.get_env("TIGHTBEAM_WAKE_TICK_MS") do

@@ -35,7 +35,7 @@ end)
 
 config = %{
   base_dir: scratch, cwd: "/tmp", port: 0,
-  default_harness: :claude, default_model: "claude-sonnet-5[medium]",
+  default_harness: :claude, default_model: Tightbeam.Model.new("claude-sonnet-5", effort: "medium"),
   max_live_sessions_per_user: 50, wake_tick_ms: 1_000, db: db
 }
 spawn_fn = Gateway.handlers(config)["spawn"]
@@ -46,7 +46,7 @@ dead = spawn_fn.(%{
   origin: "user:flynn", session_key: nil,
   params: %{display_name: "SmokeDead", handle: "smoke-dead-#{System.unique_integer([:positive])}",
             idempotency_key: "smoke-dead-#{System.unique_integer([:positive])}",
-            model: "claude-fable-5"}   # bare ref for a with-efforts model: dead
+            model: "claude-fable-5"}   # no effort for a with-efforts model: dead
 })
 
 {:ok, [[sessions_after]]} = DB.query(db, "SELECT COUNT(*) FROM sessions")

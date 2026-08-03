@@ -1,5 +1,6 @@
 defmodule Tightbeam.ArtifactsTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Projection, WorkItems}
 
@@ -641,7 +642,7 @@ defmodule Tightbeam.ArtifactsTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
   end
 end

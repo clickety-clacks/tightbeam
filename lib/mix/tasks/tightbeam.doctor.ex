@@ -2,12 +2,13 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   use Mix.Task
 
   alias Mix.Tasks.Tightbeam.Catalog.Diff
-  alias Tightbeam.Acp.Adapter
+  alias Tightbeam.Model
+  alias Tightbeam.ModelCatalog
   alias Tightbeam.Placement
 
   @shortdoc "Check inference-free Tightbeam bootstrap readiness"
 
-  @default_model "claude-sonnet-5[medium]"
+  @default_model Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
 
   @impl Mix.Task
   def run(args) do
@@ -25,9 +26,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     # because a standalone mix task does not evaluate runtime.exs.
     inputs = [
       base_dir: base_dir,
-      default_model:
-        System.get_env("TIGHTBEAM_DEFAULT_MODEL") ||
-          Application.get_env(:tightbeam, :default_model) || @default_model,
+      default_model: default_model_setting(),
       default_harness:
         System.get_env("TIGHTBEAM_DEFAULT_HARNESS") ||
           Tightbeam.Harness.default().wire_name(),
@@ -149,14 +148,20 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
   defp default_model_check(catalog, harness, model, credential_state, base_dir, host) do
     fix =
-      "Set TIGHTBEAM_DEFAULT_MODEL to a live id[effort] ref; see mix tightbeam.catalog.diff."
+      "Set TIGHTBEAM_DEFAULT_MODEL to a live model and TIGHTBEAM_DEFAULT_EFFORT to one of " <>
+        "its effort levels; see mix tightbeam.catalog.diff."
 
     cond do
-      not (is_binary(model) and String.trim(model) != "") ->
+      is_nil(model) ->
         check("default_model", false, "default model is not set", fix)
 
-      not effort_qualified?(model) ->
-        check("default_model", false, "#{inspect(model)} is not an effort-qualified ref", fix)
+      is_nil(model.effort) ->
+        check(
+          "default_model",
+          false,
+          "#{Model.describe(model)} names no effort; set TIGHTBEAM_DEFAULT_EFFORT",
+          fix
+        )
 
       credential_state == :missing ->
         module = Tightbeam.Harness.parse!(harness)
@@ -164,7 +169,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         check(
           "default_model",
           false,
-          "#{model} cannot be verified because " <>
+          "#{Model.describe(model)} cannot be verified because " <>
             missing_credential_message(
               module.credential_provider(),
               harness,
@@ -194,12 +199,17 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   end
 
   defp default_model_inventory_check(inventories, harness, model, fix, degraded \\ %{}) do
-    live? = Enum.any?(Map.get(inventories, harness, []), &(&1.ref == model))
+    live? =
+      Enum.any?(
+        Map.get(inventories, harness, []),
+        &(ModelCatalog.names_same_model?(&1, model) and model.effort in &1.efforts)
+      )
+
     reason = Map.get(degraded, harness)
 
     cond do
       live? ->
-        check("default_model", true, "#{model} is live for #{harness}", "")
+        check("default_model", true, "#{Model.describe(model)} is live for #{harness}", "")
 
       # An inventory that is empty BECAUSE the credential server could not be
       # reached says nothing about the model. Concluding "not live" from it sent
@@ -209,13 +219,14 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         unverifiable(
           "default_model",
           "not verified here: #{harness} inventory is empty because the credential " <>
-            "server is unreachable from a bare mix task, so #{model} liveness is UNKNOWN",
+            "server is unreachable from a bare mix task, so #{Model.describe(model)} " <>
+            "liveness is UNKNOWN",
           "Not a model verdict — do not repoint TIGHTBEAM_DEFAULT_MODEL on the " <>
             "strength of this row. Check the running gateway's catalog."
         )
 
       true ->
-        check("default_model", false, "#{model} is not live for #{harness}", fix)
+        check("default_model", false, "#{Model.describe(model)} is not live for #{harness}", fix)
     end
   end
 
@@ -446,9 +457,19 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     check("hosts_registered", ok, detail, "Register a host.")
   end
 
-  defp effort_qualified?(ref) do
-    {_model, effort} = Adapter.parse_model_ref(ref)
-    is_binary(effort) and effort != ""
+  # The default selection reaches this task as fields — three env vars, or the
+  # configured struct, or the built-in default. Nothing here parses a ref.
+  defp default_model_setting do
+    case System.get_env("TIGHTBEAM_DEFAULT_MODEL") do
+      family when is_binary(family) ->
+        Model.new(family,
+          effort: System.get_env("TIGHTBEAM_DEFAULT_EFFORT"),
+          context: System.get_env("TIGHTBEAM_DEFAULT_CONTEXT")
+        )
+
+      nil ->
+        Application.get_env(:tightbeam, :default_model) || @default_model
+    end
   end
 
   defp populated_identity?(identity_dir) do

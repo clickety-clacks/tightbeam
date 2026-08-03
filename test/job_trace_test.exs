@@ -1,5 +1,6 @@
 defmodule Tightbeam.JobTraceTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Assignments,
@@ -270,7 +271,7 @@ defmodule Tightbeam.JobTraceTest do
     keys =
       case type do
         type when type in ["turn_start", "turn_end"] ->
-          ~w(assignmentId at harness id jobRef model status type)a
+          ~w(assignmentId at effort harness id jobRef model status type)a
 
         "attest" ->
           ~w(assignmentId at commitRefs id kind type verdict)a
@@ -331,7 +332,7 @@ defmodule Tightbeam.JobTraceTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: "fable",
+      model: Model.new("fable"),
       host: "eezo"
     })
   end

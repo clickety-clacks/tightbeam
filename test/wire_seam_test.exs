@@ -15,6 +15,7 @@ defmodule Tightbeam.Wire.SeamTest do
   """
 
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   import Plug.Test
   import Plug.Conn
@@ -143,7 +144,7 @@ defmodule Tightbeam.Wire.SeamTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: "fable",
+      model: Model.new("fable"),
       host: "eezo"
     })
   end

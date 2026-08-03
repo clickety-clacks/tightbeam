@@ -410,6 +410,8 @@ defmodule Tightbeam.RailRemedy do
             model: target.model,
             idempotency_key: key
           }
+          |> maybe_put(:effort, target[:effort])
+          |> maybe_put(:context, target[:context])
           |> maybe_put(:archetype, target[:archetype])
           |> maybe_put(:host, target[:host])
 

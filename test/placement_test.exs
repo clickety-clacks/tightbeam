@@ -1,5 +1,6 @@
 defmodule Tightbeam.PlacementTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{Archetypes, DB, EventLog, Homes, Identity, Org, Placement, Rails}
 
@@ -541,7 +542,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: Model.new("fable"),
       sh: fn command ->
         send(parent, {:unexpected_sh, command})
         {"", 0}
@@ -586,13 +587,13 @@ defmodule Tightbeam.PlacementTest do
     cli_bin = Path.join(base_dir, "bin")
     File.mkdir_p!(cli_bin)
 
-    config = %{base_dir: base_dir, db: db, cwd: "/work", cli_bin: cli_bin, default_model: "fable"}
+    config = %{base_dir: base_dir, db: db, cwd: "/work", cli_bin: cli_bin, default_model: Model.new("fable")}
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     assert opts[:probe_cwd] == probe_cwd
-    assert opts[:probe_model] == "gpt-5.6-sol[medium]"
+    assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
     refute opts[:probe_model] == config.default_model
     refute File.exists?(Path.join(probe_cwd, "stale"))
 
@@ -619,7 +620,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable"
+      default_model: Model.new("fable")
     }
 
     # A subscription credential reaches the harness as a FILE in its home, never as an
@@ -655,7 +656,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: Model.new("fable"),
       sh: sh
     }
 
@@ -723,14 +724,14 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable",
+      default_model: Model.new("fable"),
       sh: sh
     }
 
     opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
     assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
-    assert opts[:probe_model] == "gpt-5.6-sol[medium]"
+    assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
 
     assert Enum.any?(collect_remote_gate_commands([]), fn command ->
              List.last(command) == "/srv/tb/work/gate-probe" and "rm" in command and
@@ -765,7 +766,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable"
+      default_model: Model.new("fable")
     }
 
     opts = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
@@ -785,7 +786,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: "fable"
+      default_model: Model.new("fable")
     }
 
     home = Placement.deliver_home(config, {:codex, "default", "testhost"})

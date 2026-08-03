@@ -1,6 +1,7 @@
 defmodule Tightbeam.JobTrace do
   @moduledoc "Pinned, read-only work-item trace artifact."
 
+  alias Tightbeam.Model
   alias Tightbeam.{CausalEvents, DB}
 
   # Every type needs an explicit rank — the sorter uses Map.fetch!/2, so an
@@ -117,7 +118,8 @@ defmodule Tightbeam.JobTrace do
       DB.query(
         db,
         """
-        SELECT seq, assignmentId, jobRef, status, model, harness, createdAt, endedAt
+        SELECT seq, assignmentId, jobRef, status, model, thinkingLevel, modelContext,
+               harness, createdAt, endedAt
         FROM turns
         WHERE jobRef = ?1
         ORDER BY seq ASC
@@ -125,13 +127,25 @@ defmodule Tightbeam.JobTrace do
         [work_item_id]
       )
 
-    Enum.flat_map(rows, fn [seq, assignment_id, job_ref, status, model, harness, created, ended] ->
+    Enum.flat_map(rows, fn [
+                             seq,
+                             assignment_id,
+                             job_ref,
+                             status,
+                             model,
+                             effort,
+                             model_context,
+                             harness,
+                             created,
+                             ended
+                           ] ->
       base = %{
         id: seq,
         assignmentId: assignment_id,
         jobRef: job_ref,
         status: status,
-        model: model,
+        model: model && Model.to_ref(%Model{family: model, context: model_context}),
+        effort: effort,
         harness: harness
       }
 

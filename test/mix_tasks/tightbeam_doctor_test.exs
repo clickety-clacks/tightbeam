@@ -17,7 +17,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     inputs = [
       base_dir: base_dir,
-      default_model: "claude-live[medium]",
+      default_model: Tightbeam.Model.new("claude-live", effort: "medium"),
       default_harness: :claude,
       advertised_url: "https://tightbeam.example",
       hosts: %{"local-test" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}},
@@ -31,9 +31,9 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     catalog =
       {:ok,
        %{
-         "claude" => [%{ref: "claude-live[medium]"}],
-         "codex" => [%{ref: "codex-live[high]"}],
-         "fixture" => [%{ref: "fixture-model"}]
+         "claude" => [entry("claude-live", ["medium"])],
+         "codex" => [entry("codex-live", ["high"])],
+         "fixture" => [entry("fixture-model", [])]
        }}
 
     %{base_dir: base_dir, catalog: catalog, inputs: inputs}
@@ -48,7 +48,15 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     {_status, passing} = Doctor.evaluate(ctx.catalog, ctx.inputs)
     assert find(passing, "default_model").ok
 
-    for model <- [nil, "claude-live", "claude-dead[medium]"] do
+    # nil: unset. Bare family: no effort chosen. Unknown family: not offered.
+    # A context variant of a live model is NOT the live model, which is exactly
+    # what a stripped suffix used to hide.
+    for model <- [
+          nil,
+          Tightbeam.Model.new("claude-live"),
+          Tightbeam.Model.new("claude-dead", effort: "medium"),
+          Tightbeam.Model.new("claude-live", effort: "medium", context: "1m")
+        ] do
       {_status, report} = Doctor.evaluate(ctx.catalog, put(ctx.inputs, :default_model, model))
       check = find(report, "default_model")
 
@@ -88,7 +96,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     inputs =
       ctx.inputs
       |> put(:default_harness, :codex)
-      |> put(:default_model, "gpt-5.6-sol[medium]")
+      |> put(:default_model, Tightbeam.Model.new("gpt-5.6-sol", effort: "medium"))
 
     {0, report} = Doctor.evaluate(catalog, inputs)
     failed = find(report, "harness_auth:claude")
@@ -301,6 +309,19 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
   end
 
   defp put(inputs, key, value), do: Keyword.put(inputs, key, value)
+  defp entry(family, efforts) do
+    %{
+      family: family,
+      context: nil,
+      display_name: family,
+      name: family,
+      efforts: efforts,
+      max_input_tokens: nil,
+      capabilities: %{},
+      provider: :anthropic
+    }
+  end
+
   defp find(report, name), do: Enum.find(report.checks, &(&1.name == name))
 
   defp fixture_body(path) do

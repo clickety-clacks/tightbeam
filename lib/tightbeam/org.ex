@@ -6,6 +6,7 @@ defmodule Tightbeam.Org do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Model
 
   @type db :: GenServer.server()
 
@@ -33,8 +34,7 @@ defmodule Tightbeam.Org do
           cli_token: String.t() | nil,
           harness: String.t(),
           provider: String.t(),
-          model: String.t() | nil,
-          thinking_level: String.t() | nil,
+          model: Model.t() | nil,
           host: String.t(),
           cleared_through_seq: integer(),
           adjudication_hold: String.t() | nil,
@@ -81,6 +81,7 @@ defmodule Tightbeam.Org do
     provider      TEXT NOT NULL CHECK (provider IN (__TIGHTBEAM_PROVIDERS__)),
     model         TEXT NOT NULL,
     thinkingLevel TEXT,
+    modelContext  TEXT,
     host          TEXT NOT NULL DEFAULT 'local',
     clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
     adjudicationHold TEXT,
@@ -193,6 +194,7 @@ defmodule Tightbeam.Org do
 
     now = now()
     cli_token = session_token()
+    %Model{} = model = Map.fetch!(input, :model)
 
     Txn.q(
       txn,
@@ -200,9 +202,9 @@ defmodule Tightbeam.Org do
         INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
           identityRevision, cliToken,
-          harness, provider, model, thinkingLevel, host, state, createdAt, updatedAt)
+          harness, provider, model, thinkingLevel, modelContext, host, state, createdAt, updatedAt)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-          ?15, ?16, ?17, ?18, ?19, ?20, 'active', ?21, ?21)
+          ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'active', ?22, ?22)
       """,
       [
         session_key,
@@ -222,8 +224,9 @@ defmodule Tightbeam.Org do
         cli_token,
         Map.fetch!(input, :harness),
         Map.fetch!(input, :provider),
-        Map.fetch!(input, :model),
-        Map.get(input, :thinking_level),
+        model.family,
+        model.effort,
+        model.context,
         Map.fetch!(input, :host),
         now
       ]
@@ -353,7 +356,7 @@ defmodule Tightbeam.Org do
   context. Chat history is substrate-side and unaffected. Returns the
   updated session.
   """
-  @spec set_harness(db(), String.t(), String.t(), String.t(), String.t()) :: session()
+  @spec set_harness(db(), String.t(), String.t(), String.t(), Model.t()) :: session()
   def set_harness(db \\ Tightbeam.DB, session_key, harness, provider, model) do
     transaction!(db, fn txn ->
       current = must_get(txn, session_key)
@@ -372,7 +375,7 @@ defmodule Tightbeam.Org do
   end
 
   @doc "Retune a session's model+provider (the `tune` verb's write). Returns the updated session."
-  @spec set_model(db(), String.t(), String.t(), String.t()) :: session()
+  @spec set_model(db(), String.t(), Model.t(), String.t()) :: session()
   def set_model(db \\ Tightbeam.DB, session_key, model, provider) do
     transaction!(db, fn txn ->
       current = must_get(txn, session_key)
@@ -394,27 +397,43 @@ defmodule Tightbeam.Org do
   @spec swap_model_in_txn(
           Txn.t(),
           String.t(),
-          {String.t() | nil, String.t()},
-          {String.t(), String.t(), String.t()}
+          {Model.t() | nil, String.t()},
+          {Model.t(), String.t(), String.t()}
         ) :: {:ok, session()} | {:duplicate, session()} | :stale
   def swap_model_in_txn(
         %Txn{} = txn,
         session_key,
         {expected_model, expected_harness},
-        {model, harness, provider}
+        {%Model{} = model, harness, provider}
       ) do
     current = must_get(txn, session_key)
 
     if current.model == model and current.harness == harness do
       {:duplicate, current}
     else
+      expected = expected_model || %Model{family: nil}
+
       Txn.q(
         txn,
         """
-        UPDATE sessions SET model=?4, harness=?5, provider=?6, updatedAt=?7
-        WHERE sessionKey=?1 AND model IS ?2 AND harness=?3
+        UPDATE sessions SET model=?4, thinkingLevel=?8, modelContext=?9, harness=?5,
+          provider=?6, updatedAt=?7
+        WHERE sessionKey=?1 AND model IS ?2 AND thinkingLevel IS ?10
+          AND modelContext IS ?11 AND harness=?3
         """,
-        [session_key, expected_model, expected_harness, model, harness, provider, now()]
+        [
+          session_key,
+          expected.family,
+          expected_harness,
+          model.family,
+          harness,
+          provider,
+          now(),
+          model.effort,
+          model.context,
+          expected.effort,
+          expected.context
+        ]
       )
 
       if Txn.changes(txn) == 1, do: {:ok, must_get(txn, session_key)}, else: :stale
@@ -785,7 +804,7 @@ defmodule Tightbeam.Org do
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
            identityRevision, cliToken, harness, provider,
-           model, thinkingLevel, host, clearedThroughSeq, adjudicationHold, state, createdAt, updatedAt
+           model, thinkingLevel, modelContext, host, clearedThroughSeq, adjudicationHold, state, createdAt, updatedAt
     FROM sessions
     """
   end
@@ -810,6 +829,7 @@ defmodule Tightbeam.Org do
          provider,
          model,
          thinking_level,
+         model_context,
          host,
          cleared_through_seq,
          adjudication_hold,
@@ -835,8 +855,7 @@ defmodule Tightbeam.Org do
       cli_token: cli_token,
       harness: harness,
       provider: provider,
-      model: model,
-      thinking_level: thinking_level,
+      model: model && %Model{family: model, effort: thinking_level, context: model_context},
       host: host,
       cleared_through_seq: cleared_through_seq,
       adjudication_hold: adjudication_hold,

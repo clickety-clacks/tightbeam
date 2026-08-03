@@ -1,5 +1,6 @@
 defmodule Tightbeam.AdjudicationTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{Adjudication, DB, Ledger, Org, Wakes}
 
@@ -19,7 +20,7 @@ defmodule Tightbeam.AdjudicationTest do
         host: "local",
         harness: "codex",
         provider: "openai",
-        model: "owner-model"
+        model: Model.new("owner-model")
       })
 
     holder =
@@ -33,7 +34,7 @@ defmodule Tightbeam.AdjudicationTest do
         host: "local",
         harness: "codex",
         provider: "openai",
-        model: "dead-model"
+        model: Model.new("dead-model")
       })
 
     %{db: name, holder: holder, owner: owner}

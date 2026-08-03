@@ -1,5 +1,6 @@
 defmodule Tightbeam.Wire.SocketTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     ConnRegistry,
@@ -70,7 +71,7 @@ defmodule Tightbeam.Wire.SocketTest do
         host: "testhost",
         harness: :claude,
         provider: fn -> :anthropic end,
-        model: "fable"
+        model: Model.new("fable")
       },
       ping_interval_ms: 60_000,
       pong_timeout_ms: 60_000
@@ -193,7 +194,7 @@ defmodule Tightbeam.Wire.SocketTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     {:push, {:text, not_found}, _live} =
@@ -292,7 +293,7 @@ defmodule Tightbeam.Wire.SocketTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     for n <- 1..501,
@@ -368,7 +369,7 @@ defmodule Tightbeam.Wire.SocketTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     {:appended, replayed} =

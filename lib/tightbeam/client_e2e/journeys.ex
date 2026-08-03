@@ -908,8 +908,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
       |> get_in(["modelCatalog", "models"])
       |> List.wrap()
       |> Enum.map(&(&1["ref"] || &1["id"]))
-      |> Enum.reject(&(is_nil(&1) or base_ref(&1) == current))
-      |> Enum.uniq_by(&base_ref/1)
+      |> Enum.reject(&(is_nil(&1) or &1 == current))
+      |> Enum.uniq()
 
     if candidates == [] do
       {ctx,
@@ -1011,12 +1011,12 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
     result =
       cond do
-        reported != base_ref(candidate) ->
+        reported != candidate ->
           Scorecard.fail(
             "13b",
             "model change",
             "set_model #{candidate} reported ok=true but session-status shows " <>
-              "#{inspect(reported)}, expected #{inspect(base_ref(candidate))}",
+              "#{inspect(reported)}, expected #{inspect(candidate)}",
             journey: "J6"
           )
 
@@ -1028,8 +1028,11 @@ defmodule Tightbeam.ClientE2E.Journeys do
             journey: "J6"
           )
 
-        base_ref(row["model"]) != base_ref(candidate) ->
-          Scorecard.fail("13b", "model change", "sessions.model is #{inspect(row["model"])}",
+        stored_ref(row) != candidate ->
+          Scorecard.fail(
+            "13b",
+            "model change",
+            "sessions holds #{inspect(stored_ref(row))} (model/modelContext columns)",
             journey: "J6"
           )
 
@@ -1044,7 +1047,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
         true ->
           Scorecard.pass("13b", "model change",
             journey: "J6",
-            note: "applied #{base_ref(candidate)}"
+            note: "applied #{candidate}"
           )
       end
 
@@ -2025,6 +2028,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
     |> Enum.any?()
   end
 
-  defp base_ref(nil), do: nil
-  defp base_ref(ref), do: ref |> String.split("[") |> List.first()
+  # The sessions row holds the identity in COLUMNS. This rebuilds the vendor
+  # identifier the wire published, so the two can be compared without either
+  # side parsing a packed string.
+  defp stored_ref(%{"model" => family} = row) when is_binary(family) do
+    Tightbeam.Model.to_ref(%Tightbeam.Model{
+      family: family,
+      context: blank_to_nil(row["modelContext"])
+    })
+  end
+
+  defp stored_ref(_row), do: nil
+
+  defp blank_to_nil(""), do: nil
+  defp blank_to_nil(value), do: value
 end

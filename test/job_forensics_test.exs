@@ -7,6 +7,7 @@ defmodule Tightbeam.JobForensicsTest do
   a domain write, never something a caller authored.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Adjudication,
@@ -718,7 +719,7 @@ defmodule Tightbeam.JobForensicsTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-fable-5"
+      model: Model.new("claude-fable-5")
     })
   end
 

@@ -11,6 +11,7 @@ defmodule Tightbeam.TranscriptTest do
   production-written message/turn pair, not only against staged rows.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
   import Plug.Test
   import Plug.Conn
 
@@ -26,7 +27,7 @@ defmodule Tightbeam.TranscriptTest do
   alias Tightbeam.Wire.Router
 
   @entry_keys ~w(id at role sender content attachments reply_to_message_id
-                 turn_seq model harness assignment_id job_ref)a
+                 turn_seq model effort harness assignment_id job_ref)a
 
   defmodule LaneDoorbell do
     @moduledoc false
@@ -401,6 +402,7 @@ defmodule Tightbeam.TranscriptTest do
     assert prompt.role == "user"
     assert prompt.turn_seq == turn_seq
     assert prompt.model == "fable"
+    assert prompt.effort == nil
     assert prompt.harness == "claude"
     assert prompt.assignment_id == "asg_1"
     assert prompt.job_ref == "wi_1"
@@ -575,7 +577,7 @@ defmodule Tightbeam.TranscriptTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     if opts[:state] == "retired" do

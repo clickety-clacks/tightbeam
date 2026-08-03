@@ -9,6 +9,7 @@ defmodule Tightbeam.AdapterHealTest do
   the reason under test is produced by `sh`, not by the test.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     AdapterCoordinator,
@@ -118,7 +119,7 @@ defmodule Tightbeam.AdapterHealTest do
 
     def handle_call({:load_session, _sid, model, _cwd, _mcp, _guidance}, _from, state) do
       case model do
-        model when is_binary(model) ->
+        %Tightbeam.Model{} = model ->
           state = %{
             state
             | model: model,
@@ -383,7 +384,7 @@ defmodule Tightbeam.AdapterHealTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-fable-5"
+      model: Model.new("claude-fable-5")
     })
 
     base = Path.join(System.tmp_dir!(), "heal_base_#{System.unique_integer([:positive])}")
@@ -395,7 +396,7 @@ defmodule Tightbeam.AdapterHealTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
       onboarding_lease_ms: 1_800_000,
@@ -505,17 +506,17 @@ defmodule Tightbeam.AdapterHealTest do
     adapter =
       swap_harness(ctx,
         checkout: {:error, :degraded},
-        model: "claude-sonnet-4-6",
-        cached_model: "claude-fable-5",
+        model: Model.new("claude-sonnet-4-6"),
+        cached_model: Model.new("claude-fable-5"),
         prompt_error: :prompt_dispatch_failed
       )
 
     swap_ready(adapter, nil)
     run_failing_turn(ctx, "the turn whose brief must name the owner")
 
-    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
-    assert SwapAdapterStub.held(adapter) == "claude-fable-5"
-    assert SwapAdapterStub.cached(adapter) == "claude-fable-5"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5")
+    assert SwapAdapterStub.held(adapter) == Model.new("claude-fable-5")
+    assert SwapAdapterStub.cached(adapter) == Model.new("claude-fable-5")
 
     prompt = Wakes.get(ctx.db, episode(ctx.db).owner_wake_id).prompt
     assert prompt =~ "current_model=claude-fable-5"
@@ -536,18 +537,18 @@ defmodule Tightbeam.AdapterHealTest do
     adapter =
       swap_harness(ctx,
         checkout: {:error, :degraded},
-        model: "claude-sonnet-4-6",
-        cached_model: "claude-fable-5"
+        model: Model.new("claude-sonnet-4-6"),
+        cached_model: Model.new("claude-fable-5")
       )
 
-    Org.set_model(ctx.db, "k1", "claude-sonnet-4-6", "anthropic")
+    Org.set_model(ctx.db, "k1", Model.new("claude-sonnet-4-6"), "anthropic")
     swap_ready(adapter, nil)
 
     run_residency_pass(ctx)
 
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
-    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
-    assert SwapAdapterStub.cached(adapter) == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
+    assert SwapAdapterStub.held(adapter) == Model.new("claude-sonnet-4-6")
+    assert SwapAdapterStub.cached(adapter) == Model.new("claude-sonnet-4-6")
     assert SwapAdapterStub.load_count(adapter) == 0
   end
 
@@ -1402,7 +1403,7 @@ defmodule Tightbeam.AdapterHealTest do
     adapter = swap_harness(ctx, checkout: {:error, :degraded})
     run_failing_turn(ctx, "fault")
     episode = episode(ctx.db)
-    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5")
 
     # The heal starts after the harness accepted the model. The session-mutation
     # worker still owns the lock, so the heal cannot resolve the episode until
@@ -1440,7 +1441,7 @@ defmodule Tightbeam.AdapterHealTest do
     assert is_nil(episode(ctx.db).heal_token)
 
     # Which model is loaded is the HARNESS's fact; the record is its projection.
-    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    assert SwapAdapterStub.held(adapter) == Model.new("claude-sonnet-4-6")
 
     assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter),
            "the record disagrees with the running agent about which model is loaded"
@@ -1448,7 +1449,7 @@ defmodule Tightbeam.AdapterHealTest do
     # And it is legible: `sessions.model` moved, so the row that says WHY is there.
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "model_adjudication"))
 
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
   end
 
   test "F3: a swap that WINS records the model the harness confirmed, exactly once", ctx do
@@ -1469,8 +1470,8 @@ defmodule Tightbeam.AdapterHealTest do
                }
              })
 
-    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert SwapAdapterStub.held(adapter) == Model.new("claude-sonnet-4-6")
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
     assert Adjudication.get(ctx.db, "k1", "other").status == "resolved"
 
     assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "model_adjudication")) == 1
@@ -1496,7 +1497,7 @@ defmodule Tightbeam.AdapterHealTest do
       })
 
     assert %{code: "adapter_unavailable"} = result
-    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5")
     refute Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "model_adjudication"))
   end
 
@@ -1553,7 +1554,7 @@ defmodule Tightbeam.AdapterHealTest do
 
     resolved = Adjudication.get(ctx.db, "k1", "other")
     prompt = Wakes.get(ctx.db, resolved.recovery_wake_id).prompt
-    assert prompt =~ "You now run on #{applied_model}"
+    assert prompt =~ "You now run on #{Model.describe(applied_model)}"
   end
 
   test "F3: a concurrent tune cannot invalidate the model before its ruling commits", ctx do
@@ -1604,7 +1605,7 @@ defmodule Tightbeam.AdapterHealTest do
 
     try do
       refute_receive {:tune_model_applied, "claude-opus-4-6"}, 100
-      assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+      assert SwapAdapterStub.held(adapter) == Model.new("claude-sonnet-4-6")
     after
       send(db_proxy, :release_swap_commit)
     end
@@ -1617,8 +1618,8 @@ defmodule Tightbeam.AdapterHealTest do
     assert Wakes.get(ctx.db, resolved.recovery_wake_id).prompt =~
              "You now run on claude-sonnet-4-6"
 
-    assert SwapAdapterStub.held(adapter) == "claude-opus-4-6"
-    assert Org.get(ctx.db, "k1").model == "claude-opus-4-6"
+    assert SwapAdapterStub.held(adapter) == Model.new("claude-opus-4-6")
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-opus-4-6")
   end
 
   test "before-turn push waits for tune commit and reads the new canonical model", ctx do
@@ -1649,7 +1650,7 @@ defmodule Tightbeam.AdapterHealTest do
         })
       end)
 
-    assert_receive {:tune_model_applied, "claude-sonnet-4-6"}
+    assert_receive {:tune_model_applied, %Model{family: "claude-sonnet-4-6"}}
     assert_receive {:tune_waiting_to_commit, db_proxy}
 
     turn_db =
@@ -1666,14 +1667,14 @@ defmodule Tightbeam.AdapterHealTest do
     try do
       send(db_proxy, :release_tune_commit)
       assert %{ok: true} = Task.await(tune)
-      assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+      assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
     after
       send(turn_proxy, :release_turn)
     end
 
     assert :ok = Task.await(turn)
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
-    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
+    assert SwapAdapterStub.held(adapter) == Model.new("claude-sonnet-4-6")
   end
 
   test "resident before-turn refusal has the same model-decision cause as reattach", ctx do
@@ -1722,7 +1723,7 @@ defmodule Tightbeam.AdapterHealTest do
     end
 
     assert %{ok: true} = Task.await(tune)
-    assert Org.get(ctx.db, "k1").model == "claude-opus-4-6"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-opus-4-6")
   end
 
   test "F3: the DB owner finishes projection and ruling after the wire caller dies", ctx do
@@ -1758,7 +1759,7 @@ defmodule Tightbeam.AdapterHealTest do
     send(adapter, :release_harness_apply)
 
     assert eventually(fn ->
-             Org.get(ctx.db, "k1").model == "claude-sonnet-4-6" and
+             Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6") and
                episode(ctx.db).status == "resolved"
            end)
 
@@ -1801,14 +1802,14 @@ defmodule Tightbeam.AdapterHealTest do
       })
     end
 
-    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
-    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert SwapAdapterStub.held(adapter) == Model.new("claude-sonnet-4-6")
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5")
     assert SwapAdapterStub.apply_count(adapter) == 1
 
     :ok = DB.execute(ctx.db, "DROP TRIGGER fail_model_projection")
 
     run_residency_pass(ctx)
-    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5")
     assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter)
     assert SwapAdapterStub.apply_count(adapter) == 1
     assert episode(ctx.db).status == "notified"
@@ -1836,14 +1837,14 @@ defmodule Tightbeam.AdapterHealTest do
                }
              })
 
-    assert SwapAdapterStub.held(adapter) == "claude-sonnet-4-6"
-    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert SwapAdapterStub.held(adapter) == Model.new("claude-sonnet-4-6")
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5")
     assert SwapAdapterStub.load_count(adapter) == 0
 
     run_residency_pass(ctx)
 
     assert SwapAdapterStub.load_count(adapter) == 1
-    assert Org.get(ctx.db, "k1").model == "claude-fable-5"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5")
     assert Org.get(ctx.db, "k1").model == SwapAdapterStub.held(adapter)
   end
 
@@ -2026,7 +2027,7 @@ defmodule Tightbeam.AdapterHealTest do
         :block_apply,
         :apply_error
       ])
-      |> Keyword.put_new(:model, "claude-fable-5")
+      |> Keyword.put_new(:model, Model.new("claude-fable-5"))
       |> Keyword.put(:parent, self())
 
     adapter = start_supervised!({SwapAdapterStub, adapter_opts}, id: :swap_adapter)
@@ -2062,7 +2063,8 @@ defmodule Tightbeam.AdapterHealTest do
     entries =
       for ref <- ["claude-fable-5", "claude-sonnet-4-6", "claude-opus-4-6"] do
         %{
-          ref: ref,
+          family: ref,
+          context: nil,
           display_name: ref,
           name: ref,
           efforts: [],

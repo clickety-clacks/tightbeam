@@ -195,6 +195,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             archetype,
             harness,
             model,
+            effort,
+            context,
             handle,
             host,
         } => {
@@ -206,6 +208,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("archetype", archetype),
                 ("harness", harness),
                 ("model", model),
+                ("effort", effort),
+                ("context", context),
                 ("handle", handle),
                 ("host", host),
             ] {
@@ -1439,6 +1443,10 @@ mod tests {
                 "codex",
                 "--model",
                 "gpt",
+                "--effort",
+                "high",
+                "--context",
+                "1m",
                 "--host",
                 "eezo",
                 "--key",
@@ -1446,7 +1454,7 @@ mod tests {
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","handle":"reviewer","host":"eezo"}}"#
+            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"eezo"}}"#
         );
         let command = Command::IdentityEdit {
             identity: Identity::User("flynn".to_owned()),

@@ -191,13 +191,14 @@ defmodule Tightbeam.Wire.Router do
       picker =
         for {k, atom} <- [
               {"harness", :harness},
-              {"model", :model},
               {"host", :host},
               {"archetype", :archetype}
             ],
             is_binary(body[k]) and body[k] != "",
             into: %{},
             do: {atom, body[k]}
+
+      picker = Map.merge(picker, model_params(body["model"], body["effort"]))
 
       call = %{
         verb: "spawn",
@@ -773,16 +774,34 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  # The wire's line format for a model identity is the vendor identifier the
+  # picker published (`claude-fable-5[1m]`). This seam owns both directions: it
+  # is split into fields HERE, so nothing past the router sees a packed string.
+  # Effort is already its own wire field and is never read out of the ref.
+  defp model_params(ref, effort) when is_binary(ref) and ref != "" do
+    identity = Tightbeam.Model.parse_ref(ref)
+
+    %{model: identity.family}
+    |> then(&if identity.context, do: Map.put(&1, :context, identity.context), else: &1)
+    |> then(&if is_binary(effort) and effort != "", do: Map.put(&1, :effort, effort), else: &1)
+  end
+
+  defp model_params(_ref, _effort), do: %{}
+
   defp control_call(%{"action" => "cancel_current_run"}), do: {:ok, "cancel", %{}}
 
   defp control_call(%{"action" => action}) when action in ~w(adopt unadopt),
     do: {:ok, "tune", %{setting: "adopt", adopted: action == "adopt"}}
 
   defp control_call(%{"action" => "set_model", "model" => model}),
-    do: {:ok, "tune", %{setting: "set_model", model: model}}
+    do: {:ok, "tune", Map.put(model_params(model, nil), :setting, "set_model")}
 
   defp control_call(%{"action" => "set_harness", "harness" => harness} = body),
-    do: {:ok, "tune", %{setting: "set_harness", harness: harness, model: body["model"]}}
+    do:
+      {:ok, "tune",
+       model_params(body["model"], body["effort"])
+       |> Map.put(:setting, "set_harness")
+       |> Map.put(:harness, harness)}
 
   defp control_call(%{"action" => action} = body)
        when action in ~w(set_thinking set_reasoning set_fast_mode set_mode set_verbosity) do

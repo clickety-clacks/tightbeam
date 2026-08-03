@@ -69,6 +69,8 @@ pub enum Command {
         archetype: Option<String>,
         harness: Option<String>,
         model: Option<String>,
+        effort: Option<String>,
+        context: Option<String>,
         handle: Option<String>,
         host: Option<String>,
     },
@@ -336,18 +338,22 @@ COMMANDS:
       List artifact rows matching every supplied exact filter.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
-        [--harness {{HARNESSES_PIPE}}] [--model <ref>] [--host <host>]
-        [--key <idempotencyKey>]
+        [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
+        [--context <variant>] [--host <host>] [--key <idempotencyKey>]
       Hire a new session (a worker). --display is its human label; --name
       registers a role bound to the new session — do NOT confuse it with --as,
       which is YOUR identity. --key makes the spawn idempotent
       (same key returns the same session). Omitted fields inherit the
       archetype's defaults.
         tightbeam spawn --display "Reviewer" --name reviewer:x \
-          --harness {{EXAMPLE_HARNESS}} --model "<catalog-ref>" --as orchestrator:news
+          --harness {{EXAMPLE_HARNESS}} --model <catalog-model> --effort <level> \
+          --as orchestrator:news
       --host picks a machine WITHIN the archetype's allowed set (see list's
       archetypes/hosts); omitted, the archetype's default placement applies.
-      Model refs must come from list's model catalog — never invent one.
+      A model is named by FIELDS, never one packed string: --model is the
+      model itself, --effort its reasoning level, --context the vendor's
+      context-window variant when it offers more than one. All must come from
+      list's model catalog — never invent one.
 
   list
       Show the sessions you can address (with handles + provenance), the
@@ -922,6 +928,8 @@ fn parse_with_optional_catalog(
                 archetype: nonempty(flags, "archetype"),
                 harness,
                 model: nonempty(flags, "model"),
+                effort: nonempty(flags, "effort"),
+                context: nonempty(flags, "context"),
                 handle: nonempty(flags, "name"),
                 host: nonempty(flags, "host"),
             })
@@ -2195,6 +2203,10 @@ mod tests {
                     "codex",
                     "--model",
                     "gpt",
+                    "--effort",
+                    "high",
+                    "--context",
+                    "1m",
                     "--name",
                     "reviewer",
                     "--host",
@@ -2209,6 +2221,8 @@ mod tests {
                     archetype: Some("worker".to_owned()),
                     harness: Some("codex".to_owned()),
                     model: Some("gpt".to_owned()),
+                    effort: Some("high".to_owned()),
+                    context: Some("1m".to_owned()),
                     handle: Some("reviewer".to_owned()),
                     host: Some("eezo".to_owned()),
                 },

@@ -5,7 +5,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
 
   test "working-set model absent from the live catalog is drift" do
     with_guidance(["known", "vanished"], fn path ->
-      {status, diff} = Diff.evaluate(inventories(["known[low]"]), path)
+      {status, diff} = Diff.evaluate(inventories(["known"]), path)
 
       assert status == 1
       assert diff.missing_from_catalog == ["vanished"]
@@ -15,49 +15,52 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
 
   test "live model outside the working set is informational" do
     with_guidance(["known"], fn path ->
-      {status, diff} = Diff.evaluate(inventories(["known[low]", "new[high]"]), path)
+      {status, diff} = Diff.evaluate(inventories(["known", "new"]), path)
 
       assert status == 0
       assert diff.missing_from_catalog == []
-      assert diff.new_arrivals == ["new[high]"]
+      assert diff.new_arrivals == ["new"]
 
       report = Diff.format(diff, :human)
       assert report =~ "MISSING FROM CATALOG (drift): none"
-      assert report =~ "NEW ARRIVALS (info):\n  - new[high]"
+      assert report =~ "NEW ARRIVALS (info):\n  - new"
     end)
   end
 
   test "all working-set models live has zero exit status even with new arrivals" do
     with_guidance(["known"], fn path ->
-      {status, diff} = Diff.evaluate(inventories(["known[low]", "new[high]"]), path)
+      {status, diff} = Diff.evaluate(inventories(["known", "new"]), path)
 
       assert status == 0
       assert diff.missing_from_catalog == []
-      assert diff.new_arrivals == ["new[high]"]
+      assert diff.new_arrivals == ["new"]
     end)
   end
 
   test "json output has the catalog diff shape" do
     with_guidance(["known", "retired"], fn path ->
-      {_status, diff} = Diff.evaluate(inventories(["known[low]", "new[xhigh]"]), path)
+      {_status, diff} = Diff.evaluate(inventories(["known", "new"]), path)
 
       assert {:ok,
               %{
                 "missing_from_catalog" => ["retired"],
-                "new_arrivals" => ["new[xhigh]"],
-                "live" => ["known[low]", "new[xhigh]"],
+                "new_arrivals" => ["new"],
+                "live" => ["known", "new"],
                 "working_set" => ["known", "retired"]
               }} = JSON.decode(Diff.format(diff, :json))
     end)
   end
 
-  test "bare and effort-qualified refs normalize to the same model" do
+  # A context variant is a DIFFERENT model, not a spelling of the same one. It
+  # used to be normalized away with the effort suffix, so a newly entitled
+  # 1M-context model never showed up as an arrival for anyone to characterize.
+  test "a context variant of a known model is its own arrival" do
     with_guidance(["known"], fn path ->
-      {status, diff} = Diff.evaluate(inventories(["known[low]", "known[medium]"]), path)
+      {status, diff} = Diff.evaluate(inventories(["known", {"known", "1m"}]), path)
 
       assert status == 0
       assert diff.missing_from_catalog == []
-      assert diff.new_arrivals == []
+      assert diff.new_arrivals == ["known[1m]"]
     end)
   end
 
@@ -65,7 +68,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     with_guidance(["known"], fn path ->
       File.write!(path, File.read!(path) <> "\n- **outside** — not in the working set\n")
 
-      {status, diff} = Diff.evaluate(inventories(["known[low]"]), path)
+      {status, diff} = Diff.evaluate(inventories(["known"]), path)
 
       assert status == 0
       assert diff.working_set == ["known"]
@@ -138,9 +141,16 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     assert status == 0, inspect(diff.missing_from_catalog)
   end
 
-  defp inventories(refs) do
+  # A catalog entry names a MODEL — family plus the vendor's context variant
+  # when there is one. Effort tiers are a property of the entry, so they never
+  # appear in what the diff compares.
+  defp inventories(models) do
     %{
-      "claude" => Enum.map(refs, &%{ref: &1}),
+      "claude" =>
+        Enum.map(models, fn
+          {family, context} -> %{family: family, context: context, efforts: ["low"]}
+          family -> %{family: family, context: nil, efforts: ["low"]}
+        end),
       "codex" => []
     }
   end

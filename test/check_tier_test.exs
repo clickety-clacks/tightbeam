@@ -1,5 +1,6 @@
 defmodule Tightbeam.CheckTierTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Assignments,
@@ -464,7 +465,7 @@ defmodule Tightbeam.CheckTierTest do
       archetype: archetype,
       harness: "claude",
       provider: "anthropic",
-      model: "fable",
+      model: Model.new("fable"),
       host: "eezo"
     })
   end

@@ -10,6 +10,7 @@ defmodule Tightbeam.ArtifactCarrierTest.PausingDb do
   """
 
   use GenServer
+  alias Tightbeam.Model
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
 
@@ -44,6 +45,7 @@ defmodule Tightbeam.ArtifactCarrierTest.PausingDb do
 end
 
 defmodule Tightbeam.ArtifactCarrierTest do
+  alias Tightbeam.Model
   @moduledoc """
   The artifact-record firing-turn carrier (artifact-carrier-proposal-v1).
 
@@ -100,7 +102,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(db, "carrier-coder", "flynn", coder.session_key)
@@ -250,7 +252,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(ctx.db, "carrier-other", "flynn", other.session_key)

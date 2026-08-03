@@ -364,7 +364,7 @@ defmodule Tightbeam.Harness.Support do
       if railed? and profile.railed_probe do
         Keyword.merge(plan,
           probe_cwd: Path.join(base, "work/gate-probe"),
-          probe_model: "gpt-5.6-sol[medium]"
+          probe_model: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
         )
       else
         plan
@@ -1021,6 +1021,10 @@ defmodule Tightbeam.Harness.Support do
 
   defp normalize_term(value, replace) when is_tuple(value),
     do: value |> Tuple.to_list() |> Enum.map(&normalize_term(&1, replace)) |> List.to_tuple()
+
+  # Structs are VALUES, not maps to walk into: a model identity normalizes as
+  # itself. Rebuilding one field-by-field through Map.new would strip its type.
+  defp normalize_term(%_{} = value, _replace), do: value
 
   defp normalize_term(value, replace) when is_map(value),
     do: Map.new(value, fn {key, item} -> {key, normalize_term(item, replace)} end)

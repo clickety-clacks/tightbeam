@@ -1,5 +1,6 @@
 defmodule Tightbeam.ConformanceLaneManager do
   use GenServer
+  alias Tightbeam.Model
 
   def start_link, do: GenServer.start_link(__MODULE__, :ok, name: Tightbeam.LaneManager)
   def init(:ok), do: {:ok, :ok}
@@ -9,6 +10,7 @@ defmodule Tightbeam.ConformanceLaneManager do
 end
 
 defmodule Tightbeam.ConformanceSupport do
+  alias Tightbeam.Model
   import ExUnit.Assertions
   import Tightbeam.TestCase, only: [catalog_reply: 1]
 
@@ -2361,7 +2363,7 @@ defmodule Tightbeam.ConformanceSupport do
             assert Enum.any?(Wakes.list_pending(db), &(&1.session_key == "reviewer-session"))
 
           :spawn ->
-            assert %{harness: "codex", model: "test"} = Org.get(db, producer)
+            assert %{harness: "codex", model: %Model{family: "test"}} = Org.get(db, producer)
         end
       end
 
@@ -2419,7 +2421,7 @@ defmodule Tightbeam.ConformanceSupport do
         cwd: System.tmp_dir!(),
         port: 0,
         default_harness: :codex,
-        default_model: "test",
+        default_model: Model.new("test"),
         max_live_sessions_per_user: 50,
         wake_tick_ms: 1_000,
         onboarding_lease_ms: 1_800_000,
@@ -2753,7 +2755,9 @@ defmodule Tightbeam.ConformanceSupport do
         archetype: session["archetype"],
         harness: session["harness"] || "claude",
         provider: session["provider"] || "anthropic",
-        model: session["model"] || "fable",
+        model:
+          Model.from_params(session) ||
+            Model.new("fable"),
         host: session["host"] || Placement.local_host_name()
       })
 

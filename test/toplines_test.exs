@@ -19,6 +19,7 @@ defmodule Tightbeam.ToplinesTest do
   authorization if the clock cannot move between the two responses.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
   import Plug.Test
   import Plug.Conn
 
@@ -367,7 +368,7 @@ defmodule Tightbeam.ToplinesTest do
     assert b.attests.total == 1
     assert b.jobs == 1
     assert b.turns.total == 1
-    assert b.minds == [%{model: "m-r", harness: "claude"}]
+    assert b.minds == [%{model: "m-r", effort: nil, harness: "claude"}]
 
     assert a.assignments.open == 1, "A keeps its OWN assignment"
     assert a.attests.total == 0, "A receives none of R's attests"
@@ -1184,7 +1185,7 @@ defmodule Tightbeam.ToplinesTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-fable-5"
+      model: Model.new("claude-fable-5")
     })
 
     key

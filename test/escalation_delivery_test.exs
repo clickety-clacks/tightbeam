@@ -12,6 +12,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
   to make a crash window deterministic.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Assignments,
@@ -654,7 +655,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
       host: host,
       harness: "claude",
       provider: "anthropic",
-      model: "claude-fable-5",
+      model: Model.new("claude-fable-5"),
       spawned_by: spawned_by
     })
   end
@@ -665,7 +666,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
       cwd: base_dir,
       port: 0,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
       onboarding_lease_ms: 1_800_000,

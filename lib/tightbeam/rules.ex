@@ -79,13 +79,15 @@ defmodule Tightbeam.Rules do
                  "name",
                  "harness",
                  "model",
+                 "effort",
+                 "context",
                  "archetype",
                  "host",
                  "params"
                ])
   @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)
   @embedded_fields ~w(subject prompt display)
-  @whole_fields ~w(target_role target_session reviews work_item name harness model archetype host after at)
+  @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
     assignment.verdicts
     assignment.independent_verdict_kinds
@@ -389,7 +391,8 @@ defmodule Tightbeam.Rules do
           {[], ~w(target_role target_session), ~w(prompt), ~w(prompt after at)}
 
         "spawn" ->
-          {~w(name harness model), ~w(name harness model archetype host), [], ~w(display)}
+          {~w(name harness model), ~w(name harness model effort context archetype host), [],
+           ~w(display)}
       end
 
     present_top =
