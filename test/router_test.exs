@@ -1566,6 +1566,31 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
+  test "POST /api/session-control renders an unreadable session status as its named refusal",
+       ctx do
+    key = "control-unreadable-status"
+    create_session(ctx.db, key, ctx.device.user_id)
+    message = "credential store /broken/auth/claude is unreadable"
+
+    opts =
+      ctx.opts
+      |> with_handler("tune", fn _call -> %{ok: true} end)
+      |> Keyword.put(:session_status, fn ^key ->
+        {:error, 503, "credential_store_unreadable", message}
+      end)
+
+    response = post_control(opts, ctx.device.token, key, "adopt")
+
+    assert response.status == 503
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "credential_store_unreadable",
+               "message" => message
+             }
+           }
+  end
+
   test "session-control adopt and unadopt reach tune, and a foreign session is refused", ctx do
     key = "adopt-control"
     create_session(ctx.db, key, ctx.device.user_id)

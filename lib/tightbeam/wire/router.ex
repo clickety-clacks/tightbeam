@@ -904,18 +904,24 @@ defmodule Tightbeam.Wire.Router do
   # response passes through, which is what makes it an invariant rather than a
   # convention.
   defp control_json(conn, result, session_key, action) do
-    ok = Map.get(result, :ok, not Map.has_key?(result, :code))
-    code = result[:code] || if(ok, do: nil, else: "control_failed")
+    case session_status(conn).(session_key) do
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
 
-    %{
-      "ok" => ok,
-      "sessionKey" => session_key,
-      "action" => action,
-      "status" => session_status(conn).(session_key)
-    }
-    |> put_optional("code", code)
-    |> put_optional("message", result[:message])
-    |> then(&json(conn, 200, &1))
+      session_status ->
+        ok = Map.get(result, :ok, not Map.has_key?(result, :code))
+        code = result[:code] || if(ok, do: nil, else: "control_failed")
+
+        %{
+          "ok" => ok,
+          "sessionKey" => session_key,
+          "action" => action,
+          "status" => session_status
+        }
+        |> put_optional("code", code)
+        |> put_optional("message", result[:message])
+        |> then(&json(conn, 200, &1))
+    end
   end
 
   defp error_status("forbidden"), do: 403
