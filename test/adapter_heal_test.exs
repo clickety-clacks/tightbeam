@@ -1495,6 +1495,45 @@ defmodule Tightbeam.AdapterHealTest do
     assert detail["to_effort"] == "high"
   end
 
+  # A refusal has to be TRUE. An effort-less ruling on a tiered model used to
+  # come back "model is not in a fresh harness inventory" — the model is right
+  # there; what is missing is a tier. The asymmetry with spawn and tune is
+  # deliberate: they INHERIT from a base they can name, and mid-swap there is
+  # no clean base, so a ruling names its selection completely or is refused.
+  test "an effort-less ruling on a tiered model is refused by name, not miscategorised", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        efforts: ["medium", "high"],
+        model: Model.new("claude-fable-5", effort: "medium"),
+        cached_model: Model.new("claude-fable-5", effort: "medium")
+      )
+
+    Org.set_model(ctx.db, "k1", Model.new("claude-fable-5", effort: "medium"), "anthropic")
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    result =
+      Gateway.handlers(ctx.config)["adjudicate"].(%{
+        origin: "user:flynn",
+        principal: {:session, episode.owner_target},
+        params: %{
+          episode: episode.correlation_key,
+          action: "swap",
+          model: "claude-sonnet-4-6"
+        }
+      })
+
+    assert %{code: "invalid"} = result
+    assert result.message =~ "has effort tiers"
+    assert result.message =~ "medium|high"
+
+    # The lie: the model IS in the inventory, so this must not be the refusal.
+    refute result.message =~ "not in a fresh harness inventory"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5", effort: "medium")
+  end
+
   # Resolving a ruling on family and context alone would accept a level the
   # model does not offer and respawn the session onto an invalid selection.
   test "a ruling naming an effort the model does not offer is refused", ctx do

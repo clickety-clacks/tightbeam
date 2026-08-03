@@ -587,7 +587,13 @@ defmodule Tightbeam.PlacementTest do
     cli_bin = Path.join(base_dir, "bin")
     File.mkdir_p!(cli_bin)
 
-    config = %{base_dir: base_dir, db: db, cwd: "/work", cli_bin: cli_bin, default_model: Model.new("fable")}
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: cli_bin,
+      default_model: Model.new("fable")
+    }
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]

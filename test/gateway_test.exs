@@ -3122,8 +3122,18 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: issued}
              })
 
+    # THE Q1 CONTRACT IN ONE ASSERTION. The bracket in an issued id can only
+    # ever mean context, because effort is never rendered into it — so the
+    # round trip must land the context in `context` and leave effort alone.
+    # Losing the context, or growing an effort out of the bracket, are the two
+    # ways this seam can be wrong, and both are pinned here.
     stored = Org.get(ctx.db, "k-echo").model
-    assert {stored.family, stored.context} == {"claude-fable-5", "1m"}
+    assert stored.family == "claude-fable-5"
+    assert stored.context == "1m"
+    assert stored.effort == "low", "the effort came from the session, never from the id"
+
+    # And the identity it publishes for that row is the one it was handed.
+    assert Gateway.session_status("k-echo", ctx.db).display.model == issued
   end
 
   test "session_status splits setModel (one row per model) from setReasoning (current model's tiers)",

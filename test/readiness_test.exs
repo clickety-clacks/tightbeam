@@ -45,7 +45,10 @@ defmodule Tightbeam.ReadinessTest do
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Placement.ensure_schema(db)
     on_exit(fn -> File.rm_rf!(base) end)
-    %{base: base, config: %{base_dir: base, db: db, default_model: Model.new("m", effort: "medium")}}
+    %{
+      base: base,
+      config: %{base_dir: base, db: db, default_model: Model.new("m", effort: "medium")}
+    }
   end
 
   defp install_adapter!(base, module) do

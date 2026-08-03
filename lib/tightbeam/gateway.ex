@@ -1264,11 +1264,17 @@ defmodule Tightbeam.Gateway do
   # value coming back is RESOLVED against the catalog that issued it, never
   # split with a regex. It is spelled the way the vendor spells the model
   # because that is what a human should see in a picker.
+  # ASSUMED, and it is the vendor's to keep: a family name contains no literal
+  # bracket. The `model` slot's two readings — a family, or a family carrying a
+  # context variant — both depend on it. A vendor that broke it would have
+  # broken its own identifiers first.
   def wire_model(entry) do
     identity = wire_identity(entry)
 
     %{
       id: identity,
+      # DELETE `ref` once the client decoder stops requiring both: it is a
+      # duplicate of `id` and exists for no other reason.
       ref: identity,
       model: entry.family,
       context: entry.context,
@@ -1283,6 +1289,14 @@ defmodule Tightbeam.Gateway do
   # so it is looked up in the catalog that issued it — a lookup cannot invent a
   # context the host does not offer, and cannot mistake one of our effort
   # levels for the vendor's variant. An explicit `context` skips it.
+  #
+  # RESOLUTION IS DELIBERATELY LENIENT: an id it cannot find passes through as
+  # if it were a family, and NOTHING here refuses it. That is safe only because
+  # resolve-then-validate is ONE PIPELINE — every caller hands the result to
+  # `validate_catalog_model/5`, which is where an unknown selection is refused
+  # by name against the host's live catalog. The gate lives there, once, at the
+  # boundary that knows the host. A future caller that resolves without
+  # validating reintroduces silent acceptance of an unknown model.
   #
   # COMPLETE: fields the caller omitted inherit the default, which is what the
   # CLI promises. `--effort high` alone is the default model at high effort,
@@ -4382,13 +4396,52 @@ defmodule Tightbeam.Gateway do
       p[:action] not in ~w(park swap respawn stop) ->
         %{code: "invalid", message: "action must be park, swap, respawn, or stop"}
 
-      p[:action] in ~w(swap respawn) and is_nil(Model.from_params(p)) ->
-        %{code: "invalid", message: "--model is required for #{p.action}"}
+      p[:action] in ~w(swap respawn) ->
+        ruled = Model.from_params(p)
+
+        cond do
+          is_nil(ruled) ->
+            %{code: "invalid", message: "--model is required for #{p.action}"}
+
+          refusal = tierless_ruling(db, episode, ruled) ->
+            refusal
+
+          true ->
+            adjudicate_action(config, db, call, episode)
+        end
 
       true ->
         adjudicate_action(config, db, call, episode)
     end
   end
+
+  # A ruling names its selection COMPLETELY or is refused, and the refusal has
+  # to be true. Spawn and tune inherit an omitted effort from a base they can
+  # name; mid-swap there is no clean base, and a ruling is an authority act
+  # whose papertrail should say what was chosen. Left to fall through, an
+  # effort-less ruling on a TIERED model dies in `harness_for_ref/2` as "not in
+  # a fresh harness inventory" — which is false. The model is right there; the
+  # tier is what is missing, so say that and list the tiers.
+  defp tierless_ruling(db, episode, %Model{effort: nil} = ruled) do
+    session = Org.get(db, episode.session_key)
+
+    Enum.find_value(Harness.all(), fn module ->
+      case ModelCatalog.entry(session.host, module.wire_name(), ruled) do
+        {%{efforts: [_ | _] = efforts}, :fresh} ->
+          %{
+            code: "invalid",
+            message:
+              "#{Model.to_ref(ruled)} has effort tiers on #{module.wire_name()}; the ruling " <>
+                "must name one with --effort (offers #{Enum.join(efforts, "|")})"
+          }
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
+  defp tierless_ruling(_db, _episode, _ruled), do: nil
 
   defp adjudicate_action(config, db, call, episode) do
     action = fn ->
