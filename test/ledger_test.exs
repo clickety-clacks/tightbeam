@@ -16,12 +16,12 @@ defmodule Tightbeam.LedgerTest do
       DB.execute(db, """
       INSERT INTO sessions
         (sessionKey, displayName, ownerUserId, origin, archetype, identityName,
-         harness, provider, model, createdAt, updatedAt)
+         harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
         ('k1', 'K1', 'flynn', 'user:flynn', 'default', 'default',
-         'claude', 'anthropic', 'claude-sonnet-5[medium]', 1, 1),
+         'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
         ('k2', 'K2', 'flynn', 'user:flynn', 'default', 'default',
-         'claude', 'anthropic', 'claude-sonnet-5[medium]', 1, 1);
+         'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
   end
 
@@ -101,29 +101,43 @@ defmodule Tightbeam.LedgerTest do
     assert t2.prompt == "next"
   end
 
-  test "claim stamps the session's selected mind after a queued turn is tuned",
+  # The stamp is the WHOLE identity, in fields. A context variant and a
+  # reasoning level are different questions, and a turn's provenance has to be
+  # able to tell `gpt-5.6-sol` at high from the same model at medium, and from
+  # its 1M-context sibling. Reading back only model+harness would pass with the
+  # effort and context columns never written at all.
+  test "claim stamps every field of the session's selected mind after a tune",
        %{db: db} do
     first = enqueue!(db, "k1", "before tune")
 
-    assert {:ok, [["queued", nil, nil]]} =
-             DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
+    assert {:ok, [["queued", nil, nil, nil, nil]]} = mind(db, first)
 
     :ok =
       DB.execute(
         db,
-        "UPDATE sessions SET model='gpt-5.6-sol[high]', harness='codex' WHERE sessionKey='k1'"
+        """
+        UPDATE sessions
+        SET model='gpt-5.6-sol', thinkingLevel='high', modelContext='1m', harness='codex'
+        WHERE sessionKey='k1'
+        """
       )
 
     assert {:ok, %{seq: ^first}} = Ledger.claim_next(db, "k1", "lane")
 
-    assert {:ok, [["running", "gpt-5.6-sol[high]", "codex"]]} =
-             DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
+    assert {:ok, [["running", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
 
     # The trace reads TERMINAL turns — the stamp must survive terminalization.
     :ok = Ledger.finish(db, first, "delivered")
 
-    assert {:ok, [["delivered", "gpt-5.6-sol[high]", "codex"]]} =
-             DB.query(db, "SELECT status, model, harness FROM turns WHERE seq = ?1", [first])
+    assert {:ok, [["delivered", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
+  end
+
+  defp mind(db, seq) do
+    DB.query(
+      db,
+      "SELECT status, model, thinkingLevel, modelContext, harness FROM turns WHERE seq = ?1",
+      [seq]
+    )
   end
 
   test "publication feed: terminal rows surface until marked published", %{db: db} do

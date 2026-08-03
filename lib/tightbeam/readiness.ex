@@ -209,7 +209,8 @@ defmodule Tightbeam.Readiness do
 
       Enum.any?(
         entries,
-        &(ModelCatalog.names_same_model?(&1, model) and effort_offered?(&1, model.effort))
+        &(ModelCatalog.names_same_model?(&1, model) and
+            ModelCatalog.offers_effort?(&1, model.effort))
       ) ->
         :selectable
 
@@ -217,9 +218,6 @@ defmodule Tightbeam.Readiness do
         {:absent, Model.describe(model)}
     end
   end
-
-  defp effort_offered?(%{efforts: []}, effort), do: is_nil(effort)
-  defp effort_offered?(%{efforts: efforts}, effort), do: effort in efforts
 
   @doc """
   Render the summary as the closing lines of boot.

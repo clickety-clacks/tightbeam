@@ -155,14 +155,6 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       is_nil(model) ->
         check("default_model", false, "default model is not set", fix)
 
-      is_nil(model.effort) ->
-        check(
-          "default_model",
-          false,
-          "#{Model.describe(model)} names no effort; set TIGHTBEAM_DEFAULT_EFFORT",
-          fix
-        )
-
       credential_state == :missing ->
         module = Tightbeam.Harness.parse!(harness)
 
@@ -199,12 +191,14 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   end
 
   defp default_model_inventory_check(inventories, harness, model, fix, degraded \\ %{}) do
-    live? =
-      Enum.any?(
-        Map.get(inventories, harness, []),
-        &(ModelCatalog.names_same_model?(&1, model) and model.effort in &1.efforts)
-      )
+    # The ENTRY decides whether an effort is required: a model with tiers needs
+    # one, a model without tiers must not carry one. `nil` is a legal selection
+    # for an untiered model, and rejecting it out of hand failed a default that
+    # the gateway and the catalog both accept.
+    entry =
+      Enum.find(Map.get(inventories, harness, []), &ModelCatalog.names_same_model?(&1, model))
 
+    live? = not is_nil(entry) and ModelCatalog.offers_effort?(entry, model.effort)
     reason = Map.get(degraded, harness)
 
     cond do
@@ -225,9 +219,30 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
             "strength of this row. Check the running gateway's catalog."
         )
 
+      # The model IS offered here and only the level is wrong, so say which
+      # levels it has rather than sending the operator to re-pick a model that
+      # was never the problem.
+      not is_nil(entry) ->
+        check("default_model", false, effort_mismatch(model, entry, harness), fix)
+
       true ->
         check("default_model", false, "#{Model.describe(model)} is not live for #{harness}", fix)
     end
+  end
+
+  defp effort_mismatch(model, %{efforts: []}, harness) do
+    "#{model.family} on #{harness} has no effort tiers, so TIGHTBEAM_DEFAULT_EFFORT " <>
+      "must be unset (it names #{inspect(model.effort)})"
+  end
+
+  defp effort_mismatch(%{effort: nil} = model, entry, harness) do
+    "#{model.family} on #{harness} offers #{Enum.join(entry.efforts, "|")} — " <>
+      "set TIGHTBEAM_DEFAULT_EFFORT to one of them"
+  end
+
+  defp effort_mismatch(model, entry, harness) do
+    "#{model.family} on #{harness} does not offer effort #{inspect(model.effort)}; " <>
+      "it offers #{Enum.join(entry.efforts, "|")}"
   end
 
   defp harness_auth_check(_catalog, harness, :missing, base_dir, host) do

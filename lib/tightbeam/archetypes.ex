@@ -19,7 +19,7 @@ defmodule Tightbeam.Archetypes do
           where: [String.t()],
           defaults: %{optional(:harness) => atom(), optional(:model) => Tightbeam.Model.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
-          model_preferences: [String.t()],
+          model_preferences: [Tightbeam.Model.t()],
           containment: %{fs: :off, network: :open},
           mcp: [
             %{
@@ -679,11 +679,7 @@ defmodule Tightbeam.Archetypes do
         %{name: reference_name, location: location, access: reference["access"]}
       end)
 
-    model_preferences = Map.get(manifest, "model_preferences", [])
-
-    unless is_list(model_preferences) and Enum.all?(model_preferences, &is_binary/1) do
-      raise ArgumentError, "archetype model_preferences must be a list of strings: #{path}"
-    end
+    model_preferences = validate_model_preferences!(Map.get(manifest, "model_preferences", []), path)
 
     mcp = validate_mcp!(Map.get(manifest, "mcp", %{}))
     containment = validate_containment!(Map.get(manifest, "containment", %{}), path)
@@ -699,6 +695,45 @@ defmodule Tightbeam.Archetypes do
       mcp: mcp,
       guidance: get_in(manifest, ["guidance", "text"])
     }
+  end
+
+  # A stored preference holds FIELDS, like every other stored selection: a
+  # table with `model`, and optionally `effort` and `context`.
+  #
+  #     [[model_preferences]]
+  #     model = "claude-fable-5"
+  #     effort = "high"
+  #
+  # A list of packed strings — the shape this used to take — is REFUSED by
+  # name rather than parsed. Splitting `claude-fable-5[1m]` here is exactly the
+  # guess that lost the 1M model, and a file an older version wrote deserves a
+  # bug report, not an inference.
+  defp validate_model_preferences!(raw, path) do
+    unless is_list(raw) do
+      raise ArgumentError, "archetype model_preferences must be a list of tables: #{path}"
+    end
+
+    Enum.map(raw, fn
+      preference when is_map(preference) ->
+        case Tightbeam.Model.from_params(preference) do
+          nil ->
+            raise ArgumentError,
+                  "archetype model_preferences entry is missing model: #{path}"
+
+          model ->
+            model
+        end
+
+      packed when is_binary(packed) ->
+        raise ArgumentError,
+              "archetype model_preferences entry #{inspect(packed)} is a packed string; " <>
+                "a preference is fields — [[model_preferences]] with model/effort/context: " <>
+                path
+
+      other ->
+        raise ArgumentError,
+              "archetype model_preferences entry must be a table, got #{inspect(other)}: #{path}"
+    end)
   end
 
   defp validate_containment!(raw, path) do

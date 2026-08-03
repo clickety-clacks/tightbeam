@@ -1452,6 +1452,80 @@ defmodule Tightbeam.AdapterHealTest do
     assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
   end
 
+  # An adjudication record has to be able to say what happened. Serializing the
+  # identity WITHOUT its effort made a medium->high ruling record the same value
+  # on both sides: existing audit information, destroyed.
+  test "a same-model effort ruling is legible in the record", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        efforts: ["medium", "high"],
+        model: Model.new("claude-fable-5", effort: "medium"),
+        cached_model: Model.new("claude-fable-5", effort: "medium")
+      )
+
+    Org.set_model(ctx.db, "k1", Model.new("claude-fable-5", effort: "medium"), "anthropic")
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    assert %{ok: true, action: "swap", model: "claude-fable-5", effort: "high"} =
+             Gateway.handlers(ctx.config)["adjudicate"].(%{
+               origin: "user:flynn",
+               principal: {:session, episode.owner_target},
+               params: %{
+                 episode: episode.correlation_key,
+                 action: "swap",
+                 model: "claude-fable-5",
+                 effort: "high"
+               }
+             })
+
+    detail =
+      EventLog.lifecycle_events(ctx.db)
+      |> Enum.find(&(&1.kind == "model_adjudication"))
+      |> Map.fetch!(:detail)
+      |> JSON.decode!()
+
+    # Same model on both sides — so the EFFORT is the only thing that can say
+    # what the ruling did, and it has to be in the record.
+    assert detail["from_model"] == "claude-fable-5"
+    assert detail["to_model"] == "claude-fable-5"
+    assert detail["from_effort"] == "medium"
+    assert detail["to_effort"] == "high"
+  end
+
+  # Resolving a ruling on family and context alone would accept a level the
+  # model does not offer and respawn the session onto an invalid selection.
+  test "a ruling naming an effort the model does not offer is refused", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        efforts: ["medium", "high"],
+        model: Model.new("claude-fable-5", effort: "medium"),
+        cached_model: Model.new("claude-fable-5", effort: "medium")
+      )
+
+    Org.set_model(ctx.db, "k1", Model.new("claude-fable-5", effort: "medium"), "anthropic")
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    assert %{code: "model_unavailable"} =
+             Gateway.handlers(ctx.config)["adjudicate"].(%{
+               origin: "user:flynn",
+               principal: {:session, episode.owner_target},
+               params: %{
+                 episode: episode.correlation_key,
+                 action: "swap",
+                 model: "claude-fable-5",
+                 effort: "ultra"
+               }
+             })
+
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5", effort: "medium")
+  end
+
   test "F3: a swap that WINS records the model the harness confirmed, exactly once", ctx do
     adapter = swap_harness(ctx, checkout: {:error, :degraded})
     run_failing_turn(ctx, "fault")
@@ -2032,7 +2106,7 @@ defmodule Tightbeam.AdapterHealTest do
 
     adapter = start_supervised!({SwapAdapterStub, adapter_opts}, id: :swap_adapter)
 
-    seed_swap_catalog(ctx)
+    seed_swap_catalog(ctx, Keyword.get(opts, :efforts, []))
     Org.append_pointer(ctx.db, "k1", "harness-sid-1", "created")
     adapter
   end
@@ -2045,7 +2119,7 @@ defmodule Tightbeam.AdapterHealTest do
   # `harness_for_ref/2` reads the OWNING host's inventory, so the catalog has to
   # know testhost at all — the setup's instance enumerates the real registry and
   # drops it.
-  defp seed_swap_catalog(ctx) do
+  defp seed_swap_catalog(ctx, efforts \\ []) do
     stop_supervised!(ModelCatalog)
 
     start_supervised!(
@@ -2067,7 +2141,7 @@ defmodule Tightbeam.AdapterHealTest do
           context: nil,
           display_name: ref,
           name: ref,
-          efforts: [],
+          efforts: efforts,
           max_input_tokens: 200_000,
           capabilities: %{},
           provider: :anthropic

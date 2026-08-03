@@ -198,7 +198,7 @@ defmodule Tightbeam.Wire.Router do
             into: %{},
             do: {atom, body[k]}
 
-      picker = Map.merge(picker, model_params(body["model"], body["effort"]))
+      picker = Map.merge(picker, model_params(body))
 
       call = %{
         verb: "spawn",
@@ -774,32 +774,33 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  # The wire's line format for a model identity is the vendor identifier the
-  # picker published (`claude-fable-5[1m]`). This seam owns both directions: it
-  # is split into fields HERE, so nothing past the router sees a packed string.
-  # Effort is already its own wire field and is never read out of the ref.
-  defp model_params(ref, effort) when is_binary(ref) and ref != "" do
-    identity = Tightbeam.Model.parse_ref(ref)
-
-    %{model: identity.family}
-    |> then(&if identity.context, do: Map.put(&1, :context, identity.context), else: &1)
-    |> then(&if is_binary(effort) and effort != "", do: Map.put(&1, :effort, effort), else: &1)
+  # A model identity crosses the wire as NAMED FIELDS. The router carries them
+  # across unchanged — it does not parse `model`, because a bracket in that
+  # value is the vendor's context variant and reading it as one of our effort
+  # levels is the whole defect this seam exists to prevent. A client that
+  # echoes back the row identity this seam issued is resolved against the
+  # catalog by the gateway (`resolve_selection/3`), never by a regex here.
+  defp model_params(body) do
+    for key <- ~w(model context effort),
+        is_binary(body[key]) and body[key] != "",
+        into: %{},
+        do: {String.to_existing_atom(key), body[key]}
   end
-
-  defp model_params(_ref, _effort), do: %{}
 
   defp control_call(%{"action" => "cancel_current_run"}), do: {:ok, "cancel", %{}}
 
   defp control_call(%{"action" => action}) when action in ~w(adopt unadopt),
     do: {:ok, "tune", %{setting: "adopt", adopted: action == "adopt"}}
 
-  defp control_call(%{"action" => "set_model", "model" => model}),
-    do: {:ok, "tune", Map.put(model_params(model, nil), :setting, "set_model")}
+  defp control_call(%{"action" => "set_model", "model" => model} = body)
+       when is_binary(model),
+       do: {:ok, "tune", Map.put(model_params(body), :setting, "set_model")}
 
   defp control_call(%{"action" => "set_harness", "harness" => harness} = body),
     do:
       {:ok, "tune",
-       model_params(body["model"], body["effort"])
+       body
+       |> model_params()
        |> Map.put(:setting, "set_harness")
        |> Map.put(:harness, harness)}
 

@@ -20,22 +20,13 @@ defmodule Tightbeam.ModelTest do
     assert %{Model.parse_ref(rendered) | effort: chosen.effort} == chosen
   end
 
-  test "params carry named fields in both directions" do
+  test "params carry named fields from either key shape" do
     chosen = Model.new("gpt-5.6-sol", effort: "medium")
 
-    assert Model.to_params(chosen) == %{"model" => "gpt-5.6-sol", "effort" => "medium"}
     assert Model.from_params(%{"model" => "gpt-5.6-sol", "effort" => "medium"}) == chosen
     assert Model.from_params(%{model: "gpt-5.6-sol", effort: "medium"}) == chosen
     assert Model.from_params(%{"model" => "", "effort" => "medium"}) == nil
     assert Model.from_params(%{"effort" => "medium"}) == nil
-  end
-
-  test "same_model? ignores effort and respects the context variant" do
-    fable = Model.new("claude-fable-5")
-    fable_wide = Model.new("claude-fable-5", context: "1m")
-
-    assert Model.same_model?(fable, %{fable | effort: "max"})
-    refute Model.same_model?(fable, fable_wide)
   end
 
   test "describe names every field for a reader who must pick one" do

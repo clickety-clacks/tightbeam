@@ -587,15 +587,46 @@ defmodule Tightbeam.ModelCatalogTest do
     await_fresh(catalog, "claude")
     await_fresh(catalog, "codex")
 
-    for harness <- ["claude", "codex"],
-        entry <- ModelCatalog.get(catalog)[{@host, harness}],
-        effort <- entry.efforts do
-      selection = Model.new(entry.family, context: entry.context, effort: effort)
+    # Every entry contributes at least one selection: each tier for a model with
+    # tiers, and the nil-effort selection for one without. Iterating
+    # `entry.efforts` alone SKIPPED every untiered entry silently, and a catalog
+    # of nothing but untiered models would have asserted nothing at all — so the
+    # count is asserted too, and it is derived from the catalog, not a literal.
+    selections =
+      for harness <- ["claude", "codex"],
+          entry <- ModelCatalog.get(catalog)[{@host, harness}],
+          effort <- if(entry.efforts == [], do: [nil], else: entry.efforts) do
+        {harness, Model.new(entry.family, context: entry.context, effort: effort)}
+      end
 
+    expected_count =
+      for harness <- ["claude", "codex"],
+          entry <- ModelCatalog.get(catalog)[{@host, harness}],
+          reduce: 0 do
+        total -> total + max(length(entry.efforts), 1)
+      end
+
+    assert length(selections) == expected_count
+    assert expected_count > 0
+
+    for {harness, selection} <- selections do
       assert ModelCatalog.member?(@host, harness, selection, catalog) == %{
                present?: true,
                health: :fresh
              }
+    end
+
+    # An untiered entry REFUSES an effort, and a tiered one refuses its absence.
+    # Both directions are the entry's call, and neither was covered.
+    for {harness, selection} <- selections do
+      {entry, :fresh} = ModelCatalog.entry(@host, harness, selection, catalog)
+
+      flipped =
+        if entry.efforts == [],
+          do: %{selection | effort: "medium"},
+          else: %{selection | effort: nil}
+
+      refute ModelCatalog.member?(@host, harness, flipped, catalog).present?
     end
 
     refute ModelCatalog.member?(

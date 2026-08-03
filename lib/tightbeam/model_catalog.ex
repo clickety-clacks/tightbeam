@@ -91,7 +91,7 @@ defmodule Tightbeam.ModelCatalog do
   def member?(host, harness, %Model{} = model, server \\ __MODULE__)
       when is_binary(host) and is_binary(harness) do
     {entry, health} = entry(host, harness, model, server)
-    %{present?: not is_nil(entry) and effort_offered?(entry, model.effort), health: health}
+    %{present?: not is_nil(entry) and offers_effort?(entry, model.effort), health: health}
   end
 
   @doc """
@@ -112,8 +112,15 @@ defmodule Tightbeam.ModelCatalog do
   def names_same_model?(entry, %Model{} = model),
     do: entry.family == model.family and entry.context == model.context
 
-  defp effort_offered?(%{efforts: []}, effort), do: is_nil(effort)
-  defp effort_offered?(%{efforts: efforts}, effort), do: effort in efforts
+  @doc """
+  Whether an entry offers a reasoning level. The ENTRY is the authority on what
+  may be asked of a model: one with tiers requires a level, one with none
+  refuses one. Every caller that completes a selection asks here, so no second
+  copy of the rule can drift.
+  """
+  @spec offers_effort?(entry(), String.t() | nil) :: boolean()
+  def offers_effort?(%{efforts: []}, effort), do: is_nil(effort)
+  def offers_effort?(%{efforts: efforts}, effort), do: effort in efforts
 
   @impl true
   def init(opts) do

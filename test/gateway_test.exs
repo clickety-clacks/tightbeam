@@ -2926,6 +2926,206 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # A named field that is accepted and then dropped is the silent-no-op class
+  # this codebase keeps producing. `--effort high` with no `--model` says
+  # something real; it must reach the spawn, not vanish because the identity
+  # could not be built without a family.
+  test "a partial selection completes against the default instead of being dropped", ctx do
+    base_dir = role_test_base("partial-selection")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :partial_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", [
+      {"claude-fable-5", ["low", "high"]},
+      {"claude-sonnet-4-6", ["low", "high"]}
+    ])
+
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:default_model, Model.new("claude-fable-5", effort: "low"))
+
+    spawn_with = fn params, key ->
+      Gateway.handlers(config)["spawn"].(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: Map.merge(%{display_name: "Partial", idempotency_key: key}, params)
+      })
+    end
+
+    # Effort alone: the DEFAULT model, at the effort named.
+    assert %{session_key: only_effort} = spawn_with.(%{effort: "high"}, "k-effort")
+    assert Org.get(ctx.db, only_effort).model == Model.new("claude-fable-5", effort: "high")
+
+    # Nothing named: the default, untouched.
+    assert %{session_key: neither} = spawn_with.(%{}, "k-neither")
+    assert Org.get(ctx.db, neither).model == Model.new("claude-fable-5", effort: "low")
+
+    # A model alone carries the default's tier forward, composed against what
+    # that model actually offers — one mechanism decides effort.
+    assert %{session_key: only_model} = spawn_with.(%{model: "claude-sonnet-4-6"}, "k-model")
+    assert Org.get(ctx.db, only_model).model == Model.new("claude-sonnet-4-6", effort: "low")
+  end
+
+  # An archetype default is a `%Model{}` internally. Publishing it raw put
+  # `__struct__`/`family` — an INTERNAL shape — into a client payload, and JSON
+  # encoding refused it outright, so every org-options read broke the moment an
+  # archetype declared a default model.
+  test "archetype defaults and preferences cross org_options as named fields", ctx do
+    base_dir = role_test_base("org-options-defaults")
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "defaulted.toml"), """
+    name = "defaulted"
+
+    [defaults]
+    model = "claude-fable-5"
+    effort = "high"
+    context = "1m"
+
+    [[model_preferences]]
+    model = "gpt-5.6-sol"
+    effort = "medium"
+    """)
+
+    Archetypes.load!(base_dir)
+
+    inspected =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["inspect"].(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{}
+      })
+
+    defaulted = Enum.find(inspected.archetypes, &(&1.name == "defaulted"))
+
+    assert defaulted.defaults[:model] == "claude-fable-5"
+    assert defaulted.defaults[:effort] == "high"
+    assert defaulted.defaults[:context] == "1m"
+
+    assert defaulted.modelPreferences ==
+             [%{model: "gpt-5.6-sol", effort: "medium", context: nil}]
+
+    # It must actually SERIALIZE — a `%Model{}` here raised on encode, so the
+    # whole payload failed the moment an archetype declared a default model.
+    encoded = JSON.encode!(inspected)
+    refute encoded =~ "__struct__"
+    refute encoded =~ "family"
+  end
+
+  # THE WIRE SEAM, both directions. The ruling names the wire as a seam that
+  # carries NAMED FIELDS: a 1M selection that crossed as the bare string
+  # `claude-fable-5[1m]`, with nothing saying which part was the context, left
+  # the client no way to read it and left this side re-parsing on the way back.
+  test "the wire publishes a model identity as named fields and resolves it back", ctx do
+    Archetypes.load!(role_test_base("wire-named-fields"))
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low", "high"]}])
+
+    put_host_catalog_entry("testhost", "claude", %{
+      family: "claude-fable-5",
+      context: "1m",
+      efforts: ["low", "high"]
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "k-wire",
+      display_name: "Wire",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5", effort: "low")
+    })
+
+    status = Gateway.session_status("k-wire", ctx.db)
+
+    wide =
+      Enum.find(status.modelCatalog.models, &(&1.context == "1m"))
+
+    # OUTBOUND: the fields are named. `context` is a field a client can read,
+    # not a bracket it would have to split off a string itself.
+    assert wide.model == "claude-fable-5"
+    assert wide.context == "1m"
+    assert wide.efforts == ["low", "high"]
+    assert Enum.any?(
+             status.modelCatalog.models,
+             &(&1.model == "claude-fable-5" and is_nil(&1.context))
+           )
+
+    # The current selection, likewise.
+    assert status.display.modelFamily == "claude-fable-5"
+    assert status.display.modelContext == nil
+    assert status.display.reasoningLevel == "low"
+
+    # INBOUND: named fields select the 1M variant, without anything parsing a
+    # bracket to find it.
+    config = gateway_config(role_test_base("wire-named-fields-in"), ctx.db, 0)
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-wire",
+               params: %{setting: "set_model", model: "claude-fable-5", context: "1m"}
+             })
+
+    assert Org.get(ctx.db, "k-wire").model ==
+             Model.new("claude-fable-5", context: "1m", effort: "low")
+  end
+
+  # The identity this seam ISSUES is what a client echoes back, so it has to
+  # come home to the same row. Resolution is a catalog lookup, never a regex:
+  # a lookup cannot invent a context the host does not offer.
+  test "an issued row identity echoed back resolves to that row's fields", ctx do
+    Archetypes.load!(role_test_base("wire-echo"))
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low"]}])
+
+    put_host_catalog_entry("testhost", "claude", %{
+      family: "claude-fable-5",
+      context: "1m",
+      efforts: ["low"]
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "k-echo",
+      display_name: "Echo",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5", effort: "low")
+    })
+
+    issued =
+      Gateway.session_status("k-echo", ctx.db).modelCatalog.models
+      |> Enum.find(&(&1.context == "1m"))
+      |> Map.fetch!(:ref)
+
+    config = gateway_config(role_test_base("wire-echo-in"), ctx.db, 0)
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-echo",
+               params: %{setting: "set_model", model: issued}
+             })
+
+    stored = Org.get(ctx.db, "k-echo").model
+    assert {stored.family, stored.context} == {"claude-fable-5", "1m"}
+  end
+
   test "session_status splits setModel (one row per model) from setReasoning (current model's tiers)",
        ctx do
     Archetypes.load!(role_test_base("session-status-reasoning"))
@@ -4131,6 +4331,27 @@ defmodule Tightbeam.GatewayTest do
 
   # Install a fresh catalog for one {host, harness}, so a test can give two hosts
   # genuinely different entitlements without a provider on either end.
+  defp put_host_catalog_entry(host, harness, overrides) do
+    entry =
+      Map.merge(
+        %{
+          family: "seeded",
+          context: nil,
+          display_name: "Seeded",
+          name: "Seeded",
+          efforts: [],
+          max_input_tokens: 200_000,
+          capabilities: %{},
+          provider: :anthropic
+        },
+        overrides
+      )
+
+    :sys.replace_state(ModelCatalog, fn state ->
+      update_in(state.entries[{host, harness}].entries, &(&1 ++ [entry]))
+    end)
+  end
+
   # A seeded catalog entry names a MODEL and the efforts it offers — the shape
   # `ModelCatalog` really holds, so the stub cannot drift from it.
   defp put_host_catalog(host, harness, models) do

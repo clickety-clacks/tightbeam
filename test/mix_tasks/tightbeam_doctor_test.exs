@@ -44,6 +44,45 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert Enum.all?(checks, & &1.ok)
   end
 
+  # The ENTRY decides whether an effort is required. Rejecting `nil` out of hand
+  # failed a perfectly valid default on an untiered model — a false readiness
+  # verdict on a selection the gateway and the catalog both accept.
+  test "an untiered default model is live without an effort, and a tiered one names its levels",
+       ctx do
+    catalog =
+      {:ok,
+       %{
+         "claude" => [entry("claude-flat", [])],
+         "codex" => [entry("codex-tiered", ["low", "high"])],
+         "fixture" => []
+       }}
+
+    untiered = put(ctx.inputs, :default_model, Tightbeam.Model.new("claude-flat"))
+    {_status, report} = Doctor.evaluate(catalog, untiered)
+    assert find(report, "default_model").ok
+
+    # …and an effort on a model that has none is refused, by name.
+    with_effort =
+      put(ctx.inputs, :default_model, Tightbeam.Model.new("claude-flat", effort: "high"))
+
+    {_status, report} = Doctor.evaluate(catalog, with_effort)
+    check = find(report, "default_model")
+    refute check.ok
+    assert check.detail =~ "has no effort tiers"
+
+    # A TIERED model with no effort fails, and says which levels it has rather
+    # than sending the operator to re-pick a model that was never the problem.
+    tiered =
+      ctx.inputs
+      |> put(:default_harness, :codex)
+      |> put(:default_model, Tightbeam.Model.new("codex-tiered"))
+
+    {_status, report} = Doctor.evaluate(catalog, tiered)
+    check = find(report, "default_model")
+    refute check.ok
+    assert check.detail =~ "offers low|high"
+  end
+
   test "injected default model passes when live and fails when invalid", ctx do
     {_status, passing} = Doctor.evaluate(ctx.catalog, ctx.inputs)
     assert find(passing, "default_model").ok

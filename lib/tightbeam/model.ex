@@ -104,14 +104,30 @@ defmodule Tightbeam.Model do
     end
   end
 
-  @doc "Whether two identities name the same vendor model, ignoring effort."
-  @spec same_model?(t(), t()) :: boolean()
-  def same_model?(%__MODULE__{} = a, %__MODULE__{} = b),
-    do: a.family == b.family and a.context == b.context
+  @doc """
+  The model fields a caller NAMED, as a plain map, `nil` for each one omitted.
+
+  A partial selection is not an identity — `--effort high` alone says something
+  real but does not say which model — so this deliberately does not build a
+  `%Model{}`. The caller completes it against a default. Returning `nil` here
+  instead is how `--effort high` used to be accepted and silently dropped.
+  """
+  @spec named_fields(map()) :: %{
+          family: String.t() | nil,
+          effort: String.t() | nil,
+          context: String.t() | nil
+        }
+  def named_fields(params) when is_map(params) do
+    %{
+      family: field(params, :model) || field(params, :family),
+      effort: field(params, :effort),
+      context: field(params, :context)
+    }
+  end
 
   @doc """
-  Read an identity out of a map with string or atom keys — the shape wire
-  payloads and CLI params arrive in. `nil` when no family is present.
+  Read a COMPLETE identity out of a map with string or atom keys. `nil` when no
+  family is present — for a caller that requires one and refuses without it.
   """
   @spec from_params(map()) :: t() | nil
   def from_params(params) when is_map(params) do
@@ -123,17 +139,6 @@ defmodule Tightbeam.Model do
         nil
     end
   end
-
-  @doc "Wire projection: the identity as named JSON fields, absent ones omitted."
-  @spec to_params(t()) :: map()
-  def to_params(%__MODULE__{} = model) do
-    %{"model" => model.family}
-    |> maybe_put("effort", model.effort)
-    |> maybe_put("context", model.context)
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp field(params, key) do
     case Map.fetch(params, key) do
