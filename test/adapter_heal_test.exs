@@ -2336,7 +2336,7 @@ defmodule Tightbeam.AdapterHealTest do
     Agent.update(:swap_checkout, fn _ -> {:ok, adapter, 1} end)
   end
 
-  # `harness_for_ref/2` reads the OWNING host's inventory, so the catalog has to
+  # `ModelCatalog.route/2` reads the OWNING host's inventory, so the catalog has to
   # know testhost at all — the setup's instance enumerates the real registry and
   # drops it.
   defp seed_swap_catalog(ctx, efforts \\ []) do
