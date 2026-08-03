@@ -648,6 +648,38 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert marker.content =~ "[adapter down]"
   end
 
+  test "readiness is credited to the instance the ready message names, not to the entry", ctx do
+    key = {:claude, "shared", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"credit_#{System.unique_integer([:positive])}")
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
+
+    # Wind readiness back so the credit is observable, then replay the ready
+    # message under a FOREIGN pid — the shape of an instance that announced
+    # readiness, died, and had a replacement installed before the coordinator
+    # got to the message.
+    :sys.replace_state(coordinator, fn state ->
+      %{
+        state
+        | adapters: Map.update!(state.adapters, key, &%{&1 | ready: false}),
+          ready_refs: MapSet.new()
+      }
+    end)
+
+    send(coordinator, {:adapter_ready, key, self()})
+    state = :sys.get_state(coordinator)
+    refute state.adapters[key].ready, "a foreign instance's ready credited this entry"
+    assert MapSet.size(state.ready_refs) == 0
+
+    # The instance the entry DOES point at is credited, and its monitor ref is
+    # what gets remembered — that ref is the identity a later :DOWN asks about.
+    send(coordinator, {:adapter_ready, key, adapter})
+    state = :sys.get_state(coordinator)
+    assert state.adapters[key].ready
+    assert MapSet.member?(state.ready_refs, state.adapters[key].monitor)
+  end
+
   test "a ready adapter's death is told even when a replacement already took the entry over",
        ctx do
     key = {:claude, "shared", "testhost"}

@@ -42,7 +42,8 @@ defmodule Tightbeam.AdapterCoordinator do
     post-restart ready always outranks a token stamped under an older epoch
     (spec s4-operability-v1 §2). Readiness is tracked explicitly — a fresh entry
     has zero failures and a closed circuit without ever having booted, so only
-    `{:adapter_ready, key}` may mark a key ready.
+    `{:adapter_ready, key, pid}` may mark a key ready, and only for the
+    INSTANCE it names.
   - FAILURE MEMORY is ATTEMPT-SCOPED: `last_failure` records {generation, reason}
     and is only served to a caller asking about that same generation. A
     replacement adapter's death must never be labelled with its predecessor's
@@ -660,9 +661,9 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  def handle_info({:adapter_ready, key}, state) do
+  def handle_info({:adapter_ready, key, pid}, state) do
     case state.adapters[key] do
-      %{pid: pid} = entry when is_pid(pid) ->
+      %{pid: ^pid} = entry when is_pid(pid) ->
         entry = %{entry | failures: 0, circuit: :closed, ready: true, last_failure: nil}
         state = %{state | ready_refs: put_ready_ref(state.ready_refs, entry.monitor)}
         # EDGE half of the heal trigger. The hook is invoked with the FULL token
@@ -671,6 +672,11 @@ defmodule Tightbeam.AdapterCoordinator do
         state.on_adapter_ready.(key_name(key), {state.epoch, entry.generation})
         {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
 
+      # A ready message from an instance this entry no longer points at. It
+      # died between announcing and being heard; the entry now describes a
+      # successor that has not booted, and crediting it would declare a
+      # not-yet-serving adapter ready — and fire the heal EDGE against the
+      # wrong generation.
       _ ->
         {:noreply, state}
     end
@@ -734,7 +740,13 @@ defmodule Tightbeam.AdapterCoordinator do
           opts
         end
 
-      Keyword.put(opts, :on_ready, fn -> send(coordinator, {:adapter_ready, key}) end)
+      # The message NAMES THE INSTANCE that booted. `on_ready` runs in the
+      # adapter's own process, so self() here is that adapter. Without it the
+      # coordinator can only credit whichever pid the entry holds when the
+      # message is finally processed — and an adapter that dies between
+      # announcing readiness and being heard would hand its credit to the
+      # replacement, which has not booted.
+      Keyword.put(opts, :on_ready, fn -> send(coordinator, {:adapter_ready, key, self()}) end)
     end
 
     child = %{
@@ -750,7 +762,7 @@ defmodule Tightbeam.AdapterCoordinator do
         generation = max(entry.generation, 1)
 
         # Boot is LAZY: a spawned pid proves nothing. failures/circuit are
-        # reset only by {:adapter_ready, key} — the completed-boot signal.
+        # reset only by {:adapter_ready, key, pid} — the completed-boot signal.
         entry = %{
           entry
           | pid: pid,
