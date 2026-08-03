@@ -590,6 +590,13 @@ defmodule Tightbeam.Credentials do
   #
   # Best effort by construction: a harness need not implement it, and a warm that fails must
   # not fail an onboarding whose credential already validated.
+  #
+  # NOTE FOR WHOEVER ADDS A HOME-RESET PATH: warming is triggered by a credential WRITE, not
+  # by the home's existence. Nothing today wipes a home without one -- `Homes.reconcile`
+  # removes only the entries it owns, and the harness's own cache survives -- so this holds.
+  # Add a way to clear or recreate a home without re-onboarding and it stops holding: the
+  # catalog silently narrows to the static floor and nothing re-warms. Re-warm there rather
+  # than adding detection here.
   defp warm_home(module, target, home) do
     if function_exported?(module, :warm_home, 2) do
       case module.warm_home(target, home) do
