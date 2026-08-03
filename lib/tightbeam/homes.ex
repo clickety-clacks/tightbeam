@@ -6,7 +6,17 @@ defmodule Tightbeam.Homes do
   `.tightbeam/`, and the substrate baseline skills. Regeneration is
   ownership-scoped: it never removes the home and therefore preserves
   harness-owned sessions, history, projects, transcripts, and memory
-  byte-for-byte. Substrate baseline skills project separately from org
+  byte-for-byte.
+
+  IF YOU ADD A PATH THAT DOES REMOVE OR RECREATE A HOME, it must re-warm the
+  harness afterwards. Some harnesses cache what the account is ENTITLED to in
+  their own home -- claude keeps the extra models it may select there -- and
+  Tightbeam fills that cache exactly once, when a credential is written
+  (`Credentials.warm_home/3`). A home cleared without a credential write comes
+  back with its credential relinked and that cache gone, and the model catalog
+  silently narrows to the static floor: it reads as a smaller account, not as an
+  emptied directory. Re-warm in the reset path; do not add cold-home detection
+  here. Substrate baseline skills project separately from org
   identity and are never sourced from the org-editable skill library.
 
   Callers gate regeneration on a stopped runtime. Before replacing a
