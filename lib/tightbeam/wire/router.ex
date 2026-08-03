@@ -781,10 +781,26 @@ defmodule Tightbeam.Wire.Router do
   # echoes back the row identity this seam issued is resolved against the
   # catalog by the gateway (`resolve_selection/3`), never by a regex here.
   defp model_params(body) do
-    for key <- ~w(model context effort),
-        is_binary(body[key]) and body[key] != "",
-        into: %{},
-        do: {String.to_existing_atom(key), body[key]}
+    Enum.reduce(~w(model context effort), %{}, fn key, params ->
+      case Map.fetch(body, key) do
+        {:ok, value} when is_binary(value) and value != "" ->
+          Map.put(params, String.to_existing_atom(key), value)
+
+        # NAMED, AND NAMED EMPTY. `null` and `""` are the client saying "this
+        # field, with nothing in it" — the vendor's default window, no tier —
+        # which is a different request from omitting the key. Dropping them
+        # here would undo at the outermost seam the distinction every layer
+        # below is built to carry, and the caller's explicit choice would
+        # arrive as silence and be inherited over.
+        {:ok, value} when is_nil(value) or value == "" ->
+          Map.put(params, String.to_existing_atom(key), nil)
+
+        # Anything else is not a field value this seam knows how to read, and
+        # it is not turned into one by guessing.
+        _ ->
+          params
+      end
+    end)
   end
 
   defp control_call(%{"action" => "cancel_current_run"}), do: {:ok, "cancel", %{}}

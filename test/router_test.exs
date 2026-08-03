@@ -1601,6 +1601,84 @@ defmodule Tightbeam.Wire.RouterTest do
     refute_received {:call, %{verb: "tune"}}
   end
 
+  # THE THIRD DESTRUCTION SITE. JSON can say `null`, and the router dropped it —
+  # so "the caller named context and named it empty" arrived downstream
+  # indistinguishable from "the caller said nothing about context", which is
+  # the exact collapse `named_fields/1` and `put_named/3` exist to prevent.
+  # Two seams below carrying the distinction is worth nothing if the seam that
+  # faces the outside throws it away first.
+  test "an explicitly null model field crosses the wire as named, not omitted", ctx do
+    key = "explicit-null-control"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", fn call -> send_call(call) end)
+
+    response =
+      conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(%{
+          "sessionKey" => key,
+          "action" => "set_model",
+          "model" => "claude-fable-5",
+          "context" => nil,
+          "effort" => "high"
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+
+    assert_received {:call, %{verb: "tune", params: params}}
+
+    assert params.model == "claude-fable-5"
+    assert params.effort == "high"
+
+    assert Map.has_key?(params, :context),
+           "an explicit null must arrive as a NAMED field holding nil, not vanish"
+
+    assert params.context == nil
+
+    # …and an omitted field still arrives omitted, or the distinction is only
+    # half carried and inheritance downstream can never fire.
+    response =
+      conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(%{
+          "sessionKey" => key,
+          "action" => "set_model",
+          "model" => "claude-fable-5"
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_received {:call, %{verb: "tune", params: omitted}}
+    refute Map.has_key?(omitted, :context)
+
+    # An empty string is the same statement as null: the field, named, empty.
+    response =
+      conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(%{
+          "sessionKey" => key,
+          "action" => "set_model",
+          "model" => "claude-fable-5",
+          "context" => ""
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_received {:call, %{verb: "tune", params: blank}}
+    assert Map.has_key?(blank, :context)
+    assert blank.context == nil
+  end
+
   defp post_control(opts, token, session_key, action) do
     conn(
       :post,
