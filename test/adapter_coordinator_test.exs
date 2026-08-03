@@ -618,8 +618,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # the branch it selects is the production one.
     stale_ref = make_ref()
 
+    # Ready, like the instance a real absorbed :DOWN belongs to: it had booted
+    # and was serving before a replacement took the entry over.
     :sys.replace_state(coordinator, fn state ->
-      %{state | monitors: Map.put(state.monitors, stale_ref, key)}
+      %{
+        state
+        | monitors: Map.put(state.monitors, stale_ref, key),
+          ready_refs: MapSet.put(state.ready_refs, stale_ref)
+      }
     end)
 
     send(coordinator, {:DOWN, stale_ref, :process, adapter, :killed})
@@ -638,6 +644,46 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # The resident session is still TOLD: the message claims only that the
     # engine stopped, which is true of an absorbed death too, so there is no
     # attribution to get wrong.
+    assert [marker] = Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10)
+    assert marker.content =~ "[adapter down]"
+  end
+
+  test "a ready adapter's death is told even when a replacement already took the entry over",
+       ctx do
+    key = {:claude, "shared", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"absorbed2_#{System.unique_integer([:positive])}")
+
+    session_key = seed_session!(ctx.db)
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
+
+    # The state an absorbed death actually presents, injected rather than raced
+    # into being: the instance that DIED had booted (its ref is in ready_refs),
+    # while the entry now describes the replacement that took over and has not
+    # booted yet (ready: false). Driving it with a second live adapter cannot
+    # pin this — its own {:adapter_ready, key} can overtake the :DOWN in the
+    # mailbox, and the test then passes for the wrong reason.
+    #
+    # Readiness asked of the ENTRY answers for the successor and this genuine
+    # post-ready death goes silent; asked of the REF it answers for the instance
+    # that died. Nothing re-marks the entry ready here, so the distinction is
+    # the only thing this test can be reading.
+    stale_ref = make_ref()
+
+    :sys.replace_state(coordinator, fn state ->
+      %{
+        state
+        | monitors: Map.put(state.monitors, stale_ref, key),
+          ready_refs: MapSet.put(state.ready_refs, stale_ref),
+          adapters: Map.update!(state.adapters, key, &%{&1 | ready: false})
+      }
+    end)
+
+    send(coordinator, {:DOWN, stale_ref, :process, adapter, :killed})
+    _ = :sys.get_state(coordinator)
+
+    assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
     assert [marker] = Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10)
     assert marker.content =~ "[adapter down]"
   end
