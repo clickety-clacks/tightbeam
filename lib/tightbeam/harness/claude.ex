@@ -285,31 +285,40 @@ defmodule Tightbeam.Harness.Claude do
     # hundred tests that had no business talking to a provider.
     sh = Map.get(target, :sh, &Support.system_cmd_out/1)
 
-    if Support.local?(target) do
-      timeout = Map.get(target, :warm_timeout_ms, @warm_timeout_ms)
+    timeout = Map.get(target, :warm_timeout_ms, @warm_timeout_ms)
 
-      case Support.bounded_run(
-             sh,
-             [cli_binary(), "-p", "ok", "--model", "sonnet", "--config-dir", home],
-             timeout
-           ) do
-        {:ok, {_output, 0}} ->
-          :ok
-
-        {:ok, {output, status}} when is_integer(status) ->
-          {:error, {:warm_failed, status, String.trim(to_string(output))}}
-
-        {:ok, {:error, reason}} ->
-          {:error, reason}
-
-        {:error, reason} ->
-          {:error, reason}
+    argv =
+      if Support.local?(target) do
+        [cli_binary(), "-p", "ok", "--model", "sonnet", "--config-dir", home]
+      else
+        # The same turn, over the channel the credential itself just travelled. A remote
+        # home has to warm on the host that owns it -- the cache is written by the harness
+        # into ITS filesystem -- and the credential install already proved this route works.
+        # Skipping it left a satellite holding a good credential whose harness had never
+        # asked what it may run, which reads as a weak account rather than a missing step.
+        ["ssh" | Support.ssh_opts()] ++
+          [
+            target.host_config.ssh,
+            Enum.map_join(
+              [cli_binary(), "-p", "ok", "--model", "sonnet", "--config-dir", home],
+              " ",
+              &Support.shell_quote/1
+            )
+          ]
       end
-    else
-      # Remote homes warm on the host that owns them, through the same ssh path a launch
-      # uses. Not attempted here: the cold-home cost is a catalog that fills in on first
-      # use, which is a delay rather than a failure.
-      :ok
+
+    case Support.bounded_run(sh, argv, timeout) do
+      {:ok, {_output, 0}} ->
+        :ok
+
+      {:ok, {output, status}} when is_integer(status) ->
+        {:error, {:warm_failed, status, String.trim(to_string(output))}}
+
+      {:ok, {:error, reason}} ->
+        {:error, reason}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

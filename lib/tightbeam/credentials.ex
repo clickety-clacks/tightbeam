@@ -590,6 +590,10 @@ defmodule Tightbeam.Credentials do
   #
   # Best effort by construction: a harness need not implement it, and a warm that fails must
   # not fail an onboarding whose credential already validated.
+  #
+  # Triggered by a credential WRITE, not by the home's existence -- which holds only because
+  # `Tightbeam.Homes` never removes a home. Its moduledoc carries the warning for anyone
+  # who changes that.
   defp warm_home(module, target, home) do
     if function_exported?(module, :warm_home, 2) do
       case module.warm_home(target, home) do
