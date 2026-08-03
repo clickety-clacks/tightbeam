@@ -1365,16 +1365,24 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # THE ONE HOME for a published SELECTION — `model` the family, `context` the
-  # vendor's window variant, `effort` ours. Everything that publishes a chosen
-  # identity goes through here: `inspect_session/1`, the tune and adjudication
-  # responses, `wire_preference/1`, `wire_defaults/1`.
+  # The one home for a published selection IN THIS MODULE — `model` the family,
+  # `context` the vendor's window variant, `effort` ours. Five call sites:
+  # `inspect_session/1`, the tune and adjudication responses,
+  # `wire_preference/1`, `wire_defaults/1`.
   #
-  # NOT the catalog row (`wire_model/1`), and deliberately. A row names a model
-  # rather than a choice: it carries `efforts` — what MAY be asked of it —
-  # where a selection carries the single `effort` that WAS asked. Routing the
-  # row through here and deleting the key afterwards would be contortion in
-  # service of a claim, not a shared shape.
+  # SCOPED DELIBERATELY, because a wider claim here has now been false three
+  # times. Two other kinds of projection publish the same trio and do NOT come
+  # through here:
+  #
+  #   - the catalog ROW (`wire_model/1`) names a model rather than a choice: it
+  #     carries `efforts`, what MAY be asked, where a selection carries the one
+  #     `effort` that WAS.
+  #   - turn provenance (`Toplines.minds/1`, `Transcript`, `JobTrace`) reads
+  #     three COLUMNS and never holds a `%Model{}` at all.
+  #
+  # Both would have to build a struct only to flatten it again. Narrowing the
+  # claim costs nothing; leaving it wide invites the next reader to trust it
+  # further than it goes.
   #
   # A packed value alone would make a consumer split the string to recover the
   # context, which is the parsing this refactor exists to end — the rendering

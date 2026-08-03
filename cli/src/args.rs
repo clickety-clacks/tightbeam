@@ -68,9 +68,14 @@ pub enum Command {
         idempotency_key: String,
         archetype: Option<String>,
         harness: Option<String>,
-        model: Option<String>,
-        effort: Option<String>,
-        context: Option<String>,
+        /// A model field the operator NAMED. `None` is a flag they did not
+        /// pass; `Some(None)` is one they passed empty — "the vendor's default
+        /// window", "no tier" — which is a real selection and a different
+        /// request from silence. Collapsing the two is how an explicit choice
+        /// arrives downstream as an omission and gets inherited over.
+        model: Option<Option<String>>,
+        effort: Option<Option<String>>,
+        context: Option<Option<String>>,
         handle: Option<String>,
         host: Option<String>,
     },
@@ -594,6 +599,21 @@ fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
 }
 
+/// PRESENCE, for the fields where an empty value means something. `nonempty`
+/// answers "is there a value here", which silently merges "not passed" with
+/// "passed empty"; a model selection needs those apart, because an empty
+/// `--context` is the default window and an absent one is a question the
+/// caller did not answer.
+fn named(flags: &HashMap<String, String>, name: &str) -> Option<Option<String>> {
+    flags.get(name).map(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.clone())
+        }
+    })
+}
+
 fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
     let identities = [
         nonempty(flags, "as").map(Identity::Role),
@@ -927,9 +947,9 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
                 archetype: nonempty(flags, "archetype"),
                 harness,
-                model: nonempty(flags, "model"),
-                effort: nonempty(flags, "effort"),
-                context: nonempty(flags, "context"),
+                model: named(flags, "model"),
+                effort: named(flags, "effort"),
+                context: named(flags, "context"),
                 handle: nonempty(flags, "name"),
                 host: nonempty(flags, "host"),
             })
@@ -2220,9 +2240,9 @@ mod tests {
                     idempotency_key: "k".to_owned(),
                     archetype: Some("worker".to_owned()),
                     harness: Some("codex".to_owned()),
-                    model: Some("gpt".to_owned()),
-                    effort: Some("high".to_owned()),
-                    context: Some("1m".to_owned()),
+                    model: Some(Some("gpt".to_owned())),
+                    effort: Some(Some("high".to_owned())),
+                    context: Some(Some("1m".to_owned())),
                     handle: Some("reviewer".to_owned()),
                     host: Some("eezo".to_owned()),
                 },
