@@ -1365,11 +1365,21 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # EVERY published identity, everywhere: `model` is the family, `context` the
-  # vendor's window variant, `effort` ours. A packed value alone would make a
-  # consumer split the string to recover the context, which is the parsing this
-  # refactor exists to end — the rendering belongs only where one line of text
-  # is structurally required, and that is the catalog row's `id`.
+  # THE ONE HOME for a published SELECTION — `model` the family, `context` the
+  # vendor's window variant, `effort` ours. Everything that publishes a chosen
+  # identity goes through here: `inspect_session/1`, the tune and adjudication
+  # responses, `wire_preference/1`, `wire_defaults/1`.
+  #
+  # NOT the catalog row (`wire_model/1`), and deliberately. A row names a model
+  # rather than a choice: it carries `efforts` — what MAY be asked of it —
+  # where a selection carries the single `effort` that WAS asked. Routing the
+  # row through here and deleting the key afterwards would be contortion in
+  # service of a claim, not a shared shape.
+  #
+  # A packed value alone would make a consumer split the string to recover the
+  # context, which is the parsing this refactor exists to end — the rendering
+  # belongs only where one line of text is structurally required, and that is
+  # the row's `id`.
   defp published_identity(nil), do: %{model: nil, context: nil, effort: nil}
 
   defp published_identity(%Model{} = model),
@@ -1390,12 +1400,8 @@ defmodule Tightbeam.Gateway do
   # Archetype defaults cross the wire as named fields. A stored default is a
   # `%Model{}`, and publishing it raw would put `__struct__` and `family` — an
   # INTERNAL shape — into a client payload (and fail JSON encoding outright).
-  defp wire_defaults(%{model: %Model{} = model} = defaults) do
-    defaults
-    |> Map.put(:model, model.family)
-    |> Map.put(:effort, model.effort)
-    |> Map.put(:context, model.context)
-  end
+  defp wire_defaults(%{model: %Model{} = model} = defaults),
+    do: Map.merge(defaults, published_identity(model))
 
   defp wire_defaults(defaults), do: defaults
 

@@ -1601,6 +1601,57 @@ defmodule Tightbeam.Wire.RouterTest do
     refute_received {:call, %{verb: "tune"}}
   end
 
+  # SPAWN, through the real wire payload. The session-control test below covers
+  # the same `model_params/1`, but spawn is where the consequence bites: a
+  # configured 1M default plus an explicit `context: null` must select the
+  # default window, and a dropped key would inherit `1m` instead. Testing this
+  # at the gateway with a hand-built params map bypasses the very seam that
+  # was losing the field.
+  test "spawn carries an explicitly null context across the wire, not omitted", ctx do
+    opts = with_handler(ctx.opts, "spawn", fn call -> send_call(call) end)
+
+    body =
+      JSON.encode!(%{
+        "displayName" => "Wire Spawn",
+        "idempotencyKey" => "k-wire-null-context",
+        "model" => "claude-fable-5",
+        "context" => nil,
+        "effort" => "high"
+      })
+
+    response =
+      conn(:post, "/api/streams", body)
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status in [200, 201]
+    assert_received {:call, %{verb: "spawn", params: params}}
+
+    assert params.model == "claude-fable-5"
+    assert params.effort == "high"
+
+    assert Map.has_key?(params, :context),
+           "an explicit null must reach spawn as a NAMED field, or the default " <>
+             "window is indistinguishable from silence and 1m gets inherited"
+
+    assert params.context == nil
+
+    # And an omitted context still arrives omitted, so inheritance can fire.
+    omitted_body =
+      JSON.encode!(%{
+        "displayName" => "Wire Spawn",
+        "idempotencyKey" => "k-wire-omitted-context",
+        "model" => "claude-fable-5"
+      })
+
+    conn(:post, "/api/streams", omitted_body)
+    |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+    |> Router.call(Router.init(opts))
+
+    assert_received {:call, %{verb: "spawn", params: omitted}}
+    refute Map.has_key?(omitted, :context)
+  end
+
   # THE THIRD DESTRUCTION SITE. JSON can say `null`, and the router dropped it —
   # so "the caller named context and named it empty" arrived downstream
   # indistinguishable from "the caller said nothing about context", which is

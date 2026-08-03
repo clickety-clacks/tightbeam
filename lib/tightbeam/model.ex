@@ -147,11 +147,17 @@ defmodule Tightbeam.Model do
   # `%Model{family: nil}` to be built downstream.
   defp named_family(params) do
     case named(params, :model) do
-      {:present, nil} -> named(params, :family)
-      :absent -> named(params, :family)
-      present -> present
+      {:present, family} when is_binary(family) -> {:present, family}
+      _ -> binary_or_absent(named(params, :family))
     end
   end
+
+  # An empty family is ABSENCE however it arrives — under either key, as nil or
+  # as "". Anything else builds a `%Model{family: nil}`, which is not a
+  # selection at all: it refuses downstream instead of behaving like the
+  # partial selection the caller actually made.
+  defp binary_or_absent({:present, family}) when is_binary(family), do: {:present, family}
+  defp binary_or_absent(_), do: :absent
 
   defp fetch_either(params, key) do
     case Map.fetch(params, key) do

@@ -56,6 +56,21 @@ defmodule Tightbeam.ModelTest do
     assert Model.named_fields(%{model: nil, effort: "high"}) == %{effort: "high"}
     assert Model.named_fields(%{model: nil}) == %{}
     refute Map.has_key?(Model.named_fields(%{model: nil}), :family)
+
+    # …through EITHER key, and for the empty string too. The exception is about
+    # what an empty family MEANS, not about which key it arrived under: a
+    # `%Model{family: nil}` built from any of these refuses downstream instead
+    # of behaving like the partial selection it actually is.
+    for empty <- [nil, ""] do
+      assert Model.named_fields(%{family: empty, effort: "high"}) == %{effort: "high"}
+      assert Model.named_fields(%{"family" => empty}) == %{}
+      assert Model.named_fields(%{model: empty, family: empty}) == %{}
+      assert Model.named_fields(%{"model" => empty, "context" => "1m"}) == %{context: "1m"}
+    end
+
+    # And a real family still arrives, under either key.
+    assert Model.named_fields(%{family: "m"}) == %{family: "m"}
+    assert Model.named_fields(%{model: nil, family: "m"}) == %{family: "m"}
   end
 
   test "describe names every field for a reader who must pick one" do
