@@ -10,6 +10,7 @@ defmodule Tightbeam.Wire.RouterTest do
     Devices,
     Gateway,
     Org,
+    Placement,
     Roles,
     Wakes,
     WorkItems,
@@ -1650,6 +1651,38 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert_received {:call, %{verb: "spawn", params: omitted}}
     refute Map.has_key?(omitted, :context)
+  end
+
+  test "a disappeared placement host reaches HTTP as a named refusal", ctx do
+    opts =
+      with_handler(ctx.opts, "spawn", fn _call ->
+        Placement.workdir_path(
+          %{base_dir: ctx.base_dir, db: ctx.db},
+          %{session_key: "vanished-session", host: "eurisko", harness: "codex"}
+        )
+      end)
+
+    response =
+      conn(
+        :post,
+        "/api/streams",
+        JSON.encode!(%{
+          "displayName" => "Vanished",
+          "idempotencyKey" => "vanished-placement"
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 400
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "unknown_host",
+               "message" =>
+                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>"
+             }
+           }
   end
 
   # THE THIRD DESTRUCTION SITE. JSON can say `null`, and the router dropped it —
