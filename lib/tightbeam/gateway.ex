@@ -4450,52 +4450,13 @@ defmodule Tightbeam.Gateway do
       p[:action] not in ~w(park swap respawn stop) ->
         %{code: "invalid", message: "action must be park, swap, respawn, or stop"}
 
-      p[:action] in ~w(swap respawn) ->
-        ruled = Model.from_params(p)
-
-        cond do
-          is_nil(ruled) ->
-            %{code: "invalid", message: "--model is required for #{p.action}"}
-
-          refusal = tierless_ruling(db, episode, ruled) ->
-            refusal
-
-          true ->
-            adjudicate_action(config, db, call, episode)
-        end
+      p[:action] in ~w(swap respawn) and is_nil(Model.from_params(p)) ->
+        %{code: "invalid", message: "--model is required for #{p.action}"}
 
       true ->
         adjudicate_action(config, db, call, episode)
     end
   end
-
-  # A ruling names its selection COMPLETELY or is refused, and the refusal has
-  # to be true. Spawn and tune inherit an omitted effort from a base they can
-  # name; mid-swap there is no clean base, and a ruling is an authority act
-  # whose papertrail should say what was chosen. Left to fall through, an
-  # effort-less ruling on a TIERED model dies in `harness_for_ref/2` as "not in
-  # a fresh harness inventory" — which is false. The model is right there; the
-  # tier is what is missing, so say that and list the tiers.
-  defp tierless_ruling(db, episode, %Model{effort: nil} = ruled) do
-    session = Org.get(db, episode.session_key)
-
-    Enum.find_value(Harness.all(), fn module ->
-      case ModelCatalog.entry(session.host, module.wire_name(), ruled) do
-        {%{efforts: [_ | _] = efforts}, :fresh} ->
-          %{
-            code: "invalid",
-            message:
-              "#{Model.to_ref(ruled)} has effort tiers on #{module.wire_name()}; the ruling " <>
-                "must name one with --effort (offers #{Enum.join(efforts, "|")})"
-          }
-
-        _ ->
-          nil
-      end
-    end)
-  end
-
-  defp tierless_ruling(_db, _episode, _ruled), do: nil
 
   defp adjudicate_action(config, db, call, episode) do
     action = fn ->
@@ -5489,30 +5450,63 @@ defmodule Tightbeam.Gateway do
   # context alone would let a ruling respawn a session at an effort the model
   # does not offer, and would call two harnesses ambiguous when only one of
   # them offers the level asked for.
+  # THE ONE ANSWER to "can this selection be routed, and if not why". Routability
+  # is a question about the WHOLE fleet — one harness tiering a model says
+  # nothing while another offers it untiered — so every entry naming the model
+  # is gathered BEFORE anything is refused. A second gate in front of this,
+  # deciding the same thing from a narrower view, is what refused a valid
+  # untiered ruling on the strength of the first tiered entry it happened to
+  # find. The refusal belongs here, on the complete answer.
   defp harness_for_ref(host, %Model{} = ref) do
-    matches =
+    naming_model =
       Enum.flat_map(Harness.all(), fn module ->
         case ModelCatalog.entry(host, module.wire_name(), ref) do
-          {%{} = entry, :fresh} ->
-            if ModelCatalog.offers_effort?(entry, ref.effort), do: [{module, entry}], else: []
-
-          _ ->
-            []
+          {%{} = entry, :fresh} -> [{module, entry}]
+          _ -> []
         end
       end)
 
-    case matches do
+    case Enum.filter(naming_model, fn {_module, entry} ->
+           ModelCatalog.offers_effort?(entry, ref.effort)
+         end) do
       [{module, entry}] ->
         {:ok, module.wire_name(), Atom.to_string(entry.provider)}
 
       [] ->
-        {:error,
-         %{code: "model_unavailable", message: "model is not in a fresh harness inventory"}}
+        {:error, unroutable(ref, naming_model)}
 
       _ ->
         {:error,
          %{code: "ambiguous_ref", message: "model appears in multiple harness inventories"}}
     end
+  end
+
+  # Each cause named as itself. Reporting "not in inventory" for a model that is
+  # plainly there, because only its TIER was wrong, sends the reader after the
+  # wrong thing.
+  defp unroutable(_ref, []),
+    do: %{code: "model_unavailable", message: "model is not in a fresh harness inventory"}
+
+  defp unroutable(%Model{effort: nil} = ref, naming_model) do
+    %{
+      code: "invalid",
+      message:
+        "#{Model.to_ref(ref)} has effort tiers on " <>
+          "#{Enum.map_join(naming_model, ", ", fn {module, entry} -> "#{module.wire_name()} (#{Enum.join(entry.efforts, "|")})" end)}" <>
+          "; the ruling must name one with --effort"
+    }
+  end
+
+  defp unroutable(%Model{} = ref, naming_model) do
+    %{
+      code: "model_unavailable",
+      message:
+        "#{Model.to_ref(ref)} does not offer effort #{inspect(ref.effort)} on any fresh " <>
+          "harness; offered: " <>
+          Enum.map_join(naming_model, ", ", fn {module, entry} ->
+            "#{module.wire_name()} (#{Enum.join(entry.efforts, "|")})"
+          end)
+    }
   end
 
   # Says four things and nothing more: the engine changed, from what to what,

@@ -1534,6 +1534,45 @@ defmodule Tightbeam.AdapterHealTest do
     assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5", effort: "medium")
   end
 
+  # THE TIER REFUSAL MUST NOT FIRE TOO EARLY. Whether a selection is routable is
+  # a question about the WHOLE fleet: one harness tiering a model says nothing
+  # if another offers it untiered, where an effort-less ruling is complete and
+  # uniquely routable. Refusing on the first tiered entry found blocked a valid
+  # swap — a check answering a narrower question than the caller asked.
+  test "an effort-less ruling routes to a harness that offers the model untiered", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        efforts: ["medium", "high"],
+        model: Model.new("claude-fable-5", effort: "medium"),
+        cached_model: Model.new("claude-fable-5", effort: "medium")
+      )
+
+    Org.set_model(ctx.db, "k1", Model.new("claude-fable-5", effort: "medium"), "anthropic")
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    # `shared-model` is TIERED on claude and UNTIERED on codex. Naming no effort
+    # is therefore complete, and the only entry that can take it is codex's.
+    result =
+      Gateway.handlers(ctx.config)["adjudicate"].(%{
+        origin: "user:flynn",
+        principal: {:session, episode.owner_target},
+        params: %{
+          episode: episode.correlation_key,
+          action: "swap",
+          model: "shared-model"
+        }
+      })
+
+    refute match?(%{code: "invalid"}, result),
+           "a routable untiered selection must not be refused for naming no tier"
+
+    # It routes, and reaches the cross-harness rule rather than a tier refusal.
+    assert %{code: "cross_harness_requires_respawn"} = result
+  end
+
   # Resolving a ruling on family and context alone would accept a level the
   # model does not offer and respawn the session onto an invalid selection.
   test "a ruling naming an effort the model does not offer is refused", ctx do
@@ -2173,8 +2212,25 @@ defmodule Tightbeam.AdapterHealTest do
        codex_read: fn _ -> {:error, :offline} end}
     )
 
+    # THE SAME FAMILY on the other harness, carried UNTIERED. An effort-less
+    # ruling naming it is complete and uniquely routable — claude's tiered entry
+    # cannot take a nil effort, codex's untiered one can — so nothing may refuse
+    # it on the strength of claude's entry alone.
+    untiered = [
+      %{
+        family: "shared-model",
+        context: nil,
+        display_name: "shared-model",
+        name: "shared-model",
+        efforts: [],
+        max_input_tokens: 200_000,
+        capabilities: %{},
+        provider: :openai
+      }
+    ]
+
     entries =
-      for ref <- ["claude-fable-5", "claude-sonnet-4-6", "claude-opus-4-6"] do
+      for ref <- ["claude-fable-5", "claude-sonnet-4-6", "claude-opus-4-6", "shared-model"] do
         %{
           family: ref,
           context: nil,
@@ -2190,13 +2246,13 @@ defmodule Tightbeam.AdapterHealTest do
     :sys.replace_state(ModelCatalog, fn state ->
       now = state.now.()
 
-      put_in(state.entries[{"testhost", "claude"}], %{
-        entries: entries,
-        derived_at: now,
-        attempted_at: now,
-        reason: nil,
-        refreshing: false
-      })
+      fresh = fn rows ->
+        %{entries: rows, derived_at: now, attempted_at: now, reason: nil, refreshing: false}
+      end
+
+      state
+      |> put_in([:entries, {"testhost", "claude"}], fresh.(entries))
+      |> put_in([:entries, {"testhost", "codex"}], fresh.(untiered))
     end)
   end
 
