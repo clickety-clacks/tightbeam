@@ -21,7 +21,6 @@ defmodule Tightbeam.Transcript do
   `id` is random and `timestamp` can tie or regress, so neither may order a page.
   """
 
-  alias Tightbeam.Model
   alias Tightbeam.{DB, Org}
 
   @default_limit 50
@@ -232,7 +231,8 @@ defmodule Tightbeam.Transcript do
       attachments: JSON.decode!(attachments),
       reply_to_message_id: reply_to_message_id,
       turn_seq: turn_seq,
-      model: model && Model.to_ref(%Model{family: model, context: model_context}),
+      model: model,
+      context: model_context,
       effort: effort,
       harness: harness,
       assignment_id: assignment_id,

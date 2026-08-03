@@ -40,7 +40,6 @@ defmodule Tightbeam.Toplines do
      than through any item-attributed carrier.
   """
 
-  alias Tightbeam.Model
   alias Tightbeam.{CausalEvents, DB}
 
   @edge_basis "concurrent_turn"
@@ -452,10 +451,10 @@ defmodule Tightbeam.Toplines do
   # no mind: a fully-null pair is the absence of a stamp, not a mind.
   defp minds(union) do
     union
-    |> Enum.map(&%{model: &1.model, effort: &1.effort, harness: &1.harness})
+    |> Enum.map(&%{model: &1.model, context: &1.context, effort: &1.effort, harness: &1.harness})
     |> Enum.reject(&(is_nil(&1.model) and is_nil(&1.harness)))
     |> Enum.uniq()
-    |> Enum.sort_by(&{&1.model || "", &1.effort || "", &1.harness || ""})
+    |> Enum.sort_by(&{&1.model || "", &1.context || "", &1.effort || "", &1.harness || ""})
   end
 
   defp fan_out(world, set) do
@@ -797,7 +796,8 @@ defmodule Tightbeam.Toplines do
         assignment_id: assignment_id,
         job_ref: job_ref,
         status: status,
-        model: model && Model.to_ref(%Model{family: model, context: model_context}),
+        model: model,
+        context: model_context,
         effort: effort,
         harness: harness,
         ended_at: ended_at

@@ -105,25 +105,30 @@ defmodule Tightbeam.Model do
   end
 
   @doc """
-  The model fields a caller NAMED, as a plain map, `nil` for each one omitted.
+  The model fields a caller NAMED — and ONLY those. A field the caller omitted
+  is an ABSENT KEY, never a key holding `nil`.
 
-  A partial selection is not an identity — `--effort high` alone says something
-  real but does not say which model — so this deliberately does not build a
-  `%Model{}`. The caller completes it against a default. Returning `nil` here
-  instead is how `--effort high` used to be accepted and silently dropped.
+  That distinction is load-bearing, not stylistic. `context: nil` is a real
+  selection: it means the model's default window, which is a different request
+  from "the caller said nothing about context". Collapsing them into one `nil`
+  is how selecting the default-window row silently kept a session on the 1M
+  variant — the completing code read the explicit nil as an omission and
+  inherited over it.
+
+  A partial selection is not an identity either — `--effort high` alone says
+  something real but does not say which model — so this does not build a
+  `%Model{}`. The caller completes it against a default.
   """
-  @spec named_fields(map()) :: %{
-          family: String.t() | nil,
-          effort: String.t() | nil,
-          context: String.t() | nil
-        }
+  @spec named_fields(map()) :: %{optional(:family | :effort | :context) => String.t() | nil}
   def named_fields(params) when is_map(params) do
-    %{
-      family: field(params, :model) || field(params, :family),
-      effort: field(params, :effort),
-      context: field(params, :context)
-    }
+    %{}
+    |> put_named(:family, field(params, :model) || field(params, :family))
+    |> put_named(:effort, field(params, :effort))
+    |> put_named(:context, field(params, :context))
   end
+
+  defp put_named(fields, _key, nil), do: fields
+  defp put_named(fields, key, value), do: Map.put(fields, key, value)
 
   @doc """
   Read a COMPLETE identity out of a map with string or atom keys. `nil` when no

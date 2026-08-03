@@ -27,7 +27,7 @@ defmodule Tightbeam.TranscriptTest do
   alias Tightbeam.Wire.Router
 
   @entry_keys ~w(id at role sender content attachments reply_to_message_id
-                 turn_seq model effort harness assignment_id job_ref)a
+                 turn_seq model context effort harness assignment_id job_ref)a
 
   defmodule LaneDoorbell do
     @moduledoc false
@@ -377,7 +377,12 @@ defmodule Tightbeam.TranscriptTest do
     :ok =
       DB.execute(
         ctx.db,
-        "UPDATE turns SET model='fable', harness='claude', assignmentId='asg_1', jobRef='wi_1' WHERE seq=#{turn_seq}"
+        """
+        UPDATE turns
+        SET model='fable', thinkingLevel='high', modelContext='1m', harness='claude',
+            assignmentId='asg_1', jobRef='wi_1'
+        WHERE seq=#{turn_seq}
+        """
       )
 
     reply_id =
@@ -402,7 +407,8 @@ defmodule Tightbeam.TranscriptTest do
     assert prompt.role == "user"
     assert prompt.turn_seq == turn_seq
     assert prompt.model == "fable"
-    assert prompt.effort == nil
+    assert prompt.context == "1m"
+    assert prompt.effort == "high"
     assert prompt.harness == "claude"
     assert prompt.assignment_id == "asg_1"
     assert prompt.job_ref == "wi_1"
@@ -424,7 +430,15 @@ defmodule Tightbeam.TranscriptTest do
     # A pre-attribution-column turn: the migration adds nullable columns with no
     # backfill, so its message carries a turnSeq but null assignmentId/jobRef.
     legacy_msg = message!(ctx.db, "owned", "user", "legacy prompt")
-    legacy_seq = turn!(ctx.db, "owned", legacy_msg, model: "fable", harness: "claude")
+
+    legacy_seq =
+      turn!(ctx.db, "owned", legacy_msg,
+        model: "fable",
+        effort: "high",
+        context: "1m",
+        harness: "claude"
+      )
+
     legacy = Enum.find(read(ctx, %{session_key: "owned"}).messages, &(&1.id == legacy_msg))
     assert legacy.turn_seq == legacy_seq
     assert legacy.assignment_id == nil
@@ -629,10 +643,11 @@ defmodule Tightbeam.TranscriptTest do
       DB.query(
         db,
         """
-        INSERT INTO turns (sessionKey, messageId, origin, prompt, model, harness, createdAt)
-        VALUES (?1, ?2, 'user:flynn', 'legacy', ?3, ?4, 1)
+        INSERT INTO turns (sessionKey, messageId, origin, prompt, model, thinkingLevel,
+          modelContext, harness, createdAt)
+        VALUES (?1, ?2, 'user:flynn', 'legacy', ?3, ?5, ?6, ?4, 1)
         """,
-        [session_key, message_id, opts[:model], opts[:harness]]
+        [session_key, message_id, opts[:model], opts[:harness], opts[:effort], opts[:context]]
       )
 
     {:ok, [[seq]]} =

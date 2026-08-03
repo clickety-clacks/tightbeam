@@ -1,7 +1,6 @@
 defmodule Tightbeam.JobTrace do
   @moduledoc "Pinned, read-only work-item trace artifact."
 
-  alias Tightbeam.Model
   alias Tightbeam.{CausalEvents, DB}
 
   # Every type needs an explicit rank — the sorter uses Map.fetch!/2, so an
@@ -144,7 +143,8 @@ defmodule Tightbeam.JobTrace do
         assignmentId: assignment_id,
         jobRef: job_ref,
         status: status,
-        model: model && Model.to_ref(%Model{family: model, context: model_context}),
+        model: model,
+        context: model_context,
         effort: effort,
         harness: harness
       }

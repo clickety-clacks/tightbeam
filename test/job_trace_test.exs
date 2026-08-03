@@ -47,13 +47,13 @@ defmodule Tightbeam.JobTraceTest do
       VALUES ('asg_direct', 'z.ex'), ('asg_direct', 'a.ex');
 
       INSERT INTO turns
-        (sessionKey, messageId, origin, prompt, assignmentId, jobRef, model, harness,
-         status, createdAt, endedAt)
+        (sessionKey, messageId, origin, prompt, assignmentId, jobRef, model, thinkingLevel,
+         modelContext, harness, status, createdAt, endedAt)
       VALUES
         ('holder', 'm_direct', 'process:tightbeam', 'brief', 'asg_direct', 'wi_trace',
-         'gpt-5.6-sol[high]', 'codex', 'delivered', 100, 100),
+         'gpt-5.6-sol', 'high', '1m', 'codex', 'delivered', 100, 100),
         ('owner-session', 'm_nag', 'process:tightbeam', 'nag', NULL, 'wi_trace',
-         NULL, NULL, 'queued', 100, NULL);
+         NULL, NULL, NULL, NULL, 'queued', 100, NULL);
 
       INSERT INTO condition_facts (id, ts, kind, scope, origin)
       VALUES (1, 90, 'quota-recovered', 'asg_direct', 'user:owner');
@@ -153,6 +153,12 @@ defmodule Tightbeam.JobTraceTest do
     assert review.reviewsAssignmentId == "asg_direct"
 
     Enum.each(trace.timeline, &assert_entry_schema/1)
+
+    # The stamp must arrive as FIELDS with their real values. Asserting only
+    # that the keys exist stays green if a consumer hardcodes or drops them.
+    stamped = Enum.find(trace.timeline, &(&1.type == "turn_start" and &1.id == 1))
+    assert {stamped.model, stamped.context, stamped.effort} == {"gpt-5.6-sol", "1m", "high"}
+    assert stamped.harness == "codex"
 
     assert Enum.any?(trace.timeline, fn
              %{type: "attest", assignmentId: "asg_review", verdict: "changes-requested"} -> true
@@ -271,7 +277,7 @@ defmodule Tightbeam.JobTraceTest do
     keys =
       case type do
         type when type in ["turn_start", "turn_end"] ->
-          ~w(assignmentId at effort harness id jobRef model status type)a
+          ~w(assignmentId at context effort harness id jobRef model status type)a
 
         "attest" ->
           ~w(assignmentId at commitRefs id kind type verdict)a

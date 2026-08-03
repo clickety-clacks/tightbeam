@@ -2971,6 +2971,101 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, only_model).model == Model.new("claude-sonnet-4-6", effort: "low")
   end
 
+  # The OTHER half of the omitted-versus-explicit distinction, and it only
+  # means anything as a pair: an omitted context INHERITS, where an explicit
+  # default-window selection does not (see the wire round-trip tests). Collapse
+  # the two representations into one nil and exactly one of these two breaks,
+  # whichever way the collapse falls.
+  test "an omitted context inherits from the default, unlike an explicit one", ctx do
+    base_dir = role_test_base("omitted-context-inherits")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :omitted_context_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low", "high"]}])
+
+    put_host_catalog_entry("testhost", "claude", %{
+      family: "claude-fable-5",
+      context: "1m",
+      efforts: ["low", "high"]
+    })
+
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:default_model, Model.new("claude-fable-5", context: "1m", effort: "low"))
+
+    assert %{session_key: key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Omitted",
+                 idempotency_key: "k-omitted-context",
+                 effort: "high"
+               }
+             })
+
+    assert Org.get(ctx.db, key).model ==
+             Model.new("claude-fable-5", context: "1m", effort: "high"),
+           "naming only an effort must keep the default's context"
+  end
+
+  # A refusal has to name the right cause. An effort-only selection whose
+  # EFFORT is the invalid part was reported as a broken configured default,
+  # sending the operator to change a setting that was never the problem.
+  test "an invalid caller effort is not blamed on the configured default", ctx do
+    base_dir = role_test_base("effort-not-default")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :effort_blame_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low", "high"]}])
+
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:default_model, Model.new("claude-fable-5", effort: "low"))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{code: "model_unavailable"} =
+                 Gateway.handlers(config)["spawn"].(%{
+                   origin: "user:flynn",
+                   session_key: nil,
+                   params: %{
+                     display_name: "Blame",
+                     idempotency_key: "k-blame",
+                     effort: "bogus"
+                   }
+                 })
+      end)
+
+    refute log =~ "configured default model",
+           "the caller's effort was invalid; the configured default is fine"
+
+    # And the genuine case still warns — the flag means "entirely from policy".
+    dead = Map.put(config, :default_model, Model.new("not-in-catalog", effort: "low"))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{code: "model_unavailable"} =
+                 Gateway.handlers(dead)["spawn"].(%{
+                   origin: "user:flynn",
+                   session_key: nil,
+                   params: %{display_name: "Blame", idempotency_key: "k-blame-2"}
+                 })
+      end)
+
+    assert log =~ "configured default model"
+  end
+
   # An archetype default is a `%Model{}` internally. Publishing it raw put
   # `__struct__`/`family` — an INTERNAL shape — into a client payload, and JSON
   # encoding refused it outright, so every org-options read broke the moment an
@@ -3081,9 +3176,62 @@ defmodule Tightbeam.GatewayTest do
              Model.new("claude-fable-5", context: "1m", effort: "low")
   end
 
+  # THE OTHER DIRECTION of the round trip, and a silent-retain if the two are
+  # confused: a session ON the 1M variant, whose client selects the DEFAULT
+  # row. `resolve_issued/3` resolves that id to `context: nil` — an explicit
+  # "the default window" — but a nil that also means "the caller said nothing"
+  # gets inherited over, and the tune reports success while the session stays
+  # on the 1M model. Explicit-default and omitted must not share a slot.
+  test "selecting the default-context row leaves the 1M variant, not inherits it", ctx do
+    Archetypes.load!(role_test_base("wire-default-context"))
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low"]}])
+
+    put_host_catalog_entry("testhost", "claude", %{
+      family: "claude-fable-5",
+      context: "1m",
+      efforts: ["low"]
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "k-wide",
+      display_name: "Wide",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5", context: "1m", effort: "low")
+    })
+
+    default_row =
+      Gateway.session_status("k-wide", ctx.db).modelCatalog.models
+      |> Enum.find(&is_nil(&1.context))
+
+    config = gateway_config(role_test_base("wire-default-context-in"), ctx.db, 0)
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-wide",
+               params: %{setting: "set_model", model: default_row.ref}
+             })
+
+    assert Org.get(ctx.db, "k-wide").model ==
+             Model.new("claude-fable-5", effort: "low"),
+           "selecting the default-window row must LEAVE the 1M variant"
+  end
+
   # The identity this seam ISSUES is what a client echoes back, so it has to
   # come home to the same row. Resolution is a catalog lookup, never a regex:
   # a lookup cannot invent a context the host does not offer.
+  #
+  # THIS TEST IS THE GUARD on `wire_identity/1` rendering family and context
+  # ONLY. It is what fails if effort is ever rendered into the wire id, which
+  # would silently restore the 1M collision by giving that slot two meanings
+  # again. It reads as redundant beside the catalog tests. It is not.
   test "an issued row identity echoed back resolves to that row's fields", ctx do
     Archetypes.load!(role_test_base("wire-echo"))
     put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low"]}])
@@ -3405,8 +3553,11 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k-codex-untiered").model == Model.new("gpt-5.6-classic")
   end
 
-  test "set_model still accepts a full bracketed ref directly (back-compat)", ctx do
-    base_dir = role_test_base("set-model-full-ref-back-compat")
+  # Renamed with the shape it now tests. There is no bracketed ref to be
+  # backward-compatible WITH: an explicit effort arrives as its own field and
+  # is honoured as given, never composed over.
+  test "set_model honours an explicitly named effort rather than composing one", ctx do
+    base_dir = role_test_base("set-model-explicit-effort")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
 

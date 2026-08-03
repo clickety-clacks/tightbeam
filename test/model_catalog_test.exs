@@ -1007,8 +1007,19 @@ defmodule Tightbeam.ModelCatalogTest do
              "catalog offered a model the adapter refuses: #{inspect(families)}"
 
       # The filter matches the vendor IDENTITY. Efforts are a property of the
-      # kept entry, not part of what is matched, so they survive intact.
-      assert Enum.all?(claude, &is_list(&1.efforts))
+      # kept entry, not part of what is matched, so they survive INTACT — which
+      # means the values the fixture declares, not merely "a list". `is_list/1`
+      # stayed green against every list being emptied, which is exactly the
+      # damage a filter keyed on the wrong thing would do.
+      sonnet_5 = Enum.find(claude, &(&1.family == "claude-sonnet-5"))
+
+      assert MapSet.new(sonnet_5.efforts) ==
+               MapSet.new(["low", "medium", "high", "xhigh", "max"])
+
+      # …and an untiered model keeps its empty list, so "intact" is not read as
+      # "non-empty" and the two cases stay distinguishable.
+      haiku = Enum.find(claude, &(&1.family == "claude-haiku-4-5-20251001"))
+      assert haiku.efforts == []
     end
 
     # Where a substitution WOULD live: `Model.parse_ref/1` is the only transform

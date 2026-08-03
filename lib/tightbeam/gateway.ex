@@ -1290,6 +1290,10 @@ defmodule Tightbeam.Gateway do
   # context the host does not offer, and cannot mistake one of our effort
   # levels for the vendor's variant. An explicit `context` skips it.
   #
+  # THE PROPERTY, because it is what to go looking for elsewhere: this function
+  # CANNOT DISTINGUISH A MISS FROM A HIT. Both return fields, and no caller can
+  # tell which happened. The disambiguation is downstream, and only there.
+  #
   # RESOLUTION IS DELIBERATELY LENIENT: an id it cannot find passes through as
   # if it were a family, and NOTHING here refuses it. That is safe only because
   # resolve-then-validate is ONE PIPELINE — every caller hands the result to
@@ -1308,34 +1312,78 @@ defmodule Tightbeam.Gateway do
     params |> Model.named_fields() |> resolve_issued(host, harness) |> complete(base)
   end
 
-  defp resolve_issued(%{family: family, context: nil} = fields, host, harness)
-       when is_binary(family) do
+  defp resolve_issued(%{family: family} = fields, host, harness)
+       when is_binary(family) and not is_map_key(fields, :context) do
     {catalog, _health} = ModelCatalog.get(host, harness, ModelCatalog)
 
     case Enum.find(catalog, &(wire_identity(&1) == family)) do
-      nil -> fields
-      entry -> %{fields | family: entry.family, context: entry.context}
+      nil ->
+        fields
+
+      entry ->
+        # A resolved row states its context EXPLICITLY, `nil` included — the
+        # row for the default window is a real selection, not a silence. The
+        # key is put unconditionally so completion can tell the two apart.
+        fields |> Map.put(:family, entry.family) |> Map.put(:context, entry.context)
     end
   end
 
   defp resolve_issued(fields, _host, _harness), do: fields
 
-  defp complete(%{family: nil, effort: nil, context: nil}, base), do: base
-  defp complete(%{family: nil}, nil), do: nil
+  # Inheritance fills only what the caller left ABSENT. A key that is present
+  # — even holding nil — is the caller's answer and is taken as given.
+  defp complete(fields, base) when map_size(fields) == 0, do: base
 
-  defp complete(%{family: nil} = fields, %Model{} = base),
-    do: %{base | effort: fields.effort || base.effort, context: fields.context || base.context}
+  defp complete(fields, base) when not is_map_key(fields, :family) do
+    case base do
+      %Model{} = base ->
+        %{
+          base
+          | effort: named_or(fields, :effort, base.effort),
+            context: named_or(fields, :context, base.context)
+        }
+
+      _ ->
+        nil
+    end
+  end
 
   defp complete(%{family: family} = fields, base) do
     inherits? = match?(%Model{}, base) and base.family == family
 
     %Model{
       family: family,
-      effort: fields.effort || (inherits? && base.effort) || nil,
-      context: fields.context || (inherits? && base.context) || nil
+      effort: named_or(fields, :effort, inherits? && base.effort),
+      context: named_or(fields, :context, inherits? && base.context)
     }
   end
 
+  defp named_or(fields, key, fallback) do
+    case Map.fetch(fields, key) do
+      {:ok, named} -> named
+      :error -> fallback || nil
+    end
+  end
+
+  # EVERY published identity, everywhere: `model` is the family, `context` the
+  # vendor's window variant, `effort` ours. A packed value alone would make a
+  # consumer split the string to recover the context, which is the parsing this
+  # refactor exists to end — the rendering belongs only where one line of text
+  # is structurally required, and that is the catalog row's `id`.
+  defp published_identity(nil), do: %{model: nil, context: nil, effort: nil}
+
+  defp published_identity(%Model{} = model),
+    do: %{model: model.family, context: model.context, effort: model.effort}
+
+  # LOAD-BEARING: family and context ONLY. The whole dual representation rests
+  # on effort never reaching this slot — a bracket here can then mean exactly
+  # one thing, and the 1M collision needed two meanings competing for it.
+  # Rendering effort into this would silently restore that collision.
+  #
+  # The guard is the round-trip test in gateway_test.exs, "an issued row
+  # identity echoed back resolves to that row's fields", which asserts the
+  # effort came from the session and never from the id. It looks redundant
+  # beside the catalog tests; it is not. Do not delete it.
   defp wire_identity(%{family: family, context: context}),
     do: Model.to_ref(Model.new(family, context: context))
 
@@ -1358,8 +1406,7 @@ defmodule Tightbeam.Gateway do
     do: %{model: model.family, effort: model.effort, context: model.context}
 
   # An agent reading `inspect` sees the identity as FIELDS, the same way it
-  # supplies them back on spawn: `model` names the model (with its context
-  # variant when there is one) and `effort` is its own key.
+  # supplies them back on spawn.
   defp inspect_session(session) do
     session
     |> Map.take([
@@ -1374,8 +1421,7 @@ defmodule Tightbeam.Gateway do
       :state,
       :created_at
     ])
-    |> Map.put(:model, session.model && Model.to_ref(session.model))
-    |> Map.put(:effort, session.model && session.model.effort)
+    |> Map.merge(published_identity(session.model))
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -3210,7 +3256,7 @@ defmodule Tightbeam.Gateway do
     # Placement resolved the host FIRST, so the ref is judged against the account
     # that will actually run the turn (#88) — not the gateway's.
     with :ok <- validate_credential(config, harness_string, host),
-         :ok <- validate_catalog_model(config, host, harness_string, model, is_nil(p[:model])),
+         :ok <- validate_catalog_model(config, host, harness_string, model, from_default?(p)),
          :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
       input = %{
         display_name: p.display_name,
@@ -3358,7 +3404,7 @@ defmodule Tightbeam.Gateway do
                      session.host,
                      harness,
                      model,
-                     is_nil(p[:model])
+                     from_default?(p)
                    ),
                  :ok <-
                    Spinup.ensure_ready(
@@ -3452,7 +3498,8 @@ defmodule Tightbeam.Gateway do
                     harness: harness,
                     # The wire's line format for the identity, plus effort as its
                     # own field — the same shape the picker publishes.
-                    model: Model.to_ref(model),
+                    model: model.family,
+                    context: model.context,
                     effort: model.effort,
                     # The swap may have crossed providers, and the new provider's
                     # credential on this host may be a different kind. This is
@@ -3996,6 +4043,13 @@ defmodule Tightbeam.Gateway do
 
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
+
+  # "The selection came ENTIRELY from configured policy" — which is the only
+  # case where blaming the configured default is true. Keyed on `p[:model]`
+  # alone, an effort-only selection with a bad effort was reported as a broken
+  # default: a refusal naming the wrong cause, and the operator sent to change
+  # a setting that was never the problem.
+  defp from_default?(params), do: Model.named_fields(params) == %{}
 
   defp warn_dead_default(_host, _harness, _model, false), do: :ok
 
@@ -4694,7 +4748,8 @@ defmodule Tightbeam.Gateway do
           %{
             ok: true,
             action: "swap",
-            model: Model.to_ref(applied_model),
+            model: applied_model.family,
+            context: applied_model.context,
             effort: applied_model.effort,
             recovery_wake_id: wake_id
           }
