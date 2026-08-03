@@ -603,8 +603,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
   ## Task #14 — the guard covers the ACTION, not the RECORD
 
-  test "a death absorbed by a replacement is recorded, restarts nothing, and accuses nobody",
-       ctx do
+  test "a death absorbed by a replacement is recorded and told, but restarts nothing", ctx do
     key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"absorbed_#{System.unique_integer([:positive])}")
 
@@ -612,6 +611,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     running_turn!(ctx.db, session_key)
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
 
     # The race this guard exists for, made deterministic: a :DOWN arriving under
     # a monitor ref the entry has already replaced. Only the ref is synthetic —
@@ -635,44 +635,56 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert coordinator_generation(coordinator, key) == 1
     assert %{pid: ^adapter, timer: nil} = :sys.get_state(coordinator).adapters[key]
 
-    # And NOBODY was told their turn stopped. A replacement inherits the
-    # entry's generation, so a turn running on it carries the same stamp as one
-    # that died on the original: there is no fact that separates them, and the
-    # turn above is in fact still running.
-    assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
+    # The resident session is still TOLD: the message claims only that the
+    # engine stopped, which is true of an absorbed death too, so there is no
+    # attribution to get wrong.
+    assert [marker] = Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10)
+    assert marker.content =~ "[adapter down]"
   end
 
-  test "a turn running against a LATER generation is not blamed on this death", ctx do
+  test "an adapter that never became ready messages nobody", ctx do
     key = {:claude, "shared", "testhost"}
-    coordinator = start_fake_coordinator(ctx, :"gen_#{System.unique_integer([:positive])}")
+
+    # `false` never speaks the ACP handshake, so this adapter dies during boot
+    # and is never marked ready. A boot-failure cascade runs this five times
+    # before the circuit opens; posting each one to every session on the host
+    # is the firehose the audit exists to prevent.
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         backoff_base_ms: 60_000,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+         end,
+         db: ctx.db,
+         name: :"never_ready_#{System.unique_integer([:positive])}"}
+      )
 
     session_key = seed_session!(ctx.db)
-    seq = running_turn!(ctx.db, session_key)
-    # This turn checked out a LATER adapter than the one about to die.
-    :ok = Tightbeam.Ledger.stamp_adapter(ctx.db, seq, 7)
+    _seq = running_turn!(ctx.db, session_key)
 
-    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
-    Process.exit(adapter, :kill)
+    assert {:ok, _pid, 1} = AdapterCoordinator.adapter_for(coordinator, key)
 
-    assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
+    assert eventually(fn -> EventLog.lifecycle_events(ctx.db) != [] end)
 
+    # The death is still ON THE RECORD; only the interruption is withheld.
     assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
     assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
   end
 
-  test "a death that halted a session posts a fault message that session's reader sees", ctx do
+  test "a death posts a fault message the session's reader sees", ctx do
     key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"halted_#{System.unique_integer([:positive])}")
 
     session_key = seed_session!(ctx.db)
 
-    # An idle session is not "halted"; a session with a turn RUNNING against
-    # THIS adapter generation is what the death actually stopped. The stamp is
-    # what makes that a fact rather than a guess.
     seq = running_turn!(ctx.db, session_key)
     :ok = Tightbeam.Ledger.stamp_adapter(ctx.db, seq, 1)
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
     Process.exit(adapter, :kill)
 
     assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
@@ -690,35 +702,36 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert Tightbeam.Wire.Payloads.server_message(marker)["attentionTier"] == 0
   end
 
-  test "an UNSTAMPED running turn is not told its turn stopped", ctx do
+  test "a session resident on the adapter is told even with no turn in flight", ctx do
     key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"unstamped_#{System.unique_integer([:positive])}")
 
+    # No turn at all. The engine this session runs on died and its harness
+    # context went with it, which is true whether or not a prompt was in
+    # flight — and the turn-attribution predicates that would have excluded
+    # this session are exactly what three review rounds found unsound.
     session_key = seed_session!(ctx.db)
-    # No stamp: Ledger.stamp_adapter/3 runs only once session establishment
-    # succeeds, so a NULL adapterGen covers BOTH "checked this adapter out"
-    # and "has not reached checkout at all". Claiming the death stopped this
-    # turn would be a false statement in someone's chat whenever it is the
-    # second. The turn's own "[turn failed]" marker still reaches this reader
-    # if it really did die; only the cause sentence is withheld.
-    _seq = running_turn!(ctx.db, session_key)
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
     Process.exit(adapter, :kill)
 
     assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
 
     assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
-    assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
+    assert [marker] = Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10)
+    assert marker.content =~ "[adapter down]"
   end
 
-  test "a death with no turn running on it halts nobody and messages nobody", ctx do
-    key = {:claude, "shared", "testhost"}
+  test "a death on a key no session is resident to messages nobody", ctx do
+    # The session below lives on `testhost`; this adapter serves `otherhost`.
+    key = {:claude, "shared", "otherhost"}
     coordinator = start_fake_coordinator(ctx, :"idle_#{System.unique_integer([:positive])}")
 
     session_key = seed_session!(ctx.db)
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
     Process.exit(adapter, :kill)
 
     assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
@@ -726,6 +739,19 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # The record is unconditional; the interruption is not.
     assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
     assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
+  end
+
+  # `start_supervised!` is not a boot barrier: Acp.Adapter returns from init
+  # before `node` is spawned, and only {:adapter_ready, key} marks the entry
+  # ready. A death BEFORE that point is a boot failure, which deliberately
+  # messages nobody — so a test about a working engine dying must wait here.
+  defp await_ready!(coordinator, key) do
+    assert wait_until(
+             fn ->
+               match?({:ok, {_epoch, _gen}}, AdapterCoordinator.ready_token(coordinator, key))
+             end,
+             2_000
+           )
   end
 
   defp seed_session!(db) do

@@ -482,71 +482,52 @@ defmodule Tightbeam.AdapterCoordinator do
       "adapter_down",
       name,
       "#{inspect(reason)} absorbed=#{absorbed?}",
-      audience: {:sessions, halted_sessions(state.db, key, entry, absorbed?)},
+      audience: {:sessions, told_sessions(state.db, key, entry)},
       attention: :normal,
       message:
-        "[adapter down]\n\nThe #{name} engine stopped: #{inspect(reason)}. The turn " <>
-          "running here stopped with it. Tightbeam restarts the engine and releases " <>
-          "this session when it is ready again."
+        "[adapter down]\n\nThe #{name} engine stopped: #{inspect(reason)}. Anything " <>
+          "that was running on it stopped with it. Tightbeam restarts the engine and " <>
+          "releases this session when it is ready again."
     )
   end
 
-  # An ABSORBED death names nobody. `start_adapter_unfenced` reuses the entry's
-  # generation for the replacement it starts, so a turn running on the
-  # replacement and a turn that died on the original carry the SAME stamp:
-  # there is no fact on hand that tells them apart, and guessing would put
-  # "your turn stopped" in the chat of a session whose turn is still running.
-  # The row is unconditional (#14); the interruption is only for a death we can
-  # attribute.
-  defp halted_sessions(_db, _key, _entry, true = _absorbed?), do: []
+  # Who is told. THE MESSAGE CLAIMS ONLY WHAT IS CERTAIN — this engine stopped —
+  # so the audience needs no turn attribution, and with it goes a whole family
+  # of ways to be wrong. Three reviews died on the attribution question: which
+  # sessions a given adapter INSTANCE halted is not a fact this substrate
+  # records. Generation is the only stamp and `start_adapter_unfenced/4` reuses
+  # it for a replacement, so an instance is indistinguishable from its
+  # successor; `adapterGen IS NULL` covers both "checked this adapter out" and
+  # "has not reached checkout"; and the lane can finalize the turn from the same
+  # death before this handler runs. Every predicate over that state is an
+  # inference, and this message is read by a person.
+  #
+  # Attributing nothing is not a weaker claim, it is a TRUE one: an adapter
+  # death takes the harness context of every session resident on the key,
+  # whether or not that session had a turn in flight. That is worth a line in
+  # each of their chats, and it is the counterpart of the "[adapter recovered]"
+  # probe those same readers already get.
+  #
+  # ONE gate, on `ready`: a key whose adapter never finished booting was serving
+  # nobody, and a boot-failure cascade (five deaths into an open circuit) would
+  # otherwise post five lines to every session on the host. A death during boot
+  # still gets its row; the turn that asked for it gets its own spawn error.
+  defp told_sessions(_db, _key, %{ready: false}), do: []
 
-  # Which sessions this death halted: those resident on this adapter with a
-  # turn RUNNING that is STAMPED against the generation that just died.
-  # Sessions reach a key the way the gateway builds one — harness and host,
-  # shared archetype — so a key of any other shape holds no sessions and halted
-  # nobody.
-  #
-  # An unstamped (`adapterGen IS NULL`) running turn is deliberately NOT
-  # counted. `Ledger.stamp_adapter/3` runs only once session establishment
-  # succeeds (gateway.ex), so NULL covers two unlike states at once — a turn
-  # that had checked this adapter out and one that has not reached checkout at
-  # all — and treating the pair as one would tell a session still running
-  # happily that its turn stopped. That is the absence-as-success shape, and
-  # this message is a factual claim about somebody's turn.
-  #
-  # THE STANDING RULE HERE IS: prefer saying nothing to saying something false.
-  # Two known cases say nothing.
-  #   - The lane learns its prompt failed from the same death and can finalize
-  #     the turn before this handler runs; it is then no longer 'running'.
-  #   - An ABSORBED death (see the clause above) cannot be attributed at all.
-  # In BOTH the session still receives its own "[turn failed]" marker, so
-  # nobody is left staring at silence — what is lost is the sentence naming the
-  # cause. Closing them for real means making an adapter INSTANCE
-  # distinguishable from its replacement, which today it is not: generation is
-  # the only stamp and `start_adapter_unfenced/4` reuses it. That is a change to
-  # the generation algebra the moduledoc calls binding, and it feeds the heal
-  # token's ordering, so it is its own change and not this one.
-  #
-  # This reads `turns` directly because a `Ledger` reader is the right home and
-  # ledger.ex belongs to another lane right now (reported, not edited).
-  defp halted_sessions(db, {harness, "shared", host}, entry, false) do
+  defp told_sessions(db, {harness, "shared", host}, _entry) do
     {:ok, rows} =
       Tightbeam.DB.query(
         db,
-        """
-        SELECT s.sessionKey
-        FROM sessions AS s
-        JOIN turns AS t ON t.sessionKey = s.sessionKey
-        WHERE s.state = 'active' AND s.harness = ?1 AND s.host = ?2
-          AND t.status = 'running' AND t.adapterGen = ?3
-        """,
-        [Atom.to_string(harness), host, entry.generation]
+        "SELECT sessionKey FROM sessions WHERE state = 'active' AND harness = ?1 AND host = ?2",
+        [Atom.to_string(harness), host]
       )
 
     Enum.map(rows, fn [session_key] -> session_key end)
   end
 
-  defp halted_sessions(_db, _key, _entry, false), do: []
+  # Sessions reach a key the way the gateway builds one — harness and host,
+  # shared archetype — so a key of any other shape is resident to nobody.
+  defp told_sessions(_db, _key, _entry), do: []
 
   defp retire_adapter(key, state) do
     case state.adapters[key] do
