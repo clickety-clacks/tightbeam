@@ -206,15 +206,26 @@ defmodule ClientE2ERunner do
     end
   end
 
+  # BOTH FIELDS, ALWAYS. A model and its effort are separate fields now
+  # (model-identity-v1), and a tiered model named without a tier is an INCOMPLETE
+  # selection — unplaceable, so the leg boots NOT READY. Passing the model alone
+  # was correct when an identifier could carry its own suffix; it silently stopped
+  # being correct, and the readiness message blames the catalog rather than the
+  # missing tier, so the failure does not name its own cause.
   defp leg_env(harness) do
     [
       {"TIGHTBEAM_DEFAULT_HARNESS", harness},
-      {"TIGHTBEAM_DEFAULT_MODEL", model_for(harness)}
+      {"TIGHTBEAM_DEFAULT_MODEL", model_for(harness)},
+      {"TIGHTBEAM_DEFAULT_EFFORT", effort_for(harness)}
     ]
   end
 
   defp model_for(harness) do
     env!("TIGHTBEAM_SMOKE_MODEL_#{String.upcase(harness)}")
+  end
+
+  defp effort_for(harness) do
+    env!("TIGHTBEAM_SMOKE_EFFORT_#{String.upcase(harness)}")
   end
 
   defp legs do
