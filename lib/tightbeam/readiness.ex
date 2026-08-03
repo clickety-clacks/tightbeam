@@ -196,13 +196,18 @@ defmodule Tightbeam.Readiness do
   defp classify(:not_derived), do: {:unknown, :catalog_not_derived_yet}
   defp classify(reason), do: {:degraded, reason}
 
-  # Selectability is only meaningful once the catalog is real; with no credential
-  # the empty inventory says nothing about the model. This short-circuit is also
-  # where the not-yet-derived policy lives: a catalog that has not landed leaves
-  # the CREDENTIAL unknown, so the model row is unknown too and boot asserts
-  # nothing about either.
-  defp model_state(_host, _harness, credential, _config, _catalog) when credential != :live,
-    do: :unknown
+  # THE MODEL ROW DEFERS ONLY WHERE ANOTHER ROW ALREADY SPEAKS. An ABSENT or
+  # UNKNOWN credential is the credential column's story — it names the grant, the
+  # host and the onboard command — and repeating it here would be noise, so the
+  # model is reported unknown (this is also where the not-yet-derived policy
+  # lives: nothing is established, so nothing is asserted).
+  #
+  # A DEGRADED catalog is a different fact. The credential is not implicated: the
+  # inventory came back empty for the catalog's own reason — a client_version
+  # filter, a malformed body — and NO other row says so. Deferring there is how
+  # the centralized "upgrade the binary" diagnosis failed to reach boot at all.
+  defp model_state(_host, _harness, {:absent, _reason}, _config, _catalog), do: :unknown
+  defp model_state(_host, _harness, {:unknown, _reason}, _config, _catalog), do: :unknown
 
   # Asked of the one routability owner rather than derived here. Boot used to
   # decide this itself, with a narrower rule that could not tell "no such model"
@@ -358,18 +363,37 @@ defmodule Tightbeam.Readiness do
   # default — and a tier gap is fixed by naming a tier, not by re-picking a model
   # that was never the problem.
   defp model_line(%{model: {:unroutable, unroutable}}) do
-    "default model " <>
-      Unroutable.message(unroutable) <> " — " <> default_model_remedy(unroutable)
+    case default_model_remedy(unroutable) do
+      nil -> "default model " <> Unroutable.message(unroutable)
+      remedy -> "default model " <> Unroutable.message(unroutable) <> " — " <> remedy
+    end
   end
 
-  defp default_model_remedy(%Unroutable{cause: cause})
-       when cause in [:needs_effort, :effort_not_offered] do
-    "set TIGHTBEAM_DEFAULT_EFFORT to one of the tiers it offers " <>
-      "(see mix tightbeam.catalog.diff)"
+  # A REMEDY THAT CANNOT WORK IS A FALSE STATEMENT. Naming a tier fixes a model
+  # that HAS tiers; a model with none is fixed by unsetting the level; and a
+  # catalog that could not be derived is not fixed by re-picking a model at all —
+  # its repair is in the refusal itself (onboard the grant, upgrade the binary),
+  # so boot adds nothing.
+  defp default_model_remedy(%Unroutable{cause: :no_catalog}), do: nil
+
+  defp default_model_remedy(%Unroutable{cause: :effort_not_offered, offered: offered})
+       when offered != [] do
+    if Enum.all?(offered, &(&1.entry.efforts == [])) do
+      "unset TIGHTBEAM_DEFAULT_EFFORT (see mix tightbeam.catalog.diff)"
+    else
+      effort_remedy()
+    end
   end
+
+  defp default_model_remedy(%Unroutable{cause: :needs_effort}), do: effort_remedy()
 
   defp default_model_remedy(_unroutable) do
     "set TIGHTBEAM_DEFAULT_MODEL/_EFFORT to something that host offers " <>
+      "(see mix tightbeam.catalog.diff)"
+  end
+
+  defp effort_remedy do
+    "set TIGHTBEAM_DEFAULT_EFFORT to one of the tiers it offers " <>
       "(see mix tightbeam.catalog.diff)"
   end
 

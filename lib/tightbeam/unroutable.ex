@@ -73,6 +73,18 @@ defmodule Tightbeam.Unroutable do
   def code(%__MODULE__{cause: :effort_not_offered}), do: "model_unavailable"
   def code(%__MODULE__{cause: :ambiguous}), do: "ambiguous_ref"
 
+  @doc """
+  Every code a routability refusal can carry, so a caller deciding whether a
+  denial is ABOUT ROUTING asks here instead of keeping its own list of strings
+  that a new cause would silently fall out of.
+  """
+  @spec codes() :: [String.t()]
+  def codes do
+    [:no_catalog, :family_absent, :needs_effort, :effort_not_offered, :ambiguous]
+    |> Enum.map(&code(%__MODULE__{cause: &1, host: "", selection: %Model{family: ""}}))
+    |> Enum.uniq()
+  end
+
   @doc "The one honest sentence for this refusal."
   @spec message(t()) :: String.t()
   def message(%__MODULE__{cause: :no_catalog} = unroutable) do
@@ -116,10 +128,14 @@ defmodule Tightbeam.Unroutable do
     end
   end
 
+  # No "name the harness" remedy: a selection IS a model, with no harness field,
+  # and every caller of the fleet answer hands one straight in. Telling an
+  # operator to do something the API cannot express is the same failure as naming
+  # the wrong cause.
   def message(%__MODULE__{cause: :ambiguous} = unroutable) do
     "#{Model.to_ref(unroutable.selection)} appears in more than one fresh harness inventory " <>
-      "on #{unroutable.host} (#{Enum.map_join(unroutable.offered, ", ", & &1.harness)}); " <>
-      "the selection must name the harness"
+      "on #{unroutable.host} (#{Enum.map_join(unroutable.offered, ", ", & &1.harness)}), so " <>
+      "nothing can choose between them; name a model only one of them offers"
   end
 
   defp catalog_story({harness, {:unavailable, {:needs_onboarding, reason}}}, host) do

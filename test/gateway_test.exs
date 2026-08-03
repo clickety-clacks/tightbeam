@@ -1015,6 +1015,24 @@ defmodule Tightbeam.GatewayTest do
              Org.get(ctx.db, Org.personal_session_key(device.user_id))
   end
 
+  # Both spellings of the routability question reach the running catalog: the
+  # fleet one that adjudication asks, and the per-harness one that validation and
+  # boot ask. Written against the DEFAULT server, because that is the whole
+  # difference between them and a spelling that raises instead of routing is not
+  # an API at all.
+  test "route answers the fleet and one harness alike, against the running catalog", _ctx do
+    put_host_catalog("testhost", "claude", [{"tiered-here", ["low", "high"]}])
+
+    assert {:ok, %{harness: "claude", provider: "anthropic"}} =
+             ModelCatalog.route("testhost", Model.new("tiered-here", effort: "high"))
+
+    assert {:ok, %{harness: "claude"}} =
+             ModelCatalog.route("testhost", "claude", Model.new("tiered-here", effort: "high"))
+
+    assert {:error, %Tightbeam.Unroutable{cause: :needs_effort}} =
+             ModelCatalog.route("testhost", "claude", Model.new("tiered-here"))
+  end
+
   # Task #41. A model the adapter cannot select must be refused by NAME and the
   # operator told what IS available — before, this died deep in the adapter as
   # "Invalid value for config option model", on every session/new and session/load.

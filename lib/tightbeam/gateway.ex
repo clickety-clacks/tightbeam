@@ -3342,8 +3342,13 @@ defmodule Tightbeam.Gateway do
       else: classified_denial(config_code, denial)
   end
 
+  # A routability refusal keeps its OWN code and sentence. The list is asked of
+  # the routability owner rather than spelled here, because a hand-kept list held
+  # only the two codes the old mechanism produced — so a needs-an-effort refusal
+  # (composition and validation read the catalog separately, and an async refresh
+  # can land between them) came back re-labelled a PLACEMENT denial.
   defp classified_denial(code, denial) do
-    if denial[:code] in ["model_unavailable", "catalog_unavailable"] do
+    if denial[:code] in Unroutable.codes() do
       Map.put(denial, :detail, denial)
     else
       %{code: code, message: denial[:message] || inspect(denial), detail: denial}

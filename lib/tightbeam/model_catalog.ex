@@ -107,18 +107,9 @@ defmodule Tightbeam.ModelCatalog do
   This is a READ of the already-cached catalog. It starts nothing, waits on
   nothing, and does no provider I/O, so it can sit on the prompt path.
   """
-  @spec route(String.t(), Model.t(), GenServer.server()) ::
-          {:ok, routed()} | {:error, Unroutable.t()}
-  def route(host, %Model{} = selection, server \\ __MODULE__) when is_binary(host) do
-    answers = Enum.map(harness_names(), &{&1, route(host, &1, selection, server)})
-    routable = for {_harness, {:ok, routed}} <- answers, do: routed
-
-    case routable do
-      [routed] -> {:ok, routed}
-      [] -> {:error, fold_refusals(host, selection, answers)}
-      _many -> {:error, ambiguous(host, selection, answers)}
-    end
-  end
+  @spec route(String.t(), Model.t()) :: {:ok, routed()} | {:error, Unroutable.t()}
+  def route(host, %Model{} = selection) when is_binary(host),
+    do: route(host, selection, __MODULE__)
 
   @doc """
   The same answer for ONE harness: what that harness's catalog on that host says
@@ -129,6 +120,28 @@ defmodule Tightbeam.ModelCatalog do
   absent, it is evidence of nothing, so it refuses as `:no_catalog` rather than
   implying the fleet does not have the model.
   """
+  @spec route(String.t(), String.t(), Model.t()) :: {:ok, routed()} | {:error, Unroutable.t()}
+  @spec route(String.t(), Model.t(), GenServer.server()) ::
+          {:ok, routed()} | {:error, Unroutable.t()}
+  # Two shapes at one arity, told apart by what the second argument IS: a harness
+  # is a name, a selection is a struct. No default arguments, because a defaulted
+  # server on the fold would collide with the per-harness form and leave one of
+  # the two spellings raising instead of routing.
+  def route(host, %Model{} = selection, server) when is_binary(host) do
+    answers = Enum.map(harness_names(), &{&1, route(host, &1, selection, server)})
+    routable = for {_harness, {:ok, routed}} <- answers, do: routed
+
+    case routable do
+      [routed] -> {:ok, routed}
+      [] -> {:error, fold_refusals(host, selection, answers)}
+      _many -> {:error, ambiguous(host, selection, answers)}
+    end
+  end
+
+  def route(host, harness, %Model{} = selection) when is_binary(host) and is_binary(harness),
+    do: route(host, harness, selection, __MODULE__)
+
+  @doc "One harness's answer, against a named catalog server."
   @spec route(String.t(), String.t(), Model.t(), GenServer.server()) ::
           {:ok, routed()} | {:error, Unroutable.t()}
   def route(host, harness, %Model{} = selection, server)

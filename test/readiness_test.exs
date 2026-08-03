@@ -227,6 +227,56 @@ defmodule Tightbeam.ReadinessTest do
     refute line =~ "is not in #{module.wire_name()}'s live catalog"
   end
 
+  # The catalog can fail for its OWN reason, with a working credential: the codex
+  # models endpoint drops every model for a too-old client_version and returns
+  # 200. No other row says that — the credential row calls it "degraded" — so a
+  # model row that defers here is how the one honest diagnosis failed to reach
+  # boot at all.
+  test "a catalog emptied by a client_version filter blames the binary at boot", ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+
+    catalog =
+      catalog!(%{
+        module.wire_name() => {[], {:unavailable, {:empty_catalog_for_client_version, "0.99.0"}}}
+      })
+
+    line =
+      ctx.config
+      |> Readiness.summary(catalog)
+      |> Readiness.render(ctx.config)
+      |> Enum.find(&(&1 =~ "default model"))
+
+    assert line, "the catalog's own failure must be named"
+    assert line =~ ~s(EMPTY model list for client_version "0.99.0")
+    assert line =~ "credential is not implicated"
+    assert line =~ "upgrade #{module.wire_name()}"
+
+    # …and boot adds no remedy of its own, because re-picking a model cannot
+    # repair a catalog that was never derived.
+    refute line =~ "TIGHTBEAM_DEFAULT_MODEL"
+    refute line =~ "TIGHTBEAM_DEFAULT_EFFORT"
+  end
+
+  test "a model with no tiers is told to UNSET the effort, not to pick one", ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+    # ctx.config's default is `m` at effort medium; this entry offers no tiers.
+    catalog = catalog!(%{module.wire_name() => live("m", [])})
+
+    line =
+      ctx.config
+      |> Readiness.summary(catalog)
+      |> Readiness.render(ctx.config)
+      |> Enum.find(&(&1 =~ "default model"))
+
+    assert line =~ "has no effort tiers"
+    assert line =~ "unset TIGHTBEAM_DEFAULT_EFFORT"
+
+    # The remedy that cannot work: there is no tier to name.
+    refute line =~ "to one of the tiers it offers"
+  end
+
   test "an archetype whose where names no registered host is called out", ctx do
     catalog = catalog!(%{})
 

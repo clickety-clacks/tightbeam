@@ -781,6 +781,41 @@ defmodule Tightbeam.ModelCatalogTest do
       assert message =~ "claude"
       assert message =~ "codex"
       assert Unroutable.code(unroutable) == "ambiguous_ref"
+
+      # A remedy the API cannot express is the same failure as the wrong cause: a
+      # selection is a MODEL, with no harness field, and every caller of the
+      # fleet answer hands one straight in.
+      refute message =~ "name the harness"
+      assert message =~ "name a model only one of them offers"
+    end
+
+    # The list a caller consults to ask "is this denial about routing" — the
+    # gateway's spawn classifier keeps a refusal's own code only for these. Held
+    # by hand, it carried the two codes the old mechanism produced, and a
+    # needs-an-effort refusal came back re-labelled a placement denial.
+    test "every cause has a code and a message, and the codes are published", _ctx do
+      for cause <- [
+            :no_catalog,
+            :family_absent,
+            :needs_effort,
+            :effort_not_offered,
+            :ambiguous
+          ] do
+        unroutable = %Unroutable{
+          cause: cause,
+          host: @host,
+          harness: "claude",
+          selection: Model.new("m", effort: "medium"),
+          health: [{"claude", {:unavailable, :whatever}}],
+          offered: [%{harness: "claude", entry: %{family: "m", context: nil, efforts: ["low"]}}]
+        }
+
+        assert is_binary(Unroutable.message(unroutable)), "#{cause} has no sentence"
+        assert Unroutable.code(unroutable) in Unroutable.codes(), "#{cause}'s code is unpublished"
+      end
+
+      assert "invalid" in Unroutable.codes()
+      assert "ambiguous_ref" in Unroutable.codes()
     end
 
     # ROUTABILITY IS A QUESTION ABOUT THE WHOLE FLEET. One harness tiering a
