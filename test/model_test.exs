@@ -57,20 +57,20 @@ defmodule Tightbeam.ModelTest do
     assert Model.named_fields(%{model: nil}) == %{}
     refute Map.has_key?(Model.named_fields(%{model: nil}), :family)
 
-    # …through EITHER key, and for the empty string too. The exception is about
-    # what an empty family MEANS, not about which key it arrived under: a
-    # `%Model{family: nil}` built from any of these refuses downstream instead
-    # of behaving like the partial selection it actually is.
+    # …and for the empty string too. The exception is about what an empty
+    # family MEANS: a `%Model{family: nil}` is not a selection at all, and
+    # would refuse downstream instead of behaving like the partial the caller
+    # actually made.
     for empty <- [nil, ""] do
-      assert Model.named_fields(%{family: empty, effort: "high"}) == %{effort: "high"}
-      assert Model.named_fields(%{"family" => empty}) == %{}
-      assert Model.named_fields(%{model: empty, family: empty}) == %{}
+      assert Model.named_fields(%{model: empty, effort: "high"}) == %{effort: "high"}
+      assert Model.named_fields(%{"model" => empty}) == %{}
       assert Model.named_fields(%{"model" => empty, "context" => "1m"}) == %{context: "1m"}
     end
 
-    # And a real family still arrives, under either key.
-    assert Model.named_fields(%{family: "m"}) == %{family: "m"}
-    assert Model.named_fields(%{model: nil, family: "m"}) == %{family: "m"}
+    # `model` is the only key a family arrives under. A `family` key is not an
+    # alternative spelling — it is not read at all, and nothing sends one.
+    assert Model.named_fields(%{family: "m"}) == %{}
+    assert Model.from_params(%{family: "m"}) == nil
   end
 
   test "describe names every field for a reader who must pick one" do

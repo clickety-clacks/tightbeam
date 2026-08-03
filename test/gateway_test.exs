@@ -3033,6 +3033,51 @@ defmodule Tightbeam.GatewayTest do
            "naming the context as nil must select the default window, not inherit 1m"
   end
 
+  # THE FAMILY EXCEPTION, THROUGH THE SEAM. A unit test on `named_fields/1`
+  # proves the field map; it does not prove what `complete/2` builds from it.
+  # An explicitly nil family must behave like an absent one — inherit — and
+  # never construct a `%Model{family: nil}` that is routed as though nil were
+  # a model and refused downstream for the wrong reason.
+  test "an explicitly nil family inherits the default rather than becoming a nil model", ctx do
+    base_dir = role_test_base("nil-family")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :nil_family_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low", "high"]}])
+
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:default_model, Model.new("claude-fable-5", effort: "low"))
+
+    # `model: nil` is what the wire delivers for `{"model": null}` now that the
+    # router carries an explicit null instead of dropping it.
+    for empty <- [nil, ""] do
+      key = "k-nil-family-#{inspect(empty)}"
+
+      assert %{session_key: spawned} =
+               Gateway.handlers(config)["spawn"].(%{
+                 origin: "user:flynn",
+                 session_key: nil,
+                 params: %{
+                   display_name: "Nil Family",
+                   idempotency_key: key,
+                   model: empty,
+                   effort: "high"
+                 }
+               }),
+             "an empty family must not refuse — it is a partial selection"
+
+      assert Org.get(ctx.db, spawned).model ==
+               Model.new("claude-fable-5", effort: "high"),
+             "the family inherits from the default; the named effort is honoured"
+    end
+  end
+
   # A refusal has to name the right cause. An effort-only selection whose
   # EFFORT is the invalid part was reported as a broken configured default,
   # sending the operator to change a setting that was never the problem.

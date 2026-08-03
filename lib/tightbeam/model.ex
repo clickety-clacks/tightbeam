@@ -145,19 +145,20 @@ defmodule Tightbeam.Model do
   # answers, but there is no model you select by declining to name one. So an
   # explicitly nil family IS absence, and says so here rather than leaving a
   # `%Model{family: nil}` to be built downstream.
+  # `model` is the ONLY key a family arrives under, and an empty one is
+  # ABSENCE — nil or "". A `%Model{family: nil}` is not a selection: it would
+  # refuse downstream instead of behaving like the partial the caller made.
+  #
+  # There used to be a `family` key accepted as an alternative. Nothing ever
+  # sent it — not the router, the CLI, rail remedies, or smoke — and its only
+  # user in the end was the test written to prove a defect inside it. It is
+  # deleted rather than hardened: a key no producer emits cannot be got wrong.
   defp named_family(params) do
     case named(params, :model) do
       {:present, family} when is_binary(family) -> {:present, family}
-      _ -> binary_or_absent(named(params, :family))
+      _ -> :absent
     end
   end
-
-  # An empty family is ABSENCE however it arrives — under either key, as nil or
-  # as "". Anything else builds a `%Model{family: nil}`, which is not a
-  # selection at all: it refuses downstream instead of behaving like the
-  # partial selection the caller actually made.
-  defp binary_or_absent({:present, family}) when is_binary(family), do: {:present, family}
-  defp binary_or_absent(_), do: :absent
 
   defp fetch_either(params, key) do
     case Map.fetch(params, key) do
@@ -172,7 +173,7 @@ defmodule Tightbeam.Model do
   """
   @spec from_params(map()) :: t() | nil
   def from_params(params) when is_map(params) do
-    case field(params, :model) || field(params, :family) do
+    case field(params, :model) do
       family when is_binary(family) and family != "" ->
         new(family, effort: field(params, :effort), context: field(params, :context))
 
