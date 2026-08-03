@@ -1928,6 +1928,77 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
   end
 
+  test "spawn uses the next where host when the first cannot run the requested harness", ctx do
+    base_dir = placement_test_base("later-eligible", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("racter", "codex")
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn
+        :openai, "eurisko" -> {:needs_onboarding, :missing}
+        :openai, "racter" -> :onboarded
+      end)
+      |> Map.put(:sh, fn _command -> {"", 0} end)
+
+    assert %{session_key: session_key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Placed later",
+                 idempotency_key: "spawn-later-eligible"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "racter"
+  end
+
+  test "spawn refusal names every where host, harness, cause, and remedy", ctx do
+    base_dir = placement_test_base("all-ineligible", ["eurisko", "racter"])
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> {:needs_onboarding, :missing} end)
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "host_unready"},
+             message: message
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Nowhere",
+                 idempotency_key: "spawn-all-ineligible"
+               }
+             })
+
+    assert message =~ "no host in archetype default's where can run codex"
+
+    for {host, base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
+      assert message =~ "Tightbeam has no credential for openai on #{host}"
+      assert message =~ Path.join(base, "auth")
+      assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
+    end
+  end
+
   test "spawn fails closed when a registered host has no credential server", ctx do
     machine = "credential-worker-missing"
     base_dir = move_test_base(ctx.db, "credential-server-missing", machine)
@@ -6989,6 +7060,28 @@ defmodule Tightbeam.GatewayTest do
     register_hosts(db, %{
       remote_host => %{ssh: remote_host, base_dir: "/remote/tb", cli_bin: nil}
     })
+
+    base_dir
+  end
+
+  defp placement_test_base(suffix, where) do
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_placement_#{suffix}_#{System.unique_integer([:positive])}"
+      )
+
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    hosts = Enum.map_join(where, ", ", &inspect/1)
+    File.write!(Path.join(manifests, "default.toml"), "name = \"default\"\nwhere = [#{hosts}]\n")
+    Archetypes.load!(base_dir)
+
+    on_exit(fn ->
+      File.rm_rf!(base_dir)
+      :persistent_term.erase(Archetypes)
+    end)
 
     base_dir
   end

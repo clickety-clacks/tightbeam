@@ -22,6 +22,14 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    register_hosts(db, %{
+      "eezo" => %{
+        ssh: nil,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        cli_bin: nil
+      }
+    })
+
     {:ok, _} =
       DB.query(
         db,

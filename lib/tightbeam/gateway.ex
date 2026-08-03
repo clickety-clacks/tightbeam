@@ -3233,13 +3233,58 @@ defmodule Tightbeam.Gateway do
             {:ok, nil}
           end
 
+        harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
+        module = if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
+
         with {:ok, overrides} <- override_result,
              {:ok, host} <-
-               Placement.resolve(archetype, p[:host], Placement.hosts(config.base_dir, db)) do
+               resolve_spawn_host(config, db, archetype, p, module.wire_name()) do
           create_spawn(config, db, call, caller, archetype, host, overrides)
         else
           {:error, denial} -> classified_spawn_denial(denial, "config_denied", "placement_denied")
         end
+    end
+  end
+
+  defp resolve_spawn_host(config, db, archetype, %{host: host}, _harness)
+       when is_binary(host) do
+    Placement.resolve(archetype, host, Placement.hosts(config.base_dir, db))
+  end
+
+  defp resolve_spawn_host(config, db, %{where: ["*"]} = archetype, _p, _harness) do
+    Placement.resolve(archetype, nil, Placement.hosts(config.base_dir, db))
+  end
+
+  defp resolve_spawn_host(config, db, archetype, _p, harness) do
+    hosts = Placement.hosts(config.base_dir, db)
+
+    results =
+      Enum.map(archetype.where, fn host ->
+        result =
+          with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
+               :ok <- validate_credential(config, harness, host) do
+            :ok
+          end
+
+        {host, result}
+      end)
+
+    case Enum.find(results, fn {_host, result} -> result == :ok end) do
+      {host, :ok} ->
+        {:ok, host}
+
+      nil ->
+        causes =
+          Enum.map_join(results, "\n", fn {host, {:error, denial}} ->
+            "  #{host}: #{denial.message}"
+          end)
+
+        {:error,
+         %{
+           code: "host_unready",
+           message:
+             "no host in archetype #{archetype.name}'s where can run #{harness}:\n#{causes}"
+         }}
     end
   end
 
@@ -3349,7 +3394,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp classified_spawn_denial(denial, config_code, placement_code) do
-    if denial[:code] in ["host_not_allowed", "unknown_host"],
+    if denial[:code] in ["host_not_allowed", "unknown_host", "host_unready"],
       do: classified_denial(placement_code, denial),
       else: classified_denial(config_code, denial)
   end

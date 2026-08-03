@@ -155,7 +155,7 @@ defmodule Tightbeam.Placement do
   """
   @spec holder_workdir(map(), map()) :: String.t()
   def holder_workdir(config, holder_session) do
-    host = hosts_for(config)[holder_session.host] || %{ssh: nil, base_dir: config.base_dir}
+    host = Map.fetch!(hosts_for(config), holder_session.host)
     path = workdir_path(config, holder_session)
 
     url =
@@ -208,7 +208,7 @@ defmodule Tightbeam.Placement do
   @doc "Derive a session's durable workspace path without creating it."
   @spec workdir_path(map(), map()) :: String.t()
   def workdir_path(config, session) do
-    host = hosts_for(config)[session.host] || %{base_dir: config.base_dir}
+    host = Map.fetch!(hosts_for(config), session.host)
 
     digest =
       :crypto.hash(:sha256, session.session_key)

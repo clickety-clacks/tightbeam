@@ -109,6 +109,27 @@ defmodule Tightbeam.PlacementTest do
     assert unknown =~ "work-2"
   end
 
+  test "a session whose registered host disappears never falls back to the gateway", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    register_hosts(db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/tightbeam", cli_bin: nil}
+    })
+
+    session = %{session_key: "remote-session", host: "eurisko", cli_token: "secret"}
+    remote_workdir = Placement.workdir_path(%{base_dir: base_dir, db: db}, session)
+    assert String.starts_with?(remote_workdir, "/srv/tightbeam/work/")
+
+    :ok = DB.execute(db, "DELETE FROM hosts WHERE name='eurisko'")
+
+    assert_raise KeyError, fn ->
+      Placement.holder_workdir(%{base_dir: base_dir, db: db, port: 4000}, session)
+    end
+
+    refute File.exists?(Path.join(base_dir, "work"))
+  end
+
   test "move_workdir copies local to local", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-local")
     new_base = Path.join(base_dir, "new-local")
