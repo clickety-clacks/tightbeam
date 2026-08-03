@@ -167,6 +167,24 @@ pub(crate) fn complete(challenge: &Challenge, pasted: &str) -> Result<Credential
 /// A missing refresh token or expiry is a REFUSAL, not a default. A credential banked
 /// without them looks healthy and dies silently when the access token lapses, which is the
 /// failure shape this whole area keeps producing.
+/// The ONE place a bearer token is taken out of the stored record.
+///
+/// Everything that authenticates with a subscription credential comes through here -- the
+/// catalog probe, and anything added later. Three separate extractions grew before this
+/// existed, in three languages, and two of them were wrong at different times.
+pub(crate) fn access_token(raw: &str) -> Result<String, String> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(json) => json
+            .get("claudeAiOauth")
+            .and_then(|oauth| oauth.get("accessToken"))
+            .and_then(serde_json::Value::as_str)
+            .map(|token| token.trim().to_owned())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| "credential has no claudeAiOauth.accessToken".to_owned()),
+        Err(error) => Err(format!("credential is not a JSON OAuth record: {error}")),
+    }
+}
+
 fn parse_credential(body: &str) -> Result<Credential, String> {
     let json: serde_json::Value = serde_json::from_str(body)
         .map_err(|error| format!("token exchange returned invalid JSON: {error}"))?;

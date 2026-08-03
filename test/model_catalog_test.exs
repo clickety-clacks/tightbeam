@@ -624,12 +624,25 @@ defmodule Tightbeam.ModelCatalogTest do
       # rather than cat-ing it -- but the property this test exists for is unchanged and
       # asserted above: the secret is captured into a shell variable on the owning host and
       # never appears in any argv. `python3` is handed the PATH, not the token.
+      # The far host's own tightbeam binary reads the credential -- it is already installed
+      # there and already exec'd for `harness-group`. What this replaced was a `python3`
+      # one-liner parsing the vendor's JSON, which added a runtime dependency to every
+      # satellite and was a THIRD copy of an extraction that already existed twice.
+      #
+      # The property this test exists for is stronger now, not weaker: the secret never
+      # enters a shell variable at all. Only the PATH is on the command line, asserted here
+      # and by the `refute` above.
       credential_file = Path.join([ctx.satellite_base, "auth", "claude", ".credentials.json"])
-      assert claude_line =~ "credential=$(python3 -c "
+      assert claude_line =~ "catalog-probe anthropic subscription"
       assert claude_line =~ credential_file
-      assert claude_line =~ "accessToken"
+      refute claude_line =~ "python3"
+      refute claude_line =~ "credential=$("
 
-      assert claude_line =~ ~s(-H "authorization: Bearer $credential")
+      # No authorization header on the command line at all: the binary builds it from the
+      # file it just read. The old form referenced a shell variable, which was safe; this
+      # form has nothing to reference.
+      refute claude_line =~ "authorization:"
+      refute claude_line =~ "Bearer"
       assert ["ssh" | claude_rest] = claude
       assert "sat.example" in claude_rest
 

@@ -473,27 +473,10 @@ defmodule Tightbeam.Harness.Claude do
     ]
   end
 
-  # How the far host turns its credential file into a bearer token.
-  #
-  # An API key IS the file. A subscription is Claude Code's OAuth record and the token is a
-  # field inside it, so it has to be parsed -- and parsed properly: a regex over a vendor's
-  # JSON is the brittle mirror this codebase keeps deleting, and it would fail silently by
-  # producing a plausible wrong string rather than an error.
-  #
-  # The value is captured into a SHELL VARIABLE, never an argument. `python3` receives only
-  # the path; the secret leaves on stdout and is captured by `$(...)`, so it never reaches
-  # any process's argv -- which `each host's catalog is its own, and neither token reaches a
-  # command line` exists to enforce.
-  defp remote_credential_expansion(:api_key, credential_path) do
-    "credential=$(cat " <> credential_path <> ")"
-  end
-
-  defp remote_credential_expansion(:subscription, credential_path) do
-    reader =
-      "import json,sys;print(json.load(open(sys.argv[1]))[\"claudeAiOauth\"][\"accessToken\"])"
-
-    "credential=$(python3 -c '" <> reader <> "' " <> credential_path <> ")"
-  end
+  # The tightbeam binary on the host that owns the credential. `assimilate` installs it and
+  # the gateway already execs it there, so this names an existing artifact rather than
+  # introducing one.
+  defp cli_path(state), do: Path.join([state.base_dir, "bin", "tightbeam"])
 
   defp remote_getter(state, dest, credential_path, kind) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
@@ -502,11 +485,17 @@ defmodule Tightbeam.Harness.Claude do
       # The script's own stderr is folded into its stdout so a failure carries a
       # reason; ssh's is NOT, because an ssh warning on a SUCCESSFUL connection
       # would land in the middle of the JSON body.
+      # The CLI reads the credential, not this shell. It is already installed on every
+      # assimilated host and the gateway already execs it there for `harness-group`, so
+      # this is the same transport with the credential reader moved into the binary that
+      # WROTE the file. What it replaced was a `python3` one-liner parsing a vendor JSON
+      # shape -- a runtime dependency added to every satellite, and a third copy of an
+      # extraction that already existed twice.
       script = """
       exec 2>&1
       set -eu
-      #{remote_credential_expansion(kind, credential_path)}
-      exec #{Support.catalog_curl("#{@api_base}#{path}", curl_headers(kind))}
+      exec #{Support.shell_quote(cli_path(state))} catalog-probe anthropic #{kind} \
+        #{Support.shell_quote(credential_path)} #{Support.shell_quote("#{@api_base}#{path}")}
       """
 
       case Support.catalog_probe(sh, Support.catalog_probe_argv(dest, script)) do
@@ -516,15 +505,6 @@ defmodule Tightbeam.Harness.Claude do
     end
   end
 
-  # `$credential` is expanded by the REMOTE shell, so no credential byte is
-  # interpolated into a command line on either machine -- the property the
-  # subscription probe already had, kept for the API key, which is equally a
-  # secret.
-  defp curl_headers(:subscription),
-    do: ["authorization: Bearer $credential", "anthropic-version: 2023-06-01"]
-
-  defp curl_headers(:api_key),
-    do: ["x-api-key: $credential", "anthropic-version: 2023-06-01"]
 
   # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
   # the already-derived entries — no probe, no extra fetch, nothing at boot; the
