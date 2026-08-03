@@ -578,7 +578,8 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   test "a propagated reconciliation failure does not kill coordinator accounting", ctx do
-    :ok = EventLog.ensure_schema(ctx.db)
+    # The whole schema: a death is now told to the sessions it halted.
+    :ok = ensure_all_schemas(ctx.db)
     path = Path.join(ctx.test_dir, "failed-reconcile-adapter.js")
     File.write!(path, @fake_adapter)
     key = {:claude, "shared", "testhost"}
@@ -639,7 +640,8 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   test "identity removal failure is cleanup and does not suppress the scheduled restart", ctx do
-    :ok = EventLog.ensure_schema(ctx.db)
+    # The whole schema: a death is now told to the sessions it halted.
+    :ok = ensure_all_schemas(ctx.db)
     path = Path.join(ctx.test_dir, "cleanup-failure-adapter.js")
     cleanup_failing_helper = Path.join(ctx.test_dir, "cleanup-failing-helper")
     File.write!(path, @fake_adapter)

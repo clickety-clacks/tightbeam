@@ -19,7 +19,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     File.mkdir_p!(test_dir)
     on_exit(fn -> File.rm_rf!(test_dir) end)
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = EventLog.ensure_schema(db)
+    # The whole schema, not just the events table: a death is now told to the
+    # sessions it halted, so the coordinator reads `sessions` and `messages`.
+    :ok = ensure_all_schemas(db)
     start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: sup})
     %{db: db, sup: sup, test_dir: test_dir}
   end
@@ -597,6 +599,140 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert_receive :second_entered
     Task.await(first)
     Task.await(second)
+  end
+
+  ## Task #14 — the guard covers the ACTION, not the RECORD
+
+  test "a death absorbed by a replacement is still recorded, and still does not restart", ctx do
+    key = {:claude, "shared", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"absorbed_#{System.unique_integer([:positive])}")
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    # The race this guard exists for, made deterministic: a :DOWN arriving under
+    # a monitor ref the entry has already replaced. Only the ref is synthetic —
+    # the branch it selects is the production one.
+    stale_ref = make_ref()
+
+    :sys.replace_state(coordinator, fn state ->
+      %{state | monitors: Map.put(state.monitors, stale_ref, key)}
+    end)
+
+    send(coordinator, {:DOWN, stale_ref, :process, adapter, :killed})
+    _ = :sys.get_state(coordinator)
+
+    assert [%{kind: "adapter_down", subject: "claude:shared@testhost", detail: detail}] =
+             EventLog.lifecycle_events(ctx.db)
+
+    assert detail =~ "absorbed=true"
+
+    # The ACTION stayed gated: no generation bump, no restart timer, and the
+    # live adapter the replacement owns was not nilled out.
+    assert coordinator_generation(coordinator, key) == 1
+    assert %{pid: ^adapter, timer: nil} = :sys.get_state(coordinator).adapters[key]
+  end
+
+  test "a death that halted a session posts a fault message that session's reader sees", ctx do
+    key = {:claude, "shared", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"halted_#{System.unique_integer([:positive])}")
+
+    :ok =
+      DB.execute(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
+
+    session_key = "agent:main:clawline:flynn:main"
+
+    Tightbeam.Org.create(ctx.db, %{
+      session_key: session_key,
+      display_name: "Main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("claude-fable-5")
+    })
+
+    # An idle session is not "halted"; a session with a turn RUNNING on this
+    # adapter is what the death actually stopped.
+    {:ok, _seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: session_key,
+        message_id: "m1",
+        origin: "user:flynn",
+        prompt: "do the thing"
+      })
+
+    {:ok, _turn} = Tightbeam.Ledger.claim_next(ctx.db, session_key, "lane")
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    Process.exit(adapter, :kill)
+
+    assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
+
+    assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
+
+    # A message a clawline client renders and replays — the counterpart of the
+    # "[adapter recovered]" probe that already reaches this reader.
+    assert [marker] = Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10)
+    assert marker.content =~ "[adapter down]"
+    assert marker.content =~ "claude:shared@testhost"
+    assert marker.sender == "process:tightbeam"
+    assert marker.attention_tier == 0
+
+    assert Tightbeam.Wire.Payloads.server_message(marker)["attentionTier"] == 0
+  end
+
+  test "a death with no turn running on it halts nobody and messages nobody", ctx do
+    key = {:claude, "shared", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"idle_#{System.unique_integer([:positive])}")
+
+    :ok =
+      DB.execute(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
+
+    session_key = "agent:main:clawline:flynn:main"
+
+    Tightbeam.Org.create(ctx.db, %{
+      session_key: session_key,
+      display_name: "Main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("claude-fable-5")
+    })
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    Process.exit(adapter, :kill)
+
+    assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
+
+    # The record is unconditional; the interruption is not.
+    assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
+    assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
+  end
+
+  defp start_fake_coordinator(ctx, name) do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
+    File.write!(path, @fake)
+
+    start_supervised!(
+      {AdapterCoordinator,
+       adapter_sup: ctx.sup,
+       adapter_context: fn _ -> [] end,
+       adapter_opts: fn _, _ ->
+         [
+           harness: :claude,
+           cmd: [System.find_executable("node"), path],
+           home: ctx.test_dir,
+           cwd: ctx.test_dir
+         ]
+       end,
+       db: ctx.db,
+       name: name}
+    )
   end
 
   defp eventually(fun, tries \\ 40) do

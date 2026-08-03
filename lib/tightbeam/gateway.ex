@@ -4153,10 +4153,12 @@ defmodule Tightbeam.Gateway do
   defp maybe_put_opt(opts, _key, nil), do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
-  # The agent ELECTS its reply's attention tier, during its own turn. Two tiers:
-  # normal (0, the default an agent that elects nothing gets) and high (1). The
-  # substrate derives nothing — there is no kind-to-tier mapping and no anti-
-  # inflation rule — and what a client DOES with the tier is the client's business.
+  # The agent ELECTS its reply's attention tier, during its own turn. An agent
+  # elects between normal (0, what electing nothing gets) and high (1); `low`
+  # (-1) exists in the same vocabulary but is the substrate's own election over
+  # its ambient notices, not something a reply asks for. The substrate derives
+  # nothing here — there is no kind-to-tier mapping and no anti-inflation rule —
+  # and what a client DOES with the tier is the client's business.
   #
   # The target turn is never named by the caller: it is the caller session's
   # running turn, which the lane serializes to exactly one.
@@ -4173,7 +4175,7 @@ defmodule Tightbeam.Gateway do
 
               seq ->
                 DB.Txn.q(txn, "UPDATE turns SET replyAttention = ?2 WHERE seq = ?1", [seq, tier])
-                %{turn_seq: seq, attention: attention_name(tier)}
+                %{turn_seq: seq, attention: Projection.attention_name(tier)}
             end
           end)
 
@@ -4183,9 +4185,6 @@ defmodule Tightbeam.Gateway do
         %{code: "invalid", message: "attend requires a session caller"}
     end
   end
-
-  defp attention_name(1), do: "high"
-  defp attention_name(_), do: "normal"
 
   defp running_turn_seq_in_txn(txn, session_key) do
     case DB.Txn.q(
@@ -5212,7 +5211,10 @@ defmodule Tightbeam.Gateway do
           "adjudication heal errored for #{session_key} (#{condition}): #{inspect(error)}"
         )
 
-        EventLog.lifecycle(
+        # The hold stays wide and this arm is the last thing that would have
+        # opened it, so the only remaining actor is a person — and the session
+        # they would be reading looks merely quiet. Say so in it.
+        EventLog.notice(
           db,
           "adjudication_heal_error",
           session_key,
@@ -5221,7 +5223,13 @@ defmodule Tightbeam.Gateway do
             condition: condition,
             healToken: encoded_token,
             error: inspect(error)
-          })
+          }),
+          audience: {:session, session_key},
+          attention: :high,
+          message:
+            "[hold not released]\n\nThe adapter this session was waiting on recovered, " <>
+              "but releasing the hold failed: #{inspect(error)}. The session stays held " <>
+              "until someone adjudicates it (`tightbeam adjudicate`)."
         )
 
         {:error, error}

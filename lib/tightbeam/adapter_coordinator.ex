@@ -469,6 +469,45 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
+  # A death is told to the sessions it HALTED, not just to the events table.
+  # "[adapter recovered]" already reaches those readers when the replacement
+  # comes up (Adjudication.probe_prompt/0); without this they only ever saw
+  # the good news, and a turn that stopped for an engine fault read as a
+  # prompt that vanished.
+  defp record_adapter_down(state, key, reason, absorbed?) do
+    name = key_name(key)
+
+    Tightbeam.EventLog.notice(
+      state.db,
+      "adapter_down",
+      name,
+      "#{inspect(reason)} absorbed=#{absorbed?}",
+      audience: {:sessions, halted_sessions(state.db, key)},
+      attention: :normal,
+      message:
+        "[adapter down]\n\nThe #{name} engine stopped: #{inspect(reason)}. The turn " <>
+          "running here stopped with it. Tightbeam restarts the engine and releases " <>
+          "this session when it is ready again."
+    )
+  end
+
+  # Which sessions this death halted: the ones resident on this adapter with a
+  # turn running on it. Sessions reach a key the way the gateway builds one —
+  # harness and host, shared archetype — so a key of any other shape holds no
+  # sessions and halted nobody.
+  defp halted_sessions(db, {harness, "shared", host}) do
+    {:ok, rows} =
+      Tightbeam.DB.query(
+        db,
+        "SELECT sessionKey FROM sessions WHERE state = 'active' AND harness = ?1 AND host = ?2",
+        [Atom.to_string(harness), host]
+      )
+
+    for [session_key] <- rows, Tightbeam.Ledger.running?(db, session_key), do: session_key
+  end
+
+  defp halted_sessions(_db, _key), do: []
+
   defp retire_adapter(key, state) do
     case state.adapters[key] do
       %{pid: pid, monitor: monitor} = entry ->
@@ -515,10 +554,19 @@ defmodule Tightbeam.AdapterCoordinator do
         # the death was already absorbed by that replacement — treating it as
         # a fresh death would nil the new adapter's pid and schedule a
         # spurious restart (adapter leak). Dropping the ref is the cleanup.
-        if entry.monitor == ref do
-          :ok =
-            Tightbeam.EventLog.lifecycle(state.db, "adapter_down", key_name(key), inspect(reason))
+        #
+        # The guard covers the ACTION, not the RECORD (#14). An absorbed death
+        # is still a death: a harness process really exited and whatever was
+        # running on it really stopped. Recording inside the guard made a
+        # fast-recovered fault indistinguishable from no fault at all — so the
+        # record and its notice are unconditional here, and the absorbed ones
+        # say so in their detail.
+        absorbed? = entry.monitor != ref
+        :ok = record_adapter_down(state, key, reason, absorbed?)
 
+        if absorbed? do
+          {:noreply, state}
+        else
           case Tightbeam.HarnessProcess.reconcile_key(state.db, key) do
             :ok ->
               :ok
@@ -563,8 +611,6 @@ defmodule Tightbeam.AdapterCoordinator do
           }
 
           {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
-        else
-          {:noreply, state}
         end
 
       load_slot = slot_for_monitor(state.load_active, ref) ->
