@@ -36,6 +36,9 @@ const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Claude Code's own OAuth client. The credential minted with it is consumed by Claude Code.
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
+/// Sent on refresh only. See `refresh` — the endpoint answers 403 without it.
+const USER_AGENT: &str = "claude-cli/2.0.0 (external, cli)";
+
 /// Shows the code on a page instead of redirecting to a local server, so the browser does
 /// not have to be on this machine.
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
@@ -167,6 +170,117 @@ pub(crate) fn complete(challenge: &Challenge, pasted: &str) -> Result<Credential
 /// A missing refresh token or expiry is a REFUSAL, not a default. A credential banked
 /// without them looks healthy and dies silently when the access token lapses, which is the
 /// failure shape this whole area keeps producing.
+/// How long before expiry a stored token is treated as spent.
+///
+/// Not zero: a token that expires mid-request fails the request, and the caller cannot tell
+/// that from a revoked credential. One minute is enough to cover a slow catalog fetch.
+const REFRESH_SKEW_MS: i64 = 60_000;
+
+/// Is this stored credential too old to authenticate with?
+///
+/// A record with no `expiresAt` answers NO. It is not this function's job to decide a
+/// malformed credential's fate — `access_token` refuses it by name, and guessing here would
+/// turn an unreadable record into a spurious refresh against a token we never parsed.
+pub(crate) fn is_expired(raw: &str, now_ms: i64) -> bool {
+    match expires_at_ms(raw) {
+        Some(expires_at) => now_ms + REFRESH_SKEW_MS >= expires_at,
+        None => false,
+    }
+}
+
+fn expires_at_ms(raw: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()?
+        .get("claudeAiOauth")?
+        .get("expiresAt")?
+        .as_i64()
+}
+
+fn stored_refresh_token(raw: &str) -> Result<String, String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|error| format!("credential is not a JSON OAuth record: {error}"))?
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("refreshToken"))
+        .and_then(serde_json::Value::as_str)
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            "credential has no claudeAiOauth.refreshToken, so it cannot be renewed; \
+             re-run `tightbeam onboard anthropic`"
+                .to_owned()
+        })
+}
+
+/// Trade the stored refresh token for a live access token.
+///
+/// Anthropic access tokens are short-lived (~8h observed). Claude Code renews in place
+/// whenever it runs, but nothing in Tightbeam did: an install left idle overnight woke to
+/// `401 OAuth access token has expired`, an empty catalog, and no way back — and with the
+/// catalog empty nothing can be placed, so no turn runs to renew it either. That is the same
+/// deadlock `warm_home` exists to break, arriving from the other end.
+///
+/// THE USER-AGENT IS LOAD-BEARING. Without a Claude Code agent string this endpoint answers
+/// 403, which reads exactly like a revoked credential and sends you to re-onboard a
+/// credential that was fine. The authorization_code grant does not need it; this one does.
+pub(crate) fn refresh(raw: &str) -> Result<Credential, String> {
+    let refresh_token = stored_refresh_token(raw)?;
+
+    let mut body = BTreeMap::new();
+    body.insert("grant_type", "refresh_token");
+    body.insert("client_id", CLIENT_ID);
+    body.insert("refresh_token", refresh_token.as_str());
+
+    let payload = serde_json::to_string(&body).map_err(|error| error.to_string())?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .timeout_connect(Duration::from_secs(30))
+        .build();
+
+    let response = agent
+        .post(TOKEN_URL)
+        .set("content-type", "application/json")
+        .set("accept", "application/json")
+        .set("user-agent", USER_AGENT)
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .send_string(&payload);
+
+    let body = match response {
+        Ok(response) => response
+            .into_string()
+            .map_err(|error| format!("token refresh returned an unreadable body: {error}"))?,
+        Err(ureq::Error::Status(status, response)) => {
+            let detail = response.into_string().unwrap_or_default();
+            return Err(format!(
+                "token refresh refused: HTTP {status} {}",
+                detail.trim()
+            ));
+        }
+        Err(error) => return Err(format!("could not reach the token endpoint: {error}")),
+    };
+
+    // A rotated refresh token is optional in the response; the grant stays valid when the
+    // provider omits it. Carrying the stored one forward is what keeps a renewal from
+    // quietly disarming the NEXT renewal.
+    renewed_credential(&body, &refresh_token)
+}
+
+fn renewed_credential(body: &str, previous_refresh_token: &str) -> Result<Credential, String> {
+    match parse_credential(body) {
+        Ok(credential) => Ok(credential),
+        Err(reason) if reason.contains("no refresh_token") => {
+            let patched: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| format!("token refresh returned invalid JSON: {error}"))?;
+            let mut object = match patched {
+                serde_json::Value::Object(object) => object,
+                _ => return Err("token refresh did not return a JSON object".to_owned()),
+            };
+            object.insert("refresh_token".into(), previous_refresh_token.into());
+            parse_credential(&serde_json::Value::Object(object).to_string())
+        }
+        Err(reason) => Err(reason),
+    }
+}
+
 /// The ONE place a bearer token is taken out of the stored record.
 ///
 /// Everything that authenticates with a subscription credential comes through here -- the

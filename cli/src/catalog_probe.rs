@@ -16,6 +16,7 @@
 //! without passing through a shell variable, an interpreter's argv, or a `$(...)` capture.
 //! What comes back on stdout is the provider's model list, which is not secret.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
 use crate::anthropic_oauth;
@@ -42,6 +43,20 @@ pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
 
     let raw = std::fs::read_to_string(credential_path)
         .map_err(|error| format!("could not read the credential at {credential_path}: {error}"))?;
+
+    // RENEW BEFORE ASKING, not after being refused. An expired subscription token answers
+    // 401, the catalog records "degraded", and the gateway offers zero models -- with
+    // nothing placeable, no turn ever runs to renew the token, so the install cannot
+    // recover on its own. Renewing here is what breaks that: this verb is the reader that
+    // would take the 401, and it is also the writer of this file's shape.
+    //
+    // Best-effort by construction. A renewal that fails must not fail the probe: the stored
+    // token may still be good (a clock skew, a provider hiccup), and the honest outcome of
+    // asking with it is the provider's own answer rather than ours.
+    let raw = match renewed(provider, kind, &raw, credential_path) {
+        Ok(Some(fresh)) => fresh,
+        Ok(None) | Err(_) => raw,
+    };
 
     let header = authorization(provider, kind, &raw)?;
 
@@ -74,6 +89,75 @@ pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
         }
         Err(error) => Err(format!("catalog request failed: {error}")),
     }
+}
+
+/// `Some(fresh_json)` when the stored credential was spent and has been renewed on disk.
+///
+/// Only a SUBSCRIPTION can be renewed: an api key is a bare secret with no expiry and no
+/// grant behind it, so it is never touched here.
+fn renewed(
+    provider: &str,
+    kind: &str,
+    raw: &str,
+    credential_path: &str,
+) -> Result<Option<String>, String> {
+    if (provider, kind) != ("anthropic", "subscription") {
+        return Ok(None);
+    }
+
+    if !anthropic_oauth::is_expired(raw, now_ms()) {
+        return Ok(None);
+    }
+
+    let credential = anthropic_oauth::refresh(raw)?;
+    let json = anthropic_oauth::credentials_json(&credential);
+    write_credential(credential_path, &json)?;
+    Ok(Some(json))
+}
+
+/// Replace the credential without ever leaving a partial one behind.
+///
+/// Write-then-rename because the alternative is truncating the only copy of a credential and
+/// then failing to fill it: Claude Code reads this same file, and a half-written record is
+/// not a degraded login but a destroyed one. The temporary lands in the same directory so the
+/// rename stays on one filesystem, and it is created 0600 -- a credential must never exist,
+/// even for an instant, at the default umask.
+fn write_credential(credential_path: &str, json: &str) -> Result<(), String> {
+    let path = std::path::Path::new(credential_path);
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let temporary = directory.join(format!(
+        ".{}.renewing",
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "credentials".to_owned())
+    ));
+
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("could not stage the renewed credential: {error}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|error| format!("could not write the renewed credential: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("could not flush the renewed credential: {error}"))?;
+    }
+
+    std::fs::rename(&temporary, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("could not install the renewed credential: {error}")
+    })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Body, newline, status -- the shape the gateway's splitter reads.
@@ -119,7 +203,8 @@ fn authorization(provider: &str, kind: &str, raw: &str) -> Result<Vec<(String, S
 mod tests {
     use super::*;
 
-    const RECORD: &str = r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"MUST-NOT-LEAK"}}"#;
+    const RECORD: &str =
+        r#"{"claudeAiOauth":{"accessToken":"tok","refreshToken":"MUST-NOT-LEAK"}}"#;
 
     /// The whole point: a subscription sends the access token, and the refresh token stays
     /// on disk. Sending the record whole is what a naive reader does, and it both fails
@@ -180,7 +265,115 @@ mod tests {
     /// tell a 401 from a host it could not reach, and a nonzero exit collapses those.
     #[test]
     fn an_http_refusal_still_renders_a_parseable_trailer() {
-        assert_eq!(rendered("{\"error\":\"nope\"}", 401), "{\"error\":\"nope\"}\n401\n");
+        assert_eq!(
+            rendered("{\"error\":\"nope\"}", 401),
+            "{\"error\":\"nope\"}\n401\n"
+        );
+    }
+
+    /// An api key has no expiry and no grant behind it, so renewal must never touch it.
+    /// Reaching the refresh path with one would send a bare secret to a token endpoint.
+    #[test]
+    fn an_api_key_is_never_renewed() {
+        let temporary = std::env::temp_dir().join("tb-renew-apikey");
+        assert_eq!(
+            renewed(
+                "anthropic",
+                "api_key",
+                "sk-ant-x",
+                temporary.to_str().unwrap()
+            ),
+            Ok(None)
+        );
+        assert!(!temporary.exists(), "an api key path must not be written");
+    }
+
+    /// A LIVE subscription is left alone. Renewing a good token on every probe would
+    /// rotate the credential constantly and turn a read into a write.
+    #[test]
+    fn a_live_subscription_is_left_alone() {
+        let live = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{}}}}}"#,
+            now_ms() + 3_600_000
+        );
+        let temporary = std::env::temp_dir().join("tb-renew-live");
+        assert_eq!(
+            renewed(
+                "anthropic",
+                "subscription",
+                &live,
+                temporary.to_str().unwrap()
+            ),
+            Ok(None)
+        );
+    }
+
+    /// The expiry question, both sides of the boundary. A token inside the skew window is
+    /// already spent: it can expire between this check and the request it authorizes, and
+    /// the caller cannot tell that from a revoked credential.
+    #[test]
+    fn expiry_is_judged_with_a_skew_so_a_token_cannot_lapse_mid_request() {
+        let at = |expires_at: i64| {
+            format!(r#"{{"claudeAiOauth":{{"accessToken":"a","expiresAt":{expires_at}}}}}"#)
+        };
+        let now = 1_000_000_000_000;
+
+        assert!(
+            anthropic_oauth::is_expired(&at(now - 1), now),
+            "past expiry"
+        );
+        assert!(
+            anthropic_oauth::is_expired(&at(now + 30_000), now),
+            "inside the skew window is spent, not live"
+        );
+        assert!(!anthropic_oauth::is_expired(&at(now + 3_600_000), now));
+    }
+
+    /// A record with no expiry is NOT treated as expired. Guessing here would refresh
+    /// against a token we never parsed; `access_token` is what refuses a malformed record,
+    /// and it names it.
+    #[test]
+    fn a_record_without_an_expiry_is_not_guessed_to_be_expired() {
+        assert!(!anthropic_oauth::is_expired(
+            r#"{"claudeAiOauth":{"accessToken":"a"}}"#,
+            0
+        ));
+        assert!(!anthropic_oauth::is_expired("not json", 0));
+    }
+
+    /// The renewed credential must land whole or not at all. Claude Code reads this same
+    /// file: a half-written record is not a degraded login, it is a destroyed one.
+    #[test]
+    fn a_renewed_credential_is_installed_whole_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join("tb-renew-write");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(".credentials.json");
+        std::fs::write(&path, "OLD").unwrap();
+
+        write_credential(
+            path.to_str().unwrap(),
+            r#"{"claudeAiOauth":{"accessToken":"new"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"claudeAiOauth":{"accessToken":"new"}}"#
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a credential must never sit at the default umask"
+        );
+        assert!(
+            std::fs::read_dir(&directory).unwrap().count() == 1,
+            "the staging file must not survive the rename"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
