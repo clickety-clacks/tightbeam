@@ -4,6 +4,29 @@ defmodule Tightbeam.HarnessProcessTest do
   alias Tightbeam.{AdapterCoordinator, DB, EventLog, HarnessProcess}
   alias Tightbeam.HarnessProcessCensus
 
+  # A BARE NAME MUST RESOLVE. `Port.open({:spawn_executable, name})` never searches PATH --
+  # it raises `:enoent` for anything that is not a real path. Call sites pass "ssh", so every
+  # remote identity read and every remote `harness-group` failed BEFORE it was attempted, and
+  # the rescue dressed it as exit 127 with an Erlang message -- which reads as the SATELLITE
+  # refusing a command that never left the gateway. The suite was green with that bug: nothing
+  # reached this code without a real ssh, so nothing could fail.
+  test "a bare executable name is resolved to a path rather than handed over unresolved" do
+    assert {:ok, path} = HarnessProcess.resolve_executable_for_test("sh")
+    assert String.starts_with?(path, "/"), "must resolve to a real path, got: #{path}"
+    assert File.exists?(path)
+  end
+
+  # An absolute path is taken as given: a satellite's own CLI lives at a path that is NOT on
+  # this gateway's PATH, so resolving it through `find_executable` would reject it.
+  test "an absolute path is taken as given, not looked up on PATH" do
+    assert {:ok, "/bin/sh"} = HarnessProcess.resolve_executable_for_test("/bin/sh")
+    assert :error = HarnessProcess.resolve_executable_for_test("/nonexistent/tb-probe")
+  end
+
+  test "an unresolvable name is refused rather than raised on" do
+    assert :error = HarnessProcess.resolve_executable_for_test("tightbeam-no-such-binary")
+  end
+
   @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
   @fake_adapter ~S"""
   const rl = require("node:readline").createInterface({ input: process.stdin });

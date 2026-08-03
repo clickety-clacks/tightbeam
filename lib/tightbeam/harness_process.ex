@@ -558,18 +558,53 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp bounded_command(executable, args, timeout_ms) do
-    port =
-      Port.open({:spawn_executable, executable}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        :hide,
-        {:args, args}
-      ])
+    # `:spawn_executable` NEVER searches PATH -- it wants a real path and raises
+    # `:enoent` for a bare name. Callers pass "ssh", so every remote identity read and
+    # every remote `harness-group` failed before it was attempted, and the rescue below
+    # dressed it as exit 127 with an Erlang message: it read as the SATELLITE refusing a
+    # command that had in fact never left this machine. Resolving here keeps every call
+    # site able to name its executable the way an operator would.
+    case resolve_executable(executable) do
+      {:ok, path} ->
+        port =
+          Port.open({:spawn_executable, path}, [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            :hide,
+            {:args, args}
+          ])
 
-    await_command(port, [], deadline(timeout_ms))
+        await_command(port, [], deadline(timeout_ms))
+
+      :error ->
+        # Named as OURS, not as the remote's. The old shape blamed the far end.
+        {"#{executable} is not on this gateway's PATH", 127}
+    end
   rescue
     error -> {Exception.message(error), 127}
+  end
+
+  @doc false
+  # Test seam. `bounded_command/3` is reachable only behind a real ssh or a real satellite
+  # CLI, so the rule it depends on -- that a bare name is resolved rather than handed to a
+  # spawner that cannot resolve it -- had no way to be proven. That is why the bug survived:
+  # the suite was green with it.
+  def resolve_executable_for_test(executable), do: resolve_executable(executable)
+
+  defp resolve_executable(executable) do
+    cond do
+      # An absolute path the caller already resolved (a satellite's own CLI, say) is used
+      # as given -- `find_executable` would reject it if it is not on PATH.
+      String.contains?(executable, "/") ->
+        if File.exists?(executable), do: {:ok, executable}, else: :error
+
+      path = System.find_executable(executable) ->
+        {:ok, path}
+
+      true ->
+        :error
+    end
   end
 
   defp await_command(port, output, deadline) do
