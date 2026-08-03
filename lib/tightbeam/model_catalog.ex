@@ -22,7 +22,7 @@ defmodule Tightbeam.ModelCatalog do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model, Placement}
+  alias Tightbeam.{Harness, Model, Placement, Unroutable}
 
   @default_ttl_ms :timer.minutes(15)
 
@@ -80,21 +80,6 @@ defmodule Tightbeam.ModelCatalog do
   end
 
   @doc """
-  Check membership on a host with the health of the inventory used.
-
-  A selection is offered when the host lists that family and context AND the
-  effort matches what the entry offers: an entry with effort tiers requires
-  one, an entry with none refuses one.
-  """
-  @spec member?(String.t(), String.t(), Model.t(), GenServer.server()) ::
-          %{present?: boolean(), health: health()}
-  def member?(host, harness, %Model{} = model, server \\ __MODULE__)
-      when is_binary(host) and is_binary(harness) do
-    {entry, health} = entry(host, harness, model, server)
-    %{present?: not is_nil(entry) and offers_effort?(entry, model.effort), health: health}
-  end
-
-  @doc """
   Return the catalog entry for a selection's family and context on a host, and
   the inventory health used. The effort is not consulted — the entry is what
   says which efforts exist.
@@ -105,6 +90,161 @@ defmodule Tightbeam.ModelCatalog do
       when is_binary(host) and is_binary(harness) do
     {entries, health} = get(host, harness, server)
     {Enum.find(entries, &names_same_model?(&1, model)), health}
+  end
+
+  @typedoc "A routed selection: which harness runs it, on whose grant, and the entry that says so."
+  @type routed :: %{harness: String.t(), provider: String.t(), entry: entry()}
+
+  @doc """
+  THE ONE ANSWER to "can this selection be routed on this host, and if not why".
+
+  Routability is a question about the WHOLE fleet on a host — one harness tiering
+  a model says nothing while another offers it untiered — so this gathers every
+  fresh entry naming the model BEFORE anything is refused. A second gate deciding
+  the same thing from a narrower view is what refused a valid untiered ruling on
+  the strength of the first tiered entry it happened to find.
+
+  This is a READ of the already-cached catalog. It starts nothing, waits on
+  nothing, and does no provider I/O, so it can sit on the prompt path.
+  """
+  @spec route(String.t(), Model.t(), GenServer.server()) ::
+          {:ok, routed()} | {:error, Unroutable.t()}
+  def route(host, %Model{} = selection, server \\ __MODULE__) when is_binary(host) do
+    answers = Enum.map(harness_names(), &{&1, route(host, &1, selection, server)})
+    routable = for {_harness, {:ok, routed}} <- answers, do: routed
+
+    case routable do
+      [routed] -> {:ok, routed}
+      [] -> {:error, fold_refusals(host, selection, answers)}
+      _many -> {:error, ambiguous(host, selection, answers)}
+    end
+  end
+
+  @doc """
+  The same answer for ONE harness: what that harness's catalog on that host says
+  about this selection. `route/2` is a fold over this — one derivation, two
+  quantifiers.
+
+  Only a FRESH inventory can route. A stale one is not evidence that a model is
+  absent, it is evidence of nothing, so it refuses as `:no_catalog` rather than
+  implying the fleet does not have the model.
+  """
+  @spec route(String.t(), String.t(), Model.t(), GenServer.server()) ::
+          {:ok, routed()} | {:error, Unroutable.t()}
+  def route(host, harness, %Model{} = selection, server)
+      when is_binary(host) and is_binary(harness) do
+    {entries, health} = get(host, harness, server)
+    entry = Enum.find(entries, &names_same_model?(&1, selection))
+
+    refuse = fn cause, offered ->
+      {:error,
+       %Unroutable{
+         cause: cause,
+         host: host,
+         harness: harness,
+         selection: selection,
+         health: [{harness, health}],
+         offered: offered
+       }}
+    end
+
+    cond do
+      health != :fresh ->
+        refuse.(:no_catalog, [])
+
+      is_nil(entry) ->
+        refuse.(:family_absent, offers(harness, entries))
+
+      offers_effort?(entry, selection.effort) ->
+        {:ok, %{harness: harness, provider: Atom.to_string(entry.provider), entry: entry}}
+
+      is_nil(selection.effort) ->
+        refuse.(:needs_effort, offers(harness, [entry]))
+
+      true ->
+        refuse.(:effort_not_offered, offers(harness, [entry]))
+    end
+  end
+
+  # Which refusal the fleet gives when nothing routed. A cause that names the
+  # model as PRESENT wins: one harness having it and only tiering it wrong is
+  # the true story, and "not in any inventory" would be a lie about a model the
+  # reader can see in the catalog.
+  defp fold_refusals(host, selection, answers) do
+    refusals = for {_harness, {:error, unroutable}} <- answers, do: unroutable
+    health = Enum.flat_map(refusals, & &1.health)
+    named = Enum.filter(refusals, &(&1.cause in [:needs_effort, :effort_not_offered]))
+
+    {cause, offered} =
+      cond do
+        # Named refusals cannot disagree about WHICH effort cause they are:
+        # `route/3` decides that from the selection, which is the same on every
+        # harness. So folding them is a union of what they offer, not a vote.
+        named != [] ->
+          {if(is_nil(selection.effort), do: :needs_effort, else: :effort_not_offered),
+           Enum.flat_map(named, & &1.offered)}
+
+        Enum.all?(refusals, &(&1.cause == :no_catalog)) ->
+          {:no_catalog, []}
+
+        true ->
+          {:family_absent, Enum.flat_map(refusals, & &1.offered)}
+      end
+
+    %Unroutable{
+      cause: cause,
+      host: host,
+      harness: nil,
+      selection: selection,
+      health: health,
+      offered: offered
+    }
+  end
+
+  defp ambiguous(host, selection, answers) do
+    %Unroutable{
+      cause: :ambiguous,
+      host: host,
+      harness: nil,
+      selection: selection,
+      health: consulted_health(answers),
+      offered:
+        for(
+          {_harness, {:ok, routed}} <- answers,
+          do: %{harness: routed.harness, entry: routed.entry}
+        )
+    }
+  end
+
+  # A routed answer is fresh by construction; a refused one carries the health it
+  # was refused on.
+  defp consulted_health(answers) do
+    Enum.flat_map(answers, fn
+      {harness, {:ok, _routed}} -> [{harness, :fresh}]
+      {_harness, {:error, unroutable}} -> unroutable.health
+    end)
+  end
+
+  defp offers(harness, entries), do: Enum.map(entries, &%{harness: harness, entry: &1})
+
+  @doc """
+  A catalog entry as prose, for a refusal that has to say what IS available.
+  Harness-agnostic, and for claude it reflects the selectable filter rather than
+  the raw API list.
+  """
+  @spec describe_entry(entry()) :: String.t()
+  def describe_entry(entry) do
+    qualifiers =
+      [
+        entry.context && "context #{entry.context}",
+        entry.efforts != [] && "efforts: #{Enum.join(entry.efforts, "|")}"
+      ]
+      |> Enum.filter(&is_binary/1)
+
+    case qualifiers do
+      [] -> entry.family
+      parts -> "#{entry.family} (#{Enum.join(parts, ", ")})"
+    end
   end
 
   @doc "Whether a catalog entry names the same vendor model as a selection."

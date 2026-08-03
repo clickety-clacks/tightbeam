@@ -30,7 +30,7 @@ defmodule Tightbeam.Readiness do
   thing it names.
   """
 
-  alias Tightbeam.{Harness, Model, ModelCatalog, Placement}
+  alias Tightbeam.{Harness, Model, ModelCatalog, Placement, Unroutable}
 
   @type harness_row :: %{
           host: String.t(),
@@ -38,7 +38,7 @@ defmodule Tightbeam.Readiness do
           harness: String.t(),
           adapter: :present | {:missing, String.t()} | {:unknown, atom()},
           credential: :live | {:absent, atom()} | {:unknown, term()} | {:degraded, term()},
-          model: :selectable | {:absent, String.t()} | :unknown,
+          model: :selectable | :unset | {:unroutable, Unroutable.t()} | :unknown,
           runnable?: boolean()
         }
 
@@ -132,7 +132,7 @@ defmodule Tightbeam.Readiness do
 
     adapter = adapter_state(module, local?, config)
     credential = credential_state(entries, health)
-    model = model_state(entries, credential, config)
+    model = model_state(host, wire, credential, config, catalog)
 
     %{
       host: host,
@@ -197,25 +197,26 @@ defmodule Tightbeam.Readiness do
   defp classify(reason), do: {:degraded, reason}
 
   # Selectability is only meaningful once the catalog is real; with no credential
-  # the empty inventory says nothing about the model.
-  defp model_state(_entries, credential, _config) when credential != :live, do: :unknown
+  # the empty inventory says nothing about the model. This short-circuit is also
+  # where the not-yet-derived policy lives: a catalog that has not landed leaves
+  # the CREDENTIAL unknown, so the model row is unknown too and boot asserts
+  # nothing about either.
+  defp model_state(_host, _harness, credential, _config, _catalog) when credential != :live,
+    do: :unknown
 
-  defp model_state(entries, _credential, config) do
-    model = Map.get(config, :default_model)
+  # Asked of the one routability owner rather than derived here. Boot used to
+  # decide this itself, with a narrower rule that could not tell "no such model"
+  # from "model present, no tier named" — and reported the second as the first.
+  defp model_state(host, harness, _credential, config, catalog) do
+    case Map.get(config, :default_model) do
+      %Model{} = model ->
+        case ModelCatalog.route(host, harness, model, catalog) do
+          {:ok, _routed} -> :selectable
+          {:error, unroutable} -> {:unroutable, unroutable}
+        end
 
-    cond do
-      not match?(%Model{}, model) ->
-        {:absent, "(unset)"}
-
-      Enum.any?(
-        entries,
-        &(ModelCatalog.names_same_model?(&1, model) and
-            ModelCatalog.offers_effort?(&1, model.effort))
-      ) ->
-        :selectable
-
-      true ->
-        {:absent, Model.describe(model)}
+      _ ->
+        :unset
     end
   end
 
@@ -347,14 +348,28 @@ defmodule Tightbeam.Readiness do
   defp model_line(%{model: :selectable}), do: nil
   defp model_line(%{model: :unknown}), do: nil
 
-  defp model_line(%{harness: wire, model: {:absent, "(unset)"}}) do
+  defp model_line(%{harness: wire, model: :unset}) do
     "no default model set — set TIGHTBEAM_DEFAULT_MODEL to a live #{wire} model " <>
       "and TIGHTBEAM_DEFAULT_EFFORT to one of its levels (see mix tightbeam.catalog.diff)"
   end
 
-  defp model_line(%{harness: wire, host: host, model: {:absent, model}}) do
-    "default model #{model} is not in #{wire}'s live catalog on #{host} — set " <>
-      "TIGHTBEAM_DEFAULT_MODEL/_EFFORT to something that host offers " <>
+  # The FACT is the routability owner's; boot no longer derives a narrower one of
+  # its own. The REMEDY is boot's, because it is the environment that sets this
+  # default — and a tier gap is fixed by naming a tier, not by re-picking a model
+  # that was never the problem.
+  defp model_line(%{model: {:unroutable, unroutable}}) do
+    "default model " <>
+      Unroutable.message(unroutable) <> " — " <> default_model_remedy(unroutable)
+  end
+
+  defp default_model_remedy(%Unroutable{cause: cause})
+       when cause in [:needs_effort, :effort_not_offered] do
+    "set TIGHTBEAM_DEFAULT_EFFORT to one of the tiers it offers " <>
+      "(see mix tightbeam.catalog.diff)"
+  end
+
+  defp default_model_remedy(_unroutable) do
+    "set TIGHTBEAM_DEFAULT_MODEL/_EFFORT to something that host offers " <>
       "(see mix tightbeam.catalog.diff)"
   end
 

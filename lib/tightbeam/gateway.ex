@@ -89,6 +89,7 @@ defmodule Tightbeam.Gateway do
     Spinup,
     SubagentMarkers,
     Supervision,
+    Unroutable,
     Wakes,
     WorkItems,
     WorkState
@@ -1297,7 +1298,7 @@ defmodule Tightbeam.Gateway do
   # RESOLUTION IS DELIBERATELY LENIENT: an id it cannot find passes through as
   # if it were a family, and NOTHING here refuses it. That is safe only because
   # resolve-then-validate is ONE PIPELINE — every caller hands the result to
-  # `validate_catalog_model/5`, which is where an unknown selection is refused
+  # `validate_catalog_model/4`, which is where an unknown selection is refused
   # by name against the host's live catalog. The gate lives there, once, at the
   # boundary that knows the host. A future caller that resolves without
   # validating reintroduces silent acceptance of an unknown model.
@@ -1440,19 +1441,6 @@ defmodule Tightbeam.Gateway do
   # A catalog entry for a reader who has to pick one — an operator reading a
   # refusal, an adjudicator reading a brief. Fields are named, because what the
   # reader must produce next is flags, not a packed string.
-  defp describe_entry(entry) do
-    qualifiers =
-      [
-        entry.context && "context #{entry.context}",
-        entry.efforts != [] && "efforts: #{Enum.join(entry.efforts, "|")}"
-      ]
-      |> Enum.filter(&is_binary/1)
-
-    case qualifiers do
-      [] -> entry.family
-      parts -> "#{entry.family} (#{Enum.join(parts, ", ")})"
-    end
-  end
 
   # Which KIND of credential this session's turns actually run on — an API key or
   # a subscription. A fact about {the session's host, its harness's provider},
@@ -1803,7 +1791,7 @@ defmodule Tightbeam.Gateway do
     Map.new(Harness.all(), fn module ->
       {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
       {module.wire_name(),
-       %{health: inspect(health), models: Enum.map(models, &describe_entry/1)}}
+       %{health: inspect(health), models: Enum.map(models, &ModelCatalog.describe_entry/1)}}
     end)
   end
 
@@ -3269,7 +3257,7 @@ defmodule Tightbeam.Gateway do
     # Placement resolved the host FIRST, so the ref is judged against the account
     # that will actually run the turn (#88) — not the gateway's.
     with :ok <- validate_credential(config, harness_string, host),
-         :ok <- validate_catalog_model(config, host, harness_string, model, from_default?(p)),
+         {:ok, routed} <- validate_catalog_model(host, harness_string, model, from_default?(p)),
          :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
       input = %{
         display_name: p.display_name,
@@ -3284,7 +3272,7 @@ defmodule Tightbeam.Gateway do
         identity_name: identity_name,
         host: host,
         harness: harness_string,
-        provider: catalog_provider!(host, harness_string, model),
+        provider: routed.provider,
         model: model
       }
 
@@ -3411,9 +3399,8 @@ defmodule Tightbeam.Gateway do
               )
 
             with :ok <- validate_credential(config, harness, session.host),
-                 :ok <-
+                 {:ok, routed} <-
                    validate_catalog_model(
-                     config,
                      session.host,
                      harness,
                      model,
@@ -3438,7 +3425,7 @@ defmodule Tightbeam.Gateway do
                 db,
                 call.session_key,
                 harness,
-                catalog_provider!(session.host, harness, model),
+                routed.provider,
                 model
               )
 
@@ -3657,9 +3644,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp apply_model_change(config, db, _call, session, new_ref) do
-    with :ok <- validate_catalog_model(config, session.host, session.harness, new_ref, false),
-         {%{provider: provider}, _health} <-
-           ModelCatalog.entry(session.host, session.harness, new_ref, ModelCatalog) do
+    with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
       result =
         run_session_mutation(session.session_key, fn ->
           apply_tuned_model(
@@ -3667,7 +3652,7 @@ defmodule Tightbeam.Gateway do
             db,
             session,
             new_ref,
-            Atom.to_string(provider)
+            routed.provider
           )
         end)
 
@@ -3812,94 +3797,31 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # Every refusal names the harness, the HOST that owns the catalog, and the
-  # repair ON THAT HOST. The catalog belongs to the account that will run the
-  # turn, so sending an operator to the gateway to fix a satellite's grant — as
-  # this did before per-host catalogs — sent them to the wrong machine.
-  defp validate_catalog_model(config, host, harness, model, configured_default?) do
-    case match?(%Model{}, model) && ModelCatalog.member?(host, harness, model) do
-      %{present?: true, health: :fresh} ->
-        :ok
-
-      %{health: :fresh} ->
+  # A RELAY, not a second opinion. `ModelCatalog.route/3` owns which selections
+  # are routable and why, so every refusal here names the harness, the HOST that
+  # owns the catalog, and the repair on that host — including the lessons this
+  # copy used to hold alone (the client_version filter) and the one it used to
+  # get wrong (a missing tier reported as a missing model).
+  #
+  # It returns the ROUTED answer, so its callers no longer look the entry up a
+  # second time to learn the provider.
+  defp validate_catalog_model(host, harness, model, configured_default?) do
+    with %Model{} <- model,
+         {:ok, routed} <- ModelCatalog.route(host, harness, model, ModelCatalog) do
+      {:ok, routed}
+    else
+      {:error, %Unroutable{} = unroutable} ->
         warn_dead_default(host, harness, model, configured_default?)
+        {:error, routing_error(unroutable)}
 
-        {:error,
-         %{
-           code: "model_unavailable",
-           message:
-             "model #{inspect(Model.describe(model))} is not offered by #{harness} on host #{host}" <>
-               offered_models_hint(host, harness)
-         }}
-
-      %{health: {:unavailable, {:needs_onboarding, reason}}} ->
-        warn_dead_default(host, harness, model, configured_default?)
-        provider = Harness.parse!(harness).credential_provider()
-
-        message =
-          if reason == :missing do
-            "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: " <>
-              missing_credential_message(config, provider, harness, host)
-          else
-            "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: no " <>
-              "#{harness} model catalog there, because #{provider} has no usable credential " <>
-              "on #{host} (#{inspect(reason)}). A catalog is derived on the host that runs " <>
-              "the turn, so this is #{host}'s grant to fix; run tightbeam onboard " <>
-              "#{provider} on #{host}"
-          end
-
-        {:error,
-         %{
-           code: "catalog_unavailable",
-           message: message
-         }}
-
-      # The codex models endpoint filters by the caller's client_version and says
-      # nothing about it: too old a binary and every model is dropped, with a 200.
-      # Blaming the account here would send the operator to re-onboard a grant
-      # that was never the problem.
-      %{health: {:unavailable, {:empty_catalog_for_client_version, version}}} ->
-        warn_dead_default(host, harness, model, configured_default?)
-
-        {:error,
-         %{
-           code: "catalog_unavailable",
-           message:
-             "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: the " <>
-               "provider returned an EMPTY model list for client_version #{inspect(version)}, " <>
-               "which is the #{harness} binary's own version on #{host}. The credential is " <>
-               "not implicated; upgrade #{harness} on #{host}"
-         }}
-
-      %{health: health} ->
-        warn_dead_default(host, harness, model, configured_default?)
-
-        {:error,
-         %{
-           code: "catalog_unavailable",
-           message:
-             "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: " <>
-               "#{inspect(health)}"
-         }}
-
-      false ->
+      _not_a_model ->
         warn_dead_default(host, harness, model, configured_default?)
         {:error, %{code: "model_unavailable", message: "model must be specified"}}
     end
   end
 
-  # A refusal that names only the rejected value makes the operator guess. The
-  # catalog is already in hand, so say what IS offered — harness-agnostic, and for
-  # claude it reflects the selectable filter rather than the raw API list.
-  defp offered_models_hint(host, harness) do
-    case ModelCatalog.get(host, harness, ModelCatalog) do
-      {[_ | _] = entries, _health} ->
-        "; offered: " <>
-          (entries |> Enum.map(&describe_entry/1) |> Enum.sort() |> Enum.join(", "))
-
-      _ ->
-        ""
-    end
+  defp routing_error(%Unroutable{} = unroutable) do
+    %{code: Unroutable.code(unroutable), message: Unroutable.message(unroutable)}
   end
 
   defp validate_credential(config, harness, machine) do
@@ -4665,7 +4587,7 @@ defmodule Tightbeam.Gateway do
     session = Org.get(db, episode.session_key)
     ruled = Model.from_params(call.params)
 
-    with {:ok, harness, provider} <- harness_for_ref(session.host, ruled) do
+    with {:ok, %{harness: harness, provider: provider}} <- ModelCatalog.route(session.host, ruled) do
       if harness != session.harness do
         %{
           code: "cross_harness_requires_respawn",
@@ -4690,7 +4612,7 @@ defmodule Tightbeam.Gateway do
         end
       end
     else
-      {:error, error} -> error
+      {:error, unroutable} -> routing_error(unroutable)
     end
   end
 
@@ -4874,7 +4796,7 @@ defmodule Tightbeam.Gateway do
     old = Org.get(db, episode.session_key)
     ruled = Model.from_params(call.params)
 
-    with {:ok, harness, provider} <- harness_for_ref(old.host, ruled) do
+    with {:ok, %{harness: harness, provider: provider}} <- ModelCatalog.route(old.host, ruled) do
       new_session_key = "agent:" <> Tightbeam.Id.uuid4()
 
       {:ok, transferred_rows} =
@@ -5084,7 +5006,7 @@ defmodule Tightbeam.Gateway do
           }
       end
     else
-      {:error, error} -> error
+      {:error, unroutable} -> routing_error(unroutable)
     end
   end
 
@@ -5452,69 +5374,6 @@ defmodule Tightbeam.Gateway do
     count > 0
   end
 
-  # Matches the COMPLETE selection, effort included. Resolving on family and
-  # context alone would let a ruling respawn a session at an effort the model
-  # does not offer, and would call two harnesses ambiguous when only one of
-  # them offers the level asked for.
-  # THE ONE ANSWER to "can this selection be routed, and if not why". Routability
-  # is a question about the WHOLE fleet — one harness tiering a model says
-  # nothing while another offers it untiered — so every entry naming the model
-  # is gathered BEFORE anything is refused. A second gate in front of this,
-  # deciding the same thing from a narrower view, is what refused a valid
-  # untiered ruling on the strength of the first tiered entry it happened to
-  # find. The refusal belongs here, on the complete answer.
-  defp harness_for_ref(host, %Model{} = ref) do
-    naming_model =
-      Enum.flat_map(Harness.all(), fn module ->
-        case ModelCatalog.entry(host, module.wire_name(), ref) do
-          {%{} = entry, :fresh} -> [{module, entry}]
-          _ -> []
-        end
-      end)
-
-    case Enum.filter(naming_model, fn {_module, entry} ->
-           ModelCatalog.offers_effort?(entry, ref.effort)
-         end) do
-      [{module, entry}] ->
-        {:ok, module.wire_name(), Atom.to_string(entry.provider)}
-
-      [] ->
-        {:error, unroutable(ref, naming_model)}
-
-      _ ->
-        {:error,
-         %{code: "ambiguous_ref", message: "model appears in multiple harness inventories"}}
-    end
-  end
-
-  # Each cause named as itself. Reporting "not in inventory" for a model that is
-  # plainly there, because only its TIER was wrong, sends the reader after the
-  # wrong thing.
-  defp unroutable(_ref, []),
-    do: %{code: "model_unavailable", message: "model is not in a fresh harness inventory"}
-
-  defp unroutable(%Model{effort: nil} = ref, naming_model) do
-    %{
-      code: "invalid",
-      message:
-        "#{Model.to_ref(ref)} has effort tiers on " <>
-          "#{Enum.map_join(naming_model, ", ", fn {module, entry} -> "#{module.wire_name()} (#{Enum.join(entry.efforts, "|")})" end)}" <>
-          "; the ruling must name one with --effort"
-    }
-  end
-
-  defp unroutable(%Model{} = ref, naming_model) do
-    %{
-      code: "model_unavailable",
-      message:
-        "#{Model.to_ref(ref)} does not offer effort #{inspect(ref.effort)} on any fresh " <>
-          "harness; offered: " <>
-          Enum.map_join(naming_model, ", ", fn {module, entry} ->
-            "#{module.wire_name()} (#{Enum.join(entry.efforts, "|")})"
-          end)
-    }
-  end
-
   # Says four things and nothing more: the engine changed, from what to what,
   # that earlier history is RETAINED rather than deleted, and that this is
   # expected. `Projection.list_after/5` floors at the barrier — it never deletes
@@ -5536,16 +5395,6 @@ defmodule Tightbeam.Gateway do
 
   defp describe_engine(harness, nil), do: "#{harness}"
   defp describe_engine(harness, model), do: "#{harness} (#{Model.describe(model)})"
-
-  defp catalog_provider!(host, harness, ref) do
-    case ModelCatalog.entry(host, harness, ref) do
-      {%{provider: provider}, _health} ->
-        Atom.to_string(provider)
-
-      {nil, _health} ->
-        raise "catalog entry missing after validation: #{harness}/#{ref} on #{host}"
-    end
-  end
 
   defp commit_host_rearm(_config, _db, _session, _host, 0),
     do: {:error, "holder assignments kept changing while the workspace moved"}

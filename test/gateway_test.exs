@@ -1030,7 +1030,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-opus-5"}
              })
 
-    assert message =~ ~s(model "claude-opus-5" is not offered by claude on host testhost)
+    assert message =~ ~s("claude-opus-5" is not offered by claude on host testhost)
 
     # The hint is the point: naming only the rejection makes the operator guess.
     assert message =~ "offered:"
@@ -2479,7 +2479,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{code: "model_unavailable", message: message} =
              place.("worker", "gateway-only-model", "k-worker-bad")
 
-    assert message =~ ~s(model "gateway-only-model" is not offered by claude on host worker)
+    assert message =~ ~s("gateway-only-model" is not offered by claude on host worker)
     assert message =~ "worker-only-model"
 
     # Symmetrically, on the gateway's own host (session k1) the gateway's ref is
