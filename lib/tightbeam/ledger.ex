@@ -304,13 +304,18 @@ defmodule Tightbeam.Ledger do
   a session created in between would otherwise see its now-claimable turn forced
   to `failed` on the strength of a reading that had already expired. Deciding
   and acting in one statement is what makes that window unrepresentable.
+
+  The seqs come from `RETURNING` for the same reason. Re-reading them afterwards
+  identifies rows by the error string this function itself wrote, so a session
+  aged twice reports its first batch again as newly aged — the statement that
+  did the work is the only thing that knows what it did.
   """
   @spec fail_unclaimable(db(), String.t(), unclaimable()) :: [integer()]
   def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
     {:ok, seqs} =
       DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
+        txn
+        |> Txn.q(
           """
           UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
           WHERE sessionKey = ?1 AND status = 'queued'
@@ -318,26 +323,12 @@ defmodule Tightbeam.Ledger do
               SELECT 1 FROM sessions AS s
               WHERE s.sessionKey = ?1 AND s.state = 'active'
             )
+          RETURNING seq
           """,
           [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
         )
-
-        case Txn.changes(txn) do
-          0 ->
-            []
-
-          _ ->
-            txn
-            |> Txn.q(
-              """
-              SELECT seq FROM turns
-              WHERE sessionKey = ?1 AND status = 'failed' AND error = ?2
-              ORDER BY seq
-              """,
-              [session_key, unclaimable_error(reason)]
-            )
-            |> Enum.map(&hd/1)
-        end
+        |> Enum.map(&hd/1)
+        |> Enum.sort()
       end)
 
     seqs

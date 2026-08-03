@@ -256,6 +256,18 @@ defmodule Tightbeam.LedgerTest do
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
   end
 
+  # Re-review finding. Identifying the aged rows by the error string this
+  # function itself wrote makes a second aging re-report the first batch, so the
+  # lane announces rows it did not touch. Only the statement that did the work
+  # knows what it did.
+  test "aging reports the rows it transitioned, never a previous batch", %{db: db} do
+    first = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+    assert [^first] = Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+
+    second = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+    assert [^second] = Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+  end
+
   # A turn the ledger would refuse today, written the way the pre-guard gateway
   # wrote it — the reproduction for the ORPHANS already in a live database.
   defp insert_orphan_turn(db, session_key) do
