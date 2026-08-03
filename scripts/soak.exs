@@ -118,15 +118,93 @@ defmodule Tightbeam.Soak do
     File.mkdir_p!(Path.join(base_dir, "auth"))
     File.mkdir_p!(Path.join(base_dir, "work"))
 
-    auth_source = Path.join(System.user_home!(), ".tightbeam-beam/auth/claude")
+    # WHICH ORG LENDS ITS CREDENTIAL. This was a hardcoded `~/.tightbeam-beam`, which
+    # rotted silently: that org still holds the pre-model-identity `oauth-token` file,
+    # so the arena booted with a credential this build does not read and every spawn
+    # failed as `placement_denied` — "no credential for anthropic" — rather than as a
+    # stale source. A hardcoded path to someone else's org cannot be kept true by the
+    # code that depends on it.
+    auth_source =
+      System.get_env("TIGHTBEAM_SOAK_AUTH_SOURCE") ||
+        Path.join(System.user_home!(), ".tightbeam-beam/auth/claude")
+
     auth_target = Path.join([base_dir, "auth", "claude"])
 
     unless File.dir?(auth_source) do
-      raise "Claude auth directory not found: #{auth_source}"
+      raise "Claude auth directory not found: #{auth_source} " <>
+              "(set TIGHTBEAM_SOAK_AUTH_SOURCE to an onboarded org's auth/claude)"
     end
 
-    File.ln_s!(auth_source, auth_target)
+    # Name the shape, not just the directory: a source that predates model-identity
+    # has the same layout and fails much later, at the first spawn, blaming placement.
+    unless File.exists?(Path.join(auth_source, ".credentials.json")) do
+      raise "#{auth_source} holds no .credentials.json — it predates the current " <>
+              "credential shape. Point TIGHTBEAM_SOAK_AUTH_SOURCE at a currently " <>
+              "onboarded org, or re-onboard this one."
+    end
+
+    # COPY, NOT SYMLINK. A symlinked store is silently ignored — no catalog, no log
+    # line at all — so every spawn failed as `catalog_unavailable: :not_derived` and
+    # blamed the catalog. Verified on one arena, same boot, symlink vs copy the only
+    # difference: copy derives the catalog and reports READY. The arena is disposable
+    # and same-machine, so copying the credential here crosses no boundary.
+    File.cp_r!(auth_source, auth_target)
+
+    # THE HOME AND THE ADAPTERS TRAVEL WITH THE CREDENTIAL. Claude's catalog is derived
+    # from the installed ACP adapter (its version decides which models are selectable at
+    # all) plus `additionalModelOptionsCache` inside the harness home. The home is built
+    # by `Credentials.reconcile_provider_homes/2` on a credential WRITE, which never
+    # happens here — the arena borrows an already-onboarded credential rather than
+    # onboarding one. Without these the catalog never derives and every spawn fails as
+    # `catalog_unavailable: {:unavailable, :not_derived}`, blaming the catalog for a
+    # missing input. These are the same directories client_e2e provisions; the arena was
+    # carrying one of the four.
+    org_root = Path.dirname(Path.dirname(auth_source))
+
+    for dir <- ~w(homes adapters), File.dir?(Path.join(org_root, dir)) do
+      File.cp_r!(Path.join(org_root, dir), Path.join(base_dir, dir))
+    end
   end
+
+  # `/version` answering means the wire is up, NOT that a turn can be placed: the model
+  # catalog derives asynchronously after boot, so the first spawn raced it and died on
+  #   catalog_unavailable: {:unavailable, :not_derived}
+  # which reads as a broken catalog rather than one that has not arrived yet.
+  #
+  # Retrying the SPAWN is the honest wait — it polls the exact capability required,
+  # where a separate readiness probe would be a second mechanism answering the same
+  # question and could be satisfied while the spawn still fails. `:not_derived` is the
+  # only retried condition; every other refusal is a real answer and is returned at
+  # once, so this cannot mask a genuinely absent model.
+  defp spawn_when_placeable(state, body, deadline) do
+    case dispatch(state, body, 30_000) do
+      {:error, reason, state} = failure ->
+        if String.contains?(to_string(reason), "not_derived") and monotonic_ms() < deadline do
+          Process.sleep(500)
+          spawn_when_placeable(state, body, deadline)
+        else
+          failure
+        end
+
+      other ->
+        other
+    end
+  end
+
+  # WHICH MODEL THE ARENA DRIVES. This was hardcoded `haiku`, a bare SDK alias that the
+  # derived catalog no longer offers — the catalog carries vendor families
+  # (`claude-haiku-4-5-20251001`), so every spawn failed `model_unavailable` naming a
+  # model the operator never chose. A soak is about lifecycle under load, not about
+  # which model runs, so this takes the same env the other tiers use and defaults to a
+  # family rather than an alias.
+  # Default is a TIERED family on purpose: the soak names an effort, and an untiered
+  # entry (`claude-haiku-4-5-20251001`, offered with `efforts: []`) accepts only a
+  # selection with no effort at all. Pairing an effort with it is refused, correctly and
+  # confusingly — "is not offered", listing the model right there in the offered set.
+  defp soak_model,
+    do: System.get_env("TIGHTBEAM_SMOKE_MODEL_CLAUDE") || "claude-sonnet-5"
+
+  defp soak_effort, do: System.get_env("TIGHTBEAM_SMOKE_EFFORT_CLAUDE") || "medium"
 
   defp initial_state(options) do
     now = monotonic_ms()
@@ -169,7 +247,12 @@ defmodule Tightbeam.Soak do
       {~c"TIGHTBEAM_PORT", Integer.to_charlist(state.options.port)},
       {~c"TIGHTBEAM_CWD", String.to_charlist(Path.join(base_dir, "work"))},
       {~c"TIGHTBEAM_DEFAULT_HARNESS", ~c"claude"},
-      {~c"TIGHTBEAM_DEFAULT_MODEL", ~c"haiku"}
+      # BOTH FIELDS. A model and its effort are separate now (model-identity-v1); a
+      # tiered model named without a tier is an incomplete selection, so the arena
+      # booted NOT READY and every spawn failed. The model alone was complete when an
+      # identifier could carry its own suffix, and silently stopped being so.
+      {~c"TIGHTBEAM_DEFAULT_MODEL", String.to_charlist(soak_model())},
+      {~c"TIGHTBEAM_DEFAULT_EFFORT", String.to_charlist(soak_effort())}
     ]
 
     port =
@@ -206,11 +289,12 @@ defmodule Tightbeam.Soak do
           "idempotencyKey" => "soak-session-#{index}",
           "archetype" => "default",
           "harness" => "claude",
-          "model" => "haiku"
+          "model" => soak_model(),
+          "effort" => soak_effort()
         }
       }
 
-      case dispatch(state, body, 30_000) do
+      case spawn_when_placeable(state, body, monotonic_ms() + @recovery_threshold_ms) do
         {:ok, %{"result" => result}, state} ->
           session_key = result["sessionKey"] || get_in(result, ["stream", "sessionKey"])
 
@@ -506,15 +590,18 @@ defmodule Tightbeam.Soak do
     url = "http://127.0.0.1:#{state.options.port}#{path}"
     timeout_s = max(div(timeout_ms, 1000), 1)
 
+    # Unconditional, unlike the bearer: the wire refuses an unversioned caller before it
+    # looks at authentication (42f7bd5), so an unauthenticated probe needs it too.
     args =
       ["-sS", "--max-time", Integer.to_string(timeout_s), "-o", "-", "-w", "\n%{http_code}"] ++
         if(authenticated?, do: ["-H", "Authorization: Bearer #{state.token}"], else: []) ++
-        # Unconditional, unlike the bearer: the wire refuses an unversioned caller before it
-        # looks at authentication (42f7bd5), so an unauthenticated probe needs it too.
         ["-H", "x-tightbeam-cli-version: #{Tightbeam.CliCompatibility.required_version()}"] ++
         case method do
-          :get -> [url]
-          :post -> ["-X", "POST", "-H", "Content-Type: application/json", "-d", JSON.encode!(body), url]
+          :get ->
+            [url]
+
+          :post ->
+            ["-X", "POST", "-H", "Content-Type: application/json", "-d", JSON.encode!(body), url]
         end
 
     case System.cmd("curl", args, stderr_to_stdout: true) do
