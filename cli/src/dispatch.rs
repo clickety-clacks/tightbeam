@@ -16,7 +16,37 @@ pub struct RequestSpec {
 pub struct Endpoint {
     pub base: String,
     pub token: String,
-    pub session_file: Option<PathBuf>,
+    pub origin: Origin,
+}
+
+/// WHERE the endpoint came from, kept because it answers a question its VALUES cannot.
+///
+/// "Is this request aimed at the gateway running on this machine?" was answered by
+/// comparing an endpoint's token to the local one -- so a deliberately remote `--url`
+/// that happened to carry the same token was classified local, and an operator adding a
+/// user to another org got a row inserted into this machine's database instead. Value
+/// equality was never the question. An endpoint is local when it was RESOLVED from this
+/// machine's own provisioning, and that is decided once, where the resolution happens,
+/// and then carried rather than re-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// A `.tightbeam-session` file found walking up from the working directory.
+    Session(PathBuf),
+    /// `TIGHTBEAM_URL` and `TIGHTBEAM_TOKEN` named a gateway outright. Explicit, and
+    /// therefore never this machine's own affair even when the two coincide.
+    Named,
+    /// This machine's provisioned `gateway.json`.
+    Provisioned,
+}
+
+impl Endpoint {
+    /// The session file this endpoint came from, for the callers that report it.
+    pub fn session_file(&self) -> Option<&Path> {
+        match &self.origin {
+            Origin::Session(path) => Some(path),
+            _ => None,
+        }
+    }
 }
 
 fn quoted(value: &str) -> String {
@@ -600,6 +630,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("provider", provider)],
         )),
+        Command::AddUser {
+            identity,
+            user_id,
+            admin,
+        } => Ok(request(
+            identity,
+            "add-user",
+            vec![],
+            vec![
+                string_field("userId", user_id),
+                format!("\"isAdmin\":{admin}"),
+            ],
+        )),
         Command::ConfigGet { identity, setting } => Ok(request(
             identity,
             "config",
@@ -724,7 +767,7 @@ where
         return Ok(Endpoint {
             base,
             token,
-            session_file: None,
+            origin: Origin::Named,
         });
     }
 
@@ -754,7 +797,7 @@ fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
         return Ok(Some(Endpoint {
             base: base.to_owned(),
             token: token.to_owned(),
-            session_file: Some(path),
+            origin: Origin::Session(path),
         }));
     }
 
@@ -809,7 +852,7 @@ fn endpoint_from_gateway_file(path: &Path) -> Result<Endpoint, String> {
     Ok(Endpoint {
         base,
         token,
-        session_file: None,
+        origin: Origin::Provisioned,
     })
 }
 
@@ -922,6 +965,24 @@ pub(crate) fn gateway_request(
         .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
 }
 
+/// LOAD-BEARING WORDING. This sentence is control flow, not just prose.
+///
+/// `ceremonies::cancel_after_begin` matches `contains("onboarding lease expired")` on
+/// whatever a failed cancel dispatch returns, and this is the only thing that produces
+/// that substring on that route. Reword it and the guard stops matching, falls through to
+/// its `_` arm, and the cancel failure silently vanishes from the operator's message. No
+/// test covers the transition, so nothing goes red.
+///
+/// The phrase is doing the job of an error code while looking like an error message.
+/// Several sites across four modules produce it, tests in four modules assert on it (one
+/// of them NEGATIVELY, that a message must not contain it), and this guard is the only
+/// place it changes behaviour. Making it a real variant is a change worth doing and is not
+/// this branch's to make.
+///
+/// Deliberately no count. The first version of this comment carried one, and it was wrong
+/// before it reached review — restated from a message, never recounted against the file.
+/// A tally in a comment is stale the moment someone adds a test; what a reader needs is
+/// that exactly one site branches on it, and that survives.
 fn ceremony_expired() -> String {
     "gateway request refused because the onboarding lease expired".to_owned()
 }
@@ -1004,6 +1065,58 @@ where
             unreachable!("help is handled before dispatch")
         }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
+        Command::AddUser {
+            identity,
+            user_id,
+            admin,
+        } => {
+            // Resolve the requested org before inspecting or mutating local state. An
+            // explicit remote endpoint must not get a user inserted into whichever
+            // empty state.db happens to exist on this machine.
+            let endpoint = discover_endpoint()?;
+            let first_user = first_user_for_target(add_user_target_is_local(&endpoint), || {
+                crate::users::create_first_if_local(&user_id, admin)
+            })?;
+            match first_user {
+                crate::users::FirstUser::Created {
+                    user_id,
+                    is_admin,
+                    created_at,
+                } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "user": {
+                                "userId": user_id,
+                                "isAdmin": is_admin,
+                                "createdAt": created_at
+                            }
+                        }))
+                        .expect("JSON value serializes")
+                    );
+                    Ok(())
+                }
+                crate::users::FirstUser::Dispatch => {
+                    require_session_endpoint(&identity, &endpoint)?;
+                    let request = request(
+                        &identity,
+                        "add-user",
+                        vec![],
+                        vec![
+                            string_field("userId", &user_id),
+                            format!("\"isAdmin\":{admin}"),
+                        ],
+                    );
+                    if let Some(result) = send_request(&endpoint, &request, None)? {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::Onboard {
@@ -1039,8 +1152,35 @@ where
     }
 }
 
+fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
+    add_user_endpoint_matches_local(endpoint, &provisioned())
+}
+
+fn first_user_for_target<F>(local: bool, create: F) -> Result<crate::users::FirstUser, String>
+where
+    F: FnOnce() -> Result<crate::users::FirstUser, String>,
+{
+    if local {
+        create()
+    } else {
+        Ok(crate::users::FirstUser::Dispatch)
+    }
+}
+
+/// The one case that may create a user without asking a gateway: this machine IS the
+/// gateway host, and the request resolved to it because nothing else was named.
+///
+/// Both halves are provenance, not comparison. `Origin::Named` and `Origin::Session` each
+/// say an endpoint was chosen deliberately, and a deliberate choice is honoured as made
+/// even when it resolves to the same address and the same token as the local gateway --
+/// which is precisely the case that used to fall through to a local mutation.
+fn add_user_endpoint_matches_local(endpoint: &Endpoint, provisioned: &Provisioned) -> bool {
+    matches!(provisioned, Provisioned::GatewayHost)
+        && matches!(endpoint.origin, Origin::Provisioned)
+}
+
 fn require_session_endpoint(identity: &Identity, endpoint: &Endpoint) -> Result<(), String> {
-    if matches!(identity, Identity::Session) && endpoint.session_file.is_none() {
+    if matches!(identity, Identity::Session) && endpoint.session_file().is_none() {
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
         return Err(identity_required(&cwd));
     }
@@ -1091,6 +1231,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::KungfuList { identity }
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
+        | Command::AddUser { identity, .. }
         | Command::ConfigGet { identity, .. }
         | Command::ConfigSet { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
@@ -1127,11 +1268,72 @@ mod tests {
     }
 
     #[test]
+    fn add_user_builds_the_ordinary_authenticated_gateway_request() {
+        assert_eq!(
+            body(&["add-user", "guest", "--admin", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"add-user","params":{"userId":"guest","isAdmin":true}}"#
+        );
+    }
+
+    /// The case the value comparison could not see.
+    ///
+    /// `--url` naming a remote gateway that happens to share the local token -- one org's
+    /// token deployed on two hosts, or a satellite pointed back at its own gateway -- was
+    /// classified LOCAL and inserted a user into whatever `state.db` this machine had.
+    /// The comparison that shipped could not distinguish it because there is nothing in
+    /// the values to distinguish; the fixtures below share base AND token deliberately,
+    /// so nothing here can pass by comparing them.
+    #[test]
+    fn an_explicit_remote_add_user_target_cannot_use_the_local_empty_org_exception() {
+        let base = "http://127.0.0.1:11373".to_owned();
+        let token = "tbc_local".to_owned();
+        let provisioned = Endpoint {
+            base: base.clone(),
+            token: token.clone(),
+            origin: Origin::Provisioned,
+        };
+        let named = Endpoint {
+            base: base.clone(),
+            token: token.clone(),
+            origin: Origin::Named,
+        };
+        let session = Endpoint {
+            base,
+            token,
+            origin: Origin::Session(PathBuf::from("/work/.tightbeam-session")),
+        };
+
+        assert!(add_user_endpoint_matches_local(
+            &provisioned,
+            &Provisioned::GatewayHost
+        ));
+        assert!(
+            !add_user_endpoint_matches_local(&named, &Provisioned::GatewayHost),
+            "an endpoint named on the command line is the operator's choice of target, \
+             whatever it resolves to"
+        );
+        assert!(!add_user_endpoint_matches_local(
+            &session,
+            &Provisioned::GatewayHost
+        ));
+        assert!(!add_user_endpoint_matches_local(
+            &provisioned,
+            &Provisioned::Satellite {
+                machine: Some("worker".to_owned())
+            }
+        ));
+        assert_eq!(
+            first_user_for_target(false, || panic!("remote target attempted local mutation")),
+            Ok(crate::users::FirstUser::Dispatch)
+        );
+    }
+
+    #[test]
     fn gateway_request_owns_authentication_and_cli_version_for_every_path() {
         let endpoint = Endpoint {
             base: "http://gateway.example:11373".to_owned(),
             token: "tbc_org".to_owned(),
-            session_file: None,
+            origin: Origin::Provisioned,
         };
 
         for (method, path) in [
@@ -1627,7 +1829,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
                 token: "configured".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
 
@@ -1644,7 +1846,7 @@ mod tests {
             Ok(Endpoint {
                 base: "https://gateway".to_owned(),
                 token: "env-token".to_owned(),
-                session_file: None,
+                origin: Origin::Named,
             })
         );
 
@@ -1669,7 +1871,7 @@ mod tests {
                 Ok(Endpoint {
                     base: "http://127.0.0.1:4321".to_owned(),
                     token: "configured".to_owned(),
-                    session_file: None,
+                    origin: Origin::Provisioned,
                 })
             );
         }
@@ -1683,7 +1885,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
                 token: "configured".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
 
@@ -1705,7 +1907,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:4321".to_owned(),
                 token: "configured".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
 
@@ -1714,7 +1916,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:9876".to_owned(),
                 token: "default".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
         let env = HashMap::from([("TIGHTBEAM_HOME".to_owned(), String::new())]);
@@ -1758,7 +1960,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://gateway.example:11373".to_owned(),
                 token: "tbc_org".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
         assert_eq!(
@@ -1766,7 +1968,7 @@ mod tests {
             Ok(Endpoint {
                 base: "http://127.0.0.1:11373".to_owned(),
                 token: "tbc_org".to_owned(),
-                session_file: None,
+                origin: Origin::Provisioned,
             })
         );
         fs::remove_dir_all(root).unwrap();
@@ -1829,7 +2031,7 @@ mod tests {
                 Ok(Endpoint {
                     base: expected.to_owned(),
                     token: "tbc_org".to_owned(),
-                    session_file: None,
+                    origin: Origin::Provisioned,
                 }),
                 "{name}"
             );
@@ -1879,7 +2081,7 @@ mod tests {
             Ok(Endpoint {
                 base: "https://nearest-session".to_owned(),
                 token: "nearest-token".to_owned(),
-                session_file: Some(ancestor.join("work").join(".tightbeam-session")),
+                origin: Origin::Session(ancestor.join("work").join(".tightbeam-session")),
             })
         );
 
@@ -1911,7 +2113,7 @@ mod tests {
                 Ok(Endpoint {
                     base: "https://session-gateway".to_owned(),
                     token: "tbs_discovered".to_owned(),
-                    session_file: Some(PathBuf::from("/work/.tightbeam-session")),
+                    origin: Origin::Session(PathBuf::from("/work/.tightbeam-session")),
                 })
             },
             |endpoint, request, deadline| {
@@ -1928,7 +2130,7 @@ mod tests {
         let endpoint = Endpoint {
             base: "http://127.0.0.1:1".to_owned(),
             token: "tbc_test".to_owned(),
-            session_file: None,
+            origin: Origin::Provisioned,
         };
         let error = run_with(
             Command::List {
@@ -1946,6 +2148,14 @@ mod tests {
         ));
     }
 
+    /// Serialises the tests that mutate `TIGHTBEAM_MACHINE`.
+    ///
+    /// The environment is process-global and cargo runs tests in threads, so two tests
+    /// setting and restoring the same variable interleave: one restores while the other is
+    /// mid-run, and the loser reads a value it never set. Neither test is wrong on its own,
+    /// which is why this failed only under parallelism and only sometimes.
+    static MACHINE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn onboarding_discovers_once_and_keeps_every_phase_on_that_endpoint() {
         use std::cell::{Cell, RefCell};
@@ -1957,6 +2167,15 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&staging);
         fs::create_dir_all(&staging).unwrap();
+        // The stub codex below is `true`: it exits zero and writes nothing, which is the
+        // shape of a CANCELLED device-code login, and the openai leg now refuses it. This
+        // test is about endpoints rather than credentials, so it stages the credential the
+        // real ceremony would have produced and lets the phases run. Do not delete this as
+        // setup noise -- without it the run cancels and never reaches `finish`.
+        fs::write(staging.join("auth.json"), br#"{"tokens":{}}"#).unwrap();
+        let _env = MACHINE_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior_machine = std::env::var_os("TIGHTBEAM_MACHINE");
         unsafe {
             std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
@@ -1977,7 +2196,7 @@ mod tests {
                 Ok(Endpoint {
                     base: gateway.clone(),
                     token: "tbc_one".to_owned(),
-                    session_file: None,
+                    origin: Origin::Provisioned,
                 })
             },
             |endpoint, request, deadline| {
@@ -1998,7 +2217,15 @@ mod tests {
                         "leaseTtlMs": 60_000
                     })))
                 } else {
-                    Ok(None)
+                    // What the gateway actually answers a finish with
+                    // (gateway.ex:2495). This used to be `Ok(None)`, which the CLI read as
+                    // success -- so this test asserted, and protected, the defect that a
+                    // transport 2xx counts as the gateway confirming an install.
+                    Ok(Some(serde_json::json!({
+                        "provider": "openai",
+                        "credentialKind": "subscription",
+                        "status": "onboarded"
+                    })))
                 }
             },
             |endpoint, deadline| {
@@ -2033,6 +2260,121 @@ mod tests {
         );
     }
 
+    /// A 2xx is the transport saying it arrived, not the gateway saying it installed.
+    ///
+    /// The same mistake as reading a codex exit code as "a credential was produced", one
+    /// layer out. `parse_response` answers `Ok(None)` for a success with no `result`, so
+    /// before this every 2xx reached `Ok(())` and the CLI reported a completed onboarding
+    /// the gateway had never confirmed. The stub here returns exactly that: a finish that
+    /// succeeds at the transport and says nothing.
+    ///
+    /// Today's gateway cannot send it. It is checked because the CLI and the gateway are
+    /// versioned and shipped separately, and the CLI is the half that has to survive
+    /// meeting a version of the other that answers differently.
+    #[test]
+    fn a_finish_the_gateway_never_confirmed_is_refused_and_cancelled() {
+        use std::cell::RefCell;
+
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-onboard-unconfirmed-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("auth.json"), br#"{"tokens":{}}"#).unwrap();
+        let _env = MACHINE_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_machine = std::env::var_os("TIGHTBEAM_MACHINE");
+        unsafe {
+            std::env::set_var("TIGHTBEAM_MACHINE", "fixture-machine");
+        }
+
+        let phases = RefCell::new(Vec::new());
+        let result = run_with(
+            Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "openai".to_owned(),
+                api_key: false,
+            },
+            || {
+                Ok(Endpoint {
+                    base: "https://gateway.test".to_owned(),
+                    token: "tbc_one".to_owned(),
+                    origin: Origin::Provisioned,
+                })
+            },
+            |_, request, _| {
+                let phase = if request.body_json.contains(r#""phase":"begin""#) {
+                    "begin"
+                } else if request.body_json.contains(r#""phase":"finish""#) {
+                    "finish"
+                } else {
+                    "cancel"
+                };
+                phases.borrow_mut().push(phase);
+                match phase {
+                    "begin" => Ok(Some(serde_json::json!({
+                        "stagingPath": staging,
+                        "leaseId": "lease-7",
+                        "leaseTtlMs": 60_000
+                    }))),
+                    // 2xx, no result. The transport succeeded and the gateway said nothing.
+                    _ => Ok(None),
+                }
+            },
+            |_, _| {
+                Ok(Some(crate::harnesses::HarnessCatalog {
+                    harnesses: vec![crate::harnesses::HarnessProjection {
+                        wire_name: "codex".to_owned(),
+                        install_package: "codex-acp".to_owned(),
+                        cli_binary: "true".to_owned(),
+                        process_markers: vec!["codex".to_owned()],
+                    }],
+                }))
+            },
+        );
+
+        match prior_machine {
+            Some(value) => unsafe { std::env::set_var("TIGHTBEAM_MACHINE", value) },
+            None => unsafe { std::env::remove_var("TIGHTBEAM_MACHINE") },
+        }
+        let _ = fs::remove_dir_all(&staging);
+
+        let error = result.unwrap_err();
+        assert!(error.contains("did not confirm"), "{error}");
+        assert!(error.contains("doctor"), "no way forward offered: {error}");
+        assert_eq!(
+            phases.into_inner(),
+            vec!["begin", "finish", "cancel"],
+            "an unconfirmed finish must release the lease rather than leave it open"
+        );
+    }
+
+    /// The one condition, at the seam, without the ceremony around it.
+    #[test]
+    fn only_an_onboarded_status_counts_as_a_finished_onboarding() {
+        use crate::ceremonies::onboarded_outcome;
+
+        let confirmed = serde_json::json!({"provider": "openai", "status": "onboarded"});
+        assert_eq!(onboarded_outcome(Some(confirmed.clone())), Ok(confirmed));
+
+        for unconfirmed in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!({"status": "pending"})),
+            Some(serde_json::json!({"provider": "openai"})),
+        ] {
+            let error = onboarded_outcome(unconfirmed.clone()).unwrap_err();
+            assert!(
+                error.contains("did not confirm"),
+                "{unconfirmed:?} was accepted as a finished onboarding"
+            );
+        }
+    }
+
     #[test]
     fn an_expired_deadline_refuses_gateway_io_as_lease_expiry() {
         use std::time::{Duration, Instant};
@@ -2040,7 +2382,7 @@ mod tests {
         let endpoint = Endpoint {
             base: "http://127.0.0.1:1".to_owned(),
             token: "tbc_test".to_owned(),
-            session_file: None,
+            origin: Origin::Provisioned,
         };
         let request = build_onboard_phase_request(
             &Identity::User("flynn".to_owned()),

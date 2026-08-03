@@ -13,7 +13,7 @@
 # itself, and has no business booting the gateway (or depending on the state of whatever
 # identity repo the operator's own base_dir happens to hold).
 #
-# Requires ~/.tightbeam-beam/auth/claude/oauth-token. Network required — this really
+# Requires ~/.tightbeam-beam/auth/claude/.credentials.json. Network required — this really
 # does hit the npm registry, which is the point.
 
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -124,7 +124,11 @@ File.rm_rf!(control)
 # And a real turn through the adapter that was just provisioned.
 home = Path.join([base, "homes", "smoke"])
 File.mkdir_p!(home)
-File.cp!(Path.join([base, "auth", "claude", "oauth-token"]), Path.join(home, "oauth-token"))
+
+File.cp!(
+  Path.join([base, "auth", "claude", ".credentials.json"]),
+  Path.join(home, ".credentials.json")
+)
 
 cwd = Path.join([base, "work", "smoke"])
 File.mkdir_p!(cwd)

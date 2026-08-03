@@ -750,6 +750,10 @@ defmodule Tightbeam.Gateway do
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
+      "add-user" =>
+        admin_handler(db, fn p ->
+          %{user: Devices.add_user(db, p.user_id, Map.get(p, :is_admin, false))}
+        end),
       "config" => admin_handler(db, fn p -> config_result(db, p) end),
       "harness-processes" =>
         admin_handler(db, fn _params ->
@@ -1295,6 +1299,11 @@ defmodule Tightbeam.Gateway do
     rust_cli = Path.expand("cli/target/release/tightbeam", File.cwd!())
 
     if File.exists?(rust_cli) do
+      # Removed first, not copied over. On macOS, writing into an existing Mach-O
+      # invalidates its code signature and the kernel SIGKILLs it on exec -- exit 137,
+      # no output, indistinguishable from a corrupt build. Observed while replacing this
+      # very wrapper by hand.
+      File.rm(wrapper)
       File.cp!(rust_cli, wrapper)
     else
       # There is NO fallback. There used to be one, to the retired TypeScript CLI

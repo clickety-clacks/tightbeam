@@ -41,9 +41,19 @@ defmodule Tightbeam.HarnessConformanceTest do
       |> Enum.flat_map(&String.split(&1, "/"))
       |> MapSet.new()
 
+    # Optional callbacks carry no vector, and requiring one would be a contradiction: a
+    # vector asserts what EVERY harness must render, while an optional callback is by
+    # definition one some harnesses do not implement. They are still covered -- by the
+    # behaviour, and by whatever tests the implementing harness brings.
+    optional =
+      Harness.behaviour_info(:optional_callbacks)
+      |> Enum.map(fn {callback, _arity} -> Atom.to_string(callback) end)
+      |> MapSet.new()
+
     offending =
       callbacks
       |> MapSet.difference(constants)
+      |> MapSet.difference(optional)
       |> MapSet.difference(declared)
 
     assert offending == MapSet.new(),

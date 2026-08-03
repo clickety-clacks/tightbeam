@@ -99,7 +99,7 @@ defmodule Tightbeam.Devices do
           claimed_name = Map.fetch!(input, :claimed_name)
           user_id = slug_user_id(claimed_name)
           first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
-          ensure_user(txn, user_id, first_ever?)
+          ensure_user(txn, user_id)
           status = if first_ever?, do: "allowlisted", else: "pending"
           token = if first_ever?, do: mint_token(), else: nil
 
@@ -155,7 +155,7 @@ defmodule Tightbeam.Devices do
   def approve(db \\ Tightbeam.DB, device_id, user_id \\ nil) do
     transaction!(db, fn txn ->
       must_get(txn, device_id)
-      if user_id, do: ensure_user(txn, user_id, false)
+      if user_id, do: ensure_user(txn, user_id)
 
       Txn.q(
         txn,
@@ -205,6 +205,16 @@ defmodule Tightbeam.Devices do
       [row] -> to_user(row)
       [] -> nil
     end
+  end
+
+  @doc "Add a user. The shared cold-start insertion rule makes the first user admin."
+  @spec add_user(db(), String.t(), boolean()) :: user()
+  def add_user(db \\ Tightbeam.DB, user_id, is_admin) do
+    transaction!(db, fn txn ->
+      insert_user(txn, user_id, is_admin)
+
+      must_get_user(txn, user_id)
+    end)
   end
 
   @doc "Set a user's admin bit (the promote-user verb's write). Raises on unknown user."
@@ -286,18 +296,29 @@ defmodule Tightbeam.Devices do
     }
   end
 
-  defp ensure_user(txn, user_id, is_admin) do
+  defp ensure_user(txn, user_id) do
     case Txn.q(txn, "SELECT userId FROM users WHERE userId = ?1", [user_id]) do
       [] ->
-        Txn.q(txn, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, ?2, ?3)", [
-          user_id,
-          if(is_admin, do: 1, else: 0),
-          now()
-        ])
+        insert_user(txn, user_id, false)
 
       [_] ->
         :ok
     end
+  end
+
+  defp insert_user(txn, user_id, requested_admin) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO users (userId, isAdmin, createdAt)
+      VALUES (
+        ?1,
+        CASE WHEN (SELECT COUNT(*) FROM users) = 0 THEN 1 ELSE ?2 END,
+        ?3
+      )
+      """,
+      [user_id, if(requested_admin, do: 1, else: 0), now()]
+    )
   end
 
   defp must_get_user(txn, user_id) do

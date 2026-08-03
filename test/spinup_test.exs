@@ -16,7 +16,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "local all-present allows without shell calls and records history", ctx do
-    credential = Path.join([ctx.base_dir, "auth", "claude", "oauth-token"])
+    credential = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
     File.mkdir_p!(Path.dirname(credential))
     File.write!(credential, "test-token")
     stage_claude!(ctx.base_dir)

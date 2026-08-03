@@ -58,6 +58,24 @@ defmodule Tightbeam.Harness do
   @callback credential_ready?(target(), String.t()) :: boolean()
   @callback harvest_credential(target(), String.t()) :: binary() | nil
   @callback credential_live?(target(), String.t(), keyword()) :: credential_liveness()
+  @doc """
+  Give the harness one real run against a freshly banked credential.
+
+  Some harnesses learn what an account is entitled to only by ASKING the server, and cache
+  the answer in their own home. Claude Code does: its extra model options -- a 1M-context
+  Opus, Fable -- arrive in `additionalModelOptionsCache` on first use and are absent from a
+  cold home, so a catalog derived before anything has run reports a subset and reports it as
+  the truth.
+
+  That is a deadlock, not a delay: an incomplete catalog means no model can be placed, so no
+  session spawns, so the cache never fills, so the catalog stays incomplete. Nothing about it
+  self-heals. One run at onboarding, when the credential has just been proven anyway, is what
+  breaks it.
+
+  Optional: a harness that keeps no such state need not implement it.
+  """
+  @callback warm_home(target(), String.t()) :: :ok | {:error, term()}
+
   @callback install_cli_projection(String.t()) :: :ok
   @callback probe_cli(target()) ::
               {:ok, %{bin: String.t(), version: String.t()}}
@@ -66,6 +84,8 @@ defmodule Tightbeam.Harness do
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
+  @optional_callbacks warm_home: 2
+
   @callback conformance_vectors() :: %{
               required(String.t()) => [
                 %{

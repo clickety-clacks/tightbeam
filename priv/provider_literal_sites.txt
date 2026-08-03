@@ -1,4 +1,5 @@
 cli/src/args.rs
+cli/src/catalog_probe.rs
 cli/src/ceremonies.rs
 cli/src/dispatch.rs
 lib/tightbeam/credentials.ex

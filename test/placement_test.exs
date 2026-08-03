@@ -609,7 +609,10 @@ defmodule Tightbeam.PlacementTest do
   } do
     token_dir = Path.join([base_dir, "auth", "claude"])
     File.mkdir_p!(token_dir)
-    File.write!(Path.join(token_dir, "oauth-token"), "sk-ant-oat01-test\n")
+    File.write!(
+      Path.join(token_dir, ".credentials.json"),
+      ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-test"}})
+    )
 
     config = %{
       base_dir: base_dir,
@@ -619,12 +622,15 @@ defmodule Tightbeam.PlacementTest do
       default_model: "fable"
     }
 
+    # A subscription credential reaches the harness as a FILE in its home, never as an
+    # environment variable: it carries a refresh token that Claude Code rotates in place,
+    # and an env var has nowhere to keep one.
     claude_env = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
-    assert {"CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test"} in claude_env
+    refute Enum.any?(claude_env, fn {k, _} -> k == "CLAUDE_CODE_OAUTH_TOKEN" end)
+    assert Enum.any?(claude_env, fn {k, _} -> k == "CLAUDE_CONFIG_DIR" end)
 
-    # The token is harness-scoped: codex adapters never receive claude's.
-    codex_env = Placement.adapter_opts(config, {:codex, "default", "testhost"})[:env]
-    refute Enum.any?(codex_env, fn {k, _} -> k == "CLAUDE_CODE_OAUTH_TOKEN" end)
+    # And no secret is smuggled in by another name.
+    refute inspect(claude_env) =~ "sk-ant-oat01-test"
   end
 
   test "adapter_opts embeds every remote agent env in the ssh command", %{
@@ -685,9 +691,9 @@ defmodule Tightbeam.PlacementTest do
 
     claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
 
-    assert "CLAUDE_CODE_OAUTH_TOKEN=$(cat /srv/tb/auth/claude/oauth-token 2>/dev/null)" in claude_opts[
-             :cmd
-           ]
+    # No credential expansion for a subscription: the remote reads its own home file.
+    refute Enum.any?(claude_opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
+    assert Enum.any?(claude_opts[:cmd], &String.contains?(&1, "CLAUDE_CONFIG_DIR="))
 
     # Harness-scoped: codex remote env never carries claude's token expansion.
     refute Enum.any?(opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))

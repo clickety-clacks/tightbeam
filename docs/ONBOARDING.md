@@ -60,9 +60,9 @@ process groups — names what it killed, and leaves the credential store
 untouched. It does not write a failure log on that path; the watchdog line in
 the gateway log is the record.
 
-**A failed capture preserves its transcript** at
-`<base_dir>/setup-token-failure.log`, and the refusal says why. Report the
-refusal reason before re-arming; codes are single-use.
+**A failed capture is not persisted.** The transcript can contain a live year-long
+credential, so the refusal explains the screen shape without copying the bytes to a log.
+Report that refusal before re-arming; codes are single-use.
 
 **Scanning a ceremony's working directory for leaked secrets: match regular
 files only** (`find … -type f`, or exclude non-regular files). A ceremony's
@@ -86,7 +86,7 @@ different endpoints, so a guess produces a confident answer about the wrong one.
 
 - **claude**, either kind: `GET https://api.anthropic.com/v1/models?limit=1`
   with the header that kind requires — `Authorization: Bearer` for a
-  subscription setup-token, `x-api-key` for an API key.
+  subscription OAuth access token, `x-api-key` for an API key.
 - **codex, subscription**: `GET https://chatgpt.com/backend-api/wham/accounts/check`
   with the host-local ChatGPT grant and account header. The platform route
   refuses this grant (403, missing scope `api.model.read`).
@@ -105,16 +105,17 @@ Login status and file presence are not liveness.
 Credentials are store rows, not loose files. Each provider needs all three:
 
 - the store backing file — `auth/codex/auth.json`, claude
-  `auth/claude/oauth-token`;
+  `auth/claude/.credentials.json`;
 - the home symlink `homes/<machine>/<harness>/…` → store file;
 - the metadata row `auth/<harness>/.tightbeam/credential.json` with
   `"onboarded": true` AND `"kind": "subscription" | "api_key"`.
 
 The KIND is what every credential seam dispatches on; a row without one is not
-usable, because nothing infers it from the file. The claude backing file holds
-whichever kind is active — a full 108-character `sk-ant-oat…` setup token under
-a subscription, an `sk-ant-api…` key under the other. That filename is
-historical and is NOT evidence of the kind.
+usable, because nothing infers it from the file. Under a subscription, the
+claude backing file is Claude Code's OAuth record with a refresh token; it is
+linked into the harness home so Claude Code can rotate it in place. Under an
+API key, that same filename holds the bare secret, which is still injected
+through `ANTHROPIC_API_KEY`. The filename is NOT evidence of the kind.
 
 The openai path does not populate `expires_at` or `subscription_status` even on
 a fresh write; they are null by design there, not stale.

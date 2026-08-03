@@ -128,14 +128,69 @@ pub fn group(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
 
-    let error = std::io::Error::last_os_error();
+    classify_group_kill(pgid, std::io::Error::last_os_error())
+}
 
-    if error.raw_os_error() == Some(libc::ESRCH) {
+/// A group that is already gone is a success, and darwin says so differently.
+///
+/// linux answers ESRCH when nothing in the group can be signalled. macOS answers EPERM once
+/// the group's members have all exited -- the group id still resolves, but there is nothing
+/// live in it to own. Treating that as a failure turns "already dead" into "could not kill",
+/// which is what it did: a live onboarding aborted with
+/// `kill_failed: process group 62968 could not be signalled: Operation not permitted`
+/// against a group that `kill -0` reported as no such process.
+///
+/// EPERM is only read this way AFTER `authorize_group_signal` has established the group is
+/// ours by identity and boot epoch. Without that check EPERM would be ambiguous with
+/// somebody else's group, which is exactly what it means on linux and why this is
+/// darwin-only. `child_process.rs` already carries the same guard for the same reason; this
+/// is the one place that knew the fact in only one language.
+fn classify_group_kill(pgid: libc::pid_t, error: std::io::Error) -> Result<i32, String> {
+    let gone = error.raw_os_error() == Some(libc::ESRCH)
+        || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM));
+
+    if gone {
         Ok(0)
     } else {
         Err(format!(
             "process group {pgid} could not be signalled: {error}"
         ))
+    }
+}
+
+#[cfg(test)]
+mod group_kill_tests {
+    use super::classify_group_kill;
+    use std::io::Error;
+
+    /// linux's answer for "nothing here to signal".
+    #[test]
+    fn esrch_is_already_gone_on_every_platform() {
+        assert!(classify_group_kill(1234, Error::from_raw_os_error(libc::ESRCH)).is_ok());
+    }
+
+    /// darwin's answer for the same state. Read as a failure it aborted a live onboarding
+    /// against a group `kill -0` reported as no such process.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn eperm_is_already_gone_on_darwin() {
+        assert!(classify_group_kill(1234, Error::from_raw_os_error(libc::EPERM)).is_ok());
+    }
+
+    /// On linux EPERM means somebody else's group, which must stay an error -- the darwin
+    /// reading is not portable and must not leak across.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn eperm_is_still_a_refusal_on_linux() {
+        assert!(classify_group_kill(1234, Error::from_raw_os_error(libc::EPERM)).is_err());
+    }
+
+    /// Anything else is a real failure and must name itself.
+    #[test]
+    fn an_unexpected_errno_is_reported_with_the_group() {
+        let error = classify_group_kill(4321, Error::from_raw_os_error(libc::EINVAL)).unwrap_err();
+        assert!(error.contains("4321"), "{error}");
+        assert!(error.contains("could not be signalled"), "{error}");
     }
 }
 

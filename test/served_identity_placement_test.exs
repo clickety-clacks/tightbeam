@@ -178,21 +178,24 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     assert joined =~ "tightbeam__*"
     assert joined =~ "rsync"
     refute joined =~ "auth.json"
-    refute joined =~ "oauth-token"
+    refute joined =~ ".credentials.json"
   end
 
-  test "many Claude sessions read one non-rotating local setup-token", ctx do
-    token = Path.join([ctx.base, "auth", "claude", "oauth-token"])
+  # The credential no longer travels in the environment at all -- it is a file in the home
+  # that Claude Code reads and rotates. What must still hold, and is the point of this test,
+  # is that many sessions sharing one host put NO secret material into any launch plan.
+  test "many Claude sessions share one host credential without it entering a launch plan", ctx do
+    token = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
     File.mkdir_p!(Path.dirname(token))
-    File.write!(token, "sk-ant-oat01-shared")
+    File.write!(token, ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-shared"}}))
 
     config = %{base_dir: ctx.base, db: ctx.db, cwd: "/work", cli_bin: "/bin"}
 
     for _index <- 1..20 do
       opts = Placement.adapter_opts(config, {:claude, "shared", "eezo"})
-      assert {"CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-shared"} in opts[:env]
-      refute Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CONFIG_CREDENTIALS" end)
-      refute inspect(opts) =~ ".credentials.json"
+      assert Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CONFIG_DIR" end)
+      refute Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CODE_OAUTH_TOKEN" end)
+      refute inspect(opts) =~ "sk-ant-oat01-shared"
       refute inspect(opts) =~ "refresh_token"
       refute inspect(opts) =~ "invalid_grant"
     end

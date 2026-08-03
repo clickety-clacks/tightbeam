@@ -1,11 +1,14 @@
 defmodule Tightbeam.Credentials do
+  require Logger
   @moduledoc """
   Per-machine credential onboarding and lifecycle.
 
   This process is deliberately not a refresher. Codex owns and rotates the
-  live home `auth.json` while its runtime is running; Claude uses one
-  non-rotating setup-token through `CLAUDE_CODE_OAUTH_TOKEN`. Expiry is
-  compared only at read seams—there is no timer or sweep.
+  live home `auth.json` while its runtime is running. A Claude subscription is
+  Claude Code's own `.credentials.json`: an OAuth record with a refresh token,
+  linked into the harness home and rotated there by Claude Code. A Claude API
+  key is a bare secret in the same filename and remains environment-injected.
+  Expiry is compared only at read seams—there is no timer or sweep.
 
   A host holds ONE active credential per provider, of either KIND: an API key or
   a subscription token. The kind is recorded in that provider's
@@ -16,8 +19,8 @@ defmodule Tightbeam.Credentials do
 
   Rotation posture is a property of the kind, not of the provider: API keys are
   static, so they have no refresh and no single-writer constraint. Subscription
-  is claude-static (a year-long setup-token) and codex-self-rotating (in place,
-  single writer).
+  credentials are self-rotating in place and therefore single-writer for both
+  Claude and Codex.
   """
 
   use GenServer
@@ -146,7 +149,7 @@ defmodule Tightbeam.Credentials do
     path =
       case provider do
         :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
-        :anthropic -> Path.join([base_dir, "auth", "claude", "oauth-token"])
+        :anthropic -> Path.join([base_dir, "auth", "claude", ".credentials.json"])
         :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
       end
 
@@ -559,9 +562,11 @@ defmodule Tightbeam.Credentials do
     target = credential_target(state)
 
     Enum.each(harnesses_for_provider(provider), fn module ->
+      home = Homes.home_path(state.base_dir, state.machine, module.id())
+
       module.reconcile_home(
         target,
-        Homes.home_path(state.base_dir, state.machine, module.id()),
+        home,
         %{
           harness: module.id(),
           machine: state.machine,
@@ -570,7 +575,34 @@ defmodule Tightbeam.Credentials do
           harvest_auth: false
         }
       )
+
+      warm_home(module, target, home)
     end)
+  end
+
+  # Give the harness one run before anyone asks it what it can do.
+  #
+  # Some harnesses learn an account's entitlements only by asking the server and cache the
+  # answer in their home; a catalog derived from a cold home reports a subset as the truth.
+  # It does not recover on its own -- an incomplete catalog means nothing can be placed, so
+  # no session spawns, so the cache never fills. Warming here, where the credential has just
+  # been proven, is what breaks that circle.
+  #
+  # Best effort by construction: a harness need not implement it, and a warm that fails must
+  # not fail an onboarding whose credential already validated.
+  defp warm_home(module, target, home) do
+    if function_exported?(module, :warm_home, 2) do
+      case module.warm_home(target, home) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.info(
+            "#{module.id()} home was not warmed on #{inspect(target.host_name)}: " <>
+              "#{inspect(reason)} — its catalog will fill in on first use"
+          )
+      end
+    end
   end
 
   defp credential_target(state),
@@ -682,7 +714,7 @@ defmodule Tightbeam.Credentials do
     do: Path.join([state.base_dir, "auth", "codex", "auth.json"])
 
   defp credential_store_path(state, :anthropic),
-    do: Path.join([state.base_dir, "auth", "claude", "oauth-token"])
+    do: Path.join([state.base_dir, "auth", "claude", ".credentials.json"])
 
   defp credential_store_path(state, :fixture_provider),
     do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
@@ -737,8 +769,11 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  # `.credentials.json` -- Claude Code's own name, because this file is LINKED into the
+  # harness home and read by the harness directly. A subscription credential is the OAuth
+  # record it refreshes in place; an API key is a bare secret. Same path, two contents.
   defp staged_credential(:anthropic, kind, path) do
-    case File.read(Path.join(path, "oauth-token")) do
+    case File.read(Path.join(path, ".credentials.json")) do
       {:ok, bytes} -> {:ok, Map.put(installed_metadata(:anthropic, kind), :bytes, bytes)}
       {:error, reason} -> {:error, {:setup_token_failed, reason}}
     end
@@ -794,7 +829,7 @@ defmodule Tightbeam.Credentials do
   defp installed_metadata(_provider, :subscription), do: %{expires_at: nil}
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
-  defp staged_path(:anthropic, path), do: Path.join(path, "oauth-token")
+  defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")
   defp staged_path(:fixture_provider, path), do: Path.join(path, "fixture.json")
 
   defp onboarding_staging_path(%{ssh: nil}, provider) do

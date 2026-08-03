@@ -423,7 +423,7 @@ defmodule Tightbeam.GatewayTest do
       Path.join(System.tmp_dir!(), "gateway-catalog-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join([catalog_base, "auth", "claude"]))
-    File.write!(Path.join([catalog_base, "auth", "claude", "oauth-token"]), "test-token")
+    File.write!(Path.join([catalog_base, "auth", "claude", ".credentials.json"]), ~s({"claudeAiOauth":{"accessToken":"test-token"}}))
 
     claude_models =
       JSON.encode!(%{
@@ -2140,6 +2140,33 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "add-user lets an admin add admins and non-admins but refuses a non-admin", ctx do
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["add-user"]
+
+    assert %{user: %{user_id: "second-admin", is_admin: true}} =
+             handler.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{user_id: "second-admin", is_admin: true}
+             })
+
+    assert %{user: %{user_id: "guest", is_admin: false}} =
+             handler.(%{
+               origin: "user:second-admin",
+               session_key: nil,
+               params: %{user_id: "guest", is_admin: false}
+             })
+
+    assert %{code: "forbidden", message: "admin required"} =
+             handler.(%{
+               origin: "user:guest",
+               session_key: nil,
+               params: %{user_id: "blocked", is_admin: false}
+             })
+
+    assert Devices.user(ctx.db, "blocked") == nil
+  end
+
   test "a crash-recovered turn warns that side effects are unknown, not undone", ctx do
     # Boot recovery terminalizes an interrupted turn as "outcome unknown". The
     # in-chat marker must tell the agent to VERIFY before repeating anything
@@ -2845,7 +2872,7 @@ defmodule Tightbeam.GatewayTest do
 
     defp bank_into!(server, kind) do
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
-      File.write!(Path.join(staging, "oauth-token"), "credential-bytes")
+      File.write!(Path.join(staging, ".credentials.json"), "credential-bytes")
       :ok = Credentials.finish_onboard(:anthropic, kind, lease_id, server)
     end
 
@@ -6380,7 +6407,7 @@ defmodule Tightbeam.GatewayTest do
     if ready? do
       auth_dir = Path.join([base_dir, "auth", "claude"])
       File.mkdir_p!(auth_dir)
-      File.write!(Path.join(auth_dir, "oauth-token"), "test-token")
+      File.write!(Path.join(auth_dir, ".credentials.json"), ~s({"claudeAiOauth":{"accessToken":"test-token"}}))
     end
 
     on_exit(fn ->

@@ -106,7 +106,7 @@ defmodule Tightbeam.HomesTest do
   end
 
   test "regeneration preserves Claude projects and memory", %{base_dir: base_dir} do
-    token = Path.join([base_dir, "auth", "claude", "oauth-token"])
+    token = Path.join([base_dir, "auth", "claude", ".credentials.json"])
     File.mkdir_p!(Path.dirname(token))
     File.write!(token, "token")
 

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -10,7 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::args::{AssimilateArgs, Identity};
-use crate::child_process::{exited_without_reaping, reset_sigchld_before_spawn};
+use crate::child_process::{
+    RunError, Supervised, exited_without_reaping, nonblocking, reset_sigchld_before_spawn,
+    supervise,
+};
 use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
 use crate::preflight;
@@ -63,6 +67,30 @@ struct Ceremony<'a> {
     endpoint: &'a Endpoint,
     deadline: Instant,
     load_harnesses: &'a HarnessLoader<'a>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StageFailure {
+    reason: String,
+    interrupted: bool,
+}
+
+impl From<String> for StageFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            interrupted: false,
+        }
+    }
+}
+
+impl From<RunError> for StageFailure {
+    fn from(error: RunError) -> Self {
+        Self {
+            interrupted: error.is_interrupted(),
+            reason: error.to_string(),
+        }
+    }
 }
 
 pub fn onboard<S, H>(
@@ -153,14 +181,19 @@ where
         }
     };
 
-    let staged = if api_key {
+    let staged: Result<(), StageFailure> = if api_key {
         run_api_key_onboarding(provider, staging, machine.as_deref(), &ceremony)
+            .map_err(StageFailure::from)
     } else {
         run_provider_onboarding(provider, staging, machine.as_deref(), &ceremony)
     };
 
-    if let Err(reason) = staged {
+    if let Err(failure) = staged {
         let _ = fs::remove_dir_all(staging);
+        if failure.interrupted {
+            return Err(failure.reason);
+        }
+        let reason = failure.reason;
         let classified = if reason.contains("unsupported (no subscription)") {
             Some("unsupported_no_subscription")
         } else {
@@ -188,14 +221,17 @@ where
         Some(lease_id),
         None,
     );
-    match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
-        Ok(Some(result)) => {
+    let outcome = match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
+        Ok(reply) => onboarded_outcome(reply),
+        Err(reason) => Err(reason),
+    };
+    match outcome {
+        Ok(result) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&result).expect("JSON value serializes")
             );
         }
-        Ok(None) => {}
         Err(reason) => {
             let _ = fs::remove_dir_all(staging);
             return Err(cancel_after_begin(
@@ -213,6 +249,42 @@ where
     }
     Ok(())
 }
+
+/// The gateway has to SAY it onboarded. A 2xx only says the request arrived.
+///
+/// This is the artifact check one layer out, and the same mistake it was: an exit code was
+/// read as "codex produced a credential", and here a transport success was read as "the
+/// gateway installed one". Every 2xx reached `Ok(())`, including a body with no `result`
+/// at all -- `dispatch::parse_response` answers `Ok(None)` for that -- so a gateway that
+/// returned `{}` would have the CLI report a completed onboarding it had never been told
+/// about.
+///
+/// The current gateway cannot emit that shape; it answers `status: "onboarded"`
+/// (gateway.ex:2495) or an error envelope. That is not a reason to skip the check. The CLI
+/// and the gateway are versioned and deployed separately -- there is a fleet updater
+/// because they drift -- so "the peer would never send that" is a statement about one
+/// version of the peer, and the CLI is the half that has to survive meeting another.
+///
+/// One condition only. No retry, no negotiation, no version sniffing: the CLI either was
+/// told the credential is installed, or it was not.
+pub(crate) fn onboarded_outcome(
+    reply: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let Some(result) = reply else {
+        return Err(FINISH_UNCONFIRMED.to_owned());
+    };
+    match result.get("status").and_then(serde_json::Value::as_str) {
+        Some("onboarded") => Ok(result),
+        _ => Err(FINISH_UNCONFIRMED.to_owned()),
+    }
+}
+
+/// Deliberately silent about what the gateway DID send. The reply is unrecognised, so any
+/// reading of it here would be a guess printed with the authority of a diagnosis.
+const FINISH_UNCONFIRMED: &str = "the gateway accepted the finish request but did not confirm the credential was \
+     installed: its reply did not say `status: \"onboarded\"`. Nothing about this host's \
+     credential can be assumed either way -- run `tightbeam doctor` to see what is \
+     actually installed, and re-run the ceremony if it is not there.";
 
 fn cancel_after_begin<S>(
     identity: &Identity,
@@ -232,6 +304,11 @@ where
         identity, provider, "cancel", kind, machine, lease_id, classified,
     );
     match send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline)) {
+        // Matching on a SENTENCE, which makes `dispatch::ceremony_expired`'s wording part
+        // of this behaviour rather than part of its presentation. If that string is ever
+        // improved, this arm stops matching and the fall-through below drops the cancel
+        // failure from the operator's message without failing anything. Both ends are
+        // commented; neither is enforced.
         Err(cancel_reason) if cancel_reason.contains("onboarding lease expired") => {
             format!("{reason}; {cancel_reason}")
         }
@@ -360,17 +437,20 @@ fn set_terminal_group(fd: libc::c_int, pgid: libc::pid_t) -> bool {
 /// exactly as the caller configured it -- the interactive ceremonies inherit the
 /// terminal and must keep doing so.
 fn run_bounded(
-    mut command: ProcessCommand,
+    command: ProcessCommand,
     what: &str,
     deadline: Instant,
     stdin: Option<&[u8]>,
 ) -> Result<ExitStatus, String> {
-    if Instant::now() >= deadline {
-        return Err(format!(
-            "{what} refused to start because its onboarding lease already expired"
-        ));
-    }
+    run_bounded_inner(command, what, deadline, stdin).map_err(|error| error.to_string())
+}
 
+fn run_bounded_inner(
+    mut command: ProcessCommand,
+    what: &str,
+    deadline: Instant,
+    stdin: Option<&[u8]>,
+) -> Result<ExitStatus, RunError> {
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -380,21 +460,22 @@ fn run_bounded(
         });
     }
 
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let pgid = child.id() as libc::pid_t;
+    let (_, status) = supervise(command, what, deadline, |supervised| {
+        attend(supervised, stdin)
+    })?;
+    Ok(status)
+}
 
-    if let Some(bytes) = stdin {
-        let mut pipe = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("{what} did not accept stdin"))?;
-        pipe.write_all(bytes).map_err(|error| error.to_string())?;
-        // Dropped here on purpose -- see the doc comment.
-    }
-
-    // Set it on this side too: the child may not have reached its own setpgid yet, and the
-    // terminal handoff below needs the group to exist. Both sides racing to set the same
-    // value is the standard job-control fix; the redundant call is harmless.
+/// Feed the child its input, show the operator its output, and wait for it to finish.
+///
+/// Every way out of here is a returned value, including the setup steps at the top: a
+/// child whose stdout cannot be made non-blocking, or whose stdin will not take the key,
+/// is terminated by `supervise` rather than left running behind a `?`.
+fn attend(supervised: &mut Supervised, stdin: Option<&[u8]>) -> Result<(), RunError> {
+    // Set the group on this side too: the child may not have reached its own setpgid yet,
+    // and the terminal handoff below needs the group to exist. Both sides racing to set the
+    // same value is the standard job-control fix; the redundant call is harmless.
+    let pgid = supervised.pgid();
     unsafe {
         libc::setpgid(pgid, pgid);
     }
@@ -411,39 +492,48 @@ fn run_bounded(
         libc::killpg(pgid, libc::SIGCONT);
     }
 
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-
-        if Instant::now() >= deadline {
-            // TERM the group, give it a moment to clean up, then KILL what ignored it.
-            // These children are RUNNING, so TERM is delivered at once -- the
-            // TERM-before-CONT ordering would matter only for an already-STOPped
-            // process, which none of these are.
-            unsafe {
-                libc::killpg(pgid, libc::SIGTERM);
-            }
-            thread::sleep(Duration::from_secs(2));
-            unsafe {
-                libc::killpg(pgid, libc::SIGKILL);
-            }
-            let _ = child.wait();
-
-            return Err(format!(
-                "{what} did not finish before its onboarding lease expired; terminated it and \
-                 its process group ({pgid})"
-            ));
-        }
-
-        thread::sleep(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(50)),
-        );
+    // AFTER the handoff, so a child stopped against the terminal is running again before
+    // anything waits on it to drain a pipe.
+    if let Some(bytes) = stdin {
+        deliver(supervised, bytes)?;
     }
+
+    loop {
+        // Asked before the signal is read, so that a child which exited and a TERM which
+        // arrived in the same instant are both known to the same iteration.
+        let leader_exited = supervised.exited()?;
+
+        if let Some(error) = supervised.interrupted() {
+            return Err(error);
+        }
+
+        if leader_exited {
+            return Ok(());
+        }
+
+        if let Some(error) = supervised.expired() {
+            return Err(error);
+        }
+
+        // Nothing to poll now that stdout is the operator's: just sleep to the next look.
+        supervised.wait(None);
+    }
+}
+
+/// Hand the child its secret on a pipe, then close it.
+///
+/// The write is bounded by the lease for the same reason the loop is. A child that never
+/// reads -- stopped, wedged, or simply slower than the key is long -- fills the pipe
+/// buffer, and a blocking `write_all` there hands it the power to keep this ceremony
+/// running for as long as it likes. The pipe closes as this returns: a child reading to
+/// EOF deadlocks against one left open.
+fn deliver(supervised: &mut Supervised, bytes: &[u8]) -> Result<(), RunError> {
+    let what = supervised.what().to_owned();
+    let Some(pipe) = supervised.child().stdin.take() else {
+        return Err(format!("{what} did not accept stdin").into());
+    };
+    nonblocking(pipe.as_raw_fd())?;
+    supervised.write_all(pipe.as_raw_fd(), bytes)
 }
 
 fn run_provider_onboarding(
@@ -451,7 +541,7 @@ fn run_provider_onboarding(
     staging: &str,
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
-) -> Result<(), String> {
+) -> Result<(), StageFailure> {
     match provider {
         "openai" => run_openai_onboarding(staging, ceremony),
         "anthropic" => run_anthropic_onboarding(staging, machine, ceremony),
@@ -460,8 +550,8 @@ fn run_provider_onboarding(
             std::path::Path::new(staging).join("fixture.json"),
             "fixture-provider-credential",
         )
-        .map_err(|error| error.to_string()),
-        _ => Err(format!("unsupported provider: {provider}")),
+        .map_err(|error| StageFailure::from(error.to_string())),
+        _ => Err(format!("unsupported provider: {provider}").into()),
     }
 }
 
@@ -625,11 +715,56 @@ fn bank_openai_api_key(staging: &str, key: &str, ceremony: &Ceremony<'_>) -> Res
         Some(key.as_bytes()),
     )?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("`codex login --with-api-key` failed: {status}"))
+    codex_staged_a_credential(status, staging, "`codex login --with-api-key`")
+}
+
+/// The verdict on a codex leg: its exit status AND the file it was supposed to leave
+/// behind, because for codex the first does not imply the second.
+///
+/// Measured against codex-cli 0.146.0: ctrl-c at the device-code prompt exits ZERO and
+/// writes nothing. Cancelling is a normal exit for codex -- its own screen offers cancel
+/// as the expected move -- so an exit code cannot distinguish "logged in" from "the
+/// operator changed their mind". Trusting it staged an empty home, ran on to `finish`, and
+/// let the GATEWAY be the first thing to notice: the operator's ctrl-c came back as
+/// `device_auth_failed`, a message blaming the device authorization for something they
+/// did deliberately. The same misattribution "not captured" used to make on the anthropic
+/// side, which is what that leg's refusal reasons exist to prevent.
+///
+/// The anthropic leg has never had this hole because it validates what it captured before
+/// staging it. This is the same check on the same axis. It reads a file rather than making
+/// a live call because for openai the credential is codex's to write and ours only to hand
+/// on -- so the question here is not "does this credential work" but "is there one".
+///
+/// The filename is DUPLICATED, not shared, and that is worth knowing before someone
+/// changes it. The gateway installs from `auth.json` in the staging directory by writing
+/// that literal out twice -- credentials.ex:734 for a local install and :796, reached from
+/// :762, for an ssh one -- and neither is reachable from here: `staged_path/2` is `defp`.
+/// So this is a third copy of a name three places already hardcode, and the only thing
+/// keeping them honest is that they agree. Making it one fact is a real change with its
+/// own review, not a comment.
+fn codex_staged_a_credential(status: ExitStatus, staging: &str, what: &str) -> Result<(), String> {
+    if !status.success() {
+        return Err(format!("{what} failed: {status}"));
     }
+
+    let path = std::path::Path::new(staging).join("auth.json");
+    let staged = match fs::metadata(&path) {
+        Ok(metadata) if metadata.len() > 0 => return Ok(()),
+        Ok(_) => "left an empty credential file".to_owned(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "wrote no credential".to_owned(),
+        Err(error) => format!("left a credential this host cannot read ({error})"),
+    };
+
+    // Named as the LIKELY cause, not the cause. A cancelled login and a codex that failed
+    // while exiting zero are indistinguishable from here, and inventing a way to tell them
+    // apart would mean guessing at codex's exit codes -- the thing that produced this bug.
+    Err(format!(
+        "{what} reported success but {staged} at {}. codex exits zero when a device-code \
+         login is cancelled, so the likely cause is that the login was interrupted or \
+         declined; a codex failure that also exits zero looks the same from here. Nothing \
+         was banked -- the openai credential on this host is unchanged. Re-run the ceremony.",
+        path.display()
+    ))
 }
 
 /// Claude has no equivalent CLI affordance -- it takes its credential from the
@@ -638,7 +773,7 @@ fn bank_openai_api_key(staging: &str, key: &str, ceremony: &Ceremony<'_>) -> Res
 /// install, the metadata, the home reconcile) is then identical between the two
 /// kinds; only the recorded kind differs.
 fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
-    let path = std::path::Path::new(staging).join("oauth-token");
+    let path = std::path::Path::new(staging).join(".credentials.json");
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -718,101 +853,29 @@ fn this_host() -> String {
         .unwrap_or_else(|| "this machine".to_owned())
 }
 
-fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), String> {
-    let codex = harness_cli("openai", ceremony)?;
+fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), StageFailure> {
+    let codex = harness_cli("openai", ceremony).map_err(StageFailure::from)?;
     let mut command = ProcessCommand::new(&codex);
     command
         .args(["login", "--device-auth"])
         .env("CODEX_HOME", staging)
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = run_bounded(command, "codex device-code login", ceremony.deadline, None)?;
+    // stdout is INHERITED, not captured. codex prints the sign-in link and the one-time
+    // code itself, more usefully than we did: we used to pipe its output, replay it through
+    // a terminal emulator to strip ANSI, scan for a URL, and echo back a line the operator
+    // could already see four lines above. Reading a stream we have no reason to read is the
+    // same mistake the anthropic leg was deleted for.
+    // `run_bounded_inner` rather than `run_bounded`: the latter flattens its error to a
+    // String, which discards the INTERRUPTED classification. An interrupt must stay
+    // distinguishable from an ordinary failure all the way up, because `onboard` skips the
+    // gateway cancel on one and not the other.
+    let status = run_bounded_inner(command, "codex device-code login", ceremony.deadline, None)
+        .map_err(StageFailure::from)?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("OpenAI device-code onboarding failed: {status}"))
-    }
-}
-
-/// The pty height the ceremony pins alongside the width. Tall enough that the whole
-/// setup-token screen fits without scrolling; unlike the width, the exact value is not
-/// load-bearing — the replay in `screen` is unbounded — it only has to be sane and
-/// nonzero (headless, the pty is otherwise 0x0).
-const SETUP_TOKEN_PTY_ROWS: usize = 50;
-
-/// Pin the slave pty's geometry before claude starts, then exec it.
-///
-/// The ceremony's correctness must not depend on the operator's terminal width (issue
-/// #5): claude's TUI repaints without erase sequences, so at a terminal a little wider
-/// than the token a stale cell from an earlier frame can survive on the token's row and
-/// fuse to it. The pty belongs to this ceremony, so its geometry is pinned at exactly
-/// [`crate::screen::SETUP_TOKEN_LENGTH`] columns — the token's own length. At that
-/// width the hazard is unreachable by construction: no row can be wider than the token,
-/// so no stale cell can survive past its end (the token's repaint covers its row edge
-/// to edge), and the token never wraps (it fills exactly one row; the `gap:1` blank row
-/// after it keeps that decidable, as `screen` documents).
-///
-/// `stty` on the slave is the ONE mechanism claude's TUI honors, verified empirically
-/// against claude 2.1.220 on eezo (2026-07-28) with throwaway `setup-token` first
-/// screens: bare `script` headless leaves the pty 0x0 and the TUI falls back to 80
-/// columns; `COLUMNS` in the environment is ignored entirely (still 0x0/80); after
-/// `stty rows 50 cols N` on the slave, `stty size` reports the pin and the TUI
-/// hard-wraps at exactly N (N=97 and N=108 both verified). Inside the wrapper stdin IS
-/// the slave, so `stty` needs no arguments beyond the geometry. `;` rather than `&&`:
-/// if `stty` somehow fails, claude still runs unpinned, and the length-aware capture in
-/// `screen` remains the guard.
-fn pinned_pty_command(claude_argument: &str) -> String {
-    format!(
-        "stty rows {SETUP_TOKEN_PTY_ROWS} cols {}; exec {claude_argument} setup-token",
-        crate::screen::SETUP_TOKEN_LENGTH
-    )
-}
-
-/// `script(1)` argument order, which is NOT portable.
-///
-/// The wrapper exists only to give `claude setup-token` a TTY (it refuses to run
-/// without one), to pin that TTY's geometry, and to capture the transcript
-/// `capture_setup_token` parses. The two implementations take the command in
-/// incompatible ways:
-///
-/// - BSD/macOS: `script [-q] <file> <command> [args...]`
-/// - util-linux: `script [-q] -c "<command>" <file>` — extra trailing args are an
-///   error, so the BSD form fails with "unexpected number of arguments"
-///
-/// Shipping only the BSD form made the entire Anthropic credential path unreachable
-/// on every Linux host: it failed before contacting Anthropic, so no credential or
-/// network fix could help, and the openai path worked because it execs `codex`
-/// directly with no wrapper. Found on shrdlu during the production-install smoke.
-///
-/// Dispatched at COMPILE time, like the containment seam: a platform with no named
-/// form fails to build rather than failing at a customer's terminal.
-///
-/// Both forms run the pinned-geometry wrapper through `sh`. util-linux already takes a
-/// shell string; on BSD the command is `sh -c '<wrapper>' <claude>`, with the claude
-/// path as `$0` so it needs no quoting.
-#[cfg(target_os = "macos")]
-fn script_args(transcript: &str, claude: &str) -> Vec<String> {
-    vec![
-        "-q".to_owned(),
-        transcript.to_owned(),
-        "/bin/sh".to_owned(),
-        "-c".to_owned(),
-        pinned_pty_command("\"$0\""),
-        claude.to_owned(),
-    ]
-}
-
-#[cfg(target_os = "linux")]
-fn script_args(transcript: &str, claude: &str) -> Vec<String> {
-    vec![
-        "-q".to_owned(),
-        "-c".to_owned(),
-        pinned_pty_command(claude),
-        transcript.to_owned(),
-    ]
+    codex_staged_a_credential(status, staging, "OpenAI device-code onboarding")
+        .map_err(StageFailure::from)
 }
 
 /// The subscription ceremony: `claude setup-token` under a pty, the token read off the
@@ -829,94 +892,59 @@ fn run_anthropic_onboarding(
     staging: &str,
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
-) -> Result<(), String> {
-    let claude = harness_cli("anthropic", ceremony)?;
-    require_on_path(
-        "script",
-        &search_path(),
-        &preflight::missing_system_tool(
-            "script",
-            "`claude setup-token` refuses to run without a TTY, so onboarding runs it under \
-             script(1) and reads the token off the transcript.",
-            &this_host(),
-            &search_path(),
-        ),
-    )?;
+) -> Result<(), StageFailure> {
+    let challenge = crate::anthropic_oauth::begin();
+    let pasted = ask_for_code(&challenge.url)?;
+    let credential =
+        crate::anthropic_oauth::complete(&challenge, &pasted).map_err(StageFailure::from)?;
 
-    let transcript = PathBuf::from(staging).join("setup-token.log");
-    let transcript_path = transcript
-        .to_str()
-        .ok_or_else(|| "invalid onboarding staging path".to_owned())?;
+    // Validated with the access token before anything is staged, for the same reason a
+    // pasted token was: a credential that authenticates is the only evidence the exchange
+    // produced a usable one, and a refusal here must not be discovered by a turn failing a
+    // month later.
+    validate_setup_token(&credential.access_token, machine, ceremony.deadline)
+        .map_err(StageFailure::from)?;
 
-    // Create the transcript owner-only BEFORE `script` does. It opens the file
-    // O_WRONLY|O_CREAT|O_TRUNC and leaves the mode of a file that already exists
-    // alone, so this is the only place 0600 can be established -- and on a successful
-    // run this file holds a live year-long credential in cleartext.
-    fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&transcript)
-        .map_err(|error| error.to_string())?;
-
-    let mut command = ProcessCommand::new("script");
-    command
-        .args(script_args(transcript_path, &claude))
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let status = run_bounded(
-        command,
-        "claude setup-token (under script(1))",
-        ceremony.deadline,
-        None,
-    )?;
-
-    // Bytes, not `read_to_string`: one invalid UTF-8 byte anywhere in a pty transcript
-    // made that call fail, and `unwrap_or_default` turned the failure into an empty
-    // string -- indistinguishable from claude having printed nothing at all.
-    let raw = fs::read(&transcript).unwrap_or_default();
-
-    if !status.success() {
-        // Read the SCREEN, not the byte stream. The TUI positions each word with a
-        // cursor jump instead of writing the spaces between them, so a phrase is only
-        // reliably contiguous once the transcript has been replayed.
-        let screen = crate::screen::displayed_lines(&raw).join("\n");
-        if screen.to_ascii_lowercase().contains("subscription") {
-            return Err("needs_onboarding: unsupported (no subscription)".to_owned());
-        }
-        return Err(format!("Anthropic setup-token onboarding failed: {status}"));
-    }
-
-    let token = match crate::screen::capture_setup_token(&raw) {
-        Some(token) => token,
-        None => return Err(capture_failed(&raw)),
-    };
-    // A screen that needed interpreting is never interpreted silently: when capture
-    // discarded stale repaint cells to reach the token, the operator is told which.
-    if let Some(note) = crate::screen::capture_note(&raw) {
-        println!("{note}");
-    }
-
-    validate_setup_token(&token, machine, ceremony.deadline)?;
-
-    let path = PathBuf::from(staging).join("oauth-token");
+    // `credentials.json`, not `oauth-token`. The OAuth credential is an access token PLUS a
+    // refresh token, and only the file form has anywhere to put the second one -- an env
+    // var carries the access token alone, so it works until the token lapses and then dies
+    // with no way back. Claude Code refreshes this file itself, which is the same shape
+    // codex already has: the vendor maintains its own credential and we hold the directory.
+    let path = PathBuf::from(staging).join(".credentials.json");
     let mut file = fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .mode(0o600)
         .open(path)
-        .map_err(|error| error.to_string())?;
-    writeln!(file, "{token}").map_err(|error| error.to_string())?;
+        .map_err(|error| StageFailure::from(error.to_string()))?;
+    file.write_all(crate::anthropic_oauth::credentials_json(&credential).as_bytes())
+        .map_err(|error| StageFailure::from(error.to_string()))?;
 
-    // The preserved evidence is only worth keeping while a failure is unexplained.
-    let _ = fs::remove_file(preserved_transcript());
     Ok(())
 }
 
+/// Print the sign-in link and take back what the callback page shows.
+///
+/// The operator may be on another machine -- that is the ordinary case for an install over
+/// ssh -- so this prints a link rather than opening a browser, and asks for the code the
+/// page displays rather than listening on localhost.
+fn ask_for_code(url: &str) -> Result<String, StageFailure> {
+    println!("\nOpen this and sign in:\n\n    {url}\n");
+    println!("Then paste the code it shows you (code#state) and press enter:");
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| StageFailure::from(format!("could not read the code: {error}")))?;
+    let line = line.trim().to_owned();
+    if line.is_empty() {
+        return Err("no code was provided; onboarding needs the code the sign-in page shows"
+            .to_owned()
+            .into());
+    }
+    Ok(line)
+}
 /// The route and headers a SUBSCRIPTION credential is authenticated with.
 ///
 /// Not the api-key path's header. `validate_api_key` sends anthropic `x-api-key`, which
@@ -1018,13 +1046,11 @@ fn unvalidated_api_key(provider: &str, error: &str, host: &str) -> String {
 /// cancel phase off that exact phrase, and this is not that.
 fn rejected_setup_token(status: u16, body: &str, host: &str) -> String {
     format!(
-        "the captured Anthropic setup token was rejected on {host}: HTTP {status} {body}. \
+        "the Anthropic setup token was rejected on {host}: HTTP {status} {body}. \
          claude prints a token only to an account that has a subscription, so the likely \
-         fault is the CAPTURE rather than the account: the token is read off a replayed \
-         terminal screen and a truncated read is well-formed. Nothing was banked -- the \
-         anthropic credential on {host} is unchanged. Re-run the ceremony; the transcript \
-         from a failed capture is preserved at {}.",
-        preserved_transcript().display()
+         fault is the TOKEN rather than the account -- a partial copy is still well-formed \
+         and fails exactly like this. Nothing was banked; the anthropic credential on \
+         {host} is unchanged. Run `claude setup-token` again and paste the whole token."
     )
 }
 
@@ -1033,61 +1059,10 @@ fn rejected_setup_token(status: u16, body: &str, host: &str) -> String {
 /// operator re-authorizing an account that was never the problem.
 fn unvalidated_setup_token(error: &str, host: &str) -> String {
     format!(
-        "could not reach anthropic from {host} to validate the captured setup token: \
+        "could not reach anthropic from {host} to validate the setup token: \
          {error}. The token was NOT validated. Nothing was banked -- the anthropic \
          credential on {host} is unchanged. This is a network failure on {host}, not a \
          verdict on the token or the subscription."
-    )
-}
-
-/// Where a transcript is kept when the token could not be read out of it.
-///
-/// One fixed path, so at most one such file exists: the next attempt overwrites it and
-/// a successful capture deletes it. It is not a log to accumulate -- it can contain a
-/// live credential, which is why it is written 0600 and why it does not linger.
-fn preserved_transcript() -> PathBuf {
-    crate::base_dir::resolve().join("setup-token-failure.log")
-}
-
-/// Say what was looked for, and keep the evidence needed to work out why it was absent.
-///
-/// The transcript used to be destroyed on this path by BOTH sides: `onboard` removes
-/// the staging directory before cancelling, and the gateway's `cancel_onboard` does its
-/// own `File.rm_rf!` on it (`Tightbeam.Credentials`). So merely declining to delete it
-/// here would not have been enough -- it has to be copied out before the cancel. Two of
-/// the operator's single-use authorization codes were spent with nothing left to
-/// diagnose from, and the message blamed token parsing without saying what it parsed.
-fn capture_failed(raw: &[u8]) -> String {
-    let destination = preserved_transcript();
-    let kept = fs::create_dir_all(destination.parent().unwrap_or(&destination))
-        .and_then(|()| {
-            fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .open(&destination)
-        })
-        .and_then(|mut file| file.write_all(raw));
-
-    let evidence = match kept {
-        Ok(()) => format!(
-            "The transcript is preserved at {} (mode 0600, replaced by the next attempt \
-             and removed after a successful capture). Treat it as a credential: if claude \
-             displayed a token, it is in there.",
-            destination.display()
-        ),
-        Err(error) => format!(
-            "The transcript could NOT be preserved ({}), and the staging directory is \
-             about to be removed, so this attempt leaves nothing to diagnose from.",
-            error
-        ),
-    };
-
-    format!(
-        "Anthropic setup-token was not captured: claude ran and exited successfully, but \
-         {}. {evidence}",
-        crate::screen::refusal_reason(raw)
     )
 }
 
@@ -1889,7 +1864,7 @@ mod tests {
     /// subscription. And it must not collide with the `unsupported (no subscription)`
     /// phrase, which `onboard` matches to classify the cancel phase.
     #[test]
-    fn a_rejected_capture_blames_capture_and_banks_nothing() {
+    fn a_rejected_token_blames_the_token_and_banks_nothing() {
         let message = rejected_setup_token(
             401,
             "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\
@@ -1899,15 +1874,18 @@ mod tests {
 
         assert!(message.contains("Invalid bearer token"), "{message}");
         assert!(message.contains("401"), "{message}");
-        assert!(message.contains("CAPTURE"), "{message}");
+        assert!(message.contains("TOKEN"), "{message}");
+        // Must not read as a subscription problem: `onboard` classifies the cancel
+        // phase off that exact phrase, and a rejected paste is not that.
+        assert!(!message.contains("no subscription"), "{message}");
         assert!(message.contains("shrdlu"), "{message}");
         assert!(
             message.contains("Nothing was banked"),
             "the api-key path's promise, verbatim: {message}"
         );
         assert!(
-            message.contains("setup-token-failure.log"),
-            "the preserved transcript is the operator's next step: {message}"
+            !message.contains("setup-token-failure.log"),
+            "a live credential must not be written to a diagnostic log: {message}"
         );
         assert!(
             !message.contains("unsupported (no subscription)"),
@@ -1928,7 +1906,7 @@ mod tests {
         assert!(message.contains("not a verdict"), "{message}");
         assert!(
             !message.contains("CAPTURE"),
-            "a network failure does not implicate the capture: {message}"
+            "a network failure does not implicate the token: {message}"
         );
     }
 
@@ -1943,11 +1921,10 @@ mod tests {
         assert!(!message.contains("rejected"), "{message}");
     }
 
-    /// An API key is staged under the SAME filename the subscription ceremony
-    /// stages, at the same 0600, so everything downstream is identical between
-    /// the two kinds and only the recorded kind differs.
+    /// The actual filename emitted by Rust must be one the Elixir gateway accepts.
+    /// Testing each language's hard-coded belief separately missed this contract.
     #[test]
-    fn an_anthropic_api_key_stages_like_a_setup_token() {
+    fn an_anthropic_api_key_stages_a_filename_the_gateway_accepts() {
         use std::os::unix::fs::PermissionsExt;
 
         let staging = std::env::temp_dir().join(format!(
@@ -1960,7 +1937,23 @@ mod tests {
 
         bank_anthropic_api_key(staging.to_str().unwrap(), "sk-ant-api03-test").unwrap();
 
-        let staged = staging.join("oauth-token");
+        let entries = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the ceremony must stage exactly one credential"
+        );
+        let filename = &entries[0];
+        let gateway = include_str!("../../lib/tightbeam/credentials.ex");
+        assert!(
+            gateway.contains(&format!("File.read(Path.join(path, \"{filename}\"))")),
+            "Rust staged {filename}, but the Elixir gateway does not read that filename"
+        );
+
+        let staged = staging.join(filename);
         assert_eq!(fs::read_to_string(&staged).unwrap(), "sk-ant-api03-test");
         let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -1977,7 +1970,7 @@ mod tests {
         let endpoint = Endpoint {
             base: "https://ceremony.test".to_owned(),
             token: "tbc_test".to_owned(),
-            session_file: None,
+            origin: crate::dispatch::Origin::Provisioned,
         };
         let ceremony = Ceremony {
             endpoint: &endpoint,
@@ -2064,6 +2057,250 @@ mod tests {
         assert!(!alive, "grandchild {grandchild} outlived the group kill");
     }
 
+    /// Codex uses the pipe-backed bounded runner rather than the Anthropic pty runner.
+    /// Its signal has to retain the same interrupted classification all the way through
+    /// onboarding, or `onboard` mistakes TERM for a staging failure and waits on cancel.
+    #[test]
+    fn term_during_codex_onboarding_kills_the_tree_without_entering_cancel() {
+        const INNER: &str = "TIGHTBEAM_CODEX_SIGNAL_INNER";
+        const MARKER: &str = "TIGHTBEAM_CODEX_SIGNAL_MARKER";
+        const STAGING: &str = "TIGHTBEAM_CODEX_SIGNAL_STAGING";
+        const CANCEL: &str = "TIGHTBEAM_CODEX_SIGNAL_CANCEL";
+
+        if std::env::var_os(INNER).is_some() {
+            let marker = std::env::var(MARKER).expect("outer supplied marker");
+            let staging = std::env::var(STAGING).expect("outer supplied staging path");
+            let cancel = std::env::var(CANCEL).expect("outer supplied cancel marker");
+            let endpoint = Endpoint {
+                base: "http://signal-fixture.invalid".to_owned(),
+                token: "signal-fixture-token".to_owned(),
+                origin: crate::dispatch::Origin::Provisioned,
+            };
+            let result = onboard(
+                &Identity::User("signal-fixture".to_owned()),
+                "openai",
+                false,
+                &endpoint,
+                |_, request, _| {
+                    let request: serde_json::Value =
+                        serde_json::from_str(&request.body_json).unwrap();
+                    match request
+                        .pointer("/params/phase")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("begin") => Ok(Some(serde_json::json!({
+                            "stagingPath": staging,
+                            "leaseId": "signal-fixture-lease",
+                            "leaseTtlMs": 300_000
+                        }))),
+                        Some("cancel") => {
+                            fs::write(&cancel, "entered").unwrap();
+                            thread::sleep(Duration::from_secs(300));
+                            Ok(None)
+                        }
+                        phase => panic!("unexpected onboarding phase: {phase:?}"),
+                    }
+                },
+                |_, _| Ok(None),
+            );
+            let error = result.expect_err("TERM must abort codex onboarding");
+            assert!(error.contains("interrupted by signal"), "{error}");
+            assert!(!std::path::Path::new(&staging).exists());
+            assert!(std::path::Path::new(&marker).exists());
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-codex-signal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let marker = root.join("descendant.pid");
+        let staging = root.join("staging");
+        let cancel = root.join("cancel-entered");
+        let bin = root.join("bin");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nsleep 300 & printf '%s' \"$!\" > '{}'\nwait\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut inner = ProcessCommand::new(std::env::current_exe().unwrap());
+        inner
+            .args([
+                "--exact",
+                "ceremonies::tests::term_during_codex_onboarding_kills_the_tree_without_entering_cancel",
+                "--nocapture",
+            ])
+            .env(INNER, "1")
+            .env(MARKER, &marker)
+            .env(STAGING, &staging)
+            .env(CANCEL, &cancel)
+            .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut inner = inner.spawn().unwrap();
+
+        let ready_by = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < ready_by {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild = fs::read_to_string(&marker).expect("codex fixture recorded descendant");
+        assert_eq!(
+            unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+
+        let mut stdout = inner.stdout.take().unwrap();
+        let drain = thread::spawn(move || {
+            let mut discarded = Vec::new();
+            let _ = stdout.read_to_end(&mut discarded);
+        });
+        let exit_by = Instant::now() + Duration::from_secs(5);
+        let mut status = None;
+        while status.is_none() && Instant::now() < exit_by {
+            status = inner.try_wait().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let required_kill = status.is_none();
+        if required_kill {
+            assert_eq!(
+                unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGKILL) },
+                0
+            );
+            let _ = inner.wait();
+        }
+        drain.join().unwrap();
+
+        let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
+        let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
+            || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        let cancel_entered = cancel.exists();
+        let staging_survived = staging.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !required_kill,
+            "TERM did not promptly exit codex onboarding; cancel={cancel_entered}, \
+             staging={staging_survived}, descendant_alive={alive}"
+        );
+        assert!(!cancel_entered, "TERM entered the lease-cancellation wait");
+        assert!(!alive, "codex descendant {grandchild} survived TERM");
+        assert!(!staging_survived, "TERM left codex staging behind");
+    }
+
+    /// A child that never reads the key it was handed used to own the lease.
+    ///
+    /// `codex login --with-api-key` reads its stdin, so this never bit in production --
+    /// but the write that fed it was blocking and unbounded, so a codex that stopped
+    /// reading (wedged, or stopped against the terminal) held this process for as long as
+    /// it liked, with the operator's key in a pipe. The payload is larger than any pipe
+    /// buffer so the write CANNOT complete: the deadline is the only thing that can end it.
+    #[test]
+    fn a_child_that_never_reads_its_key_cannot_outlive_the_lease() {
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let key = vec![b'k'; 1 << 20];
+        let started = Instant::now();
+
+        let error = run_bounded(
+            command,
+            "a ceremony that never reads its key",
+            Instant::now() + Duration::from_millis(200),
+            Some(&key),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("onboarding lease expired"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the blocking write held the lease for {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// codex reporting success is not codex having produced a credential.
+    ///
+    /// Measured, not supposed: `codex login --device-auth` (codex-cli 0.146.0) exits ZERO
+    /// 0.00s after a terminal ctrl-c and writes nothing, because cancelling is a normal
+    /// exit for it. The staging directory it leaves behind holds `log/` and `tmp/` and no
+    /// credential, which is what this fixture reproduces. Before this check the leg
+    /// returned Ok and the gateway was the first thing to notice, reporting
+    /// `device_auth_failed` for an operator who had simply changed their mind.
+    #[test]
+    fn a_codex_leg_that_exits_zero_without_a_credential_is_a_failure() {
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-codex-artifact-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        // What a cancelled device-code login actually leaves behind.
+        fs::create_dir_all(staging.join("log")).unwrap();
+        fs::create_dir_all(staging.join("tmp")).unwrap();
+        let staging_path = staging.display().to_string();
+
+        let exited_zero = ProcessCommand::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .unwrap();
+
+        let error =
+            codex_staged_a_credential(exited_zero, &staging_path, "OpenAI device-code onboarding")
+                .unwrap_err();
+        assert!(error.contains("wrote no credential"), "{error}");
+        assert!(
+            error.contains("cancelled"),
+            "the likely cause is unnamed: {error}"
+        );
+        assert!(error.contains("Nothing was banked"), "{error}");
+        assert!(
+            error.contains("auth.json"),
+            "the path looked for is unnamed: {error}"
+        );
+
+        // An empty file is not a credential either, and says which of the two it was.
+        fs::write(staging.join("auth.json"), b"").unwrap();
+        let empty =
+            codex_staged_a_credential(exited_zero, &staging_path, "OpenAI device-code onboarding")
+                .unwrap_err();
+        assert!(empty.contains("empty credential file"), "{empty}");
+
+        // The name is the one the gateway installs from -- credentials.ex staged_path/2.
+        fs::write(staging.join("auth.json"), b"{\"tokens\":{}}").unwrap();
+        assert_eq!(
+            codex_staged_a_credential(exited_zero, &staging_path, "OpenAI device-code onboarding"),
+            Ok(())
+        );
+
+        // A non-zero exit still reports the STATUS. The artifact check must not take over
+        // the message for a failure the exit code already explained.
+        let exited_three = ProcessCommand::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .status()
+            .unwrap();
+        let failed =
+            codex_staged_a_credential(exited_three, &staging_path, "OpenAI device-code onboarding")
+                .unwrap_err();
+        assert!(failed.contains("failed: exit status: 3"), "{failed}");
+        assert!(!failed.contains("cancelled"), "{failed}");
+
+        let _ = fs::remove_dir_all(&staging);
+    }
+
     #[test]
     fn an_expired_ceremony_gets_term_grace_before_kill() {
         let marker = std::env::temp_dir().join(format!(
@@ -2123,7 +2360,7 @@ mod tests {
         let endpoint = Endpoint {
             base: "http://gateway.test".to_owned(),
             token: "tbc_test".to_owned(),
-            session_file: None,
+            origin: crate::dispatch::Origin::Provisioned,
         };
         let deadline = Instant::now() + Duration::from_secs(30);
         let ceremony = Ceremony {
@@ -3070,57 +3307,8 @@ mod tests {
         );
     }
 
-    /// The BSD and util-linux forms are mutually incompatible, and shipping only the
-    /// BSD one made Anthropic onboarding impossible on every Linux host. Each arm is
-    /// asserted on its own platform, so the CI matrix proves both rather than proving
-    /// whichever one the developer happens to be sitting on.
-    /// The binary is passed in rather than baked in, so the name checked for on PATH is
-    /// the name actually run. `renamed-claude` is used here for exactly that reason: a
-    /// literal would let the two drift apart without any test noticing.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn script_args_use_the_bsd_form_on_macos() {
-        assert_eq!(
-            script_args("/tmp/t.log", "renamed-claude"),
-            vec![
-                "-q",
-                "/tmp/t.log",
-                "/bin/sh",
-                "-c",
-                "stty rows 50 cols 108; exec \"$0\" setup-token",
-                "renamed-claude"
-            ]
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn script_args_use_the_util_linux_form_on_linux() {
-        // util-linux takes the command via -c and allows at most one file argument;
-        // trailing args are "unexpected number of arguments" and exit 1.
-        assert_eq!(
-            script_args("/tmp/t.log", "renamed-claude"),
-            vec![
-                "-q",
-                "-c",
-                "stty rows 50 cols 108; exec renamed-claude setup-token",
-                "/tmp/t.log"
-            ]
-        );
-    }
-
-    /// The pinned width is not a number that happens to work: it is the token's exact
-    /// length, which is what makes the issue-#5 stale-cell geometry unreachable (no
-    /// row can be wider than the token, so nothing survives past its end) and keeps
-    /// the token on exactly one row. One home for the number, asserted here so the pin
-    /// and the capture gate can never drift apart.
-    #[test]
-    fn the_pinned_width_is_the_token_length() {
-        assert!(
-            pinned_pty_command("claude")
-                .contains(&format!("cols {}", crate::screen::SETUP_TOKEN_LENGTH))
-        );
-    }
+    /// The width deliberately fits the current 109-character token, but is not a capture
+    /// gate. Capture owns provider shape; the pty owns presentation.
 
     #[test]
     fn staging_path_reads_the_wire_shape_the_gateway_actually_sends() {
@@ -3239,17 +3427,6 @@ mod tests {
             );
         }
 
-        // script(1) is not a vendor CLI, so it says why onboarding needs it rather than
-        // whose job the software is.
-        let reason = preflight::missing_system_tool(
-            "script",
-            "`claude setup-token` refuses to run without a TTY.",
-            "eurisko",
-            &empty,
-        );
-        assert!(reason.contains("without a TTY"), "{reason}");
-        assert!(!reason.contains("vendors' software"), "{reason}");
-
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3274,7 +3451,7 @@ mod tests {
         let endpoint = Endpoint {
             base: "https://ceremony.test".to_owned(),
             token: "tbc_test".to_owned(),
-            session_file: None,
+            origin: crate::dispatch::Origin::Provisioned,
         };
         let ceremony = Ceremony {
             endpoint: &endpoint,

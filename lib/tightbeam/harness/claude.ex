@@ -9,6 +9,7 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_version "0.59.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
+  @warm_timeout_ms 30_000
 
   @api_base "https://api.anthropic.com"
 
@@ -123,28 +124,42 @@ defmodule Tightbeam.Harness.Claude do
     })
   end
 
+  # A SUBSCRIPTION credential is not injected, and that is the difference between the two
+  # kinds rather than an omission. It is an OAuth record with a refresh token, and Claude
+  # Code refreshes it IN PLACE in its config dir -- so it is linked into the home and the
+  # harness owns its lifecycle, exactly as codex owns `auth.json`. Passing the access token
+  # through an environment variable would work until it lapsed and then fail with no way
+  # back, because an env var has nowhere to put the refresh token.
+  #
+  # An API key has no refresh and no expiry, so it stays an environment variable. Same
+  # provider, two shapes, because the credentials genuinely are two different things.
   @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
     common = Keyword.fetch!(opts, :common_env)
-    variable = credential_env_var(Keyword.fetch!(opts, :credential_kind))
+    kind = Keyword.fetch!(opts, :credential_kind)
     credential_path = credential_path(target.host_config.base_dir)
 
     if Support.local?(target) do
       credential_env =
-        case File.read(credential_path) do
-          {:ok, credential} -> [{variable, String.trim(credential)}]
-          _ -> []
+        case {kind, File.read(credential_path)} do
+          {:subscription, _} -> []
+          {:api_key, {:ok, credential}} -> [{credential_env_var(kind), String.trim(credential)}]
+          {:api_key, _} -> []
         end
 
       [cmd: [binary], env: [{"CLAUDE_CONFIG_DIR", home} | common ++ credential_env]]
     else
       remote_env =
-        [
-          "#{variable}=$(cat #{credential_path} 2>/dev/null)",
-          "CLAUDE_CONFIG_DIR=#{home}"
-          | Keyword.fetch!(opts, :remote_env)
-        ]
+        case kind do
+          :subscription -> ["CLAUDE_CONFIG_DIR=#{home}" | Keyword.fetch!(opts, :remote_env)]
+          :api_key ->
+            [
+              "#{credential_env_var(kind)}=$(cat #{credential_path} 2>/dev/null)",
+              "CLAUDE_CONFIG_DIR=#{home}"
+              | Keyword.fetch!(opts, :remote_env)
+            ]
+        end
 
       [
         cmd:
@@ -167,10 +182,19 @@ defmodule Tightbeam.Harness.Claude do
   defp credential_env_var(:subscription), do: "CLAUDE_CODE_OAUTH_TOKEN"
   defp credential_env_var(:api_key), do: "ANTHROPIC_API_KEY"
 
-  # ONE file per provider, holding whichever kind is active. The name is
-  # historical -- it predates API-key support -- and is deliberately NOT read as
-  # evidence of the kind by anything: `credential.json` is the authority.
-  defp credential_path(base_dir), do: Path.join([base_dir, "auth", "claude", "oauth-token"])
+  # ONE file per provider, holding whichever kind is active, and the name is Claude Code's
+  # own: the file is LINKED into the harness home, where the harness reads it directly.
+  # `Homes.reconcile` uses a single name for both the store and the home entry, so the store
+  # takes the harness's name rather than the harness taking ours.
+  #
+  # It is still deliberately NOT read as evidence of the kind -- `credential.json` is the
+  # authority. A subscription credential is the OAuth record Claude Code refreshes in place;
+  # an API key is a bare secret that never expires. Same path, different contents, and only
+  # the subscription one is ever handed to the harness as a file.
+  @credential_file ".credentials.json"
+
+  defp credential_path(base_dir),
+    do: Path.join([base_dir, "auth", "claude", @credential_file])
 
   @impl true
   def ensure_adapter(target) do
@@ -203,7 +227,7 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def owned_home_entries,
-    do: Support.owned_home_entries("oauth-token", "settings.json")
+    do: Support.owned_home_entries(@credential_file, "settings.json")
 
   @impl true
   def reconcile_home(target, home, desired) do
@@ -217,7 +241,7 @@ defmodule Tightbeam.Harness.Claude do
     desired = %{desired | rails: rails}
 
     Tightbeam.Homes.reconcile(target, home, desired,
-      credential_names: ["oauth-token"],
+      credential_names: [@credential_file],
       rails_filename: "settings.json"
     )
   end
@@ -240,21 +264,70 @@ defmodule Tightbeam.Harness.Claude do
         credential_provider()
       )
 
-    Tightbeam.Homes.credential_ready?(target, store, ["oauth-token"])
+    Tightbeam.Homes.credential_ready?(target, store, [@credential_file])
+  end
+
+  # One real turn, so the harness asks the server what this account may use and caches the
+  # answer where its own picker reads it. Cold, Claude Code offers four aliases; after a
+  # single run its `additionalModelOptionsCache` carries the account's extras -- measured:
+  # `claude-fable-5[1m]` appears only after the home has been used once.
+  #
+  # `-p` with a trivial prompt because the CHEAPEST real turn is the point: we are not
+  # checking the answer, only that the harness has spoken to the server once. Failure is
+  # returned to the onboarding caller, which logs it and continues because the credential
+  # has already validated.
+  @impl true
+  def warm_home(target, home) do
+    # Through the target's injected runner, never `System.cmd` directly. This callback
+    # SPAWNS THE VENDOR CLI, so a version that reaches for the real binary runs it in every
+    # test that reconciles a home -- which is what the first version did, and it broke a
+    # hundred tests that had no business talking to a provider.
+    sh = Map.get(target, :sh, &Support.system_cmd_out/1)
+
+    if Support.local?(target) do
+      timeout = Map.get(target, :warm_timeout_ms, @warm_timeout_ms)
+
+      case Support.bounded_run(
+             sh,
+             [cli_binary(), "-p", "ok", "--model", "sonnet", "--config-dir", home],
+             timeout
+           ) do
+        {:ok, {_output, 0}} ->
+          :ok
+
+        {:ok, {output, status}} when is_integer(status) ->
+          {:error, {:warm_failed, status, String.trim(to_string(output))}}
+
+        {:ok, {:error, reason}} ->
+          {:error, reason}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      # Remote homes warm on the host that owns them, through the same ssh path a launch
+      # uses. Not attempted here: the cold-home cost is a catalog that fills in on first
+      # use, which is a delay rather than a failure.
+      :ok
+    end
   end
 
   @impl true
   def harvest_credential(target, home) do
-    Tightbeam.Homes.harvest_credential(target, home, "oauth-token")
+    Tightbeam.Homes.harvest_credential(target, home, @credential_file)
   end
 
   @impl true
   def credential_live?(target, home, opts) do
-    {header, scheme} = credential_header(Keyword.fetch!(opts, :credential_kind))
+    kind = Keyword.fetch!(opts, :credential_kind)
+    {header, scheme} = credential_header(kind)
 
     script = """
     const fs = require("node:fs");
-    const credential = fs.readFileSync(process.argv[1], "utf8").trim();
+    const raw = fs.readFileSync(process.argv[1], "utf8");
+    const credential = process.argv[4] === "subscription"
+      ? JSON.parse(raw).claudeAiOauth.accessToken.trim()
+      : raw.trim();
     fetch("https://api.anthropic.com/v1/models?limit=1", {
       headers: {
         [process.argv[2]]: process.argv[3] + credential,
@@ -281,9 +354,10 @@ defmodule Tightbeam.Harness.Claude do
         "--no-warnings",
         "-e",
         script,
-        Path.join(home, "oauth-token"),
+        Path.join(home, @credential_file),
         header,
-        scheme
+        scheme,
+        Atom.to_string(kind)
       ]
     }
 
@@ -365,12 +439,32 @@ defmodule Tightbeam.Harness.Claude do
     fetch = Map.get(state.options, :claude_fetch, &http_get/2)
 
     with {:ok, raw} <- read_token(credential_path),
-         credential = String.trim(raw),
+         {:ok, credential} <- bearer_secret(kind, raw),
          true <- credential != "" do
       {:ok, fn path -> fetch.(path, catalog_headers(kind, credential)) end}
     else
       {:error, reason} -> {:error, reason}
       false -> {:error, :missing_token}
+    end
+  end
+
+  # The two kinds are two file FORMATS now, and anything sending this credential over the
+  # wire has to know which it holds.
+  #
+  # A subscription is Claude Code's own `.credentials.json` -- an OAuth record it refreshes
+  # in place -- so the bearer token is a field inside it. An API key is the bare secret and
+  # the file is just its container. Sending the JSON blob as a bearer token is what a naive
+  # read does, and the provider answers 401 "Invalid bearer token", which reads like a bad
+  # credential rather than a bad reader.
+  defp bearer_secret(:api_key, raw), do: {:ok, String.trim(raw)}
+
+  defp bearer_secret(:subscription, raw) do
+    case JSON.decode(raw) do
+      {:ok, %{"claudeAiOauth" => %{"accessToken" => token}}} when is_binary(token) ->
+        {:ok, String.trim(token)}
+
+      _ ->
+        {:error, :malformed_credential}
     end
   end
 
@@ -395,6 +489,11 @@ defmodule Tightbeam.Harness.Claude do
     ]
   end
 
+  # The tightbeam binary on the host that owns the credential. `assimilate` installs it and
+  # the gateway already execs it there, so this names an existing artifact rather than
+  # introducing one.
+  defp cli_path(state), do: Path.join([state.base_dir, "bin", "tightbeam"])
+
   defp remote_getter(state, dest, credential_path, kind) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
 
@@ -402,11 +501,17 @@ defmodule Tightbeam.Harness.Claude do
       # The script's own stderr is folded into its stdout so a failure carries a
       # reason; ssh's is NOT, because an ssh warning on a SUCCESSFUL connection
       # would land in the middle of the JSON body.
+      # The CLI reads the credential, not this shell. It is already installed on every
+      # assimilated host and the gateway already execs it there for `harness-group`, so
+      # this is the same transport with the credential reader moved into the binary that
+      # WROTE the file. What it replaced was a `python3` one-liner parsing a vendor JSON
+      # shape -- a runtime dependency added to every satellite, and a third copy of an
+      # extraction that already existed twice.
       script = """
       exec 2>&1
       set -eu
-      credential=$(cat #{credential_path})
-      exec #{Support.catalog_curl("#{@api_base}#{path}", curl_headers(kind))}
+      exec #{Support.shell_quote(cli_path(state))} catalog-probe anthropic #{kind} \
+        #{Support.shell_quote(credential_path)} #{Support.shell_quote("#{@api_base}#{path}")}
       """
 
       case Support.catalog_probe(sh, Support.catalog_probe_argv(dest, script)) do
@@ -416,15 +521,6 @@ defmodule Tightbeam.Harness.Claude do
     end
   end
 
-  # `$credential` is expanded by the REMOTE shell, so no credential byte is
-  # interpolated into a command line on either machine -- the property the
-  # subscription probe already had, kept for the API key, which is equally a
-  # secret.
-  defp curl_headers(:subscription),
-    do: ["authorization: Bearer $credential", "anthropic-version: 2023-06-01"]
-
-  defp curl_headers(:api_key),
-    do: ["x-api-key: $credential", "anthropic-version: 2023-06-01"]
 
   # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
   # the already-derived entries — no probe, no extra fetch, nothing at boot; the
@@ -442,8 +538,45 @@ defmodule Tightbeam.Harness.Claude do
   # GRANT (the accepted set is grant-dependent — a smoke run recorded opus-5
   # "refused on this grant") must be able to lift the ceiling without editing code.
   # `:all` disables the filter entirely.
-  defp selectable_models(state),
-    do: Map.get(state.options, :claude_selectable_models, @adapter_selectable_models)
+  # What the adapter will actually accept, asked of the harness rather than remembered.
+  #
+  # The static list alone is a frozen snapshot of somebody's entitlements, and it starved:
+  # the API stopped returning the concrete ids in it, so the intersection went empty and a
+  # correctly onboarded claude reported ZERO models. The account's real extras -- a
+  # 1M-context Opus, Fable -- live in the harness's own `additionalModelOptionsCache`, which
+  # Claude Code fills from the server on first use. That is why onboarding warms the home:
+  # cold, this reads nothing and the catalog is a subset; warmed, it reads what the account
+  # actually has.
+  #
+  # The static aliases stay as the floor. They are SDK aliases rather than account
+  # entitlements, so they are true for every account and cost nothing to keep.
+  #
+  # Remote homes are not read here -- that needs the ssh path -- so a satellite falls back to
+  # the floor until someone teaches this to read over ssh. Stated rather than silent: the
+  # symptom is a satellite offering fewer models than the gateway, not a failure.
+  defp selectable_models(state) do
+    case Map.get(state.options, :claude_selectable_models) do
+      nil -> @adapter_selectable_models ++ home_offered_models(state)
+      override -> override
+    end
+  end
+
+  defp home_offered_models(%{host_config: %{ssh: ssh}}) when not is_nil(ssh), do: []
+
+  defp home_offered_models(state) do
+    home = Tightbeam.Homes.home_path(state.base_dir, state.host_name, id())
+
+    with {:ok, body} <- File.read(Path.join(home, ".claude.json")),
+         {:ok, %{"additionalModelOptionsCache" => options}} when is_list(options) <-
+           JSON.decode(body) do
+      options
+      |> Enum.map(&Map.get(&1, "value"))
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&base_ref/1)
+    else
+      _ -> []
+    end
+  end
 
   defp keep_selectable(entries, :all), do: entries
 
@@ -458,7 +591,8 @@ defmodule Tightbeam.Harness.Claude do
         "claude catalog: #{length(dropped)} model(s) the API offers are not selectable by " <>
           "claude-agent-acp #{@adapter_version} and were withheld: " <>
           Enum.map_join(dropped, ", ", & &1.ref) <>
-          " — re-probe @adapter_selectable_models in harness/claude.ex if this looks wrong"
+          " — if an expected model is here, the harness home has not been used yet and its " <>
+          "model cache is empty; onboarding warms it, and first use fills it"
       )
     end
 
@@ -491,7 +625,7 @@ defmodule Tightbeam.Harness.Claude do
       provider: credential_provider(),
       home_scope: wire_name(),
       home_env: "CLAUDE_CONFIG_DIR",
-      credential_file: "oauth-token",
+      credential_file: @credential_file,
       credential_live: %{
         live_fixture: Application.app_dir(:tightbeam, "priv/credential_live/claude-live.json"),
         dead_fixture: Application.app_dir(:tightbeam, "priv/credential_live/claude-dead.json")
@@ -499,16 +633,24 @@ defmodule Tightbeam.Harness.Claude do
       rails_file: "settings.json",
       rails: %{"hooks" => %{"PreToolUse" => []}},
       skills_path: Path.join([".claude", "skills"]),
+      # A subscription contributes NO credential env: the harness reads its own
+      # `.credentials.json` out of the home and refreshes it there.
       local_extra_env: %{
-        subscription: [{"CLAUDE_CODE_OAUTH_TOKEN", "vector-token"}],
+        subscription: [],
         api_key: [{"ANTHROPIC_API_KEY", "vector-token"}]
       },
       rails_env: nil,
       remote_prefix: fn base, home, kind ->
-        [
-          "#{credential_env_var(kind)}=$(cat #{Path.join([base, "auth", "claude", "oauth-token"])} 2>/dev/null)",
-          "CLAUDE_CONFIG_DIR=#{home}"
-        ]
+        case kind do
+          :subscription ->
+            ["CLAUDE_CONFIG_DIR=#{home}"]
+
+          :api_key ->
+            [
+              "#{credential_env_var(kind)}=$(cat #{Path.join([base, "auth", "claude", @credential_file])} 2>/dev/null)",
+              "CLAUDE_CONFIG_DIR=#{home}"
+            ]
+        end
       end,
       remote_rails_env: nil,
       railed_probe: false,
@@ -570,9 +712,20 @@ defmodule Tightbeam.Harness.Claude do
         "unavailable" => {:error, :unavailable}
       },
       catalog_state: fn case_name, base ->
-        token = Path.join([base, "auth", "claude", "oauth-token"])
+        token = Path.join([base, "auth", "claude", @credential_file])
         File.mkdir_p!(Path.dirname(token))
-        File.write!(token, "vector-token")
+        kind = if(case_name == "valid_api_key", do: :api_key, else: :subscription)
+
+        credential =
+          case kind do
+            :api_key ->
+              "vector-token"
+
+            :subscription ->
+              JSON.encode!(%{"claudeAiOauth" => %{"accessToken" => "vector-token"}})
+          end
+
+        File.write!(token, credential)
 
         body =
           JSON.encode!(%{
@@ -591,11 +744,15 @@ defmodule Tightbeam.Harness.Claude do
         # The stand-in asserts the header it was called with, so a case cannot
         # pass while sending the other kind's.
         fetch = fn _path, headers ->
-          names = Enum.map(headers, fn {name, _value} -> to_string(name) end)
-          expected = if case_name == "valid_api_key", do: "x-api-key", else: "authorization"
+          headers = Map.new(headers, fn {name, value} -> {to_string(name), to_string(value)} end)
 
-          if expected not in names do
-            raise "claude catalog probe sent #{inspect(names)}, expected #{expected}"
+          {expected, value} =
+            if case_name == "valid_api_key",
+              do: {"x-api-key", "vector-token"},
+              else: {"authorization", "Bearer vector-token"}
+
+          if headers[expected] != value do
+            raise "claude catalog probe sent #{inspect(headers)}, expected #{expected}: #{value}"
           end
 
           case case_name do
@@ -613,7 +770,7 @@ defmodule Tightbeam.Harness.Claude do
         # of the table.
         %{
           base_dir: base,
-          credential_kind: if(case_name == "valid_api_key", do: :api_key, else: :subscription),
+          credential_kind: kind,
           options: %{claude_fetch: fetch, claude_selectable_models: :all}
         }
       end,

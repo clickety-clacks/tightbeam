@@ -450,7 +450,7 @@ mod tests {
         let endpoint = dispatch::Endpoint {
             base: "http://127.0.0.1:1".to_owned(),
             token: "tbc_test".to_owned(),
-            session_file: None,
+            origin: crate::dispatch::Origin::Provisioned,
         };
         let error =
             load_endpoint_with_deadline(&endpoint, Some(Instant::now() - Duration::from_millis(1)))

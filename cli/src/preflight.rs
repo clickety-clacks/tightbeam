@@ -191,14 +191,6 @@ pub fn missing_harness_cli(binary: &str, harness: &str, host: &str, search_path:
     )
 }
 
-/// The same shape for a tool that is neither ours nor a vendor's harness.
-pub fn missing_system_tool(binary: &str, purpose: &str, host: &str, search_path: &str) -> String {
-    format!(
-        "{binary} is missing on {host}: it is not on this shell's PATH. {purpose} Install \
-         {binary} on {host} and re-run.\nPATH searched: {search_path}"
-    )
-}
-
 pub fn verdict(
     requirements: &[Requirement],
     observation: &Observation,

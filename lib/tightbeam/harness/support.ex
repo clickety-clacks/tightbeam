@@ -1043,7 +1043,8 @@ defmodule Tightbeam.Harness.Support do
     end
   end
 
-  defp bounded_run(run, command, timeout) do
+  @doc false
+  def bounded_run(run, command, timeout) do
     case bounded_call(fn -> run.(command) end, timeout) do
       {:ok, result} -> {:ok, result}
       :timeout -> {:error, "timed out after #{timeout}ms"}
