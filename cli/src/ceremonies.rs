@@ -939,9 +939,11 @@ fn ask_for_code(url: &str) -> Result<String, StageFailure> {
         .map_err(|error| StageFailure::from(format!("could not read the code: {error}")))?;
     let line = line.trim().to_owned();
     if line.is_empty() {
-        return Err("no code was provided; onboarding needs the code the sign-in page shows"
-            .to_owned()
-            .into());
+        return Err(
+            "no code was provided; onboarding needs the code the sign-in page shows"
+                .to_owned()
+                .into(),
+        );
     }
     Ok(line)
 }
@@ -1654,7 +1656,18 @@ fn ship_current_cli(
                 "BatchMode=yes".to_owned(),
                 "--".to_owned(),
                 executable.display().to_string(),
-                format!("{ssh_dest}:{}", shell_quote(&staged_cli)),
+                // NOT `shell_quote`d, unlike every `ssh` command below. scp has shipped the
+                // SFTP protocol by default since OpenSSH 9.0, and SFTP takes this path
+                // LITERALLY -- there is no remote shell to remove quotes, so quoting it
+                // makes the quotes part of the filename and the parent directory does not
+                // exist. Measured on OpenSSH_9.6p1:
+                //   dest open "'/home/clu/.tightbeam/bin/.tightbeam.update-...'": No such
+                //   file or directory
+                // while the same unquoted destination lands. Spaces survive regardless,
+                // because SFTP never word-splits; the quoting only ever existed to survive
+                // a shell that is no longer in the path. `remote_path` above stays quoted --
+                // those DO reach a shell.
+                format!("{ssh_dest}:{staged_cli}"),
             ],
         )?;
         ssh(
@@ -2694,11 +2707,23 @@ mod tests {
         assert_eq!(io.commands[3].0, "scp");
         assert_eq!(io.commands[3].1[2], "--");
         assert_eq!(io.commands[3].1[3], "/tmp/tightbeam");
-        assert!(
+        // The destination is LITERAL, quotes and all absent. This assertion used to require
+        // the shell-quoted form and so pinned a real bug in place: under SFTP -- scp's
+        // default since OpenSSH 9.0 -- the quotes become part of the filename and assimilate
+        // cannot install the CLI on any modern host. The space in "tight beam" is still the
+        // point of the fixture: it must survive UNQUOTED, because SFTP never word-splits.
+        assert_eq!(
             io.commands[3].1[4]
-                .starts_with("-mistyped-host:'/srv/tight beam/bin/.tightbeam.update-")
+                .split(".tightbeam.update-")
+                .next()
+                .unwrap(),
+            "-mistyped-host:/srv/tight beam/bin/"
         );
-        assert!(io.commands[3].1[4].ends_with('\''));
+        assert!(
+            !io.commands[3].1[4].contains('\''),
+            "an SFTP destination must not be shell-quoted: {}",
+            io.commands[3].1[4]
+        );
     }
 
     #[test]
@@ -3063,12 +3088,13 @@ mod tests {
         ] {
             assert!(probe.contains(expected), "probe must observe {expected}");
         }
+        // Literal, not shell-quoted — see the SFTP note at the scp call site.
         assert!(
             io.commands[5]
                 .1
                 .last()
                 .unwrap()
-                .contains(":'/Users/remote/.tightbeam/bin/.tightbeam.update-")
+                .contains(":/Users/remote/.tightbeam/bin/.tightbeam.update-")
         );
         let chmod = io.commands[6].1.last().unwrap();
         assert!(chmod.starts_with("chmod +x "));
