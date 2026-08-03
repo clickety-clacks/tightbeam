@@ -13,7 +13,7 @@ clean" — the first full run after `model-identity` merged to main (3441879).
 | T2b client journeys | PASS | RUN VERDICT PASS, claude@eezo + codex@eezo |
 | T0 V0 neutral seed | PASS | learn/unlearn round-trips to exactly the seed |
 | T0 V3 ambient login | PASS | the open question is answered — see below |
-| T4 soak | see final section | 60 min, running at time of writing |
+| T4 soak | FAIL | 58 kills, 29/29 recovered; A1+A3 fail on missing RECORDS |
 | T3c N3 | PASS | boot refuses by name, binds no port |
 | T3a/T3b/N1/N2 | SKIP (named) | shrdlu holds no codex credential; interactive onboarding needs Flynn |
 
@@ -136,9 +136,63 @@ absent from it, and built an explanation without checking the code path that nam
 directory. Recorded because it is the same reason-instead-of-check failure this codebase
 keeps punishing, committed while writing up someone else's instance of it.
 
-## Soak
+## Soak — VERDICT FAIL, two real findings, both caught on its first honest run
 
-Started 04:07 local, 60 minutes, arena `~/.tightbeam-soak` against a borrowed eezo claude
-credential. Self-check first: session spawn, adapter SIGKILL recovered in 95ms, gateway
-SIGTERM 3927ms, gateway SIGKILL 1077ms, cancel_turn ok, `audit verdict=PASS`. Final
-verdict appended below when the run lands.
+Ran the full 60 minutes. **58 kill events, 29 recoveries, ZERO failures to recover** —
+adapter SIGKILL in 95ms, gateway SIGTERM in 3927ms, gateway SIGKILL in 1091ms, cancel_turn
+clean, 145 turns delivered. Recovery itself is in good shape and that is worth saying
+plainly, because the verdict is FAIL and the two are not in conflict.
+
+Final scorecard: A2, A4, A5 PASS for the whole run; A1 and A3 FAIL. Both failures are
+about what the substrate FAILED TO WRITE DOWN, not about whether it recovered.
+
+**A3 — a fast-recovered adapter death is never recorded.** `adapter_down` rows exist for
+adapters that died because the *gateway* was SIGKILLed (`{:acp_exit, 137}`), and never for
+a direct adapter kill, which recovers in ~95ms. `adapter_coordinator.ex:508` writes the
+event only inside the stale-`:DOWN` guard (`entry.monitor == ref`). That guard is correct
+and important — without it a replacement started before the `:DOWN` arrives would be nil'd
+and restarted, leaking adapters. But it wraps the **record** as well as the **action**, so
+when recovery is fastest — when the substrate is working best — the death is absorbed and
+nothing is written down. The fast/slow split in the evidence is exactly what that predicts.
+An operator auditing adapter health sees zero deaths on a machine where adapters were
+killed and replaced. Recovery being automatic is right; recovery being invisible is not.
+
+**A1 — a hard gateway kill orphans queued turns.** Three turns end the run permanently
+`queued`, `startedAt` NULL, no error, against 145 delivered. Each one's `createdAt` lands
+within milliseconds of a `gateway_sigkill` (42ms, 5ms). The gateway itself recovers every
+time; the turn queued at the moment of death is never started and never failed. It is lost
+work that announces nothing — a queued turn that will never run is indistinguishable from
+one about to run. SIGTERM does not do this, so it is specific to the path where no shutdown
+hook runs to drain. On boot, such a turn should be re-queued or failed BY NAME; which one is
+a product decision, but either beats silence.
+
+Both oracles are correct and should not be relaxed to go green.
+
+## Fixed during the run
+
+Two of the findings above were repaired rather than only recorded, because both break a
+fresh install rather than merely reporting it badly:
+
+- `fca6f0d` + `e265563` — the warm now hands the home over by `CLAUDE_CONFIG_DIR`. Review
+  BLOCKed my first attempt for a good reason: the new tests joined argv and matched a
+  substring, so they would have passed for an assignment with no `env` — right text, still
+  broken. They now assert the exact argv, local and remote, and are verified red against
+  both broken forms.
+- `e182ed4` → `f0de398` → `f3a00e4` — an expired subscription token is renewed in
+  `catalog-probe` rather than ending the install. The user-agent is load-bearing: without a
+  Claude Code agent string the token endpoint answers 403, which reads exactly like a
+  revoked credential. Two review rounds, seven findings, and the ones that mattered were
+  mine to be embarrassed by: a comment asserting a safeguard that did not exist (an
+  undateable record was live forever, never renewing — the original deadlock); a successful
+  grant discarded when the save failed, which converts a renewable credential into an
+  unrecoverable one; an empty refresh token accepted and stored; and a commit message
+  claiming two tests that were never added, on a green suite.
+
+That last one is the lesson worth keeping from this run. **A patch that silently fails to
+apply leaves a green suite, and green is indistinguishable from covered.** I verified the
+colour instead of the count. Since then: the two missing tests exist, and each was run
+against the code it claims to catch. Making the second one honest took three attempts —
+the first asserted that two SEQUENTIAL writes do not collide (they never do; only
+concurrent ones race), the second planted the wrong filename and passed by missing its own
+target. Two false receipts before one real test. The true concurrency property is not
+claimed at all, because a sequential test cannot establish it.
