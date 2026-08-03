@@ -773,7 +773,7 @@ fn codex_staged_a_credential(status: ExitStatus, staging: &str, what: &str) -> R
 /// install, the metadata, the home reconcile) is then identical between the two
 /// kinds; only the recorded kind differs.
 fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
-    let path = std::path::Path::new(staging).join("oauth-token");
+    let path = std::path::Path::new(staging).join(".credentials.json");
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1927,11 +1927,10 @@ mod tests {
         assert!(!message.contains("rejected"), "{message}");
     }
 
-    /// An API key is staged under the SAME filename the subscription ceremony
-    /// stages, at the same 0600, so everything downstream is identical between
-    /// the two kinds and only the recorded kind differs.
+    /// The actual filename emitted by Rust must be one the Elixir gateway accepts.
+    /// Testing each language's hard-coded belief separately missed this contract.
     #[test]
-    fn an_anthropic_api_key_stages_like_a_setup_token() {
+    fn an_anthropic_api_key_stages_a_filename_the_gateway_accepts() {
         use std::os::unix::fs::PermissionsExt;
 
         let staging = std::env::temp_dir().join(format!(
@@ -1944,7 +1943,23 @@ mod tests {
 
         bank_anthropic_api_key(staging.to_str().unwrap(), "sk-ant-api03-test").unwrap();
 
-        let staged = staging.join("oauth-token");
+        let entries = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the ceremony must stage exactly one credential"
+        );
+        let filename = &entries[0];
+        let gateway = include_str!("../../lib/tightbeam/credentials.ex");
+        assert!(
+            gateway.contains(&format!("File.read(Path.join(path, \"{filename}\"))")),
+            "Rust staged {filename}, but the Elixir gateway does not read that filename"
+        );
+
+        let staged = staging.join(filename);
         assert_eq!(fs::read_to_string(&staged).unwrap(), "sk-ant-api03-test");
         let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);

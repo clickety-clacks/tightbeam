@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-mechanics='CODEX_HOME|CLAUDE_CONFIG_DIR|codex-acp|claude-agent-acp|auth\.json|oauth-token|settings\.json|hooks\.json|CLAUDE_CODE_OAUTH_TOKEN|CODEX_CONFIG'
+mechanics='CODEX_HOME|CLAUDE_CONFIG_DIR|codex-acp|claude-agent-acp|auth\.json|\.credentials\.json|settings\.json|hooks\.json|CLAUDE_CODE_OAUTH_TOKEN|CODEX_CONFIG'
 # A bare harness NAME in executable code is a seam break on its own, not only
 # in pairs: a default like `Keyword.get(opts, :harness, "claude")` silently
 # pins one harness and survives a registry change (found by cross-review of

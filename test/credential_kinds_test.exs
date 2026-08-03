@@ -587,6 +587,25 @@ defmodule Tightbeam.CredentialKindsTest do
   # ------------------------------------------------------------------
 
   describe "liveness probes the route its kind can reach" do
+    test "the liveness reader handles each credential as its recorded kind", ctx do
+      subscription_home = Path.join(ctx.base, "subscription-home")
+      api_key_home = Path.join(ctx.base, "api-key-home")
+      File.mkdir_p!(subscription_home)
+      File.mkdir_p!(api_key_home)
+
+      File.write!(
+        Path.join(subscription_home, ".credentials.json"),
+        ~s({"claudeAiOauth":{"accessToken":"subscription-access","refreshToken":"must-not-leak"}})
+      )
+
+      File.write!(Path.join(api_key_home, ".credentials.json"), "api-key-secret\n")
+
+      assert %{"Authorization" => "Bearer subscription-access"} =
+               liveness_headers(subscription_home, :subscription)
+
+      assert %{"x-api-key" => "api-key-secret"} = liveness_headers(api_key_home, :api_key)
+    end
+
     test "a rejected api key is dead, from the vendor's own recorded refusal" do
       # RECORDED LIVE 2026-07-28 against api.anthropic.com with an invalid key.
       # The vendor's answer to `x-api-key` ("API key is invalid.") is a different
@@ -644,6 +663,44 @@ defmodule Tightbeam.CredentialKindsTest do
            body: JSON.encode!(recording["body"])
          }}
       end
+    end
+
+    defp liveness_headers(home, kind) do
+      owner = self()
+
+      transport = fn _target, %{command: ["node", "--no-warnings", "-e", script | args]} ->
+        mock_fetch = """
+        global.fetch = async (_url, options) => ({
+          status: 200,
+          headers: {get: () => "application/json"},
+          text: async () => JSON.stringify(options.headers)
+        });
+        """
+
+        {output, 0} = System.cmd("node", ["--no-warnings", "-e", mock_fetch <> script | args])
+        decoded = JSON.decode!(output)
+
+        response = %{
+          status: decoded["status"],
+          headers: decoded["headers"],
+          body: decoded["body"]
+        }
+
+        send(owner, {:liveness_headers, JSON.decode!(response.body)})
+        {:ok, response}
+      end
+
+      assert :live =
+               Claude.credential_live?(
+                 %{host_config: %{ssh: nil}, sh: fn _ -> {"", 0} end},
+                 home,
+                 transport: transport,
+                 timeout_ms: 500,
+                 credential_kind: kind
+               )
+
+      assert_receive {:liveness_headers, headers}
+      Map.drop(headers, ["anthropic-version", "User-Agent"])
     end
   end
 end

@@ -303,11 +303,15 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def credential_live?(target, home, opts) do
-    {header, scheme} = credential_header(Keyword.fetch!(opts, :credential_kind))
+    kind = Keyword.fetch!(opts, :credential_kind)
+    {header, scheme} = credential_header(kind)
 
     script = """
     const fs = require("node:fs");
-    const credential = fs.readFileSync(process.argv[1], "utf8").trim();
+    const raw = fs.readFileSync(process.argv[1], "utf8");
+    const credential = process.argv[4] === "subscription"
+      ? JSON.parse(raw).claudeAiOauth.accessToken.trim()
+      : raw.trim();
     fetch("https://api.anthropic.com/v1/models?limit=1", {
       headers: {
         [process.argv[2]]: process.argv[3] + credential,
@@ -336,7 +340,8 @@ defmodule Tightbeam.Harness.Claude do
         script,
         Path.join(home, @credential_file),
         header,
-        scheme
+        scheme,
+        Atom.to_string(kind)
       ]
     }
 
@@ -713,9 +718,18 @@ defmodule Tightbeam.Harness.Claude do
       catalog_state: fn case_name, base ->
         token = Path.join([base, "auth", "claude", @credential_file])
         File.mkdir_p!(Path.dirname(token))
-        # The subscription credential is Claude Code's OAuth record, not a bare token: the
-        # bearer sent to the catalog is a field inside it.
-        File.write!(token, JSON.encode!(%{"claudeAiOauth" => %{"accessToken" => "vector-token"}}))
+        kind = if(case_name == "valid_api_key", do: :api_key, else: :subscription)
+
+        credential =
+          case kind do
+            :api_key ->
+              "vector-token"
+
+            :subscription ->
+              JSON.encode!(%{"claudeAiOauth" => %{"accessToken" => "vector-token"}})
+          end
+
+        File.write!(token, credential)
 
         body =
           JSON.encode!(%{
@@ -734,11 +748,15 @@ defmodule Tightbeam.Harness.Claude do
         # The stand-in asserts the header it was called with, so a case cannot
         # pass while sending the other kind's.
         fetch = fn _path, headers ->
-          names = Enum.map(headers, fn {name, _value} -> to_string(name) end)
-          expected = if case_name == "valid_api_key", do: "x-api-key", else: "authorization"
+          headers = Map.new(headers, fn {name, value} -> {to_string(name), to_string(value)} end)
 
-          if expected not in names do
-            raise "claude catalog probe sent #{inspect(names)}, expected #{expected}"
+          {expected, value} =
+            if case_name == "valid_api_key",
+              do: {"x-api-key", "vector-token"},
+              else: {"authorization", "Bearer vector-token"}
+
+          if headers[expected] != value do
+            raise "claude catalog probe sent #{inspect(headers)}, expected #{expected}: #{value}"
           end
 
           case case_name do
@@ -756,7 +774,7 @@ defmodule Tightbeam.Harness.Claude do
         # of the table.
         %{
           base_dir: base,
-          credential_kind: if(case_name == "valid_api_key", do: :api_key, else: :subscription),
+          credential_kind: kind,
           options: %{claude_fetch: fetch, claude_selectable_models: :all}
         }
       end,
