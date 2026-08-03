@@ -72,8 +72,10 @@ defmodule Tightbeam.ReadinessTest do
     pid
   end
 
+  # A real entry always carries its provider — routing reads it — so the stub's
+  # must too, or the fixture would be a shape the catalog never produces.
   defp live(family, efforts \\ ["medium"]),
-    do: {[%{family: family, context: nil, efforts: efforts}], :fresh}
+    do: {[%{family: family, context: nil, efforts: efforts, provider: :anthropic}], :fresh}
 
   ## The verdict
 
@@ -198,6 +200,83 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "TIGHTBEAM_DEFAULT_MODEL"
   end
 
+  # THE WRONG CAUSE (task #12). A tiered model named with no effort IS in the
+  # live catalog; what is missing is the tier. Blaming the catalog sends the
+  # operator to `catalog.diff` to hunt for a model that is already there — the
+  # same defect class adjudication was fixed for, surviving in a second copy
+  # because readiness derived its own narrower answer.
+  test "a default model missing only its effort tier is refused by the tier, not the catalog",
+       ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+    catalog = catalog!(%{module.wire_name() => live("tiered-model", ["low", "medium", "high"])})
+    config = %{ctx.config | default_model: Model.new("tiered-model")}
+
+    line =
+      config
+      |> Readiness.summary(catalog)
+      |> Readiness.render(config)
+      |> Enum.find(&(&1 =~ "tiered-model"))
+
+    assert line, "the tier gap must be named at all"
+    assert line =~ "effort tiers"
+    assert line =~ "low|medium|high"
+    assert line =~ "TIGHTBEAM_DEFAULT_EFFORT"
+
+    # The lie: the model IS in the live catalog, so this must not be the refusal.
+    refute line =~ "is not in #{module.wire_name()}'s live catalog"
+  end
+
+  # The catalog can fail for its OWN reason, with a working credential: the codex
+  # models endpoint drops every model for a too-old client_version and returns
+  # 200. No other row says that — the credential row calls it "degraded" — so a
+  # model row that defers here is how the one honest diagnosis failed to reach
+  # boot at all.
+  test "a catalog emptied by a client_version filter blames the binary at boot", ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+
+    catalog =
+      catalog!(%{
+        module.wire_name() => {[], {:unavailable, {:empty_catalog_for_client_version, "0.99.0"}}}
+      })
+
+    line =
+      ctx.config
+      |> Readiness.summary(catalog)
+      |> Readiness.render(ctx.config)
+      |> Enum.find(&(&1 =~ "default model"))
+
+    assert line, "the catalog's own failure must be named"
+    assert line =~ ~s(EMPTY model list for client_version "0.99.0")
+    assert line =~ "credential is not implicated"
+    assert line =~ "upgrade #{module.wire_name()}"
+
+    # …and boot adds no remedy of its own, because re-picking a model cannot
+    # repair a catalog that was never derived.
+    refute line =~ "TIGHTBEAM_DEFAULT_MODEL"
+    refute line =~ "TIGHTBEAM_DEFAULT_EFFORT"
+  end
+
+  test "a model with no tiers is told to UNSET the effort, not to pick one", ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+    # ctx.config's default is `m` at effort medium; this entry offers no tiers.
+    catalog = catalog!(%{module.wire_name() => live("m", [])})
+
+    line =
+      ctx.config
+      |> Readiness.summary(catalog)
+      |> Readiness.render(ctx.config)
+      |> Enum.find(&(&1 =~ "default model"))
+
+    assert line =~ "has no effort tiers"
+    assert line =~ "unset TIGHTBEAM_DEFAULT_EFFORT"
+
+    # The remedy that cannot work: there is no tier to name.
+    refute line =~ "to one of the tiers it offers"
+  end
+
   test "an archetype whose where names no registered host is called out", ctx do
     catalog = catalog!(%{})
 
@@ -276,10 +355,19 @@ defmodule Tightbeam.ReadinessTest do
     # nothing (adapter present, credential live, model unknown) is unreachable
     # through summary/2 today, but the invariant lives in two functions that do
     # not know about each other.
+    unroutable = %Tightbeam.Unroutable{
+      cause: :family_absent,
+      host: "somehost",
+      harness: "h",
+      selection: Model.new("m"),
+      health: [{"h", :fresh}],
+      offered: []
+    }
+
     rows =
       for adapter <- [:present, {:missing, "/p"}, {:unknown, :not_probed_on_satellite}],
           credential <- [:live, {:absent, :missing}, {:unknown, :x}, {:degraded, :y}],
-          model <- [:selectable, {:absent, "m"}, :unknown] do
+          model <- [:selectable, :unset, {:unroutable, unroutable}, :unknown] do
         %{
           host: "somehost",
           base_dir: "/some/base",
