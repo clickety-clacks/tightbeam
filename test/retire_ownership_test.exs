@@ -13,6 +13,7 @@ defmodule Tightbeam.RetireOwnershipTest do
   `session_mutation_allowed/3` happens to grant admins for other mutations.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Assignments,
@@ -206,7 +207,7 @@ defmodule Tightbeam.RetireOwnershipTest do
           host: "testhost",
           harness: "claude",
           provider: "anthropic",
-          model: "fable"
+          model: Model.new("fable")
         },
         Map.new(opts)
       )

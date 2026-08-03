@@ -5,8 +5,8 @@
 #   TIGHTBEAM_CLIENT_E2E_PORT=12100 \
 #   TIGHTBEAM_CLIENT_E2E_HARNESSES=claude,codex \
 #   TIGHTBEAM_CLIENT_E2E_JOURNEYS=J0,J7 \
-#   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5[medium]' \
-#   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol[medium]' \
+#   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
+#   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
 #   mix run --no-start scripts/client_e2e.exs
 #
 # Per leg, in this order — the order IS the contract:

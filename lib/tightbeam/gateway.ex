@@ -78,6 +78,7 @@ defmodule Tightbeam.Gateway do
     Idempotency,
     LaneManager,
     Ledger,
+    Model,
     ModelCatalog,
     Org,
     Projection,
@@ -119,7 +120,7 @@ defmodule Tightbeam.Gateway do
           cwd: String.t(),
           port: non_neg_integer(),
           default_harness: atom(),
-          default_model: String.t(),
+          default_model: Model.t(),
           max_live_sessions_per_user: pos_integer(),
           wake_tick_ms: pos_integer(),
           prod_limit: non_neg_integer(),
@@ -1079,7 +1080,7 @@ defmodule Tightbeam.Gateway do
       archetypes:
         Enum.map(Archetypes.names(), fn name ->
           a = Archetypes.get(name)
-          %{name: a.name, where: a.where, defaults: a.defaults}
+          %{name: a.name, where: a.where, defaults: wire_defaults(a.defaults)}
         end)
     }
   end
@@ -1101,11 +1102,17 @@ defmodule Tightbeam.Gateway do
          {wire,
           catalog
           |> Map.get({host, wire}, [])
-          |> Enum.map(fn model ->
-            model
-            |> Map.put(:id, model.ref)
-            |> Map.put(:name, model.display_name)
-            |> Map.put(:provider, model.provider)
+          |> Enum.map(fn entry ->
+            # PROJECTED, not spread: the catalog entry's internal shape (its
+            # `family` key) stays inside. What crosses is the identity's named
+            # fields plus the catalog facts a caller picks a model on.
+            Map.merge(wire_model(entry), %{
+              name: entry.display_name,
+              display_name: entry.display_name,
+              provider: entry.provider,
+              max_input_tokens: entry.max_input_tokens,
+              capabilities: entry.capabilities
+            })
           end)}
        end)}
     end)
@@ -1136,17 +1143,15 @@ defmodule Tightbeam.Gateway do
         model_preferences =
           case archetype.model_preferences do
             [] -> nil
-            preferences -> preferences
+            preferences -> Enum.map(preferences, &wire_preference/1)
           end
 
-        {base_model, effort} = current_model_parts(session.model)
         {catalog, _health} = ModelCatalog.get(session.host, session.harness, ModelCatalog)
         unsupported = fn reason -> %{supported: false, reason: reason} end
 
-        models_once = Enum.uniq_by(catalog, &base_ref(&1.ref))
-
         current_efforts =
-          case Enum.find(catalog, &(not is_nil(base_model) and base_ref(&1.ref) == base_model)) do
+          case session.model &&
+                 Enum.find(catalog, &ModelCatalog.names_same_model?(&1, session.model)) do
             nil -> []
             entry -> entry.efforts
           end
@@ -1155,7 +1160,7 @@ defmodule Tightbeam.Gateway do
           case current_efforts do
             [] ->
               reason =
-                if is_nil(base_model),
+                if is_nil(session.model),
                   do: "current model is unknown",
                   else: "current model has no effort tiers"
 
@@ -1174,18 +1179,21 @@ defmodule Tightbeam.Gateway do
           # populates (found live; the TS reference omitted it too).
           sessionKey: session_key,
           display: %{
-            # Base ref only: the footer both displays this text verbatim when
-            # it can't match a catalog row and matches it against the (now
-            # base-ref) catalog rows for the current-model checkmark. The
-            # effort qualifier is carried separately in reasoningLevel.
-            model: base_model || "unknown",
+            # `model` is the row IDENTITY this seam issues (see `wire_model/1`):
+            # the footer displays it verbatim when it cannot match a catalog row,
+            # and matches it against the catalog rows for the current-model
+            # checkmark. The identity's FIELDS travel beside it, named, and are
+            # what a caller reads or sends back.
+            model: (session.model && wire_identity(session.model)) || "unknown",
+            modelFamily: session.model && session.model.family,
+            modelContext: session.model && session.model.context,
             modelPreferences: model_preferences,
             provider: session.provider,
             harness: session.harness,
             host: session.host,
             credentialKind: credential_kind(session),
             authMode: nil,
-            reasoningLevel: effort,
+            reasoningLevel: session.model && session.model.effort,
             thinkingLevel: nil,
             fastMode: nil,
             mode: nil,
@@ -1205,7 +1213,13 @@ defmodule Tightbeam.Gateway do
             setModel: %{
               supported: true,
               options:
-                Enum.map(models_once, &%{title: &1.name, value: base_ref(&1.ref), enabled: true})
+                Enum.map(
+                  catalog,
+                  &Map.merge(
+                    %{title: &1.name, value: wire_identity(&1), enabled: true},
+                    wire_model(&1)
+                  )
+                )
             },
             setThinking: unsupported.("thinking control lands in a later milestone"),
             setReasoning: reasoning_capability,
@@ -1222,31 +1236,223 @@ defmodule Tightbeam.Gateway do
           modelCatalog: %{
             available: true,
             # Client Model decoder REQUIRES id + provider + ref (id is the
-            # stable identity; ref doubles as it here). The client's model
-            # picker reads THIS list (falling back to setModel.options only
-            # when unavailable) and sends ref back as the set_model value, so
-            # rows are one-per-model with base refs — tune_result composes
-            # the effort qualifier from the reasoning selection.
+            # stable identity; ref doubles as it here). One row per vendor
+            # model — including each context variant, which is part of the
+            # identity — with the effort tier owned by the reasoning picker.
+            # `model`/`context`/`efforts` are the row's named fields.
             models:
               Enum.map(
-                models_once,
-                &%{
-                  id: base_ref(&1.ref),
-                  ref: base_ref(&1.ref),
-                  name: &1.name,
-                  provider: session.provider
-                }
+                catalog,
+                &Map.merge(%{name: &1.name, provider: session.provider}, wire_model(&1))
               )
           }
         }
     end
   end
 
-  defp current_model_parts(ref) when is_binary(ref), do: Adapter.parse_model_ref(ref)
-  defp current_model_parts(_unknown), do: {nil, nil}
+  # A catalog entry's wire/vendor identity. The entry holds the fields; this is
+  # the one line of text a client needs to name the row back to us.
+  @doc false
+  # THE WIRE SEAM's projection of a model identity, both halves in one place.
+  #
+  # `model`/`context`/`efforts` are the named fields the ruling requires: they
+  # are the payload's meaning, and `resolve_selection/3` reads them back.
+  #
+  # `id`/`ref` is one line of text because the client's decoder has ONE slot for
+  # a model's stable identity and must tell two context variants of one family
+  # apart. It is this seam's line format and nothing downstream parses it — a
+  # value coming back is RESOLVED against the catalog that issued it, never
+  # split with a regex. It is spelled the way the vendor spells the model
+  # because that is what a human should see in a picker.
+  # ASSUMED, and it is the vendor's to keep: a family name contains no literal
+  # bracket. The `model` slot's two readings — a family, or a family carrying a
+  # context variant — both depend on it. A vendor that broke it would have
+  # broken its own identifiers first.
+  def wire_model(entry) do
+    identity = wire_identity(entry)
 
-  defp base_ref(nil), do: nil
-  defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
+    %{
+      id: identity,
+      # DELETE `ref` once the client decoder stops requiring both: it is a
+      # duplicate of `id` and exists for no other reason.
+      ref: identity,
+      model: entry.family,
+      context: entry.context,
+      efforts: entry.efforts
+    }
+  end
+
+  # The inbound half of `wire_model/1`, and the one place a caller's named
+  # fields become an identity.
+  #
+  # Two steps. RESOLVE: a client sends back the row identity this seam issued,
+  # so it is looked up in the catalog that issued it — a lookup cannot invent a
+  # context the host does not offer, and cannot mistake one of our effort
+  # levels for the vendor's variant. An explicit `context` skips it.
+  #
+  # THE PROPERTY, because it is what to go looking for elsewhere: this function
+  # CANNOT DISTINGUISH A MISS FROM A HIT. Both return fields, and no caller can
+  # tell which happened. The disambiguation is downstream, and only there.
+  #
+  # RESOLUTION IS DELIBERATELY LENIENT: an id it cannot find passes through as
+  # if it were a family, and NOTHING here refuses it. That is safe only because
+  # resolve-then-validate is ONE PIPELINE — every caller hands the result to
+  # `validate_catalog_model/5`, which is where an unknown selection is refused
+  # by name against the host's live catalog. The gate lives there, once, at the
+  # boundary that knows the host. A future caller that resolves without
+  # validating reintroduces silent acceptance of an unknown model.
+  #
+  # COMPLETE: fields the caller omitted inherit the default, which is what the
+  # CLI promises. `--effort high` alone is the default model at high effort,
+  # not a flag accepted and dropped. Context and effort belong to a MODEL, so
+  # neither carries across a change of model — when the family changes they are
+  # left open for `compose_model_selection/4`, the one place that decides which
+  # tier a newly chosen model runs at.
+  defp resolve_selection(host, harness, params, base) do
+    params |> Model.named_fields() |> resolve_issued(host, harness) |> complete(base)
+  end
+
+  defp resolve_issued(%{family: family} = fields, host, harness)
+       when is_binary(family) and not is_map_key(fields, :context) do
+    {catalog, _health} = ModelCatalog.get(host, harness, ModelCatalog)
+
+    case Enum.find(catalog, &(wire_identity(&1) == family)) do
+      nil ->
+        fields
+
+      entry ->
+        # A resolved row states its context EXPLICITLY, `nil` included — the
+        # row for the default window is a real selection, not a silence. The
+        # key is put unconditionally so completion can tell the two apart.
+        fields |> Map.put(:family, entry.family) |> Map.put(:context, entry.context)
+    end
+  end
+
+  defp resolve_issued(fields, _host, _harness), do: fields
+
+  # Inheritance fills only what the caller left ABSENT. A key that is present
+  # — even holding nil — is the caller's answer and is taken as given.
+  defp complete(fields, base) when map_size(fields) == 0, do: base
+
+  defp complete(fields, base) when not is_map_key(fields, :family) do
+    case base do
+      %Model{} = base ->
+        %{
+          base
+          | effort: named_or(fields, :effort, base.effort),
+            context: named_or(fields, :context, base.context)
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  defp complete(%{family: family} = fields, base) do
+    inherits? = match?(%Model{}, base) and base.family == family
+
+    %Model{
+      family: family,
+      effort: named_or(fields, :effort, inherits? && base.effort),
+      context: named_or(fields, :context, inherits? && base.context)
+    }
+  end
+
+  defp named_or(fields, key, fallback) do
+    case Map.fetch(fields, key) do
+      {:ok, named} -> named
+      :error -> fallback || nil
+    end
+  end
+
+  # The one home for a published selection IN THIS MODULE — `model` the family,
+  # `context` the vendor's window variant, `effort` ours. Five call sites:
+  # `inspect_session/1`, the tune and adjudication responses,
+  # `wire_preference/1`, `wire_defaults/1`.
+  #
+  # SCOPED DELIBERATELY, because a wider claim here has now been false three
+  # times. Two other kinds of projection publish the same trio and do NOT come
+  # through here:
+  #
+  #   - the catalog ROW (`wire_model/1`) names a model rather than a choice: it
+  #     carries `efforts`, what MAY be asked, where a selection carries the one
+  #     `effort` that WAS.
+  #   - turn provenance (`Toplines.minds/1`, `Transcript`, `JobTrace`) reads
+  #     three COLUMNS and never holds a `%Model{}` at all.
+  #
+  # Both would have to build a struct only to flatten it again. Narrowing the
+  # claim costs nothing; leaving it wide invites the next reader to trust it
+  # further than it goes.
+  #
+  # A packed value alone would make a consumer split the string to recover the
+  # context, which is the parsing this refactor exists to end — the rendering
+  # belongs only where one line of text is structurally required, and that is
+  # the row's `id`.
+  defp published_identity(nil), do: %{model: nil, context: nil, effort: nil}
+
+  defp published_identity(%Model{} = model),
+    do: %{model: model.family, context: model.context, effort: model.effort}
+
+  # LOAD-BEARING: family and context ONLY. The whole dual representation rests
+  # on effort never reaching this slot — a bracket here can then mean exactly
+  # one thing, and the 1M collision needed two meanings competing for it.
+  # Rendering effort into this would silently restore that collision.
+  #
+  # The guard is the round-trip test in gateway_test.exs, "an issued row
+  # identity echoed back resolves to that row's fields", which asserts the
+  # effort came from the session and never from the id. It looks redundant
+  # beside the catalog tests; it is not. Do not delete it.
+  defp wire_identity(%{family: family, context: context}),
+    do: Model.to_ref(Model.new(family, context: context))
+
+  # Archetype defaults cross the wire as named fields. A stored default is a
+  # `%Model{}`, and publishing it raw would put `__struct__` and `family` — an
+  # INTERNAL shape — into a client payload (and fail JSON encoding outright).
+  defp wire_defaults(%{model: %Model{} = model} = defaults),
+    do: Map.merge(defaults, published_identity(model))
+
+  defp wire_defaults(defaults), do: defaults
+
+  # A stored preference crosses as named fields, like every other identity on
+  # this seam. It carries no `id`: a preference names a model the org prefers,
+  # not a row in some host's catalog.
+  defp wire_preference(%Model{} = model), do: published_identity(model)
+
+  # An agent reading `inspect` sees the identity as FIELDS, the same way it
+  # supplies them back on spawn.
+  defp inspect_session(session) do
+    session
+    |> Map.take([
+      :session_key,
+      :display_name,
+      :handle,
+      :archetype,
+      :host,
+      :harness,
+      :origin,
+      :spawned_by,
+      :state,
+      :created_at
+    ])
+    |> Map.merge(published_identity(session.model))
+  end
+
+  # A catalog entry for a reader who has to pick one — an operator reading a
+  # refusal, an adjudicator reading a brief. Fields are named, because what the
+  # reader must produce next is flags, not a packed string.
+  defp describe_entry(entry) do
+    qualifiers =
+      [
+        entry.context && "context #{entry.context}",
+        entry.efforts != [] && "efforts: #{Enum.join(entry.efforts, "|")}"
+      ]
+      |> Enum.filter(&is_binary/1)
+
+    case qualifiers do
+      [] -> entry.family
+      parts -> "#{entry.family} (#{Enum.join(parts, ", ")})"
+    end
+  end
 
   # Which KIND of credential this session's turns actually run on — an API key or
   # a subscription. A fact about {the session's host, its harness's provider},
@@ -1564,8 +1770,7 @@ defmodule Tightbeam.Gateway do
 
   defp adjudication_cause(_stage, _reason, _key), do: nil
 
-  defp session_model_display(model) when is_binary(model), do: model
-  defp session_model_display(_unknown), do: "unknown"
+  defp session_model_display(model), do: Model.describe(model)
 
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
@@ -1583,11 +1788,11 @@ defmodule Tightbeam.Gateway do
     cause=#{cause || "unclassified"}
     current_model=#{current_model}
     current_harness=#{session.harness}
-    model_preferences=#{JSON.encode!(archetype.model_preferences)}
+    model_preferences=#{Enum.map_join(archetype.model_preferences, ", ", &Model.describe/1)}
     live_catalog_host=#{session.host}
     live_catalog=#{JSON.encode!(inventories)}
 
-    Reply with: tightbeam adjudicate --episode <correlationKey> --action park|swap|respawn|stop [--model <ref>] [--reason <text>]
+    Reply with: tightbeam adjudicate --episode <correlationKey> --action park|swap|respawn|stop [--model <family>] [--effort <level>] [--context <variant>] [--reason <text>]
     """
   end
 
@@ -1597,7 +1802,8 @@ defmodule Tightbeam.Gateway do
   defp adjudication_model_inventories(session) do
     Map.new(Harness.all(), fn module ->
       {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
-      {module.wire_name(), %{health: inspect(health), models: Enum.map(models, & &1.ref)}}
+      {module.wire_name(),
+       %{health: inspect(health), models: Enum.map(models, &describe_entry/1)}}
     end)
   end
 
@@ -1906,12 +2112,12 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp capture_created_model(_db, _adapter, %{model: model}, _sid) when is_binary(model),
+  defp capture_created_model(_db, _adapter, %{model: %Model{}}, _sid),
     do: :ok
 
   defp capture_created_model(db, adapter, session, sid) do
     case Adapter.current_model(adapter, sid) do
-      {:ok, reported_model} when is_binary(reported_model) ->
+      {:ok, %Model{} = reported_model} ->
         _ = Org.set_model(db, session.session_key, reported_model, session.provider)
         :ok
 
@@ -2766,8 +2972,8 @@ defmodule Tightbeam.Gateway do
               %{
                 name: a.name,
                 where: a.where,
-                defaults: a.defaults,
-                modelPreferences: a.model_preferences
+                defaults: wire_defaults(a.defaults),
+                modelPreferences: Enum.map(a.model_preferences, &wire_preference/1)
               }
             end),
           hosts:
@@ -2776,23 +2982,7 @@ defmodule Tightbeam.Gateway do
         }
 
         result = %{
-          sessions:
-            Enum.map(
-              sessions,
-              &Map.take(&1, [
-                :session_key,
-                :display_name,
-                :handle,
-                :archetype,
-                :host,
-                :harness,
-                :model,
-                :origin,
-                :spawned_by,
-                :state,
-                :created_at
-              ])
-            ),
+          sessions: Enum.map(sessions, &inspect_session/1),
           wakes: wakes,
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
@@ -3062,16 +3252,24 @@ defmodule Tightbeam.Gateway do
     harness_atom = module.id()
     sessions = Org.list_for_user(db, caller.owner_user_id, false)
 
+    # One mechanism decides the tier, here as at tune: an effort the caller did
+    # not name is composed against what the chosen model actually offers.
+    default_model = archetype.defaults[:model] || defaults.model
+
     model =
-      p[:model] || archetype.defaults[:model] ||
-        defaults.model
+      compose_model_selection(
+        host,
+        harness_string,
+        default_model,
+        resolve_selection(host, harness_string, p, default_model)
+      )
 
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
 
     # Placement resolved the host FIRST, so the ref is judged against the account
     # that will actually run the turn (#88) — not the gateway's.
     with :ok <- validate_credential(config, harness_string, host),
-         :ok <- validate_catalog_model(config, host, harness_string, model, is_nil(p[:model])),
+         :ok <- validate_catalog_model(config, host, harness_string, model, from_default?(p)),
          :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
       input = %{
         display_name: p.display_name,
@@ -3200,20 +3398,16 @@ defmodule Tightbeam.Gateway do
             module = Harness.parse!(harness)
             harness_atom = module.id()
 
-            # Composed against the NEW harness, exactly as `set_model` composes against
-            # the current one. A picker offers base refs -- `setModel.options` and
-            # `modelCatalog.models` both advertise one row per model, deliberately, with
-            # the effort tier owned by the reasoning picker -- but the catalog only ever
-            # holds an effort-bearing model as `id[effort]`. So the value a client is
-            # told to send was refused here as "not offered by <harness> on <host>",
-            # while the same value through `set_model` was accepted. The advertised
-            # shape was never wrong; this path just never learned to compose (#69).
+            # Composed against the NEW harness, exactly as `set_model` composes
+            # against the current one: the wire names a vendor model, and the
+            # effort tier — owned by the reasoning picker — is carried over or
+            # chosen from what the new harness offers (#69).
             model =
               compose_model_selection(
                 session.host,
                 harness,
                 session.model,
-                p[:model] || config.default_model
+                resolve_selection(session.host, harness, p, config.default_model)
               )
 
             with :ok <- validate_credential(config, harness, session.host),
@@ -3223,7 +3417,7 @@ defmodule Tightbeam.Gateway do
                      session.host,
                      harness,
                      model,
-                     is_nil(p[:model])
+                     from_default?(p)
                    ),
                  :ok <-
                    Spinup.ensure_ready(
@@ -3312,10 +3506,10 @@ defmodule Tightbeam.Gateway do
                     Payloads.stream_history_cleared(call.session_key)
                   )
 
-                  %{
+                  published_identity(model)
+                  |> Map.merge(%{
                     ok: true,
                     harness: harness,
-                    model: model,
                     # The swap may have crossed providers, and the new provider's
                     # credential on this host may be a different kind. This is
                     # the one moment the value changes without the client polling
@@ -3324,7 +3518,7 @@ defmodule Tightbeam.Gateway do
                     credential_kind: credential_kind(Map.put(session, :harness, harness)),
                     note:
                       "engine swapped; chat cleared (rows retained); model context starts fresh"
-                  }
+                  })
               end
             else
               {:error, denial} ->
@@ -3376,7 +3570,12 @@ defmodule Tightbeam.Gateway do
 
           session ->
             new_ref =
-              compose_model_selection(session.host, session.harness, session.model, p.model)
+              compose_model_selection(
+                session.host,
+                session.harness,
+                session.model,
+                resolve_selection(session.host, session.harness, p, session.model)
+              )
 
             apply_model_change(config, db, call, session, new_ref)
         end
@@ -3386,7 +3585,7 @@ defmodule Tightbeam.Gateway do
           nil ->
             %{ok: false, code: "not_found"}
 
-          %{model: model} when not is_binary(model) ->
+          %{model: nil} ->
             %{
               ok: false,
               code: "model_unknown",
@@ -3394,7 +3593,7 @@ defmodule Tightbeam.Gateway do
             }
 
           session ->
-            new_ref = "#{base_ref(session.model)}[#{p.reasoningLevel}]"
+            new_ref = %{session.model | effort: p.reasoningLevel}
             apply_model_change(config, db, call, session, new_ref)
         end
 
@@ -3403,26 +3602,19 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # A bare model id (no "[effort]" suffix, e.g. from setModel.options) is
-  # composed with the session's current effort, falling back to "medium" or
-  # the first available tier when the current effort doesn't apply to the
-  # newly selected model. A ref already carrying "[effort]" is passed through
-  # unchanged (back-compat with callers that send a full ref directly).
-  defp compose_model_selection(host, harness, current_ref, selected) do
-    if String.contains?(selected, "[") do
-      selected
-    else
-      {_current_base, current_effort} = current_model_parts(current_ref)
-
-      case efforts_for(host, harness, selected) do
-        [] ->
-          selected
-
-        efforts ->
-          "#{selected}[#{pick_effort(efforts, current_effort)}]"
-      end
+  # A selection that names a model but no effort (the ordinary case from
+  # `setModel.options`, which offers models rather than tiers) takes the
+  # session's current effort, falling back to "medium" or the first available
+  # tier when the current one doesn't apply to the newly selected model. An
+  # explicit effort is honoured as given.
+  defp compose_model_selection(host, harness, current, %Model{effort: nil} = selected) do
+    case efforts_for(host, harness, selected) do
+      [] -> selected
+      efforts -> %{selected | effort: pick_effort(efforts, current && current.effort)}
     end
   end
+
+  defp compose_model_selection(_host, _harness, _current, %Model{} = selected), do: selected
 
   defp pick_effort(efforts, current_effort) do
     cond do
@@ -3432,12 +3624,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp efforts_for(host, harness, base_model) do
-    {catalog, _health} = ModelCatalog.get(host, harness, ModelCatalog)
-
-    case Enum.find(catalog, &(base_ref(&1.ref) == base_model)) do
-      nil -> []
-      entry -> entry.efforts
+  defp efforts_for(host, harness, %Model{} = selected) do
+    case ModelCatalog.entry(host, harness, selected, ModelCatalog) do
+      {nil, _health} -> []
+      {entry, _health} -> entry.efforts
     end
   end
 
@@ -3494,7 +3684,8 @@ defmodule Tightbeam.Gateway do
           %{
             ok: false,
             code: "model_apply_failed",
-            message: "the live session did not accept #{new_ref}: #{inspect(reason)}"
+            message:
+              "the live session did not accept #{Model.describe(new_ref)}: #{inspect(reason)}"
           }
       end
     else
@@ -3577,15 +3768,27 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # The recorded selection, read back inside the serialized mutation. The row
+  # holds FIELDS, so this is where they become an identity again — never a
+  # packed column read straight into a comparison.
+  defp read_recorded_model(txn, session_key) do
+    [[family, effort, context, harness]] =
+      Txn.q(
+        txn,
+        """
+        SELECT model, thinkingLevel, modelContext, harness
+        FROM sessions WHERE sessionKey=?1
+        """,
+        [session_key]
+      )
+
+    {family && %Model{family: family, effort: effort, context: context}, harness}
+  end
+
   defp project_tuned_model(db, session, adapter, sid, new_ref, provider) do
     result =
       DB.transaction(db, fn txn ->
-        [[record_model, record_harness]] =
-          Txn.q(
-            txn,
-            "SELECT model, harness FROM sessions WHERE sessionKey=?1",
-            [session.session_key]
-          )
+        {record_model, record_harness} = read_recorded_model(txn, session.session_key)
 
         case Org.swap_model_in_txn(
                txn,
@@ -3614,7 +3817,7 @@ defmodule Tightbeam.Gateway do
   # turn, so sending an operator to the gateway to fix a satellite's grant — as
   # this did before per-host catalogs — sent them to the wrong machine.
   defp validate_catalog_model(config, host, harness, model, configured_default?) do
-    case is_binary(model) && ModelCatalog.member?(host, harness, model) do
+    case match?(%Model{}, model) && ModelCatalog.member?(host, harness, model) do
       %{present?: true, health: :fresh} ->
         :ok
 
@@ -3625,7 +3828,7 @@ defmodule Tightbeam.Gateway do
          %{
            code: "model_unavailable",
            message:
-             "model #{inspect(model)} is not offered by #{harness} on host #{host}" <>
+             "model #{inspect(Model.describe(model))} is not offered by #{harness} on host #{host}" <>
                offered_models_hint(host, harness)
          }}
 
@@ -3635,10 +3838,10 @@ defmodule Tightbeam.Gateway do
 
         message =
           if reason == :missing do
-            "cannot validate model #{inspect(model)} for #{harness} on host #{host}: " <>
+            "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: " <>
               missing_credential_message(config, provider, harness, host)
           else
-            "cannot validate model #{inspect(model)} for #{harness} on host #{host}: no " <>
+            "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: no " <>
               "#{harness} model catalog there, because #{provider} has no usable credential " <>
               "on #{host} (#{inspect(reason)}). A catalog is derived on the host that runs " <>
               "the turn, so this is #{host}'s grant to fix; run tightbeam onboard " <>
@@ -3662,7 +3865,7 @@ defmodule Tightbeam.Gateway do
          %{
            code: "catalog_unavailable",
            message:
-             "cannot validate model #{inspect(model)} for #{harness} on host #{host}: the " <>
+             "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: the " <>
                "provider returned an EMPTY model list for client_version #{inspect(version)}, " <>
                "which is the #{harness} binary's own version on #{host}. The credential is " <>
                "not implicated; upgrade #{harness} on #{host}"
@@ -3675,7 +3878,7 @@ defmodule Tightbeam.Gateway do
          %{
            code: "catalog_unavailable",
            message:
-             "cannot validate model #{inspect(model)} for #{harness} on host #{host}: " <>
+             "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: " <>
                "#{inspect(health)}"
          }}
 
@@ -3691,7 +3894,8 @@ defmodule Tightbeam.Gateway do
   defp offered_models_hint(host, harness) do
     case ModelCatalog.get(host, harness, ModelCatalog) do
       {[_ | _] = entries, _health} ->
-        "; offered: " <> (entries |> Enum.map(& &1.ref) |> Enum.sort() |> Enum.join(", "))
+        "; offered: " <>
+          (entries |> Enum.map(&describe_entry/1) |> Enum.sort() |> Enum.join(", "))
 
       _ ->
         ""
@@ -3849,11 +4053,18 @@ defmodule Tightbeam.Gateway do
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
 
+  # "The selection came ENTIRELY from configured policy" — which is the only
+  # case where blaming the configured default is true. Keyed on `p[:model]`
+  # alone, an effort-only selection with a bad effort was reported as a broken
+  # default: a refusal naming the wrong cause, and the operator sent to change
+  # a setting that was never the problem.
+  defp from_default?(params), do: Model.named_fields(params) == %{}
+
   defp warn_dead_default(_host, _harness, _model, false), do: :ok
 
   defp warn_dead_default(host, harness, model, true) do
     Logger.warning(
-      "configured default model #{inspect(model)} is not currently offered by " <>
+      "configured default model #{inspect(Model.describe(model))} is not currently offered by " <>
         "#{harness} on host #{host}"
     )
   end
@@ -4248,7 +4459,7 @@ defmodule Tightbeam.Gateway do
       p[:action] not in ~w(park swap respawn stop) ->
         %{code: "invalid", message: "action must be park, swap, respawn, or stop"}
 
-      p[:action] in ~w(swap respawn) and not is_binary(p[:model]) ->
+      p[:action] in ~w(swap respawn) and is_nil(Model.from_params(p)) ->
         %{code: "invalid", message: "--model is required for #{p.action}"}
 
       true ->
@@ -4452,8 +4663,9 @@ defmodule Tightbeam.Gateway do
 
   defp adjudicate_swap(_config, db, call, episode) do
     session = Org.get(db, episode.session_key)
+    ruled = Model.from_params(call.params)
 
-    with {:ok, harness, provider} <- harness_for_ref(session.host, call.params.model) do
+    with {:ok, harness, provider} <- harness_for_ref(session.host, ruled) do
       if harness != session.harness do
         %{
           code: "cross_harness_requires_respawn",
@@ -4465,6 +4677,7 @@ defmodule Tightbeam.Gateway do
             adjudicate_model_swap(
               db,
               call,
+              ruled,
               episode,
               harness,
               provider,
@@ -4484,13 +4697,13 @@ defmodule Tightbeam.Gateway do
   # The session-mutation worker owns this prepare → apply → commit sequence, so
   # it survives the wire caller and excludes tune, competing rulings, and heal.
   # Each DB transaction closes before the Adapter call begins.
-  defp adjudicate_model_swap(db, call, episode, harness, provider, adapter, sid) do
+  defp adjudicate_model_swap(db, call, ruled, episode, harness, provider, adapter, sid) do
     with {:ok, {:prepared, prepared}} <- prepare_adjudicated_model_swap(db, episode),
          {:ok, applied_model} <-
            Adapter.apply_model_strict(
              adapter,
              sid,
-             call.params.model,
+             ruled,
              prepared.record_model
            ) do
       case commit_adjudicated_model_swap(
@@ -4502,7 +4715,11 @@ defmodule Tightbeam.Gateway do
            ) do
         {:ok, {:applied, delivery, wake_id}} ->
           complete_delivery(db, delivery)
-          %{ok: true, action: "swap", model: applied_model, recovery_wake_id: wake_id}
+          Map.merge(published_identity(applied_model), %{
+            ok: true,
+            action: "swap",
+            recovery_wake_id: wake_id
+          })
 
         {:ok, {:denied, current}} ->
           :ok = Adapter.forget_model_residency(adapter, sid)
@@ -4542,12 +4759,7 @@ defmodule Tightbeam.Gateway do
       if is_nil(current) or current.status != "notified" do
         {:denied, current}
       else
-        [[record_model, record_harness]] =
-          Txn.q(
-            txn,
-            "SELECT model, harness FROM sessions WHERE sessionKey=?1",
-            [current.session_key]
-          )
+        {record_model, record_harness} = read_recorded_model(txn, current.session_key)
 
         {:prepared,
          %{
@@ -4572,12 +4784,7 @@ defmodule Tightbeam.Gateway do
           {:denied, current}
 
         true ->
-          [[record_model, record_harness]] =
-            Txn.q(
-              txn,
-              "SELECT model, harness FROM sessions WHERE sessionKey=?1",
-              [current.session_key]
-            )
+          {record_model, record_harness} = read_recorded_model(txn, current.session_key)
 
           if {record_model, record_harness} !=
                {prepared.record_model, prepared.record_harness} do
@@ -4595,7 +4802,7 @@ defmodule Tightbeam.Gateway do
             end
 
             recovery_prompt =
-              "Your previous turn failed: #{current.condition}. You now run on #{applied_model}. Re-derive state from the facts and continue."
+              "Your previous turn failed: #{current.condition}. You now run on #{Model.describe(applied_model)}. Re-derive state from the facts and continue."
 
             wake_id =
               Adjudication.deterministic_wake_in_txn(
@@ -4627,8 +4834,10 @@ defmodule Tightbeam.Gateway do
               "model_adjudication",
               current.session_key,
               JSON.encode!(%{
-                from_model: record_model,
-                to_model: applied_model,
+                from_model: record_model && Model.to_ref(record_model),
+                from_effort: record_model && record_model.effort,
+                to_model: Model.to_ref(applied_model),
+                to_effort: applied_model.effort,
                 from_harness: record_harness,
                 to_harness: harness,
                 trigger: current.condition,
@@ -4663,8 +4872,9 @@ defmodule Tightbeam.Gateway do
 
   defp adjudicate_respawn(config, db, call, episode, attempts) do
     old = Org.get(db, episode.session_key)
+    ruled = Model.from_params(call.params)
 
-    with {:ok, harness, provider} <- harness_for_ref(old.host, call.params.model) do
+    with {:ok, harness, provider} <- harness_for_ref(old.host, ruled) do
       new_session_key = "agent:" <> Tightbeam.Id.uuid4()
 
       {:ok, transferred_rows} =
@@ -4729,11 +4939,11 @@ defmodule Tightbeam.Gateway do
               host: old.host,
               harness: harness,
               provider: provider,
-              model: call.params.model
+              model: ruled
             })
 
           recovery_prompt =
-            "Your predecessor's turn failed: #{current.condition}. Continue on #{call.params.model}; re-derive state from durable facts."
+            "Your predecessor's turn failed: #{current.condition}. Continue on #{Model.describe(ruled)}; re-derive state from durable facts."
 
           wake_id =
             Adjudication.deterministic_wake_in_txn(
@@ -4767,7 +4977,7 @@ defmodule Tightbeam.Gateway do
               session_key: old.session_key,
               role: "assistant",
               content:
-                "[model recovery]\n\nThis session continues as #{new_session.session_key} on #{call.params.model}.",
+                "[model recovery]\n\nThis session continues as #{new_session.session_key} on #{Model.describe(ruled)}.",
               sender: "process:tightbeam"
             })
 
@@ -4817,8 +5027,10 @@ defmodule Tightbeam.Gateway do
             "model_adjudication",
             old.session_key,
             JSON.encode!(%{
-              from_model: old.model,
-              to_model: call.params.model,
+              from_model: old.model && Model.to_ref(old.model),
+              from_effort: old.model && old.model.effort,
+              to_model: Model.to_ref(ruled),
+              to_effort: ruled.effort,
               from_harness: old.harness,
               to_harness: harness,
               trigger: current.condition,
@@ -5240,8 +5452,19 @@ defmodule Tightbeam.Gateway do
     count > 0
   end
 
-  defp harness_for_ref(host, ref) do
-    matches =
+  # Matches the COMPLETE selection, effort included. Resolving on family and
+  # context alone would let a ruling respawn a session at an effort the model
+  # does not offer, and would call two harnesses ambiguous when only one of
+  # them offers the level asked for.
+  # THE ONE ANSWER to "can this selection be routed, and if not why". Routability
+  # is a question about the WHOLE fleet — one harness tiering a model says
+  # nothing while another offers it untiered — so every entry naming the model
+  # is gathered BEFORE anything is refused. A second gate in front of this,
+  # deciding the same thing from a narrower view, is what refused a valid
+  # untiered ruling on the strength of the first tiered entry it happened to
+  # find. The refusal belongs here, on the complete answer.
+  defp harness_for_ref(host, %Model{} = ref) do
+    naming_model =
       Enum.flat_map(Harness.all(), fn module ->
         case ModelCatalog.entry(host, module.wire_name(), ref) do
           {%{} = entry, :fresh} -> [{module, entry}]
@@ -5249,18 +5472,47 @@ defmodule Tightbeam.Gateway do
         end
       end)
 
-    case matches do
+    case Enum.filter(naming_model, fn {_module, entry} ->
+           ModelCatalog.offers_effort?(entry, ref.effort)
+         end) do
       [{module, entry}] ->
         {:ok, module.wire_name(), Atom.to_string(entry.provider)}
 
       [] ->
-        {:error,
-         %{code: "model_unavailable", message: "model is not in a fresh harness inventory"}}
+        {:error, unroutable(ref, naming_model)}
 
       _ ->
         {:error,
          %{code: "ambiguous_ref", message: "model appears in multiple harness inventories"}}
     end
+  end
+
+  # Each cause named as itself. Reporting "not in inventory" for a model that is
+  # plainly there, because only its TIER was wrong, sends the reader after the
+  # wrong thing.
+  defp unroutable(_ref, []),
+    do: %{code: "model_unavailable", message: "model is not in a fresh harness inventory"}
+
+  defp unroutable(%Model{effort: nil} = ref, naming_model) do
+    %{
+      code: "invalid",
+      message:
+        "#{Model.to_ref(ref)} has effort tiers on " <>
+          "#{Enum.map_join(naming_model, ", ", fn {module, entry} -> "#{module.wire_name()} (#{Enum.join(entry.efforts, "|")})" end)}" <>
+          "; the ruling must name one with --effort"
+    }
+  end
+
+  defp unroutable(%Model{} = ref, naming_model) do
+    %{
+      code: "model_unavailable",
+      message:
+        "#{Model.to_ref(ref)} does not offer effort #{inspect(ref.effort)} on any fresh " <>
+          "harness; offered: " <>
+          Enum.map_join(naming_model, ", ", fn {module, entry} ->
+            "#{module.wire_name()} (#{Enum.join(entry.efforts, "|")})"
+          end)
+    }
   end
 
   # Says four things and nothing more: the engine changed, from what to what,
@@ -5283,7 +5535,7 @@ defmodule Tightbeam.Gateway do
   defp describe_error(error), do: inspect(error)
 
   defp describe_engine(harness, nil), do: "#{harness}"
-  defp describe_engine(harness, model), do: "#{harness} (#{model})"
+  defp describe_engine(harness, model), do: "#{harness} (#{Model.describe(model)})"
 
   defp catalog_provider!(host, harness, ref) do
     case ModelCatalog.entry(host, harness, ref) do
@@ -5373,7 +5625,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp push_known_model(_adapter, _sid, model) when not is_binary(model), do: :ok
+  defp push_known_model(_adapter, _sid, nil), do: :ok
 
   defp push_known_model(adapter, sid, model) do
     case Adapter.apply_model(adapter, sid, model) do

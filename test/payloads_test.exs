@@ -1,5 +1,6 @@
 defmodule Tightbeam.Wire.PayloadsTest do
   use ExUnit.Case, async: true
+  alias Tightbeam.Model
 
   alias Tightbeam.Wire.Payloads
 
@@ -140,7 +141,7 @@ defmodule Tightbeam.Wire.PayloadsTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: "fable",
+      model: Model.new("fable"),
       thinking_level: nil,
       state: "active",
       created_at: 1,

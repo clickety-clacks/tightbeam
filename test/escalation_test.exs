@@ -1,5 +1,6 @@
 defmodule Tightbeam.EscalationTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     ConditionFacts,
@@ -515,7 +516,7 @@ defmodule Tightbeam.EscalationTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
   end
 

@@ -1,5 +1,6 @@
 defmodule Tightbeam.OrgTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   doctest Tightbeam.Org
 
@@ -22,7 +23,7 @@ defmodule Tightbeam.OrgTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       },
       overrides
     )
@@ -166,7 +167,7 @@ defmodule Tightbeam.OrgTest do
           archetype: "reviewer",
           harness: "codex",
           provider: "openai",
-          model: "gpt-5.6-sol[high]"
+          model: Model.new("gpt-5.6-sol", effort: "high")
         })
       )
 
@@ -177,17 +178,24 @@ defmodule Tightbeam.OrgTest do
   test "rename and set_model update the row", %{db: db} do
     original = Org.create(db, base(%{session_key: "k1"}))
     renamed = Org.rename(db, "k1", "Renamed")
-    updated = Org.set_model(db, "k1", "gpt-5.6-sol[high]", "openai")
+    selection = Model.new("claude-fable-5", effort: "high", context: "1m")
+    updated = Org.set_model(db, "k1", selection, "anthropic")
 
     assert renamed.display_name == "Renamed"
-    assert updated.model == "gpt-5.6-sol[high]"
-    assert updated.provider == "openai"
+    assert updated.model == selection
+    assert updated.provider == "anthropic"
     assert updated.updated_at >= original.updated_at
 
+    # The row holds the identity in COLUMNS. A context variant and a reasoning
+    # level are different questions and never share a slot: stored packed, the
+    # `1m` here would be indistinguishable from an effort named `1m`.
     {:ok, rows} =
-      DB.query(db, "SELECT displayName, model, provider FROM sessions WHERE sessionKey = 'k1'")
+      DB.query(db, """
+      SELECT displayName, model, thinkingLevel, modelContext, provider
+      FROM sessions WHERE sessionKey = 'k1'
+      """)
 
-    assert rows == [["Renamed", "gpt-5.6-sol[high]", "openai"]]
+    assert rows == [["Renamed", "claude-fable-5", "high", "1m", "anthropic"]]
   end
 
   test "pointer chain is append-only and current is latest", %{db: db} do

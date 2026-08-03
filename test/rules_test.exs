@@ -1,5 +1,6 @@
 defmodule Tightbeam.RulesTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Assignments,
@@ -461,7 +462,7 @@ defmodule Tightbeam.RulesTest do
       db: ctx.db,
       base_dir: ctx.base_dir,
       default_harness: :claude,
-      default_model: "fable",
+      default_model: Model.new("fable"),
       max_live_sessions_per_user: 5
     }
 
@@ -1181,7 +1182,7 @@ defmodule Tightbeam.RulesTest do
       host: "testhost",
       harness: Keyword.get(opts, :harness, "claude"),
       provider: Keyword.get(opts, :provider, "anthropic"),
-      model: "fable"
+      model: Model.new("fable")
     })
   end
 end

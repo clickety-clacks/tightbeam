@@ -112,7 +112,12 @@ defmodule Tightbeam.Application do
       cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
       port: Application.get_env(:tightbeam, :port, 4_321),
       default_harness: Tightbeam.Harness.default().id(),
-      default_model: Application.get_env(:tightbeam, :default_model, "claude-sonnet-5[medium]"),
+      default_model:
+        Application.get_env(
+          :tightbeam,
+          :default_model,
+          Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
+        ),
       max_live_sessions_per_user:
         Application.get_env(:tightbeam, :max_live_sessions_per_user, 50),
       wake_tick_ms: Application.get_env(:tightbeam, :wake_tick_ms, 1_000),

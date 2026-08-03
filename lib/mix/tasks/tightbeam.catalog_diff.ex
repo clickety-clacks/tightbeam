@@ -1,7 +1,7 @@
 defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   use Mix.Task
 
-  alias Tightbeam.Acp.Adapter
+  alias Tightbeam.Model
   alias Tightbeam.ModelCatalog
 
   @shortdoc "Diff the live model catalog against the preferred-model working set"
@@ -90,19 +90,20 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
       inventories
       |> Map.values()
       |> List.flatten()
-      |> Enum.map(& &1.ref)
+      |> Enum.map(&Model.to_ref(Model.new(&1.family, context: &1.context)))
       |> Enum.uniq()
       |> Enum.sort()
 
-    live_models = MapSet.new(live, &base_ref/1)
-    working_set_models = MapSet.new(working_set, &base_ref/1)
+    live_models = MapSet.new(live)
+    working_set_models = MapSet.new(working_set)
 
-    # Working-set membership covers the catalog's base model identity regardless of
-    # whether either side spells the ref with an effort qualifier. Reports retain
-    # the source refs; only set membership is normalized through the shared parser.
+    # Both sides name MODELS, not tiers: the catalog holds one entry per vendor
+    # model (its efforts are a property of that entry) and the working set is a
+    # list of model names. Nothing is stripped to compare them — stripping a
+    # suffix is how a context variant got read as a reasoning level.
     diff = %{
-      missing_from_catalog: Enum.reject(working_set, &MapSet.member?(live_models, base_ref(&1))),
-      new_arrivals: Enum.reject(live, &MapSet.member?(working_set_models, base_ref(&1))),
+      missing_from_catalog: Enum.reject(working_set, &MapSet.member?(live_models, &1)),
+      new_arrivals: Enum.reject(live, &MapSet.member?(working_set_models, &1)),
       live: live,
       working_set: working_set
     }
@@ -208,8 +209,6 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     |> Enum.uniq()
     |> Enum.sort()
   end
-
-  defp base_ref(ref), do: elem(Adapter.parse_model_ref(ref), 0)
 
   defp report_section(label, []), do: "#{label}: none"
 

@@ -1,5 +1,6 @@
 defmodule Tightbeam.Wire.RouterTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
   import Plug.Test
   import Plug.Conn
 
@@ -704,7 +705,7 @@ defmodule Tightbeam.Wire.RouterTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(ctx.db, "orchestrator:demo", "flynn", actor.session_key)
@@ -843,7 +844,7 @@ defmodule Tightbeam.Wire.RouterTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     assert dispatch_wake(ctx, %{"userId" => "mike"}).status == 200
@@ -878,7 +879,7 @@ defmodule Tightbeam.Wire.RouterTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     assert dispatch_wake(ctx, %{"sessionKey" => key.session_key}).status == 200
@@ -897,7 +898,7 @@ defmodule Tightbeam.Wire.RouterTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     Roles.create!(ctx.db, "mike", "flynn", "role-session")
@@ -1109,7 +1110,7 @@ defmodule Tightbeam.Wire.RouterTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(ctx.db, "held", "flynn", holder.session_key)
@@ -1139,7 +1140,7 @@ defmodule Tightbeam.Wire.RouterTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-sonnet-5"
+      model: Model.new("claude-sonnet-5")
     })
 
     opts =
@@ -1292,7 +1293,7 @@ defmodule Tightbeam.Wire.RouterTest do
         db: ctx.db,
         base_dir: ctx.base_dir,
         default_harness: :claude,
-        default_model: "fable",
+        default_model: Model.new("fable"),
         max_live_sessions_per_user: 50,
         onboarding_lease_ms: 1_800_000,
         sh: fn _command -> {"", 0} end
@@ -1600,6 +1601,135 @@ defmodule Tightbeam.Wire.RouterTest do
     refute_received {:call, %{verb: "tune"}}
   end
 
+  # SPAWN, through the real wire payload. The session-control test below covers
+  # the same `model_params/1`, but spawn is where the consequence bites: a
+  # configured 1M default plus an explicit `context: null` must select the
+  # default window, and a dropped key would inherit `1m` instead. Testing this
+  # at the gateway with a hand-built params map bypasses the very seam that
+  # was losing the field.
+  test "spawn carries an explicitly null context across the wire, not omitted", ctx do
+    opts = with_handler(ctx.opts, "spawn", fn call -> send_call(call) end)
+
+    body =
+      JSON.encode!(%{
+        "displayName" => "Wire Spawn",
+        "idempotencyKey" => "k-wire-null-context",
+        "model" => "claude-fable-5",
+        "context" => nil,
+        "effort" => "high"
+      })
+
+    response =
+      conn(:post, "/api/streams", body)
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status in [200, 201]
+    assert_received {:call, %{verb: "spawn", params: params}}
+
+    assert params.model == "claude-fable-5"
+    assert params.effort == "high"
+
+    assert Map.has_key?(params, :context),
+           "an explicit null must reach spawn as a NAMED field, or the default " <>
+             "window is indistinguishable from silence and 1m gets inherited"
+
+    assert params.context == nil
+
+    # And an omitted context still arrives omitted, so inheritance can fire.
+    omitted_body =
+      JSON.encode!(%{
+        "displayName" => "Wire Spawn",
+        "idempotencyKey" => "k-wire-omitted-context",
+        "model" => "claude-fable-5"
+      })
+
+    conn(:post, "/api/streams", omitted_body)
+    |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+    |> Router.call(Router.init(opts))
+
+    assert_received {:call, %{verb: "spawn", params: omitted}}
+    refute Map.has_key?(omitted, :context)
+  end
+
+  # THE THIRD DESTRUCTION SITE. JSON can say `null`, and the router dropped it —
+  # so "the caller named context and named it empty" arrived downstream
+  # indistinguishable from "the caller said nothing about context", which is
+  # the exact collapse `named_fields/1` and `put_named/3` exist to prevent.
+  # Two seams below carrying the distinction is worth nothing if the seam that
+  # faces the outside throws it away first.
+  test "an explicitly null model field crosses the wire as named, not omitted", ctx do
+    key = "explicit-null-control"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", fn call -> send_call(call) end)
+
+    response =
+      conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(%{
+          "sessionKey" => key,
+          "action" => "set_model",
+          "model" => "claude-fable-5",
+          "context" => nil,
+          "effort" => "high"
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+
+    assert_received {:call, %{verb: "tune", params: params}}
+
+    assert params.model == "claude-fable-5"
+    assert params.effort == "high"
+
+    assert Map.has_key?(params, :context),
+           "an explicit null must arrive as a NAMED field holding nil, not vanish"
+
+    assert params.context == nil
+
+    # …and an omitted field still arrives omitted, or the distinction is only
+    # half carried and inheritance downstream can never fire.
+    response =
+      conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(%{
+          "sessionKey" => key,
+          "action" => "set_model",
+          "model" => "claude-fable-5"
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_received {:call, %{verb: "tune", params: omitted}}
+    refute Map.has_key?(omitted, :context)
+
+    # An empty string is the same statement as null: the field, named, empty.
+    response =
+      conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(%{
+          "sessionKey" => key,
+          "action" => "set_model",
+          "model" => "claude-fable-5",
+          "context" => ""
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    assert_received {:call, %{verb: "tune", params: blank}}
+    assert Map.has_key?(blank, :context)
+    assert blank.context == nil
+  end
+
   defp post_control(opts, token, session_key, action) do
     conn(
       :post,
@@ -1629,7 +1759,7 @@ defmodule Tightbeam.Wire.RouterTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable",
+      model: Model.new("fable"),
       is_built_in: Keyword.get(extra, :is_built_in, false),
       kind: Keyword.get(extra, :kind, "custom")
     })

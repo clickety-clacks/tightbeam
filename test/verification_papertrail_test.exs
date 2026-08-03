@@ -5,6 +5,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   # statutes live in priv/kungfu/agentic-engineering/rules/verification.toml and
   # are exercised here exactly as relearn delivers them.
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Archetypes,
@@ -406,7 +407,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
       host: "eezo",
       harness: harness,
       provider: provider,
-      model: "test"
+      model: Model.new("test")
     })
   end
 end

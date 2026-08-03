@@ -1,5 +1,6 @@
 defmodule Tightbeam.RailScriptTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cli_dir Path.expand("../cli", __DIR__)
@@ -74,7 +75,7 @@ defmodule Tightbeam.RailScriptTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     on_exit(fn ->
@@ -442,7 +443,7 @@ defmodule Tightbeam.RailScriptTest do
         host: "remote-testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     expected_workdir =

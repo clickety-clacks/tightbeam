@@ -14,6 +14,7 @@ defmodule Tightbeam.ReadinessTest do
   it promised not to do.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{Harness, Readiness}
 
@@ -44,7 +45,10 @@ defmodule Tightbeam.ReadinessTest do
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Placement.ensure_schema(db)
     on_exit(fn -> File.rm_rf!(base) end)
-    %{base: base, config: %{base_dir: base, db: db, default_model: "m[medium]"}}
+    %{
+      base: base,
+      config: %{base_dir: base, db: db, default_model: Model.new("m", effort: "medium")}
+    }
   end
 
   defp install_adapter!(base, module) do
@@ -68,7 +72,8 @@ defmodule Tightbeam.ReadinessTest do
     pid
   end
 
-  defp live(ref), do: {[%{ref: ref}], :fresh}
+  defp live(family, efforts \\ ["medium"]),
+    do: {[%{family: family, context: nil, efforts: efforts}], :fresh}
 
   ## The verdict
 
@@ -89,7 +94,7 @@ defmodule Tightbeam.ReadinessTest do
 
   test "a fully ready install says so in ONE line and says nothing else", ctx do
     for module <- Harness.all(), do: install_adapter!(ctx.base, module)
-    catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m[medium]")}))
+    catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m")}))
 
     summary = Readiness.summary(ctx.config, catalog)
     assert summary.runnable?
@@ -109,7 +114,7 @@ defmodule Tightbeam.ReadinessTest do
     [module | _] = Harness.all()
     base = Path.join(ctx.base, "operator's base")
     config = %{ctx.config | base_dir: base}
-    catalog = catalog!(%{module.wire_name() => live("m[medium]")})
+    catalog = catalog!(%{module.wire_name() => live("m")})
 
     line =
       config
@@ -175,10 +180,10 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "on testhost"
   end
 
-  test "a default model outside the live catalog is named with the ref", ctx do
+  test "a default model outside the live catalog is named by its fields", ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)
-    catalog = catalog!(%{module.wire_name() => live("something-else[low]")})
+    catalog = catalog!(%{module.wire_name() => live("something-else", ["low"])})
 
     line =
       ctx.config
@@ -186,7 +191,10 @@ defmodule Tightbeam.ReadinessTest do
       |> Readiness.render(ctx.config)
       |> Enum.find(&(&1 =~ "default model"))
 
-    assert line =~ "m[medium]"
+    # Named by FIELDS. The old rendering spelled this `m[medium]`, which is the
+    # same syntax Anthropic uses for a context window — the collision this
+    # refactor removed.
+    assert line =~ "m (effort medium)"
     assert line =~ "TIGHTBEAM_DEFAULT_MODEL"
   end
 

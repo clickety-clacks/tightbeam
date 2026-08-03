@@ -1,5 +1,6 @@
 defmodule Tightbeam.WorkItemsTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Assignments,
@@ -428,7 +429,7 @@ defmodule Tightbeam.WorkItemsTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: "fable",
+      model: Model.new("fable"),
       host: "eezo"
     })
   end

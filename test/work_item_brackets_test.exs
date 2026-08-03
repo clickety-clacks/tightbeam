@@ -4,6 +4,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
   the proof number it discharges; see the spec §Required proofs.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Assignments,
@@ -810,7 +811,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: "fable",
+      model: Model.new("fable"),
       host: "eezo"
     })
   end

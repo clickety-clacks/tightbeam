@@ -5,6 +5,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   doctest Tightbeam.Acp.Adapter
 
   alias Tightbeam.Acp.Adapter
+  alias Tightbeam.Model
 
   defmodule SlowBootAdapter do
     use GenServer
@@ -49,9 +50,46 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
-  test "parse_model_ref splits effort" do
-    assert Adapter.parse_model_ref("gpt-5.6-sol[medium]") == {"gpt-5.6-sol", "medium"}
-    assert Adapter.parse_model_ref("haiku") == {"haiku", nil}
+  # The defect this refactor exists to fix, in one assertion. A vendor
+  # identifier whose bracket is a CONTEXT WINDOW (`claude-fable-5[1m]`) must
+  # reach the harness intact; before the seam knew the difference it parsed the
+  # bracket as one of OUR reasoning levels, sent `claude-fable-5` as the model
+  # and `1m` as the effort, and the 1M-context model was unreachable.
+  test "a vendor context variant crosses the adapter seam without loss" do
+    {adapter, capture_path} = start_adapter()
+
+    fable_1m = Model.new("claude-fable-5", context: "1m", effort: "high")
+
+    assert :ok = Adapter.apply_model(adapter, "sess-1", fable_1m)
+
+    config = fn id ->
+      capture_path
+      |> captured_requests()
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == id))
+      |> Enum.map(& &1["value"])
+    end
+
+    assert config.("model") == ["claude-fable-5[1m]"]
+    assert config.("effort") == ["high"]
+
+    assert {:ok, %Model{family: "claude-fable-5", context: "1m", effort: "high"}} =
+             Adapter.current_model(adapter, "sess-1")
+  end
+
+  # Effort is never rendered into the model value: it is a separate config
+  # option, so an effort-bearing selection sends a BARE family as the model.
+  test "the model value the harness receives never carries our effort" do
+    {adapter, capture_path} = start_adapter()
+
+    assert :ok = Adapter.apply_model(adapter, "sess-1", Model.new("haiku", effort: "medium"))
+
+    assert ["haiku"] =
+             capture_path
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
+             |> Enum.map(& &1["value"])
   end
 
   test "residency waits behind slow adapter boot and dead adapters fail promptly" do
@@ -284,7 +322,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         if probe? do
           adapter_opts
           |> Keyword.put(:probe_cwd, Keyword.get(opts, :probe_cwd, "/tmp/gate-probe"))
-          |> Keyword.put(:probe_model, Keyword.get(opts, :probe_model, "gpt-5.6-sol[medium]"))
+          |> Keyword.put(:probe_model, Keyword.get(opts, :probe_model, Model.new("gpt-5.6-sol", effort: "medium")))
           |> Keyword.put(
             :gate_attestation_timeout,
             Keyword.get(opts, :gate_attestation_timeout, 2_000)
@@ -443,7 +481,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       %{"name" => "build", "command" => "builder", "args" => [], "env" => []}
     ]
 
-    assert {:ok, "sess-1"} = Adapter.new_session(a, "haiku", "/tmp", mcp_servers, "guidance")
+    assert {:ok, "sess-1"} = Adapter.new_session(a, Model.new("haiku"), "/tmp", mcp_servers, "guidance")
 
     assert [%{"method" => "session/new", "mcpServers" => ^mcp_servers}] =
              session_requests(capture_path)
@@ -456,7 +494,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, capture_path} = start_adapter()
 
     assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
-    assert {:ok, "haiku"} = Adapter.current_model(adapter, "sess-1")
+    assert {:ok, %Model{family: "haiku", effort: nil}} = Adapter.current_model(adapter, "sess-1")
 
     refute Enum.any?(
              captured_requests(capture_path),
@@ -467,10 +505,10 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "load_session pushes the known canonical record model" do
     {a, capture_path} = start_adapter(fail_mode: "load-owner")
 
-    assert {:ok, "stale-record"} =
-             Adapter.load_session(a, "sess-1", "stale-record", "/tmp", [], "guidance")
+    assert {:ok, %Model{family: "stale-record", effort: nil}} =
+             Adapter.load_session(a, "sess-1", Model.new("stale-record"), "/tmp", [], "guidance")
 
-    assert {:ok, "stale-record"} = Adapter.current_model(a, "sess-1")
+    assert {:ok, %Model{family: "stale-record", effort: nil}} = Adapter.current_model(a, "sess-1")
 
     assert Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/set_config_option" and
@@ -500,8 +538,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       %{"name" => "build", "command" => "builder", "args" => ["--fast"], "env" => []}
     ]
 
-    assert {:ok, "haiku"} =
-             Adapter.load_session(a, "sess-1", "haiku", "/tmp", mcp_servers, "guidance")
+    assert {:ok, %Model{family: "haiku", effort: nil}} =
+             Adapter.load_session(a, "sess-1", Model.new("haiku"), "/tmp", mcp_servers, "guidance")
 
     assert [%{"method" => "session/load", "mcpServers" => ^mcp_servers}] =
              session_requests(capture_path)
@@ -551,7 +589,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "close_session sends ACP session/close with the harness session id" do
     {adapter, capture_path} = start_adapter()
-    assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
     assert Adapter.knows_session?(adapter, "sess-1")
 
     assert :ok = Adapter.close_session(adapter, "sess-1")
@@ -563,10 +601,10 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "new_session and load_session still send an empty mcpServers list" do
     {a, capture_path} = start_adapter()
-    assert {:ok, "sess-1"} = Adapter.new_session(a, "haiku", "/tmp", [], "guidance")
+    assert {:ok, "sess-1"} = Adapter.new_session(a, Model.new("haiku"), "/tmp", [], "guidance")
 
-    assert {:ok, "haiku"} =
-             Adapter.load_session(a, "sess-1", "haiku", "/tmp", [], "guidance")
+    assert {:ok, %Model{family: "haiku", effort: nil}} =
+             Adapter.load_session(a, "sess-1", Model.new("haiku"), "/tmp", [], "guidance")
 
     assert [
              %{"method" => "session/new", "mcpServers" => []},
@@ -590,7 +628,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       {adapter, capture_path} = start_adapter(harness: harness)
 
       assert {:ok, "sess-1"} =
-               Adapter.new_session(adapter, "haiku", "/tmp", [], "served guidance")
+               Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "served guidance")
 
       assert {:ok, _pushed_model} =
                Adapter.load_session(
@@ -651,10 +689,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, _capture} = start_adapter(harness: :codex, fail_mode: "model-invalid-params")
 
     assert {:error, :model_unavailable} =
-             Adapter.new_session(adapter, "gpt-5.1-codex", "/tmp", [], "guidance")
+             Adapter.new_session(adapter, Model.new("gpt-5.1-codex"), "/tmp", [], "guidance")
 
     assert {:error, {:model_apply_failed, :model_unavailable}} =
-             Adapter.load_session(adapter, "sess-1", "gpt-5.1-codex", "/tmp", [], "guidance")
+             Adapter.load_session(adapter, "sess-1", Model.new("gpt-5.1-codex"), "/tmp", [], "guidance")
 
     refute Adapter.knows_session?(adapter, "sess-1")
   end
@@ -667,7 +705,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
 
     assert {:error, :model_unavailable} =
-             Adapter.apply_model_strict(adapter, "sess-1", "gpt-5.1-codex", prior_model)
+             Adapter.apply_model_strict(adapter, "sess-1", Model.new("gpt-5.1-codex"), prior_model)
 
     model_writes =
       captured_requests(capture_path)
@@ -680,45 +718,45 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
 
     assert {:error, %{"message" => "Invalid value for config option model"}} =
-             Adapter.new_session(adapter, "fable", "/tmp", [], "guidance")
+             Adapter.new_session(adapter, Model.new("fable"), "/tmp", [], "guidance")
 
     assert {:error,
             {:model_apply_failed, %{"message" => "Invalid value for config option model"}}} =
-             Adapter.load_session(adapter, "sess-1", "fable", "/tmp", [], "guidance")
+             Adapter.load_session(adapter, "sess-1", Model.new("fable"), "/tmp", [], "guidance")
 
     refute Adapter.knows_session?(adapter, "sess-1")
 
     {codex, _capture} = start_adapter(harness: :codex)
 
-    assert {:ok, "gpt-old[medium]"} =
-             Adapter.load_session(codex, "sess-1", "gpt-old[medium]", "/tmp", [], "guidance")
+    assert {:ok, %Model{family: "gpt-old", effort: "medium"}} =
+             Adapter.load_session(codex, "sess-1", Model.new("gpt-old", effort: "medium"), "/tmp", [], "guidance")
 
-    assert :ok = Adapter.apply_model(codex, "sess-1", "gpt-old[medium]")
+    assert :ok = Adapter.apply_model(codex, "sess-1", Model.new("gpt-old", effort: "medium"))
 
-    assert {:ok, "gpt-new[high]"} =
-             Adapter.apply_model_strict(codex, "sess-1", "gpt-new[high]", "gpt-old[medium]")
+    assert {:ok, %Model{family: "gpt-new", effort: "high"}} =
+             Adapter.apply_model_strict(codex, "sess-1", Model.new("gpt-new", effort: "high"), Model.new("gpt-old", effort: "medium"))
   end
 
   test "strict apply treats cache disagreement as unknown and forces a canonical reload" do
     {adapter, capture_path} = start_adapter(harness: :codex)
 
     assert {:ok, "sess-1"} =
-             Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+             Adapter.new_session(adapter, Model.new("gpt-old", effort: "medium"), "/tmp", [], "guidance")
 
-    assert {:ok, "gpt-new[high]"} =
-             Adapter.apply_model_strict(adapter, "sess-1", "gpt-new[high]", "gpt-old[medium]")
+    assert {:ok, %Model{family: "gpt-new", effort: "high"}} =
+             Adapter.apply_model_strict(adapter, "sess-1", Model.new("gpt-new", effort: "high"), Model.new("gpt-old", effort: "medium"))
 
     assert {:error, :model_readback_unavailable} =
-             Adapter.apply_model_strict(adapter, "sess-1", "gpt-late", "gpt-old[medium]")
+             Adapter.apply_model_strict(adapter, "sess-1", Model.new("gpt-late"), Model.new("gpt-old", effort: "medium"))
 
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:ok, "gpt-old[medium]"} =
+    assert {:ok, %Model{family: "gpt-old", effort: "medium"}} =
              Adapter.load_session(
                adapter,
                "sess-1",
-               "gpt-old[medium]",
+               Model.new("gpt-old", effort: "medium"),
                "/tmp",
                [],
                "guidance"
@@ -737,31 +775,31 @@ defmodule Tightbeam.Acp.AdapterTest do
       start_adapter(harness: :codex, fail_mode: "strict-partial-apply")
 
     assert {:ok, "sess-1"} =
-             Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+             Adapter.new_session(adapter, Model.new("gpt-old", effort: "medium"), "/tmp", [], "guidance")
 
     assert {:error, :partial_apply} =
              Adapter.apply_model_strict(
                adapter,
                "sess-1",
-               "gpt-new[high]",
-               "gpt-old[medium]"
+               Model.new("gpt-new", effort: "high"),
+               Model.new("gpt-old", effort: "medium")
              )
 
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:ok, "gpt-old[medium]"} =
+    assert {:ok, %Model{family: "gpt-old", effort: "medium"}} =
              Adapter.load_session(
                adapter,
                "sess-1",
-               "gpt-old[medium]",
+               Model.new("gpt-old", effort: "medium"),
                "/tmp",
                [],
                "guidance"
              )
 
     assert Adapter.knows_session?(adapter, "sess-1")
-    assert {:ok, "gpt-old[medium]"} = Adapter.current_model(adapter, "sess-1")
+    assert {:ok, %Model{family: "gpt-old", effort: "medium"}} = Adapter.current_model(adapter, "sess-1")
 
     recovery_requests =
       captured_requests(capture_path)
@@ -786,7 +824,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, _capture_path} = start_adapter(harness: :codex, fail_mode: "strict-effort-hang")
 
     assert {:ok, "sess-1"} =
-             Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+             Adapter.new_session(adapter, Model.new("gpt-old", effort: "medium"), "/tmp", [], "guidance")
 
     started = System.monotonic_time(:millisecond)
 
@@ -795,7 +833,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:error, :partial_apply} =
              GenServer.call(
                adapter,
-               {:apply_model_strict, "sess-1", "gpt-new[high]", "gpt-old[medium]", deadline},
+               {:apply_model_strict, "sess-1", Model.new("gpt-new", effort: "high"), Model.new("gpt-old", effort: "medium"), deadline},
                30_000
              )
 
@@ -812,14 +850,14 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "strict apply accepts a bare-model reply after the former inner bound and retains residency" do
     {adapter, _capture_path} = start_adapter(harness: :codex, fail_mode: "slow-strict-success")
 
-    assert {:ok, "sess-1"} = Adapter.new_session(adapter, "gpt-old", "/tmp", [], "guidance")
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, Model.new("gpt-old"), "/tmp", [], "guidance")
     assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:ok, "gpt-new"} =
-             Adapter.apply_model_strict(adapter, "sess-1", "gpt-new", prior_model)
+    assert {:ok, %Model{family: "gpt-new", effort: nil}} =
+             Adapter.apply_model_strict(adapter, "sess-1", Model.new("gpt-new"), prior_model)
 
     assert Adapter.knows_session?(adapter, "sess-1")
-    assert {:ok, "gpt-new"} = Adapter.current_model(adapter, "sess-1")
+    assert {:ok, %Model{family: "gpt-new", effort: nil}} = Adapter.current_model(adapter, "sess-1")
   end
 
   # FAIL-BEFORE: strict_apply/4 used to start its deadline only after the
@@ -835,7 +873,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       start_adapter(harness: :codex, fail_mode: "slow-apply-before-strict")
 
     assert {:ok, "sess-1"} =
-             Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+             Adapter.new_session(adapter, Model.new("gpt-old", effort: "medium"), "/tmp", [], "guidance")
 
     # The blocker exists to OCCUPY the shared Adapter past the strict
     # operation deadline; the handler holds the server until Conn answers at
@@ -844,7 +882,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     blocker =
       Task.async(fn ->
         try do
-          Adapter.apply_model(adapter, "sess-1", "gpt-blocking")
+          Adapter.apply_model(adapter, "sess-1", Model.new("gpt-blocking"))
         catch
           :exit, reason -> {:caller_exit, reason}
         end
@@ -855,7 +893,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     strict =
       Task.async(fn ->
         try do
-          Adapter.apply_model_strict(adapter, "sess-1", "gpt-new[high]", "gpt-old[medium]")
+          Adapter.apply_model_strict(adapter, "sess-1", Model.new("gpt-new", effort: "high"), Model.new("gpt-old", effort: "medium"))
         catch
           :exit, reason -> {:caller_exit, reason}
         end
@@ -875,19 +913,19 @@ defmodule Tightbeam.Acp.AdapterTest do
       start_adapter(harness: :codex, fail_mode: "apply-effort-failure")
 
     assert {:ok, "sess-1"} =
-             Adapter.new_session(adapter, "gpt-old[medium]", "/tmp", [], "guidance")
+             Adapter.new_session(adapter, Model.new("gpt-old", effort: "medium"), "/tmp", [], "guidance")
 
     assert {:error, %{"message" => "effort refused"}} =
-             Adapter.apply_model(adapter, "sess-1", "gpt-new[high]")
+             Adapter.apply_model(adapter, "sess-1", Model.new("gpt-new", effort: "high"))
 
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:ok, "gpt-old[medium]"} =
+    assert {:ok, %Model{family: "gpt-old", effort: "medium"}} =
              Adapter.load_session(
                adapter,
                "sess-1",
-               "gpt-old[medium]",
+               Model.new("gpt-old", effort: "medium"),
                "/tmp",
                [],
                "guidance"
@@ -1125,7 +1163,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "fixture"
+        model: Model.new("fixture")
       })
 
     Tightbeam.Org.append_pointer(db, session.session_key, "sess-1", "created")
@@ -1230,7 +1268,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "fixture"
+        model: Model.new("fixture")
       })
 
     Tightbeam.Org.append_pointer(db, session.session_key, "sess-1", "created")
@@ -1299,7 +1337,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "consecutive prompts reset the accumulator" do
     {a, _capture_path} = start_adapter()
-    {:ok, _} = Adapter.new_session(a, "haiku", "/tmp", [], "guidance")
+    {:ok, _} = Adapter.new_session(a, Model.new("haiku"), "/tmp", [], "guidance")
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "one")
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "two")
   end
@@ -1316,14 +1354,14 @@ defmodule Tightbeam.Acp.AdapterTest do
     Application.put_env(:tightbeam, :turn_timeout_ms, 25)
 
     {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
-    assert {:ok, sid} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
     assert {:error, :timeout} = Adapter.prompt(adapter, sid, "stall")
   end
 
   test "preset modes are pinned for both harnesses" do
     for {harness, expected} <- [claude: "bypassPermissions", codex: "agent-full-access"] do
       {adapter, capture_path} = start_adapter(harness: harness)
-      assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
 
       assert [%{"method" => "session/set_mode", "modeId" => ^expected}] =
                Enum.filter(captured_requests(capture_path), &(&1["method"] == "session/set_mode"))
@@ -1333,15 +1371,15 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "load does not assert mode" do
     {plain, plain_capture} = start_adapter()
 
-    assert {:ok, "haiku"} =
-             Adapter.load_session(plain, "sess-1", "haiku", "/tmp", [], "guidance")
+    assert {:ok, %Model{family: "haiku", effort: nil}} =
+             Adapter.load_session(plain, "sess-1", Model.new("haiku"), "/tmp", [], "guidance")
 
     refute Enum.any?(captured_requests(plain_capture), &(&1["method"] == "session/set_mode"))
   end
 
   test "new session mode set stays best effort" do
     {plain, _capture} = start_adapter(fail_mode: "fail")
-    assert {:ok, "sess-1"} = Adapter.new_session(plain, "haiku", "/tmp", [], "guidance")
+    assert {:ok, "sess-1"} = Adapter.new_session(plain, Model.new("haiku"), "/tmp", [], "guidance")
   end
 
   test "gate wiring-check passes on message or tool content and discards the probe session" do
@@ -1380,7 +1418,7 @@ defmodule Tightbeam.Acp.AdapterTest do
                }
              ]
 
-      assert {:ok, "sess-1"} = Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance")
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
       refute Adapter.knows_session?(adapter, "probe-sess")
 
       assert capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
@@ -1444,7 +1482,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       monitor = Process.monitor(adapter)
 
       queued =
-        Task.async(fn -> Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance") end)
+        Task.async(fn -> Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance") end)
 
       reason = assert_down(adapter, monitor)
 
@@ -1521,7 +1559,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     log =
       capture_log(fn ->
         assert {:error, {:adapter_unavailable, _reason}} =
-                 Adapter.new_session(adapter, "haiku", "/tmp", [], guidance_marker)
+                 Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], guidance_marker)
 
         assert_receive {:DOWN, ^monitor, :process, ^adapter, _reason}
         Logger.flush()
@@ -1544,7 +1582,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     monitor = Process.monitor(adapter)
 
     queued =
-      Task.async(fn -> Adapter.new_session(adapter, "haiku", "/tmp", [], "guidance") end)
+      Task.async(fn -> Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance") end)
 
     assert assert_down(adapter, monitor) == {:gate_attestation_failed, :deadline}
     died_at = System.system_time(:millisecond)

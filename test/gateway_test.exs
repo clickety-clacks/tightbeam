@@ -1,5 +1,6 @@
 defmodule Tightbeam.GatewayTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   # How long a COLD runner Task is allowed to take to reach `Adapter.prompt`.
   #
@@ -395,7 +396,7 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:current_model, "default-session"}, _from, parent) do
       send(parent, :default_model_captured)
-      {:reply, {:ok, "harness-default"}, parent}
+      {:reply, {:ok, Model.new("harness-default")}, parent}
     end
 
     def handle_call({:prompt, "default-session", _prompt, _opts}, _from, parent) do
@@ -423,7 +424,11 @@ defmodule Tightbeam.GatewayTest do
       Path.join(System.tmp_dir!(), "gateway-catalog-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join([catalog_base, "auth", "claude"]))
-    File.write!(Path.join([catalog_base, "auth", "claude", ".credentials.json"]), ~s({"claudeAiOauth":{"accessToken":"test-token"}}))
+
+    File.write!(
+      Path.join([catalog_base, "auth", "claude", ".credentials.json"]),
+      ~s({"claudeAiOauth":{"accessToken":"test-token"}})
+    )
 
     claude_models =
       JSON.encode!(%{
@@ -490,7 +495,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     {:ok, _ref, nil} =
@@ -517,7 +522,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
 
     handlers =
@@ -525,7 +530,7 @@ defmodule Tightbeam.GatewayTest do
         db: ctx.db,
         base_dir: System.tmp_dir!(),
         default_harness: :claude,
-        default_model: "claude-fable-5",
+        default_model: Model.new("claude-fable-5"),
         max_live_sessions_per_user: 5
       })
 
@@ -1006,7 +1011,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:push, _frames, _state} =
              Tightbeam.Wire.Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
 
-    assert %{harness: "claude", provider: "anthropic", model: "claude-fable-5"} =
+    assert %{harness: "claude", provider: "anthropic", model: %Model{family: "claude-fable-5"}} =
              Org.get(ctx.db, Org.personal_session_key(device.user_id))
   end
 
@@ -1560,7 +1565,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert key == created.session_key
     assert Org.get(ctx.db, key).handle == "builder"
-    assert Org.get(ctx.db, key).model == "claude-fable-5"
+    assert Org.get(ctx.db, key).model == Model.new("claude-fable-5")
 
     Roles.create!(ctx.db, "taken", "flynn", nil)
     {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
@@ -1596,7 +1601,7 @@ defmodule Tightbeam.GatewayTest do
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.put(:default_harness, :fixture)
-      |> Map.put(:default_model, "fixture-model")
+      |> Map.put(:default_model, Model.new("fixture-model"))
 
     handlers = Gateway.handlers(config)
 
@@ -1610,10 +1615,14 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert %{harness: "fixture", provider: "fixture_provider", model: "fixture-model"} =
+    assert %{
+             harness: "fixture",
+             provider: "fixture_provider",
+             model: %Model{family: "fixture-model"}
+           } =
              Org.get(ctx.db, spawned_key)
 
-    assert %{ok: true, harness: "fixture", model: "fixture-model"} =
+    assert %{ok: true, harness: "fixture", model: "fixture-model", effort: nil} =
              handlers["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
@@ -1659,7 +1668,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "before-model"
+      model: Model.new("before-model")
     })
 
     # Real prior conversation, so the barrier has something to bury.
@@ -1733,7 +1742,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "before-model"
+      model: Model.new("before-model")
     })
 
     for body <- ["first", "second"] do
@@ -2512,7 +2521,12 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol[medium]"}
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
              })
 
     assert message =~ "EMPTY model list for client_version \"0.99.0\""
@@ -2790,8 +2804,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
     assert_receive {:tune_residency_checked, "existing-session"}
-    assert_receive {:tune_model_applied, "existing-session", "claude-sonnet-4-6"}
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert_receive {:tune_model_applied, "existing-session", %Model{family: "claude-sonnet-4-6"}}
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
   end
 
   test "set_model records a resident apply failure and leaves the selected model unchanged",
@@ -2820,7 +2834,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "model_unavailable"
 
-    assert_receive {:tune_model_applied, "resident-session", "claude-sonnet-4-6"}
+    assert_receive {:tune_model_applied, "resident-session", %Model{family: "claude-sonnet-4-6"}}
     assert Org.get(ctx.db, "k1").model == before
   end
 
@@ -2849,7 +2863,7 @@ defmodule Tightbeam.GatewayTest do
         host: "kindhost",
         harness: "claude",
         provider: "anthropic",
-        model: "claude-sonnet-5[medium]"
+        model: Model.new("claude-sonnet-5", effort: "medium")
       })
 
       %{cred_base: base}
@@ -2912,6 +2926,428 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # A named field that is accepted and then dropped is the silent-no-op class
+  # this codebase keeps producing. `--effort high` with no `--model` says
+  # something real; it must reach the spawn, not vanish because the identity
+  # could not be built without a family.
+  test "a partial selection completes against the default instead of being dropped", ctx do
+    base_dir = role_test_base("partial-selection")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :partial_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", [
+      {"claude-fable-5", ["low", "high"]},
+      {"claude-sonnet-4-6", ["low", "high"]}
+    ])
+
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:default_model, Model.new("claude-fable-5", effort: "low"))
+
+    spawn_with = fn params, key ->
+      Gateway.handlers(config)["spawn"].(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: Map.merge(%{display_name: "Partial", idempotency_key: key}, params)
+      })
+    end
+
+    # Effort alone: the DEFAULT model, at the effort named.
+    assert %{session_key: only_effort} = spawn_with.(%{effort: "high"}, "k-effort")
+    assert Org.get(ctx.db, only_effort).model == Model.new("claude-fable-5", effort: "high")
+
+    # Nothing named: the default, untouched.
+    assert %{session_key: neither} = spawn_with.(%{}, "k-neither")
+    assert Org.get(ctx.db, neither).model == Model.new("claude-fable-5", effort: "low")
+
+    # A model alone carries the default's tier forward, composed against what
+    # that model actually offers — one mechanism decides effort.
+    assert %{session_key: only_model} = spawn_with.(%{model: "claude-sonnet-4-6"}, "k-model")
+    assert Org.get(ctx.db, only_model).model == Model.new("claude-sonnet-4-6", effort: "low")
+  end
+
+  # The OTHER half of the omitted-versus-explicit distinction, and it only
+  # means anything as a pair: an omitted context INHERITS, where an explicit
+  # default-window selection does not (see the wire round-trip tests). Collapse
+  # the two representations into one nil and exactly one of these two breaks,
+  # whichever way the collapse falls.
+  test "an omitted context inherits from the default, unlike an explicit one", ctx do
+    base_dir = role_test_base("omitted-context-inherits")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :omitted_context_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low", "high"]}])
+
+    put_host_catalog_entry("testhost", "claude", %{
+      family: "claude-fable-5",
+      context: "1m",
+      efforts: ["low", "high"]
+    })
+
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:default_model, Model.new("claude-fable-5", context: "1m", effort: "low"))
+
+    assert %{session_key: key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Omitted",
+                 idempotency_key: "k-omitted-context",
+                 effort: "high"
+               }
+             })
+
+    assert Org.get(ctx.db, key).model ==
+             Model.new("claude-fable-5", context: "1m", effort: "high"),
+           "naming only an effort must keep the default's context"
+
+    # …and the same request with the context NAMED as nil selects the default
+    # window instead. Identical params but for one key's presence, opposite
+    # outcomes — which is the whole point of carrying presence, and what a
+    # nil-dropping `put_named/3` silently made impossible.
+    assert %{session_key: explicit} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Explicit",
+                 idempotency_key: "k-explicit-context",
+                 effort: "high",
+                 context: nil
+               }
+             })
+
+    assert Org.get(ctx.db, explicit).model == Model.new("claude-fable-5", effort: "high"),
+           "naming the context as nil must select the default window, not inherit 1m"
+  end
+
+  # THE FAMILY EXCEPTION, THROUGH THE SEAM. A unit test on `named_fields/1`
+  # proves the field map; it does not prove what `complete/2` builds from it.
+  # An explicitly nil family must behave like an absent one — inherit — and
+  # never construct a `%Model{family: nil}` that is routed as though nil were
+  # a model and refused downstream for the wrong reason.
+  test "an explicitly nil family inherits the default rather than becoming a nil model", ctx do
+    base_dir = role_test_base("nil-family")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :nil_family_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low", "high"]}])
+
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:default_model, Model.new("claude-fable-5", effort: "low"))
+
+    # `model: nil` is what the wire delivers for `{"model": null}` now that the
+    # router carries an explicit null instead of dropping it.
+    for empty <- [nil, ""] do
+      key = "k-nil-family-#{inspect(empty)}"
+
+      assert %{session_key: spawned} =
+               Gateway.handlers(config)["spawn"].(%{
+                 origin: "user:flynn",
+                 session_key: nil,
+                 params: %{
+                   display_name: "Nil Family",
+                   idempotency_key: key,
+                   model: empty,
+                   effort: "high"
+                 }
+               }),
+             "an empty family must not refuse — it is a partial selection"
+
+      assert Org.get(ctx.db, spawned).model ==
+               Model.new("claude-fable-5", effort: "high"),
+             "the family inherits from the default; the named effort is honoured"
+    end
+  end
+
+  # A refusal has to name the right cause. An effort-only selection whose
+  # EFFORT is the invalid part was reported as a broken configured default,
+  # sending the operator to change a setting that was never the problem.
+  test "an invalid caller effort is not blamed on the configured default", ctx do
+    base_dir = role_test_base("effort-not-default")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :effort_blame_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low", "high"]}])
+
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:default_model, Model.new("claude-fable-5", effort: "low"))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{code: "model_unavailable"} =
+                 Gateway.handlers(config)["spawn"].(%{
+                   origin: "user:flynn",
+                   session_key: nil,
+                   params: %{
+                     display_name: "Blame",
+                     idempotency_key: "k-blame",
+                     effort: "bogus"
+                   }
+                 })
+      end)
+
+    refute log =~ "configured default model",
+           "the caller's effort was invalid; the configured default is fine"
+
+    # And the genuine case still warns — the flag means "entirely from policy".
+    dead = Map.put(config, :default_model, Model.new("not-in-catalog", effort: "low"))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{code: "model_unavailable"} =
+                 Gateway.handlers(dead)["spawn"].(%{
+                   origin: "user:flynn",
+                   session_key: nil,
+                   params: %{display_name: "Blame", idempotency_key: "k-blame-2"}
+                 })
+      end)
+
+    assert log =~ "configured default model"
+  end
+
+  # An archetype default is a `%Model{}` internally. Publishing it raw put
+  # `__struct__`/`family` — an INTERNAL shape — into a client payload, and JSON
+  # encoding refused it outright, so every org-options read broke the moment an
+  # archetype declared a default model.
+  test "archetype defaults and preferences cross org_options as named fields", ctx do
+    base_dir = role_test_base("org-options-defaults")
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(Path.join(manifests, "defaulted.toml"), """
+    name = "defaulted"
+
+    [defaults]
+    model = "claude-fable-5"
+    effort = "high"
+    context = "1m"
+
+    [[model_preferences]]
+    model = "gpt-5.6-sol"
+    effort = "medium"
+    """)
+
+    Archetypes.load!(base_dir)
+
+    inspected =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["inspect"].(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{}
+      })
+
+    defaulted = Enum.find(inspected.archetypes, &(&1.name == "defaulted"))
+
+    assert defaulted.defaults[:model] == "claude-fable-5"
+    assert defaulted.defaults[:effort] == "high"
+    assert defaulted.defaults[:context] == "1m"
+
+    assert defaulted.modelPreferences ==
+             [%{model: "gpt-5.6-sol", effort: "medium", context: nil}]
+
+    # It must actually SERIALIZE — a `%Model{}` here raised on encode, so the
+    # whole payload failed the moment an archetype declared a default model.
+    encoded = JSON.encode!(inspected)
+    refute encoded =~ "__struct__"
+    refute encoded =~ "family"
+  end
+
+  # THE WIRE SEAM, both directions. The ruling names the wire as a seam that
+  # carries NAMED FIELDS: a 1M selection that crossed as the bare string
+  # `claude-fable-5[1m]`, with nothing saying which part was the context, left
+  # the client no way to read it and left this side re-parsing on the way back.
+  test "the wire publishes a model identity as named fields and resolves it back", ctx do
+    Archetypes.load!(role_test_base("wire-named-fields"))
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low", "high"]}])
+
+    put_host_catalog_entry("testhost", "claude", %{
+      family: "claude-fable-5",
+      context: "1m",
+      efforts: ["low", "high"]
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "k-wire",
+      display_name: "Wire",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5", effort: "low")
+    })
+
+    status = Gateway.session_status("k-wire", ctx.db)
+
+    wide =
+      Enum.find(status.modelCatalog.models, &(&1.context == "1m"))
+
+    # OUTBOUND: the fields are named. `context` is a field a client can read,
+    # not a bracket it would have to split off a string itself.
+    assert wide.model == "claude-fable-5"
+    assert wide.context == "1m"
+    assert wide.efforts == ["low", "high"]
+    assert Enum.any?(
+             status.modelCatalog.models,
+             &(&1.model == "claude-fable-5" and is_nil(&1.context))
+           )
+
+    # The current selection, likewise.
+    assert status.display.modelFamily == "claude-fable-5"
+    assert status.display.modelContext == nil
+    assert status.display.reasoningLevel == "low"
+
+    # INBOUND: named fields select the 1M variant, without anything parsing a
+    # bracket to find it.
+    config = gateway_config(role_test_base("wire-named-fields-in"), ctx.db, 0)
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-wire",
+               params: %{setting: "set_model", model: "claude-fable-5", context: "1m"}
+             })
+
+    assert Org.get(ctx.db, "k-wire").model ==
+             Model.new("claude-fable-5", context: "1m", effort: "low")
+  end
+
+  # THE OTHER DIRECTION of the round trip, and a silent-retain if the two are
+  # confused: a session ON the 1M variant, whose client selects the DEFAULT
+  # row. `resolve_issued/3` resolves that id to `context: nil` — an explicit
+  # "the default window" — but a nil that also means "the caller said nothing"
+  # gets inherited over, and the tune reports success while the session stays
+  # on the 1M model. Explicit-default and omitted must not share a slot.
+  test "selecting the default-context row leaves the 1M variant, not inherits it", ctx do
+    Archetypes.load!(role_test_base("wire-default-context"))
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low"]}])
+
+    put_host_catalog_entry("testhost", "claude", %{
+      family: "claude-fable-5",
+      context: "1m",
+      efforts: ["low"]
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "k-wide",
+      display_name: "Wide",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5", context: "1m", effort: "low")
+    })
+
+    default_row =
+      Gateway.session_status("k-wide", ctx.db).modelCatalog.models
+      |> Enum.find(&is_nil(&1.context))
+
+    config = gateway_config(role_test_base("wire-default-context-in"), ctx.db, 0)
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-wide",
+               params: %{setting: "set_model", model: default_row.ref}
+             })
+
+    assert Org.get(ctx.db, "k-wide").model ==
+             Model.new("claude-fable-5", effort: "low"),
+           "selecting the default-window row must LEAVE the 1M variant"
+  end
+
+  # The identity this seam ISSUES is what a client echoes back, so it has to
+  # come home to the same row. Resolution is a catalog lookup, never a regex:
+  # a lookup cannot invent a context the host does not offer.
+  #
+  # THIS TEST IS THE GUARD on `wire_identity/1` rendering family and context
+  # ONLY. It is what fails if effort is ever rendered into the wire id, which
+  # would silently restore the 1M collision by giving that slot two meanings
+  # again. It reads as redundant beside the catalog tests. It is not.
+  test "an issued row identity echoed back resolves to that row's fields", ctx do
+    Archetypes.load!(role_test_base("wire-echo"))
+    put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low"]}])
+
+    put_host_catalog_entry("testhost", "claude", %{
+      family: "claude-fable-5",
+      context: "1m",
+      efforts: ["low"]
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "k-echo",
+      display_name: "Echo",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5", effort: "low")
+    })
+
+    issued =
+      Gateway.session_status("k-echo", ctx.db).modelCatalog.models
+      |> Enum.find(&(&1.context == "1m"))
+      |> Map.fetch!(:ref)
+
+    config = gateway_config(role_test_base("wire-echo-in"), ctx.db, 0)
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-echo",
+               params: %{setting: "set_model", model: issued}
+             })
+
+    # THE Q1 CONTRACT IN ONE ASSERTION. The bracket in an issued id can only
+    # ever mean context, because effort is never rendered into it — so the
+    # round trip must land the context in `context` and leave effort alone.
+    # Losing the context, or growing an effort out of the bracket, are the two
+    # ways this seam can be wrong, and both are pinned here.
+    stored = Org.get(ctx.db, "k-echo").model
+    assert stored.family == "claude-fable-5"
+    assert stored.context == "1m"
+    assert stored.effort == "low", "the effort came from the session, never from the id"
+
+    # And the identity it publishes for that row is the one it was handed.
+    assert Gateway.session_status("k-echo", ctx.db).display.model == issued
+  end
+
   test "session_status splits setModel (one row per model) from setReasoning (current model's tiers)",
        ctx do
     Archetypes.load!(role_test_base("session-status-reasoning"))
@@ -2925,7 +3361,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "codex",
       provider: "openai",
-      model: "gpt-5.6-sol[medium]"
+      model: Model.new("gpt-5.6-sol", effort: "medium")
     })
 
     status = Gateway.session_status("k-reasoning", ctx.db)
@@ -2972,7 +3408,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-sonnet-4-6"
+      model: Model.new("claude-sonnet-4-6")
     })
 
     status = Gateway.session_status("k-untiered", ctx.db)
@@ -3013,7 +3449,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert Org.get(ctx.db, "k1").model == "claude-sonnet-4-6"
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
   end
 
   test "a ref emitted by modelCatalog.models round-trips through set_model", ctx do
@@ -3030,7 +3466,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "codex",
       provider: "anthropic",
-      model: "gpt-5.6-sol[medium]"
+      model: Model.new("gpt-5.6-sol", effort: "medium")
     })
 
     adapter = start_supervised!({AdapterStub, self()})
@@ -3047,7 +3483,9 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: terra_ref}
              })
 
-    assert Org.get(ctx.db, "k-round-trip").model =~ ~r/^gpt-5\.6-terra\[(low|high)\]$/
+    stored = Org.get(ctx.db, "k-round-trip").model
+    assert {stored.family, stored.context} == {"gpt-5.6-terra", nil}
+    assert stored.effort in ["low", "high"]
     assert Org.get(ctx.db, "k-round-trip").provider == "openai"
   end
 
@@ -3065,7 +3503,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "codex",
       provider: "openai",
-      model: "gpt-5.6-sol[xhigh]"
+      model: Model.new("gpt-5.6-sol", effort: "xhigh")
     })
 
     adapter = start_supervised!({AdapterStub, self()})
@@ -3078,7 +3516,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-sol"}
              })
 
-    assert Org.get(ctx.db, "k-codex").model == "gpt-5.6-sol[xhigh]"
+    assert Org.get(ctx.db, "k-codex").model == Model.new("gpt-5.6-sol", effort: "xhigh")
   end
 
   test "set_model with a bare model id falls back to the new model's first tier when the current effort doesn't apply",
@@ -3096,7 +3534,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "codex",
       provider: "openai",
-      model: "gpt-5.6-sol[xhigh]"
+      model: Model.new("gpt-5.6-sol", effort: "xhigh")
     })
 
     adapter = start_supervised!({AdapterStub, self()})
@@ -3112,7 +3550,7 @@ defmodule Tightbeam.GatewayTest do
     # gpt-5.6-terra only offers low/high (in that catalog order); xhigh
     # doesn't carry over and terra has no "medium" either, so this lands on
     # its first listed tier.
-    assert Org.get(ctx.db, "k-codex-fallback").model == "gpt-5.6-terra[low]"
+    assert Org.get(ctx.db, "k-codex-fallback").model == Model.new("gpt-5.6-terra", effort: "low")
   end
 
   test "set_model with a bare model id prefers 'medium' when the current effort doesn't apply but medium does",
@@ -3130,7 +3568,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "codex",
       provider: "openai",
-      model: "gpt-5.6-nano[turbo]"
+      model: Model.new("gpt-5.6-nano", effort: "turbo")
     })
 
     adapter = start_supervised!({AdapterStub, self()})
@@ -3145,7 +3583,7 @@ defmodule Tightbeam.GatewayTest do
 
     # "turbo" doesn't exist on sol, but sol does offer "medium", so that's
     # preferred over just taking the first listed tier.
-    assert Org.get(ctx.db, "k-codex-medium").model == "gpt-5.6-sol[medium]"
+    assert Org.get(ctx.db, "k-codex-medium").model == Model.new("gpt-5.6-sol", effort: "medium")
   end
 
   test "set_model with a bare model id switching to an untiered model drops the effort qualifier",
@@ -3163,7 +3601,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "codex",
       provider: "openai",
-      model: "gpt-5.6-sol[high]"
+      model: Model.new("gpt-5.6-sol", effort: "high")
     })
 
     adapter = start_supervised!({AdapterStub, self()})
@@ -3176,11 +3614,14 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-classic"}
              })
 
-    assert Org.get(ctx.db, "k-codex-untiered").model == "gpt-5.6-classic"
+    assert Org.get(ctx.db, "k-codex-untiered").model == Model.new("gpt-5.6-classic")
   end
 
-  test "set_model still accepts a full bracketed ref directly (back-compat)", ctx do
-    base_dir = role_test_base("set-model-full-ref-back-compat")
+  # Renamed with the shape it now tests. There is no bracketed ref to be
+  # backward-compatible WITH: an explicit effort arrives as its own field and
+  # is honoured as given, never composed over.
+  test "set_model honours an explicitly named effort rather than composing one", ctx do
+    base_dir = role_test_base("set-model-explicit-effort")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
 
@@ -3193,7 +3634,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "codex",
       provider: "openai",
-      model: "gpt-5.6-sol[medium]"
+      model: Model.new("gpt-5.6-sol", effort: "medium")
     })
 
     adapter = start_supervised!({AdapterStub, self()})
@@ -3203,10 +3644,10 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k-codex-full-ref",
-               params: %{setting: "set_model", model: "gpt-5.6-sol[low]"}
+               params: %{setting: "set_model", model: "gpt-5.6-sol", effort: "low"}
              })
 
-    assert Org.get(ctx.db, "k-codex-full-ref").model == "gpt-5.6-sol[low]"
+    assert Org.get(ctx.db, "k-codex-full-ref").model == Model.new("gpt-5.6-sol", effort: "low")
   end
 
   test "set_reasoning composes the current model with the newly selected effort tier", ctx do
@@ -3223,7 +3664,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "codex",
       provider: "openai",
-      model: "gpt-5.6-sol[medium]"
+      model: Model.new("gpt-5.6-sol", effort: "medium")
     })
 
     adapter = start_supervised!({AdapterStub, self()})
@@ -3236,7 +3677,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_reasoning", reasoningLevel: "xhigh"}
              })
 
-    assert Org.get(ctx.db, "k-codex-reasoning").model == "gpt-5.6-sol[xhigh]"
+    assert Org.get(ctx.db, "k-codex-reasoning").model == Model.new("gpt-5.6-sol", effort: "xhigh")
   end
 
   test "set_reasoning rejects a level the current model does not offer", ctx do
@@ -3582,7 +4023,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     :ok =
@@ -3810,7 +4251,8 @@ defmodule Tightbeam.GatewayTest do
                params: %{
                  setting: "set_harness",
                  harness: "codex",
-                 model: "gpt-5.6-sol[medium]"
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
                }
              })
 
@@ -3850,7 +4292,7 @@ defmodule Tightbeam.GatewayTest do
 
     # Composed, not passed through: the tier is real information and the session must
     # end up on a ref the catalog actually offers.
-    assert Org.get(ctx.db, "k1").model == "gpt-5.6-sol[medium]"
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
 
     # And the value under test is one the picker really does advertise for this
     # session, so the case cannot keep passing if the advertised shape drifts. Read
@@ -3895,7 +4337,8 @@ defmodule Tightbeam.GatewayTest do
                params: %{
                  setting: "set_harness",
                  harness: "codex",
-                 model: "gpt-5.6-sol[medium]"
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
                }
              })
 
@@ -4027,7 +4470,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       onboarding_lease_ms: 1_800_000,
@@ -4113,14 +4556,40 @@ defmodule Tightbeam.GatewayTest do
 
   # Install a fresh catalog for one {host, harness}, so a test can give two hosts
   # genuinely different entitlements without a provider on either end.
-  defp put_host_catalog(host, harness, refs) do
-    entries =
-      Enum.map(refs, fn ref ->
+  defp put_host_catalog_entry(host, harness, overrides) do
+    entry =
+      Map.merge(
         %{
-          ref: ref,
-          display_name: ref,
-          name: ref,
+          family: "seeded",
+          context: nil,
+          display_name: "Seeded",
+          name: "Seeded",
           efforts: [],
+          max_input_tokens: 200_000,
+          capabilities: %{},
+          provider: :anthropic
+        },
+        overrides
+      )
+
+    :sys.replace_state(ModelCatalog, fn state ->
+      update_in(state.entries[{host, harness}].entries, &(&1 ++ [entry]))
+    end)
+  end
+
+  # A seeded catalog entry names a MODEL and the efforts it offers — the shape
+  # `ModelCatalog` really holds, so the stub cannot drift from it.
+  defp put_host_catalog(host, harness, models) do
+    entries =
+      Enum.map(models, fn spec ->
+        {family, efforts} = if is_tuple(spec), do: spec, else: {spec, []}
+
+        %{
+          family: family,
+          context: nil,
+          display_name: family,
+          name: family,
+          efforts: efforts,
           max_input_tokens: 200_000,
           capabilities: %{},
           provider: :anthropic
@@ -4380,7 +4849,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       onboarding_lease_ms: 1_800_000,
@@ -4466,7 +4935,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       onboarding_lease_ms: 1_800_000,
@@ -4498,7 +4967,10 @@ defmodule Tightbeam.GatewayTest do
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
     publish.("delivered")
     assert_receive {:load_apply_residency, "load-apply-session"}
-    assert_receive {:canonical_model_pushed_on_load, "load-apply-session", "fable"}
+
+    assert_receive {:canonical_model_pushed_on_load, "load-apply-session",
+                    %Model{family: "fable"}}
+
     assert_receive :load_without_owner_read_prompted
     refute_receive :unexpected_load_apply_new_session
     assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "loaded"]
@@ -4534,7 +5006,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       onboarding_lease_ms: 1_800_000,
@@ -4564,7 +5036,7 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:unknown_new_session, nil}
     assert_receive :default_model_captured
     assert_receive :default_session_prompted
-    assert Org.get(ctx.db, "k1").model == "harness-default"
+    assert Org.get(ctx.db, "k1").model == Model.new("harness-default")
 
     # The session/load-lost fallback consumes the same unknown value: it must
     # create without seeding, then capture the new harness default too.
@@ -4590,7 +5062,7 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:unknown_new_session, nil}
     assert_receive :default_model_captured
     assert_receive :default_session_prompted
-    assert Org.get(ctx.db, "k1").model == "harness-default"
+    assert Org.get(ctx.db, "k1").model == Model.new("harness-default")
     assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
   end
 
@@ -4620,7 +5092,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       onboarding_lease_ms: 1_800_000,
@@ -4744,7 +5216,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     retired =
@@ -4757,7 +5229,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
       |> then(&Org.retire(ctx.db, &1.session_key))
 
@@ -4860,7 +5332,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     retired =
@@ -4873,7 +5345,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
       |> then(&Org.retire(ctx.db, &1.session_key))
 
@@ -4889,7 +5361,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Org.append_pointer(ctx.db, main.session_key, "bundle-main-resident", "created")
@@ -4963,7 +5435,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     old =
@@ -4981,7 +5453,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     {:appended, failed_message} =
@@ -5066,7 +5538,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-stable", "created")
@@ -5113,8 +5585,8 @@ defmodule Tightbeam.GatewayTest do
     assert session_key == session.session_key
     assert_receive {:identity_apply_close, "thread-stable"}
 
-    assert_receive {:identity_apply_load, "thread-stable", "gpt-5.6-sol[medium]", ^cwd, _mcp,
-                    guidance}
+    assert_receive {:identity_apply_load, "thread-stable",
+                    %Model{family: "gpt-5.6-sol", effort: "medium"}, ^cwd, _mcp, guidance}
 
     assert guidance =~ "Codex developer message"
     assert Process.alive?(runtime_pid)
@@ -5173,7 +5645,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     # No pointer: the queued/running question is decided before any adapter work,
@@ -5223,7 +5695,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     assert {:ok, seq} =
@@ -5281,7 +5753,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
     end
 
@@ -5334,7 +5806,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-toctou", "created")
@@ -5431,7 +5903,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-newborn", "created")
@@ -5541,7 +6013,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-cancel-wait", "created")
@@ -5632,7 +6104,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-residual", "created")
@@ -5747,7 +6219,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     # No pointer appended: the session has never started. No adapter stub either —
@@ -5800,7 +6272,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-vanished", "created")
@@ -5875,7 +6347,7 @@ defmodule Tightbeam.GatewayTest do
           host: "testhost",
           harness: "codex",
           provider: "openai",
-          model: "gpt-5.6-sol[medium]"
+          model: Model.new("gpt-5.6-sol", effort: "medium")
         })
 
       if pointer, do: Org.append_pointer(ctx.db, key, pointer, "created")
@@ -5945,7 +6417,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-resident", "created")
@@ -5997,7 +6469,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     second =
@@ -6010,7 +6482,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
     fixture_session =
@@ -6023,7 +6495,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "fixture",
         provider: "fixture_provider",
-        model: "fixture-model"
+        model: Model.new("fixture-model")
       })
 
     Org.create(ctx.db, %{
@@ -6035,7 +6507,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-fable-5"
+      model: Model.new("claude-fable-5")
     })
 
     ensure_global_registry()
@@ -6063,7 +6535,7 @@ defmodule Tightbeam.GatewayTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "gpt-5.6-sol[medium]"
+        model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
       send(parent, :parked)
@@ -6320,7 +6792,7 @@ defmodule Tightbeam.GatewayTest do
       cwd: "/tmp",
       port: port,
       default_harness: :claude,
-      default_model: "claude-fable-5",
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       onboarding_lease_ms: 1_800_000,
@@ -6407,7 +6879,11 @@ defmodule Tightbeam.GatewayTest do
     if ready? do
       auth_dir = Path.join([base_dir, "auth", "claude"])
       File.mkdir_p!(auth_dir)
-      File.write!(Path.join(auth_dir, ".credentials.json"), ~s({"claudeAiOauth":{"accessToken":"test-token"}}))
+
+      File.write!(
+        Path.join(auth_dir, ".credentials.json"),
+        ~s({"claudeAiOauth":{"accessToken":"test-token"}})
+      )
     end
 
     on_exit(fn ->
@@ -6435,7 +6911,7 @@ defmodule Tightbeam.GatewayTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
   end
 

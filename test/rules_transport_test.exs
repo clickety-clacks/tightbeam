@@ -1,5 +1,6 @@
 defmodule Tightbeam.RulesTransportTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   import Plug.Conn
   import Plug.Test
@@ -72,7 +73,7 @@ defmodule Tightbeam.RulesTransportTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     actor =
@@ -85,7 +86,7 @@ defmodule Tightbeam.RulesTransportTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(db, "operator", device.user_id, actor.session_key)
@@ -112,7 +113,7 @@ defmodule Tightbeam.RulesTransportTest do
         host: "testhost",
         harness: :claude,
         provider: :anthropic,
-        model: "fable"
+        model: Model.new("fable")
       },
       ping_interval_ms: 60_000,
       pong_timeout_ms: 60_000

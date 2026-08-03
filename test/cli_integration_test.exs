@@ -1,5 +1,6 @@
 defmodule Tightbeam.CliIntegrationTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   @moduletag :cli_integration
 
@@ -72,7 +73,7 @@ defmodule Tightbeam.CliIntegrationTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(db, "cli-holder", "flynn", session.session_key)
@@ -87,7 +88,7 @@ defmodule Tightbeam.CliIntegrationTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(db, "cli-worker", "flynn", worker.session_key)
@@ -432,7 +433,7 @@ defmodule Tightbeam.CliIntegrationTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     reviewer =
@@ -445,7 +446,7 @@ defmodule Tightbeam.CliIntegrationTest do
         host: "testhost",
         harness: "codex",
         provider: "openai",
-        model: "test"
+        model: Model.new("test")
       })
 
     Roles.create!(ctx.db, "cli-coder", "flynn", coder.session_key)
@@ -649,7 +650,7 @@ defmodule Tightbeam.CliIntegrationTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     Roles.create!(ctx.db, coder.session_key, "flynn", coder.session_key)

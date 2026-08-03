@@ -30,7 +30,7 @@ defmodule Tightbeam.Readiness do
   thing it names.
   """
 
-  alias Tightbeam.{Harness, ModelCatalog, Placement}
+  alias Tightbeam.{Harness, Model, ModelCatalog, Placement}
 
   @type harness_row :: %{
           host: String.t(),
@@ -204,9 +204,18 @@ defmodule Tightbeam.Readiness do
     model = Map.get(config, :default_model)
 
     cond do
-      not (is_binary(model) and model != "") -> {:absent, "(unset)"}
-      Enum.any?(entries, &(&1.ref == model)) -> :selectable
-      true -> {:absent, model}
+      not match?(%Model{}, model) ->
+        {:absent, "(unset)"}
+
+      Enum.any?(
+        entries,
+        &(ModelCatalog.names_same_model?(&1, model) and
+            ModelCatalog.offers_effort?(&1, model.effort))
+      ) ->
+        :selectable
+
+      true ->
+        {:absent, Model.describe(model)}
     end
   end
 
@@ -339,13 +348,14 @@ defmodule Tightbeam.Readiness do
   defp model_line(%{model: :unknown}), do: nil
 
   defp model_line(%{harness: wire, model: {:absent, "(unset)"}}) do
-    "no default model set — set TIGHTBEAM_DEFAULT_MODEL to a live #{wire} ref " <>
-      "(see mix tightbeam.catalog.diff)"
+    "no default model set — set TIGHTBEAM_DEFAULT_MODEL to a live #{wire} model " <>
+      "and TIGHTBEAM_DEFAULT_EFFORT to one of its levels (see mix tightbeam.catalog.diff)"
   end
 
   defp model_line(%{harness: wire, host: host, model: {:absent, model}}) do
     "default model #{model} is not in #{wire}'s live catalog on #{host} — set " <>
-      "TIGHTBEAM_DEFAULT_MODEL to a ref that host offers (see mix tightbeam.catalog.diff)"
+      "TIGHTBEAM_DEFAULT_MODEL/_EFFORT to something that host offers " <>
+      "(see mix tightbeam.catalog.diff)"
   end
 
   defp package_for(wire) do

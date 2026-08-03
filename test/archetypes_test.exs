@@ -388,6 +388,60 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  # Stored selections hold FIELDS. A preference written as `"claude-fable-5[1m]"`
+  # is refused by name rather than split here — splitting is the guess that read
+  # a vendor context window as one of our reasoning levels and lost the model.
+  test "archetype defaults and model preferences are fields, and packed strings are refused",
+       ctx do
+    path = Path.join(manifests_dir!(ctx.base_dir), "prefs.toml")
+
+    File.write!(path, """
+    name = "prefs"
+
+    [defaults]
+    model = "claude-fable-5"
+    effort = "high"
+    context = "1m"
+
+    [[model_preferences]]
+    model = "claude-fable-5"
+    effort = "high"
+
+    [[model_preferences]]
+    model = "gpt-5.6-sol"
+    """)
+
+    archetype = Archetypes.load!(ctx.base_dir)["prefs"]
+
+    assert archetype.defaults[:model] ==
+             Tightbeam.Model.new("claude-fable-5", effort: "high", context: "1m")
+
+    assert archetype.model_preferences == [
+             Tightbeam.Model.new("claude-fable-5", effort: "high"),
+             Tightbeam.Model.new("gpt-5.6-sol")
+           ]
+
+    File.write!(path, """
+    name = "prefs"
+    model_preferences = ["claude-fable-5[1m]"]
+    """)
+
+    assert_raise ArgumentError, ~r/is a packed string; a preference is fields/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end
+
+    File.write!(path, """
+    name = "prefs"
+
+    [[model_preferences]]
+    effort = "high"
+    """)
+
+    assert_raise ArgumentError, ~r/model_preferences entry is missing model/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end
+  end
+
   test "where wildcard must stand alone and where must be non-empty", ctx do
     path = Path.join(manifests_dir!(ctx.base_dir), "bad.toml")
 

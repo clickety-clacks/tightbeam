@@ -19,6 +19,7 @@ defmodule Tightbeam.ToplinesTest do
   authorization if the clock cannot move between the two responses.
   """
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
   import Plug.Test
   import Plug.Conn
 
@@ -352,6 +353,8 @@ defmodule Tightbeam.ToplinesTest do
       assignment_id: "asg_r",
       job_ref: nil,
       model: "m-r",
+      effort: "high",
+      context: "1m",
       harness: "claude"
     )
 
@@ -367,7 +370,7 @@ defmodule Tightbeam.ToplinesTest do
     assert b.attests.total == 1
     assert b.jobs == 1
     assert b.turns.total == 1
-    assert b.minds == [%{model: "m-r", harness: "claude"}]
+    assert b.minds == [%{model: "m-r", context: "1m", effort: "high", harness: "claude"}]
 
     assert a.assignments.open == 1, "A keeps its OWN assignment"
     assert a.attests.total == 0, "A receives none of R's attests"
@@ -1087,9 +1090,9 @@ defmodule Tightbeam.ToplinesTest do
         db,
         """
         INSERT INTO turns
-          (seq, sessionKey, messageId, origin, prompt, assignmentId, jobRef, model, harness,
-           status, createdAt, endedAt)
-        VALUES (?1, ?2, ?3, 'user:flynn', 'p', ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+          (seq, sessionKey, messageId, origin, prompt, assignmentId, jobRef, model,
+           thinkingLevel, modelContext, harness, status, createdAt, endedAt)
+        VALUES (?1, ?2, ?3, 'user:flynn', 'p', ?4, ?5, ?6, ?11, ?12, ?7, ?8, ?9, ?10)
         """,
         [
           seq,
@@ -1101,7 +1104,9 @@ defmodule Tightbeam.ToplinesTest do
           Keyword.get(opts, :harness),
           Keyword.get(opts, :status, "delivered"),
           Keyword.get(opts, :created_at, @default_created),
-          Keyword.get(opts, :ended_at)
+          Keyword.get(opts, :ended_at),
+          Keyword.get(opts, :effort),
+          Keyword.get(opts, :context)
         ]
       )
 
@@ -1184,7 +1189,7 @@ defmodule Tightbeam.ToplinesTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "claude-fable-5"
+      model: Model.new("claude-fable-5")
     })
 
     key

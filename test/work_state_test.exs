@@ -1,5 +1,6 @@
 defmodule Tightbeam.WorkStateTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Assignments,
@@ -492,7 +493,7 @@ defmodule Tightbeam.WorkStateTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
   end
 

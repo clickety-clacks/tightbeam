@@ -1,5 +1,6 @@
 defmodule Tightbeam.RefixRequiresDiagnosisTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Archetypes,
@@ -314,7 +315,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       host: "eezo",
       harness: harness,
       provider: provider,
-      model: "test"
+      model: Model.new("test")
     })
   end
 end

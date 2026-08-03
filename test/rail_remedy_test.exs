@@ -1,5 +1,6 @@
 defmodule Tightbeam.RailRemedyTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     Archetypes,
@@ -1074,7 +1075,7 @@ defmodule Tightbeam.RailRemedyTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :codex,
-      default_model: "test",
+      default_model: Model.new("test"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       onboarding_lease_ms: 1_800_000,
@@ -1153,7 +1154,7 @@ defmodule Tightbeam.RailRemedyTest do
       host: "eezo",
       harness: harness,
       provider: if(harness == "codex", do: "openai", else: "anthropic"),
-      model: "test"
+      model: Model.new("test")
     })
   end
 end

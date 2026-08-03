@@ -1,5 +1,6 @@
 defmodule Tightbeam.ConditionFactsTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     ConditionFacts,
@@ -55,7 +56,7 @@ defmodule Tightbeam.ConditionFactsTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: "fable"
+        model: Model.new("fable")
       })
 
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})

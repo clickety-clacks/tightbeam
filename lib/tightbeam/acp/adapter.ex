@@ -9,16 +9,19 @@ defmodule Tightbeam.Acp.Adapter do
      session/load, and immediately before each turn. An unknown selection is
      never pushed: a fresh session keeps the harness default and captures it
      when reported, while a loaded session is left unchanged.
-  2. Model via session/set_config_option {configId:"model"} with a BARE name;
-     effort rides as "model[effort]" split and applied via the harness's effort
-     config id.
+  2. Callers pass a `Tightbeam.Model` structure. This module is the seam that
+     renders it for the harness: the vendor identifier (family, plus the
+     vendor's context variant when there is one) via
+     session/set_config_option {configId:"model"}, and the effort — Tightbeam's
+     own field — via the harness's effort config id. Nothing outside this
+     module builds or reads a packed model string.
   3. Permission requests auto-allowed by Conn (YOLO); sessions run in the
      harness's bypass mode set at session/new time.
   """
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness}
+  alias Tightbeam.{Harness, Model}
   alias Tightbeam.Acp.Conn
 
   @gate_attestation_timeout 120_000
@@ -64,8 +67,8 @@ defmodule Tightbeam.Acp.Adapter do
 
   @type adapter :: GenServer.server()
 
-  @typedoc "Model reference — bare name or \"name[effort]\" (see parse_model_ref/1)."
-  @type model_ref :: String.t()
+  @typedoc "A model identity. Structured everywhere; rendered only at this seam."
+  @type model_ref :: Tightbeam.Model.t()
 
   @doc """
   Start the adapter. Required: `:harness` (a registered harness id), `:cmd` (adapter
@@ -421,7 +424,7 @@ defmodule Tightbeam.Acp.Adapter do
           |> put_in([Access.key(:chunks), sid], [])
 
         case model do
-          model when is_binary(model) ->
+          %Model{} = model ->
             case apply_model_to_session(state, sid, model) do
               {:ok, applied_model} ->
                 {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
@@ -736,7 +739,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   ## Model application (the fable-trap rule)
 
-  defp establish_new_session_model(state, sid, model, _result) when is_binary(model),
+  defp establish_new_session_model(state, sid, %Model{} = model, _result),
     do: apply_model_to_session(state, sid, model)
 
   defp establish_new_session_model(state, _sid, _unknown, result) do
@@ -746,7 +749,7 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp remember_model(state, sid, model) when is_binary(model),
+  defp remember_model(state, sid, %Model{} = model),
     do: put_in(state.models[sid], model)
 
   defp remember_model(state, sid, _unknown),
@@ -758,15 +761,15 @@ defmodule Tightbeam.Acp.Adapter do
     end)
   end
 
-  defp apply_model_to_session(state, sid, model_ref, request) do
-    {model, effort} = parse_model_ref(model_ref)
+  defp apply_model_to_session(state, sid, %Model{} = model_ref, request) do
+    effort = model_ref.effort
 
     with {:ok, base_result} <-
            map_model_refusal(
              request.("session/set_config_option", %{
                sessionId: sid,
                configId: "model",
-               value: model
+               value: Model.to_ref(model_ref)
              })
            ),
          {:ok, effort_result} <-
@@ -797,8 +800,9 @@ defmodule Tightbeam.Acp.Adapter do
   defp map_model_refusal({:error, %{"code" => -32602}}), do: {:error, :model_unavailable}
   defp map_model_refusal(result), do: result
 
-  defp strict_apply(state, sid, model_ref, deadline) do
-    {model, effort} = parse_model_ref(model_ref)
+  defp strict_apply(state, sid, %Model{} = model_ref, deadline) do
+    model = Model.to_ref(model_ref)
+    effort = model_ref.effort
 
     case map_model_refusal(strict_model_request(state, sid, "model", model, deadline)) do
       {:ok, base_result} ->
@@ -890,10 +894,10 @@ defmodule Tightbeam.Acp.Adapter do
         :error
 
       effort in [nil, "", "default"] ->
-        {:ok, model}
+        {:ok, Model.parse_ref(model)}
 
       true ->
-        {:ok, "#{model}[#{effort}]"}
+        {:ok, %{Model.parse_ref(model) | effort: effort}}
     end
   end
 
@@ -1105,20 +1109,4 @@ defmodule Tightbeam.Acp.Adapter do
     if path, do: File.write!(path, line <> "\n", [:append])
   end
 
-  @doc """
-  Split a model ref into `{model, effort}`; effort is nil when absent.
-
-      iex> Tightbeam.Acp.Adapter.parse_model_ref("gpt-5.6-sol[medium]")
-      {"gpt-5.6-sol", "medium"}
-
-      iex> Tightbeam.Acp.Adapter.parse_model_ref("claude-fable-5")
-      {"claude-fable-5", nil}
-  """
-  @spec parse_model_ref(model_ref()) :: {String.t(), String.t() | nil}
-  def parse_model_ref(ref) do
-    case Regex.run(~r/^(.*?)\[(.*?)\]$/, ref) do
-      [_, model, effort] -> {model, effort}
-      _ -> {ref, nil}
-    end
-  end
 end

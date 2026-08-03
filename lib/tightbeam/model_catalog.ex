@@ -22,14 +22,20 @@ defmodule Tightbeam.ModelCatalog do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Placement}
+  alias Tightbeam.{Harness, Model, Placement}
 
   @default_ttl_ms :timer.minutes(15)
 
   @type health :: :fresh | :stale | {:unavailable, term()}
   @type key :: {host :: String.t(), harness :: String.t()}
+  @typedoc """
+  One vendor model on one host, as fields. `family` and `context` are the
+  vendor's (`claude-fable-5`, `1m`); `efforts` is what Tightbeam may ask of it.
+  Capabilities live here rather than folded into an identity.
+  """
   @type entry :: %{
-          ref: String.t(),
+          family: String.t(),
+          context: String.t() | nil,
           display_name: String.t(),
           efforts: [String.t()],
           max_input_tokens: non_neg_integer() | nil,
@@ -73,21 +79,48 @@ defmodule Tightbeam.ModelCatalog do
     end)
   end
 
-  @doc "Check membership on a host with the health of the inventory used."
-  @spec member?(String.t(), String.t(), String.t(), GenServer.server()) ::
+  @doc """
+  Check membership on a host with the health of the inventory used.
+
+  A selection is offered when the host lists that family and context AND the
+  effort matches what the entry offers: an entry with effort tiers requires
+  one, an entry with none refuses one.
+  """
+  @spec member?(String.t(), String.t(), Model.t(), GenServer.server()) ::
           %{present?: boolean(), health: health()}
-  def member?(host, harness, ref, server \\ __MODULE__)
-      when is_binary(host) and is_binary(harness) and is_binary(ref) do
-    {entries, health} = get(host, harness, server)
-    %{present?: Enum.any?(entries, &(&1.ref == ref)), health: health}
+  def member?(host, harness, %Model{} = model, server \\ __MODULE__)
+      when is_binary(host) and is_binary(harness) do
+    {entry, health} = entry(host, harness, model, server)
+    %{present?: not is_nil(entry) and offers_effort?(entry, model.effort), health: health}
   end
 
-  @doc "Return the selected catalog entry on a host and the inventory health used."
-  def entry(host, harness, ref, server \\ __MODULE__)
-      when is_binary(host) and is_binary(harness) and is_binary(ref) do
+  @doc """
+  Return the catalog entry for a selection's family and context on a host, and
+  the inventory health used. The effort is not consulted — the entry is what
+  says which efforts exist.
+  """
+  @spec entry(String.t(), String.t(), Model.t(), GenServer.server()) ::
+          {entry() | nil, health()}
+  def entry(host, harness, %Model{} = model, server \\ __MODULE__)
+      when is_binary(host) and is_binary(harness) do
     {entries, health} = get(host, harness, server)
-    {Enum.find(entries, &(&1.ref == ref)), health}
+    {Enum.find(entries, &names_same_model?(&1, model)), health}
   end
+
+  @doc "Whether a catalog entry names the same vendor model as a selection."
+  @spec names_same_model?(entry(), Model.t()) :: boolean()
+  def names_same_model?(entry, %Model{} = model),
+    do: entry.family == model.family and entry.context == model.context
+
+  @doc """
+  Whether an entry offers a reasoning level. The ENTRY is the authority on what
+  may be asked of a model: one with tiers requires a level, one with none
+  refuses one. Every caller that completes a selection asks here, so no second
+  copy of the rule can drift.
+  """
+  @spec offers_effort?(entry(), String.t() | nil) :: boolean()
+  def offers_effort?(%{efforts: []}, effort), do: is_nil(effort)
+  def offers_effort?(%{efforts: efforts}, effort), do: effort in efforts
 
   @impl true
   def init(opts) do

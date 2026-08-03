@@ -68,7 +68,14 @@ pub enum Command {
         idempotency_key: String,
         archetype: Option<String>,
         harness: Option<String>,
-        model: Option<String>,
+        /// A model field the operator NAMED. `None` is a flag they did not
+        /// pass; `Some(None)` is one they passed empty — "the vendor's default
+        /// window", "no tier" — which is a real selection and a different
+        /// request from silence. Collapsing the two is how an explicit choice
+        /// arrives downstream as an omission and gets inherited over.
+        model: Option<Option<String>>,
+        effort: Option<Option<String>>,
+        context: Option<Option<String>>,
         handle: Option<String>,
         host: Option<String>,
     },
@@ -336,18 +343,22 @@ COMMANDS:
       List artifact rows matching every supplied exact filter.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
-        [--harness {{HARNESSES_PIPE}}] [--model <ref>] [--host <host>]
-        [--key <idempotencyKey>]
+        [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
+        [--context <variant>] [--host <host>] [--key <idempotencyKey>]
       Hire a new session (a worker). --display is its human label; --name
       registers a role bound to the new session — do NOT confuse it with --as,
       which is YOUR identity. --key makes the spawn idempotent
       (same key returns the same session). Omitted fields inherit the
       archetype's defaults.
         tightbeam spawn --display "Reviewer" --name reviewer:x \
-          --harness {{EXAMPLE_HARNESS}} --model "<catalog-ref>" --as orchestrator:news
+          --harness {{EXAMPLE_HARNESS}} --model <catalog-model> --effort <level> \
+          --as orchestrator:news
       --host picks a machine WITHIN the archetype's allowed set (see list's
       archetypes/hosts); omitted, the archetype's default placement applies.
-      Model refs must come from list's model catalog — never invent one.
+      A model is named by FIELDS, never one packed string: --model is the
+      model itself, --effort its reasoning level, --context the vendor's
+      context-window variant when it offers more than one. All must come from
+      list's model catalog — never invent one.
 
   list
       Show the sessions you can address (with handles + provenance), the
@@ -586,6 +597,21 @@ fn split_args(args: Vec<String>) -> Flags {
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
+}
+
+/// PRESENCE, for the fields where an empty value means something. `nonempty`
+/// answers "is there a value here", which silently merges "not passed" with
+/// "passed empty"; a model selection needs those apart, because an empty
+/// `--context` is the default window and an absent one is a question the
+/// caller did not answer.
+fn named(flags: &HashMap<String, String>, name: &str) -> Option<Option<String>> {
+    flags.get(name).map(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.clone())
+        }
+    })
 }
 
 fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
@@ -921,7 +947,9 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
                 archetype: nonempty(flags, "archetype"),
                 harness,
-                model: nonempty(flags, "model"),
+                model: named(flags, "model"),
+                effort: named(flags, "effort"),
+                context: named(flags, "context"),
                 handle: nonempty(flags, "name"),
                 host: nonempty(flags, "host"),
             })
@@ -2195,6 +2223,10 @@ mod tests {
                     "codex",
                     "--model",
                     "gpt",
+                    "--effort",
+                    "high",
+                    "--context",
+                    "1m",
                     "--name",
                     "reviewer",
                     "--host",
@@ -2208,7 +2240,9 @@ mod tests {
                     idempotency_key: "k".to_owned(),
                     archetype: Some("worker".to_owned()),
                     harness: Some("codex".to_owned()),
-                    model: Some("gpt".to_owned()),
+                    model: Some(Some("gpt".to_owned())),
+                    effort: Some(Some("high".to_owned())),
+                    context: Some(Some("1m".to_owned())),
                     handle: Some("reviewer".to_owned()),
                     host: Some("eezo".to_owned()),
                 },

@@ -191,13 +191,14 @@ defmodule Tightbeam.Wire.Router do
       picker =
         for {k, atom} <- [
               {"harness", :harness},
-              {"model", :model},
               {"host", :host},
               {"archetype", :archetype}
             ],
             is_binary(body[k]) and body[k] != "",
             into: %{},
             do: {atom, body[k]}
+
+      picker = Map.merge(picker, model_params(body))
 
       call = %{
         verb: "spawn",
@@ -773,16 +774,51 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  # A model identity crosses the wire as NAMED FIELDS. The router carries them
+  # across unchanged — it does not parse `model`, because a bracket in that
+  # value is the vendor's context variant and reading it as one of our effort
+  # levels is the whole defect this seam exists to prevent. A client that
+  # echoes back the row identity this seam issued is resolved against the
+  # catalog by the gateway (`resolve_selection/3`), never by a regex here.
+  defp model_params(body) do
+    Enum.reduce(~w(model context effort), %{}, fn key, params ->
+      case Map.fetch(body, key) do
+        {:ok, value} when is_binary(value) and value != "" ->
+          Map.put(params, String.to_existing_atom(key), value)
+
+        # NAMED, AND NAMED EMPTY. `null` and `""` are the client saying "this
+        # field, with nothing in it" — the vendor's default window, no tier —
+        # which is a different request from omitting the key. Dropping them
+        # here would undo at the outermost seam the distinction every layer
+        # below is built to carry, and the caller's explicit choice would
+        # arrive as silence and be inherited over.
+        {:ok, value} when is_nil(value) or value == "" ->
+          Map.put(params, String.to_existing_atom(key), nil)
+
+        # Anything else is not a field value this seam knows how to read, and
+        # it is not turned into one by guessing.
+        _ ->
+          params
+      end
+    end)
+  end
+
   defp control_call(%{"action" => "cancel_current_run"}), do: {:ok, "cancel", %{}}
 
   defp control_call(%{"action" => action}) when action in ~w(adopt unadopt),
     do: {:ok, "tune", %{setting: "adopt", adopted: action == "adopt"}}
 
-  defp control_call(%{"action" => "set_model", "model" => model}),
-    do: {:ok, "tune", %{setting: "set_model", model: model}}
+  defp control_call(%{"action" => "set_model", "model" => model} = body)
+       when is_binary(model),
+       do: {:ok, "tune", Map.put(model_params(body), :setting, "set_model")}
 
   defp control_call(%{"action" => "set_harness", "harness" => harness} = body),
-    do: {:ok, "tune", %{setting: "set_harness", harness: harness, model: body["model"]}}
+    do:
+      {:ok, "tune",
+       body
+       |> model_params()
+       |> Map.put(:setting, "set_harness")
+       |> Map.put(:harness, harness)}
 
   defp control_call(%{"action" => action} = body)
        when action in ~w(set_thinking set_reasoning set_fast_mode set_mode set_verbosity) do

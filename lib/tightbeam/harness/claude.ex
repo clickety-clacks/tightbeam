@@ -3,6 +3,7 @@ defmodule Tightbeam.Harness.Claude do
   @behaviour Tightbeam.Harness
 
   alias Tightbeam.Harness.Support
+  alias Tightbeam.Model
 
   require Logger
 
@@ -17,9 +18,9 @@ defmodule Tightbeam.Harness.Claude do
   #
   # The derived catalog for claude comes from the Anthropic API (`fetch_catalog/1` hits
   # `/v1/models`), which currently lists 11 models. The claude ACP adapter's
-  # `session/set_config_option {configId: "model"}` accepts only SEVEN values, and
-  # `Acp.Adapter.parse_model_ref/1` strips nothing but an `[effort]` suffix — the base
-  # string goes to the adapter verbatim, so there is NO translation layer to fix. A model
+  # `session/set_config_option {configId: "model"}` accepts only SEVEN values, and the
+  # adapter seam renders the identity verbatim — family plus the vendor's context variant,
+  # with our effort on its own config option — so there is NO translation layer to fix. A model
   # the adapter refuses fails the apply, which runs after EVERY `session/new` and every
   # `session/load` (never-trust-the-advertised-model), so it recurs on resume, not just
   # spawn.
@@ -581,7 +582,6 @@ defmodule Tightbeam.Harness.Claude do
       options
       |> Enum.map(&Map.get(&1, "value"))
       |> Enum.filter(&is_binary/1)
-      |> Enum.map(&base_ref/1)
     else
       _ -> []
     end
@@ -591,15 +591,13 @@ defmodule Tightbeam.Harness.Claude do
 
   defp keep_selectable(entries, selectable) do
     {kept, dropped} =
-      Enum.split_with(entries, fn entry ->
-        entry.ref |> base_ref() |> Kernel.in(selectable)
-      end)
+      Enum.split_with(entries, &(vendor_ref(&1) in selectable))
 
     if dropped != [] do
       Logger.info(
         "claude catalog: #{length(dropped)} model(s) the API offers are not selectable by " <>
           "claude-agent-acp #{@adapter_version} and were withheld: " <>
-          Enum.map_join(dropped, ", ", & &1.ref) <>
+          Enum.map_join(dropped, ", ", &vendor_ref/1) <>
           " — if an expected model is here, the harness home has not been used yet and its " <>
           "model cache is empty; onboarding warms it, and first use fills it"
       )
@@ -608,19 +606,16 @@ defmodule Tightbeam.Harness.Claude do
     kept
   end
 
-  defp base_ref(ref) do
-    case Regex.run(~r/^(.*?)\[(.*?)\]$/, ref) do
-      [_, base, _effort] -> base
-      _ -> ref
-    end
-  end
+  defp vendor_ref(entry),
+    do: Model.to_ref(Model.new(entry.family, context: entry.context))
 
   @impl true
   def conformance_vectors do
     source = Enum.map_join(@adapter_replacements, "\n", &elem(&1, 0))
 
     valid_entry = %{
-      ref: "claude-vector[low]",
+      family: "claude-vector",
+      context: nil,
       display_name: "Claude Vector",
       name: "Claude Vector",
       efforts: ["low"],
@@ -855,7 +850,7 @@ defmodule Tightbeam.Harness.Claude do
              max_input_tokens >= 0 and is_map(capabilities) ->
         case efforts(capabilities) do
           {:ok, effort_names} ->
-            {:cont, {:ok, entries ++ entries_for(model, id, effort_names, capabilities)}}
+            {:cont, {:ok, entries ++ [entry_for(model, id, effort_names, capabilities)]}}
 
           :error ->
             {:halt, {:error, :malformed_catalog}}
@@ -887,25 +882,23 @@ defmodule Tightbeam.Harness.Claude do
     end
   end
 
-  defp entries_for(model, id, effort_names, capabilities) do
-    refs =
-      if effort_names == [],
-        do: [id],
-        else: Enum.map(effort_names, &"#{id}[#{&1}]")
-
+  # ONE entry per vendor model, carrying the efforts it offers. The vendor's id
+  # may itself name a context variant (`claude-fable-5[1m]`), which is parsed
+  # into its own field here rather than being mistaken for one of our efforts.
+  defp entry_for(model, id, effort_names, capabilities) do
+    identity = Model.parse_ref(id)
     display_name = model["display_name"] || id
 
-    Enum.map(refs, fn ref ->
-      %{
-        ref: ref,
-        display_name: display_name,
-        name: display_name,
-        efforts: effort_names,
-        max_input_tokens: model["max_input_tokens"],
-        capabilities: capabilities,
-        provider: :anthropic
-      }
-    end)
+    %{
+      family: identity.family,
+      context: identity.context,
+      display_name: display_name,
+      name: display_name,
+      efforts: effort_names,
+      max_input_tokens: model["max_input_tokens"],
+      capabilities: capabilities,
+      provider: :anthropic
+    }
   end
 
   defp http_get(path, headers) do

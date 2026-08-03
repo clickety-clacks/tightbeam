@@ -1,5 +1,6 @@
 defmodule Tightbeam.RolesTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{DB, Org, Roles}
 
@@ -92,7 +93,7 @@ defmodule Tightbeam.RolesTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: "fable"
+      model: Model.new("fable")
     })
   end
 end

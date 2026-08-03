@@ -192,7 +192,9 @@ The service must **start with no interactive login**, **survive logout**,
 | `TIGHTBEAM_BASE_DIR` | The org: `auth/`, `identity/`, `homes/`, `state.db`, `work/`. Defaults to `TIGHTBEAM_HOME`, else `~/.tightbeam`. |
 | `TIGHTBEAM_PORT` | Rewritten into `gateway.json` at every boot. |
 | `TIGHTBEAM_ADVERTISED_URL` | The URL clients are told to connect back on. `mix tightbeam.doctor` fails without it. |
-| `TIGHTBEAM_DEFAULT_MODEL` | Must be a live ref for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
+| `TIGHTBEAM_DEFAULT_MODEL` | The default model itself, undecorated (`claude-sonnet-5`). Must be live for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
+| `TIGHTBEAM_DEFAULT_EFFORT` | The default reasoning level (`low`…`max`). Required when the default model offers effort tiers — a model is selected by FIELDS, never one packed string. |
+| `TIGHTBEAM_DEFAULT_CONTEXT` | The vendor's context-window variant, when it offers more than one (`1m`). Omit for the model's default window. |
 | `CODEX_PATH` | Pin the codex binary. Harness CLIs auto-update underneath you; an unpinned one changes behaviour without warning. |
 
 Run the service **as an ordinary user, not root** — set the account explicitly

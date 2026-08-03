@@ -253,7 +253,7 @@ defmodule Tightbeam.CredentialKindsTest do
                  options: %{claude_fetch: fetch, claude_selectable_models: :all}
                })
 
-      assert entry.ref == "claude-sonnet-5[low]"
+      assert {entry.family, entry.context, entry.efforts} == {"claude-sonnet-5", nil, ["low"]}
       assert_receive {:claude_probe, path, names}
       assert path =~ "/v1/models"
       assert "x-api-key" in names
@@ -315,7 +315,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
       # The platform route answers with bare ids: no display name, no effort
       # tiers, no context window. The catalog says so rather than inventing them.
-      assert entry.ref == "gpt-5.6-sol"
+      assert entry.family == "gpt-5.6-sol"
       assert entry.display_name == "gpt-5.6-sol"
       assert entry.efforts == []
       assert entry.max_input_tokens == nil
@@ -340,7 +340,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
       # The catalog must not advertise what the adapter will refuse: spawns
       # validated against `gpt-5.1-codex` and then -32602'd at model apply.
-      assert Enum.map(entries, & &1.ref) == ["gpt-5.6-sol"]
+      assert Enum.map(entries, & &1.family) == ["gpt-5.6-sol"]
     end
 
     test "the injectable seam lifts the api-key selectable pin", ctx do
@@ -354,7 +354,7 @@ defmodule Tightbeam.CredentialKindsTest do
                  options: %{sh: sh, codex_selectable_models: :all}
                })
 
-      assert Enum.map(entries, & &1.ref) == ["gpt-5.1-codex", "gpt-5.6-sol"]
+      assert Enum.map(entries, & &1.family) == ["gpt-5.1-codex", "gpt-5.6-sol"]
     end
 
     test "the subscription catalog is not filtered by the api-key pin", ctx do
@@ -374,7 +374,7 @@ defmodule Tightbeam.CredentialKindsTest do
                  options: %{sh: sh}
                })
 
-      assert entry.ref == "gpt-x-future[medium]"
+      assert {entry.family, entry.efforts} == {"gpt-x-future", ["medium"]}
     end
 
     test "an empty api-key catalog is not blamed on a client version", ctx do
@@ -551,8 +551,8 @@ defmodule Tightbeam.CredentialKindsTest do
                {sat, _} = ModelCatalog.get("satellite", "codex", catalog)
                {gw, _} = ModelCatalog.get(local_host(), "codex", catalog)
 
-               Enum.map(sat, & &1.ref) == ["gpt-5.6-sol"] and
-                 Enum.map(gw, & &1.ref) == ["gpt-5.6-sol[medium]"]
+               Enum.map(sat, &{&1.family, &1.efforts}) == [{"gpt-5.6-sol", []}] and
+                 Enum.map(gw, &{&1.family, &1.efforts}) == [{"gpt-5.6-sol", ["medium"]}]
              end)
 
       probes = drain_probes([])

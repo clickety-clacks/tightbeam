@@ -145,7 +145,8 @@ defmodule Tightbeam.Harness.Fixture do
         {:ok,
          [
            %{
-             ref: "fixture-model",
+             family: "fixture-model",
+             context: nil,
              display_name: "Fixture Model",
              name: "Fixture Model",
              efforts: [],
@@ -168,7 +169,8 @@ defmodule Tightbeam.Harness.Fixture do
     source = "fixture-anchor"
 
     valid_entry = %{
-      ref: "fixture-model",
+      family: "fixture-model",
+      context: nil,
       display_name: "Fixture Model",
       name: "Fixture Model",
       efforts: [],

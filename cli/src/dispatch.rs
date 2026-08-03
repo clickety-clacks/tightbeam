@@ -195,6 +195,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             archetype,
             harness,
             model,
+            effort,
+            context,
             handle,
             host,
         } => {
@@ -202,15 +204,23 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("displayName", display_name),
                 string_field("idempotencyKey", idempotency_key),
             ];
+            // One pass, original field order. A model field NAMED but empty
+            // crosses as JSON null; omitted stays omitted, because inheritance
+            // on the far side depends on telling those apart. The other fields
+            // have no meaningful empty value, so they lift into the same shape.
             for (name, value) in [
-                ("archetype", archetype),
-                ("harness", harness),
-                ("model", model),
-                ("handle", handle),
-                ("host", host),
+                ("archetype", archetype.clone().map(Some)),
+                ("harness", harness.clone().map(Some)),
+                ("model", model.clone()),
+                ("effort", effort.clone()),
+                ("context", context.clone()),
+                ("handle", handle.clone().map(Some)),
+                ("host", host.clone().map(Some)),
             ] {
-                if let Some(value) = value {
-                    params.push(string_field(name, value));
+                match value {
+                    Some(Some(value)) => params.push(string_field(name, &value)),
+                    Some(None) => params.push(format!("\"{name}\":null")),
+                    None => {}
                 }
             }
             Ok(request(identity, "spawn", vec![], params))
@@ -1439,6 +1449,10 @@ mod tests {
                 "codex",
                 "--model",
                 "gpt",
+                "--effort",
+                "high",
+                "--context",
+                "1m",
                 "--host",
                 "eezo",
                 "--key",
@@ -1446,7 +1460,54 @@ mod tests {
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","handle":"reviewer","host":"eezo"}}"#
+            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"eezo"}}"#
+        );
+
+        // A flag NAMED but left empty is a real selection — "the vendor's
+        // default window", "no tier" — and it must cross as JSON null, not
+        // vanish. Dropped here, the gateway reads silence and inherits the
+        // default's context over the operator's explicit choice. The empty
+        // flag is present-with-value; `nonempty` threw exactly those away.
+        assert_eq!(
+            body(&[
+                "spawn",
+                "--display",
+                "Reviewer",
+                "--archetype",
+                "worker",
+                "--harness",
+                "codex",
+                "--model",
+                "gpt",
+                "--context",
+                "",
+                "--key",
+                "k1",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","context":null}}"#
+        );
+
+        // …and an OMITTED flag still omits the key, or inheritance downstream
+        // can never fire. The pair is what gives either one meaning.
+        assert_eq!(
+            body(&[
+                "spawn",
+                "--display",
+                "Reviewer",
+                "--archetype",
+                "worker",
+                "--harness",
+                "codex",
+                "--model",
+                "gpt",
+                "--key",
+                "k1",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt"}}"#
         );
         let command = Command::IdentityEdit {
             identity: Identity::User("flynn".to_owned()),

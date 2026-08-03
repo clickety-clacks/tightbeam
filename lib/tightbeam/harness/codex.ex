@@ -5,6 +5,7 @@ defmodule Tightbeam.Harness.Codex do
   require Logger
 
   alias Tightbeam.Harness.Support
+  alias Tightbeam.Model
 
   @adapter_version "1.1.4"
   @adapter_package "codex-acp"
@@ -57,6 +58,10 @@ defmodule Tightbeam.Harness.Codex do
   # `session/set_config_option {configId: "model"}`. Update this table and
   # `@adapter_version` together.
   @adapter_selectable_models ~w(gpt-5.6-sol)
+
+  # The gate probe's own model, as fields — it crosses the adapter seam like any
+  # other selection.
+  @probe_model %Tightbeam.Model{family: "gpt-5.6-sol", effort: "medium", context: nil}
 
   @adapter_bundle "index.js"
   @adapter_replacements [
@@ -167,7 +172,7 @@ defmodule Tightbeam.Harness.Codex do
           ensure_opts
         )
 
-        [probe_cwd: probe_cwd, probe_model: "gpt-5.6-sol[medium]"]
+        [probe_cwd: probe_cwd, probe_model: @probe_model]
       else
         []
       end
@@ -576,7 +581,8 @@ defmodule Tightbeam.Harness.Codex do
     levels = [%{"effort" => "medium"}]
 
     valid_entry = %{
-      ref: "codex-vector[medium]",
+      family: "codex-vector",
+      context: nil,
       display_name: "Codex Vector",
       name: "Codex Vector",
       efforts: ["medium"],
@@ -672,7 +678,8 @@ defmodule Tightbeam.Harness.Codex do
           {:ok,
            [
              %{
-               ref: "codex-vector",
+               family: "codex-vector",
+               context: nil,
                display_name: "codex-vector",
                name: "codex-vector",
                efforts: [],
@@ -797,7 +804,7 @@ defmodule Tightbeam.Harness.Codex do
              Enum.all?(levels, &match?(%{"effort" => effort} when is_binary(effort), &1)) do
           efforts = Enum.map(levels, & &1["effort"])
           capabilities = Map.put(capabilities, "supported_reasoning_levels", levels)
-          {:cont, {:ok, entries ++ entries_for(model, slug, efforts, capabilities)}}
+          {:cont, {:ok, entries ++ [entry_for(model, slug, efforts, capabilities)]}}
         else
           {:halt, {:error, :malformed_catalog}}
         end
@@ -807,21 +814,21 @@ defmodule Tightbeam.Harness.Codex do
     end)
   end
 
-  defp entries_for(model, id, efforts, capabilities) do
-    refs = if efforts == [], do: [id], else: Enum.map(efforts, &"#{id}[#{&1}]")
+  # ONE entry per vendor model, carrying the efforts it offers.
+  defp entry_for(model, id, efforts, capabilities) do
+    identity = Model.parse_ref(id)
     display_name = model["display_name"] || id
 
-    Enum.map(refs, fn ref ->
-      %{
-        ref: ref,
-        display_name: display_name,
-        name: display_name,
-        efforts: efforts,
-        max_input_tokens: model["max_input_tokens"] || model["context_window"],
-        capabilities: capabilities,
-        provider: :openai
-      }
-    end)
+    %{
+      family: identity.family,
+      context: identity.context,
+      display_name: display_name,
+      name: display_name,
+      efforts: efforts,
+      max_input_tokens: model["max_input_tokens"] || model["context_window"],
+      capabilities: capabilities,
+      provider: :openai
+    }
   end
 
   # The platform route answers in the PLATFORM's shape, not the codex account
@@ -843,7 +850,8 @@ defmodule Tightbeam.Harness.Codex do
           entries ++
             [
               %{
-                ref: id,
+                family: id,
+                context: nil,
                 display_name: id,
                 name: id,
                 efforts: [],
@@ -887,15 +895,13 @@ defmodule Tightbeam.Harness.Codex do
 
   defp keep_selectable(entries, selectable) do
     {kept, dropped} =
-      Enum.split_with(entries, fn entry ->
-        entry.ref |> base_ref() |> Kernel.in(selectable)
-      end)
+      Enum.split_with(entries, &(vendor_ref(&1) in selectable))
 
     if dropped != [] do
       Logger.info(
         "codex catalog: #{length(dropped)} model(s) the platform lists are not selectable by " <>
           "codex-acp #{@adapter_version} and were withheld: " <>
-          Enum.map_join(dropped, ", ", & &1.ref) <>
+          Enum.map_join(dropped, ", ", &vendor_ref/1) <>
           " — re-probe @adapter_selectable_models in harness/codex.ex if this looks wrong"
       )
     end
@@ -903,12 +909,8 @@ defmodule Tightbeam.Harness.Codex do
     kept
   end
 
-  defp base_ref(ref) do
-    case Regex.run(~r/^(.*?)\[(.*?)\]$/, ref) do
-      [_, base, _effort] -> base
-      _ -> ref
-    end
-  end
+  defp vendor_ref(entry),
+    do: Model.to_ref(Model.new(entry.family, context: entry.context))
 
   defp adapter_binary(target) do
     # One path for both localities, as fixture.ex already does: the adapter lives

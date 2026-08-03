@@ -115,7 +115,8 @@ defmodule Tightbeam.ClientE2E.Substrate do
   def session(base_dir, session_key) do
     base_dir
     |> query("""
-    SELECT sessionKey, displayName, kind, ownerUserId, origin, state, harness, model, host
+    SELECT sessionKey, displayName, kind, ownerUserId, origin, state, harness, model,
+           thinkingLevel, modelContext, host
     FROM sessions WHERE sessionKey = #{quote_string(session_key)}
     """)
     |> List.first()

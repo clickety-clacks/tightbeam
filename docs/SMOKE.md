@@ -18,8 +18,8 @@ from `<base_dir>/gateway.json`).
 ## Harness parity (normative for every run)
 
 This runbook is a MATRIX, not a list: one full pass PER HARNESS the org
-supports (today: claude on `claude-sonnet-5[medium]`, codex on
-`gpt-5.6-sol[medium]`), using a
+supports (today: claude on `claude-sonnet-5` at effort `medium`, codex on
+`gpt-5.6-sol` at effort `medium`), using a
 session of that harness for every step. A smoke run's verdict is
 INCOMPLETE — not passed — until every harness leg has run or been WAIVED by
 name with the blocker stated (e.g. "codex leg waived: no codex grant in the
@@ -140,22 +140,24 @@ on 2026-07-25:
   boots a second gateway that OVERWRITES `gateway.json` and silently redirects
   the smoke away from the gateway under test. The script enumerates
   `Tightbeam.Harness.all/0`, runs one complete leg per registry entry, and adds
-  that leg's `harness` and `model` to every spawn explicitly. Supply one
-  compatible model per leg through
-  `TIGHTBEAM_SMOKE_MODEL_<UPPERCASE_WIRE_NAME>`; missing model configuration
+  that leg's `harness`, `model`, and `effort` to every spawn explicitly. A model
+  is named by FIELDS, never one packed string: supply the model per leg through
+  `TIGHTBEAM_SMOKE_MODEL_<UPPERCASE_WIRE_NAME>`, its reasoning level through
+  `TIGHTBEAM_SMOKE_EFFORT_<…>`, and a vendor context-window variant, if the leg
+  needs one, through `TIGHTBEAM_SMOKE_CONTEXT_<…>`. Missing model configuration
   refuses the run before the first leg. For the current registry:
 
   ```sh
   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
-  TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5[medium]' \
-  TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol[medium]' \
+  TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
+  TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
   mix run --no-start scripts/feature_smoke.exs
   ```
 
   The claude model must be one the ADAPTER accepts, which is a narrower set than the
   derived catalog — `fable` and `claude-fable-5` are both refused, and a refusal fails
   the model apply on every `session/new` and `session/load`. The recipe above used to
-  say `fable`; every real run on record used `claude-sonnet-5[medium]`
+  say `fable`; every real run on record used `claude-sonnet-5` at effort `medium`
   instead, which is why the stale value was never caught. The accepted list and how to
   re-probe it live in the note above `@adapter_selectable_models` in
   `lib/tightbeam/harness/claude.ex`.

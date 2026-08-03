@@ -14,15 +14,17 @@ defmodule Tightbeam.LaneTest do
       CREATE TABLE sessions (
         sessionKey TEXT PRIMARY KEY,
         model TEXT NOT NULL,
+        thinkingLevel TEXT,
+        modelContext TEXT,
         harness TEXT NOT NULL,
         state TEXT NOT NULL DEFAULT 'active',
         adjudicationHold TEXT,
         updatedAt INTEGER NOT NULL DEFAULT 0
       );
-      INSERT INTO sessions (sessionKey, model, harness)
+      INSERT INTO sessions (sessionKey, model, thinkingLevel, harness)
       VALUES
-        ('k1', 'claude-sonnet-5[medium]', 'claude'),
-        ('k2', 'claude-sonnet-5[medium]', 'claude');
+        ('k1', 'claude-sonnet-5', 'medium', 'claude'),
+        ('k2', 'claude-sonnet-5', 'medium', 'claude');
       """)
 
     reg = start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})

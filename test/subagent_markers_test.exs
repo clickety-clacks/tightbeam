@@ -1,5 +1,6 @@
 defmodule Tightbeam.SubagentMarkersTest do
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.Model
 
   alias Tightbeam.{
     ConditionFacts,
@@ -274,7 +275,7 @@ defmodule Tightbeam.SubagentMarkersTest do
         host: "eezo",
         harness: harness,
         provider: provider,
-        model: "fixture"
+        model: Model.new("fixture")
       })
 
     Org.append_pointer(db, key, sid, "created")
