@@ -153,7 +153,9 @@ defmodule Tightbeam.Harness.Claude do
     else
       remote_env =
         case kind do
-          :subscription -> ["CLAUDE_CONFIG_DIR=#{home}" | Keyword.fetch!(opts, :remote_env)]
+          :subscription ->
+            ["CLAUDE_CONFIG_DIR=#{home}" | Keyword.fetch!(opts, :remote_env)]
+
           :api_key ->
             [
               "#{credential_env_var(kind)}=$(cat #{credential_path} 2>/dev/null)",
@@ -287,9 +289,22 @@ defmodule Tightbeam.Harness.Claude do
 
     timeout = Map.get(target, :warm_timeout_ms, @warm_timeout_ms)
 
+    # THE HOME IS DELIVERED BY ENV, NOT BY A FLAG. This passed `--config-dir <home>`,
+    # which Claude Code has no such option for -- it exits 2 with "unknown option", so
+    # the warm has never once succeeded. Being best-effort, the failure was swallowed
+    # every time, and the cold-catalog deadlock this exists to break was never broken;
+    # it only looked fixed because a real turn warms the home by another route.
+    # `prepare_launch/2` had it right all along: `CLAUDE_CONFIG_DIR`.
+    #
+    # Via `env` rather than the runner's environment because `Support.system_cmd_out/1`
+    # takes only argv, and because it then reads the same local and remote -- an `env`
+    # word survives `shell_quote` over ssh, where a bare `FOO=bar` prefix would be
+    # quoted into a command name and not recognized as an assignment at all.
+    warm = ["env", "CLAUDE_CONFIG_DIR=#{home}", cli_binary(), "-p", "ok", "--model", "sonnet"]
+
     argv =
       if Support.local?(target) do
-        [cli_binary(), "-p", "ok", "--model", "sonnet", "--config-dir", home]
+        warm
       else
         # The same turn, over the channel the credential itself just travelled. A remote
         # home has to warm on the host that owns it -- the cache is written by the harness
@@ -299,11 +314,7 @@ defmodule Tightbeam.Harness.Claude do
         ["ssh" | Support.ssh_opts()] ++
           [
             target.host_config.ssh,
-            Enum.map_join(
-              [cli_binary(), "-p", "ok", "--model", "sonnet", "--config-dir", home],
-              " ",
-              &Support.shell_quote/1
-            )
+            Enum.map_join(warm, " ", &Support.shell_quote/1)
           ]
       end
 
@@ -530,7 +541,6 @@ defmodule Tightbeam.Harness.Claude do
       end
     end
   end
-
 
   # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
   # the already-derived entries — no probe, no extra fetch, nothing at boot; the

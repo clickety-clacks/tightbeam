@@ -3,6 +3,48 @@ defmodule Tightbeam.HarnessClaudeWarmTest do
 
   alias Tightbeam.Harness.Claude
 
+  # THE WARM MUST SPEAK A LANGUAGE THE HARNESS UNDERSTANDS. This passed
+  # `--config-dir <home>`, an option Claude Code does not have, so every warm exited
+  # "unknown option" and was swallowed by the best-effort contract — the mechanism
+  # built to break the cold-catalog deadlock had never once run. The old assertions
+  # could not catch it: they checked that the home PATH appeared in the command, which
+  # a wrong flag satisfies just as well as a right one. What must be pinned is the
+  # DELIVERY MECHANISM, and that it is the same one `prepare_launch/2` uses.
+  test "the home is delivered by CLAUDE_CONFIG_DIR, never by a flag the CLI lacks" do
+    parent = self()
+    target = local_target(fn command -> send(parent, {:ran, command}) && {"", 0} end)
+
+    assert :ok = Claude.warm_home(target, "/tmp/claude-home")
+
+    assert_receive {:ran, command}
+    line = Enum.join(command, " ")
+
+    assert line =~ "CLAUDE_CONFIG_DIR=/tmp/claude-home",
+           "the warm must hand the home over the way a launch does: #{line}"
+
+    refute line =~ "--config-dir",
+           "claude has no --config-dir option; a warm using one exits unknown-option: #{line}"
+  end
+
+  # Same contract on the satellite path, which had the identical bug: a remote home that
+  # never warms leaves the host holding a good credential whose harness has never asked
+  # what it may run, and the catalog narrows to the static floor.
+  test "a remote warm delivers the home by env too" do
+    parent = self()
+
+    target = %{
+      host_config: %{ssh: "worker@sat.example"},
+      sh: fn command -> send(parent, {:ran, command}) && {"", 0} end
+    }
+
+    assert :ok = Claude.warm_home(target, "/srv/tb/homes/sat/claude")
+
+    assert_receive {:ran, command}
+    line = Enum.join(command, " ")
+    assert line =~ "CLAUDE_CONFIG_DIR=/srv/tb/homes/sat/claude", line
+    refute line =~ "--config-dir", line
+  end
+
   test "a failed warm is reported to the onboarding caller" do
     target = local_target(fn _command -> {"provider refused", 1} end)
 
