@@ -276,6 +276,9 @@ defmodule Tightbeam.ModelCatalog do
         # hand-assembled store can, and it deserves a refusal, not a guess.
         :none ->
           {:error, {:needs_onboarding, :missing}}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     rescue
       error -> {:error, {:exception, Exception.message(error)}}

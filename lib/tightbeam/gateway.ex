@@ -1124,7 +1124,8 @@ defmodule Tightbeam.Gateway do
   pending turns) + per-harness capability advertisement from the model
   catalog. Nil for unknown sessions.
   """
-  @spec session_status(String.t(), DB.server()) :: map() | nil
+  @spec session_status(String.t(), DB.server()) ::
+          map() | nil | {:error, 503, String.t(), String.t()}
   def session_status(session_key, db \\ Tightbeam.DB) do
     case Org.get(db, session_key) do
       nil ->
@@ -1173,7 +1174,9 @@ defmodule Tightbeam.Gateway do
               }
           end
 
-        %{
+        credential_kind = credential_kind(session)
+
+        payload = %{
           # sessionKey is REQUIRED by the client's SessionStatus decoder — its
           # absence fails the whole decode and the model footer never
           # populates (found live; the TS reference omitted it too).
@@ -1191,7 +1194,7 @@ defmodule Tightbeam.Gateway do
             provider: session.provider,
             harness: session.harness,
             host: session.host,
-            credentialKind: credential_kind(session),
+            credentialKind: credential_kind,
             authMode: nil,
             reasoningLevel: session.model && session.model.effort,
             thinkingLevel: nil,
@@ -1247,6 +1250,14 @@ defmodule Tightbeam.Gateway do
               )
           }
         }
+
+        case credential_kind do
+          {:error, reason} ->
+            {:error, 503, "credential_store_unreadable", describe_error(reason)}
+
+          _kind ->
+            payload
+        end
     end
   end
 
@@ -1469,8 +1480,14 @@ defmodule Tightbeam.Gateway do
     server = Tightbeam.Credentials.server(session.host)
 
     case GenServer.whereis(server) do
-      nil -> wire_credential_kind(:none)
-      _pid -> wire_credential_kind(Tightbeam.Credentials.kind(provider, server))
+      nil ->
+        wire_credential_kind(:none)
+
+      _pid ->
+        case Tightbeam.Credentials.kind(provider, server) do
+          {:error, reason} -> {:error, reason}
+          kind -> wire_credential_kind(kind)
+        end
     end
   end
 

@@ -2915,6 +2915,21 @@ defmodule Tightbeam.GatewayTest do
       assert display.credentialKind == "none"
     end
 
+    test "an unreadable credential store refuses status instead of reporting none", ctx do
+      store = Path.join([ctx.cred_base, "auth", "claude"])
+      target = Path.join(ctx.cred_base, "credential-target")
+      File.mkdir_p!(target)
+      File.mkdir_p!(Path.dirname(store))
+      File.ln_s!(target, store)
+      owner!(ctx.cred_base)
+
+      assert {:error, 503, "credential_store_unreadable", message} =
+               Gateway.session_status("k-kind", ctx.db)
+
+      assert message =~ store
+      refute message =~ ~s(credentialKind: "none")
+    end
+
     # The test that distinguishes "resolved at read time" from "stamped on the
     # row" — a row-stamped implementation passes all three above and fails this.
     test "the reported kind flips when the host is re-onboarded on the other kind", ctx do
@@ -3215,7 +3230,6 @@ defmodule Tightbeam.GatewayTest do
     assert wide.model == "claude-fable-5"
     assert wide.context == "1m"
     assert wide.efforts == ["low", "high"]
-
     assert Enum.any?(
              status.modelCatalog.models,
              &(&1.model == "claude-fable-5" and is_nil(&1.context))
@@ -6970,7 +6984,18 @@ defmodule Tightbeam.GatewayTest do
 
   defp credential_probe(parent, command) do
     send(parent, {:credential_command, command})
-    {"", 1}
+
+    case Enum.take(command, -3) do
+      ["test", operator, path] when operator in ["-d", "-x"] ->
+        if String.ends_with?(path, "/auth") or String.ends_with?(path, "/auth/") do
+          {"", 0}
+        else
+          {"", 1}
+        end
+
+      _ ->
+        {"", 1}
+    end
   end
 
   defp collect_credential_commands(commands) do

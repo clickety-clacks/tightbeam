@@ -1,6 +1,5 @@
 defmodule Tightbeam.Credentials do
   require Logger
-
   @moduledoc """
   Per-machine credential onboarding and lifecycle.
 
@@ -70,7 +69,7 @@ defmodule Tightbeam.Credentials do
   expired credential still has a kind, and reporting it is what lets an operator
   tell "the API key stopped working" from "nothing is installed here".
   """
-  @spec kind(provider(), GenServer.server()) :: kind() | :none
+  @spec kind(provider(), GenServer.server()) :: kind() | :none | {:error, term()}
   def kind(provider, server \\ __MODULE__),
     do: GenServer.call(server, {:kind, provider})
 
@@ -534,8 +533,8 @@ defmodule Tightbeam.Credentials do
           :none
         end
 
-      {:error, _reason} ->
-        :none
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -752,7 +751,7 @@ defmodule Tightbeam.Credentials do
       false ->
         case remote_test(state, "-e", store) do
           true -> unreadable_store(store, :other, :directory)
-          false -> {:ok, %{}}
+          false -> classify_remote_absence(state, store)
           {:error, reason} -> unreadable_store(store, reason, :directory)
         end
 
@@ -778,6 +777,18 @@ defmodule Tightbeam.Credentials do
       {_output, 0} -> true
       {_output, 1} -> false
       {output, status} -> {:error, {:probe_failed, status, String.trim(output)}}
+    end
+  end
+
+  defp classify_remote_absence(state, store) do
+    parent = Path.dirname(store)
+
+    with true <- remote_test(state, "-d", parent),
+         true <- remote_test(state, "-x", parent) do
+      {:ok, %{}}
+    else
+      false -> unreadable_store(parent, :untraversable, :traversable_directory)
+      {:error, reason} -> unreadable_store(parent, reason, :traversable_directory)
     end
   end
 

@@ -1,6 +1,8 @@
 defmodule Tightbeam.ModelCatalogTest do
   use Tightbeam.TestCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Tightbeam.{Archetypes, Gateway, Model, ModelCatalog, Placement}
   alias Tightbeam.Harness.Support
 
@@ -473,6 +475,30 @@ defmodule Tightbeam.ModelCatalogTest do
           {:unavailable, {:needs_onboarding, :credential_server_unavailable}}
       end)
     end
+  end
+
+  test "an unreadable credential store is the catalog health and warning reason", ctx do
+    reason =
+      {:credential_store_unreadable,
+       %{path: Path.join(ctx.base_dir, "auth/claude"), found: :symlink, expected: :directory}}
+
+    catalog = unique_name(:unreadable_store_catalog)
+
+    log =
+      capture_log(fn ->
+        start_catalog(ctx,
+          name: catalog,
+          credential_status: fn _provider -> {:needs_onboarding, reason} end
+        )
+
+        for harness <- ["claude", "codex"] do
+          expected = {[], {:unavailable, {:needs_onboarding, reason}}}
+          await(fn -> ModelCatalog.get(@host, harness, catalog) == expected end)
+          assert ModelCatalog.get(@host, harness, catalog) == expected
+        end
+      end)
+
+    assert log =~ "refresh degraded: #{inspect({:needs_onboarding, reason})}"
   end
 
   test "failed fetch, malformed JSON, and a refused grant degrade without crashing readers",

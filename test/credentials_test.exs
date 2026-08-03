@@ -119,10 +119,11 @@ defmodule Tightbeam.CredentialsTest do
 
     {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-    assert Credentials.status(:openai, server) ==
-             {:needs_onboarding,
-              {:credential_store_unreadable,
-               %{path: store, found: :symlink, expected: :directory}}}
+    reason =
+      {:credential_store_unreadable, %{path: store, found: :symlink, expected: :directory}}
+
+    assert Credentials.status(:openai, server) == {:needs_onboarding, reason}
+    assert Credentials.kind(:openai, server) == {:error, reason}
   end
 
   test "corrupt credential metadata refuses with its path and expected shape", ctx do
@@ -137,6 +138,29 @@ defmodule Tightbeam.CredentialsTest do
              {:needs_onboarding,
               {:credential_store_unreadable,
                %{path: metadata, found: :invalid_json, expected: :valid_json_object}}}
+  end
+
+  test "remote absence requires a positively traversable parent", ctx do
+    parent = Path.join([ctx.base, "auth"])
+    File.mkdir_p!(parent)
+
+    {:ok, server} = remote_server(ctx.base)
+
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+  end
+
+  test "remote store below an untraversable parent refuses rather than guessing absence", ctx do
+    parent = Path.join([ctx.base, "auth"])
+    File.mkdir_p!(parent)
+    File.chmod!(parent, 0o600)
+    on_exit(fn -> File.chmod(parent, 0o700) end)
+
+    {:ok, server} = remote_server(ctx.base)
+
+    assert Credentials.status(:openai, server) ==
+             {:needs_onboarding,
+              {:credential_store_unreadable,
+               %{path: parent, found: :untraversable, expected: :traversable_directory}}}
   end
 
   test "Codex credential is never written while stop cannot confirm runtime exit", ctx do
@@ -655,12 +679,10 @@ defmodule Tightbeam.CredentialsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
-
       File.write!(
         Path.join(staging, ".credentials.json"),
         ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-staged"}})
       )
-
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata = credential_metadata(ctx.base, "claude")
@@ -700,6 +722,19 @@ defmodule Tightbeam.CredentialsTest do
     |> Path.join()
     |> File.read!()
     |> JSON.decode!()
+  end
+
+  defp remote_server(base) do
+    Credentials.start_link(
+      name: nil,
+      base_dir: base,
+      machine: "worker",
+      ssh: "worker",
+      sh: fn command ->
+        remote_command = command |> Enum.drop(6) |> Enum.join(" ")
+        System.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
+      end
+    )
   end
 
   defp fixture(name) do
