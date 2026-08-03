@@ -249,6 +249,39 @@ defmodule Tightbeam.SupervisionTest do
     assert Supervision.ladder_target(ctx.db, "holder", 2) == nil
   end
 
+  # Review finding 2. The watermark row says "escalation"; retiring it as
+  # terminus must clear THAT row. Clearing against a rewritten branch loses the
+  # CAS silently, and a watermark that never clears re-enters this path — and
+  # re-logs it — on every one-second sweep, forever.
+  test "an escalation whose ladder empties at drain time clears its watermark", ctx do
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", seq)
+
+    # Re-arm a pending ESCALATION on the row, then empty the ladder underneath
+    # it. Re-evaluating the SAME terminal keeps evaluate on its :duplicate path,
+    # so nothing rewrites the watermark after the drain — which is the only way
+    # to see whether the drain itself cleared it. Re-evaluating a NEW terminal
+    # masks the bug: claim_and_act overwrites the whole row regardless.
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE supervision_watermarks SET lastEvaluatedTerminal=?1, pendingBranch='escalation', pendingAssignment='asg_1', pendingK=1, pendingN=0 WHERE sessionKey='holder'",
+        [seq]
+      )
+
+    Org.retire(ctx.db, "supervisor")
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+
+    Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", seq)
+
+    # THE property: the row the drain cleared is the row the database holds.
+    assert %{pendingBranch: nil, pendingAssignment: nil} = Supervision.watermark(ctx.db, "holder")
+  end
+
   # The reproduction, end to end: this is the exact shape of the six orphans —
   # `process:tightbeam` re-resolving a lineage whose owner has no main session.
   test "a lineage notice for an owner with no main session enqueues nothing and is named", ctx do
@@ -277,6 +310,33 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
     assert Ledger.non_terminal_older_than(ctx.db, -1) == []
+  end
+
+  # Review finding 4, on the GATE-LESS arm — the one path that reaches the echo,
+  # because it accepts its session key without re-resolving anything. The echo
+  # commits in the same transaction and cannot be taken back, so a refused
+  # delivery must write NOTHING: a message with no turn is history nobody can
+  # answer, and it surfaces as ghost transcript if that key is ever created.
+  test "a refused delivery commits no message, not just no turn", ctx do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :skipped =
+                 Gateway.deliver_prompt(
+                   "agent:main:clawline:nobody:main",
+                   "process:tightbeam",
+                   "a notice for a key that names no session",
+                   db: ctx.db,
+                   sender: "process:tightbeam"
+                 )
+      end)
+
+    assert log =~ "refusing a turn addressed to agent:main:clawline:nobody:main"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [
+               "agent:main:clawline:nobody:main"
+             ])
   end
 
   test "a retired holder with a pending wake is stranded before continuation", ctx do

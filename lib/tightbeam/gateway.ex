@@ -893,67 +893,93 @@ defmodule Tightbeam.Gateway do
       nil ->
         :skipped
 
-      {target, role_ref, role_fallback} ->
-        input = %{
-          session_key: target,
-          role: "user",
-          content: stamped,
-          device_id: opts[:device_id],
-          client_message_id: opts[:client_message_id],
-          attachments: opts[:attachments] || [],
-          sender: opts[:sender]
-        }
-
-        case Projection.append_in_txn(txn, input) do
-          {:appended, message} ->
-            {assignment_id, job_ref} = turn_attribution(txn, opts)
-
-            enqueued =
-              Ledger.enqueue_in_txn(txn, %{
-                session_key: target,
-                message_id: message.id,
-                wake_id: opts[:wake_id],
-                origin: origin,
-                prompt: stamped,
-                role_ref: role_ref || opts[:role_ref],
-                role_fallback: role_fallback || opts[:role_fallback] || false,
-                assignment_id: assignment_id,
-                job_ref: job_ref
-              })
-
-            case enqueued do
-              {:ok, _seq} ->
-                fire_wake_in_txn(txn, opts)
-
-                # Nag-by-re-arm: a bracket wake that just fired re-arms its
-                # replacement IN this transaction if the item is still holderless
-                # and non-terminal (the lattice does not watch holderless work).
-                # No-ops for every non-bracket wake (the discriminator is the item's
-                # routing/slate wake-id matching this wake).
-                WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
-
-                {:appended, target, message, opts}
-
-              {:error, :no_session} ->
-                # The ledger's backstop fired, so something upstream resolved an
-                # address that does not name a session at all. The wake is still
-                # CONSUMED — leaving it pending would redeliver the same
-                # undeliverable notice every tick — and the loss is named here
-                # rather than left as a queued row nobody can claim.
-                fire_wake_in_txn(txn, opts)
-
-                Logger.error(
-                  "refusing a turn addressed to #{target}: no session row exists for that key " <>
-                    "(origin=#{origin} wake=#{opts[:wake_id] || "none"} sender=#{opts[:sender] || "none"})"
-                )
-
-                :skipped
-            end
-
-          other ->
-            other
+      {target, role_ref, role_fallback} when not is_nil(target) ->
+        if Ledger.enqueueable_in_txn?(txn, target) do
+          append_and_enqueue_in_txn(
+            txn,
+            target,
+            role_ref,
+            role_fallback,
+            origin,
+            stamped,
+            opts
+          )
+        else
+          # Asked BEFORE the echo, because the echo commits in this same
+          # transaction and a raise is not available to take it back (it would
+          # roll the caller's wake `fired` mark back with it). The ledger still
+          # refuses independently — it is the single writer — but a message with
+          # no turn is history nobody can answer, so nothing is written at all.
+          refuse_undeliverable_turn(txn, target, origin, opts)
         end
     end
+  end
+
+  defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
+    input = %{
+      session_key: target,
+      role: "user",
+      content: stamped,
+      device_id: opts[:device_id],
+      client_message_id: opts[:client_message_id],
+      attachments: opts[:attachments] || [],
+      sender: opts[:sender]
+    }
+
+    case Projection.append_in_txn(txn, input) do
+      {:appended, message} ->
+        {assignment_id, job_ref} = turn_attribution(txn, opts)
+
+        enqueued =
+          Ledger.enqueue_in_txn(txn, %{
+            session_key: target,
+            message_id: message.id,
+            wake_id: opts[:wake_id],
+            origin: origin,
+            prompt: stamped,
+            role_ref: role_ref || opts[:role_ref],
+            role_fallback: role_fallback || opts[:role_fallback] || false,
+            assignment_id: assignment_id,
+            job_ref: job_ref
+          })
+
+        case enqueued do
+          {:ok, _seq} ->
+            fire_wake_in_txn(txn, opts)
+
+            # Nag-by-re-arm: a bracket wake that just fired re-arms its
+            # replacement IN this transaction if the item is still holderless
+            # and non-terminal (the lattice does not watch holderless work).
+            # No-ops for every non-bracket wake (the discriminator is the item's
+            # routing/slate wake-id matching this wake).
+            WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
+
+            {:appended, target, message, opts}
+
+          # The ledger is the single writer and refuses on its own authority, so
+          # this stays reachable for any future caller even though the check
+          # above already declined this one in the same transaction.
+          {:error, :no_session} ->
+            refuse_undeliverable_turn(txn, target, origin, opts)
+        end
+
+      other ->
+        other
+    end
+  end
+
+  # The wake is still CONSUMED — leaving it pending would redeliver the same
+  # undeliverable notice every tick — and the loss is named rather than left as
+  # a queued row nobody can claim.
+  defp refuse_undeliverable_turn(txn, target, origin, opts) do
+    fire_wake_in_txn(txn, opts)
+
+    Logger.error(
+      "refusing a turn addressed to #{target}: no session row exists for that key " <>
+        "(origin=#{origin} wake=#{opts[:wake_id] || "none"} sender=#{opts[:sender] || "none"})"
+    )
+
+    :skipped
   end
 
   defp fire_wake_in_txn(txn, opts) do

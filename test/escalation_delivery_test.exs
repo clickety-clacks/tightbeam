@@ -500,8 +500,11 @@ defmodule Tightbeam.EscalationDeliveryTest do
               "adjudicate_respawn/5"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "release_hold/6"} =>
                1,
-             {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2", "deliver_prompt_in_txn/5"} =>
-               1,
+             # `deliver_prompt_in_txn/5` declines undeliverable addresses BEFORE
+             # appending the echo, and hands the append+enqueue pair to this one
+             # private. Still exactly one turn sink; it simply has a name now.
+             {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2",
+              "append_and_enqueue_in_txn/7"} => 1,
              {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1
            }
 
@@ -617,7 +620,11 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     File.rm_rf!(base_dir)
     File.mkdir_p!(Path.join([base_dir, "auth", "claude"]))
-    File.write!(Path.join([base_dir, "auth", "claude", ".credentials.json"]), ~s({"claudeAiOauth":{"accessToken":"test-token"}}))
+
+    File.write!(
+      Path.join([base_dir, "auth", "claude", ".credentials.json"]),
+      ~s({"claudeAiOauth":{"accessToken":"test-token"}})
+    )
 
     on_exit(fn ->
       File.rm_rf!(base_dir)

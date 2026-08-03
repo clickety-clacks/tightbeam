@@ -231,6 +231,31 @@ defmodule Tightbeam.LedgerTest do
     assert Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session) == []
   end
 
+  # Review finding 3. The diagnosis and the failure are separate transactions,
+  # so the cause has to be re-asserted by the UPDATE itself. A session created
+  # in that window makes the turn claimable again, and aging it anyway destroys
+  # live work on the strength of a reading that had already expired.
+  test "a session appearing after the diagnosis spares its turn", %{db: db} do
+    seq = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+
+    assert {:unclaimable, :no_session} =
+             Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO sessions
+        (sessionKey, displayName, ownerUserId, origin, archetype, identityName,
+         harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
+      VALUES
+        ('agent:main:clawline:flynn:main', 'Flynn', 'flynn', 'user:flynn', 'default',
+         'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
+      """)
+
+    assert Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session) == []
+    assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq = ?1", [seq])
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
+  end
+
   # A turn the ledger would refuse today, written the way the pre-guard gateway
   # wrote it — the reproduction for the ORPHANS already in a live database.
   defp insert_orphan_turn(db, session_key) do

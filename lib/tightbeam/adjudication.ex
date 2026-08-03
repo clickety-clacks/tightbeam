@@ -442,8 +442,13 @@ defmodule Tightbeam.Adjudication do
               }
 
               case Supervision.ladder_target(txn, next.reresolve_seed, next.reresolve_rung) do
+                # No rung above the one already notified. NOTHING is lost here:
+                # the episode was delivered to the rung it has, and the ladder
+                # simply has a top. So this writes nothing, says nothing, and
+                # escalates the moment a higher rung exists — which is what
+                # makes recovery automatic instead of waiting out a window.
                 nil ->
-                  defer_undeliverable_in_txn(txn, episode, condition, response_window_ms)
+                  false
 
                 target ->
                   escalate_to_in_txn(
@@ -466,36 +471,6 @@ defmodule Tightbeam.Adjudication do
     end)
 
     :ok
-  end
-
-  # The ladder ran out and the owner has no main session, so this rung — and
-  # every rung above it — names nobody. Nothing escalates and nothing is
-  # recorded as notified. The deadline moves one window so the retry cadence
-  # matches a delivered escalation's rather than restating the same loss on
-  # every sweep, and so an owner who later gains a main session is reached by
-  # the next window with no operator verb.
-  defp defer_undeliverable_in_txn(%Txn{} = txn, episode, condition, response_window_ms) do
-    Logger.error(
-      "overdue model adjudication for #{episode.session_key} (condition=#{condition} " <>
-        "cause=#{episode.cause || "unclassified"}) cannot escalate: the lineage ladder from " <>
-        "#{episode.reresolve_seed} is exhausted and its owner has no active main session"
-    )
-
-    Txn.q(
-      txn,
-      """
-      UPDATE adjudication_episodes SET deadlineAt=?4
-      WHERE sessionKey=?1 AND condition=?2 AND correlationKey=?3
-      """,
-      [
-        episode.session_key,
-        condition,
-        episode.correlation_key,
-        now() + response_window_ms
-      ]
-    )
-
-    false
   end
 
   defp escalate_to_in_txn(

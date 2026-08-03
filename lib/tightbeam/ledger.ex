@@ -131,6 +131,16 @@ defmodule Tightbeam.Ledger do
     end
   end
 
+  @doc """
+  Would `enqueue_in_txn/2` accept a turn for this key? The SAME question the
+  guard asks, so a caller with work to do BEFORE the enqueue (the projection
+  echo, which commits in the same transaction and cannot be taken back) can
+  decline without duplicating the rule or provoking a rollback.
+  """
+  @spec enqueueable_in_txn?(Txn.t(), String.t()) :: boolean()
+  def enqueueable_in_txn?(%Txn{} = txn, session_key),
+    do: session_exists_in_txn?(txn, session_key)
+
   defp session_exists_in_txn?(%Txn{} = txn, session_key) do
     Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [session_key]) != []
   end
@@ -288,28 +298,46 @@ defmodule Tightbeam.Ledger do
   for work no claim can ever reach. Returns the seqs transitioned; they carry
   `endedAt` with no `publishedAt`, so the reconciler's existing
   `unpublished_terminals/1` feed publishes them like any other terminal.
+
+  The CAUSE is a predicate of the UPDATE, not a fact sampled beforehand. The
+  diagnosis in `claim_next/3` and the failure here are separate transactions, so
+  a session created in between would otherwise see its now-claimable turn forced
+  to `failed` on the strength of a reading that had already expired. Deciding
+  and acting in one statement is what makes that window unrepresentable.
   """
   @spec fail_unclaimable(db(), String.t(), unclaimable()) :: [integer()]
   def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
     {:ok, seqs} =
       DB.transaction(db, fn txn ->
-        rows =
-          Txn.q(
-            txn,
-            "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'queued' ORDER BY seq",
-            [session_key]
-          )
-
         Txn.q(
           txn,
           """
           UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
           WHERE sessionKey = ?1 AND status = 'queued'
+            AND NOT EXISTS (
+              SELECT 1 FROM sessions AS s
+              WHERE s.sessionKey = ?1 AND s.state = 'active'
+            )
           """,
           [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
         )
 
-        Enum.map(rows, &hd/1)
+        case Txn.changes(txn) do
+          0 ->
+            []
+
+          _ ->
+            txn
+            |> Txn.q(
+              """
+              SELECT seq FROM turns
+              WHERE sessionKey = ?1 AND status = 'failed' AND error = ?2
+              ORDER BY seq
+              """,
+              [session_key, unclaimable_error(reason)]
+            )
+            |> Enum.map(&hd/1)
+        end
       end)
 
     seqs

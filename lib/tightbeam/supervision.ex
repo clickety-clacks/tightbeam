@@ -568,10 +568,27 @@ defmodule Tightbeam.Supervision do
         {"prod", current.prodCount + 1}
       else
         rung = current.prodCount - n + 1
-        target = ladder_target(db, session_key, rung)
-        # No target is the same shape as "the ladder led back to the holder":
-        # there is nobody above to escalate to, which is what terminus MEANS.
-        {if(target in [nil, session_key], do: "terminus", else: "escalation"), rung}
+
+        case ladder_target(db, session_key, rung) do
+          # Nobody above to escalate to is what terminus MEANS — but the ruling
+          # wants the loss NAMED, and terminus's own record says only holder and
+          # attempt count. This is the common way an escalation finds no owner;
+          # the drain-time race below is the rare one.
+          nil ->
+            Logger.error(
+              "supervision escalation for assignment #{assignment.id} is undeliverable: " <>
+                "the lineage ladder from #{session_key} rung #{rung} is exhausted and its " <>
+                "owner has no active main session"
+            )
+
+            {"terminus", rung}
+
+          ^session_key ->
+            {"terminus", rung}
+
+          _target ->
+            {"escalation", rung}
+        end
       end
 
     stalled_at =
@@ -684,16 +701,18 @@ defmodule Tightbeam.Supervision do
     case ladder_target(db, pending.sessionKey, pending.pendingK) do
       nil ->
         # The ladder emptied between the evaluation that recorded this branch and
-        # this drain. Nothing changes about the escalation except that it has
-        # nowhere to go, which is the terminus branch's whole subject — including
-        # the record it already writes.
+        # this drain. It has nowhere to go, which is what terminus MEANS — but the
+        # watermark row still says "escalation" and `clear_pending_in_txn/2` CASes
+        # on that value. Retiring it as terminus WITHOUT rewriting the branch is
+        # what closes the clear; carrying a rewritten struct in would lose the CAS
+        # every sweep and re-log this forever.
         Logger.error(
           "supervision escalation for assignment #{assignment.id} is undeliverable: " <>
             "the lineage ladder from #{pending.sessionKey} rung #{pending.pendingK} is " <>
             "exhausted and its owner has no active main session"
         )
 
-        drain_open(db, handlers, %{pending | pendingBranch: "terminus"}, assignment)
+        terminus(db, pending)
 
       target ->
         dispatch_wake(db, handlers, pending, assignment, target)
@@ -701,6 +720,10 @@ defmodule Tightbeam.Supervision do
   end
 
   defp drain_open(db, _handlers, %{pendingBranch: "terminus"} = pending, _assignment) do
+    terminus(db, pending)
+  end
+
+  defp terminus(db, pending) do
     attempt_count =
       (prod_state(db, pending.pendingAssignment) || zero_state(pending.pendingAssignment)).attemptCount
 
