@@ -509,6 +509,9 @@ defmodule Tightbeam.Soak do
     args =
       ["-sS", "--max-time", Integer.to_string(timeout_s), "-o", "-", "-w", "\n%{http_code}"] ++
         if(authenticated?, do: ["-H", "Authorization: Bearer #{state.token}"], else: []) ++
+        # Unconditional, unlike the bearer: the wire refuses an unversioned caller before it
+        # looks at authentication (42f7bd5), so an unauthenticated probe needs it too.
+        ["-H", "x-tightbeam-cli-version: #{Tightbeam.CliCompatibility.required_version()}"] ++
         case method do
           :get -> [url]
           :post -> ["-X", "POST", "-H", "Content-Type: application/json", "-d", JSON.encode!(body), url]

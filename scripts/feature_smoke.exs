@@ -2300,6 +2300,11 @@ defmodule FeatureSmoke do
       "\n%{http_code}",
       "-H",
       "Authorization: Bearer #{state.token}",
+      # The wire refuses a caller that will not say what it is (42f7bd5). This script IS a
+      # CLI client, so it states the version the gateway was built from rather than a
+      # literal — a pinned string here would pass while claiming something untrue.
+      "-H",
+      "x-tightbeam-cli-version: #{Tightbeam.CliCompatibility.required_version()}",
       "-X",
       "POST",
       "-H",
