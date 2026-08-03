@@ -713,10 +713,10 @@ defmodule Tightbeam.Gateway do
               {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
                 [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
 
-            {_name, %{ssh: nil}} ->
-              []
-          end)
-          |> Enum.sort_by(& &1.name)
+              {_name, %{ssh: nil}} ->
+                []
+            end)
+            |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
         end),
@@ -908,38 +908,61 @@ defmodule Tightbeam.Gateway do
           {:appended, message} ->
             {assignment_id, job_ref} = turn_attribution(txn, opts)
 
-            Ledger.enqueue_in_txn(txn, %{
-              session_key: target,
-              message_id: message.id,
-              wake_id: opts[:wake_id],
-              origin: origin,
-              prompt: stamped,
-              role_ref: role_ref || opts[:role_ref],
-              role_fallback: role_fallback || opts[:role_fallback] || false,
-              assignment_id: assignment_id,
-              job_ref: job_ref
-            })
+            enqueued =
+              Ledger.enqueue_in_txn(txn, %{
+                session_key: target,
+                message_id: message.id,
+                wake_id: opts[:wake_id],
+                origin: origin,
+                prompt: stamped,
+                role_ref: role_ref || opts[:role_ref],
+                role_fallback: role_fallback || opts[:role_fallback] || false,
+                assignment_id: assignment_id,
+                job_ref: job_ref
+              })
 
-            if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
-              DB.Txn.q(
-                txn,
-                "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-                [opts[:wake_id], System.system_time(:millisecond)]
-              )
+            case enqueued do
+              {:ok, _seq} ->
+                fire_wake_in_txn(txn, opts)
+
+                # Nag-by-re-arm: a bracket wake that just fired re-arms its
+                # replacement IN this transaction if the item is still holderless
+                # and non-terminal (the lattice does not watch holderless work).
+                # No-ops for every non-bracket wake (the discriminator is the item's
+                # routing/slate wake-id matching this wake).
+                WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
+
+                {:appended, target, message, opts}
+
+              {:error, :no_session} ->
+                # The ledger's backstop fired, so something upstream resolved an
+                # address that does not name a session at all. The wake is still
+                # CONSUMED — leaving it pending would redeliver the same
+                # undeliverable notice every tick — and the loss is named here
+                # rather than left as a queued row nobody can claim.
+                fire_wake_in_txn(txn, opts)
+
+                Logger.error(
+                  "refusing a turn addressed to #{target}: no session row exists for that key " <>
+                    "(origin=#{origin} wake=#{opts[:wake_id] || "none"} sender=#{opts[:sender] || "none"})"
+                )
+
+                :skipped
             end
-
-            # Nag-by-re-arm: a bracket wake that just fired re-arms its
-            # replacement IN this transaction if the item is still holderless
-            # and non-terminal (the lattice does not watch holderless work).
-            # No-ops for every non-bracket wake (the discriminator is the item's
-            # routing/slate wake-id matching this wake).
-            WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
-
-            {:appended, target, message, opts}
 
           other ->
             other
         end
+    end
+  end
+
+  defp fire_wake_in_txn(txn, opts) do
+    if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
+      DB.Txn.q(
+        txn,
+        "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+        [opts[:wake_id], System.system_time(:millisecond)]
+      )
     end
   end
 
@@ -1035,9 +1058,22 @@ defmodule Tightbeam.Gateway do
         {session_key, nil, false}
 
       _ when gate.reresolve == "lineage" ->
+        # Re-resolution answers "who owns this now", and NOBODY is one of the
+        # answers. Until the ladder could say so, a notice whose recorded target
+        # had gone was re-addressed to a composed personal key that named no
+        # session, and the substrate queued it there forever.
         case Supervision.ladder_target(txn, gate.reresolve_seed, gate.reresolve_rung) do
-          nil -> nil
-          target -> {target, nil, false}
+          nil ->
+            Logger.error(
+              "substrate notice for #{session_key} is undeliverable: re-resolving the lineage " <>
+                "from #{gate.reresolve_seed} rung #{gate.reresolve_rung} found no active " <>
+                "session to own it"
+            )
+
+            nil
+
+          target ->
+            {target, nil, false}
         end
 
       _ ->
@@ -1802,6 +1838,7 @@ defmodule Tightbeam.Gateway do
   defp adjudication_model_inventories(session) do
     Map.new(Harness.all(), fn module ->
       {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
+
       {module.wire_name(),
        %{health: inspect(health), models: Enum.map(models, &describe_entry/1)}}
     end)
@@ -4715,6 +4752,7 @@ defmodule Tightbeam.Gateway do
            ) do
         {:ok, {:applied, delivery, wake_id}} ->
           complete_delivery(db, delivery)
+
           Map.merge(published_identity(applied_model), %{
             ok: true,
             action: "swap",

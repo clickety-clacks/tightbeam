@@ -78,45 +78,73 @@ defmodule Tightbeam.Ledger do
 
   @doc """
   Transactionally enqueue a turn (call inside the same DB.transaction that
-  persists the message row, so message+turn commit together). Returns seq.
+  persists the message row, so message+turn commit together).
+
+  Refuses, as a VALUE, a turn addressed to a sessionKey with NO ROW. Such a key
+  is composed, never read — `Org.personal_session_key/1` builds one from a user
+  id — and a turn addressed to one is work nobody can ever claim: the prompt is
+  lost while the ledger reports it pending. The refusal is a value and not a
+  raise deliberately: the caller's transaction carries other committed effects
+  (a wake's `fired` mark, an episode transition), and rolling those back would
+  re-deliver the same undeliverable notice forever.
+
+  Existence, deliberately, and not `state = 'active'`: a `targetGate = 0`
+  decision notice delivers to a HELD OR RETIRED target by design and an
+  active-session gate here is forbidden (spec escalation-delivery-v1). A retired
+  target's turn is still unclaimable, and `claim_next/3` names it rather than
+  this write refusing routing that a live spec requires.
+
   Raises on wakeId conflict (caller treats as already-enqueued).
   """
-  @spec enqueue_in_txn(Txn.t(), map()) :: integer()
+  @spec enqueue_in_txn(Txn.t(), map()) :: {:ok, integer()} | {:error, :no_session}
   def enqueue_in_txn(%Txn{} = txn, attrs) do
     now = System.system_time(:millisecond)
+    session_key = Map.fetch!(attrs, :session_key)
 
-    Txn.q(
-      txn,
-      """
-        INSERT INTO turns
-          (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
-           assignmentId, jobRef, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-      """,
-      [
-        Map.fetch!(attrs, :session_key),
-        Map.fetch!(attrs, :message_id),
-        Map.get(attrs, :wake_id),
-        Map.fetch!(attrs, :origin),
-        Map.fetch!(attrs, :prompt),
-        Map.get(attrs, :role_ref),
-        if(Map.get(attrs, :role_fallback, false), do: 1, else: 0),
-        Map.get(attrs, :assignment_id),
-        Map.get(attrs, :job_ref),
-        now
-      ]
-    )
+    if session_exists_in_txn?(txn, session_key) do
+      Txn.q(
+        txn,
+        """
+          INSERT INTO turns
+            (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
+             assignmentId, jobRef, createdAt)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        """,
+        [
+          session_key,
+          Map.fetch!(attrs, :message_id),
+          Map.get(attrs, :wake_id),
+          Map.fetch!(attrs, :origin),
+          Map.fetch!(attrs, :prompt),
+          Map.get(attrs, :role_ref),
+          if(Map.get(attrs, :role_fallback, false), do: 1, else: 0),
+          Map.get(attrs, :assignment_id),
+          Map.get(attrs, :job_ref),
+          now
+        ]
+      )
 
-    [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
-    seq
+      [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+      {:ok, seq}
+    else
+      {:error, :no_session}
+    end
+  end
+
+  defp session_exists_in_txn?(%Txn{} = txn, session_key) do
+    Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [session_key]) != []
   end
 
   @doc "Convenience: enqueue outside an existing transaction."
-  @spec enqueue(db(), map()) :: {:ok, integer()} | {:error, :duplicate_wake | term()}
+  @spec enqueue(db(), map()) ::
+          {:ok, integer()} | {:error, :duplicate_wake | :no_session | term()}
   def enqueue(db \\ Tightbeam.DB, attrs) do
     case DB.transaction(db, fn txn -> enqueue_in_txn(txn, attrs) end) do
-      {:ok, seq} ->
+      {:ok, {:ok, seq}} ->
         {:ok, seq}
+
+      {:ok, {:error, reason}} ->
+        {:error, reason}
 
       {:error, %{message: msg} = e} ->
         if is_binary(msg) and String.contains?(msg, "UNIQUE") do
@@ -130,12 +158,23 @@ defmodule Tightbeam.Ledger do
     end
   end
 
+  @typedoc """
+  Why queued work exists that no claim can ever reach. NOT a hold: an
+  adjudication hold is designed waiting and stays `:none`.
+  """
+  @type unclaimable :: :no_session | :session_retired
+
   @doc """
   Claim the next queued turn for a session — refuses if one is running
-  (one-turn-per-session in SQL). Returns {:ok, %{seq:, prompt:, ...}} or
-  :none or :busy.
+  (one-turn-per-session in SQL). Returns {:ok, %{seq:, prompt:, ...}}, :busy,
+  :none, or {:unclaimable, reason}.
+
+  `:none` is the EMPTY answer only. "Queued work that no claim can ever reach"
+  is a different fact and gets its own answer: while the two shared `:none`, six
+  orphaned turns were indistinguishable from an idle queue for hours.
   """
-  @spec claim_next(db(), String.t(), String.t()) :: {:ok, turn()} | :busy | :none
+  @spec claim_next(db(), String.t(), String.t()) ::
+          {:ok, turn()} | :busy | :none | {:unclaimable, unclaimable()}
   def claim_next(db \\ Tightbeam.DB, session_key, owner) do
     now = System.system_time(:millisecond)
 
@@ -214,13 +253,73 @@ defmodule Tightbeam.Ledger do
                  wake_id: wake_id
                }}
             else
-              :none
+              no_claim(txn, session_key)
             end
         end
       end)
 
     result
   end
+
+  # Nothing moved. Either the queue is empty, or it holds work whose session
+  # cannot host a turn — the same read the claim UPDATE's EXISTS clause makes,
+  # asked as a question instead of collapsed into a nil result.
+  defp no_claim(%Txn{} = txn, session_key) do
+    queued? =
+      Txn.q(txn, "SELECT 1 FROM turns WHERE sessionKey = ?1 AND status = 'queued' LIMIT 1", [
+        session_key
+      ]) != []
+
+    if queued? do
+      case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
+        [] -> {:unclaimable, :no_session}
+        [["retired"]] -> {:unclaimable, :session_retired}
+        # Active, so the only thing standing between this turn and a claim is an
+        # adjudication hold — designed waiting, healed by the ruling.
+        _ -> :none
+      end
+    else
+      :none
+    end
+  end
+
+  @doc """
+  Age a session's queued turns into `failed` under a named cause — the backstop
+  for work no claim can ever reach. Returns the seqs transitioned; they carry
+  `endedAt` with no `publishedAt`, so the reconciler's existing
+  `unpublished_terminals/1` feed publishes them like any other terminal.
+  """
+  @spec fail_unclaimable(db(), String.t(), unclaimable()) :: [integer()]
+  def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
+    {:ok, seqs} =
+      DB.transaction(db, fn txn ->
+        rows =
+          Txn.q(
+            txn,
+            "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'queued' ORDER BY seq",
+            [session_key]
+          )
+
+        Txn.q(
+          txn,
+          """
+          UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
+          WHERE sessionKey = ?1 AND status = 'queued'
+          """,
+          [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
+        )
+
+        Enum.map(rows, &hd/1)
+      end)
+
+    seqs
+  end
+
+  defp unclaimable_error(:no_session),
+    do: "unclaimable: no session row exists for this turn's sessionKey"
+
+  defp unclaimable_error(:session_retired),
+    do: "unclaimable: the session retired before this turn was claimed"
 
   @doc """
   Exactly-one durable terminal transition (CAS). Returns :ok if this caller

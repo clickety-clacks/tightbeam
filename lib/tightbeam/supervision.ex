@@ -22,6 +22,8 @@ defmodule Tightbeam.Supervision do
 
   alias Tightbeam.DB.Txn
 
+  require Logger
+
   @prods_ddl """
   CREATE TABLE IF NOT EXISTS assignment_prods (
     assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
@@ -122,7 +124,18 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  @spec ladder_target(DB.server() | Txn.t(), String.t(), pos_integer()) :: String.t()
+  @doc """
+  Who owns this holder at `rung` of its lineage ladder — or NOBODY.
+
+  `nil` is a real answer and the reason this returns it: the last rung falls
+  back to the owner's main session, and `Org.personal_session_key/1` COMPOSES
+  that key from a user id rather than reading a row. An owner with no main
+  session got a well-formed address to a session that does not exist, and every
+  notice sent there queued forever. Verified the way `Gateway`'s sibling
+  `active_personal_target/3` verifies it; callers name what they could not
+  deliver.
+  """
+  @spec ladder_target(DB.server() | Txn.t(), String.t(), pos_integer()) :: String.t() | nil
   def ladder_target(db_or_txn, holder_key, rung) do
     [[owner, spawned_by]] =
       query(db_or_txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey = ?1", [
@@ -130,7 +143,22 @@ defmodule Tightbeam.Supervision do
       ])
 
     chain = lineage(db_or_txn, spawned_by, MapSet.new([holder_key]), [])
-    Enum.at(chain, rung - 1) || Org.personal_session_key(owner)
+
+    case Enum.at(chain, rung - 1) do
+      nil -> active_personal_key(db_or_txn, owner)
+      rung_key -> rung_key
+    end
+  end
+
+  defp active_personal_key(db_or_txn, owner) do
+    key = Org.personal_session_key(owner)
+
+    case query(db_or_txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1 AND state = 'active'", [
+           key
+         ]) do
+      [] -> nil
+      [_ | _] -> key
+    end
   end
 
   @spec evaluate(DB.server(), Dispatch.handlers(), non_neg_integer(), String.t(), integer() | nil) ::
@@ -541,7 +569,9 @@ defmodule Tightbeam.Supervision do
       else
         rung = current.prodCount - n + 1
         target = ladder_target(db, session_key, rung)
-        {if(target == session_key, do: "terminus", else: "escalation"), rung}
+        # No target is the same shape as "the ladder led back to the holder":
+        # there is nobody above to escalate to, which is what terminus MEANS.
+        {if(target in [nil, session_key], do: "terminus", else: "escalation"), rung}
       end
 
     stalled_at =
@@ -651,8 +681,23 @@ defmodule Tightbeam.Supervision do
   end
 
   defp drain_open(db, handlers, %{pendingBranch: "escalation"} = pending, assignment) do
-    target = ladder_target(db, pending.sessionKey, pending.pendingK)
-    dispatch_wake(db, handlers, pending, assignment, target)
+    case ladder_target(db, pending.sessionKey, pending.pendingK) do
+      nil ->
+        # The ladder emptied between the evaluation that recorded this branch and
+        # this drain. Nothing changes about the escalation except that it has
+        # nowhere to go, which is the terminus branch's whole subject — including
+        # the record it already writes.
+        Logger.error(
+          "supervision escalation for assignment #{assignment.id} is undeliverable: " <>
+            "the lineage ladder from #{pending.sessionKey} rung #{pending.pendingK} is " <>
+            "exhausted and its owner has no active main session"
+        )
+
+        drain_open(db, handlers, %{pending | pendingBranch: "terminus"}, assignment)
+
+      target ->
+        dispatch_wake(db, handlers, pending, assignment, target)
+    end
   end
 
   defp drain_open(db, _handlers, %{pendingBranch: "terminus"} = pending, _assignment) do
@@ -856,24 +901,33 @@ defmodule Tightbeam.Supervision do
         :ok
 
       count ->
-        target = ladder_target(state.db, session_key, 1)
         row_label = if count == 1, do: "row", else: "rows"
 
         prompt =
           "Session #{session_key} retired with #{count} open assignment #{row_label}. " <>
             "The work is stranded and requires your attention."
 
-        Gateway.deliver_prompt(
-          target,
-          "process:tightbeam",
-          prompt,
-          [
-            db: state.db,
-            sender: "process:tightbeam",
-            device_id: "process:tightbeam",
-            client_message_id: "retired-strand:#{session_key}"
-          ] ++ state.delivery_opts
-        )
+        case ladder_target(state.db, session_key, 1) do
+          nil ->
+            Logger.error(
+              "stranded-work notice for retired session #{session_key} " <>
+                "(#{count} open assignment #{row_label}) is undeliverable: its owner has no " <>
+                "active main session"
+            )
+
+          target ->
+            Gateway.deliver_prompt(
+              target,
+              "process:tightbeam",
+              prompt,
+              [
+                db: state.db,
+                sender: "process:tightbeam",
+                device_id: "process:tightbeam",
+                client_message_id: "retired-strand:#{session_key}"
+              ] ++ state.delivery_opts
+            )
+        end
     end
   end
 

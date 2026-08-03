@@ -228,6 +228,57 @@ defmodule Tightbeam.SupervisionTest do
     assert Supervision.ladder_target(ctx.db, "holder", 1) == ctx.main.session_key
   end
 
+  # The ladder's last rung is the owner's MAIN session, and that key is composed
+  # from a user id rather than read from a row. Every substrate notice addressed
+  # to a user with no main session went to a session that does not exist, was
+  # accepted by delivery, and queued forever — six of them in one soak.
+  test "the ladder answers nobody rather than composing a key for a session that has no row",
+       ctx do
+    assert Supervision.ladder_target(ctx.db, "holder", 2) == ctx.main.session_key
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+
+    assert Supervision.ladder_target(ctx.db, "holder", 2) == nil
+    # Rungs above the chain are the same answer, not a deeper composed key.
+    assert Supervision.ladder_target(ctx.db, "holder", 9) == nil
+  end
+
+  test "a retired main session is nobody too — the ladder verifies, it does not compose", ctx do
+    Org.retire(ctx.db, ctx.main.session_key)
+    assert Supervision.ladder_target(ctx.db, "holder", 2) == nil
+  end
+
+  # The reproduction, end to end: this is the exact shape of the six orphans —
+  # `process:tightbeam` re-resolving a lineage whose owner has no main session.
+  test "a lineage notice for an owner with no main session enqueues nothing and is named", ctx do
+    Org.retire(ctx.db, "supervisor")
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+
+    gate = %{reresolve: "lineage", reresolve_seed: "holder", reresolve_rung: 1}
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :skipped =
+                 Gateway.deliver_prompt(
+                   ctx.main.session_key,
+                   "process:tightbeam",
+                   "Model adjudication required.",
+                   db: ctx.db,
+                   sender: "process:tightbeam",
+                   target_gate: gate
+                 )
+      end)
+
+    assert log =~ "undeliverable"
+    assert log =~ "holder"
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert Ledger.non_terminal_older_than(ctx.db, -1) == []
+  end
+
   test "a retired holder with a pending wake is stranded before continuation", ctx do
     existing =
       Wakes.schedule(ctx.db, %{
