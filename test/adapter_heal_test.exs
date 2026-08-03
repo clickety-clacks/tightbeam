@@ -1534,6 +1534,109 @@ defmodule Tightbeam.AdapterHealTest do
     assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5", effort: "medium")
   end
 
+  # ROUTABILITY IS ABOUT FRESH ENTRIES ONLY. A stale inventory is not evidence
+  # that a model is absent — it is evidence of nothing — so a model offered
+  # only by a stale harness must not be treated as routable, and the refusal
+  # must say the model is not in a FRESH inventory rather than implying the
+  # fleet does not have it.
+  test "a model only a stale harness offers is not routable", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        efforts: ["medium", "high"],
+        model: Model.new("claude-fable-5", effort: "medium"),
+        cached_model: Model.new("claude-fable-5", effort: "medium")
+      )
+
+    Org.set_model(ctx.db, "k1", Model.new("claude-fable-5", effort: "medium"), "anthropic")
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    # Age codex's inventory past its TTL. `refreshing: true` is load-bearing:
+    # without it the next read triggers a refresh that resets `derived_at` and
+    # the entry is fresh again by the time routability looks — a fixture that
+    # would have made this test pass for the wrong reason.
+    :sys.replace_state(ModelCatalog, fn state ->
+      # Aged against the catalog's OWN clock. A literal timestamp is not
+      # reliably old here — monotonic time starts negative — which is the sort
+      # of fixture that silently ages nothing.
+      stale_at = state.now.() - state.ttl_ms * 2
+
+      state
+      |> put_in([:entries, {"testhost", "codex"}, :derived_at], stale_at)
+      |> put_in([:entries, {"testhost", "codex"}, :refreshing], true)
+    end)
+
+    assert {_entries, :stale} = ModelCatalog.get("testhost", "codex", ModelCatalog),
+           "the fixture must actually be stale, or this test proves nothing"
+
+    result =
+      Gateway.handlers(ctx.config)["adjudicate"].(%{
+        origin: "user:flynn",
+        principal: {:session, episode.owner_target},
+        params: %{episode: episode.correlation_key, action: "swap", model: "shared-model"}
+      })
+
+    # Claude has it TIERED and fresh, so the tier refusal is the true cause —
+    # the stale codex entry contributes nothing in either direction.
+    assert %{code: "invalid"} = result
+    assert result.message =~ "has effort tiers"
+    refute result.message =~ "codex"
+  end
+
+  # Two FRESH harnesses both completely matching is genuine ambiguity, and it
+  # must stay ambiguous rather than silently resolving to whichever was
+  # enumerated first.
+  test "two harnesses that both completely match are refused as ambiguous", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        efforts: ["medium", "high"],
+        model: Model.new("claude-fable-5", effort: "medium"),
+        cached_model: Model.new("claude-fable-5", effort: "medium")
+      )
+
+    Org.set_model(ctx.db, "k1", Model.new("claude-fable-5", effort: "medium"), "anthropic")
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    # Give codex the same family at the same tier: now BOTH match completely.
+    :sys.replace_state(ModelCatalog, fn state ->
+      update_in(state.entries[{"testhost", "codex"}].entries, fn entries ->
+        entries ++
+          [
+            %{
+              family: "claude-fable-5",
+              context: nil,
+              display_name: "claude-fable-5",
+              name: "claude-fable-5",
+              efforts: ["medium", "high"],
+              max_input_tokens: 200_000,
+              capabilities: %{},
+              provider: :openai
+            }
+          ]
+      end)
+    end)
+
+    result =
+      Gateway.handlers(ctx.config)["adjudicate"].(%{
+        origin: "user:flynn",
+        principal: {:session, episode.owner_target},
+        params: %{
+          episode: episode.correlation_key,
+          action: "swap",
+          model: "claude-fable-5",
+          effort: "high"
+        }
+      })
+
+    assert %{code: "ambiguous_ref"} = result
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5", effort: "medium")
+  end
+
   # THE THIRD DIRECTION of the same distinction. `unroutable/2` tells three
   # causes apart, and the other two tests only assert this message is NOT used
   # for them — a refute cannot catch the clause that produces it going wrong.

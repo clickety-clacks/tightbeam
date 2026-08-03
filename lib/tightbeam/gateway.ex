@@ -1402,8 +1402,7 @@ defmodule Tightbeam.Gateway do
   # A stored preference crosses as named fields, like every other identity on
   # this seam. It carries no `id`: a preference names a model the org prefers,
   # not a row in some host's catalog.
-  defp wire_preference(%Model{} = model),
-    do: %{model: model.family, effort: model.effort, context: model.context}
+  defp wire_preference(%Model{} = model), do: published_identity(model)
 
   # An agent reading `inspect` sees the identity as FIELDS, the same way it
   # supplies them back on spawn.
@@ -3493,14 +3492,10 @@ defmodule Tightbeam.Gateway do
                     Payloads.stream_history_cleared(call.session_key)
                   )
 
-                  %{
+                  published_identity(model)
+                  |> Map.merge(%{
                     ok: true,
                     harness: harness,
-                    # The wire's line format for the identity, plus effort as its
-                    # own field — the same shape the picker publishes.
-                    model: model.family,
-                    context: model.context,
-                    effort: model.effort,
                     # The swap may have crossed providers, and the new provider's
                     # credential on this host may be a different kind. This is
                     # the one moment the value changes without the client polling
@@ -3509,7 +3504,7 @@ defmodule Tightbeam.Gateway do
                     credential_kind: credential_kind(Map.put(session, :harness, harness)),
                     note:
                       "engine swapped; chat cleared (rows retained); model context starts fresh"
-                  }
+                  })
               end
             else
               {:error, denial} ->
@@ -4706,14 +4701,11 @@ defmodule Tightbeam.Gateway do
            ) do
         {:ok, {:applied, delivery, wake_id}} ->
           complete_delivery(db, delivery)
-          %{
+          Map.merge(published_identity(applied_model), %{
             ok: true,
             action: "swap",
-            model: applied_model.family,
-            context: applied_model.context,
-            effort: applied_model.effort,
             recovery_wake_id: wake_id
-          }
+          })
 
         {:ok, {:denied, current}} ->
           :ok = Adapter.forget_model_residency(adapter, sid)

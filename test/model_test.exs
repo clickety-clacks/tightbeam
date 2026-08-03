@@ -29,6 +29,35 @@ defmodule Tightbeam.ModelTest do
     assert Model.from_params(%{"effort" => "medium"}) == nil
   end
 
+  # WHERE THE DISTINCTION IS DESTROYED. `named_fields/1` is the function that
+  # claims to carry "omitted" and "explicitly nil" apart, so it is the function
+  # that has to be tested for it — the gateway tests only ever saw a nil that
+  # `resolve_issued/3` manufactured AFTER this ran, so they could not see this
+  # collapse at all. Coverage of a distinction belongs where it can be lost,
+  # not only where it is made.
+  test "an explicitly nil field is named, and an omitted one is not" do
+    assert Model.named_fields(%{model: "m", context: nil}) == %{family: "m", context: nil}
+    assert Model.named_fields(%{model: "m"}) == %{family: "m"}
+
+    assert Model.named_fields(%{"model" => "m", "context" => nil}) ==
+             %{family: "m", context: nil}
+
+    # An empty string is the wire's way of saying "cleared", which is explicit.
+    assert Model.named_fields(%{model: "m", context: ""}) == %{family: "m", context: nil}
+
+    # Same for effort: naming no tier is a real answer, distinct from silence.
+    assert Model.named_fields(%{model: "m", effort: nil}) == %{family: "m", effort: nil}
+    assert Model.named_fields(%{model: "m", effort: "high"}) == %{family: "m", effort: "high"}
+  end
+
+  # The family is the exception, and deliberately: there is no model you select
+  # by declining to name one, so an explicitly nil family is absence.
+  test "an explicitly nil family is absence, not a selection" do
+    assert Model.named_fields(%{model: nil, effort: "high"}) == %{effort: "high"}
+    assert Model.named_fields(%{model: nil}) == %{}
+    refute Map.has_key?(Model.named_fields(%{model: nil}), :family)
+  end
+
   test "describe names every field for a reader who must pick one" do
     assert Model.describe(Model.new("gpt-5.6-sol")) == "gpt-5.6-sol"
 

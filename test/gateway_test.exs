@@ -3012,6 +3012,25 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, key).model ==
              Model.new("claude-fable-5", context: "1m", effort: "high"),
            "naming only an effort must keep the default's context"
+
+    # …and the same request with the context NAMED as nil selects the default
+    # window instead. Identical params but for one key's presence, opposite
+    # outcomes — which is the whole point of carrying presence, and what a
+    # nil-dropping `put_named/3` silently made impossible.
+    assert %{session_key: explicit} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Explicit",
+                 idempotency_key: "k-explicit-context",
+                 effort: "high",
+                 context: nil
+               }
+             })
+
+    assert Org.get(ctx.db, explicit).model == Model.new("claude-fable-5", effort: "high"),
+           "naming the context as nil must select the default window, not inherit 1m"
   end
 
   # A refusal has to name the right cause. An effort-only selection whose

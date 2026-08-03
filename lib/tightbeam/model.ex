@@ -122,13 +122,43 @@ defmodule Tightbeam.Model do
   @spec named_fields(map()) :: %{optional(:family | :effort | :context) => String.t() | nil}
   def named_fields(params) when is_map(params) do
     %{}
-    |> put_named(:family, field(params, :model) || field(params, :family))
-    |> put_named(:effort, field(params, :effort))
-    |> put_named(:context, field(params, :context))
+    |> put_named(:family, named_family(params))
+    |> put_named(:effort, named(params, :effort))
+    |> put_named(:context, named(params, :context))
   end
 
-  defp put_named(fields, _key, nil), do: fields
-  defp put_named(fields, key, value), do: Map.put(fields, key, value)
+  # PRESENCE, not value. Reading the params with `Map.get` collapses "the caller
+  # omitted this" into "the caller said nil" — the very distinction this
+  # function exists to carry — so the two are kept apart all the way through.
+  defp put_named(fields, _key, :absent), do: fields
+  defp put_named(fields, key, {:present, value}), do: Map.put(fields, key, value)
+
+  defp named(params, key) do
+    case fetch_either(params, key) do
+      :error -> :absent
+      {:ok, value} -> {:present, blank_to_nil(value)}
+    end
+  end
+
+  # The family is the ONE field with no meaningful explicit nil: `context: nil`
+  # is the vendor's default window and `effort: nil` is "no tier", both real
+  # answers, but there is no model you select by declining to name one. So an
+  # explicitly nil family IS absence, and says so here rather than leaving a
+  # `%Model{family: nil}` to be built downstream.
+  defp named_family(params) do
+    case named(params, :model) do
+      {:present, nil} -> named(params, :family)
+      :absent -> named(params, :family)
+      present -> present
+    end
+  end
+
+  defp fetch_either(params, key) do
+    case Map.fetch(params, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(params, Atom.to_string(key))
+    end
+  end
 
   @doc """
   Read a COMPLETE identity out of a map with string or atom keys. `nil` when no
@@ -146,9 +176,9 @@ defmodule Tightbeam.Model do
   end
 
   defp field(params, key) do
-    case Map.fetch(params, key) do
+    case fetch_either(params, key) do
       {:ok, value} -> blank_to_nil(value)
-      :error -> params |> Map.get(Atom.to_string(key)) |> blank_to_nil()
+      :error -> nil
     end
   end
 

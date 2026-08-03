@@ -67,7 +67,7 @@ defmodule Tightbeam.Schema do
       :ok = module.ensure_schema(db)
     end)
 
-    stamp(db)
+    :ok
   end
 
   defp ensure_stamp_table(db) do
@@ -87,8 +87,8 @@ defmodule Tightbeam.Schema do
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
         # written before stamping existed. Those are DIFFERENT, and telling
-        # them apart is the whole point — an unstamped database with session
-        # rows in it predates the structured model identity.
+        # them apart is the whole point — an unstamped database with a
+        # `sessions` table in it predates the structured model identity.
         unstamped(db)
 
       {:ok, [[found]]} ->
@@ -100,13 +100,38 @@ defmodule Tightbeam.Schema do
 
         There is no migration. Move the database aside and let it be recreated.
         """
+
+      # More than one shape stamped. Nothing writes a second row, so this is a
+      # database in a state this build has no reading for — which is a refusal
+      # like any other, not an unhandled case falling out as a CaseClauseError.
+      {:ok, [_ | _] = rows} ->
+        raise ShapeError, """
+        this Tightbeam database carries MORE THAN ONE shape stamp.
+
+          stamped: #{rows |> List.flatten() |> Enum.join(", ")}
+          this build: #{@shape}
+
+        Nothing in Tightbeam writes a second stamp, so this database was
+        assembled by something else. Move it aside and let it be recreated.
+        """
     end
   end
 
+  # A FRESH DATABASE MUST NEVER BE REFUSED, which is why the stamp is written
+  # HERE — before a single table exists — rather than after the modules run.
+  # Stamped last, a bootstrap interrupted between `sessions` and the stamp left
+  # an unstamped database WITH sessions, indistinguishable from a genuinely old
+  # one, and the next boot refused a database this build had just created. The
+  # absence class again: "interrupted fresh bootstrap" and "genuine old
+  # database" sharing one representation.
+  #
+  # Stamping first cannot lose that way. Interrupted after the stamp, the next
+  # boot reads its own shape and carries on creating what is missing, which is
+  # exactly what `CREATE TABLE IF NOT EXISTS` is for.
   defp unstamped(db) do
     case DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'") do
       {:ok, []} ->
-        :ok
+        stamp(db)
 
       {:ok, [_ | _]} ->
         raise ShapeError, """
