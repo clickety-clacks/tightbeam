@@ -17,13 +17,20 @@ defmodule Tightbeam.HarnessClaudeWarmTest do
     assert :ok = Claude.warm_home(target, "/tmp/claude-home")
 
     assert_receive {:ran, command}
-    line = Enum.join(command, " ")
 
-    assert line =~ "CLAUDE_CONFIG_DIR=/tmp/claude-home",
-           "the warm must hand the home over the way a launch does: #{line}"
-
-    refute line =~ "--config-dir",
-           "claude has no --config-dir option; a warm using one exits unknown-option: #{line}"
+    # THE EXACT ARGV, IN ORDER -- not a substring of it. A joined-and-searched assertion
+    # passes for `["CLAUDE_CONFIG_DIR=...", "claude", ...]`, which carries the right text
+    # and is still broken: `System.cmd/2` would try to EXECUTE the assignment as a program.
+    # What has to be pinned is that `env` applies it.
+    assert command == [
+             "env",
+             "CLAUDE_CONFIG_DIR=/tmp/claude-home",
+             "claude",
+             "-p",
+             "ok",
+             "--model",
+             "sonnet"
+           ]
   end
 
   # Same contract on the satellite path, which had the identical bug: a remote home that
@@ -40,9 +47,18 @@ defmodule Tightbeam.HarnessClaudeWarmTest do
     assert :ok = Claude.warm_home(target, "/srv/tb/homes/sat/claude")
 
     assert_receive {:ran, command}
-    line = Enum.join(command, " ")
-    assert line =~ "CLAUDE_CONFIG_DIR=/srv/tb/homes/sat/claude", line
-    refute line =~ "--config-dir", line
+
+    assert hd(command) == "ssh"
+    assert "worker@sat.example" in command
+
+    # The remote leg is one shell word per argv element, quoted. Assert the whole
+    # command line, so an assignment that lost its `env` -- and would be read as a
+    # command NAME by the remote shell -- cannot pass.
+    remote = List.last(command)
+
+    assert remote ==
+             "'env' 'CLAUDE_CONFIG_DIR=/srv/tb/homes/sat/claude' 'claude' '-p' 'ok' " <>
+               "'--model' 'sonnet'"
   end
 
   test "a failed warm is reported to the onboarding caller" do
