@@ -61,7 +61,7 @@ pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
             let body = response
                 .into_string()
                 .map_err(|error| format!("catalog response was unreadable: {error}"))?;
-            println!("{body}\n{status}");
+            print!("{}", rendered(&body, status));
             Ok(0)
         }
         Err(ureq::Error::Status(status, response)) => {
@@ -69,11 +69,23 @@ pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
             // distinguishes a 401 from an unreachable host by the trailer, and a nonzero
             // exit would collapse those into one unhelpful failure.
             let body = response.into_string().unwrap_or_default();
-            println!("{body}\n{status}");
+            print!("{}", rendered(&body, status));
             Ok(0)
         }
         Err(error) => Err(format!("catalog request failed: {error}")),
     }
+}
+
+/// Body, newline, status -- the shape the gateway's splitter reads.
+///
+/// This is a CROSS-LANGUAGE CONTRACT and it has no compiler to enforce it: the Elixir side
+/// takes the last line as the status and everything before it as the body. Emitting the
+/// status on its own line is therefore load-bearing, and it is what `curl -w "\n%{http_code}"`
+/// produced before this verb existed. A body that does not end in a newline would otherwise
+/// run into the status and both would be unparseable.
+fn rendered(body: &str, status: u16) -> String {
+    let separator = if body.ends_with('\n') { "" } else { "\n" };
+    format!("{body}{separator}{status}\n")
 }
 
 /// The header this credential authenticates with, chosen by KIND rather than by sniffing.
@@ -141,5 +153,54 @@ mod tests {
     #[test]
     fn an_unknown_provider_refuses_rather_than_guessing_a_header() {
         assert!(authorization("gemini", "api_key", "x").is_err());
+    }
+
+    /// The trailer contract, asserted against the ELIXIR SIDE'S OWN SOURCE.
+    ///
+    /// Nothing else can enforce this: two languages agree on a wire shape by convention,
+    /// which is exactly how a staged filename came to disagree with the reader that wanted
+    /// it. If the gateway stops splitting on the last line, this fails here rather than as
+    /// an unparseable catalog in production.
+    #[test]
+    fn the_trailer_is_the_shape_the_gateway_splits_on() {
+        assert_eq!(rendered("{\"data\":[]}", 200), "{\"data\":[]}\n200\n");
+        // A body that already ends in a newline must not gain a blank line, or the status
+        // stops being the last line.
+        assert_eq!(rendered("{}\n", 401), "{}\n401\n");
+
+        let gateway = include_str!("../../lib/tightbeam/harness/support.ex");
+        assert!(
+            gateway.contains("split_trailing_line"),
+            "the gateway no longer splits a trailing status line; this verb's output shape \
+             is stale"
+        );
+    }
+
+    /// A refusal is reported in the TRAILER, not the exit code: the caller must be able to
+    /// tell a 401 from a host it could not reach, and a nonzero exit collapses those.
+    #[test]
+    fn an_http_refusal_still_renders_a_parseable_trailer() {
+        assert_eq!(rendered("{\"error\":\"nope\"}", 401), "{\"error\":\"nope\"}\n401\n");
+    }
+
+    #[test]
+    fn wrong_arity_names_the_usage_rather_than_panicking() {
+        let error = probe(&["anthropic".to_owned()]).unwrap_err();
+        assert!(error.contains("usage: tightbeam catalog-probe"), "{error}");
+    }
+
+    /// A missing credential names the PATH. The gateway runs this over ssh and reads one
+    /// stream, so a reason that does not say which file is a support ticket.
+    #[test]
+    fn a_missing_credential_names_the_path_it_looked_for() {
+        let missing = "/nonexistent/tightbeam-probe-fixture/.credentials.json";
+        let error = probe(&[
+            "anthropic".to_owned(),
+            "subscription".to_owned(),
+            missing.to_owned(),
+            "https://example.invalid/v1/models".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(error.contains(missing), "{error}");
     }
 }
