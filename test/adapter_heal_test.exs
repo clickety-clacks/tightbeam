@@ -1534,6 +1534,45 @@ defmodule Tightbeam.AdapterHealTest do
     assert Org.get(ctx.db, "k1").model == Model.new("claude-fable-5", effort: "medium")
   end
 
+  # THE THIRD DIRECTION of the same distinction. `unroutable/2` tells three
+  # causes apart, and the other two tests only assert this message is NOT used
+  # for them — a refute cannot catch the clause that produces it going wrong.
+  # A model no fresh harness carries must still be reported as absent, or the
+  # "named but wrong tier" message would start claiming models exist that do not.
+  test "a model no fresh harness carries is still reported as absent", ctx do
+    adapter =
+      swap_harness(ctx,
+        checkout: {:error, :degraded},
+        efforts: ["medium", "high"],
+        model: Model.new("claude-fable-5", effort: "medium"),
+        cached_model: Model.new("claude-fable-5", effort: "medium")
+      )
+
+    Org.set_model(ctx.db, "k1", Model.new("claude-fable-5", effort: "medium"), "anthropic")
+    run_failing_turn(ctx, "fault")
+    episode = episode(ctx.db)
+    swap_ready(adapter, nil)
+
+    result =
+      Gateway.handlers(ctx.config)["adjudicate"].(%{
+        origin: "user:flynn",
+        principal: {:session, episode.owner_target},
+        params: %{
+          episode: episode.correlation_key,
+          action: "swap",
+          model: "no-such-model",
+          effort: "high"
+        }
+      })
+
+    assert %{code: "model_unavailable"} = result
+    assert result.message =~ "not in a fresh harness inventory"
+
+    # …and it must NOT borrow the tier vocabulary for a model that is absent.
+    refute result.message =~ "does not offer effort"
+    refute result.message =~ "has effort tiers"
+  end
+
   # THE TIER REFUSAL MUST NOT FIRE TOO EARLY. Whether a selection is routable is
   # a question about the WHOLE fleet: one harness tiering a model says nothing
   # if another offers it untiered, where an effort-less ruling is complete and
