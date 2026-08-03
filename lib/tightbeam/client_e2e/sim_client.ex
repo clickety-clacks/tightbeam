@@ -291,7 +291,13 @@ defmodule Tightbeam.ClientE2E.SimClient do
   defp request(client, method, path, body) do
     _ = Application.ensure_all_started(:inets)
     url = ~c"http://#{client.host}:#{client.port}#{path}"
-    headers = [{~c"authorization", ~c"Bearer #{client.token}"}]
+    # The sim client is a CLI client and the wire refuses one that will not say what
+    # it is (42f7bd5). Sourced from the gateway's own requirement rather than a
+    # literal, so a version bump cannot leave this claiming something untrue.
+    headers = [
+      {~c"authorization", ~c"Bearer #{client.token}"},
+      {~c"x-tightbeam-cli-version", to_charlist(Tightbeam.CliCompatibility.required_version())}
+    ]
 
     request =
       if is_nil(body),
