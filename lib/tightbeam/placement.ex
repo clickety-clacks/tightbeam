@@ -72,6 +72,12 @@ defmodule Tightbeam.Placement do
   alias Tightbeam.{Archetypes, DB, Harness, Homes, Identity, Org, Rails}
   import Bitwise
 
+  defmodule Refusal do
+    @moduledoc "A placement refusal that synchronous and turn boundaries can relay by name."
+    @enforce_keys [:code, :host, :harness, :message]
+    defexception [:code, :host, :harness, :message]
+  end
+
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
   # misconfigured host must fail in seconds with a reason, never hang on TCP
   # timeouts or an invisible password prompt.
@@ -905,7 +911,8 @@ defmodule Tightbeam.Placement do
         lineage: lineage,
         rails: Rails.hook_settings(),
         statutes: Rails.statutes?(),
-        credential_kind: credential_kind(config, module.credential_provider(), host),
+        credential_kind:
+          credential_kind(config, module.credential_provider(), host, module.wire_name()),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)
       )
@@ -933,8 +940,12 @@ defmodule Tightbeam.Placement do
   """
   @spec adapter_context(map(), adapter_key()) :: keyword()
   def adapter_context(config, {harness, _identity_name, host}) do
-    provider = Harness.module!(harness).credential_provider()
-    [credential_kind: credential_kind(config, provider, host)]
+    module = Harness.module!(harness)
+
+    [
+      credential_kind:
+        credential_kind(config, module.credential_provider(), host, module.wire_name())
+    ]
   end
 
   @doc "Derive the stored name for a normalized overridden identity."
@@ -1152,15 +1163,36 @@ defmodule Tightbeam.Placement do
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
 
-  defp credential_kind(%{credential_kind: kind}, _provider, _host)
+  defp credential_kind(config, provider, host, harness) do
+    case read_credential_kind(config, provider, host) do
+      {:error, reason} ->
+        code =
+          case reason do
+            {name, _detail} when is_atom(name) -> Atom.to_string(name)
+            _other -> "host_unready"
+          end
+
+        raise Refusal,
+          code: code,
+          host: host,
+          harness: harness,
+          message:
+            "credential kind for #{harness} on host #{host} is unreadable: #{inspect(reason)}"
+
+      kind ->
+        kind
+    end
+  end
+
+  defp read_credential_kind(%{credential_kind: kind}, _provider, _host)
        when is_atom(kind),
        do: kind
 
-  defp credential_kind(%{credential_kind: kind}, provider, _host)
+  defp read_credential_kind(%{credential_kind: kind}, provider, _host)
        when is_function(kind, 1),
        do: kind.(provider)
 
-  defp credential_kind(%{credential_kind: kind}, provider, host)
+  defp read_credential_kind(%{credential_kind: kind}, provider, host)
        when is_function(kind, 2),
        do: kind.(provider, host)
 
@@ -1168,14 +1200,11 @@ defmodule Tightbeam.Placement do
   # injected value or fun wins, otherwise the machine's own lifecycle owner is
   # asked.
   #
-  # An unresolvable kind falls back to `:subscription` — the ONLY kind that
-  # existed before this invariant — so the fallback reproduces today's behaviour
-  # rather than inventing a new failure. It is not a credential gate: spawn
-  # already refused a host whose credential needs onboarding
-  # (`Gateway.validate_credential/3`), so by the time a launch runs there is a
-  # credential and it has a recorded kind. Reaching the fallback means a race or
-  # a test harness, and in both the old behaviour is the right one.
-  defp credential_kind(_config, provider, host) do
+  # An unreachable lifecycle owner falls back to `:subscription` — the ONLY kind
+  # that existed before this invariant. An owner that answers with an unreadable
+  # store is different: it supplied a cause, so placement refuses the host with
+  # that cause instead of passing an error tuple as a launch kind.
+  defp read_credential_kind(_config, provider, host) do
     server = Tightbeam.Credentials.server(host)
 
     case GenServer.whereis(server) do
