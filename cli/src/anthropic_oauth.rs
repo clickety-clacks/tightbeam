@@ -176,15 +176,19 @@ pub(crate) fn complete(challenge: &Challenge, pasted: &str) -> Result<Credential
 /// that from a revoked credential. One minute is enough to cover a slow catalog fetch.
 const REFRESH_SKEW_MS: i64 = 60_000;
 
-/// Is this stored credential too old to authenticate with?
+/// Should this stored credential be renewed before it is used?
 ///
-/// A record with no `expiresAt` answers NO. It is not this function's job to decide a
-/// malformed credential's fate — `access_token` refuses it by name, and guessing here would
-/// turn an unreadable record into a spurious refresh against a token we never parsed.
-pub(crate) fn is_expired(raw: &str, now_ms: i64) -> bool {
+/// A record with no readable `expiresAt` answers YES, and the reason matters: nothing else
+/// refuses it. `access_token` validates only `accessToken`, so answering NO would treat an
+/// undateable record as live forever — it would 401 on every probe and never renew, which
+/// is precisely the deadlock this function exists to end. Renewing is also self-healing:
+/// the record we write back HAS an expiry, so the unknown state resolves permanently
+/// instead of recurring. A renewal that fails still falls back to trying the stored token,
+/// so this costs one request and never less capability.
+pub(crate) fn needs_renewal(raw: &str, now_ms: i64) -> bool {
     match expires_at_ms(raw) {
         Some(expires_at) => now_ms + REFRESH_SKEW_MS >= expires_at,
-        None => false,
+        None => true,
     }
 }
 
@@ -258,27 +262,32 @@ pub(crate) fn refresh(raw: &str) -> Result<Credential, String> {
         Err(error) => return Err(format!("could not reach the token endpoint: {error}")),
     };
 
-    // A rotated refresh token is optional in the response; the grant stays valid when the
-    // provider omits it. Carrying the stored one forward is what keeps a renewal from
-    // quietly disarming the NEXT renewal.
     renewed_credential(&body, &refresh_token)
 }
 
+/// Fill in an OMITTED refresh token, and only an omitted one.
+///
+/// Rotation is optional: the grant stays valid when the provider returns no new refresh
+/// token, so carrying the stored one forward is what keeps a renewal from quietly disarming
+/// the NEXT renewal. But the question "was it omitted?" is answered STRUCTURALLY, by asking
+/// the JSON whether the key is absent. Deciding it from `parse_credential`'s diagnostic text
+/// made two different things look alike: a wording change would silently disable the
+/// fallback, and a key PRESENT but unusable (`"refresh_token": null`) produced the same
+/// message and got the old token substituted for a value the provider actually sent.
+/// Present-but-invalid is a refusal; only absent is filled in.
 fn renewed_credential(body: &str, previous_refresh_token: &str) -> Result<Credential, String> {
-    match parse_credential(body) {
-        Ok(credential) => Ok(credential),
-        Err(reason) if reason.contains("no refresh_token") => {
-            let patched: serde_json::Value = serde_json::from_str(body)
-                .map_err(|error| format!("token refresh returned invalid JSON: {error}"))?;
-            let mut object = match patched {
-                serde_json::Value::Object(object) => object,
-                _ => return Err("token refresh did not return a JSON object".to_owned()),
-            };
-            object.insert("refresh_token".into(), previous_refresh_token.into());
-            parse_credential(&serde_json::Value::Object(object).to_string())
-        }
-        Err(reason) => Err(reason),
+    let json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("token refresh returned invalid JSON: {error}"))?;
+
+    let serde_json::Value::Object(mut object) = json else {
+        return Err("token refresh did not return a JSON object".to_owned());
+    };
+
+    if !object.contains_key("refresh_token") {
+        object.insert("refresh_token".into(), previous_refresh_token.into());
     }
+
+    parse_credential(&serde_json::Value::Object(object).to_string())
 }
 
 /// The ONE place a bearer token is taken out of the stored record.

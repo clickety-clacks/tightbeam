@@ -55,7 +55,15 @@ pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
     // asking with it is the provider's own answer rather than ours.
     let raw = match renewed(provider, kind, &raw, credential_path) {
         Ok(Some(fresh)) => fresh,
-        Ok(None) | Err(_) => raw,
+        Ok(None) => raw,
+        Err(Renewal { fresh, reason }) => {
+            // A renewal that could not be SAVED still produced a live token, and using it
+            // is strictly better than authenticating with one known to be spent. Falling
+            // back to `raw` here would guarantee the 401 this whole path exists to avoid.
+            // The failure goes to stderr rather than stdout, which carries the catalog.
+            eprintln!("tightbeam: {reason}");
+            fresh.unwrap_or(raw)
+        }
     };
 
     let header = authorization(provider, kind, &raw)?;
@@ -100,57 +108,109 @@ fn renewed(
     kind: &str,
     raw: &str,
     credential_path: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, Renewal> {
     if (provider, kind) != ("anthropic", "subscription") {
         return Ok(None);
     }
 
-    if !anthropic_oauth::is_expired(raw, now_ms()) {
+    if !anthropic_oauth::needs_renewal(raw, now_ms()) {
         return Ok(None);
     }
 
-    let credential = anthropic_oauth::refresh(raw)?;
+    let credential = anthropic_oauth::refresh(raw).map_err(|reason| Renewal {
+        fresh: None,
+        reason: format!("could not renew the anthropic credential: {reason}"),
+    })?;
+
     let json = anthropic_oauth::credentials_json(&credential);
-    write_credential(credential_path, &json)?;
-    Ok(Some(json))
+
+    // THE GRANT ALREADY HAPPENED. If the provider rotated the refresh token, the stored
+    // record is now the one that cannot renew again — so a failed write must not throw the
+    // fresh credential away and report success at using the old one. It is handed back for
+    // this process to use, with the persistence failure named.
+    match write_credential(credential_path, &json) {
+        Ok(()) => Ok(Some(json)),
+        Err(reason) => Err(Renewal {
+            fresh: Some(json),
+            reason: format!(
+                "renewed the anthropic credential but could not save it to \
+                 {credential_path}: {reason}. This process will use the new token; if the \
+                 provider rotated the refresh token, the stored record may no longer renew \
+                 and re-onboarding will be required."
+            ),
+        }),
+    }
 }
 
-/// Replace the credential without ever leaving a partial one behind.
+/// A renewal that failed, carrying whatever it still managed to produce.
+///
+/// Two unlike failures used to share one shape (`Err(_)`): "the grant was refused" and "the
+/// grant succeeded but the file would not save". The first means the stored token is all we
+/// have; the second means we hold a BETTER token than the stored one. Collapsing them threw
+/// away a live credential.
+struct Renewal {
+    fresh: Option<String>,
+    reason: String,
+}
+
+/// Replace the credential without ever leaving a partial or shared one behind.
 ///
 /// Write-then-rename because the alternative is truncating the only copy of a credential and
 /// then failing to fill it: Claude Code reads this same file, and a half-written record is
-/// not a degraded login but a destroyed one. The temporary lands in the same directory so the
-/// rename stays on one filesystem, and it is created 0600 -- a credential must never exist,
-/// even for an instant, at the default umask.
+/// not a degraded login but a destroyed one.
+///
+/// The staging path is UNIQUE PER WRITER and created `O_EXCL`. A fixed name was a race with
+/// two teeth: two probes renewing at once could hold the same inode, one renaming it into
+/// place while the other wrote through its descriptor — modifying the live credential
+/// non-atomically — and `.mode(0o600)` is ignored for a file that already exists, so a
+/// pre-existing permissive staging file would have received the secret.
 fn write_credential(credential_path: &str, json: &str) -> Result<(), String> {
     let path = std::path::Path::new(credential_path);
     let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "credentials".to_owned());
     let temporary = directory.join(format!(
-        ".{}.renewing",
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "credentials".to_owned())
+        ".{name}.renewing.{}.{}",
+        std::process::id(),
+        now_ms()
     ));
 
-    {
+    let staged = (|| -> Result<(), String> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&temporary)
             .map_err(|error| format!("could not stage the renewed credential: {error}"))?;
         file.write_all(json.as_bytes())
             .map_err(|error| format!("could not write the renewed credential: {error}"))?;
         file.sync_all()
-            .map_err(|error| format!("could not flush the renewed credential: {error}"))?;
+            .map_err(|error| format!("could not flush the renewed credential: {error}"))
+    })();
+
+    // Every failure path removes the staging file, including the ones that fail BEFORE the
+    // rename. A leftover holding a live token is a secret lying around under a predictable
+    // name, and the next writer would collide with it.
+    if let Err(reason) = staged {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(reason);
     }
 
-    std::fs::rename(&temporary, path).map_err(|error| {
+    if let Err(error) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
-        format!("could not install the renewed credential: {error}")
-    })
+        return Err(format!("could not install the renewed credential: {error}"));
+    }
+
+    // Durability of the REPLACEMENT, not just of the bytes: without this the rename can be
+    // lost across a crash and the file reverts to the spent token it just replaced.
+    if let Ok(handle) = std::fs::File::open(directory) {
+        let _ = handle.sync_all();
+    }
+
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -276,7 +336,7 @@ mod tests {
     #[test]
     fn an_api_key_is_never_renewed() {
         let temporary = std::env::temp_dir().join("tb-renew-apikey");
-        assert_eq!(
+        assert!(matches!(
             renewed(
                 "anthropic",
                 "api_key",
@@ -284,7 +344,7 @@ mod tests {
                 temporary.to_str().unwrap()
             ),
             Ok(None)
-        );
+        ));
         assert!(!temporary.exists(), "an api key path must not be written");
     }
 
@@ -297,7 +357,7 @@ mod tests {
             now_ms() + 3_600_000
         );
         let temporary = std::env::temp_dir().join("tb-renew-live");
-        assert_eq!(
+        assert!(matches!(
             renewed(
                 "anthropic",
                 "subscription",
@@ -305,40 +365,42 @@ mod tests {
                 temporary.to_str().unwrap()
             ),
             Ok(None)
-        );
+        ));
     }
 
     /// The expiry question, both sides of the boundary. A token inside the skew window is
     /// already spent: it can expire between this check and the request it authorizes, and
     /// the caller cannot tell that from a revoked credential.
     #[test]
-    fn expiry_is_judged_with_a_skew_so_a_token_cannot_lapse_mid_request() {
+    fn renewal_is_judged_with_a_skew_so_a_token_cannot_lapse_mid_request() {
         let at = |expires_at: i64| {
             format!(r#"{{"claudeAiOauth":{{"accessToken":"a","expiresAt":{expires_at}}}}}"#)
         };
         let now = 1_000_000_000_000;
 
         assert!(
-            anthropic_oauth::is_expired(&at(now - 1), now),
+            anthropic_oauth::needs_renewal(&at(now - 1), now),
             "past expiry"
         );
         assert!(
-            anthropic_oauth::is_expired(&at(now + 30_000), now),
+            anthropic_oauth::needs_renewal(&at(now + 30_000), now),
             "inside the skew window is spent, not live"
         );
-        assert!(!anthropic_oauth::is_expired(&at(now + 3_600_000), now));
+        assert!(!anthropic_oauth::needs_renewal(&at(now + 3_600_000), now));
     }
 
-    /// A record with no expiry is NOT treated as expired. Guessing here would refresh
-    /// against a token we never parsed; `access_token` is what refuses a malformed record,
-    /// and it names it.
+    /// A record we cannot DATE must be renewed, not trusted. Nothing else refuses it —
+    /// `access_token` validates only `accessToken` — so answering "live" here would leave
+    /// an undateable record 401ing on every probe and never renewing, which is exactly the
+    /// deadlock this path exists to end. Renewing is self-healing: what we write back has
+    /// an expiry, so the unknown state resolves instead of recurring.
     #[test]
-    fn a_record_without_an_expiry_is_not_guessed_to_be_expired() {
-        assert!(!anthropic_oauth::is_expired(
+    fn a_record_with_no_readable_expiry_is_renewed_rather_than_trusted_forever() {
+        assert!(anthropic_oauth::needs_renewal(
             r#"{"claudeAiOauth":{"accessToken":"a"}}"#,
             0
         ));
-        assert!(!anthropic_oauth::is_expired("not json", 0));
+        assert!(anthropic_oauth::needs_renewal("not json", 0));
     }
 
     /// The renewed credential must land whole or not at all. Claude Code reads this same
