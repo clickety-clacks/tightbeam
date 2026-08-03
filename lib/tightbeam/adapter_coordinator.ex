@@ -474,7 +474,7 @@ defmodule Tightbeam.AdapterCoordinator do
   # comes up (Adjudication.probe_prompt/0); without this they only ever saw
   # the good news, and a turn that stopped for an engine fault read as a
   # prompt that vanished.
-  defp record_adapter_down(state, key, reason, absorbed?) do
+  defp record_adapter_down(state, key, entry, reason, absorbed?) do
     name = key_name(key)
 
     Tightbeam.EventLog.notice(
@@ -482,7 +482,7 @@ defmodule Tightbeam.AdapterCoordinator do
       "adapter_down",
       name,
       "#{inspect(reason)} absorbed=#{absorbed?}",
-      audience: {:sessions, halted_sessions(state.db, key)},
+      audience: {:sessions, halted_sessions(state.db, key, entry, absorbed?)},
       attention: :normal,
       message:
         "[adapter down]\n\nThe #{name} engine stopped: #{inspect(reason)}. The turn " <>
@@ -491,22 +491,53 @@ defmodule Tightbeam.AdapterCoordinator do
     )
   end
 
-  # Which sessions this death halted: the ones resident on this adapter with a
-  # turn running on it. Sessions reach a key the way the gateway builds one —
-  # harness and host, shared archetype — so a key of any other shape holds no
-  # sessions and halted nobody.
-  defp halted_sessions(db, {harness, "shared", host}) do
+  # An ABSORBED death names nobody. `start_adapter_unfenced` reuses the entry's
+  # generation for the replacement it starts, so a turn running on the
+  # replacement and a turn that died on the original carry the SAME stamp:
+  # there is no fact on hand that tells them apart, and guessing would put
+  # "your turn stopped" in the chat of a session whose turn is still running.
+  # The row is unconditional (#14); the interruption is only for a death we can
+  # attribute.
+  defp halted_sessions(_db, _key, _entry, true = _absorbed?), do: []
+
+  # Which sessions this death halted: those resident on this adapter with a
+  # turn RUNNING against the generation that just died. Sessions reach a key
+  # the way the gateway builds one — harness and host, shared archetype — so a
+  # key of any other shape holds no sessions and halted nobody. A NULL
+  # `adapterGen` is a turn that checked this adapter out and died before
+  # `Ledger.stamp_adapter/3` ran; it was on this key and this key had exactly
+  # one adapter, so it counts.
+  #
+  # KNOWN GAP, stated rather than papered over: the lane learns its prompt
+  # failed from the same death, so it can finalize the turn before this handler
+  # runs, and then the turn is no longer 'running' and this returns nobody. The
+  # session is not left silent — its own "[turn failed]" marker still lands —
+  # it loses the sentence naming the CAUSE. Widening to recently-failed turns
+  # would need a time window, which is a proxy for an edge this query does not
+  # have; the real home for the cause line is the failure path, which knows
+  # both the session and the adapter key already.
+  #
+  # This reads `turns` directly because a `Ledger` reader is the right home and
+  # ledger.ex belongs to another lane right now (reported, not edited).
+  defp halted_sessions(db, {harness, "shared", host}, entry, false) do
     {:ok, rows} =
       Tightbeam.DB.query(
         db,
-        "SELECT sessionKey FROM sessions WHERE state = 'active' AND harness = ?1 AND host = ?2",
-        [Atom.to_string(harness), host]
+        """
+        SELECT s.sessionKey
+        FROM sessions AS s
+        JOIN turns AS t ON t.sessionKey = s.sessionKey
+        WHERE s.state = 'active' AND s.harness = ?1 AND s.host = ?2
+          AND t.status = 'running'
+          AND (t.adapterGen = ?3 OR t.adapterGen IS NULL)
+        """,
+        [Atom.to_string(harness), host, entry.generation]
       )
 
-    for [session_key] <- rows, Tightbeam.Ledger.running?(db, session_key), do: session_key
+    Enum.map(rows, fn [session_key] -> session_key end)
   end
 
-  defp halted_sessions(_db, _key), do: []
+  defp halted_sessions(_db, _key, _entry, false), do: []
 
   defp retire_adapter(key, state) do
     case state.adapters[key] do
@@ -562,7 +593,7 @@ defmodule Tightbeam.AdapterCoordinator do
         # record and its notice are unconditional here, and the absorbed ones
         # say so in their detail.
         absorbed? = entry.monitor != ref
-        :ok = record_adapter_down(state, key, reason, absorbed?)
+        :ok = record_adapter_down(state, key, entry, reason, absorbed?)
 
         if absorbed? do
           {:noreply, state}

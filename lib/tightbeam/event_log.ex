@@ -300,13 +300,15 @@ defmodule Tightbeam.EventLog do
         # The record and the markers commit together: a crash between them
         # would leave exactly the split this function exists to prevent.
         Enum.reduce(candidates(audience), {[], []}, fn session_key, {appended, undeliverable} ->
-          if active_session?(txn, session_key) do
-            {:appended, marker} =
-              Projection.append_marker_in_txn(txn, session_key, message, attention)
+          case active_owner(txn, session_key) do
+            nil ->
+              {appended, [session_key | undeliverable]}
 
-            {[{session_key, marker} | appended], undeliverable}
-          else
-            {appended, [session_key | undeliverable]}
+            owner ->
+              {:appended, marker} =
+                Projection.append_marker_in_txn(txn, session_key, message, attention)
+
+              {[{session_key, owner, marker} | appended], undeliverable}
           end
         end)
       end)
@@ -319,7 +321,7 @@ defmodule Tightbeam.EventLog do
       )
     end)
 
-    Enum.each(Enum.reverse(appended), &publish_marker(db, registry, &1))
+    Enum.each(Enum.reverse(appended), &publish_marker(registry, &1))
   end
 
   defp candidates(:record_only), do: []
@@ -329,8 +331,24 @@ defmodule Tightbeam.EventLog do
 
   # Read through the transaction handle, not Org: a `DB.query` from inside a
   # transaction re-enters the owner process that is running it.
-  defp active_session?(txn, session_key) do
-    Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) == [["active"]]
+  #
+  # The OWNER comes back with the answer rather than being re-read after the
+  # commit. `ownerUserId` is NOT NULL, so nil here means exactly one thing —
+  # no active session by that key — and the publish below then needs no second
+  # trip through the single-writer DB owner. That trip was the wide half of
+  # the publication race: it can queue behind another session's transaction,
+  # during which the lane that owns this session can commit AND publish a
+  # LATER seq, and ConnRegistry drops an earlier one for good once a
+  # connection's watermark has passed it.
+  defp active_owner(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1 AND state = 'active'",
+           [session_key]
+         ) do
+      [[owner]] -> owner
+      [] -> nil
+    end
   end
 
   # The durable half is already committed by the time we get here, so a fan-out
@@ -338,21 +356,15 @@ defmodule Tightbeam.EventLog do
   # the next socket that drains this session. Letting the exit through would
   # take out the caller — a dying adapter's own coordinator, in the case that
   # found this — over a process whose absence means the wire is down anyway.
-  defp publish_marker(db, registry, {session_key, marker}) do
-    case Org.get(db, session_key) do
-      nil ->
-        :ok
-
-      session ->
-        ConnRegistry.publish_message(
-          registry,
-          session_key,
-          session.owner_user_id,
-          marker.seq,
-          Payloads.server_message(marker),
-          fn pid, payload -> send(pid, {:push_message, session_key, marker.seq, payload}) end
-        )
-    end
+  defp publish_marker(registry, {session_key, owner, marker}) do
+    ConnRegistry.publish_message(
+      registry,
+      session_key,
+      owner,
+      marker.seq,
+      Payloads.server_message(marker),
+      fn pid, payload -> send(pid, {:push_message, session_key, marker.seq, payload}) end
+    )
   catch
     :exit, reason ->
       Logger.warning(

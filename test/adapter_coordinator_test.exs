@@ -603,9 +603,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
   ## Task #14 — the guard covers the ACTION, not the RECORD
 
-  test "a death absorbed by a replacement is still recorded, and still does not restart", ctx do
+  test "a death absorbed by a replacement is recorded, restarts nothing, and accuses nobody",
+       ctx do
     key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"absorbed_#{System.unique_integer([:positive])}")
+
+    session_key = seed_session!(ctx.db)
+    running_turn!(ctx.db, session_key)
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
 
@@ -630,40 +634,43 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # live adapter the replacement owns was not nilled out.
     assert coordinator_generation(coordinator, key) == 1
     assert %{pid: ^adapter, timer: nil} = :sys.get_state(coordinator).adapters[key]
+
+    # And NOBODY was told their turn stopped. A replacement inherits the
+    # entry's generation, so a turn running on it carries the same stamp as one
+    # that died on the original: there is no fact that separates them, and the
+    # turn above is in fact still running.
+    assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
+  end
+
+  test "a turn running against a LATER generation is not blamed on this death", ctx do
+    key = {:claude, "shared", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"gen_#{System.unique_integer([:positive])}")
+
+    session_key = seed_session!(ctx.db)
+    seq = running_turn!(ctx.db, session_key)
+    # This turn checked out a LATER adapter than the one about to die.
+    :ok = Tightbeam.Ledger.stamp_adapter(ctx.db, seq, 7)
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    Process.exit(adapter, :kill)
+
+    assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
+
+    assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
+    assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
   end
 
   test "a death that halted a session posts a fault message that session's reader sees", ctx do
     key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"halted_#{System.unique_integer([:positive])}")
 
-    :ok =
-      DB.execute(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
-
-    session_key = "agent:main:clawline:flynn:main"
-
-    Tightbeam.Org.create(ctx.db, %{
-      session_key: session_key,
-      display_name: "Main",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Tightbeam.Model.new("claude-fable-5")
-    })
+    session_key = seed_session!(ctx.db)
 
     # An idle session is not "halted"; a session with a turn RUNNING on this
-    # adapter is what the death actually stopped.
-    {:ok, _seq} =
-      Tightbeam.Ledger.enqueue(ctx.db, %{
-        session_key: session_key,
-        message_id: "m1",
-        origin: "user:flynn",
-        prompt: "do the thing"
-      })
-
-    {:ok, _turn} = Tightbeam.Ledger.claim_next(ctx.db, session_key, "lane")
+    # adapter is what the death actually stopped. This one is unstamped, which
+    # pins the NULL-adapterGen arm: it checked the adapter out and died before
+    # Ledger.stamp_adapter/3 ran.
+    _seq = running_turn!(ctx.db, session_key)
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     Process.exit(adapter, :kill)
@@ -687,12 +694,23 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"idle_#{System.unique_integer([:positive])}")
 
-    :ok =
-      DB.execute(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
+    session_key = seed_session!(ctx.db)
 
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    Process.exit(adapter, :kill)
+
+    assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
+
+    # The record is unconditional; the interruption is not.
+    assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
+    assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
+  end
+
+  defp seed_session!(db) do
+    :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
     session_key = "agent:main:clawline:flynn:main"
 
-    Tightbeam.Org.create(ctx.db, %{
+    Tightbeam.Org.create(db, %{
       session_key: session_key,
       display_name: "Main",
       owner_user_id: "flynn",
@@ -704,14 +722,20 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       model: Tightbeam.Model.new("claude-fable-5")
     })
 
-    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
-    Process.exit(adapter, :kill)
+    session_key
+  end
 
-    assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
+  defp running_turn!(db, session_key) do
+    {:ok, seq} =
+      Tightbeam.Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: "m_#{System.unique_integer([:positive])}",
+        origin: "user:flynn",
+        prompt: "do the thing"
+      })
 
-    # The record is unconditional; the interruption is not.
-    assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
-    assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
+    {:ok, _turn} = Tightbeam.Ledger.claim_next(db, session_key, "lane")
+    seq
   end
 
   defp start_fake_coordinator(ctx, name) do
