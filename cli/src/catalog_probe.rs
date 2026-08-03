@@ -438,6 +438,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// A PRE-EXISTING staging file must never be written through.
+    ///
+    /// This is the deterministic half of the fixed-name hazard, and the half with teeth:
+    /// `.mode(0o600)` is ignored for a file that already exists, so with a fixed name a
+    /// planted world-readable staging file would have received the live token. `create_new`
+    /// plus a per-writer name makes that unreachable. (The other half — two probes racing on
+    /// one inode — is a genuine concurrency property that a sequential test cannot establish,
+    /// so it is not claimed here.)
+    #[test]
+    fn a_planted_staging_file_never_receives_the_secret() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join("tb-renew-planted");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(".credentials.json");
+
+        // EXACTLY the name the fixed-path version builds: `.{file_name}.renewing`, and the
+        // file name already begins with a dot, so it is doubled. Getting this wrong makes
+        // the test green for the wrong reason — it did, the first time.
+        let planted = directory.join("..credentials.json.renewing");
+        std::fs::write(&planted, "").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        write_credential(path.to_str().unwrap(), r#"{"secret":"live-token"}"#).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&planted).unwrap(),
+            "",
+            "the planted permissive file must not have received the credential"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"secret":"live-token"}"#
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A write that cannot even be staged must leave the EXISTING credential exactly as it
+    /// was. The failure mode this guards is the one that costs a login: truncating the only
+    /// copy and then failing to fill it.
+    #[test]
+    fn a_failed_write_leaves_the_existing_credential_untouched() {
+        let directory = std::env::temp_dir().join("tb-renew-failed");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(".credentials.json");
+        std::fs::write(&path, "ORIGINAL").unwrap();
+
+        // The parent of this path is a FILE, so staging cannot succeed.
+        let unwritable = path.join("nested").join(".credentials.json");
+        assert!(write_credential(unwritable.to_str().unwrap(), r#"{"a":1}"#).is_err());
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ORIGINAL");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Every spelling of "the provider sent no new refresh token" must inherit the stored
+    /// one. `""` used to be ACCEPTED and written, which stores a token that cannot renew and
+    /// disables the next renewal silently and permanently.
+    #[test]
+    fn absent_null_and_blank_refresh_tokens_all_inherit_the_stored_one() {
+        let base = |extra: &str| {
+            format!(
+                r#"{{"access_token":"new","expires_in":3600,{extra}"scope":"user:sessions:claude_code"}}"#
+            )
+        };
+
+        for body in [
+            base(""),
+            base(r#""refresh_token":null,"#),
+            base(r#""refresh_token":"","#),
+            base(r#""refresh_token":"   ","#),
+        ] {
+            let credential = anthropic_oauth::renewed_credential_for_test(&body, "STORED")
+                .unwrap_or_else(|error| panic!("{body} -> {error}"));
+            assert_eq!(credential.refresh_token, "STORED", "{body}");
+        }
+
+        // A real rotation is kept, not overwritten by the stored one.
+        let rotated = anthropic_oauth::renewed_credential_for_test(
+            &base(r#""refresh_token":"ROTATED","#),
+            "STORED",
+        )
+        .unwrap();
+        assert_eq!(rotated.refresh_token, "ROTATED");
+    }
+
     #[test]
     fn wrong_arity_names_the_usage_rather_than_panicking() {
         let error = probe(&["anthropic".to_owned()]).unwrap_err();

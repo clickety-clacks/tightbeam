@@ -275,6 +275,19 @@ pub(crate) fn refresh(raw: &str) -> Result<Credential, String> {
 /// fallback, and a key PRESENT but unusable (`"refresh_token": null`) produced the same
 /// message and got the old token substituted for a value the provider actually sent.
 /// Present-but-invalid is a refusal; only absent is filled in.
+/// Test seam for the inherit-vs-rotate rule.
+///
+/// `renewed_credential` is reachable only behind a live HTTP grant, and the rule it encodes
+/// — which spellings of "no new token" inherit the stored one — is exactly the part that was
+/// wrong twice. Exposing it for tests beats leaving it unprovable.
+#[cfg(test)]
+pub(crate) fn renewed_credential_for_test(
+    body: &str,
+    previous_refresh_token: &str,
+) -> Result<Credential, String> {
+    renewed_credential(body, previous_refresh_token)
+}
+
 fn renewed_credential(body: &str, previous_refresh_token: &str) -> Result<Credential, String> {
     let json: serde_json::Value = serde_json::from_str(body)
         .map_err(|error| format!("token refresh returned invalid JSON: {error}"))?;
@@ -283,7 +296,18 @@ fn renewed_credential(body: &str, previous_refresh_token: &str) -> Result<Creden
         return Err("token refresh did not return a JSON object".to_owned());
     };
 
-    if !object.contains_key("refresh_token") {
+    // ONE RULE FOR EVERY WAY OF NOT SENDING A TOKEN. `contains_key` alone split three
+    // spellings of the same thing: absent inherited the stored token, `null` was refused,
+    // and `""` was ACCEPTED and written to disk — storing a refresh token that cannot
+    // renew, which disables the next renewal silently and permanently. An empty or blank
+    // string is not a value the provider sent; it is the absence of one, and all three
+    // now inherit.
+    let rotated = object
+        .get("refresh_token")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty());
+
+    if !rotated {
         object.insert("refresh_token".into(), previous_refresh_token.into());
     }
 
