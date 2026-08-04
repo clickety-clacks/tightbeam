@@ -138,25 +138,27 @@ that does not have one.
 
 ### More than one gateway on one machine
 
-Supported, and it needs nothing from you beyond what a second instance needs
-anyway: its own `TIGHTBEAM_BASE_DIR` and its own `TIGHTBEAM_PORT`.
+Supported. Give each instance its own `TIGHTBEAM_BASE_DIR` and its own
+`TIGHTBEAM_PORT` and you are done.
 
-A release build also runs a named Erlang node, and two nodes on a machine cannot
-share a name. `tightbeam-gateway` derives one from the port —
-`tightbeam_gateway_<port>` — so distinct ports give distinct nodes. Set
-`TIGHTBEAM_NODE` if you want to name it yourself; it is the only reason to.
+A release build also runs a named Erlang node, and two nodes on one machine
+cannot share a name. `tightbeam-gateway` derives the name from the port, so
+distinct ports already give distinct names and there is nothing extra to set.
+`TIGHTBEAM_NODE` names it yourself if you want to; the only way to collide is to
+give two instances the same port, or to pin them to the same name by hand.
 
-If a second gateway ever exits complaining that a name `seems to be in use by
-another Erlang node`, that is this: two instances resolved to the same node name,
-almost certainly because they were given the same port.
+That name is also how `tightbeam-gateway stop`, `remote` and `pid` FIND a running
+gateway — so **run them the same way you started it**. Same port (or same
+`TIGHTBEAM_NODE`), same machine name. When they disagree you do not get a clear
+message; you get a connection failure like
 
-The release's other commands — `tightbeam-gateway stop`, `remote`, `pid` — find a
-running gateway by that same name, so **run them in the same environment you
-started it in**. Three things decide the name, in order: `RELEASE_NODE`,
-`TIGHTBEAM_NODE`, `TIGHTBEAM_PORT` — which is why the rule is the environment
-rather than any one variable. Get it wrong and they report `nodedown` about a
-gateway that is running perfectly well; they looked for a different name. Same
-discipline as the CLI, for the same reason.
+```
+--rpc-eval : RPC failed with reason :noconnection
+```
+
+about a gateway that is running perfectly well. It means the name they looked for
+is not the name it started under. Same discipline as the CLI, for the same
+reason.
 
 With at least one usable harness through preflight, the first boot creates the
 base dir and serves, but **cannot run a turn yet**: it has no credentials, so it
