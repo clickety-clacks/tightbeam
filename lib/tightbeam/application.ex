@@ -27,28 +27,87 @@ defmodule Tightbeam.Application do
 
       case Tightbeam.Gateway.preflight(config) do
         :ok ->
-          with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
-            Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
-              {:ok, _pid} = Supervisor.start_child(supervisor, child)
-            end)
+          # The SAME expected-refusal shape, raised rather than returned: a database
+          # from an older build (Schema.ShapeError) and an identity tree missing its
+          # required refs both name a state an operator must resolve, and both would
+          # otherwise reach application_controller as a kernel panic with a dump. Only
+          # these two named refusals are caught — anything else is a defect and must
+          # still crash with its dump.
+          try do
+            start_tree(config)
+          rescue
+            error in [Tightbeam.Schema.ShapeError] ->
+              refuse(Exception.message(error))
 
-            # LAST, deliberately: Bandit's "Running ... (http)" has already been
-            # logged by now, and that line reads as a verdict. On an org that cannot
-            # run a single turn it was the wrong one, so the real verdict goes after
-            # it. Assembled from what boot already knows; it starts nothing and
-            # cannot fail the boot.
-            report_readiness(config)
+            error in [ArgumentError] ->
+              message = Exception.message(error)
 
-            {:ok, supervisor}
+              if String.contains?(message, "identity repository is missing required refs") do
+                refuse(message)
+              else
+                reraise error, __STACKTRACE__
+              end
           end
 
         {:error, {:no_harness_cli, message}} ->
-          Logger.error(message)
-          {:error, message}
+          refuse(message)
       end
     else
       # Test env: unit tests own their supervision; boot the tree explicitly.
       Supervisor.start_link([], strategy: :one_for_one, name: Tightbeam.Supervisor)
+    end
+  end
+
+  defp start_tree(config) do
+    with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
+      Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
+        {:ok, _pid} = Supervisor.start_child(supervisor, child)
+      end)
+
+      # LAST, deliberately: Bandit's "Running ... (http)" has already been
+      # logged by now, and that line reads as a verdict. On an org that cannot
+      # run a single turn it was the wrong one, so the real verdict goes after
+      # it. Assembled from what boot already knows; it starts nothing and
+      # cannot fail the boot.
+      report_readiness(config)
+
+      {:ok, supervisor}
+    end
+  end
+
+  # AN EXPECTED REFUSAL IS NOT A CRASH.
+  #
+  # Returning `{:error, _}` from `start/2` is correct OTP, and under `mix run` it reads
+  # fine. In a RELEASE it does not: the app is permanent, so application_controller
+  # escalates the failed start into "Kernel pid terminated", an {exit,terminating,...}
+  # stacktrace, and an `erl_crash.dump` in the install directory. Measured on shrdlu from
+  # the npm tarball with no harness CLI on PATH — the most ordinary first-run state there
+  # is ("I installed tightbeam before I installed claude") presented as a kernel panic.
+  #
+  # So: say the sentence, exit non-zero, write no dump. `System.halt/1` with an integer
+  # status does not dump. Nothing has started at this point — preflight refuses before
+  # the supervisor exists — so there is nothing to shut down in order.
+  #
+  # ONLY NAMED, EXPECTED refusals come here. An unexpected exception must still crash
+  # loudly with its dump: a real defect that exits quietly is the silence this codebase
+  # spent a night removing.
+  @doc false
+  # Test seam: the refusal DECISION is reachable without taking the VM down with it.
+  def refuse_for_test(message), do: refuse(message)
+
+  defp refuse(message) do
+    # STDERR FIRST, SYNCHRONOUSLY. `Logger.error/1` is asynchronous and `System.halt/1`
+    # does not flush it — measured: the first version of this fix exited 1 with a
+    # ZERO-BYTE log, trading a crash dump for silence, which is the worse of the two.
+    # The refusal is a sentence for a person, so it goes to stderr like any CLI's would;
+    # the Logger call stays for anything capturing structured logs.
+    IO.puts(:stderr, message)
+    Logger.error(message)
+
+    case Application.get_env(:tightbeam, :refusal_exit, :halt) do
+      :halt -> System.halt(1)
+      # Tests assert the DECISION without taking the VM down with them.
+      fun when is_function(fun, 1) -> fun.(message)
     end
   end
 

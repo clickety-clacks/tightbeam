@@ -1,0 +1,12 @@
+{
+  "name": "tightbeam",
+  "description": "Tightbeam — a durable organization of AI agents. Gateway plus CLI in one package; the version handshake between them holds by construction.",
+  "license": "UNLICENSED",
+  "private": false,
+  "bin": {
+    "tightbeam": "bin/tightbeam",
+    "tightbeam-gateway": "bin/tightbeam-gateway"
+  },
+  "files": ["bin", "release"],
+  "engines": { "node": ">=20" }
+}
