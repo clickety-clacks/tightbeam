@@ -144,7 +144,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within the settle window of its own turn's close; and one of them ARRIVES, by the driver's clock, while another of these turns is still open by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
+        "assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of its own turn's close; and one of them ARRIVES, by the driver's clock, while another of these turns is still open by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -712,15 +712,23 @@ defmodule Tightbeam.ClientE2E.Journeys do
           # replies leaves the last turn's terminal frame sitting unread in the
           # socket — and an oracle that asks where a reply sits relative to that
           # frame would fail the healthy run for want of a frame nobody read.
+          #
+          # ONE deadline across all six, not six of them: six waits that each
+          # restart the turn timeout let a socket that has gone quiet hold J5
+          # for six times as long as any single turn is allowed to take.
+          deadline = System.monotonic_time(:millisecond) + ctx.turn_timeout_ms
+
           Enum.reduce([b_id, slow_id, done_id], ctx, fn id, ctx ->
             ctx
             |> await_frame_into(
               watermark,
+              deadline,
               &(&1["type"] == "message" and &1["role"] == "assistant" and
                   &1["replyToClientMessageId"] == id)
             )
             |> await_frame_into(
               watermark,
+              deadline,
               &(&1["type"] == "event" and &1["event"] == "prompt_turn_state" and
                   get_in(&1, ["payload", "messageId"]) == id and
                   get_in(&1, ["payload", "terminalState"]) == true)
@@ -825,7 +833,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
           # FAILS — calling it incomplete would launder exactly the defect this
           # journey should catch.
           substrate_concurrent? ->
-            case concurrency_delivery_error(frames, expected, ctx.settle_ms) do
+            case concurrency_delivery_error(frames, expected) do
               nil ->
                 Scorecard.pass("10", "concurrency", journey: "J5")
 
@@ -904,6 +912,13 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {ctx, [immediate, delayed]}
   end
 
+  # How long a reply may trail the close of its own turn and still count as
+  # delivered live. The path measures 0-1ms end to end (append -> publish ->
+  # client frame, all on one host); a second is three orders of magnitude above
+  # that and an order below what a person would notice as waiting, so what
+  # crosses it is a frame that waited for something.
+  @delivery_budget_ms 1_000
+
   @doc """
   J5's client-side oracle: what a client must show while two lanes run at once.
 
@@ -924,10 +939,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
   2. every one of those replies reached the client;
   3. they arrived in the order the store COMMITTED them — a frame reordered, or
      held past a later commit, shows up here;
-  4. each reply carried the sessionKey of the stream it answers, and so did its
-     turn-state frames. Correlating a turn state by `messageId` alone would let
-     a frame labelled with the wrong stream vouch for a window the client was
-     never shown;
+  4. each reply carried the sessionKey of the stream it answers, and so did the
+     terminal turn-state frame it is judged against. Correlating that frame by
+     `messageId` alone would let one labelled with the wrong stream stand in for
+     a frame the client was never shown;
   5. each reply arrived BEFORE its own turn's terminal `prompt_turn_state`.
      The substrate publishes those back to back at the end of the turn, so
      their order is the edge that catches a reply held behind the close of the
@@ -936,26 +951,34 @@ defmodule Tightbeam.ClientE2E.Journeys do
      reached the client fails here too: an indicator left spinning is not a
      delivered turn;
   6. EVERY reply reached the client within `budget_ms` of the moment its own
-     turn closed (`ended_at`, written immediately after the reply is published).
-     This is the one leg with a number in it, because a frame that arrives
-     eventually, in the right order, behind its own already-closed turn has no
-     edge to be caught at — nothing else in the run moves while it waits. The
-     budget is the driver's settle window, three orders of magnitude above the
-     0-1ms this path actually measures, so it names a frame that WAITED for
-     something rather than a slow one;
-  7. and some reply ARRIVED, by the driver's own clock, while another of these
-     turns was still open by the substrate's (`started_at`..`ended_at`). This
-     is the cross-lane liveness the journey exists to prove, and it holds
-     whichever lane finishes first. It is deliberately a clock question rather
-     than a frame-order one: a gateway that withheld every frame and flushed
-     them in perfect order at the end satisfies every order leg and fails this.
-     Its bounds are inclusive: both clocks are millisecond truncations of the
-     same source, so a tie is ambiguous, and ambiguity must not fail a run.
+     turn closed (`ended_at`, written immediately after the reply is published;
+     a turn with no `ended_at` fails here rather than skipping the check).
+
+     This is the one leg with a number in it. A frame that arrives eventually,
+     in the right order, behind its own already-closed turn has no edge to be
+     caught at — it is the last thing that happens in the run, so nothing else
+     moves while it waits, and no successor event can bound it. Where no edge
+     exists, the number: `@delivery_budget_ms`, three orders of magnitude above
+     the 0-1ms this path measures and an order below anything a person would
+     call waiting. What it names is a frame that WAITED for something, never a
+     slow one. THE RESIDUAL, recorded rather than papered over: a delay shorter
+     than the budget is invisible to this row, and no threshold can be chosen
+     that both catches every delay and never fires on a healthy run;
+  7. and some reply ARRIVED, by the driver's own clock, STRICTLY inside another
+     of these turns (`started_at`..`ended_at` by the substrate's). This is the
+     cross-lane liveness the journey exists to prove, and it holds whichever
+     lane finishes first. It is deliberately a clock question rather than a
+     frame-order one: a gateway that withheld every frame and flushed them in
+     perfect order at the end satisfies every order leg and fails this. Strict
+     bounds, because both clocks are millisecond truncations of one source: an
+     arrival landing exactly on a turn's boundary is ambiguous, and an oracle
+     must not accept ambiguity as proof. A flush timed to the millisecond of the
+     last close would otherwise pass as live delivery.
 
   Returns nil when every leg holds, else the text of the first that did not.
   """
   @spec concurrency_delivery_error([map()], [map()], pos_integer()) :: String.t() | nil
-  def concurrency_delivery_error(frames, expected, budget_ms) do
+  def concurrency_delivery_error(frames, expected, budget_ms \\ @delivery_budget_ms) do
     replies = reply_indexes(frames, expected)
     terminals = turn_state_indexes(frames, expected, &terminal_turn_state?/1)
 
@@ -1019,8 +1042,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
   # Read until `predicate` matches, keeping whatever arrived on the way. A frame
   # that never comes is left to the oracle to name — the wait decides only when
   # to stop reading.
-  defp await_frame_into(ctx, watermark, predicate) do
-    case SimClient.await(ctx.client, watermark, predicate, ctx.turn_timeout_ms) do
+  defp await_frame_into(ctx, watermark, deadline, predicate) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    case SimClient.await(ctx.client, watermark, predicate, remaining) do
       {:ok, _frame, client} -> %{ctx | client: client}
       {:error, _reason, client} -> %{ctx | client: client}
     end
@@ -1031,8 +1056,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
   # this measures how long the FRAME waited, not how long the model thought.
   defp late_arrivals(expected, replies, budget_ms) do
     for %{id: id, ended_at: ended_at} <- expected,
-        is_integer(ended_at),
-        replies[id].received_at - ended_at > budget_ms,
+        not is_integer(ended_at) or replies[id].received_at - ended_at > budget_ms,
         do: id
   end
 
@@ -1042,7 +1066,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
       Enum.any?(expected, fn other ->
         other.session_key != key and is_integer(other.started_at) and
-          is_integer(other.ended_at) and other.started_at <= at and at <= other.ended_at
+          is_integer(other.ended_at) and other.started_at < at and at < other.ended_at
       end)
     end)
   end

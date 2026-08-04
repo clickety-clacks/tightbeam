@@ -557,10 +557,10 @@ defmodule Tightbeam.ClientE2ETest do
       ]
     end
 
-    # 2_500ms is the driver's settle window, which J5 passes as the delivery
-    # budget; the fixtures below sit far from it in both directions.
-    defp j5_oracle(frames, seqs, turns, budget_ms \\ 2_500),
-      do: Journeys.concurrency_delivery_error(frames, j5_expected(seqs, turns), budget_ms)
+    # The oracle owns its own delivery budget (1s against a 0-1ms path); the
+    # fixtures below sit far from it in both directions.
+    defp j5_oracle(frames, seqs, turns),
+      do: Journeys.concurrency_delivery_error(frames, j5_expected(seqs, turns))
 
     test "the client-e2e-v1 shape passes: B answers during Main's slow turn" do
       assert j5_oracle(b_answers_first(), [b: 1, slow: 2, done: 3], b_first_turns()) == nil
@@ -713,9 +713,11 @@ defmodule Tightbeam.ClientE2ETest do
                "[\"b\"] reached the client only after its own turn had been closed"
     end
 
-    test "a reply arriving on the same millisecond its neighbour's turn ends still witnesses liveness" do
-      # Both clocks are millisecond truncations of one source, so a tie is
-      # ambiguous — and ambiguity must not fail a healthy run.
+    test "an arrival landing exactly on a turn's boundary is not a liveness witness" do
+      # Both clocks are millisecond truncations of one source, so a tie cannot
+      # say whether the frame arrived while the other turn was open or just as
+      # it closed. An oracle must not accept ambiguity as proof: a flush timed
+      # to the millisecond of the last close would otherwise read as live.
       frames = [
         j5_running(@main, "slow", 100),
         j5_running(@smoke_b, "b", 110),
@@ -730,7 +732,15 @@ defmodule Tightbeam.ClientE2ETest do
 
       turns = [slow: {100, 300}, b: {110, 300}, done: {300, 350}]
 
-      assert j5_oracle(frames, [b: 1, slow: 2, done: 3], turns) == nil
+      assert j5_oracle(frames, [b: 1, slow: 2, done: 3], turns) =~
+               "while another of these streams' turns was still open"
+    end
+
+    test "a turn the substrate never closed fails the delivery bound rather than skipping it" do
+      turns = [slow: {100, 900}, b: {110, nil}, done: {900, 950}]
+
+      assert j5_oracle(b_answers_first(), [b: 1, slow: 2, done: 3], turns) =~
+               "[\"b\"] reached the client only after its own turn had been closed"
     end
 
     test "a driver that recorded no arrival time refuses to judge liveness" do
