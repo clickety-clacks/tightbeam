@@ -471,6 +471,45 @@ defmodule Tightbeam.ClientE2ETest do
     end
   end
 
+  describe "J5's parallelism-opportunity gate (step 10)" do
+    defp turn(created, started, ended),
+      do: %{"createdAt" => created, "startedAt" => started, "endedAt" => ended}
+
+    test "a run whose posts never overlapped had no opportunity — INCOMPLETE, not FAIL" do
+      # slow 100..105, B 110..115, done 120..125: each posted after the previous
+      # finished. Comparing B's enqueue against `done`'s close would say
+      # otherwise for every sequential run, because B exists before `done` does.
+      refute Journeys.lanes_had_opportunity?(
+               turn(100, 100, 105),
+               turn(108, 110, 115),
+               turn(118, 120, 125)
+             )
+    end
+
+    test "Smoke B enqueued while Main's slow turn ran had the opportunity" do
+      assert Journeys.lanes_had_opportunity?(
+               turn(100, 100, 500),
+               turn(200, 510, 600),
+               turn(610, 620, 700)
+             )
+    end
+
+    test "Main's second post enqueued while Smoke B ran had the opportunity" do
+      # slow finished long before B was posted, so the first pair says nothing —
+      # but `done` was queued while B was still running and ran after it anyway.
+      assert Journeys.lanes_had_opportunity?(
+               turn(100, 100, 200),
+               turn(210, 220, 500),
+               turn(215, 500, 600)
+             )
+    end
+
+    test "a turn row the substrate never wrote cannot witness an opportunity" do
+      refute Journeys.lanes_had_opportunity?(nil, turn(200, 210, 300), nil)
+      refute Journeys.lanes_had_opportunity?(turn(100, 100, nil), turn(200, 210, 300), nil)
+    end
+  end
+
   describe "J5's delivery oracle (step 10)" do
     @main "agent:main:clawline:user:main"
     @smoke_b "agent:main:clawline:user:main s_b"

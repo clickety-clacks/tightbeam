@@ -793,23 +793,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       # Main necessarily STARTS after Main ends — using its start time put the
       # serialized case into INCOMPLETE and made the queued-behind FAIL branch
       # unreachable, which a probe confirmed.
-      # EITHER of Main's turns, for the same reason the overlap witness takes
-      # either: B enqueued while Main's SECOND turn was still running had just
-      # as much opportunity to run beside it, and judging only against the first
-      # sent that serialized run to INCOMPLETE — the verdict that means "the
-      # driver could not establish the conditions", when the conditions were
-      # established and the substrate failed them.
-      had_opportunity? =
-        case b_turn do
-          %{"createdAt" => b_created} when is_integer(b_created) ->
-            Enum.any?([slow_turn, done_turn], fn
-              %{"endedAt" => ended} when is_integer(ended) -> b_created < ended
-              _ -> false
-            end)
-
-          _ ->
-            false
-        end
+      had_opportunity? = lanes_had_opportunity?(slow_turn, b_turn, done_turn)
 
       witness =
         "sampled_together=#{sampled_together?} intervals_overlapped=#{intervals_overlapped?} widest_sample=#{Substrate.widest_sample(samples)}"
@@ -1131,6 +1115,33 @@ defmodule Tightbeam.ClientE2E.Journeys do
       end)
     end)
   end
+
+  @doc """
+  Whether the substrate ever had the chance to run these lanes beside each
+  other — the question that separates "the lanes are not parallel" (FAIL) from
+  "there was nothing to observe" (INCOMPLETE).
+
+  Asked of each ADJACENT pair in post order, and always of the LATER post's
+  enqueue against the EARLIER turn's close: Smoke B was posted after Main's slow
+  prompt, and Main's `done` after Smoke B. Comparing a turn's enqueue against
+  the close of something posted after it proves nothing — B is created before
+  `done` exists, so `b.createdAt < done.endedAt` is true in a perfectly
+  sequential run and would report every such run as a parallelism failure.
+
+  It is the ENQUEUE and not the start on the later side: a turn serialized
+  behind another necessarily starts after it ends, so using its start makes the
+  queued-behind case unreachable.
+  """
+  @spec lanes_had_opportunity?(map() | nil, map() | nil, map() | nil) :: boolean()
+  def lanes_had_opportunity?(slow_turn, b_turn, done_turn) do
+    queued_while_running?(b_turn, slow_turn) or queued_while_running?(done_turn, b_turn)
+  end
+
+  defp queued_while_running?(%{"createdAt" => created}, %{"endedAt" => ended})
+       when is_integer(created) and is_integer(ended),
+       do: created < ended
+
+  defp queued_while_running?(_later, _earlier), do: false
 
   # Every post with ANY assistant frame answering it in a stream it was not
   # posted to. All of its frames and not just the first: a second bubble for the
