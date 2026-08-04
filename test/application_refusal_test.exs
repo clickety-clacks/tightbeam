@@ -78,13 +78,18 @@ defmodule Tightbeam.ApplicationRefusalTest do
                "succeed and this test could not fail for its stated reason"
     end
 
-    tmp = Path.join(System.tmp_dir!(), "tb-refusal-#{System.unique_integer([:positive])}")
-    File.mkdir_p!(tmp)
-    on_exit_rm(tmp)
+    parent = Path.join(System.tmp_dir!(), "tb-refusal-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(parent)
+    on_exit_rm(parent)
 
-    dump_before = dump_stamps(dirs_to_watch(tmp))
+    # The base dir is NOT created. A refusal must decide before it builds anything, so
+    # its continued absence is an assertion, not a precondition.
+    base = Path.join(parent, "base")
+    dump = Path.join(parent, "erl_crash.dump")
 
-    {output, status} = boot_with([], Enum.join(dirs, ":"), tmp)
+    dump_before = dump_stamps(dirs_to_watch(parent))
+
+    {output, status} = boot_with([{"ERL_CRASH_DUMP", dump}], Enum.join(dirs, ":"), base)
 
     # 1. IT EXITS NON-ZERO. A refusal that exits 0 is a gateway that "started".
     assert status == 1, "expected exit 1, got #{status}. Output:\n#{output}"
@@ -114,8 +119,29 @@ defmodule Tightbeam.ApplicationRefusalTest do
     refute output =~ "Kernel pid terminated",
            "the refusal escalated into a kernel panic. Output:\n#{output}"
 
-    # 4. IT LEAVES NO NEW DUMP. The dump was the whole defect: a first-run state
-    #    presented as a VM crash, in the install directory.
+    # 4. IT NAMES THE CAUSE AND THE REMEDY, WITHOUT A STACKTRACE. These assertions
+    #    moved here from an in-process test in application_test.exs that called
+    #    `Application.start/2` directly and asserted `{:error, message}`. That test
+    #    depended on the deleted `:refusal_exit` seam; against a refusal that really
+    #    halts, it took the whole suite VM down with it. There is now one test of this
+    #    behaviour and it exercises the real path.
+    assert output =~ "expected on a fresh machine"
+    assert output =~ "Install `claude` or `codex`"
+    assert output =~ "Run `tightbeam doctor`"
+
+    refute output =~ "** (",
+           "the refusal carried a stacktrace, which is the shape it exists to replace. " <>
+             "Output:\n#{output}"
+
+    # 5. IT DECIDES BEFORE IT BUILDS ANYTHING. The base dir was never created by this
+    #    test, and a refusal must not create it either — no store, no artifacts.
+    refute File.exists?(base),
+           "the refusal created its base dir before deciding it could not start"
+
+    # 6. IT LEAVES NO NEW DUMP. The dump was the whole defect: a first-run state
+    #    presented as a VM crash, in the install directory. ERL_CRASH_DUMP is pointed at
+    #    a path of our own so this cannot be satisfied by a dump landing elsewhere.
+    refute File.exists?(dump), "an expected refusal wrote a crash dump"
     #
     #    Asserted as "no dump APPEARED OR CHANGED", not "no dump exists": the VM writes
     #    erl_crash.dump into its working directory, which for `mix run` is the project
@@ -123,11 +149,11 @@ defmodule Tightbeam.ApplicationRefusalTest do
     #    2026-07-28. A bare existence check therefore failed on a stale file and would
     #    equally have PASSED for the wrong reason on a machine where someone had just
     #    deleted one.
-    assert dump_stamps(dirs_to_watch(tmp)) == dump_before,
-           "an expected refusal wrote a crash dump"
+    assert dump_stamps(dirs_to_watch(parent)) == dump_before,
+           "an expected refusal wrote a crash dump into the working directory"
   end
 
-  defp dirs_to_watch(tmp), do: [tmp, File.cwd!()]
+  defp dirs_to_watch(parent), do: [parent, File.cwd!()]
 
   defp dump_stamps(dirs) do
     Map.new(dirs, fn dir ->
