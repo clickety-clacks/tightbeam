@@ -1738,16 +1738,12 @@ defmodule Tightbeam.Gateway do
               )
             end
 
-            adjudicate_in_txn = fn txn ->
+            adjudicate_with_owner_in_txn = fn txn ->
               DB.Txn.q(
                 txn,
                 "UPDATE sessions SET adjudicationHold='*', updatedAt=?2 WHERE sessionKey=?1",
                 [turn.session_key, System.system_time(:millisecond)]
               )
-
-              if condition == "other" do
-                Adjudication.record_unclassified_in_txn(txn, turn.session_key, reason)
-              end
 
               episode_opts = [
                 claim_window_ms: Map.get(config, :adjudication_claim_window_ms, 300_000),
@@ -1788,6 +1784,40 @@ defmodule Tightbeam.Gateway do
                   adjudication_prompt,
                   Map.get(config, :adjudication_response_window_ms, 86_400_000)
                 )
+              end
+            end
+
+            # BEFORE holding anything: is the ruling the hold waits for even
+            # deliverable? A hold only a ruling can release must not be entered
+            # when no ruling can arrive (Flynn, 2026-08-04: "if there's nothing
+            # to deliver to, log it and be done with it"). With no one to
+            # notify: no hold, no episode, no parked queue — the turn already
+            # failed with its named reason, and that is the whole story.
+            # Supervision's escalation has always done this (nil ladder ->
+            # log + terminus); adjudication now matches.
+            adjudicate_in_txn = fn txn ->
+              # The RECORD is unconditional — it is the "log it" half of the
+              # rule, and a fault with no one to tell is still a fault that
+              # happened. Only the hold, the episode and the notify depend on
+              # somebody existing to rule.
+              if condition == "other" do
+                Adjudication.record_unclassified_in_txn(txn, turn.session_key, reason)
+              end
+
+              case Tightbeam.Supervision.ladder_target(txn, turn.session_key, 1) do
+                nil ->
+                  Logger.error(
+                    "model adjudication for #{turn.session_key} " <>
+                      "(condition=#{condition} cause=#{cause || "unclassified"}) " <>
+                      "has no deliverable owner: the lineage ladder is exhausted " <>
+                      "and its owner has no active main session — logged and " <>
+                      "done; no hold taken, the turn failed with its own reason"
+                  )
+
+                  :undeliverable
+
+                _target ->
+                  adjudicate_with_owner_in_txn.(txn)
               end
             end
 

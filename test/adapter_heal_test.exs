@@ -2240,6 +2240,37 @@ defmodule Tightbeam.AdapterHealTest do
     end)
   end
 
+  test "no deliverable owner: the failure is logged and done — no hold, no episode", ctx do
+    # The soak finding realized (2026-08-04): the owner's main session does not
+    # exist, so the ruling an adjudication hold waits for CANNOT arrive. The old
+    # behaviour held the session and parked a 'claimed' episode forever — a
+    # deadlock with good manners. Flynn's rule: if there's nothing to deliver
+    # to, log it and be done. The turn still fails with its own named reason.
+    start_supervised!({CoordinatorStub, checkout: {:error, :degraded}})
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        DB.Txn.q(txn, "DELETE FROM sessions WHERE sessionKey = ?1", [
+          Org.personal_session_key("flynn")
+        ])
+      end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        {_seq, reason} = run_failing_turn(ctx, "fault into the void")
+        assert reason != nil
+      end)
+
+    assert log =~ "no deliverable owner"
+    assert log =~ "logged and done"
+
+    assert hold(ctx.db) == nil,
+           "a hold was taken for a ruling that cannot arrive"
+
+    assert episode(ctx.db) == nil,
+           "an episode was parked with nobody to notify — 'claimed' forever"
+  end
+
   ## Helpers
 
   # Deliver a prompt, claim it, run the real gateway turn runner, then close the

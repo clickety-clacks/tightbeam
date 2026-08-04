@@ -200,9 +200,12 @@ defmodule Tightbeam.Adjudication do
 
   @doc """
   Schedule the deterministic owner wake and perform claimed→notified in the same
-  txn. `:undeliverable` when the ladder names nobody: an episode nobody can be
-  notified of stays `claimed` rather than recording a notification that was
-  addressed to a session which does not exist.
+  txn. `:undeliverable` when the ladder names nobody — near-unreachable now: the
+  gateway checks deliverability BEFORE claiming, and with nobody to notify it
+  logs and takes no hold and no episode (Flynn 2026-08-04: "if there's nothing
+  to deliver to, log it and be done with it"). This branch remains as defense
+  for any other caller; it must never record a notification addressed to a
+  session which does not exist.
   """
   def notify_in_txn(%Txn{} = txn, episode, prompt, response_window_ms) do
     case Supervision.ladder_target(txn, episode.reresolve_seed, episode.reresolve_rung) do
