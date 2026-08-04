@@ -761,11 +761,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       # bubble in the wrong stream is a defect whatever the lanes did, and the
       # delivery oracle that also checks it is only reached once the substrate
       # has been shown to have run them together.
-      cross_talk =
-        for %{id: id, session_key: key} <- posts,
-            frame = find_reply(frames, id),
-            frame["sessionKey"] != key,
-            do: id
+      cross_talk = wrong_stream_replies(frames, posts)
 
       turns =
         Enum.map([slow_id, b_id, done_id], &Substrate.turn_for_client_message(ctx.base_dir, &1))
@@ -1044,10 +1040,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
             if delivered != committed, do: {key, delivered, committed}
           end)
 
-        cross_talk =
-          for %{id: id, session_key: key} <- expected,
-              replies[id].frame["sessionKey"] != key,
-              do: id
+        cross_talk = wrong_stream_replies(frames, expected)
 
         held =
           for %{id: id} <- expected,
@@ -1088,14 +1081,6 @@ defmodule Tightbeam.ClientE2E.Journeys do
     end
   end
 
-  defp find_reply(frames, client_message_id) do
-    Enum.find(
-      frames,
-      &(&1["type"] == "message" and &1["role"] == "assistant" and
-          &1["replyToClientMessageId"] == client_message_id)
-    )
-  end
-
   # Read until `predicate` matches, keeping whatever arrived on the way. A frame
   # that never comes is left to the oracle to name — the wait decides only when
   # to stop reading.
@@ -1126,6 +1111,20 @@ defmodule Tightbeam.ClientE2E.Journeys do
           is_integer(other.ended_at) and other.started_at < at and at < other.ended_at
       end)
     end)
+  end
+
+  # Every post with ANY assistant frame answering it in a stream it was not
+  # posted to. All of its frames and not just the first: a second bubble for the
+  # same post, rendered in the wrong session, is the same defect and a check
+  # that stopped at the first correctly-labelled one could not see it.
+  defp wrong_stream_replies(frames, posts) do
+    for %{id: id, session_key: key} <- posts,
+        frame <- frames,
+        assistant_reply?(frame),
+        frame["replyToClientMessageId"] == id,
+        frame["sessionKey"] != key,
+        uniq: true,
+        do: id
   end
 
   defp order_by(expected, key_fun), do: expected |> Enum.sort_by(key_fun) |> Enum.map(& &1.id)

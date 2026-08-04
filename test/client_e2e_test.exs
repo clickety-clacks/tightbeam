@@ -649,6 +649,24 @@ defmodule Tightbeam.ClientE2ETest do
                "cross-talk: [\"slow\"]"
     end
 
+    test "a DUPLICATE bubble in the wrong stream is cross-talk too" do
+      # The post is answered correctly first, then answered again in somebody
+      # else's stream. A check that stopped at the first correctly-labelled
+      # frame would call this healthy while a client renders the second bubble
+      # in the wrong session.
+      duplicate = j5_reply(@main, "b", 305)
+
+      frames =
+        Enum.flat_map(b_answers_first(), fn frame ->
+          if frame["replyToClientMessageId"] == "b" and frame["type"] == "message",
+            do: [frame, duplicate],
+            else: [frame]
+        end)
+
+      assert j5_oracle(frames, [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "cross-talk: [\"b\"]"
+    end
+
     test "a turn state labelled with the wrong stream cannot stand in for one the client saw" do
       # slow's running/terminal frames relabelled to Smoke B. Correlating a turn
       # state by messageId alone would accept them as Main's.
