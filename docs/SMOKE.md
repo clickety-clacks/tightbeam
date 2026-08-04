@@ -237,11 +237,15 @@ on 2026-07-25:
 10. [auto: J5] Create session "Smoke B". Post a slow prompt in Main ("write a haiku
     about each of 10 planets"), then IMMEDIATELY post in Smoke B ("what is
     2+2?"), then a third in Main ("now say DONE").
-    PASS: Smoke B's reply arrives while Main's first turn is still running
-    (different lanes run in parallel); Main's two turns complete in order;
-    ALL turns reach `delivered` with assistant bubbles; no cross-talk
-    (each reply in its own stream). DB: at peak, two `running` rows with
-    DIFFERENT sessionKeys.
+    PASS: the replies arrive in the order the store committed them, and one of
+    them arrives while ANOTHER stream's turn is still running (different lanes
+    run in parallel, and neither one's frames wait for the other to finish);
+    Main's two turns complete in order; ALL turns reach `delivered` with
+    assistant bubbles; no cross-talk (each reply in its own stream). DB: at
+    peak, two `running` rows with DIFFERENT sessionKeys.
+    Which prompt the model answers first decides nothing here: a trivial
+    prompt in a fresh stream routinely outlives a slow one in a warm stream,
+    and a model's speed is not evidence about delivery.
 
 ## 6. Slash commands (current contract)
 

@@ -471,6 +471,139 @@ defmodule Tightbeam.ClientE2ETest do
     end
   end
 
+  describe "J5's delivery oracle (step 10)" do
+    @main "agent:main:clawline:user:main"
+    @smoke_b "agent:main:clawline:user:main s_b"
+
+    defp j5_reply(session_key, cmid),
+      do: %{
+        "type" => "message",
+        "role" => "assistant",
+        "sessionKey" => session_key,
+        "replyToClientMessageId" => cmid
+      }
+
+    defp j5_running(session_key, cmid), do: j5_turn_state(session_key, cmid, "running", false)
+
+    defp j5_delivered(session_key, cmid), do: j5_turn_state(session_key, cmid, "delivered", true)
+
+    defp j5_turn_state(session_key, cmid, state, terminal?) do
+      %{
+        "type" => "event",
+        "event" => "prompt_turn_state",
+        "payload" => %{
+          "messageId" => cmid,
+          "sessionKey" => session_key,
+          "state" => state,
+          "terminalState" => terminal?
+        }
+      }
+    end
+
+    # The client-e2e-v1 shape: Main's slow prompt, Smoke B's trivial one beside
+    # it, then a second Main post — with B answering DURING Main's slow turn.
+    defp b_answers_first do
+      [
+        j5_running(@main, "slow"),
+        j5_running(@smoke_b, "b"),
+        j5_reply(@smoke_b, "b"),
+        j5_delivered(@smoke_b, "b"),
+        j5_reply(@main, "slow"),
+        j5_delivered(@main, "slow"),
+        j5_running(@main, "done"),
+        j5_reply(@main, "done"),
+        j5_delivered(@main, "done")
+      ]
+    end
+
+    # The same run with the models the other way round: B's trivial prompt in a
+    # FRESH stream outlives Main's deliberately slow one in a warm stream. Both
+    # of Main's replies land while B's turn is still running.
+    defp b_answers_last do
+      [
+        j5_running(@main, "slow"),
+        j5_running(@smoke_b, "b"),
+        j5_reply(@main, "slow"),
+        j5_delivered(@main, "slow"),
+        j5_running(@main, "done"),
+        j5_reply(@main, "done"),
+        j5_delivered(@main, "done"),
+        j5_reply(@smoke_b, "b"),
+        j5_delivered(@smoke_b, "b")
+      ]
+    end
+
+    test "the client-e2e-v1 shape passes: B answers during Main's slow turn" do
+      assert Journeys.concurrency_delivery_error(b_answers_first(), ["b", "slow", "done"]) == nil
+    end
+
+    test "REGRESSION: a lane whose reply commits LAST is not a delivery failure" do
+      # The field case (codex leg, 2026-08-04): B's trivial turn took 20.4s
+      # against Main's 12.6s, so B's reply committed 8.2s after Main's turn had
+      # already ended — publish→arrival measured 0ms on all three frames. The
+      # old rule asked only whether B's bubble preceded Main's and reported "a
+      # delayed client frame", blaming the wire for which prompt the model
+      # finished first.
+      assert Journeys.concurrency_delivery_error(b_answers_last(), ["slow", "done", "b"]) == nil
+    end
+
+    test "a reply the client never received fails, and names it" do
+      frames = Enum.reject(b_answers_first(), &(&1["replyToClientMessageId"] == "b"))
+
+      assert Journeys.concurrency_delivery_error(frames, ["b", "slow", "done"]) =~
+               "never received: [\"b\"]"
+    end
+
+    test "replies shown in an order the store never committed fail" do
+      # Delivered slow → done → b against a store that committed slow → b →
+      # done: the frame was held past a later commit. This is the shape a
+      # publication that does not ride commit order produces.
+      assert Journeys.concurrency_delivery_error(b_answers_last(), ["slow", "b", "done"]) =~
+               "an order the store never committed"
+    end
+
+    test "frames withheld until the neighbouring lane finished fail, though the order is right" do
+      # Every reply in committed order, none dropped — and no reply lands
+      # inside another stream's running window. A gateway that serialized its
+      # fan-out behind whichever lane held the floor looks exactly like this.
+      serialized = [
+        j5_running(@main, "slow"),
+        j5_reply(@main, "slow"),
+        j5_delivered(@main, "slow"),
+        j5_running(@smoke_b, "b"),
+        j5_reply(@smoke_b, "b"),
+        j5_delivered(@smoke_b, "b")
+      ]
+
+      assert Journeys.concurrency_delivery_error(serialized, ["slow", "b"]) =~
+               "while another stream's turn was still running"
+    end
+
+    test "a reply inside its OWN lane's window is not cross-lane evidence" do
+      alone = [
+        j5_running(@main, "slow"),
+        j5_reply(@main, "slow"),
+        j5_delivered(@main, "slow")
+      ]
+
+      assert Journeys.concurrency_delivery_error(alone, ["slow"]) =~
+               "while another stream's turn was still running"
+    end
+
+    test "a turn whose terminal state never arrived is still running to the end of the window" do
+      # B's turn never reports delivered — it was still in flight when the
+      # window closed. Main's reply landed inside it all the same.
+      unterminated = [
+        j5_running(@smoke_b, "b"),
+        j5_running(@main, "slow"),
+        j5_reply(@main, "slow"),
+        j5_delivered(@main, "slow")
+      ]
+
+      assert Journeys.concurrency_delivery_error(unterminated, ["slow"]) == nil
+    end
+  end
+
   describe "leg provisioning carries the template's adapters (#102)" do
     alias Tightbeam.ClientE2E.LegGateway
 
