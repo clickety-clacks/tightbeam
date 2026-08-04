@@ -1859,10 +1859,25 @@ defmodule Tightbeam.Gateway do
             # else: the same terminal publish, the same failed turn row, the
             # same indicator clearing. The user sees one sentence naming the
             # missing credential and the command that supplies it.
-            {reason, adjudicate_in_txn} =
+            {reason, adjudicate_in_txn, failure_publish} =
               case onboarding_refusal do
-                {:refused, message} -> {message, fn _txn -> :not_adjudicated end}
-                :not_applicable -> {reason, adjudicate_in_txn}
+                {:refused, message} ->
+                  # THE ERROR MUST REACH THE CHAT. An adjudication-routed failure
+                  # deliberately skips the generic `[turn failed]` marker because
+                  # the brief IS its message — so suppressing the brief without
+                  # restoring the marker left this failure with no channel at
+                  # all: gibson showed "agent progress interrupted" and never
+                  # said why (Flynn, 2026-08-04, second production touch). A
+                  # failed turn with no marker is a prompt that silently
+                  # vanishes; this one now speaks like every other error.
+                  {message, fn _txn -> :not_adjudicated end,
+                   fn terminal ->
+                     append_turn_failed_marker(db, turn.session_key, message)
+                     failure_publish.(terminal)
+                   end}
+
+                :not_applicable ->
+                  {reason, adjudicate_in_txn, failure_publish}
               end
 
             {:error,
