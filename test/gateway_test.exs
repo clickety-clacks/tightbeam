@@ -2329,8 +2329,9 @@ defmodule Tightbeam.GatewayTest do
     first_pid = GenServer.whereis(server)
     assert is_pid(first_pid)
     assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
-    assert_receive {:credential_command, first_command}
-    assert Enum.join(first_command, " ") =~ "/remote/tb"
+    first_commands = collect_credential_commands([])
+    assert first_commands != []
+    assert Enum.all?(first_commands, &(Enum.join(&1, " ") =~ "/remote/tb"))
 
     :ok = :sys.suspend(first_pid)
 
@@ -2383,8 +2384,9 @@ defmodule Tightbeam.GatewayTest do
     assert is_pid(second_pid)
     refute second_pid == first_pid
     assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
-    assert_receive {:credential_command, second_command}
-    assert Enum.join(second_command, " ") =~ "/remote/new-tb"
+    second_commands = collect_credential_commands([])
+    assert second_commands != []
+    assert Enum.all?(second_commands, &(Enum.join(&1, " ") =~ "/remote/new-tb"))
 
     assert %{
              code: "placement_denied",
@@ -3242,6 +3244,21 @@ defmodule Tightbeam.GatewayTest do
       # "no credential here" from a decoder change.
       assert Map.has_key?(display, :credentialKind)
       assert display.credentialKind == "none"
+    end
+
+    test "an unreadable credential store refuses status instead of reporting none", ctx do
+      store = Path.join([ctx.cred_base, "auth", "claude"])
+      target = Path.join(ctx.cred_base, "credential-target")
+      File.mkdir_p!(target)
+      File.mkdir_p!(Path.dirname(store))
+      File.ln_s!(target, store)
+      owner!(ctx.cred_base)
+
+      assert {:error, 503, "credential_store_unreadable", message} =
+               Gateway.session_status("k-kind", ctx.db)
+
+      assert message =~ store
+      refute message =~ ~s(credentialKind: "none")
     end
 
     # The test that distinguishes "resolved at read time" from "stamped on the
@@ -7390,7 +7407,26 @@ defmodule Tightbeam.GatewayTest do
 
   defp credential_probe(parent, command) do
     send(parent, {:credential_command, command})
-    {"", 1}
+
+    case Enum.take(command, -3) do
+      ["test", operator, path] when operator in ["-d", "-x"] ->
+        if String.ends_with?(path, "/auth") or String.ends_with?(path, "/auth/") do
+          {"", 0}
+        else
+          {"", 1}
+        end
+
+      _ ->
+        {"", 1}
+    end
+  end
+
+  defp collect_credential_commands(commands) do
+    receive do
+      {:credential_command, command} -> collect_credential_commands([command | commands])
+    after
+      0 -> Enum.reverse(commands)
+    end
   end
 
   defp move_test_base(db, suffix, remote_host \\ "worker") do

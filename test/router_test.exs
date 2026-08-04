@@ -6,6 +6,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   alias Tightbeam.{
     Assignments,
+    Credentials,
     DB,
     Devices,
     Gateway,
@@ -1289,6 +1290,12 @@ defmodule Tightbeam.Wire.RouterTest do
         else: Application.delete_env(:tightbeam, :advertised_url)
     end)
 
+    credential_supervisor =
+      start_supervised!(%{
+        id: :router_credential_supervisor,
+        start: {Supervisor, :start_link, [[], [strategy: :one_for_one]]}
+      })
+
     register_host =
       Gateway.handlers(%{
         db: ctx.db,
@@ -1297,6 +1304,7 @@ defmodule Tightbeam.Wire.RouterTest do
         default_model: Model.new("fable"),
         max_live_sessions_per_user: 50,
         onboarding_lease_ms: 1_800_000,
+        credential_supervisor: credential_supervisor,
         sh: fn _command -> {"", 0} end
       })["register-host"]
 
@@ -1326,6 +1334,16 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     assert admin.status == 200, admin.resp_body
+
+    assert Enum.any?(Supervisor.which_children(credential_supervisor), fn
+             {{Credentials, "worker"}, _pid, :worker, [Credentials]} -> true
+             _child -> false
+           end)
+
+    refute Enum.any?(Supervisor.which_children(Tightbeam.Supervisor), fn
+             {{Credentials, "worker"}, _pid, :worker, [Credentials]} -> true
+             _child -> false
+           end)
 
     assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
     assert_receive {:call, %{origin: "user:flynn", principal: {:session, "main-token"}}}
@@ -1565,6 +1583,31 @@ defmodule Tightbeam.Wire.RouterTest do
       assert is_binary(body["code"]) and body["code"] != "",
              "a non-ok control response must name a code: #{inspect(result)} -> #{inspect(body)}"
     end
+  end
+
+  test "POST /api/session-control renders an unreadable session status as its named refusal",
+       ctx do
+    key = "control-unreadable-status"
+    create_session(ctx.db, key, ctx.device.user_id)
+    message = "credential store /broken/auth/claude is unreadable"
+
+    opts =
+      ctx.opts
+      |> with_handler("tune", fn _call -> %{ok: true} end)
+      |> Keyword.put(:session_status, fn ^key ->
+        {:error, 503, "credential_store_unreadable", message}
+      end)
+
+    response = post_control(opts, ctx.device.token, key, "adopt")
+
+    assert response.status == 503
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "credential_store_unreadable",
+               "message" => message
+             }
+           }
   end
 
   test "session-control adopt and unadopt reach tune, and a foreign session is refused", ctx do

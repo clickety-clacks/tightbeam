@@ -99,6 +99,70 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
   end
 
+  test "an absent credential store is missing rather than unreadable", ctx do
+    store = Path.join([ctx.base, "auth", "codex"])
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    refute File.exists?(store)
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+  end
+
+  test "a symlinked credential store refuses with its path and actual shape", ctx do
+    store = Path.join([ctx.base, "auth", "codex"])
+    target = Path.join(ctx.base, "symlink-target")
+    metadata = Path.join([target, ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(Path.join(target, "auth.json"), ~S({"token":"present"}))
+    File.write!(metadata, ~S({"provider":"openai","onboarded":true}))
+    File.mkdir_p!(Path.dirname(store))
+    File.ln_s!(target, store)
+
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    reason =
+      {:credential_store_unreadable, %{path: store, found: :symlink, expected: :directory}}
+
+    assert Credentials.status(:openai, server) == {:needs_onboarding, reason}
+    assert Credentials.kind(:openai, server) == {:error, reason}
+  end
+
+  test "corrupt credential metadata refuses with its path and expected shape", ctx do
+    store = Path.join([ctx.base, "auth", "codex"])
+    metadata = Path.join([store, ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(metadata, "not json")
+
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    assert Credentials.status(:openai, server) ==
+             {:needs_onboarding,
+              {:credential_store_unreadable,
+               %{path: metadata, found: :invalid_json, expected: :valid_json_object}}}
+  end
+
+  test "remote absence requires a positively traversable parent", ctx do
+    parent = Path.join([ctx.base, "auth"])
+    File.mkdir_p!(parent)
+
+    {:ok, server} = remote_server(ctx.base)
+
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+  end
+
+  test "remote store below an untraversable parent refuses rather than guessing absence", ctx do
+    parent = Path.join([ctx.base, "auth"])
+    File.mkdir_p!(parent)
+    File.chmod!(parent, 0o600)
+    on_exit(fn -> File.chmod(parent, 0o700) end)
+
+    {:ok, server} = remote_server(ctx.base)
+
+    assert Credentials.status(:openai, server) ==
+             {:needs_onboarding,
+              {:credential_store_unreadable,
+               %{path: parent, found: :untraversable, expected: :traversable_directory}}}
+  end
+
   test "Codex credential is never written while stop cannot confirm runtime exit", ctx do
     store = Path.join([ctx.base, "auth", "codex", "auth.json"])
     File.mkdir_p!(Path.dirname(store))
@@ -658,6 +722,19 @@ defmodule Tightbeam.CredentialsTest do
     |> Path.join()
     |> File.read!()
     |> JSON.decode!()
+  end
+
+  defp remote_server(base) do
+    Credentials.start_link(
+      name: nil,
+      base_dir: base,
+      machine: "worker",
+      ssh: "worker",
+      sh: fn command ->
+        remote_command = command |> Enum.drop(6) |> Enum.join(" ")
+        System.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
+      end
+    )
   end
 
   defp fixture(name) do

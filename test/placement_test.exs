@@ -2,7 +2,7 @@ defmodule Tightbeam.PlacementTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Archetypes, DB, EventLog, Homes, Identity, Org, Placement, Rails}
+  alias Tightbeam.{Archetypes, Credentials, DB, EventLog, Homes, Identity, Org, Placement, Rails}
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
@@ -107,6 +107,40 @@ defmodule Tightbeam.PlacementTest do
              Placement.resolve(archetype, "work-2", hosts)
 
     assert unknown =~ "work-2"
+  end
+
+  test "adapter context refuses an unreadable credential kind with its cause", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    host = "unreadable-#{System.unique_integer([:positive])}"
+    store = Path.join(base_dir, "auth/claude")
+    target = Path.join(base_dir, "credential-target")
+    File.mkdir_p!(target)
+    File.mkdir_p!(Path.dirname(store))
+    File.ln_s!(target, store)
+
+    server = Credentials.server(host)
+
+    start_supervised!(%{
+      id: server,
+      start: {Credentials, :start_link, [[name: server, base_dir: base_dir, machine: host]]}
+    })
+
+    reason =
+      {:credential_store_unreadable, %{path: store, found: :symlink, expected: :directory}}
+
+    config = %{base_dir: base_dir, db: db}
+
+    error =
+      assert_raise Placement.Refusal, fn ->
+        Placement.adapter_context(config, {:claude, "shared", host})
+      end
+
+    assert error.code == "credential_store_unreadable"
+    assert error.host == host
+    assert error.harness == "claude"
+    assert error.message =~ inspect(reason)
   end
 
   test "workdir_path names a disappeared host instead of falling back to the gateway", %{
@@ -712,6 +746,7 @@ defmodule Tightbeam.PlacementTest do
       cli_bin: cli_bin,
       default_model: Model.new("fable")
     }
+
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
@@ -734,6 +769,7 @@ defmodule Tightbeam.PlacementTest do
   } do
     token_dir = Path.join([base_dir, "auth", "claude"])
     File.mkdir_p!(token_dir)
+
     File.write!(
       Path.join(token_dir, ".credentials.json"),
       ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-test"}})
