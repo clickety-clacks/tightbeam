@@ -37,6 +37,16 @@ defmodule Tightbeam.Harness do
   @callback id() :: atom()
   @callback wire_name() :: String.t()
   @callback credential_provider() :: atom()
+
+  @doc """
+  The model a fresh org runs on this harness when nobody has chosen one.
+
+  A CONSTANT in the boot path used to name claude-sonnet-5 whatever harness was
+  in play, so a codex-only box defaulted to a model its harness cannot run and
+  failed on the first turn naming a vendor the operator never installed
+  (Flynn, 2026-08-04). Each harness names its own.
+  """
+  @callback default_model() :: Tightbeam.Model.t()
   @callback install_package() :: binary()
   @doc """
   The vendor CLI this harness invokes directly.

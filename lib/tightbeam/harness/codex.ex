@@ -113,6 +113,9 @@ defmodule Tightbeam.Harness.Codex do
   def credential_provider, do: :openai
 
   @impl true
+  def default_model, do: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+
+  @impl true
   def install_package, do: "@agentclientprotocol/codex-acp"
 
   @impl true

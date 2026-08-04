@@ -49,12 +49,13 @@
     }
   ],
   "constant_accessor_callbacks": [
-    "id",
-    "wire_name",
-    "credential_provider",
-    "install_package",
     "cli_binary",
-    "conformance_vectors"
+    "conformance_vectors",
+    "credential_provider",
+    "default_model",
+    "id",
+    "install_package",
+    "wire_name"
   ],
   "vector_contract": {
     "prepare_launch": {

@@ -109,6 +109,9 @@ defmodule Tightbeam.Harness.Claude do
   def credential_provider, do: :anthropic
 
   @impl true
+  def default_model, do: Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
+
+  @impl true
   def install_package, do: "@agentclientprotocol/claude-agent-acp"
 
   @impl true

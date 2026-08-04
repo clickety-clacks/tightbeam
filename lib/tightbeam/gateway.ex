@@ -349,20 +349,27 @@ defmodule Tightbeam.Gateway do
       ]
   end
 
-  @doc "Check harness and identity readiness before the production store is created."
-  @spec preflight(config()) :: :ok | {:error, {:no_harness_cli, String.t()}}
+  @doc """
+  Check harness and identity readiness before the production store is created.
+
+  Returns WHICH harnesses are installed, not merely that one is: the defaults a
+  fresh org runs on are derived from what the box actually has, and throwing
+  that away is why a codex-only machine defaulted to claude and claude-sonnet-5
+  (Flynn, 2026-08-04).
+  """
+  @spec preflight(config()) :: {:ok, [atom()]} | {:error, {:no_harness_cli, String.t()}}
   def preflight(config) do
-    with :ok <- harness_binary_readiness(Path.join(config.base_dir, "bin")) do
+    with {:ok, installed} <- harness_binary_readiness(Path.join(config.base_dir, "bin")) do
       Identity.init!(config.base_dir)
-      :ok
+      {:ok, installed}
     end
   end
 
   @doc "Raise for every preflight refusal; used by callers that require bang semantics."
-  @spec preflight!(config()) :: :ok
+  @spec preflight!(config()) :: [atom()]
   def preflight!(config) do
     case preflight(config) do
-      :ok -> :ok
+      {:ok, installed} -> installed
       {:error, {:no_harness_cli, message}} -> raise message
     end
   end
@@ -509,7 +516,7 @@ defmodule Tightbeam.Gateway do
 
     cond do
       Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) ->
-        :ok
+        {:ok, for({harness, {:ok, _}} <- results, do: harness)}
 
       Enum.all?(results, fn {_harness, result} -> result == {:error, :not_found} end) ->
         binaries = Enum.map_join(Harness.all(), " or ", &"`#{&1.cli_binary()}`")

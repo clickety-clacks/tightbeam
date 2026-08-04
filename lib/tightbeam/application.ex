@@ -49,7 +49,7 @@ defmodule Tightbeam.Application do
       # arises on the fresh install this refusal is for. If a quiet refusal is ever
       # wanted for them, it needs its own authority and its own test.
       case Tightbeam.Gateway.preflight(config) do
-        :ok -> start_tree(config)
+        {:ok, installed} -> config |> apply_installed_defaults(installed) |> start_tree()
         {:error, {:no_harness_cli, message}} -> refuse(message)
       end
     else
@@ -162,6 +162,32 @@ defmodule Tightbeam.Application do
   @doc "True while the gateway is shutting down — lanes refuse new claims."
   @spec draining?() :: boolean()
   def draining?, do: :persistent_term.get({__MODULE__, :draining}, false)
+
+  # THE DEFAULTS COME FROM WHAT THE BOX HAS, not from a constant.
+  #
+  # `default_harness` was `hd(Harness.all())` — registry order — and
+  # `default_model` was the literal claude-sonnet-5, whatever harness that
+  # implied. A codex-only machine therefore placed its first turn on a harness
+  # it had never installed, with a model it cannot run, and refused naming a
+  # vendor the operator never chose (Flynn, 2026-08-04: "what if i'm a codex
+  # only user"). An operator's explicit choice still wins; this only decides
+  # what "no preference" means, and it now means "the harness you installed".
+  #
+  # With BOTH installed and no preference, registry order still decides — but
+  # that is a real choice between two working harnesses, not a broken install.
+  defp apply_installed_defaults(config, installed) do
+    chosen =
+      cond do
+        Application.get_env(:tightbeam, :default_harness) -> Tightbeam.Harness.default()
+        match?([_only], installed) -> Tightbeam.Harness.module!(hd(installed))
+        true -> Tightbeam.Harness.default()
+      end
+
+    model =
+      Application.get_env(:tightbeam, :default_model) || chosen.default_model()
+
+    %{config | default_harness: chosen.id(), default_model: model}
+  end
 
   defp production_config do
     %{
