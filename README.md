@@ -5,10 +5,38 @@ items, assignments, and gate statutes over a closed verb set.
 
 You RUN tightbeam; you do not depend on it. There is no Hex package.
 
+## Two ways to install
+
+**From a release package** (below) — a per-platform npm tarball carrying the
+gateway *and* the CLI, with Erlang bundled. No Elixir, no Rust, no C toolchain
+on the target machine. This is the shorter path and the one to prefer.
+
+**From source** — clone and build. You need this to *produce* a release package
+(there is no registry to install from yet, so somebody builds the tarball), and
+to develop Tightbeam itself.
+
+The prerequisites below are split accordingly; everything else in this document
+applies to both.
+
 ## Prerequisites
 
 None of these are installed for you, and a missing one is not always obvious
 from the failure — see `mix tightbeam.doctor` and the notes below.
+
+Needed by **both** paths:
+
+- **A registered harness CLI** — `claude` and/or `codex` — installed and on
+  PATH *before* you start. Boot refuses by name when it cannot find a usable
+  registered harness. `mix tightbeam.doctor` reports each as
+  `harness_binary:<harness>`.
+- **node + npm.** The ACP adapters are npm packages, and the gateway installs
+  them into `<base_dir>/adapters` itself on first spawn. Without npm that
+  install fails and no turn can start. The release package is also an npm
+  package, so this is how you install it.
+- **git**, for the identity repository.
+
+Needed to build **from source only** — a release package has all of these
+already compiled into it:
 
 - **Elixir + OTP.** Built against Elixir 1.19 / OTP 28. With no Elixir on PATH
   every command below fails as `mix: command not found`; nothing in this
@@ -25,14 +53,6 @@ from the failure — see `mix tightbeam.doctor` and the notes below.
   documented step, onboarding a credential, *is* that binary. You would get a
   gateway that looks healthy, cannot be onboarded, cannot run a turn, and
   reports its problem as missing credentials rather than a missing CLI.
-- **A registered harness CLI** — `claude` and/or `codex` — installed and on
-  PATH before you clone or build Tightbeam. Boot refuses by name when it cannot
-  find a usable registered harness. `mix tightbeam.doctor` reports each as
-  `harness_binary:<harness>`.
-- **node + npm.** The ACP adapters are npm packages, and the gateway installs
-  them into `<base_dir>/adapters` itself on first spawn. Without npm that
-  install fails and no turn can start.
-- **git**, for the identity repository.
 - **A C toolchain** (`gcc`/`clang` + `make`) — `exqlite` builds a native NIF.
 - **Hex and rebar3**, Elixir's package and build tools. They do NOT ship with
   Elixir. Without them `mix deps.get` cannot fetch anything, and on a machine
@@ -57,6 +77,40 @@ and/or:
 npm install -g @openai/codex
 codex --version
 ```
+
+### From a release package
+
+There is no registry to install from, so the tarball is built rather than
+downloaded. **Build it on the platform you will run it on** — the package
+carries a compiled Erlang runtime and a compiled CLI, so it does not
+cross-compile. From a source checkout on a machine of that platform:
+
+```sh
+sh packaging/assemble.sh
+# artifact: _build/npm/tightbeam-<version>-<os>-<arch>.tgz
+```
+
+Copy that one file to the target machine and install it:
+
+```sh
+npm install -g ./tightbeam-<version>-<os>-<arch>.tgz
+tightbeam --version
+tightbeam-gateway                  # boots the gateway in the foreground
+```
+
+`tightbeam-gateway` is the release equivalent of `mix run --no-halt`: same
+foreground process, same environment contract, same first-boot behaviour. It
+creates the base dir, seeds the identity repository, creates `state.db` and
+`bin/`, and prints the NOT READY summary described below. Continue from
+**Connect your first client**; everything after this point is identical for
+both install paths.
+
+The CLI and the gateway ship in one package on purpose, so their version
+handshake holds by construction — you cannot end up with a CLI that its gateway
+refuses. `npm install -g` puts both on PATH; nothing else is added to the
+machine, and neither Elixir nor Rust is needed to run either one.
+
+### From source
 
 Only after a harness is on PATH, install Tightbeam:
 
