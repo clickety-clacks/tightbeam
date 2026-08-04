@@ -1316,7 +1316,7 @@ defmodule Tightbeam.Assignments do
     defaults = %{
       base_dir: Application.get_env(:tightbeam, :base_dir, System.tmp_dir!()),
       db: db,
-      port: Application.get_env(:tightbeam, :port, 4_321),
+      port: Application.get_env(:tightbeam, :port, 11_373),
       effort_checkin_horizon_ms:
         Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000)
     }

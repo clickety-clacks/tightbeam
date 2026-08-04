@@ -37,7 +37,7 @@ if [ -z "${RELEASE_NODE:-}" ]; then
   if [ -n "${TIGHTBEAM_NODE:-}" ]; then
     RELEASE_NODE="$TIGHTBEAM_NODE"
   else
-    RELEASE_NODE="tightbeam_gateway_${TIGHTBEAM_PORT:-4321}"
+    RELEASE_NODE="tightbeam_gateway_${TIGHTBEAM_PORT:-11373}"
   fi
   export RELEASE_NODE
 fi
