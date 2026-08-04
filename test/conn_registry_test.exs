@@ -44,11 +44,11 @@ defmodule Tightbeam.ConnRegistryTest do
     refute_received {:sent, :flynn, _}
   end
 
-  test "per-connection seq filter drops already-delivered (late pre-watermark) messages", %{
+  test "publish_message delivers unconditionally — no filter, no watermark", %{
     reg: reg,
     deliver: d
   } do
-    {:ok, ref, _} =
+    {:ok, _ref, _} =
       ConnRegistry.register(reg, %{
         pid: :c,
         user_id: "u",
@@ -57,29 +57,15 @@ defmodule Tightbeam.ConnRegistryTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    # replay advanced this connection's watermark to seq 11 for k1
-    ConnRegistry.note_replayed(reg, ref, "k1", 11)
-
-    # a LATE publication of seq 10 (committed before the watermark) is dropped
-    :ok = ConnRegistry.publish_message(reg, "k1", "u", 10, %{seq: 10}, d)
-    refute_received {:sent, :c, _}
-
-    # seq 15 (after the watermark) is delivered
-    :ok = ConnRegistry.publish_message(reg, "k1", "u", 15, %{seq: 15}, d)
-    assert_received {:sent, :c, %{seq: 15}}
-
-    # Delivering 15 does NOT advance the suppression watermark — only replay does.
-    # 13 was never replayed and is not a duplicate, so it arrives even though a
-    # HIGHER live frame went first. This is the whole fix: the client's cursor has
-    # moved past 13, and replay serves `seq >` that cursor, so suppressing it here
-    # would lose it for good.
-    :ok = ConnRegistry.publish_message(reg, "k1", "u", 13, %{seq: 13}, d)
-    assert_received {:sent, :c, %{seq: 13}}
-
-    # A live frame at or below what REPLAY sent is still suppressed — that is a
-    # real duplicate of something this connection has already been given.
-    :ok = ConnRegistry.publish_message(reg, "k1", "u", 9, %{seq: 9}, d)
-    refute_received {:sent, :c, _}
+    # The registry filters NOTHING. Delivery is a hint; the store is truth; a
+    # duplicate is the client's to reconcile by seq/id (it already must, to
+    # survive reconnect replay). The registry used to keep a watermark here and
+    # drop frames at or below it — which permanently deleted a live frame
+    # whenever a HIGHER one arrived first. Any seq, any order, always delivered:
+    for seq <- [10, 15, 13, 15, 9] do
+      :ok = ConnRegistry.publish_message(reg, "k1", "u", seq, %{seq: seq}, d)
+      assert_received {:sent, :c, %{seq: ^seq}}
+    end
   end
 
   test "a live frame is never suppressed by a HIGHER live frame that arrived first", %{

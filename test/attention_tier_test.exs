@@ -114,7 +114,12 @@ defmodule Tightbeam.AttentionTierTest do
 
     base_dir = Path.join(System.tmp_dir!(), "attention_#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join([base_dir, "auth", "claude"]))
-    File.write!(Path.join([base_dir, "auth", "claude", ".credentials.json"]), ~s({"claudeAiOauth":{"accessToken":"t"}}))
+
+    File.write!(
+      Path.join([base_dir, "auth", "claude", ".credentials.json"]),
+      ~s({"claudeAiOauth":{"accessToken":"t"}})
+    )
+
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     start_supervised!(

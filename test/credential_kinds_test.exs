@@ -82,10 +82,12 @@ defmodule Tightbeam.CredentialKindsTest do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
+
       File.write!(
         Path.join(staging, ".credentials.json"),
         ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-staged"}})
       )
+
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata =
@@ -261,7 +263,13 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a subscription claude host still sends a bearer token", ctx do
-      stage!(ctx.base, "claude", ".credentials.json", ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-catalog"}}))
+      stage!(
+        ctx.base,
+        "claude",
+        ".credentials.json",
+        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-catalog"}})
+      )
+
       owner = self()
 
       fetch = fn _path, headers ->

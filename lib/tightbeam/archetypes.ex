@@ -679,7 +679,8 @@ defmodule Tightbeam.Archetypes do
         %{name: reference_name, location: location, access: reference["access"]}
       end)
 
-    model_preferences = validate_model_preferences!(Map.get(manifest, "model_preferences", []), path)
+    model_preferences =
+      validate_model_preferences!(Map.get(manifest, "model_preferences", []), path)
 
     mcp = validate_mcp!(Map.get(manifest, "mcp", %{}))
     containment = validate_containment!(Map.get(manifest, "containment", %{}), path)

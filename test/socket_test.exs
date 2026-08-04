@@ -398,8 +398,72 @@ defmodule Tightbeam.Wire.SocketTest do
 
     assert live.phase == :live
 
-    # Once live, message pushes flow straight through (registry filters).
+    # Once live, message pushes flow straight through (the registry filters
+    # nothing; delivery is a hint, the store is truth).
     assert {:push, {:text, _}, _} = Socket.handle_info(fresh, live)
+  end
+
+  test "drain never deletes a stalled frame the replay window excluded", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+
+    key = Org.personal_session_key(device.user_id)
+
+    Org.create(ctx.db, %{
+      session_key: key,
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: device.user_id,
+      origin: "user:#{device.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    # Three committed rows. Row ONE's publisher stalled between commit and
+    # publish; the client saw row TWO live, so its cursor sits at two.
+    {:appended, one} =
+      Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "stalled"})
+
+    {:appended, two} =
+      Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "seen live"})
+
+    {:appended, three} =
+      Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "while away"})
+
+    {:ok, state} = Socket.init(ctx.deps)
+
+    # Reconnect with cursor at TWO: replay serves only three (`seq >` two).
+    # The cursor OVERSTATES what the client has — it never saw ONE.
+    auth = %{
+      "type" => "auth",
+      "token" => device.token,
+      "deviceId" => device.device_id,
+      "lastMessageId" => two.id
+    }
+
+    {:push, _frames, replaying} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+
+    # ONE's stalled publish finally lands, mid-replay, and is buffered.
+    stalled = {:push_message, key, one.seq, %{"type" => "message", "id" => one.id}}
+    {:ok, buffered} = Socket.handle_info(stalled, replaying)
+
+    {:push, frames, _live} = Socket.handle_info(:finish_replay, buffered)
+    decoded = Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame) end)
+
+    # ONE is below the replay maximum (three.seq) but was NOT replayed — the
+    # window excluded it. A high-water drain drops it here, and NOTHING brings
+    # it back: every future replay serves `seq >` a cursor that is already past
+    # it. It must come through; the client reconciles order by seq.
+    assert three.seq > one.seq
+
+    assert decoded == [
+             %{"type" => "message", "id" => one.id},
+             %{"type" => "sync_complete"}
+           ]
   end
 
   test "work-state-only auth skips chat material, gates inbound chat, and preserves class on re-auth",

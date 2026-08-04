@@ -11,21 +11,22 @@ defmodule Tightbeam.Wire.Socket do
     sync_complete → live
 
   Process/ownership rules (the Elixir-shape decisions — binding):
-  - This process owns NOTHING shared. Fan-out scoping, device takeover, and
-    the replay/live de-dup watermark live in `Tightbeam.ConnRegistry`; this
-    process registers on auth, unregisters on terminate, and forwards frames.
-  - Replay protocol vs the registry (the race-closing order): register FIRST
-    (live pushes start arriving and are buffered by this process), then read
-    the replay window from Projection, sending each and advancing the
-    watermark via `ConnRegistry.note_replayed`, then drain the buffer THROUGH
-    the watermark, then send sync_complete, then go live. The drain filter is
-    load-bearing: a message published between register and note_replayed
-    passes the registry's filter (watermark still 0) AND appears in the
-    replay window — so message pushes arrive tagged as
-    `{:push_message, session_key, seq, payload}` and the drain drops any
-    whose seq ≤ the watermark this socket advanced during replay. Untagged
-    `{:push, payload}` events (turn state, typing, activity) have no seq and
-    drain unfiltered.
+  - This process owns NOTHING shared. Fan-out scoping and device takeover
+    live in `Tightbeam.ConnRegistry`; this process registers on auth,
+    unregisters on terminate, and forwards frames. The registry filters
+    nothing — delivery is a hint, the store is truth.
+  - Replay protocol (the race-closing order): register FIRST (live pushes
+    start arriving and are buffered by this process), then read the replay
+    window from Projection and send it, then drain the buffer, then send
+    sync_complete, then go live. The drain drops a buffered message push only
+    when its exact {session, seq} is IN THE SET of rows this socket just sent
+    in replay — a literal re-send of something the client received moments ago
+    on this same connection, and nothing else. Set membership, never a
+    high-water mark: a mark also drops frames below the max that were NOT in
+    the replay window (a stalled publisher whose row the cursor already
+    passed), which deletes them permanently. Message pushes arrive tagged
+    `{:push_message, session_key, seq, payload}` for exactly this comparison. Untagged `{:push, payload}` events (turn state, typing,
+    activity) have no seq and drain unfiltered.
   - Takeover: `ConnRegistry.register` returns the replaced ref; the SOCKET
     (not the registry) then sends session_replaced+close to the old pid via
     the registry's message — the old socket receives `{:takeover_close}` and
@@ -69,7 +70,7 @@ defmodule Tightbeam.Wire.Socket do
           phase: :unauthed | :replaying | :live,
           subscriptions: MapSet.t(String.t()) | nil,
           buffer: [tuple()],
-          watermarks: %{optional(String.t()) => integer()},
+          replayed_seqs: MapSet.t(),
           deps: map()
         }
 
@@ -80,7 +81,7 @@ defmodule Tightbeam.Wire.Socket do
             phase: :unauthed,
             subscriptions: nil,
             buffer: [],
-            watermarks: %{},
+            replayed_seqs: MapSet.new(),
             deps: %{}
 
   @impl true
@@ -121,14 +122,16 @@ defmodule Tightbeam.Wire.Socket do
         {:ok, state}
 
       :finish_replay ->
-        # Drain THROUGH the watermark (see moduledoc): drop buffered message
-        # pushes already covered by the replay window; keep everything else.
+        # Drain the buffer, dropping ONLY literal re-sends: a buffered message
+        # push whose exact {session, seq} this socket just sent in replay. Set
+        # membership, never a high-water comparison — a mark deletes frames it
+        # never sent (see the replay reduce).
         frames =
           state.buffer
           |> Enum.reverse()
           |> Enum.flat_map(fn
             {:msg, key, seq, payload} ->
-              if seq > Map.get(state.watermarks, key, 0), do: [payload], else: []
+              if MapSet.member?(state.replayed_seqs, {key, seq}), do: [], else: [payload]
 
             {:frame, payload} ->
               [payload]
@@ -313,23 +316,19 @@ defmodule Tightbeam.Wire.Socket do
     keys = Enum.map(sessions, & &1.session_key)
     cursors = replay_cursors(msg, device.user_id, state)
 
-    {replay, truncated?, watermarks} =
-      Enum.reduce(keys, {[], false, %{}}, fn key, {messages, truncated, marks} ->
+    {replay, truncated?, replayed_seqs} =
+      Enum.reduce(keys, {[], false, MapSet.new()}, fn key, {messages, truncated, sent} ->
         barrier = Enum.find_value(sessions, 0, &(&1.session_key == key && &1.cleared_through_seq))
         rows = Projection.list_after(db(state), key, cursors[key], 501, barrier || 0)
         selected = Enum.take(rows, 500)
 
-        Enum.each(selected, fn message ->
-          ConnRegistry.note_replayed(conn_registry(state), conn_ref, key, message.seq)
-        end)
+        # The SET of rows sent, not a high-water mark. A mark deletes: a stalled
+        # frame below the max but absent from the replay window (the client's
+        # cursor already passed it, so `seq >` excluded it) would drain as
+        # "≤ mark" and be lost for good — the registry's old bug, one layer down.
+        sent = Enum.reduce(selected, sent, fn m, acc -> MapSet.put(acc, {key, m.seq}) end)
 
-        marks =
-          case List.last(selected) do
-            %{seq: seq} -> Map.put(marks, key, seq)
-            nil -> marks
-          end
-
-        {messages ++ selected, truncated or length(rows) == 501, marks}
+        {messages ++ selected, truncated or length(rows) == 501, sent}
       end)
 
     read_states = if chat?, do: Projection.read_states(db(state), device.user_id), else: %{}
@@ -372,7 +371,7 @@ defmodule Tightbeam.Wire.Socket do
         is_admin: device.is_admin,
         subscriptions: subscriptions,
         phase: :replaying,
-        watermarks: watermarks
+        replayed_seqs: replayed_seqs
     }
 
     state = state |> schedule_ping() |> arm_pong_deadline()

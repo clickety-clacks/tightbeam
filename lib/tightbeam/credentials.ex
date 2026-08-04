@@ -1,5 +1,6 @@
 defmodule Tightbeam.Credentials do
   require Logger
+
   @moduledoc """
   Per-machine credential onboarding and lifecycle.
 

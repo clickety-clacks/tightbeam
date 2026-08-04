@@ -46,6 +46,7 @@ end
 
 defmodule Tightbeam.ArtifactCarrierTest do
   alias Tightbeam.Model
+
   @moduledoc """
   The artifact-record firing-turn carrier (artifact-carrier-proposal-v1).
 

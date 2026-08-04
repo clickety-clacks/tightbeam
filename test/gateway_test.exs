@@ -3561,6 +3561,7 @@ defmodule Tightbeam.GatewayTest do
     assert wide.model == "claude-fable-5"
     assert wide.context == "1m"
     assert wide.efforts == ["low", "high"]
+
     assert Enum.any?(
              status.modelCatalog.models,
              &(&1.model == "claude-fable-5" and is_nil(&1.context))

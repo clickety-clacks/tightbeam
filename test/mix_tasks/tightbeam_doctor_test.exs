@@ -348,6 +348,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
   end
 
   defp put(inputs, key, value), do: Keyword.put(inputs, key, value)
+
   defp entry(family, efforts) do
     %{
       family: family,

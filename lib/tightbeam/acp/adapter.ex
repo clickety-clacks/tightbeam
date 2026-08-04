@@ -1108,5 +1108,4 @@ defmodule Tightbeam.Acp.Adapter do
 
     if path, do: File.write!(path, line <> "\n", [:append])
   end
-
 end

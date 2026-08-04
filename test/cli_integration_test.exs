@@ -401,7 +401,10 @@ defmodule Tightbeam.CliIntegrationTest do
     # walk now exercises that real arrival path, and fails if learn stops
     # delivering rules/.
     assert :initialized = Archetypes.init_identity!(ctx.base_dir)
-    assert {:ok, _revision} = Tightbeam.Identity.learn!(ctx.base_dir, "agentic-engineering", "operator")
+
+    assert {:ok, _revision} =
+             Tightbeam.Identity.learn!(ctx.base_dir, "agentic-engineering", "operator")
+
     Archetypes.load!(ctx.base_dir)
 
     for file <- ["engineering.toml", "verification.toml"] do

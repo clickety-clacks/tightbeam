@@ -38,6 +38,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert snapshot.skills == %{}
     assert snapshot.guidance =~ "expert on Tightbeam, setting it up on this machine"
     assert snapshot.guidance =~ "tightbeam doctor"
+
     assert snapshot.guidance =~
              "tightbeam assimilate <ssh-dest> --as-user <adminUserId> --harness <harness>"
 
@@ -90,11 +91,11 @@ defmodule Tightbeam.ArchetypesTest do
     assert default["skills"] != [],
            "the seeded default elects no skills, so this test would prove nothing"
 
-
     bundle_archetypes =
       Application.app_dir(:tightbeam, "priv/kungfu/*/archetypes/*.toml")
       |> Path.wildcard()
       |> Enum.map(fn path -> path |> File.read!() |> Toml.decode!() |> Map.fetch!("name") end)
+
     # The same empty-iteration trap one level down: with no bundle archetypes the
     # refutations below execute zero times and this passes proving nothing.
     assert bundle_archetypes != [],
@@ -357,6 +358,7 @@ defmodule Tightbeam.ArchetypesTest do
         ~s(Help teams turn "ideas" into shipped work.\nKeep it accountable.),
         "user:flynn"
       )
+
     identity_dir = Path.join(ctx.base_dir, "identity")
 
     assert Enum.map(paths, &Path.relative_to(&1, identity_dir)) == scaffold_paths("demo")
