@@ -136,3 +136,63 @@ jobs:
       - name: cargo test
         working-directory: cli
         run: cargo test
+
+  # THE DEPLOY ARTIFACT IS BUILT HERE, from the pushed SHA, by a machine nobody
+  # develops or smoke-tests on. Building it from a dev tree conflates "what I
+  # have" with "what was reviewed"; building it on the smoke host conflates the
+  # gate with the artifact (caught by Flynn, 2026-08-04: "you're bundling up a
+  # deploy from a smoke test?!"). The runners are exactly the two supported
+  # platforms — ubuntu x86_64 and macOS arm64 — so `assemble.sh`'s refusal of
+  # anything else composes with this matrix rather than fighting it.
+  #
+  # Gated on the test matrix: an artifact never exists for a SHA the suite did
+  # not pass on that platform.
+  release:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: darwin-aarch64
+    name: release ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BEAM (pinned, same as the gate)
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ matrix.name }}-${{ hashFiles('cli/Cargo.lock') }}
+
+      - name: mix deps.get
+        run: mix deps.get
+
+      - name: Assemble the npm package
+        run: sh packaging/assemble.sh
+
+      - name: Stamp provenance
+        run: |
+          cd _build/npm
+          for f in tightbeam-*.tgz; do
+            mv "$f" "${f%.tgz}-${GITHUB_SHA::7}.tgz"
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tightbeam-${{ matrix.name }}
+          path: _build/npm/tightbeam-*.tgz
+          retention-days: 90
+          if-no-files-found: error
