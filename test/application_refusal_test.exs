@@ -37,10 +37,29 @@ defmodule Tightbeam.ApplicationRefusalTest do
     File.mkdir_p!(bin)
     on_exit_rm(bin)
 
+    # WRAPPER SCRIPTS, not symlinks. OTP's `erl` is itself a shell script that
+    # derives its root from $0's directory; invoked through a symlink in our
+    # scratch dir it cannot, and falls back to a build-time path that does not
+    # exist on the host — measured on the macOS CI runner as exit 126,
+    # "/tmp/otp-aarch64-apple-darwin/.../erlexec: No such file or directory".
+    # An exec by absolute real path keeps $0 pointing where the tool lives.
     for tool <- ~w(elixir elixirc mix erl escript) do
       case System.find_executable(tool) do
-        nil -> :ok
-        real -> File.ln_s!(real, Path.join(bin, tool))
+        nil ->
+          :ok
+
+        real ->
+          path = Path.join(bin, tool)
+
+          if tool == "mix" do
+            # `elixir -S mix` resolves mix from PATH and evaluates its CONTENT
+            # as Elixir source — a sh wrapper here is handed to the Elixir
+            # compiler ("undefined variable exec"). A symlink reads through.
+            File.ln_s!(real, path)
+          else
+            File.write!(path, "#!/bin/sh\nexec #{real} \"$@\"\n")
+            File.chmod!(path, 0o755)
+          end
       end
     end
 

@@ -626,7 +626,10 @@ defmodule Tightbeam.CredentialKindsTest do
                  %{host_config: %{ssh: nil}, sh: fn _ -> {"", 0} end},
                  "/vector/home",
                  transport: transport,
-                 timeout_ms: 500,
+                 # Wait bound on a STUBBED in-process transport, never the subject: 500ms
+                 # timed out on a loaded CI runner ({:unknown, :timeout}, run
+                 # 30943150925) while the same code was green on three quiet hosts.
+                 timeout_ms: 5_000,
                  credential_kind: :api_key
                )
     end
@@ -643,7 +646,10 @@ defmodule Tightbeam.CredentialKindsTest do
         %{host_config: %{ssh: nil}, sh: fn _ -> {"", 0} end},
         "/vector/home",
         transport: transport,
-        timeout_ms: 500,
+        # Wait bound on a STUBBED in-process transport, never the subject: 500ms
+        # timed out on a loaded CI runner ({:unknown, :timeout}, run
+        # 30943150925) while the same code was green on three quiet hosts.
+        timeout_ms: 5_000,
         credential_kind: :api_key
       )
 
@@ -703,7 +709,10 @@ defmodule Tightbeam.CredentialKindsTest do
                  %{host_config: %{ssh: nil}, sh: fn _ -> {"", 0} end},
                  home,
                  transport: transport,
-                 timeout_ms: 500,
+                 # Wait bound on a STUBBED in-process transport, never the subject: 500ms
+                 # timed out on a loaded CI runner ({:unknown, :timeout}, run
+                 # 30943150925) while the same code was green on three quiet hosts.
+                 timeout_ms: 5_000,
                  credential_kind: kind
                )
 

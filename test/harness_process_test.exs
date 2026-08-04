@@ -117,25 +117,29 @@ defmodule Tightbeam.HarnessProcessTest do
     key = {:claude, "shared", "testhost"}
 
     coordinator =
-      start_supervised!(
-        {AdapterCoordinator,
-         adapter_sup: ctx.sup,
-         adapter_context: fn _ -> [] end,
-         adapter_opts: fn _, _ ->
-           [
-             harness: :claude,
-             cmd: [System.find_executable("node"), path],
-             home: ctx.test_dir,
-             cwd: ctx.test_dir,
-             stderr_path: Path.join(ctx.test_dir, "adapter.stderr"),
-             process_identity_dir: ctx.test_dir,
-             process_helper: @helper
-           ]
-         end,
-         park_grace_ms: 50,
-         db: ctx.db,
-         name: :identity_integration_coordinator}
-      )
+      start_supervised!({
+        AdapterCoordinator,
+        # Wait bound, not the subject: 50ms was enough for the fake adapter to
+        # exit gracefully on quiet hosts and NOT on a loaded CI runner, where
+        # the park killed it and the row read "killed" (run 30941227365). The
+        # graceful path exits promptly; this only bounds a genuinely-slow one.
+        adapter_sup: ctx.sup,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, _ ->
+          [
+            harness: :claude,
+            cmd: [System.find_executable("node"), path],
+            home: ctx.test_dir,
+            cwd: ctx.test_dir,
+            stderr_path: Path.join(ctx.test_dir, "adapter.stderr"),
+            process_identity_dir: ctx.test_dir,
+            process_helper: @helper
+          ]
+        end,
+        park_grace_ms: 5_000,
+        db: ctx.db,
+        name: :identity_integration_coordinator
+      })
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     assert Process.alive?(adapter)
