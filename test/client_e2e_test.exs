@@ -476,31 +476,50 @@ defmodule Tightbeam.ClientE2ETest do
     @smoke_b "agent:main:clawline:user:main s_b"
 
     # The client-e2e-v1 posts: Main's slow prompt, Smoke B's trivial one beside
-    # it, then a second Main post.
-    defp j5_expected(seqs) do
-      [
-        %{id: "slow", session_key: @main, committed_seq: seqs[:slow]},
-        %{id: "b", session_key: @smoke_b, committed_seq: seqs[:b]},
-        %{id: "done", session_key: @main, committed_seq: seqs[:done]}
-      ]
+    # it, then a second Main post. `turns` gives each post's substrate interval
+    # and `seqs` the store's commit order for its reply; frame arrival times are
+    # the driver's own clock, on the same scale.
+    defp j5_expected(seqs, turns) do
+      for {id, key} <- [{"slow", @main}, {"b", @smoke_b}, {"done", @main}] do
+        {started, ended} = Keyword.fetch!(turns, String.to_atom(id))
+
+        %{
+          id: id,
+          session_key: key,
+          committed_seq: seqs[String.to_atom(id)],
+          started_at: started,
+          ended_at: ended
+        }
+      end
     end
 
-    defp j5_reply(session_key, cmid),
+    # B answers DURING Main's slow turn: Main 100..900, B 110..300, done 900..950.
+    defp b_first_turns, do: [slow: {100, 900}, b: {110, 300}, done: {900, 950}]
+
+    # The models the other way round: B's trivial prompt in a FRESH stream
+    # outlives Main's deliberately slow one in a warm stream.
+    defp b_last_turns, do: [slow: {100, 300}, b: {110, 900}, done: {300, 400}]
+
+    defp j5_reply(session_key, cmid, at),
       do: %{
         "type" => "message",
         "role" => "assistant",
         "sessionKey" => session_key,
-        "replyToClientMessageId" => cmid
+        "replyToClientMessageId" => cmid,
+        "receivedAt" => at
       }
 
-    defp j5_running(session_key, cmid), do: j5_turn_state(session_key, cmid, "running", false)
+    defp j5_running(session_key, cmid, at),
+      do: j5_turn_state(session_key, cmid, "running", false, at)
 
-    defp j5_delivered(session_key, cmid), do: j5_turn_state(session_key, cmid, "delivered", true)
+    defp j5_delivered(session_key, cmid, at),
+      do: j5_turn_state(session_key, cmid, "delivered", true, at)
 
-    defp j5_turn_state(session_key, cmid, state, terminal?) do
+    defp j5_turn_state(session_key, cmid, state, terminal?, at) do
       %{
         "type" => "event",
         "event" => "prompt_turn_state",
+        "receivedAt" => at,
         "payload" => %{
           "messageId" => cmid,
           "sessionKey" => session_key,
@@ -510,43 +529,39 @@ defmodule Tightbeam.ClientE2ETest do
       }
     end
 
-    # B answers DURING Main's slow turn.
     defp b_answers_first do
       [
-        j5_running(@main, "slow"),
-        j5_running(@smoke_b, "b"),
-        j5_reply(@smoke_b, "b"),
-        j5_delivered(@smoke_b, "b"),
-        j5_reply(@main, "slow"),
-        j5_delivered(@main, "slow"),
-        j5_running(@main, "done"),
-        j5_reply(@main, "done"),
-        j5_delivered(@main, "done")
+        j5_running(@main, "slow", 100),
+        j5_running(@smoke_b, "b", 110),
+        j5_reply(@smoke_b, "b", 300),
+        j5_delivered(@smoke_b, "b", 300),
+        j5_reply(@main, "slow", 900),
+        j5_delivered(@main, "slow", 900),
+        j5_running(@main, "done", 900),
+        j5_reply(@main, "done", 950),
+        j5_delivered(@main, "done", 950)
       ]
     end
 
-    # The same run with the models the other way round: B's trivial prompt in a
-    # FRESH stream outlives Main's deliberately slow one in a warm stream, so
-    # both of Main's replies land while B's turn is still open.
     defp b_answers_last do
       [
-        j5_running(@main, "slow"),
-        j5_running(@smoke_b, "b"),
-        j5_reply(@main, "slow"),
-        j5_delivered(@main, "slow"),
-        j5_running(@main, "done"),
-        j5_reply(@main, "done"),
-        j5_delivered(@main, "done"),
-        j5_reply(@smoke_b, "b"),
-        j5_delivered(@smoke_b, "b")
+        j5_running(@main, "slow", 100),
+        j5_running(@smoke_b, "b", 110),
+        j5_reply(@main, "slow", 300),
+        j5_delivered(@main, "slow", 300),
+        j5_running(@main, "done", 300),
+        j5_reply(@main, "done", 400),
+        j5_delivered(@main, "done", 400),
+        j5_reply(@smoke_b, "b", 900),
+        j5_delivered(@smoke_b, "b", 900)
       ]
     end
 
-    defp j5_oracle(frames, seqs),
-      do: Journeys.concurrency_delivery_error(frames, j5_expected(seqs))
+    defp j5_oracle(frames, seqs, turns),
+      do: Journeys.concurrency_delivery_error(frames, j5_expected(seqs, turns))
 
     test "the client-e2e-v1 shape passes: B answers during Main's slow turn" do
-      assert j5_oracle(b_answers_first(), b: 1, slow: 2, done: 3) == nil
+      assert j5_oracle(b_answers_first(), [b: 1, slow: 2, done: 3], b_first_turns()) == nil
     end
 
     test "REGRESSION: a lane whose reply commits LAST is not a delivery failure" do
@@ -556,27 +571,28 @@ defmodule Tightbeam.ClientE2ETest do
       # old rule asked only whether B's bubble preceded Main's and reported "a
       # delayed client frame", blaming the wire for which prompt the model
       # finished first.
-      assert j5_oracle(b_answers_last(), slow: 1, done: 2, b: 3) == nil
+      assert j5_oracle(b_answers_last(), [slow: 1, done: 2, b: 3], b_last_turns()) == nil
     end
 
     test "a post the store holds no reply for fails BEFORE the client legs can compare" do
-      # Absence must not be representable as success: with no committed seq,
-      # the order lists would otherwise agree on what they both omit.
-      assert j5_oracle(b_answers_first(), b: 1, slow: 2, done: nil) =~
+      # Absence must not be representable as success: with no committed seq, the
+      # order lists would otherwise agree on what they both omit.
+      assert j5_oracle(b_answers_first(), [b: 1, slow: 2, done: nil], b_first_turns()) =~
                "holds no reply row for [\"done\"]"
     end
 
     test "a reply the client never received fails, and names it" do
       frames = Enum.reject(b_answers_first(), &(&1["replyToClientMessageId"] == "b"))
 
-      assert j5_oracle(frames, b: 1, slow: 2, done: 3) =~ "never received: [\"b\"]"
+      assert j5_oracle(frames, [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "never received: [\"b\"]"
     end
 
     test "replies shown in an order the store never committed fail" do
       # Delivered slow -> done -> b against a store that committed slow -> b ->
       # done: the frame was held past a later commit. This is the shape a
       # publication that does not ride commit order produces.
-      assert j5_oracle(b_answers_last(), slow: 1, b: 2, done: 3) =~
+      assert j5_oracle(b_answers_last(), [slow: 1, b: 2, done: 3], b_last_turns()) =~
                "an order the store never committed"
     end
 
@@ -591,7 +607,22 @@ defmodule Tightbeam.ClientE2ETest do
             else: frame
         end)
 
-      assert j5_oracle(frames, b: 1, slow: 2, done: 3) =~ "cross-talk: [\"slow\"]"
+      assert j5_oracle(frames, [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "cross-talk: [\"slow\"]"
+    end
+
+    test "a turn state labelled with the wrong stream cannot stand in for one the client saw" do
+      # slow's running/terminal frames relabelled to Smoke B. Correlating a turn
+      # state by messageId alone would accept them as Main's.
+      frames =
+        Enum.map(b_answers_first(), fn frame ->
+          if get_in(frame, ["payload", "messageId"]) == "slow",
+            do: put_in(frame, ["payload", "sessionKey"], @smoke_b),
+            else: frame
+        end)
+
+      assert j5_oracle(frames, [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "before its own turn's terminal state"
     end
 
     test "a reply held behind its own turn's close fails, though its order is right" do
@@ -599,67 +630,65 @@ defmodule Tightbeam.ClientE2ETest do
       # but it arrives AFTER its own turn's terminal state, which the substrate
       # publishes immediately after the reply. Only this leg sees it.
       frames = [
-        j5_running(@main, "slow"),
-        j5_running(@smoke_b, "b"),
-        j5_reply(@main, "slow"),
-        j5_delivered(@main, "slow"),
-        j5_running(@main, "done"),
-        j5_reply(@main, "done"),
-        j5_delivered(@main, "done"),
-        j5_delivered(@smoke_b, "b"),
-        j5_reply(@smoke_b, "b")
+        j5_running(@main, "slow", 100),
+        j5_running(@smoke_b, "b", 110),
+        j5_reply(@main, "slow", 300),
+        j5_delivered(@main, "slow", 300),
+        j5_running(@main, "done", 300),
+        j5_reply(@main, "done", 400),
+        j5_delivered(@main, "done", 400),
+        j5_delivered(@smoke_b, "b", 900),
+        j5_reply(@smoke_b, "b", 905)
       ]
 
-      assert j5_oracle(frames, slow: 1, done: 2, b: 3) =~ "before its own turn's terminal state"
+      assert j5_oracle(frames, [slow: 1, done: 2, b: 3], b_last_turns()) =~
+               "before its own turn's terminal state"
     end
 
     test "a turn whose terminal state never arrived fails — the indicator is left spinning" do
       frames = Enum.reject(b_answers_first(), &(get_in(&1, ["payload", "state"]) == "delivered"))
 
-      assert j5_oracle(frames, b: 1, slow: 2, done: 3) =~ "before its own turn's terminal state"
+      assert j5_oracle(frames, [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "before its own turn's terminal state"
     end
 
-    test "frames withheld until the neighbouring lane finished fail, though the order is right" do
-      # Every reply in committed order, none dropped, each inside its own turn —
-      # and no reply lands inside another stream's open window. A gateway that
-      # serialized its fan-out behind whichever lane held the floor looks
-      # exactly like this.
-      serialized = [
-        j5_running(@main, "slow"),
-        j5_reply(@main, "slow"),
-        j5_delivered(@main, "slow"),
-        j5_running(@smoke_b, "b"),
-        j5_reply(@smoke_b, "b"),
-        j5_delivered(@smoke_b, "b"),
-        j5_running(@main, "done"),
-        j5_reply(@main, "done"),
-        j5_delivered(@main, "done")
-      ]
+    test "frames flushed in perfect order AFTER both lanes finished fail the liveness leg" do
+      # Every earlier leg holds — nothing dropped, committed order preserved,
+      # each reply inside its own turn, no cross-talk. Only the arrival CLOCK
+      # can tell this from live delivery, which is why the leg asks for one.
+      flushed =
+        Enum.map(b_answers_first(), fn frame -> %{frame | "receivedAt" => 5_000} end)
 
-      assert j5_oracle(serialized, slow: 1, b: 2, done: 3) =~
-               "while another of these streams' turns was open"
+      assert j5_oracle(flushed, [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "while another of these streams' turns was still open"
     end
 
-    test "a turn OUTSIDE this journey cannot manufacture the liveness window" do
-      # An unclosed `running` for someone else's turn spans everything after it.
-      # Scoping every leg to this journey's own posts is what stops it from
-      # vouching for a run whose lanes were fan-out-serialized.
-      stray = j5_running("agent:main:clawline:user:main s_other", "someone-elses-turn")
+    test "fan-out serialized behind whichever lane holds the floor fails" do
+      # The lanes ran back to back in the substrate too, so no reply can land
+      # inside another turn's interval.
+      serialized_turns = [slow: {100, 200}, b: {300, 400}, done: {500, 600}]
 
       serialized = [
-        j5_running(@main, "slow"),
-        j5_reply(@main, "slow"),
-        j5_delivered(@main, "slow"),
-        j5_running(@smoke_b, "b"),
-        j5_reply(@smoke_b, "b"),
-        j5_delivered(@smoke_b, "b"),
-        j5_running(@main, "done"),
-        j5_reply(@main, "done"),
-        j5_delivered(@main, "done")
+        j5_running(@main, "slow", 100),
+        j5_reply(@main, "slow", 200),
+        j5_delivered(@main, "slow", 200),
+        j5_running(@smoke_b, "b", 300),
+        j5_reply(@smoke_b, "b", 400),
+        j5_delivered(@smoke_b, "b", 400),
+        j5_running(@main, "done", 500),
+        j5_reply(@main, "done", 600),
+        j5_delivered(@main, "done", 600)
       ]
 
-      assert j5_oracle([stray | serialized], slow: 1, b: 2, done: 3) =~
-               "while another of these streams' turns was open"
+      assert j5_oracle(serialized, [slow: 1, b: 2, done: 3], serialized_turns) =~
+               "while another of these streams' turns was still open"
+    end
+
+    test "a driver that recorded no arrival time refuses to judge liveness" do
+      undated = Enum.map(b_answers_first(), &Map.delete(&1, "receivedAt"))
+
+      assert j5_oracle(undated, [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "recorded no arrival time"
     end
   end
 

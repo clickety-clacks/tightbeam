@@ -242,9 +242,12 @@ on 2026-07-25:
     arrives before its own turn's terminal state (a reply held behind the close
     of its own turn is a delayed frame even when it was committed last anyway);
     each lands in the stream it was posted to (no cross-talk); and one of them
-    arrives while ANOTHER of these streams' turns is still open — different
-    lanes run in parallel, and neither one's frames wait for the other to
-    finish. Main's two turns complete in order; ALL turns reach `delivered`.
+    ARRIVES, by the clock, while ANOTHER of these turns is still open by the
+    substrate's — different lanes run in parallel, and neither one's frames wait
+    for the other to finish. The arrival clock is what tells live delivery from
+    a gateway that withheld every frame and flushed them, in perfect order, once
+    both lanes were done. Main's two turns complete in order; ALL turns reach
+    `delivered`.
     DB: at peak, two `running` rows with DIFFERENT sessionKeys.
     Which prompt the model answers first decides nothing here: a trivial
     prompt in a fresh stream routinely outlives a slow one in a warm stream,
