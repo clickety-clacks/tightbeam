@@ -5784,7 +5784,8 @@ defmodule Tightbeam.Gateway do
           seq,
           Payloads.server_message(message),
           # Message pushes carry (key, seq) so the socket's replay drain can
-          # filter them against its watermark (see Wire.Socket moduledoc).
+          # recognise literal re-sends of its own replay (set membership, not a
+          # watermark — see Wire.Socket moduledoc).
           fn pid, payload -> send(pid, {:push_message, session_key, seq, payload}) end
         )
     end

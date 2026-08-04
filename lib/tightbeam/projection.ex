@@ -30,8 +30,9 @@ defmodule Tightbeam.Projection do
   @attention_tiers %{low: -1, normal: 0, high: 1}
 
   @typedoc """
-  A stored message. `seq` is the per-store commit order (the replay/live
-  de-dup watermark); `llm_visible_message_id` is the id the harness saw.
+  A stored message. `seq` is the per-store commit order — replay pages by it,
+  the wire carries it on every frame, and the client settles order and
+  identity with it; `llm_visible_message_id` is the id the harness saw.
   """
   @type message :: %{
           seq: integer(),

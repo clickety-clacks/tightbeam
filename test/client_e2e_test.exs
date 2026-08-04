@@ -607,9 +607,35 @@ defmodule Tightbeam.ClientE2ETest do
       ]
     end
 
+    # Reply frames on the real wire carry the store seq (payloads.server_message);
+    # the fixtures stamp it from the same mapping the expectation is built from,
+    # so a passing fixture is one whose frames are placeable — exactly the
+    # contract. Tests that want a LYING frame stamp a different mapping.
+    defp stamp_seqs(frames, seqs) do
+      Enum.map(frames, fn frame ->
+        case frame do
+          %{"type" => "message", "replyToClientMessageId" => cmid} ->
+            # Mirror j5_expected: a keyword value may be bare seq or {seq, stamp}.
+            seq =
+              case Keyword.get(seqs, String.to_atom(cmid)) do
+                {seq, _committed_at} -> seq
+                seq -> seq
+              end
+
+            Map.put(frame, "seq", seq)
+
+          other ->
+            other
+        end
+      end)
+    end
+
     # The oracle owns its own delivery budget (1s against a 0-1ms path); the
     # fixtures below sit far from it in both directions.
     defp j5_oracle(frames, seqs, turns),
+      do: Journeys.concurrency_delivery_error(stamp_seqs(frames, seqs), j5_expected(seqs, turns))
+
+    defp j5_oracle_raw(frames, seqs, turns),
       do: Journeys.concurrency_delivery_error(frames, j5_expected(seqs, turns))
 
     test "the client-e2e-v1 shape passes: B answers during Main's slow turn" do
@@ -640,15 +666,31 @@ defmodule Tightbeam.ClientE2ETest do
                "never received: [\"b\"]"
     end
 
-    test "replies shown in an order their OWN stream never committed fail" do
-      # Main delivered slow -> done against a store that committed done -> slow:
-      # the shape a publication that does not ride commit order produces, and
-      # the shape ConnRegistry's per-session cursor turns into a permanently
-      # dropped frame. This asserts the ORACLE reports it; J5's own three posts
-      # cannot produce it, and the moduledoc says so rather than letting the
-      # row imply coverage it does not have.
-      assert j5_oracle(b_answers_last(), [done: 1, slow: 2, b: 3], b_last_turns()) =~
-               "an order the store never committed"
+    test "out-of-order ARRIVAL with truthful seqs is not a defect" do
+      # The contract change (ruled 2026-08-04): delivery is a hint, the store is
+      # truth, and ConnRegistry no longer filters — so frames may arrive in an
+      # order the store never committed, carrying the seq that lets the client
+      # settle them. Main's store committed done(1) -> slow(2); the frames
+      # arrive slow -> done. With truthful seqs that is legal delivery, where
+      # the old oracle called it "an order the store never committed".
+      assert j5_oracle(b_answers_last(), [done: 1, slow: 2, b: 3], b_last_turns()) == nil
+    end
+
+    test "a frame whose seq lies about its store row fails as unplaceable" do
+      # What the contract DOES promise: every frame carries its store seq. A
+      # frame stamped with the wrong one cannot be settled into commit order —
+      # the client would place the reply where a different message belongs.
+      frames = stamp_seqs(b_answers_first(), b: 7, slow: 2, done: 3)
+
+      assert j5_oracle_raw(frames, [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "cannot settle these into commit order"
+    end
+
+    test "a frame with NO seq fails as unplaceable" do
+      # Missing is not different from wrong: an absent seq must not read as
+      # placeable (absence representable as success is the house defect class).
+      assert j5_oracle_raw(b_answers_first(), [b: 1, slow: 2, done: 3], b_first_turns()) =~
+               "cannot settle these into commit order"
     end
 
     test "two streams interleaving differently from the global seq order is NOT a defect" do

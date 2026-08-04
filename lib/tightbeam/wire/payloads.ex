@@ -113,6 +113,10 @@ defmodule Tightbeam.Wire.Payloads do
     %{
       "type" => "message",
       "id" => Map.fetch!(m, :id),
+      # Store commit order, on every frame. Delivery is a hint and may arrive
+      # out of order; seq is what lets a client settle order and identity.
+      # Without it the ids are opaque and a late frame cannot be placed.
+      "seq" => Map.fetch!(m, :seq),
       "role" => Map.fetch!(m, :role),
       "content" => Map.fetch!(m, :content),
       "timestamp" => Map.fetch!(m, :timestamp),

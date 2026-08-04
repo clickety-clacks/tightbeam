@@ -137,7 +137,13 @@ defmodule Tightbeam.Wire.Socket do
               [payload]
           end)
 
-        push_many(frames ++ [Payloads.sync_complete()], %{state | phase: :live, buffer: []})
+        # The set's job ends here — it exists only to recognise re-sends of this
+        # handshake's replay during this drain. Cleared so a long-lived socket
+        # does not carry up to 500 tuples per session for its lifetime.
+        push_many(
+          frames ++ [Payloads.sync_complete()],
+          %{state | phase: :live, buffer: [], replayed_seqs: MapSet.new()}
+        )
 
       {:takeover_close} ->
         stop_with(Payloads.wire_error("session_replaced"), state)

@@ -338,8 +338,9 @@ defmodule Tightbeam.EventLog do
   # trip through the single-writer DB owner. That trip was the wide half of
   # the publication race: it can queue behind another session's transaction,
   # during which the lane that owns this session can commit AND publish a
-  # LATER seq, and ConnRegistry drops an earlier one for good once a
-  # connection's watermark has passed it.
+  # LATER seq. ConnRegistry no longer drops the earlier one (delivery is
+  # unconditional now); skipping the second trip still narrows the window in
+  # which frames leave in an order the client must settle by seq.
   defp active_owner(txn, session_key) do
     case Txn.q(
            txn,

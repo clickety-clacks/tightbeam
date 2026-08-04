@@ -1026,14 +1026,17 @@ defmodule Tightbeam.ClientE2E.Journeys do
         "the store committed replies the client never received: #{inspect(missing)}"
 
       true ->
-        misordered =
-          expected
-          |> Enum.group_by(& &1.session_key)
-          |> Enum.find_value(fn {key, posts} ->
-            delivered = order_by(posts, fn %{id: id} -> replies[id].index end)
-            committed = order_by(posts, & &1.committed_seq)
-            if delivered != committed, do: {key, delivered, committed}
-          end)
+        # ARRIVAL order is deliberately not asserted. The wire contract (ruled
+        # 2026-08-04, "delivery is a hint, the store is truth") permits frames
+        # to arrive out of commit order; what it PROMISES is that every frame
+        # carries the store seq that lets the client settle order. So the leg
+        # asserts seq fidelity — frame seq present and equal to the store's —
+        # which is exactly the capability the settled view stands on. A frame
+        # with a missing or wrong seq is unplaceable, and THAT is the defect.
+        unplaceable =
+          for %{id: id, committed_seq: committed} <- expected,
+              replies[id].frame["seq"] != committed,
+              do: {id, replies[id].frame["seq"], committed}
 
         cross_talk = wrong_stream_replies(frames, expected)
 
@@ -1045,11 +1048,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
         undated = for %{id: id} <- expected, not is_integer(replies[id].received_at), do: id
 
         cond do
-          misordered ->
-            {key, delivered, committed} = misordered
-
-            "in #{key} the client showed replies in an order the store never committed: " <>
-              "client #{inspect(delivered)}, committed #{inspect(committed)}"
+          unplaceable != [] ->
+            "frames whose seq does not match the store row they carry — the client " <>
+              "cannot settle these into commit order: " <>
+              "#{inspect(Enum.map(unplaceable, fn {id, got, want} -> "#{id} seq=#{inspect(got)} store=#{want}" end))}"
 
           cross_talk != [] ->
             "cross-talk: #{inspect(cross_talk)} answered in a stream it was not posted to"
@@ -1156,8 +1158,6 @@ defmodule Tightbeam.ClientE2E.Journeys do
         uniq: true,
         do: id
   end
-
-  defp order_by(expected, key_fun), do: expected |> Enum.sort_by(key_fun) |> Enum.map(& &1.id)
 
   # %{clientMessageId => %{frame, index, received_at}} for the replies to THESE
   # posts, in the stream each was posted to. The FIRST frame answering a post is
