@@ -144,7 +144,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), and one of them ARRIVES, by the driver's clock, while another of these turns is still open by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
+        "assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within the settle window of its own turn's close; and one of them ARRIVES, by the driver's clock, while another of these turns is still open by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -825,7 +825,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
           # FAILS — calling it incomplete would launder exactly the defect this
           # journey should catch.
           substrate_concurrent? ->
-            case concurrency_delivery_error(frames, expected) do
+            case concurrency_delivery_error(frames, expected, ctx.settle_ms) do
               nil ->
                 Scorecard.pass("10", "concurrency", journey: "J5")
 
@@ -935,18 +935,27 @@ defmodule Tightbeam.ClientE2E.Journeys do
      held reply was committed last anyway. A turn whose terminal state never
      reached the client fails here too: an indicator left spinning is not a
      delivered turn;
-  6. some reply ARRIVED, by the driver's own clock, while another of these
+  6. EVERY reply reached the client within `budget_ms` of the moment its own
+     turn closed (`ended_at`, written immediately after the reply is published).
+     This is the one leg with a number in it, because a frame that arrives
+     eventually, in the right order, behind its own already-closed turn has no
+     edge to be caught at — nothing else in the run moves while it waits. The
+     budget is the driver's settle window, three orders of magnitude above the
+     0-1ms this path actually measures, so it names a frame that WAITED for
+     something rather than a slow one;
+  7. and some reply ARRIVED, by the driver's own clock, while another of these
      turns was still open by the substrate's (`started_at`..`ended_at`). This
      is the cross-lane liveness the journey exists to prove, and it holds
      whichever lane finishes first. It is deliberately a clock question rather
      than a frame-order one: a gateway that withheld every frame and flushed
-     them in perfect order at the end satisfies every leg above and fails only
-     this one.
+     them in perfect order at the end satisfies every order leg and fails this.
+     Its bounds are inclusive: both clocks are millisecond truncations of the
+     same source, so a tie is ambiguous, and ambiguity must not fail a run.
 
   Returns nil when every leg holds, else the text of the first that did not.
   """
-  @spec concurrency_delivery_error([map()], [map()]) :: String.t() | nil
-  def concurrency_delivery_error(frames, expected) do
+  @spec concurrency_delivery_error([map()], [map()], pos_integer()) :: String.t() | nil
+  def concurrency_delivery_error(frames, expected, budget_ms) do
     replies = reply_indexes(frames, expected)
     terminals = turn_state_indexes(frames, expected, &terminal_turn_state?/1)
 
@@ -993,6 +1002,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
             "the driver recorded no arrival time for #{inspect(undated)}, so live delivery " <>
               "cannot be judged for this run"
 
+          (late = late_arrivals(expected, replies, budget_ms)) != [] ->
+            "#{inspect(late)} reached the client only after its own turn had been closed " <>
+              "for more than #{budget_ms}ms — delivered, but not delivered live"
+
           not cross_lane_live?(expected, replies) ->
             "no reply arrived while another of these streams' turns was still open — " <>
               "the frames were delivered, but not while the other lane was running"
@@ -1013,13 +1026,23 @@ defmodule Tightbeam.ClientE2E.Journeys do
     end
   end
 
+  # Every reply whose arrival trails the close of its own turn by more than the
+  # budget. `ended_at` is written immediately after the reply is published, so
+  # this measures how long the FRAME waited, not how long the model thought.
+  defp late_arrivals(expected, replies, budget_ms) do
+    for %{id: id, ended_at: ended_at} <- expected,
+        is_integer(ended_at),
+        replies[id].received_at - ended_at > budget_ms,
+        do: id
+  end
+
   defp cross_lane_live?(expected, replies) do
     Enum.any?(expected, fn %{id: id, session_key: key} ->
       at = replies[id].received_at
 
       Enum.any?(expected, fn other ->
         other.session_key != key and is_integer(other.started_at) and
-          is_integer(other.ended_at) and other.started_at < at and at < other.ended_at
+          is_integer(other.ended_at) and other.started_at <= at and at <= other.ended_at
       end)
     end)
   end

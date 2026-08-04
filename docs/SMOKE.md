@@ -241,13 +241,16 @@ on 2026-07-25:
     every one of them; they arrive in the order the store committed them; each
     arrives before its own turn's terminal state (a reply held behind the close
     of its own turn is a delayed frame even when it was committed last anyway);
-    each lands in the stream it was posted to (no cross-talk); and one of them
+    each lands in the stream it was posted to (no cross-talk); each reaches the
+    client within the settle window of the moment its own turn closed (a frame
+    that arrives eventually, in the right order, behind its own finished turn is
+    a delayed frame — this is the one condition stated as a duration, because
+    nothing else in the run moves while such a frame waits); and one of them
     ARRIVES, by the clock, while ANOTHER of these turns is still open by the
-    substrate's — different lanes run in parallel, and neither one's frames wait
-    for the other to finish. The arrival clock is what tells live delivery from
-    a gateway that withheld every frame and flushed them, in perfect order, once
-    both lanes were done. Main's two turns complete in order; ALL turns reach
-    `delivered`.
+    substrate's — different lanes run in parallel. That last one is what tells
+    live delivery from a gateway that withheld every frame and flushed them, in
+    perfect order, once both lanes were done. Main's two turns complete in
+    order; ALL turns reach `delivered`.
     DB: at peak, two `running` rows with DIFFERENT sessionKeys.
     Which prompt the model answers first decides nothing here: a trivial
     prompt in a fresh stream routinely outlives a slow one in a warm stream,

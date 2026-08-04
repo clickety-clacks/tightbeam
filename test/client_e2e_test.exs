@@ -557,8 +557,10 @@ defmodule Tightbeam.ClientE2ETest do
       ]
     end
 
-    defp j5_oracle(frames, seqs, turns),
-      do: Journeys.concurrency_delivery_error(frames, j5_expected(seqs, turns))
+    # 2_500ms is the driver's settle window, which J5 passes as the delivery
+    # budget; the fixtures below sit far from it in both directions.
+    defp j5_oracle(frames, seqs, turns, budget_ms \\ 2_500),
+      do: Journeys.concurrency_delivery_error(frames, j5_expected(seqs, turns), budget_ms)
 
     test "the client-e2e-v1 shape passes: B answers during Main's slow turn" do
       assert j5_oracle(b_answers_first(), [b: 1, slow: 2, done: 3], b_first_turns()) == nil
@@ -652,12 +654,14 @@ defmodule Tightbeam.ClientE2ETest do
                "before its own turn's terminal state"
     end
 
-    test "frames flushed in perfect order AFTER both lanes finished fail the liveness leg" do
+    test "frames flushed in perfect order once both lanes were done fail the liveness leg" do
       # Every earlier leg holds — nothing dropped, committed order preserved,
-      # each reply inside its own turn, no cross-talk. Only the arrival CLOCK
-      # can tell this from live delivery, which is why the leg asks for one.
-      flushed =
-        Enum.map(b_answers_first(), fn frame -> %{frame | "receivedAt" => 5_000} end)
+      # each reply before its own terminal frame, no cross-talk, and the flush
+      # lands the instant the last turn closes, so it is inside the delivery
+      # budget for every reply. Only the question "was any of it delivered WHILE
+      # the other lane was running" can tell this from live delivery — 951 is
+      # the first millisecond at which no turn of this journey is still open.
+      flushed = Enum.map(b_answers_first(), fn frame -> %{frame | "receivedAt" => 951} end)
 
       assert j5_oracle(flushed, [b: 1, slow: 2, done: 3], b_first_turns()) =~
                "while another of these streams' turns was still open"
@@ -682,6 +686,51 @@ defmodule Tightbeam.ClientE2ETest do
 
       assert j5_oracle(serialized, [slow: 1, b: 2, done: 3], serialized_turns) =~
                "while another of these streams' turns was still open"
+    end
+
+    test "REGRESSION: one timely reply cannot launder another lane's delayed frame" do
+      # The lanes genuinely overlapped (B runs 110..900 across both of Main's
+      # turns), commit and arrival order agree, and each reply precedes its own
+      # terminal frame — so every other leg holds. B's frames simply arrive five
+      # seconds after B's turn closed. An existential liveness check passes this
+      # on the strength of Main's timely replies; the per-reply budget is what
+      # sees it.
+      delayed = [
+        j5_running(@main, "slow", 100),
+        j5_running(@smoke_b, "b", 110),
+        j5_reply(@main, "slow", 300),
+        j5_delivered(@main, "slow", 300),
+        j5_running(@main, "done", 300),
+        j5_reply(@main, "done", 400),
+        j5_delivered(@main, "done", 400),
+        j5_reply(@smoke_b, "b", 5_900),
+        j5_delivered(@smoke_b, "b", 5_901)
+      ]
+
+      turns = [slow: {100, 300}, b: {110, 900}, done: {300, 400}]
+
+      assert j5_oracle(delayed, [slow: 1, done: 2, b: 3], turns) =~
+               "[\"b\"] reached the client only after its own turn had been closed"
+    end
+
+    test "a reply arriving on the same millisecond its neighbour's turn ends still witnesses liveness" do
+      # Both clocks are millisecond truncations of one source, so a tie is
+      # ambiguous — and ambiguity must not fail a healthy run.
+      frames = [
+        j5_running(@main, "slow", 100),
+        j5_running(@smoke_b, "b", 110),
+        j5_reply(@smoke_b, "b", 300),
+        j5_delivered(@smoke_b, "b", 300),
+        j5_reply(@main, "slow", 300),
+        j5_delivered(@main, "slow", 300),
+        j5_running(@main, "done", 300),
+        j5_reply(@main, "done", 350),
+        j5_delivered(@main, "done", 350)
+      ]
+
+      turns = [slow: {100, 300}, b: {110, 300}, done: {300, 350}]
+
+      assert j5_oracle(frames, [b: 1, slow: 2, done: 3], turns) == nil
     end
 
     test "a driver that recorded no arrival time refuses to judge liveness" do
