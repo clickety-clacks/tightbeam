@@ -436,16 +436,23 @@ defmodule Tightbeam.Soak do
     %{state | kill_events: state.kill_events ++ [event], kill_index: state.kill_index + 1}
   end
 
+  # The adapter is the process the SUBSTRATE monitors: `harness_processes.osPid`,
+  # the session leader `tightbeam harness-exec` exec'd into. Selecting it out of
+  # the process tree by its argv instead ALSO matches that launcher, which forks,
+  # waits, and carries the very same argv — and killing the launcher kills
+  # nothing. That is what the 2026-08-03 soak did: 6 of its 8 "adapter kills"
+  # took the launcher, the adapter kept delivering turns on an unchanged
+  # generation, and A3 then charged the substrate with 6 unrecorded deaths that
+  # had never happened. Asking the ledger kills the process A3 is asking about.
   defp execute_kill(:adapter_sigkill, state) do
-    with {:ok, gateway_pid} <- gateway_os_pid(state.gateway),
-         [_ | _] = pids <- adapter_descendants(gateway_pid),
+    with [_ | _] = pids <- recorded_adapter_pids(state),
+         [_ | _] = pids <- Enum.filter(pids, &adapter_pid?/1),
          pid <- Enum.random(pids),
          {_output, 0} <-
            System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true) do
       {true, "SIGKILL adapter pid=#{pid}", state}
     else
-      [] -> {false, "no claude adapter subprocess found", state}
-      {:error, reason} -> {false, inspect(reason), state}
+      [] -> {false, "no live adapter process recorded", state}
       {output, status} -> {false, "kill exited #{status}: #{String.trim(output)}", state}
     end
   end
@@ -688,40 +695,37 @@ defmodule Tightbeam.Soak do
     end
   end
 
-  defp adapter_descendants(gateway_pid) do
-    {output, 0} = System.cmd("ps", ["-axo", "pid=,ppid=,command="])
-
-    processes =
-      output
-      |> String.split("\n", trim: true)
-      |> Enum.flat_map(fn line ->
-        case Regex.run(~r/^\s*(\d+)\s+(\d+)\s+(.*)$/, line) do
-          [_, pid, parent, command] ->
-            [{String.to_integer(pid), String.to_integer(parent), command}]
-
-          _ ->
-            []
-        end
-      end)
-
-    descendants = descendant_ids(processes, MapSet.new([gateway_pid]))
-
-    processes
-    |> Enum.filter(fn {pid, _parent, command} ->
-      MapSet.member?(descendants, pid) and String.contains?(command, "claude-agent-acp")
-    end)
-    |> Enum.map(&elem(&1, 0))
+  defp recorded_adapter_pids(state) do
+    state.options.base_dir
+    |> Path.join("state.db")
+    |> readonly_query(
+      """
+      SELECT osPid
+      FROM harness_processes
+      WHERE state = 'running' AND osPid IS NOT NULL
+      """,
+      []
+    )
+    |> Enum.map(fn [os_pid] -> os_pid end)
   end
 
-  defp descendant_ids(processes, ids) do
-    expanded =
-      Enum.reduce(processes, ids, fn {pid, parent, _command}, acc ->
-        if MapSet.member?(ids, parent), do: MapSet.put(acc, pid), else: acc
-      end)
+  # A pid read from a ledger is a pid the OS may have already recycled, so the
+  # process is IDENTIFIED before it is signalled — the recorded pid must still be
+  # running the adapter. `harness-exec` also excludes the launcher, which is the
+  # process this kill used to hit by accident; the substrate never records the
+  # launcher as `osPid`, so a match there means the record is stale, not that
+  # the launcher is a legitimate target.
+  defp adapter_pid?(pid) do
+    case System.cmd("ps", ["-o", "command=", "-p", Integer.to_string(pid)],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        String.contains?(output, "claude-agent-acp") and
+          not String.contains?(output, "harness-exec")
 
-    if MapSet.size(expanded) == MapSet.size(ids),
-      do: expanded,
-      else: descendant_ids(processes, expanded)
+      _ ->
+        false
+    end
   end
 
   defp audit(state, label) do

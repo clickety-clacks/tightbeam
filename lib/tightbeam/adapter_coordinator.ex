@@ -416,7 +416,34 @@ defmodule Tightbeam.AdapterCoordinator do
       case state.adapters[key] do
         %{pid: pid, monitor: monitor} when is_pid(pid) and is_reference(monitor) ->
           Tightbeam.Acp.Adapter.request_close(pid)
-          await_adapter_exit(monitor, pid, state.park_grace_ms)
+
+          case await_adapter_exit(monitor, pid, state.park_grace_ms) do
+            # The park asked for :normal and got a FAULT: this adapter was
+            # killed or crashed inside the park window. The selective receive
+            # below is the only place that death is ever observed —
+            # handle_info/2 never sees the :DOWN, and retire_adapter flushes
+            # whatever arrives later — so dropping the reason here is the
+            # difference between a recorded death and no record at all.
+            # Recording is unconditional for a genuine death (#14); it is the
+            # ACTION that stays behind park's state.
+            {:exited, reason} when reason != :normal ->
+              :ok =
+                record_adapter_down(
+                  state,
+                  key,
+                  MapSet.member?(state.ready_refs, monitor),
+                  reason,
+                  "absorbed=false parked=true"
+                )
+
+              true
+
+            {:exited, :normal} ->
+              true
+
+            :grace_expired ->
+              false
+          end
 
         %{pid: pid} when is_pid(pid) ->
           Tightbeam.Acp.Adapter.request_close(pid)
@@ -440,11 +467,14 @@ defmodule Tightbeam.AdapterCoordinator do
     {result, state}
   end
 
+  # The REASON comes back, not just the fact of an exit. "Closed as asked" and
+  # "was killed while we asked" are different deaths wearing the same boolean,
+  # and only the reason tells them apart.
   defp await_adapter_exit(monitor, pid, grace_ms) do
     receive do
-      {:DOWN, ^monitor, :process, ^pid, _reason} -> true
+      {:DOWN, ^monitor, :process, ^pid, reason} -> {:exited, reason}
     after
-      grace_ms -> false
+      grace_ms -> :grace_expired
     end
   end
 
@@ -482,14 +512,17 @@ defmodule Tightbeam.AdapterCoordinator do
   # ever saw the good news, and a turn that stopped for an engine fault read as
   # a prompt that vanished — with no marker of its own, because the failure
   # path publishes terminal turn-state and no chat line.
-  defp record_adapter_down(state, key, was_ready?, reason, absorbed?) do
+  # `state_detail` names the STATE the adapter died in — the caller knows it and
+  # the row must carry it, because "absorbed" and "parked" are the two ways a
+  # death reaches this function by a path other than a live monitor.
+  defp record_adapter_down(state, key, was_ready?, reason, state_detail) do
     name = key_name(key)
 
     Tightbeam.EventLog.notice(
       state.db,
       "adapter_down",
       name,
-      "#{inspect(reason)} absorbed=#{absorbed?}",
+      "#{inspect(reason)} #{state_detail}",
       audience: {:sessions, told_sessions(state.db, key, was_ready?)},
       attention: :normal,
       message:
@@ -601,7 +634,7 @@ defmodule Tightbeam.AdapterCoordinator do
         # record and its notice are unconditional here, and the absorbed ones
         # say so in their detail.
         absorbed? = entry.monitor != ref
-        :ok = record_adapter_down(state, key, was_ready?, reason, absorbed?)
+        :ok = record_adapter_down(state, key, was_ready?, reason, "absorbed=#{absorbed?}")
 
         if absorbed? do
           {:noreply, state}
