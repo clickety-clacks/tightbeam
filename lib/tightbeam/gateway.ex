@@ -1726,6 +1726,19 @@ defmodule Tightbeam.Gateway do
           {:ok, %{terminal_publish: terminal_publish}}
         else
           {:error, {failed_stage, reason}} ->
+            # A FAULT WHOSE CAUSE IS A MISSING CREDENTIAL IS NOT AN ADJUDICATION.
+            # The first real production touch proved the alternative (gibson,
+            # 2026-08-04): "hi" on a fresh un-onboarded org faulted the adapter
+            # and greeted the brand-new admin with park|swap grammar whose own
+            # evidence said `needs_onboarding, :missing`. No ruling can conjure
+            # a credential, so when the engine fails on a harness the catalog
+            # AFFIRMATIVELY knows needs onboarding, the turn fails with the boot
+            # sentence and its one action instead — no episode, no hold, no
+            # "interrupted". Transient health (catalog not yet derived, a failed
+            # fetch) does not requalify the fault: those self-resolve and the
+            # adjudication path remains right for them.
+            onboarding_refusal = unonboarded_refusal(session, failed_stage)
+
             condition = Adjudication.classify(reason)
             cause = adjudication_cause(failed_stage, reason, adapter_key)
             brief_inventories = adjudication_model_inventories(session)
@@ -1841,6 +1854,16 @@ defmodule Tightbeam.Gateway do
                   adjudicate_with_owner_in_txn.(txn)
               end
             end
+
+            # The refusal replaces the REASON and the adjudication, and nothing
+            # else: the same terminal publish, the same failed turn row, the
+            # same indicator clearing. The user sees one sentence naming the
+            # missing credential and the command that supplies it.
+            {reason, adjudicate_in_txn} =
+              case onboarding_refusal do
+                {:refused, message} -> {message, fn _txn -> :not_adjudicated end}
+                :not_applicable -> {reason, adjudicate_in_txn}
+              end
 
             {:error,
              %{
@@ -4113,6 +4136,50 @@ defmodule Tightbeam.Gateway do
            message: message
          }}
     end
+  end
+
+  # :checkout and :session are the stages a missing credential kills; a fault in
+  # a later stage happened INSIDE a running engine and is a real adjudication
+  # whatever the catalog thinks.
+  defp unonboarded_refusal(session, failed_stage) when failed_stage in [:checkout, :session] do
+    harness = session.harness
+
+    health =
+      try do
+        {_entries, health} =
+          Tightbeam.ModelCatalog.get(session.host, harness, Tightbeam.ModelCatalog)
+
+        health
+      catch
+        # No catalog server is a boot shape, not evidence of anything.
+        :exit, _ -> :unavailable_server
+      end
+
+    case health do
+      # ONLY `:missing` — the credential store affirmatively answering "there is
+      # no credential here". `needs_onboarding` also carries
+      # `:credential_server_unavailable`, which means "I could not ASK", a
+      # transient that self-resolves. Matching the wildcard collapsed those two
+      # unlike absences into one and would have converted every could-not-ask
+      # fault into a bogus "you have no credential" — the defect class this
+      # codebase keeps punishing, caught here by 29 adapter-heal tests whose
+      # arenas run without a Credentials server. Flynn's gibson brief said
+      # `{:needs_onboarding, :missing}` exactly.
+      {:unavailable, {:needs_onboarding, :missing}} ->
+        provider = Harness.parse!(harness).credential_provider()
+        {:refused, missing_credential_message_for(session.host, provider, harness)}
+
+      _fresh_or_transient_or_unknown ->
+        :not_applicable
+    end
+  end
+
+  defp unonboarded_refusal(_session, _failed_stage), do: :not_applicable
+
+  defp missing_credential_message_for(host, provider, harness) do
+    "Tightbeam has no credential for #{provider} on #{host}. It does not use or " <>
+      "import your normal #{harness} CLI login; Tightbeam keeps its own. " <>
+      "Run on #{host}: tightbeam onboard #{provider} --as-user <userId>"
   end
 
   defp missing_credential_message(config, provider, harness, machine) do
