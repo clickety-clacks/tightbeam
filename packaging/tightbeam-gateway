@@ -49,10 +49,16 @@ fi
 # failed `nodedown` against a gateway that was plainly running. A name that only the
 # start path knows is not a name.
 #
-# Those commands find the node by NAME, so they need the same `TIGHTBEAM_PORT` the
-# gateway was started with — the same discipline the README already states for the CLI.
-if [ "$#" -eq 0 ]; then
-  set -- start
-fi
+# Those commands find the node by NAME, so they must resolve to the SAME name the
+# gateway was started under: the same `TIGHTBEAM_NODE` if one was set, otherwise the same
+# `TIGHTBEAM_PORT`. Saying "the same port" alone is false whenever an override is in play.
+#
+# A LEADING FLAG STILL MEANS `start`. The previous form was `start "$@"`, so
+# `tightbeam-gateway --erl "+sbwt none"` passed that option to start; treating a
+# leading `-` as a subcommand would answer it with `Unknown command --erl`. Only a
+# bare word is a subcommand.
+case "${1:-}" in
+  "" | -*) set -- start "$@" ;;
+esac
 
 exec "$DIR/release/bin/tightbeam_gateway" "$@"
