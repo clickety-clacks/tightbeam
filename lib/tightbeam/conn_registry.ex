@@ -19,11 +19,50 @@ defmodule Tightbeam.ConnRegistry do
      publication of a pre-watermark commit forever, closing the
      replay/live race.
 
-  ORDERING DEPENDENCY: the filter is safe ONLY if publications for
-  a session arrive in commit (seq) order. That is guaranteed by publishing
-  from the single-writer commit path (Tightbeam.DB), not by this module. This
-  module enforces the per-connection monotonic filter; the caller must not
-  publish out of seq order.
+  ORDERING DEPENDENCY, AND IT IS UNMET: the filter above is safe ONLY if
+  publications for a session arrive in commit (seq) order, and nothing
+  currently provides that. Every publication happens AFTER its transaction has
+  returned, from the caller's own process — `Projection.append/2` commits at
+  projection.ex:95-96 and its caller publishes afterwards — so two writers to
+  one session can commit in one order and publish in the other. The window is
+  not simultaneity: it is one publisher pausing between its commit and its
+  publish while another commits AND publishes inside that gap. When that
+  happens this module drops the earlier frame at :161-162 and a connected
+  client never sees it.
+
+  Nor is a replay a reliable repair. Replay serves rows after the client's own
+  cursor (wire/socket.ex:319, `Projection.list_after/5` selecting `seq >`), so
+  it restores the dropped row only while that cursor still sits behind it. A
+  client whose cursor has already advanced past it — because it received the
+  LATER frame — never sees the earlier one again, on reconnect or on a re-auth
+  of the same socket (wire/socket.ex:299-303). This module enforces the
+  per-connection monotonic filter and cannot enforce the ordering it rests on.
+
+  The publication sites, every one of them post-commit: gateway.ex:1701 (an
+  agent's reply, published from the turn's own task), :1043 (a delivery echo,
+  from whichever process ran the dispatch — a socket, a wake, a control route),
+  :4142 (a credential-transition notice the substrate authors), and :5195,
+  :5767 (markers), all through the helper at :5772; plus event_log.ex:324,
+  after the transaction opened at :297. SCOPE OF THAT LIST: it is the message
+  path, read at 422ff58. The remaining `DB.transaction` callers were not
+  audited, so treat it as where to start rather than as exhaustive, and
+  re-derive the lines before trusting them.
+
+  WHAT SERIALIZES, AND WHAT DOES NOT: a session's lane serializes its TURNS, not
+  the writes to it. A client post's echo and a running turn's reply are two
+  independent writers to one session, from two processes, with nothing ordering
+  them against each other. The client-e2e concurrency journey (J5) creates both
+  of those writers on its Main stream, so the ingredients are present there.
+
+  No reproduction is known, and nothing here claims any journey is IMMUNE —
+  that would be a second guarantee asserted without code to back it, which is
+  the mistake this note exists to correct. J5 has not been observed producing
+  it, and it arranges no such window deliberately; whether its commits and
+  publishes can interleave badly is not controlled by anything and has not been
+  measured. A deliberate reproduction would hold one writer between its commit
+  and its publish while a second writer completes both.
+
+  Fixing this is a design in its own right and is not attempted here.
   """
 
   use GenServer
