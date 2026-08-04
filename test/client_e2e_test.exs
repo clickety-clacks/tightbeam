@@ -521,16 +521,20 @@ defmodule Tightbeam.ClientE2ETest do
     # `seqs` is `[slow: {seq, committed_at}, ...]`; a bare seq means the store
     # stamped the reply the instant its turn ended, which is what happens when
     # nothing stalls between the write and the publish.
+    # ONE parser for the seqs keyword, shared by the expectation builder and the
+    # frame stamper — so a new value shape cannot make them silently diverge and
+    # stamp a wire-impossible seq that the expectation then agrees with.
+    defp normalize_seq({seq, committed_at}, _default) when is_integer(seq) or is_nil(seq),
+      do: {seq, committed_at}
+
+    defp normalize_seq(seq, default) when is_integer(seq) or is_nil(seq), do: {seq, default}
+
     defp j5_expected(seqs, turns) do
       for {id, key} <- [{"slow", @main}, {"b", @smoke_b}, {"done", @main}] do
         name = String.to_atom(id)
         {started, ended} = Keyword.fetch!(turns, name)
 
-        {seq, committed_at} =
-          case seqs[name] do
-            {seq, committed_at} -> {seq, committed_at}
-            seq -> {seq, ended}
-          end
+        {seq, committed_at} = normalize_seq(seqs[name], ended)
 
         %{
           id: id,
@@ -615,13 +619,7 @@ defmodule Tightbeam.ClientE2ETest do
       Enum.map(frames, fn frame ->
         case frame do
           %{"type" => "message", "replyToClientMessageId" => cmid} ->
-            # Mirror j5_expected: a keyword value may be bare seq or {seq, stamp}.
-            seq =
-              case Keyword.get(seqs, String.to_atom(cmid)) do
-                {seq, _committed_at} -> seq
-                seq -> seq
-              end
-
+            {seq, _} = normalize_seq(Keyword.get(seqs, String.to_atom(cmid)), nil)
             Map.put(frame, "seq", seq)
 
           other ->

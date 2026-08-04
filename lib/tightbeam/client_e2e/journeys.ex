@@ -144,7 +144,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "within each stream, assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of the store stamping it; and one of them ARRIVES, by the driver's clock, strictly inside another of these turns by the substrate's; Main's two turns complete in post order. A missing reply, cross-talk, a non-delivered turn row and Main's own two turns out of order fail the row whatever the lanes did. Past those, when the substrate never ran the lanes together the delivery legs are not asked at all: FAIL if Smoke B was enqueued while Main was still running yet never ran beside it (the lanes are not parallel), otherwise INCOMPLETE, because there was no overlap to observe",
+        "every assistant bubble carries the store seq of its own reply row (delivery is a hint and may arrive out of commit order; the seq is what the client settles order with, so a missing or wrong seq fails), each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of the store stamping it; and one of them ARRIVES, by the driver's clock, strictly inside another of these turns by the substrate's; Main's two turns complete in post order. A missing reply, cross-talk, a non-delivered turn row and Main's own two turns out of order fail the row whatever the lanes did. Past those, when the substrate never ran the lanes together the delivery legs are not asked at all: FAIL if Smoke B was enqueued while Main was still running yet never ran beside it (the lanes are not parallel), otherwise INCOMPLETE, because there was no overlap to observe",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -800,10 +800,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
       # The three posts, each with the stream it went to, the `messages.seq` the
       # store gave its reply — the per-store COMMIT order — and its turn's own
-      # interval. That the wire publishes in commit order is what this row
-      # ASSERTS, not something it assumes: publication happens from each writer
-      # after its transaction returns, so two writers to one stream can commit
-      # in one order and publish in the other.
+      # interval. Publication does NOT ride commit order and this row no longer
+      # pretends it does: delivery is a hint, and what the row asserts is that
+      # every frame carries the store seq that lets the client settle order.
       expected = expected_deliveries(ctx.base_dir, posts)
 
       row =
@@ -945,13 +944,12 @@ defmodule Tightbeam.ClientE2E.Journeys do
      client's success: the later legs would compare lists that agree on what
      they both omit;
   2. every one of those replies reached the client;
-  3. within EACH stream, they arrived in the order the store COMMITTED them —
-     a frame reordered, or held past a later commit in its own stream, shows up
-     here. Per stream and not across them, because that is the guarantee the
-     wire makes: `ConnRegistry` keeps its delivered-seq cursor per session, and
-     two streams' publications are independent, so one lane committing before
-     another and publishing after it is ordinary concurrency rather than a
-     defect. A global order would fail healthy runs.
+  3. every reply frame carries the store seq of its own row — seq fidelity.
+     Arrival order is NOT asserted: delivery is a hint (ruled 2026-08-04),
+     frames may legally arrive out of commit order, and the seq on each frame
+     is what the client settles them with. A frame with a missing or wrong seq
+     is unplaceable, and that is the defect. This replaced an arrival-order
+     leg that the old registry filter enforced by deletion.
 
      WHAT THIS LEG DOES NOT REACH, since the row should not claim it: J5's
      three posts cannot produce two CONCURRENT writers to one stream. Main's
@@ -1033,10 +1031,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
         # asserts seq fidelity — frame seq present and equal to the store's —
         # which is exactly the capability the settled view stands on. A frame
         # with a missing or wrong seq is unplaceable, and THAT is the defect.
+        # EVERY reply frame for a post, not only the first: a truthful first
+        # frame must not launder a later duplicate whose seq is missing or
+        # wrong — a client that placed the duplicate would corrupt its view.
+        by_id = Map.new(expected, &{&1.id, &1.committed_seq})
+
         unplaceable =
-          for %{id: id, committed_seq: committed} <- expected,
-              replies[id].frame["seq"] != committed,
-              do: {id, replies[id].frame["seq"], committed}
+          for frame <- frames,
+              assistant_reply?(frame),
+              committed = Map.get(by_id, frame["replyToClientMessageId"]),
+              committed != nil,
+              frame["seq"] != committed,
+              do: {frame["replyToClientMessageId"], frame["seq"], committed}
 
         cross_talk = wrong_stream_replies(frames, expected)
 
