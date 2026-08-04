@@ -362,7 +362,20 @@ defmodule Tightbeam.Harness.Claude do
         body: await response.text()
       }));
     }).catch(error => {
-      process.stderr.write(error.code || error.message);
+      // NAME WHAT ACTUALLY FAILED. `error.code || error.message` reported the string
+      // "fetch failed" for every transport failure there is: on a fetch rejection undici
+      // leaves `code` UNDEFINED on the outer error and puts the real reason -- ENOTFOUND,
+      // ECONNRESET, UND_ERR_CONNECT_TIMEOUT, a TLS failure -- in `error.cause`. So the
+      // fallback always won, and a refusal that exists to report dirt named none of it.
+      // Measured 2026-08-04: a client-e2e leg blocked twice at two SHAs on
+      // `{:transport_exit, 70, "fetch failed"}` with a credential proven live by a 200
+      // from this same endpoint, and the message could not say which transport failed.
+      const cause = error.cause;
+      process.stderr.write(
+        [cause && cause.code, cause && cause.message, error.code, error.message]
+          .filter(Boolean)
+          .join(": ") || "unknown transport failure"
+      );
       process.exitCode = 70;
     });
     """
