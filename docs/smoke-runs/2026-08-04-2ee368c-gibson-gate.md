@@ -188,15 +188,35 @@ because per stream is the guarantee the wire actually makes.
 
 Its claude leg blocked three times out of four on `ETIMEDOUT` at preflight — a name only
 visible because of the probe repair earlier the same night, which was the fix's first
-real use. The lane's own reading was environmental egress flakiness under load, offered
-explicitly as a hypothesis rather than a finding. That was the right way to offer it, and
+real use. Two hypotheses died on the way to the honest answer, one of them mine.
+
+The lane's first reading was environmental egress flakiness under load, offered
+explicitly as a hypothesis rather than a finding. That was the right way to offer it and
 it made it cheap to test: 40 consecutive connects to the probe's exact endpoint, no
 credential, at load average 11.14 — inside the band where the timeouts happened — came
-back 40/40 in under 0.52s with zero failures.
+back 40/40 in under 0.52s with zero failures. Load and egress out.
 
-So load and egress are out, along with the grant and the credential copy, each ruled out
-by a measurement rather than an argument. What survives is narrow and unexplained: the
-same preflight passes against the template directory and fails against a provisioned copy
-of it, twice, at two revisions. That is in ROADMAP as a well-isolated unknown, which is a
-better artifact than a plausible story — the same discipline that took three wrong
-theories off the soak earlier the same night.
+What I wrote in its place was worse: "the variable is isolated to the leg's provisioning
+or invocation context." The lane retracted that against its own data before I could act
+on it, and it was right. A provisioned leg had PASSED outright — whole claude leg green,
+row 10 included — which a base_dir defect cannot do. And the template side was a single
+run, which at the observed failure rate passes by luck about a quarter of the time. Four
+samples against one is not an asymmetry. ETIMEDOUT is a TCP connect failure anyway; a bad
+directory could not produce one.
+
+So the mechanism went from "environmental" to "isolated" to genuinely unknown, and both
+steps toward confidence were wrong.
+
+What measurement does support, taken afterwards: node's `fetch` to that endpoint really
+does fail intermittently from this box — 2 ETIMEDOUT in 400 attempts, each completing in
+~282ms — while curl over IPv4 never failed once. The host advertises an IPv6 address,
+node resolves both families, and IPv6 egress to it is dead from eezo. That ~282ms sits
+close enough to node's 250ms happy-eyeballs attempt timeout to be worth naming, but the
+controlled test was INCONCLUSIVE — 400 attempts with family autoselection on gave 2
+failures, 400 with it off gave 0, and 2 versus 0 is not a result. It is in the record as
+a lead, explicitly not as support.
+
+The question that actually matters is the one none of this answers: a 0.5% base rate does
+not explain a leg failing 3 times in 4. Something in the leg amplifies it by two orders of
+magnitude, and that is where the next person should start — with a measurement, not a
+third story.
