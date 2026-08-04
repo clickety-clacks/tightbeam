@@ -203,7 +203,18 @@ vendor's own `login` does not onboard Tightbeam:
 ```
 
 `<provider>` is the credential provider — **`anthropic`** or **`openai`** — not
-the harness name. `<userId>` is the admin created by that first pairing.
+the harness name. `<userId>` is the admin created by that first pairing. From a
+release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
+is only needed on a source install.
+
+**RUN IT ONCE PER HARNESS YOU INTEND TO USE.** A credential is per provider, and
+onboarding one leaves the other unusable — a session placed on an un-onboarded
+harness fails naming the credential it lacks. The boot summary already lists
+exactly what is missing, one line per provider, with the command for each: if it
+named two, run two. With both installed and nothing chosen, a fresh org defaults
+to the first registered harness; with only one installed, that one is the
+default and its own model comes with it, so a single-harness box needs no model
+configuration at all.
 
 ### Then learn the working identity
 
