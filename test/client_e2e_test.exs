@@ -602,10 +602,12 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "replies shown in an order their OWN stream never committed fail" do
-      # Main delivered slow -> done against a store that committed done -> slow.
-      # This is the shape a publication that does not ride commit order
-      # produces, and the shape ConnRegistry's per-session cursor turns into a
-      # permanently dropped frame.
+      # Main delivered slow -> done against a store that committed done -> slow:
+      # the shape a publication that does not ride commit order produces, and
+      # the shape ConnRegistry's per-session cursor turns into a permanently
+      # dropped frame. This asserts the ORACLE reports it; J5's own three posts
+      # cannot produce it, and the moduledoc says so rather than letting the
+      # row imply coverage it does not have.
       assert j5_oracle(b_answers_last(), [done: 1, slow: 2, b: 3], b_last_turns()) =~
                "an order the store never committed"
     end

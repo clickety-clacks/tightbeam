@@ -144,7 +144,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "within each stream, assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of the store committing it; and one of them ARRIVES, by the driver's clock, strictly inside another of these turns by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together the row is not judged on the client at all: FAIL if Smoke B was enqueued while Main was still running yet never ran beside it (the lanes are not parallel), otherwise INCOMPLETE, because there was no overlap to observe",
+        "within each stream, assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of the store stamping it; and one of them ARRIVES, by the driver's clock, strictly inside another of these turns by the substrate's; Main's two turns complete in post order. A missing reply, cross-talk, a non-delivered turn row and Main's own two turns out of order fail the row whatever the lanes did. Past those, when the substrate never ran the lanes together the delivery legs are not asked at all: FAIL if Smoke B was enqueued while Main was still running yet never ran beside it (the lanes are not parallel), otherwise INCOMPLETE, because there was no overlap to observe",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -912,8 +912,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {ctx, [immediate, delayed]}
   end
 
-  # How long a reply may trail the close of its own turn and still count as
-  # delivered live. The path measures 0-1ms end to end (append -> publish ->
+  # How long a reply may trail its own store stamp and still count as delivered
+  # live. The path measures 0-1ms end to end (stamp -> commit -> publish ->
   # client frame, all on one host); a second is three orders of magnitude above
   # that and an order below what a person would notice as waiting, so what
   # crosses it is a frame that waited for something.
@@ -944,7 +944,17 @@ defmodule Tightbeam.ClientE2E.Journeys do
      wire makes: `ConnRegistry` keeps its delivered-seq cursor per session, and
      two streams' publications are independent, so one lane committing before
      another and publishing after it is ordinary concurrency rather than a
-     defect. A global order would fail healthy runs;
+     defect. A global order would fail healthy runs.
+
+     WHAT THIS LEG DOES NOT REACH, since the row should not claim it: J5's
+     three posts cannot produce two CONCURRENT writers to one stream. Main's
+     two turns are serialized by its own lane and Smoke B is a second stream
+     with its own cursor, so the drop this leg is shaped to catch — a publish
+     out of commit order inside ONE session, which the cursor then suppresses
+     forever — is not reachable from this journey. Reaching it needs two
+     writers to one session at once (a client post's echo against a marker
+     appended by something else), which is a different construction than three
+     posts from one client;
   4. each reply carried the sessionKey of the stream it answers, and so did the
      terminal turn-state frame it is judged against. Correlating that frame by
      `messageId` alone would let one labelled with the wrong stream stand in for
@@ -956,14 +966,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
      held reply was committed last anyway. A turn whose terminal state never
      reached the client fails here too: an indicator left spinning is not a
      delivered turn;
-  6. EVERY reply reached the client within `budget_ms` of the moment it was
-     COMMITTED (`committed_at`, `messages.timestamp`, stamped inside the append
-     transaction; a reply with no commit stamp fails here rather than skipping
-     the check). Against the COMMIT and not against `turns.endedAt`: the lane
-     writes `endedAt` after the runner returns and the runner publishes before
-     returning, so a stalled publication drags `endedAt` along with it and
-     cannot measure its own delay. Commit-to-client is also the whole seam the
-     defect lives in — append commits, then the caller publishes.
+  6. EVERY reply reached the client within `budget_ms` of its own store stamp
+     (`committed_at`, `messages.timestamp`, taken as the row is inserted; a
+     reply with no stamp fails here rather than skipping the check). The
+     interval it measures is stamp -> commit -> publish -> frame, so a slow
+     COMMIT counts against it as well as a slow publication; that is honest
+     about what a client waited for, and the commit itself is microseconds of a
+     one-second budget.
+
+     Against the stamp and NOT against `turns.endedAt`, which is the timestamp
+     this leg used to trust: the lane writes `endedAt` after the runner returns
+     and the runner publishes before returning, so a stalled publication drags
+     `endedAt` along with it and the bound measured the delay against itself.
 
      This is the one leg with a number in it. A frame that arrives eventually,
      in the right order, behind its own already-closed turn has no edge to be
@@ -1046,7 +1060,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
           (late = late_arrivals(expected, replies, budget_ms)) != [] ->
             "#{inspect(late)} reached the client more than #{budget_ms}ms after the store " <>
-              "committed it — delivered, but not delivered live"
+              "stamped it — delivered, but not delivered live"
 
           not cross_lane_live?(expected, replies) ->
             "no reply arrived while another of these streams' turns was still open — " <>

@@ -244,7 +244,7 @@ on 2026-07-25:
     arrives before its own turn's terminal state (a reply held behind the close
     of its own turn is a delayed frame even when it was committed last anyway);
     each lands in the stream it was posted to (no cross-talk); each reaches the
-    client within a second of the moment the STORE COMMITTED it — `messages.
+    client within a second of the moment the STORE STAMPED it — `messages.
     timestamp`, not `turns.endedAt`, which is written after publication and so
     moves along with any stall it might have measured (a frame that arrives
     eventually, in the right order, long after its commit is a delayed frame —

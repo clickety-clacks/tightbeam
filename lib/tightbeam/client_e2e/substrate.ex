@@ -125,10 +125,11 @@ defmodule Tightbeam.ClientE2E.Substrate do
   @doc """
   Messages for a session in stream order (the transcript the client replays).
 
-  `timestamp` is stamped inside the append transaction, so it dates the COMMIT.
-  `turns.endedAt` does not: the lane writes it after the runner returns, and the
-  runner publishes before it returns, so a stalled publication moves `endedAt`
-  along with itself and cannot measure its own delay.
+  `timestamp` is taken as the row is inserted, inside the append transaction —
+  so it dates the write, a hair before the commit that follows it. It is the
+  only clock in the store that a stalled PUBLICATION cannot move: the lane
+  writes `turns.endedAt` after the runner returns, and the runner publishes
+  before it returns, so `endedAt` travels with any delay it might have measured.
   """
   @spec messages(base_dir(), String.t()) :: [map()]
   def messages(base_dir, session_key) do
