@@ -25,32 +25,32 @@ defmodule Tightbeam.Application do
     if Application.get_env(:tightbeam, :autostart, true) do
       config = production_config()
 
+      # ONE refusal is quiet here, and it is the one that was asked for: a first run
+      # with no registered harness CLI on PATH (task #23 — measured on shrdlu from the
+      # npm tarball, the most ordinary first-run state there is).
+      #
+      # This used to also wrap `start_tree/1` in a try/rescue naming two more refusals,
+      # a stale database (Schema.ShapeError) and an identity tree missing its refs.
+      # NEITHER ARM COULD EVER FIRE, so neither changed any behaviour:
+      #
+      #   * the identity refusal raises inside `Gateway.preflight/1`, which is called
+      #     BEFORE the try — measured, from this repo's own boot:
+      #       (ArgumentError) identity repository is missing required refs: ...
+      #         gateway.ex:356: Tightbeam.Gateway.preflight/1
+      #         application.ex:28: Tightbeam.Application.start/2
+      #   * `Schema.ShapeError` is raised by `Schema.ensure_all/1` inside
+      #     `Boot.start_link/1`, a SUPERVISED CHILD. A child's raise never reaches the
+      #     caller as an exception; `Supervisor.start_link/2` RETURNS
+      #     {:error, {:shutdown, {:failed_to_start_child, Tightbeam.Boot, ...}}}.
+      #
+      # So both states still produced the crash dump the guard existed to prevent, while
+      # the code asserted they did not. Making them work would be a new behaviour change
+      # with nothing requiring it, so the dead arms are deleted instead: neither state
+      # arises on the fresh install this refusal is for. If a quiet refusal is ever
+      # wanted for them, it needs its own authority and its own test.
       case Tightbeam.Gateway.preflight(config) do
-        :ok ->
-          # The SAME expected-refusal shape, raised rather than returned: a database
-          # from an older build (Schema.ShapeError) and an identity tree missing its
-          # required refs both name a state an operator must resolve, and both would
-          # otherwise reach application_controller as a kernel panic with a dump. Only
-          # these two named refusals are caught — anything else is a defect and must
-          # still crash with its dump.
-          try do
-            start_tree(config)
-          rescue
-            error in [Tightbeam.Schema.ShapeError] ->
-              refuse(Exception.message(error))
-
-            error in [ArgumentError] ->
-              message = Exception.message(error)
-
-              if String.contains?(message, "identity repository is missing required refs") do
-                refuse(message)
-              else
-                reraise error, __STACKTRACE__
-              end
-          end
-
-        {:error, {:no_harness_cli, message}} ->
-          refuse(message)
+        :ok -> start_tree(config)
+        {:error, {:no_harness_cli, message}} -> refuse(message)
       end
     else
       # Test env: unit tests own their supervision; boot the tree explicitly.
@@ -91,10 +91,13 @@ defmodule Tightbeam.Application do
   # ONLY NAMED, EXPECTED refusals come here. An unexpected exception must still crash
   # loudly with its dump: a real defect that exits quietly is the silence this codebase
   # spent a night removing.
-  @doc false
-  # Test seam: the refusal DECISION is reachable without taking the VM down with it.
-  def refuse_for_test(message), do: refuse(message)
-
+  # NO TEST SEAM. This path had a public `refuse_for_test/1` and a `:refusal_exit`
+  # config hook so a unit test could reach the decision without halting the VM. That put
+  # a switch in a production-trusted path which, if ever set or leaked, would let a
+  # release keep booting past a refusal it had just printed — silence wearing a message,
+  # arranged for the convenience of a test. The refusal is now proven the only way it
+  # can honestly be proven: by booting the application in a subprocess with no harness
+  # CLI on PATH and reading its exit status and stderr (application_refusal_test.exs).
   defp refuse(message) do
     # STDERR FIRST, SYNCHRONOUSLY. `Logger.error/1` is asynchronous and `System.halt/1`
     # does not flush it — measured: the first version of this fix exited 1 with a
@@ -103,12 +106,7 @@ defmodule Tightbeam.Application do
     # the Logger call stays for anything capturing structured logs.
     IO.puts(:stderr, message)
     Logger.error(message)
-
-    case Application.get_env(:tightbeam, :refusal_exit, :halt) do
-      :halt -> System.halt(1)
-      # Tests assert the DECISION without taking the VM down with them.
-      fun when is_function(fun, 1) -> fun.(message)
-    end
+    System.halt(1)
   end
 
   # Never allowed to break a boot that would otherwise have succeeded: this is a

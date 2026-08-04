@@ -221,6 +221,15 @@ defmodule Tightbeam.Soak do
       load_errors: [],
       kill_events: [],
       kill_index: 0,
+      # Gateway deaths NOBODY ASKED FOR. `ensure_gateway/1` restores service on the next
+      # tick, and without this it would restore it silently — so a gateway that crashed
+      # on its own between two ticks could be replaced before the next load and the run
+      # could still score PASS. Restoring the arena and scoring the product are separate
+      # jobs; the repair must not erase the evidence.
+      spontaneous_exits: [],
+      # The port of a gateway that WAS signalled but outlived its await window. Its exit
+      # is late, not spontaneous, and must not be counted against the product.
+      expected_late_exit: nil,
       started_at: now,
       deadline: now + options.minutes * 60_000,
       next_load: now,
@@ -524,9 +533,18 @@ defmodule Tightbeam.Soak do
           {true, "#{signal} gateway pid=#{pid} exit=#{status}; restart pending: #{reason}", state}
       end
     else
-      {:error, reason, state} -> {false, reason, state}
-      {:error, reason} -> {false, inspect(reason), state}
-      {output, status} -> {false, "kill exited #{status}: #{String.trim(output)}", state}
+      # The signal landed and the gateway did not exit in time. Its eventual exit is
+      # ATTRIBUTABLE to this kill, so mark it expected: otherwise `drain_gateway_output/1`
+      # would see the death on a later tick and score it against the product as a
+      # spontaneous crash. Measured on 2026-08-04: a SIGTERM took 91s against a 60s await.
+      {:error, reason, state} ->
+        {false, reason, %{state | expected_late_exit: state.gateway}}
+
+      {:error, reason} ->
+        {false, inspect(reason), state}
+
+      {output, status} ->
+        {false, "kill exited #{status}: #{String.trim(output)}", state}
     end
   end
 
@@ -704,9 +722,31 @@ defmodule Tightbeam.Soak do
         drain_gateway_output(state)
 
       {^port, {:exit_status, status}} ->
-        log_event(state, "gateway unexpected_exit status=#{status}")
         Process.delete(:tightbeam_soak_gateway)
-        %{state | gateway: nil, token: nil}
+
+        if state.expected_late_exit == port do
+          # Attributable: this gateway was signalled by a kill that gave up waiting.
+          log_event(
+            state,
+            "gateway late_exit status=#{status} (attributed to the kill that signalled it)"
+          )
+
+          %{state | gateway: nil, token: nil, expected_late_exit: nil}
+        else
+          # NOBODY ASKED FOR THIS ONE. Record it as an offender before `ensure_gateway/1`
+          # restores service, or the repair silently erases the product's crash.
+          log_event(
+            state,
+            "gateway unexpected_exit status=#{status} — NOT attributable to any kill"
+          )
+
+          %{
+            state
+            | gateway: nil,
+              token: nil,
+              spontaneous_exits: state.spontaneous_exits ++ [%{status: status, at: wall_ms()}]
+          }
+        end
     after
       0 -> state
     end
@@ -959,7 +999,10 @@ defmodule Tightbeam.Soak do
         []
       end
 
-    offenders = event_offenders ++ missing_kinds
+    # A gateway that died on its own is an A5 failure even though the arena repaired it.
+    unbidden = Enum.map(state.spontaneous_exits, &{:gateway_died_unbidden, &1})
+
+    offenders = event_offenders ++ missing_kinds ++ unbidden
     {"A5", offenders == [], offenders}
   end
 

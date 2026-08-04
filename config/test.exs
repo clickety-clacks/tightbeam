@@ -23,9 +23,3 @@ config :tightbeam, :autostart, false
 config :tightbeam, :local_host_name, "testhost"
 config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp
-
-# An expected boot refusal HALTS in production (a release must not escalate it into a
-# kernel panic + crash dump — measured on shrdlu from the npm tarball). Tests must be
-# able to observe that decision without taking the test VM down with it, so here the
-# seam returns instead of halting. Production keeps the :halt default.
-config :tightbeam, :refusal_exit, fn message -> {:error, message} end

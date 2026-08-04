@@ -17,7 +17,14 @@ defmodule Tightbeam.MixProject do
 
   # The npm-installable gateway (Flynn rulings 2026-08-03: one package carrying CLI and
   # gateway so the version handshake holds by construction; mix release bundled
-  # per-platform; no registry until a real release — installs are tarball/git URL).
+  # per-platform; no registry until a real release).
+  #
+  # INSTALLS ARE FROM A BUILT TARBALL, NOT FROM THE GIT URL. `packaging/package.json` is
+  # a template that `packaging/assemble.sh` stamps with the version and platform; there
+  # is deliberately no manifest at the repository root, so `npm install <git-url>` has
+  # nothing to install and would fail. The package cannot come from a checkout anyway:
+  # it carries a compiled ERTS and a compiled CLI, so it is built per platform and
+  # shipped as the one file. README documents that path and only that path.
   # `include_executables_for: [:unix]` and bundled ERTS: `npm install` must yield a
   # working install with NO Elixir toolchain on the host — that is the entire point.
   defp releases do
