@@ -42,7 +42,8 @@ defmodule Tightbeam.AdapterCoordinator do
     post-restart ready always outranks a token stamped under an older epoch
     (spec s4-operability-v1 §2). Readiness is tracked explicitly — a fresh entry
     has zero failures and a closed circuit without ever having booted, so only
-    `{:adapter_ready, key}` may mark a key ready.
+    `{:adapter_ready, key, pid}` may mark a key ready, and only for the
+    INSTANCE it names.
   - FAILURE MEMORY is ATTEMPT-SCOPED: `last_failure` records {generation, reason}
     and is only served to a caller asking about that same generation. A
     replacement adapter's death must never be labelled with its predecessor's
@@ -258,6 +259,12 @@ defmodule Tightbeam.AdapterCoordinator do
        on_adapter_ready: Keyword.get(opts, :on_adapter_ready, fn _key_name, _token -> :ok end),
        adapters: %{},
        monitors: %{},
+       # Monitor refs of adapter INSTANCES that completed boot. Readiness on the
+       # entry describes whichever adapter the entry currently points at, which
+       # for an absorbed death is the REPLACEMENT — so a question about the
+       # instance that just died has to be keyed on something unique to it, and
+       # its monitor ref is exactly that.
+       ready_refs: MapSet.new(),
        context_requests: %{},
        load_active: %{},
        load_queue: %{}
@@ -469,6 +476,67 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
+  # A death is told to the sessions RESIDENT on the dead engine, not just to the
+  # events table. "[adapter recovered]" already reaches those readers when the
+  # replacement comes up (Adjudication.probe_prompt/0); without this they only
+  # ever saw the good news, and a turn that stopped for an engine fault read as
+  # a prompt that vanished — with no marker of its own, because the failure
+  # path publishes terminal turn-state and no chat line.
+  defp record_adapter_down(state, key, was_ready?, reason, absorbed?) do
+    name = key_name(key)
+
+    Tightbeam.EventLog.notice(
+      state.db,
+      "adapter_down",
+      name,
+      "#{inspect(reason)} absorbed=#{absorbed?}",
+      audience: {:sessions, told_sessions(state.db, key, was_ready?)},
+      attention: :normal,
+      message:
+        "[adapter down]\n\nThe #{name} engine stopped: #{inspect(reason)}. Anything " <>
+          "that was running on it stopped with it. Tightbeam restarts the engine and " <>
+          "releases this session when it is ready again."
+    )
+  end
+
+  # Who is told. THE MESSAGE CLAIMS ONLY WHAT IS CERTAIN — this engine stopped —
+  # so the audience needs no turn attribution, and with it goes a whole family
+  # of ways to be wrong. Three reviews died on the attribution question: which
+  # sessions a given adapter INSTANCE halted is not a fact this substrate
+  # records. Generation is the only stamp and `start_adapter_unfenced/4` reuses
+  # it for a replacement, so an instance is indistinguishable from its
+  # successor; `adapterGen IS NULL` covers both "checked this adapter out" and
+  # "has not reached checkout"; and the lane can finalize the turn from the same
+  # death before this handler runs. Every predicate over that state is an
+  # inference, and this message is read by a person.
+  #
+  # Attributing nothing is not a weaker claim, it is a TRUE one: an adapter
+  # death takes the harness context of every session resident on the key,
+  # whether or not that session had a turn in flight. That is worth a line in
+  # each of their chats, and it is the counterpart of the "[adapter recovered]"
+  # probe those same readers already get.
+  #
+  # ONE gate, on `ready`: a key whose adapter never finished booting was serving
+  # nobody, and a boot-failure cascade (five deaths into an open circuit) would
+  # otherwise post five lines to every session on the host. A death during boot
+  # still gets its row; the turn that asked for it gets its own spawn error.
+  defp told_sessions(_db, _key, false = _was_ready?), do: []
+
+  defp told_sessions(db, {harness, "shared", host}, true) do
+    {:ok, rows} =
+      Tightbeam.DB.query(
+        db,
+        "SELECT sessionKey FROM sessions WHERE state = 'active' AND harness = ?1 AND host = ?2",
+        [Atom.to_string(harness), host]
+      )
+
+    Enum.map(rows, fn [session_key] -> session_key end)
+  end
+
+  # Sessions reach a key the way the gateway builds one — harness and host,
+  # shared archetype — so a key of any other shape is resident to nobody.
+  defp told_sessions(_db, _key, _was_ready?), do: []
+
   defp retire_adapter(key, state) do
     case state.adapters[key] do
       %{pid: pid, monitor: monitor} = entry ->
@@ -484,7 +552,8 @@ defmodule Tightbeam.AdapterCoordinator do
               if(is_reference(monitor),
                 do: Map.delete(state.monitors, monitor),
                 else: state.monitors
-              )
+              ),
+            ready_refs: MapSet.delete(state.ready_refs, monitor)
         }
 
       _ ->
@@ -506,7 +575,16 @@ defmodule Tightbeam.AdapterCoordinator do
          finish_context_request(request, {:error, {:context_worker_exit, reason}}, state)}
 
       key = state.monitors[ref] ->
-        state = %{state | monitors: Map.delete(state.monitors, ref)}
+        # Was the instance that just died a WORKING engine? Asked of the ref, so
+        # the answer survives a replacement having already taken the entry over.
+        was_ready? = MapSet.member?(state.ready_refs, ref)
+
+        state = %{
+          state
+          | monitors: Map.delete(state.monitors, ref),
+            ready_refs: MapSet.delete(state.ready_refs, ref)
+        }
+
         entry = Map.fetch!(state.adapters, key)
 
         # Stale-:DOWN guard: adapter_for may observe a dead pid
@@ -515,10 +593,19 @@ defmodule Tightbeam.AdapterCoordinator do
         # the death was already absorbed by that replacement — treating it as
         # a fresh death would nil the new adapter's pid and schedule a
         # spurious restart (adapter leak). Dropping the ref is the cleanup.
-        if entry.monitor == ref do
-          :ok =
-            Tightbeam.EventLog.lifecycle(state.db, "adapter_down", key_name(key), inspect(reason))
+        #
+        # The guard covers the ACTION, not the RECORD (#14). An absorbed death
+        # is still a death: a harness process really exited and whatever was
+        # running on it really stopped. Recording inside the guard made a
+        # fast-recovered fault indistinguishable from no fault at all — so the
+        # record and its notice are unconditional here, and the absorbed ones
+        # say so in their detail.
+        absorbed? = entry.monitor != ref
+        :ok = record_adapter_down(state, key, was_ready?, reason, absorbed?)
 
+        if absorbed? do
+          {:noreply, state}
+        else
           case Tightbeam.HarnessProcess.reconcile_key(state.db, key) do
             :ok ->
               :ok
@@ -563,8 +650,6 @@ defmodule Tightbeam.AdapterCoordinator do
           }
 
           {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
-        else
-          {:noreply, state}
         end
 
       load_slot = slot_for_monitor(state.load_active, ref) ->
@@ -576,16 +661,22 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  def handle_info({:adapter_ready, key}, state) do
+  def handle_info({:adapter_ready, key, pid}, state) do
     case state.adapters[key] do
-      %{pid: pid} = entry when is_pid(pid) ->
+      %{pid: ^pid} = entry when is_pid(pid) ->
         entry = %{entry | failures: 0, circuit: :closed, ready: true, last_failure: nil}
+        state = %{state | ready_refs: put_ready_ref(state.ready_refs, entry.monitor)}
         # EDGE half of the heal trigger. The hook is invoked with the FULL token
         # so the sweep can decide replay-vs-new without asking us back (and
         # without this process ever blocking on a DB transaction).
         state.on_adapter_ready.(key_name(key), {state.epoch, entry.generation})
         {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
 
+      # A ready message from an instance this entry no longer points at. It
+      # died between announcing and being heard; the entry now describes a
+      # successor that has not booted, and crediting it would declare a
+      # not-yet-serving adapter ready — and fire the heal EDGE against the
+      # wrong generation.
       _ ->
         {:noreply, state}
     end
@@ -649,7 +740,13 @@ defmodule Tightbeam.AdapterCoordinator do
           opts
         end
 
-      Keyword.put(opts, :on_ready, fn -> send(coordinator, {:adapter_ready, key}) end)
+      # The message NAMES THE INSTANCE that booted. `on_ready` runs in the
+      # adapter's own process, so self() here is that adapter. Without it the
+      # coordinator can only credit whichever pid the entry holds when the
+      # message is finally processed — and an adapter that dies between
+      # announcing readiness and being heard would hand its credit to the
+      # replacement, which has not booted.
+      Keyword.put(opts, :on_ready, fn -> send(coordinator, {:adapter_ready, key, self()}) end)
     end
 
     child = %{
@@ -665,7 +762,7 @@ defmodule Tightbeam.AdapterCoordinator do
         generation = max(entry.generation, 1)
 
         # Boot is LAZY: a spawned pid proves nothing. failures/circuit are
-        # reset only by {:adapter_ready, key} — the completed-boot signal.
+        # reset only by {:adapter_ready, key, pid} — the completed-boot signal.
         entry = %{
           entry
           | pid: pid,
@@ -803,6 +900,11 @@ defmodule Tightbeam.AdapterCoordinator do
         state
     end
   end
+
+  defp put_ready_ref(ready_refs, monitor) when is_reference(monitor),
+    do: MapSet.put(ready_refs, monitor)
+
+  defp put_ready_ref(ready_refs, _monitor), do: ready_refs
 
   defp live_entry?(entry), do: is_pid(entry.pid) and Process.alive?(entry.pid)
   defp checkout(entry), do: {:ok, entry.pid, entry.generation}

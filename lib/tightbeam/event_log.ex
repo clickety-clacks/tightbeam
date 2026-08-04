@@ -9,10 +9,21 @@ defmodule Tightbeam.EventLog do
   Crash recording is BY INFERENCE (spec: lifecycle acceptance): a boot epoch
   with no clean-shutdown stamp is recorded as a dirty exit at the NEXT boot.
   No component claims to log its own death.
+
+  `lifecycle/4` writes a row and stops there, which is right for the events
+  nobody needs woken for. An event that HAPPENED TO SOMEONE goes through
+  `notice/5` instead: same row, plus the chat marker its audience reads. One
+  call owns both halves on purpose — see `notice/5`.
   """
 
+  require Logger
+
+  alias Tightbeam.ConnRegistry
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Org
+  alias Tightbeam.Projection
+  alias Tightbeam.Wire.Payloads
 
   @type db :: GenServer.server()
 
@@ -226,6 +237,142 @@ defmodule Tightbeam.EventLog do
     )
 
     :ok
+  end
+
+  ## Record-and-notify
+
+  @typedoc """
+  Who hears about an event, decided by the caller that records it.
+
+  - `{:session, key}` / `{:sessions, keys}` — the sessions the event happened
+    TO. A key with no active session is a log line, never a queued message and
+    never a session created on demand.
+  - `{:ambient, user_id}` — that user's main session, by the same rule.
+  - `:record_only` — the row is the whole story; nobody is interrupted.
+
+  There is no "the owner": a Tightbeam serves several, so an ambient audience
+  NAMES the one it means rather than inferring a house owner.
+  """
+  @type audience ::
+          {:session, String.t()}
+          | {:sessions, [String.t()]}
+          | {:ambient, String.t()}
+          | :record_only
+
+  @doc """
+  Record an event AND tell whoever it happened to, in one call.
+
+  The lifecycle row is always written — the table is the dashboard-shaped
+  record and stays whatever the audience is. What varies is who is
+  interrupted, and THAT decision is made here, at the site that knows the
+  event, because a `notice` that could be split into "record now, notify
+  maybe later" is how faults ended up in a table no client reads while
+  recoveries reached the chat.
+
+  Options:
+  - `:audience` (required) — see `t:audience/0`.
+  - `:message` (required unless `:record_only`) — the sentence a human reads
+    in the chat. `detail` is for the record and is usually `inspect/1` output;
+    they are different registers and neither is derived from the other. There
+    is no kind-to-text registry.
+  - `:attention` (required unless `:record_only`) — `:low` for ambient info a
+    client hides by default, `:normal` for a fault that affected this session,
+    `:high` for something that needs a human now.
+  - `:conn_registry` — injected in tests; defaults to `Tightbeam.ConnRegistry`.
+  """
+  @spec notice(db(), String.t(), String.t(), String.t() | nil, keyword()) :: :ok
+  def notice(db \\ Tightbeam.DB, kind, subject, detail, opts) do
+    audience = Keyword.fetch!(opts, :audience)
+
+    {message, attention} =
+      case audience do
+        :record_only ->
+          {nil, nil}
+
+        _ ->
+          {Keyword.fetch!(opts, :message), Keyword.fetch!(opts, :attention)}
+      end
+
+    {:ok, {appended, undeliverable}} =
+      DB.transaction(db, fn txn ->
+        lifecycle_in_txn(txn, kind, subject, detail)
+
+        # The record and the markers commit together: a crash between them
+        # would leave exactly the split this function exists to prevent.
+        Enum.reduce(candidates(audience), {[], []}, fn session_key, {appended, undeliverable} ->
+          case active_owner(txn, session_key) do
+            nil ->
+              {appended, [session_key | undeliverable]}
+
+            owner ->
+              {:appended, marker} =
+                Projection.append_marker_in_txn(txn, session_key, message, attention)
+
+              {[{session_key, owner, marker} | appended], undeliverable}
+          end
+        end)
+      end)
+
+    registry = Keyword.get(opts, :conn_registry, ConnRegistry)
+
+    Enum.each(Enum.reverse(undeliverable), fn session_key ->
+      Logger.info(
+        "#{kind} for #{subject} was not delivered to #{session_key}: no active session there"
+      )
+    end)
+
+    Enum.each(Enum.reverse(appended), &publish_marker(registry, &1))
+  end
+
+  defp candidates(:record_only), do: []
+  defp candidates({:session, session_key}), do: [session_key]
+  defp candidates({:sessions, session_keys}), do: session_keys
+  defp candidates({:ambient, user_id}), do: [Org.personal_session_key(user_id)]
+
+  # Read through the transaction handle, not Org: a `DB.query` from inside a
+  # transaction re-enters the owner process that is running it.
+  #
+  # The OWNER comes back with the answer rather than being re-read after the
+  # commit. `ownerUserId` is NOT NULL, so nil here means exactly one thing —
+  # no active session by that key — and the publish below then needs no second
+  # trip through the single-writer DB owner. That trip was the wide half of
+  # the publication race: it can queue behind another session's transaction,
+  # during which the lane that owns this session can commit AND publish a
+  # LATER seq, and ConnRegistry drops an earlier one for good once a
+  # connection's watermark has passed it.
+  defp active_owner(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1 AND state = 'active'",
+           [session_key]
+         ) do
+      [[owner]] -> owner
+      [] -> nil
+    end
+  end
+
+  # The durable half is already committed by the time we get here, so a fan-out
+  # that cannot run is a DELIVERY delay, not a lost event: the marker replays to
+  # the next socket that drains this session. Letting the exit through would
+  # take out the caller — a dying adapter's own coordinator, in the case that
+  # found this — over a process whose absence means the wire is down anyway.
+  defp publish_marker(registry, {session_key, owner, marker}) do
+    ConnRegistry.publish_message(
+      registry,
+      session_key,
+      owner,
+      marker.seq,
+      Payloads.server_message(marker),
+      fn pid, payload -> send(pid, {:push_message, session_key, marker.seq, payload}) end
+    )
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "live push of #{session_key} seq #{marker.seq} failed (#{inspect(reason)}); " <>
+          "the message is stored and replays on the next connect"
+      )
+
+      :ok
   end
 
   @doc "All lifecycle events, oldest first."

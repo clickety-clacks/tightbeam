@@ -43,6 +43,16 @@ defmodule Tightbeam.Wire.Payloads do
   - `[turn failed]` — the turn reached a terminal failure and no reply is
     coming; the body carries the human-readable reason. Covers both
     in-band failures and crash-recovered "interrupted: outcome unknown".
+  - `[adapter down]` — the harness engine this session runs on died and took
+    the running turn with it; `[adapter recovered]` follows when the
+    replacement is ready.
+
+  Markers carry `attentionTier` like any other message. The substrate elects
+  it the way an agent elects its reply's, over the SAME vocabulary, and -1
+  (low) is the tier for ambient information a client is expected to hide by
+  default. A client that hides low-attention messages must still replay and
+  store them: elevation is a new, higher-attention message referencing the
+  event, so the hidden record is what the elevated one refers back to.
 
   Conditional-key rules from the TS reference (omit, don't nil):
   - server message: deviceId/clientMessageId only when non-nil (user echoes);
