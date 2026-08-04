@@ -793,12 +793,22 @@ defmodule Tightbeam.ClientE2E.Journeys do
       # Main necessarily STARTS after Main ends — using its start time put the
       # serialized case into INCOMPLETE and made the queued-behind FAIL branch
       # unreachable, which a probe confirmed.
+      # EITHER of Main's turns, for the same reason the overlap witness takes
+      # either: B enqueued while Main's SECOND turn was still running had just
+      # as much opportunity to run beside it, and judging only against the first
+      # sent that serialized run to INCOMPLETE — the verdict that means "the
+      # driver could not establish the conditions", when the conditions were
+      # established and the substrate failed them.
       had_opportunity? =
-        with %{"createdAt" => b_created} when is_integer(b_created) <- b_turn,
-             %{"endedAt" => main_end} when is_integer(main_end) <- slow_turn do
-          b_created < main_end
-        else
-          _ -> false
+        case b_turn do
+          %{"createdAt" => b_created} when is_integer(b_created) ->
+            Enum.any?([slow_turn, done_turn], fn
+              %{"endedAt" => ended} when is_integer(ended) -> b_created < ended
+              _ -> false
+            end)
+
+          _ ->
+            false
         end
 
       witness =
