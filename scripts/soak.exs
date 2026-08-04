@@ -9,6 +9,7 @@ defmodule Tightbeam.Soak do
   @recovery_threshold_ms 60_000
   @audit_interval_ms 10 * 60_000
   @kill_kinds [:adapter_sigkill, :gateway_sigterm, :gateway_sigkill, :cancel_turn]
+  @gateway_kill_kinds [:gateway_sigterm, :gateway_sigkill]
 
   def main(argv) do
     options = parse_options(argv)
@@ -317,7 +318,7 @@ defmodule Tightbeam.Soak do
         state
 
       true ->
-        state = drain_gateway_output(state)
+        state = state |> drain_gateway_output() |> ensure_gateway()
         now = monotonic_ms()
 
         state =
@@ -405,12 +406,26 @@ defmodule Tightbeam.Soak do
     started_mono = monotonic_ms()
     log_event(state, "kill ##{event_number} kind=#{kind} start")
 
+    # The port the gateway served from BEFORE the signal. A gateway kill has recovered
+    # only when a DIFFERENT gateway is answering: a shutting-down gateway keeps serving
+    # until it finishes, so `version_ok` alone cannot tell "my replacement is up" from
+    # "the process I just signalled has not finished dying". Measured 2026-08-04: a
+    # SIGTERM under load took 91s to exit, the 60s await gave up WITHOUT restarting, the
+    # doomed gateway answered version in 12ms, the row scored recovered=true — and the
+    # run then fired its remaining 27 kills at a closed socket for 53 minutes.
+    pre_kill_gateway = state.gateway
+
     {action_ok?, detail, state} = execute_kill(kind, state)
 
     {recovered?, recovery_ms, state, recovery_detail} =
       case wait_for_version(state, @recovery_threshold_ms) do
         {:ok, latency, state} ->
-          {true, monotonic_ms() - started_mono, state, "version_ok poll=#{latency}ms"}
+          if kind in @gateway_kill_kinds and state.gateway == pre_kill_gateway do
+            {false, monotonic_ms() - started_mono, state,
+             "version answered by the gateway that was signalled — no replacement was started"}
+          else
+            {true, monotonic_ms() - started_mono, state, "version_ok poll=#{latency}ms"}
+          end
 
         {:error, reason, state} ->
           {false, monotonic_ms() - started_mono, state, reason}
@@ -655,6 +670,28 @@ defmodule Tightbeam.Soak do
         end
     end
   end
+
+  # The arena's own precondition: a soak against a dead port measures nothing. Nothing
+  # outside this script restarts the arena gateway, and `drain_gateway_output/1` only
+  # RECORDS `unexpected_exit` before carrying on — so one gateway that outlived its await
+  # window silently turned the last 53 minutes of a 60-minute run into kills fired at a
+  # closed socket, every one of them scored as a failure of the product. Restoring the
+  # gateway here keeps the arena's absence from being read as the substrate's.
+  defp ensure_gateway(%{gateway: nil} = state) do
+    log_event(state, "gateway absent — restarting the arena gateway before continuing")
+
+    case start_gateway(state) do
+      {:ok, state} ->
+        log_event(state, "arena gateway restarted")
+        state
+
+      {:error, reason, state} ->
+        log_event(state, "arena gateway restart FAILED: #{reason}")
+        state
+    end
+  end
+
+  defp ensure_gateway(state), do: state
 
   defp drain_gateway_output(%{gateway: nil} = state), do: state
 
