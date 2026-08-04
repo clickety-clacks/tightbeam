@@ -2261,6 +2261,10 @@ defmodule Tightbeam.AdapterHealTest do
         assert reason != nil
       end)
 
+    # The identifiers, not just the phrases: the log is the only artifact this
+    # path leaves, so it must name WHICH session and WHAT failed.
+    assert log =~ "model adjudication for k1"
+    assert log =~ "condition=other"
     assert log =~ "no deliverable owner"
     assert log =~ "logged and done"
 
