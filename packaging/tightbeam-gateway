@@ -42,4 +42,17 @@ if [ -z "${RELEASE_NODE:-}" ]; then
   export RELEASE_NODE
 fi
 
-exec "$DIR/release/bin/tightbeam_gateway" start "$@"
+# EVERY release command goes through here, not just `start`. This used to exec
+# `start "$@"` unconditionally, which left `stop`, `restart`, `remote`, `rpc` and `pid`
+# reachable only by invoking `release/bin/tightbeam_gateway` directly — where the
+# derivation above has not run, so they defaulted to the old `tightbeam_gateway` node and
+# failed `nodedown` against a gateway that was plainly running. A name that only the
+# start path knows is not a name.
+#
+# Those commands find the node by NAME, so they need the same `TIGHTBEAM_PORT` the
+# gateway was started with — the same discipline the README already states for the CLI.
+if [ "$#" -eq 0 ]; then
+  set -- start
+fi
+
+exec "$DIR/release/bin/tightbeam_gateway" "$@"

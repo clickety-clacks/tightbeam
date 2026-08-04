@@ -150,6 +150,12 @@ If a second gateway ever exits complaining that a name `seems to be in use by
 another Erlang node`, that is this: two instances resolved to the same node name,
 almost certainly because they were given the same port.
 
+The release's other commands — `tightbeam-gateway stop`, `remote`, `pid` — find a
+running gateway by that same derived name, so run them with the same
+`TIGHTBEAM_PORT` you started it with. Without it they look for
+`tightbeam_gateway_4321` and report `nodedown` about a gateway that is running
+perfectly well on another port. Same discipline as the CLI, for the same reason.
+
 With at least one usable harness through preflight, the first boot creates the
 base dir and serves, but **cannot run a turn yet**: it has no credentials, so it
 prints a NOT READY summary naming every gap. Harness homes are projected per
