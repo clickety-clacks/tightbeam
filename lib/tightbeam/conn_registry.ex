@@ -24,11 +24,19 @@ defmodule Tightbeam.ConnRegistry do
   currently provides that. Every publication happens AFTER its transaction has
   returned, from the caller's own process — `Projection.append/2` commits at
   projection.ex:95-96 and its caller publishes afterwards — so two writers to
-  one session can commit in one order and publish in the other. When they do,
-  this module drops the earlier frame at :161-162 and a connected client never
-  sees it; only a replay restores it, on reconnect or on a re-auth of the same
-  socket (wire/socket.ex:299-303). This module enforces the per-connection
-  monotonic filter and cannot enforce the ordering it rests on.
+  one session can commit in one order and publish in the other. The window is
+  not simultaneity: it is one publisher pausing between its commit and its
+  publish while another commits AND publishes inside that gap. When that
+  happens this module drops the earlier frame at :161-162 and a connected
+  client never sees it.
+
+  Nor is a replay a reliable repair. Replay serves rows after the client's own
+  cursor (wire/socket.ex:319, `Projection.list_after/5` selecting `seq >`), so
+  it restores the dropped row only while that cursor still sits behind it. A
+  client whose cursor has already advanced past it — because it received the
+  LATER frame — never sees the earlier one again, on reconnect or on a re-auth
+  of the same socket (wire/socket.ex:299-303). This module enforces the
+  per-connection monotonic filter and cannot enforce the ordering it rests on.
 
   The publication sites, every one of them post-commit: gateway.ex:1701 (an
   agent's reply, published from the turn's own task), :1043 (a delivery echo,
@@ -44,12 +52,15 @@ defmodule Tightbeam.ConnRegistry do
   the writes to it. A client post's echo and a running turn's reply are two
   independent writers to one session, from two processes, with nothing ordering
   them against each other. The client-e2e concurrency journey (J5) creates both
-  of those writers on its Main stream — so it is not immune by construction. It
-  is immune only by timing: its three posts land together at the start and the
-  replies commit seconds later, so the two never write at the same instant.
+  of those writers on its Main stream, so the ingredients are present there.
 
-  No reproduction is known. One would need those two writes to land together,
-  which J5 does not arrange and which nothing in the suite currently does.
+  No reproduction is known, and nothing here claims any journey is IMMUNE —
+  that would be a second guarantee asserted without code to back it, which is
+  the mistake this note exists to correct. J5 has not been observed producing
+  it, and it arranges no such window deliberately; whether its commits and
+  publishes can interleave badly is not controlled by anything and has not been
+  measured. A deliberate reproduction would hold one writer between its commit
+  and its publish while a second writer completes both.
 
   Fixing this is a design in its own right and is not attempted here.
   """
