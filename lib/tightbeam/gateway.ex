@@ -714,10 +714,10 @@ defmodule Tightbeam.Gateway do
               {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
                 [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
 
-            {_name, %{ssh: nil}} ->
-              []
-          end)
-          |> Enum.sort_by(& &1.name)
+              {_name, %{ssh: nil}} ->
+                []
+            end)
+            |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
         end),
@@ -894,40 +894,59 @@ defmodule Tightbeam.Gateway do
       nil ->
         :skipped
 
-      {target, role_ref, role_fallback} ->
-        input = %{
-          session_key: target,
-          role: "user",
-          content: stamped,
-          device_id: opts[:device_id],
-          client_message_id: opts[:client_message_id],
-          attachments: opts[:attachments] || [],
-          sender: opts[:sender]
-        }
+      {target, role_ref, role_fallback} when not is_nil(target) ->
+        if Ledger.enqueueable_in_txn?(txn, target) do
+          append_and_enqueue_in_txn(
+            txn,
+            target,
+            role_ref,
+            role_fallback,
+            origin,
+            stamped,
+            opts
+          )
+        else
+          # Asked BEFORE the echo, because the echo commits in this same
+          # transaction and a raise is not available to take it back (it would
+          # roll the caller's wake `fired` mark back with it). The ledger still
+          # refuses independently — it is the single writer — but a message with
+          # no turn is history nobody can answer, so nothing is written at all.
+          refuse_undeliverable_turn(txn, target, origin, opts)
+        end
+    end
+  end
 
-        case Projection.append_in_txn(txn, input) do
-          {:appended, message} ->
-            {assignment_id, job_ref} = turn_attribution(txn, opts)
+  defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
+    input = %{
+      session_key: target,
+      role: "user",
+      content: stamped,
+      device_id: opts[:device_id],
+      client_message_id: opts[:client_message_id],
+      attachments: opts[:attachments] || [],
+      sender: opts[:sender]
+    }
 
-            Ledger.enqueue_in_txn(txn, %{
-              session_key: target,
-              message_id: message.id,
-              wake_id: opts[:wake_id],
-              origin: origin,
-              prompt: stamped,
-              role_ref: role_ref || opts[:role_ref],
-              role_fallback: role_fallback || opts[:role_fallback] || false,
-              assignment_id: assignment_id,
-              job_ref: job_ref
-            })
+    case Projection.append_in_txn(txn, input) do
+      {:appended, message} ->
+        {assignment_id, job_ref} = turn_attribution(txn, opts)
 
-            if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
-              DB.Txn.q(
-                txn,
-                "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-                [opts[:wake_id], System.system_time(:millisecond)]
-              )
-            end
+        enqueued =
+          Ledger.enqueue_in_txn(txn, %{
+            session_key: target,
+            message_id: message.id,
+            wake_id: opts[:wake_id],
+            origin: origin,
+            prompt: stamped,
+            role_ref: role_ref || opts[:role_ref],
+            role_fallback: role_fallback || opts[:role_fallback] || false,
+            assignment_id: assignment_id,
+            job_ref: job_ref
+          })
+
+        case enqueued do
+          {:ok, _seq} ->
+            fire_wake_in_txn(txn, opts)
 
             # Nag-by-re-arm: a bracket wake that just fired re-arms its
             # replacement IN this transaction if the item is still holderless
@@ -938,9 +957,39 @@ defmodule Tightbeam.Gateway do
 
             {:appended, target, message, opts}
 
-          other ->
-            other
+          # The ledger is the single writer and refuses on its own authority, so
+          # this stays reachable for any future caller even though the check
+          # above already declined this one in the same transaction.
+          {:error, :no_session} ->
+            refuse_undeliverable_turn(txn, target, origin, opts)
         end
+
+      other ->
+        other
+    end
+  end
+
+  # The wake is still CONSUMED — leaving it pending would redeliver the same
+  # undeliverable notice every tick — and the loss is named rather than left as
+  # a queued row nobody can claim.
+  defp refuse_undeliverable_turn(txn, target, origin, opts) do
+    fire_wake_in_txn(txn, opts)
+
+    Logger.error(
+      "refusing a turn addressed to #{target}: no session row exists for that key " <>
+        "(origin=#{origin} wake=#{opts[:wake_id] || "none"} sender=#{opts[:sender] || "none"})"
+    )
+
+    :skipped
+  end
+
+  defp fire_wake_in_txn(txn, opts) do
+    if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
+      DB.Txn.q(
+        txn,
+        "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+        [opts[:wake_id], System.system_time(:millisecond)]
+      )
     end
   end
 
@@ -1036,9 +1085,22 @@ defmodule Tightbeam.Gateway do
         {session_key, nil, false}
 
       _ when gate.reresolve == "lineage" ->
+        # Re-resolution answers "who owns this now", and NOBODY is one of the
+        # answers. Until the ladder could say so, a notice whose recorded target
+        # had gone was re-addressed to a composed personal key that named no
+        # session, and the substrate queued it there forever.
         case Supervision.ladder_target(txn, gate.reresolve_seed, gate.reresolve_rung) do
-          nil -> nil
-          target -> {target, nil, false}
+          nil ->
+            Logger.error(
+              "substrate notice for #{session_key} is undeliverable: re-resolving the lineage " <>
+                "from #{gate.reresolve_seed} rung #{gate.reresolve_rung} found no active " <>
+                "session to own it"
+            )
+
+            nil
+
+          target ->
+            {target, nil, false}
         end
 
       _ ->
@@ -1790,6 +1852,7 @@ defmodule Tightbeam.Gateway do
   defp adjudication_model_inventories(session) do
     Map.new(Harness.all(), fn module ->
       {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
+
       {module.wire_name(),
        %{health: inspect(health), models: Enum.map(models, &ModelCatalog.describe_entry/1)}}
     end)
@@ -4772,6 +4835,7 @@ defmodule Tightbeam.Gateway do
            ) do
         {:ok, {:applied, delivery, wake_id}} ->
           complete_delivery(db, delivery)
+
           Map.merge(published_identity(applied_model), %{
             ok: true,
             action: "swap",

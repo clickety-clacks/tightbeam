@@ -271,4 +271,46 @@ defmodule Tightbeam.LaneTest do
     {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
     assert status == "failed_unknown"
   end
+
+  # The backstop, driven by the reconciler exactly as a real orphan is: the scan
+  # feeds a session whose queued work no claim can reach, the lane names the
+  # cause instead of nudging forever, and the named terminal rides the SAME
+  # at-least-once publication every other terminal rides. Nothing here should
+  # fire once `enqueue_in_txn/2`'s guard is in place — this proves the rows
+  # ALREADY in a database written before it are resolved rather than swept.
+  test "the reconciler resolves a queued turn nobody can claim instead of nudging it forever",
+       ctx do
+    parent = self()
+
+    :ok =
+      DB.execute(ctx.db, """
+        INSERT INTO turns (sessionKey, messageId, origin, prompt, createdAt)
+        VALUES ('agent:main:clawline:flynn:main', 'm_orphan', 'process:tightbeam',
+                'Model adjudication required.', 1)
+      """)
+
+    {:ok, [[seq]]} = DB.query(ctx.db, "SELECT seq FROM turns WHERE messageId = 'm_orphan'")
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: fn _ -> {:ok, %{}} end,
+        interval: 60_000,
+        terminal_publisher: fn row ->
+          send(parent, {:published, row.seq, row.status, row.error})
+        end,
+        on_terminal: fn _key, _seq -> :ok end,
+        name: :"mgr_#{System.unique_integer([:positive])}"
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+    :ok = LaneManager.reconcile(mgr)
+
+    assert_receive {:published, ^seq, "failed", error}
+    assert error =~ "no session row"
+    assert Ledger.non_terminal_older_than(ctx.db, -1) == []
+  end
 end

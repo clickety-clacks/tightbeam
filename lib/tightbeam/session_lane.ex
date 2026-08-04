@@ -227,6 +227,22 @@ defmodule Tightbeam.SessionLane do
 
       :none ->
         state
+
+      {:unclaimable, reason} ->
+        # Backstop. `Ledger.enqueue_in_txn/2` refuses to write a turn nobody can
+        # claim, so reaching here means a row predates that guard or a session
+        # retired between the enqueue and this claim. Either way the wait is
+        # over: no claim will ever move it, and a queued row that cannot move is
+        # exactly the shape that hid six lost prompts. Aging it into `failed`
+        # names the cause and publishes through the reconciler's terminal feed.
+        seqs = Ledger.fail_unclaimable(state.db, state.session_key, reason)
+
+        Logger.error(
+          "aged #{length(seqs)} unclaimable turn(s) for #{state.session_key} into failed: " <>
+            "#{reason} (seqs #{Enum.join(seqs, ",")})"
+        )
+
+        state
     end
   end
 

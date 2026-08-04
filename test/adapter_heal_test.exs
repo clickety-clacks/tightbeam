@@ -375,17 +375,24 @@ defmodule Tightbeam.AdapterHealTest do
         model: nil
       })
 
-    Org.create(db, %{
-      session_key: "k1",
-      display_name: "Main",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("claude-fable-5")
-    })
+    # flynn's actual main stream. `k1` is named "Main" but is not keyed as one,
+    # and adjudication notices climb the lineage ladder to the OWNER's main
+    # session — which the ladder now verifies exists instead of composing its
+    # key. Without this row every episode here is undeliverable and stays
+    # claimed, which is a different proof from the ones in this file.
+    for key <- [Org.personal_session_key("flynn"), "k1"] do
+      Org.create(db, %{
+        session_key: key,
+        display_name: "Main",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("claude-fable-5")
+      })
+    end
 
     base = Path.join(System.tmp_dir!(), "heal_base_#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)

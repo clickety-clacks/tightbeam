@@ -10,6 +10,22 @@ defmodule Tightbeam.AdjudicationTest do
 
     :ok = Tightbeam.Schema.ensure_all(name)
 
+    # flynn's main stream — the ladder's top rung. It exists here because the
+    # ladder now VERIFIES that rung instead of composing its key, and these
+    # proofs are about escalation reaching an owner, not about an owner who has
+    # never connected a client.
+    Org.create(name, %{
+      session_key: Org.personal_session_key("flynn"),
+      display_name: "Flynn",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "local",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("owner-model")
+    })
+
     owner =
       Org.create(name, %{
         session_key: "owner",
