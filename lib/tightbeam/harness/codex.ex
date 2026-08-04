@@ -337,7 +337,16 @@ defmodule Tightbeam.Harness.Codex do
         body: await response.text()
       }));
     }).catch(error => {
-      process.stderr.write(error.code || error.message);
+      // Same defect as claude.ex's probe, fixed the same way: undici leaves `code`
+      // undefined on a fetch rejection and puts the real reason in `error.cause`, so
+      // `error.code || error.message` reported "fetch failed" for every transport
+      // failure and named none of them.
+      const cause = error.cause;
+      process.stderr.write(
+        [cause && cause.code, cause && cause.message, error.code, error.message]
+          .filter(Boolean)
+          .join(": ") || "unknown transport failure"
+      );
       process.exitCode = 70;
     });
     """
