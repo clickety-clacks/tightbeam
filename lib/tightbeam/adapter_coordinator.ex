@@ -461,10 +461,53 @@ defmodule Tightbeam.AdapterCoordinator do
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result
+
+    # ONE LAST LOOK BEFORE THE FLUSH, and only on the path that recorded nothing.
+    #
+    # `retire_adapter/2` demonitors with [:flush], which DISCARDS a queued :DOWN without
+    # ever reading it. Grace expiry does not mean the adapter is alive — it means no
+    # :DOWN had arrived YET — and everything between that timeout and this line
+    # (begin_park's row, park/reconcile) is database work the adapter can die during.
+    # Flushing that death uninspected leaves "still running" and "died unobserved"
+    # indistinguishable: the exact collapse this lane exists to undo, surviving one
+    # branch over.
+    state = record_death_arriving_late(key, state, exited?)
     state = retire_adapter(key, state)
     if result == :ok, do: Tightbeam.HarnessProcess.complete_park(state.db, key)
 
     {result, state}
+  end
+
+  # Nothing to look for when the exit was already observed and judged above.
+  defp record_death_arriving_late(_key, state, true), do: state
+
+  defp record_death_arriving_late(key, state, false) do
+    case state.adapters[key] do
+      %{pid: pid, monitor: monitor} when is_pid(pid) and is_reference(monitor) ->
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, reason} when reason != :normal ->
+            :ok =
+              record_adapter_down(
+                state,
+                key,
+                MapSet.member?(state.ready_refs, monitor),
+                reason,
+                "absorbed=false parked=true grace_expired=true"
+              )
+
+            state
+
+          {:DOWN, ^monitor, :process, ^pid, _normal} ->
+            state
+        after
+          # Genuinely still running. `retire_adapter/2` kills it next, and that
+          # death is ours, not a fault — it is correctly not recorded.
+          0 -> state
+        end
+
+      _ ->
+        state
+    end
   end
 
   # The REASON comes back, not just the fact of an exit. "Closed as asked" and
