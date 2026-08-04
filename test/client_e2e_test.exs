@@ -479,9 +479,9 @@ defmodule Tightbeam.ClientE2ETest do
     # it, then a second Main post. `turns` gives each post's substrate interval
     # and `seqs` the store's commit order for its reply; frame arrival times are
     # the driver's own clock, on the same scale.
-    # `seqs` is `[slow: {seq, committed_at}, ...]`; a bare seq means the reply
-    # committed the instant its turn ended, which is what the substrate does
-    # when nothing stalls between the append and the publish.
+    # `seqs` is `[slow: {seq, committed_at}, ...]`; a bare seq means the store
+    # stamped the reply the instant its turn ended, which is what happens when
+    # nothing stalls between the write and the publish.
     defp j5_expected(seqs, turns) do
       for {id, key} <- [{"slow", @main}, {"b", @smoke_b}, {"done", @main}] do
         name = String.to_atom(id)
@@ -760,12 +760,12 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "REGRESSION: a stall between the commit and the publish is caught" do
-      # THE defect this lane was chartered for. B's reply commits at 150 and its
-      # frame arrives at 5900 — but `turns.endedAt` is written after the runner
-      # publishes, so B's turn row reads 110..5901 and the stall drags the turn's
-      # own close along with it. Judged against `endedAt` the arrival looks
-      # instant, and Main's 300ms reply even sits strictly inside B's inflated
-      # window. Only the COMMIT stamp sees it.
+      # THE defect this lane was chartered for. B's reply is stamped at 150 and
+      # its frame arrives at 5900 — but `turns.endedAt` is written after the
+      # runner publishes, so B's turn row reads 110..5901 and the stall drags
+      # the turn's own close along with it. Judged against `endedAt` the arrival
+      # looks instant, and Main's 300ms reply even sits strictly inside B's
+      # inflated window. Only the store's own stamp sees it.
       stalled = [
         j5_running(@main, "slow", 100),
         j5_running(@smoke_b, "b", 110),

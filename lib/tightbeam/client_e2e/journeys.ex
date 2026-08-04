@@ -751,26 +751,44 @@ defmodule Tightbeam.ClientE2E.Journeys do
               &1["replyToClientMessageId"] == b_id)
         )
 
+      posts = [
+        %{id: slow_id, session_key: ctx.main_key},
+        %{id: b_id, session_key: session_key},
+        %{id: done_id, session_key: ctx.main_key}
+      ]
+
+      # EVERY reply, not just Smoke B's, and BEFORE the concurrency gate: a
+      # bubble in the wrong stream is a defect whatever the lanes did, and the
+      # delivery oracle that also checks it is only reached once the substrate
+      # has been shown to have run them together.
       cross_talk =
-        Enum.find(
-          frames,
-          &(&1["type"] == "message" and &1["role"] == "assistant" and
-              &1["replyToClientMessageId"] == b_id and &1["sessionKey"] != session_key)
-        )
+        for %{id: id, session_key: key} <- posts,
+            frame = find_reply(frames, id),
+            frame["sessionKey"] != key,
+            do: id
 
       turns =
         Enum.map([slow_id, b_id, done_id], &Substrate.turn_for_client_message(ctx.base_dir, &1))
 
-      [slow_turn, b_turn, _done_turn] = turns
+      [slow_turn, b_turn, done_turn] = turns
 
       # SIMULTANEITY, two independent witnesses, both of which are about ONE
       # instant rather than a maximum merged across samples:
       #   - a single sample that caught both lanes running at once, and
-      #   - the two turn rows' own start/end intervals overlapping.
+      #   - the turn rows' own start/end intervals overlapping.
       # Either one proves the substrate ran them concurrently; the interval
       # join does not depend on the sampler being lucky.
+      #
+      # EITHER of Main's turns against B's, because either one overlapping B is
+      # the lanes running beside each other — and the delivery oracle accepts a
+      # reply landing inside any of these turns, so a gate that only knew about
+      # `slow` could refuse a run the oracle was ready to pass.
       sampled_together? = Substrate.simultaneous?(samples, [ctx.main_key, session_key])
-      intervals_overlapped? = Substrate.turns_overlapped?(slow_turn, b_turn)
+
+      intervals_overlapped? =
+        Substrate.turns_overlapped?(slow_turn, b_turn) or
+          Substrate.turns_overlapped?(done_turn, b_turn)
+
       substrate_concurrent? = sampled_together? or intervals_overlapped?
 
       # Did the substrate have the OPPORTUNITY to overlap them? The question is
@@ -795,20 +813,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
       # ASSERTS, not something it assumes: publication happens from each writer
       # after its transaction returns, so two writers to one stream can commit
       # in one order and publish in the other.
-      expected =
-        expected_deliveries(ctx.base_dir, [
-          %{id: slow_id, session_key: ctx.main_key},
-          %{id: b_id, session_key: session_key},
-          %{id: done_id, session_key: ctx.main_key}
-        ])
+      expected = expected_deliveries(ctx.base_dir, posts)
 
       row =
         cond do
           is_nil(b_reply) ->
             Scorecard.fail("10", "concurrency", "Smoke B never replied", journey: "J5")
 
-          not is_nil(cross_talk) ->
-            Scorecard.fail("10", "concurrency", "cross-talk: a reply landed in the wrong stream",
+          cross_talk != [] ->
+            Scorecard.fail(
+              "10",
+              "concurrency",
+              "cross-talk: #{inspect(cross_talk)} landed in a stream it was not posted to",
               journey: "J5"
             )
 
@@ -924,7 +940,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
   `expected` is one entry per post this journey made — `%{id: clientMessageId,
   session_key: the stream it was posted to, committed_seq: and committed_at:
-  its reply's `messages.seq` and commit stamp (nil when the store holds no
+  its reply's `messages.seq` and store stamp (nil when the store holds no
   reply), started_at: and ended_at: its turn row's own interval}` — so every
   leg is scoped to THIS journey's three turns and a frame belonging to any
   other turn can neither satisfy a leg nor break one.
@@ -1072,6 +1088,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
     end
   end
 
+  defp find_reply(frames, client_message_id) do
+    Enum.find(
+      frames,
+      &(&1["type"] == "message" and &1["role"] == "assistant" and
+          &1["replyToClientMessageId"] == client_message_id)
+    )
+  end
+
   # Read until `predicate` matches, keeping whatever arrived on the way. A frame
   # that never comes is left to the oracle to name — the wait decides only when
   # to stop reading.
@@ -1084,9 +1108,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
     end
   end
 
-  # Every reply whose arrival trails the close of its own turn by more than the
-  # budget. `ended_at` is written immediately after the reply is published, so
-  # this measures how long the FRAME waited, not how long the model thought.
+  # Every reply whose arrival trails its own store stamp by more than the
+  # budget. The stamp is taken as the row is written, so this measures how long
+  # the FRAME waited, not how long the model thought.
   defp late_arrivals(expected, replies, budget_ms) do
     for %{id: id, committed_at: committed_at} <- expected,
         not is_integer(committed_at) or replies[id].received_at - committed_at > budget_ms,
