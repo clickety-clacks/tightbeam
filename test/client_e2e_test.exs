@@ -479,14 +479,25 @@ defmodule Tightbeam.ClientE2ETest do
     # it, then a second Main post. `turns` gives each post's substrate interval
     # and `seqs` the store's commit order for its reply; frame arrival times are
     # the driver's own clock, on the same scale.
+    # `seqs` is `[slow: {seq, committed_at}, ...]`; a bare seq means the reply
+    # committed the instant its turn ended, which is what the substrate does
+    # when nothing stalls between the append and the publish.
     defp j5_expected(seqs, turns) do
       for {id, key} <- [{"slow", @main}, {"b", @smoke_b}, {"done", @main}] do
-        {started, ended} = Keyword.fetch!(turns, String.to_atom(id))
+        name = String.to_atom(id)
+        {started, ended} = Keyword.fetch!(turns, name)
+
+        {seq, committed_at} =
+          case seqs[name] do
+            {seq, committed_at} -> {seq, committed_at}
+            seq -> {seq, ended}
+          end
 
         %{
           id: id,
           session_key: key,
-          committed_seq: seqs[String.to_atom(id)],
+          committed_seq: seq,
+          committed_at: committed_at,
           started_at: started,
           ended_at: ended
         }
@@ -690,27 +701,6 @@ defmodule Tightbeam.ClientE2ETest do
                "while another of these streams' turns was still open"
     end
 
-    test "fan-out serialized behind whichever lane holds the floor fails" do
-      # The lanes ran back to back in the substrate too, so no reply can land
-      # inside another turn's interval.
-      serialized_turns = [slow: {100, 200}, b: {300, 400}, done: {500, 600}]
-
-      serialized = [
-        j5_running(@main, "slow", 100),
-        j5_reply(@main, "slow", 200),
-        j5_delivered(@main, "slow", 200),
-        j5_running(@smoke_b, "b", 300),
-        j5_reply(@smoke_b, "b", 400),
-        j5_delivered(@smoke_b, "b", 400),
-        j5_running(@main, "done", 500),
-        j5_reply(@main, "done", 600),
-        j5_delivered(@main, "done", 600)
-      ]
-
-      assert j5_oracle(serialized, [slow: 1, b: 2, done: 3], serialized_turns) =~
-               "while another of these streams' turns was still open"
-    end
-
     test "REGRESSION: one timely reply cannot launder another lane's delayed frame" do
       # The lanes genuinely overlapped (B runs 110..900 across both of Main's
       # turns), commit and arrival order agree, and each reply precedes its own
@@ -733,7 +723,7 @@ defmodule Tightbeam.ClientE2ETest do
       turns = [slow: {100, 300}, b: {110, 900}, done: {300, 400}]
 
       assert j5_oracle(delayed, [slow: 1, done: 2, b: 3], turns) =~
-               "[\"b\"] reached the client only after its own turn had been closed"
+               "[\"b\"] reached the client more than"
     end
 
     test "an arrival landing exactly on a turn's boundary is not a liveness witness" do
@@ -759,11 +749,37 @@ defmodule Tightbeam.ClientE2ETest do
                "while another of these streams' turns was still open"
     end
 
-    test "a turn the substrate never closed fails the delivery bound rather than skipping it" do
-      turns = [slow: {100, 900}, b: {110, nil}, done: {900, 950}]
+    test "a reply the store never stamped fails the delivery bound rather than skipping it" do
+      assert j5_oracle(
+               b_answers_first(),
+               [b: {1, nil}, slow: 2, done: 3],
+               b_first_turns()
+             ) =~ "[\"b\"] reached the client more than"
+    end
 
-      assert j5_oracle(b_answers_first(), [b: 1, slow: 2, done: 3], turns) =~
-               "[\"b\"] reached the client only after its own turn had been closed"
+    test "REGRESSION: a stall between the commit and the publish is caught" do
+      # THE defect this lane was chartered for. B's reply commits at 150 and its
+      # frame arrives at 5900 — but `turns.endedAt` is written after the runner
+      # publishes, so B's turn row reads 110..5901 and the stall drags the turn's
+      # own close along with it. Judged against `endedAt` the arrival looks
+      # instant, and Main's 300ms reply even sits strictly inside B's inflated
+      # window. Only the COMMIT stamp sees it.
+      stalled = [
+        j5_running(@main, "slow", 100),
+        j5_running(@smoke_b, "b", 110),
+        j5_reply(@main, "slow", 300),
+        j5_delivered(@main, "slow", 301),
+        j5_running(@main, "done", 301),
+        j5_reply(@main, "done", 400),
+        j5_delivered(@main, "done", 401),
+        j5_reply(@smoke_b, "b", 5_900),
+        j5_delivered(@smoke_b, "b", 5_902)
+      ]
+
+      turns = [slow: {100, 300}, b: {110, 5_901}, done: {301, 400}]
+      seqs = [slow: {1, 300}, done: {2, 400}, b: {3, 150}]
+
+      assert j5_oracle(stalled, seqs, turns) =~ "[\"b\"] reached the client more than"
     end
 
     test "a driver that recorded no arrival time refuses to judge liveness" do

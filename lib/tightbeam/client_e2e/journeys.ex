@@ -144,7 +144,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "within each stream, assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of its own turn's close; and one of them ARRIVES, by the driver's clock, strictly inside another of these turns by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
+        "within each stream, assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of the store committing it; and one of them ARRIVES, by the driver's clock, strictly inside another of these turns by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together the row is not judged on the client at all: FAIL if Smoke B was enqueued while Main was still running yet never ran beside it (the lanes are not parallel), otherwise INCOMPLETE, because there was no overlap to observe",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -923,10 +923,11 @@ defmodule Tightbeam.ClientE2E.Journeys do
   J5's client-side oracle: what a client must show while two lanes run at once.
 
   `expected` is one entry per post this journey made — `%{id: clientMessageId,
-  session_key: the stream it was posted to, committed_seq: its reply's
-  `messages.seq` or nil, started_at:, ended_at: its turn row's own interval}` —
-  so every leg is scoped to THIS journey's three turns and a frame belonging to
-  any other turn can neither satisfy a leg nor break one.
+  session_key: the stream it was posted to, committed_seq: and committed_at:
+  its reply's `messages.seq` and commit stamp (nil when the store holds no
+  reply), started_at: and ended_at: its turn row's own interval}` — so every
+  leg is scoped to THIS journey's three turns and a frame belonging to any
+  other turn can neither satisfy a leg nor break one.
 
   No leg asks which model answered first. A trivial prompt in a fresh stream
   routinely outlives a deliberately slow one in a warm stream — it pays a new
@@ -955,9 +956,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
      held reply was committed last anyway. A turn whose terminal state never
      reached the client fails here too: an indicator left spinning is not a
      delivered turn;
-  6. EVERY reply reached the client within `budget_ms` of the moment its own
-     turn closed (`ended_at`, written immediately after the reply is published;
-     a turn with no `ended_at` fails here rather than skipping the check).
+  6. EVERY reply reached the client within `budget_ms` of the moment it was
+     COMMITTED (`committed_at`, `messages.timestamp`, stamped inside the append
+     transaction; a reply with no commit stamp fails here rather than skipping
+     the check). Against the COMMIT and not against `turns.endedAt`: the lane
+     writes `endedAt` after the runner returns and the runner publishes before
+     returning, so a stalled publication drags `endedAt` along with it and
+     cannot measure its own delay. Commit-to-client is also the whole seam the
+     defect lives in — append commits, then the caller publishes.
 
      This is the one leg with a number in it. A frame that arrives eventually,
      in the right order, behind its own already-closed turn has no edge to be
@@ -1039,8 +1045,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
               "cannot be judged for this run"
 
           (late = late_arrivals(expected, replies, budget_ms)) != [] ->
-            "#{inspect(late)} reached the client only after its own turn had been closed " <>
-              "for more than #{budget_ms}ms — delivered, but not delivered live"
+            "#{inspect(late)} reached the client more than #{budget_ms}ms after the store " <>
+              "committed it — delivered, but not delivered live"
 
           not cross_lane_live?(expected, replies) ->
             "no reply arrived while another of these streams' turns was still open — " <>
@@ -1068,8 +1074,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
   # budget. `ended_at` is written immediately after the reply is published, so
   # this measures how long the FRAME waited, not how long the model thought.
   defp late_arrivals(expected, replies, budget_ms) do
-    for %{id: id, ended_at: ended_at} <- expected,
-        not is_integer(ended_at) or replies[id].received_at - ended_at > budget_ms,
+    for %{id: id, committed_at: committed_at} <- expected,
+        not is_integer(committed_at) or replies[id].received_at - committed_at > budget_ms,
         do: id
   end
 
@@ -1139,13 +1145,15 @@ defmodule Tightbeam.ClientE2E.Journeys do
       session_keys
       |> Enum.flat_map(&Substrate.messages(base_dir, &1))
       |> Enum.filter(&is_binary(&1["replyToClientMessageId"]))
-      |> Map.new(&{&1["replyToClientMessageId"], &1["seq"]})
+      |> Map.new(&{&1["replyToClientMessageId"], {&1["seq"], &1["timestamp"]}})
 
     Enum.map(posts, fn post ->
       turn = Substrate.turn_for_client_message(base_dir, post.id) || %{}
+      {seq, committed_at} = Map.get(committed, post.id, {nil, nil})
 
       Map.merge(post, %{
-        committed_seq: committed[post.id],
+        committed_seq: seq,
+        committed_at: committed_at,
         started_at: turn["startedAt"],
         ended_at: turn["endedAt"]
       })

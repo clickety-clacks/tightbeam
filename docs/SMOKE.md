@@ -244,13 +244,15 @@ on 2026-07-25:
     arrives before its own turn's terminal state (a reply held behind the close
     of its own turn is a delayed frame even when it was committed last anyway);
     each lands in the stream it was posted to (no cross-talk); each reaches the
-    client within a second of the moment its own turn closed (a frame that
-    arrives eventually, in the right order, behind its own finished turn is a
-    delayed frame — the one condition stated as a duration, because nothing else
-    in the run moves while such a frame waits, so there is no event to catch it
-    at; a delay shorter than that budget is out of this row's reach and no
-    threshold exists that both catches every delay and never fires on a healthy
-    run); and one of them ARRIVES, by the clock, strictly inside ANOTHER of
+    client within a second of the moment the STORE COMMITTED it — `messages.
+    timestamp`, not `turns.endedAt`, which is written after publication and so
+    moves along with any stall it might have measured (a frame that arrives
+    eventually, in the right order, long after its commit is a delayed frame —
+    the one condition stated as a duration, because nothing else in the run
+    moves while such a frame waits, so there is no event to catch it at; a
+    delay shorter than that budget is out of this row's reach and no threshold
+    exists that both catches every delay and never fires on a healthy run); and
+    one of them ARRIVES, by the clock, strictly inside ANOTHER of
     these turns by the substrate's — different lanes run in parallel. That last
     one is what tells live delivery from a gateway that withheld every frame and
     flushed them, in perfect order, once both lanes were done. Main's two turns
