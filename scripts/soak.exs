@@ -9,6 +9,7 @@ defmodule Tightbeam.Soak do
   @recovery_threshold_ms 60_000
   @audit_interval_ms 10 * 60_000
   @kill_kinds [:adapter_sigkill, :gateway_sigterm, :gateway_sigkill, :cancel_turn]
+  @gateway_kill_kinds [:gateway_sigterm, :gateway_sigkill]
 
   def main(argv) do
     options = parse_options(argv)
@@ -220,6 +221,15 @@ defmodule Tightbeam.Soak do
       load_errors: [],
       kill_events: [],
       kill_index: 0,
+      # Gateway deaths NOBODY ASKED FOR. `ensure_gateway/1` restores service on the next
+      # tick, and without this it would restore it silently — so a gateway that crashed
+      # on its own between two ticks could be replaced before the next load and the run
+      # could still score PASS. Restoring the arena and scoring the product are separate
+      # jobs; the repair must not erase the evidence.
+      spontaneous_exits: [],
+      # The port of a gateway that WAS signalled but outlived its await window. Its exit
+      # is late, not spontaneous, and must not be counted against the product.
+      expected_late_exit: nil,
       started_at: now,
       deadline: now + options.minutes * 60_000,
       next_load: now,
@@ -317,7 +327,7 @@ defmodule Tightbeam.Soak do
         state
 
       true ->
-        state = drain_gateway_output(state)
+        state = state |> drain_gateway_output() |> ensure_gateway()
         now = monotonic_ms()
 
         state =
@@ -405,12 +415,26 @@ defmodule Tightbeam.Soak do
     started_mono = monotonic_ms()
     log_event(state, "kill ##{event_number} kind=#{kind} start")
 
+    # The port the gateway served from BEFORE the signal. A gateway kill has recovered
+    # only when a DIFFERENT gateway is answering: a shutting-down gateway keeps serving
+    # until it finishes, so `version_ok` alone cannot tell "my replacement is up" from
+    # "the process I just signalled has not finished dying". Measured 2026-08-04: a
+    # SIGTERM under load took 91s to exit, the 60s await gave up WITHOUT restarting, the
+    # doomed gateway answered version in 12ms, the row scored recovered=true — and the
+    # run then fired its remaining 27 kills at a closed socket for 53 minutes.
+    pre_kill_gateway = state.gateway
+
     {action_ok?, detail, state} = execute_kill(kind, state)
 
     {recovered?, recovery_ms, state, recovery_detail} =
       case wait_for_version(state, @recovery_threshold_ms) do
         {:ok, latency, state} ->
-          {true, monotonic_ms() - started_mono, state, "version_ok poll=#{latency}ms"}
+          if kind in @gateway_kill_kinds and state.gateway == pre_kill_gateway do
+            {false, monotonic_ms() - started_mono, state,
+             "version answered by the gateway that was signalled — no replacement was started"}
+          else
+            {true, monotonic_ms() - started_mono, state, "version_ok poll=#{latency}ms"}
+          end
 
         {:error, reason, state} ->
           {false, monotonic_ms() - started_mono, state, reason}
@@ -509,9 +533,18 @@ defmodule Tightbeam.Soak do
           {true, "#{signal} gateway pid=#{pid} exit=#{status}; restart pending: #{reason}", state}
       end
     else
-      {:error, reason, state} -> {false, reason, state}
-      {:error, reason} -> {false, inspect(reason), state}
-      {output, status} -> {false, "kill exited #{status}: #{String.trim(output)}", state}
+      # The signal landed and the gateway did not exit in time. Its eventual exit is
+      # ATTRIBUTABLE to this kill, so mark it expected: otherwise `drain_gateway_output/1`
+      # would see the death on a later tick and score it against the product as a
+      # spontaneous crash. Measured on 2026-08-04: a SIGTERM took 91s against a 60s await.
+      {:error, reason, state} ->
+        {false, reason, %{state | expected_late_exit: state.gateway}}
+
+      {:error, reason} ->
+        {false, inspect(reason), state}
+
+      {output, status} ->
+        {false, "kill exited #{status}: #{String.trim(output)}", state}
     end
   end
 
@@ -656,6 +689,28 @@ defmodule Tightbeam.Soak do
     end
   end
 
+  # The arena's own precondition: a soak against a dead port measures nothing. Nothing
+  # outside this script restarts the arena gateway, and `drain_gateway_output/1` only
+  # RECORDS `unexpected_exit` before carrying on — so one gateway that outlived its await
+  # window silently turned the last 53 minutes of a 60-minute run into kills fired at a
+  # closed socket, every one of them scored as a failure of the product. Restoring the
+  # gateway here keeps the arena's absence from being read as the substrate's.
+  defp ensure_gateway(%{gateway: nil} = state) do
+    log_event(state, "gateway absent — restarting the arena gateway before continuing")
+
+    case start_gateway(state) do
+      {:ok, state} ->
+        log_event(state, "arena gateway restarted")
+        state
+
+      {:error, reason, state} ->
+        log_event(state, "arena gateway restart FAILED: #{reason}")
+        state
+    end
+  end
+
+  defp ensure_gateway(state), do: state
+
   defp drain_gateway_output(%{gateway: nil} = state), do: state
 
   defp drain_gateway_output(state) do
@@ -667,9 +722,31 @@ defmodule Tightbeam.Soak do
         drain_gateway_output(state)
 
       {^port, {:exit_status, status}} ->
-        log_event(state, "gateway unexpected_exit status=#{status}")
         Process.delete(:tightbeam_soak_gateway)
-        %{state | gateway: nil, token: nil}
+
+        if state.expected_late_exit == port do
+          # Attributable: this gateway was signalled by a kill that gave up waiting.
+          log_event(
+            state,
+            "gateway late_exit status=#{status} (attributed to the kill that signalled it)"
+          )
+
+          %{state | gateway: nil, token: nil, expected_late_exit: nil}
+        else
+          # NOBODY ASKED FOR THIS ONE. Record it as an offender before `ensure_gateway/1`
+          # restores service, or the repair silently erases the product's crash.
+          log_event(
+            state,
+            "gateway unexpected_exit status=#{status} — NOT attributable to any kill"
+          )
+
+          %{
+            state
+            | gateway: nil,
+              token: nil,
+              spontaneous_exits: state.spontaneous_exits ++ [%{status: status, at: wall_ms()}]
+          }
+        end
     after
       0 -> state
     end
@@ -922,7 +999,10 @@ defmodule Tightbeam.Soak do
         []
       end
 
-    offenders = event_offenders ++ missing_kinds
+    # A gateway that died on its own is an A5 failure even though the arena repaired it.
+    unbidden = Enum.map(state.spontaneous_exits, &{:gateway_died_unbidden, &1})
+
+    offenders = event_offenders ++ missing_kinds ++ unbidden
     {"A5", offenders == [], offenders}
   end
 
