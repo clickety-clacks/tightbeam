@@ -12,57 +12,34 @@ defmodule Tightbeam.ConnRegistry do
      connection's unregister compares generations and cannot delete its
      replacement. So a slow-closing old socket can never evict the new one.
 
-  2. Persistent per-connection delivered-seq filter. Every message carries its
-     per-session store `seq`. A connection tracks `lastDeliveredSeq` per
-     session for its WHOLE lifetime (not just during replay drain): any push
-     with seq <= lastDeliveredSeq is dropped. This suppresses a late
-     publication of a pre-watermark commit forever, closing the
-     replay/live race.
+  2. Replay/live de-dup, and ONLY that. Replay hands a reconnecting client
+     everything after its cursor; live publication runs concurrently. A message
+     could therefore be sent twice, so a connection remembers how far REPLAY got
+     per session (`replayed_through`) and suppresses a live frame at or below it.
 
-  ORDERING DEPENDENCY, AND IT IS UNMET: the filter above is safe ONLY if
-  publications for a session arrive in commit (seq) order, and nothing
-  currently provides that. Every publication happens AFTER its transaction has
-  returned, from the caller's own process — `Projection.append/2` commits at
-  projection.ex:95-96 and its caller publishes afterwards — so two writers to
-  one session can commit in one order and publish in the other. The window is
-  not simultaneity: it is one publisher pausing between its commit and its
-  publish while another commits AND publishes inside that gap. When that
-  happens this module drops the earlier frame at :161-162 and a connected
-  client never sees it.
+  WHAT THIS DELIBERATELY NO LONGER DOES. That watermark used to be advanced by
+  live delivery as well, and the filter dropped anything at or below the highest
+  seq ever sent. Two writers to one session — a client post's echo and a running
+  turn's reply, from two different processes with nothing ordering them — commit
+  20 then 21 and can publish in the other order, because publication happens
+  after each transaction returns rather than inside it. The client got 21, the
+  watermark advanced to 21, and 20 was then dropped as "already delivered".
 
-  Nor is a replay a reliable repair. Replay serves rows after the client's own
-  cursor (wire/socket.ex:319, `Projection.list_after/5` selecting `seq >`), so
-  it restores the dropped row only while that cursor still sits behind it. A
-  client whose cursor has already advanced past it — because it received the
-  LATER frame — never sees the earlier one again, on reconnect or on a re-auth
-  of the same socket (wire/socket.ex:299-303). This module enforces the
-  per-connection monotonic filter and cannot enforce the ordering it rests on.
+  It was not recoverable. Replay serves rows after the CLIENT's own cursor
+  (wire/socket.ex, `Projection.list_after/5` selecting `seq >`), and that cursor
+  had advanced past 20 when 21 arrived, so no reconnect and no re-auth ever
+  restored it. A reply the store held perfectly was gone from that client's view
+  for good.
 
-  The publication sites, every one of them post-commit: gateway.ex:1701 (an
-  agent's reply, published from the turn's own task), :1043 (a delivery echo,
-  from whichever process ran the dispatch — a socket, a wake, a control route),
-  :4142 (a credential-transition notice the substrate authors), and :5195,
-  :5767 (markers), all through the helper at :5772; plus event_log.ex:324,
-  after the transaction opened at :297. SCOPE OF THAT LIST: it is the message
-  path, read at 422ff58. The remaining `DB.transaction` callers were not
-  audited, so treat it as where to start rather than as exhaustive, and
-  re-derive the lines before trusting them.
+  So delivery no longer withholds anything it has not literally already sent.
+  Out-of-order arrival is now a cosmetic ordering question the client can settle
+  from the seq it already receives on every message, instead of a silent
+  permanent loss. The narrower cost — a genuine double-publish of one seq would
+  now reach the client twice — buys back the only failure here that could not be
+  seen or undone, and duplicates are neither.
 
-  WHAT SERIALIZES, AND WHAT DOES NOT: a session's lane serializes its TURNS, not
-  the writes to it. A client post's echo and a running turn's reply are two
-  independent writers to one session, from two processes, with nothing ordering
-  them against each other. The client-e2e concurrency journey (J5) creates both
-  of those writers on its Main stream, so the ingredients are present there.
-
-  No reproduction is known, and nothing here claims any journey is IMMUNE —
-  that would be a second guarantee asserted without code to back it, which is
-  the mistake this note exists to correct. J5 has not been observed producing
-  it, and it arranges no such window deliberately; whether its commits and
-  publishes can interleave badly is not controlled by anything and has not been
-  measured. A deliberate reproduction would hold one writer between its commit
-  and its publish while a second writer completes both.
-
-  Fixing this is a design in its own right and is not attempted here.
+  Publication order is still not guaranteed by anything, and this module still
+  cannot provide it. It simply no longer converts that into deletion.
   """
 
   use GenServer
@@ -74,7 +51,8 @@ defmodule Tightbeam.ConnRegistry do
 
   defstruct conns: %{}, devices: %{}, rate_windows: %{}
 
-  # conns:   ref => %{pid, user_id, device_id, is_admin, subscriptions, gen, delivered: %{session_key => seq}}
+  # conns:   ref => %{pid, user_id, device_id, is_admin, subscriptions, gen,
+  #                     replayed_through: %{session_key => seq}}
   # devices: device_id => %{ref, gen}
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -110,10 +88,13 @@ defmodule Tightbeam.ConnRegistry do
   Publish a per-session message (with its store seq) to the OWNER's
   connections only — admin grants powers, never a merged feed; not one byte
   of another user's content reaches an admin device (TS parity:
-  server.ts broadcastMessage). Applies each connection's monotonic filter.
-  `deliver` is `(pid, payload) -> any` — injected so tests capture without a
-  real socket. Callers must publish in seq order (see the moduledoc ordering
-  dependency).
+  server.ts broadcastMessage). Suppresses only what replay already sent to that
+  connection. `deliver` is `(pid, payload) -> any` — injected so tests capture
+  without a real socket.
+
+  CALLERS NEED NOT PUBLISH IN SEQ ORDER, and nothing guarantees they do. Out of
+  order is delivered out of order, carrying the seq that lets a client settle it;
+  it is no longer treated as a duplicate and deleted.
   """
   @spec publish_message(server(), String.t(), String.t(), integer(), term(), deliver()) :: :ok
   def publish_message(server \\ __MODULE__, session_key, owner_user_id, seq, payload, deliver) do
@@ -138,7 +119,7 @@ defmodule Tightbeam.ConnRegistry do
     GenServer.call(server, {:publish_work_item, owner_user_ids, payload, deliver})
   end
 
-  @doc "Advance a connection's delivered watermark during replay (per session)."
+  @doc "Advance a connection's REPLAYED-through watermark (per session)."
   @spec note_replayed(server(), reference(), String.t(), integer()) :: :ok
   def note_replayed(server \\ __MODULE__, ref, session_key, seq) do
     GenServer.cast(server, {:note_replayed, ref, session_key, seq})
@@ -169,7 +150,7 @@ defmodule Tightbeam.ConnRegistry do
       is_admin: conn.is_admin,
       subscriptions: conn.subscriptions,
       gen: gen,
-      delivered: %{}
+      replayed_through: %{}
     }
 
     replaced = prior && prior.ref
@@ -192,18 +173,22 @@ defmodule Tightbeam.ConnRegistry do
 
   def handle_call({:publish_message, session_key, owner, seq, payload, deliver}, _from, state) do
     conns =
-      Enum.reduce(state.conns, state.conns, fn {ref, e}, acc ->
+      Enum.reduce(state.conns, state.conns, fn {_ref, e}, acc ->
         cond do
           e.user_id != owner or not MapSet.member?(e.subscriptions, "chat") ->
             acc
 
-          Map.get(e.delivered, session_key, 0) >= seq ->
-            # already delivered (late pre-watermark publication) — drop forever
+          Map.get(e.replayed_through, session_key, 0) >= seq ->
+            # Already sent to this connection BY REPLAY. The only real duplicate.
             acc
 
           true ->
+            # Everything else is delivered. A live frame is never withheld because a
+            # HIGHER one arrived first: it is not a duplicate, and withholding it loses
+            # it for good — replay serves rows after the client's own cursor, which has
+            # already moved past it, so no reconnect restores it.
             deliver.(e.pid, payload)
-            put_in(acc[ref].delivered[session_key], seq)
+            acc
         end
       end)
 
@@ -268,7 +253,9 @@ defmodule Tightbeam.ConnRegistry do
 
       _ ->
         {:noreply,
-         update_in(state.conns[ref].delivered[session_key], fn cur -> max(cur || 0, seq) end)}
+         update_in(state.conns[ref].replayed_through[session_key], fn cur ->
+           max(cur || 0, seq)
+         end)}
     end
   end
 

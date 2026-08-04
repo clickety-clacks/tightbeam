@@ -64,13 +64,48 @@ defmodule Tightbeam.ConnRegistryTest do
     :ok = ConnRegistry.publish_message(reg, "k1", "u", 10, %{seq: 10}, d)
     refute_received {:sent, :c, _}
 
-    # seq 12 (after the watermark) is delivered, and advances the filter
-    :ok = ConnRegistry.publish_message(reg, "k1", "u", 12, %{seq: 12}, d)
-    assert_received {:sent, :c, %{seq: 12}}
+    # seq 15 (after the watermark) is delivered
+    :ok = ConnRegistry.publish_message(reg, "k1", "u", 15, %{seq: 15}, d)
+    assert_received {:sent, :c, %{seq: 15}}
 
-    # re-publishing 12 (a duplicate) is dropped
-    :ok = ConnRegistry.publish_message(reg, "k1", "u", 12, %{seq: 12}, d)
+    # Delivering 15 does NOT advance the suppression watermark — only replay does.
+    # 13 was never replayed and is not a duplicate, so it arrives even though a
+    # HIGHER live frame went first. This is the whole fix: the client's cursor has
+    # moved past 13, and replay serves `seq >` that cursor, so suppressing it here
+    # would lose it for good.
+    :ok = ConnRegistry.publish_message(reg, "k1", "u", 13, %{seq: 13}, d)
+    assert_received {:sent, :c, %{seq: 13}}
+
+    # A live frame at or below what REPLAY sent is still suppressed — that is a
+    # real duplicate of something this connection has already been given.
+    :ok = ConnRegistry.publish_message(reg, "k1", "u", 9, %{seq: 9}, d)
     refute_received {:sent, :c, _}
+  end
+
+  test "a live frame is never suppressed by a HIGHER live frame that arrived first", %{
+    reg: reg,
+    deliver: d
+  } do
+    {:ok, _ref, _} =
+      ConnRegistry.register(reg, %{
+        pid: :c,
+        user_id: "u",
+        device_id: "d",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    # Two writers to one session commit 20 then 21, and publish in the other order:
+    # publication happens after each transaction returns, from each caller's own
+    # process, so nothing orders them against each other.
+    :ok = ConnRegistry.publish_message(reg, "k1", "u", 21, %{seq: 21}, d)
+    assert_received {:sent, :c, %{seq: 21}}
+
+    # 20 is NOT a duplicate and was never replayed. It must arrive. Suppressing it
+    # loses it permanently: replay serves rows after the CLIENT's cursor, which has
+    # already advanced past 20, so no reconnect ever restores it.
+    :ok = ConnRegistry.publish_message(reg, "k1", "u", 20, %{seq: 20}, d)
+    assert_received {:sent, :c, %{seq: 20}}
   end
 
   test "generation-tagged takeover: new registration owns the slot; slow old unregister cannot evict it",
