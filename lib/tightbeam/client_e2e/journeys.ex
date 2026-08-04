@@ -144,7 +144,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "Smoke B's assistant bubble arrives while Main's slow turn is still running; every assistant bubble carries its own sessionKey (no cross-talk); Main's two turns complete in post order. When the slow prompt finishes first there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
+        "within each stream, assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of the store stamping it; and one of them ARRIVES, by the driver's clock, strictly inside another of these turns by the substrate's; Main's two turns complete in post order. A missing reply, cross-talk, a non-delivered turn row and Main's own two turns out of order fail the row whatever the lanes did. Past those, when the substrate never ran the lanes together the delivery legs are not asked at all: FAIL if Smoke B was enqueued while Main was still running yet never ran beside it (the lanes are not parallel), otherwise INCOMPLETE, because there was no overlap to observe",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -692,10 +692,11 @@ defmodule Tightbeam.ClientE2E.Journeys do
         SimClient.post(
           ctx.client,
           ctx.main_key,
-          # Long ON PURPOSE. The client-side half of this journey can only be
-          # observed while Main's turn is STILL RUNNING, so a prompt that might
-          # finish first does not make the substrate wrong — it makes the
-          # observation impossible. See the premise handling below.
+          # Long ON PURPOSE — a turn that lasts is what gives the other lane
+          # something to run BESIDE. Which of the two finishes first is the
+          # model's business and decides nothing here: the oracle asserts
+          # committed order and live cross-lane delivery, both of which hold
+          # either way.
           "Write a detailed haiku about each of the 10 planets and dwarf planets, " <>
             "one at a time, with a sentence of commentary after each."
         )
@@ -706,18 +707,34 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
       {ctx, samples} =
         Substrate.sample_while(ctx.base_dir, 150, fn ->
+          # The reply AND its turn's terminal state, for each post. `await/4`
+          # stops reading the moment its predicate matches, so waiting only on
+          # replies leaves the last turn's terminal frame sitting unread in the
+          # socket — and an oracle that asks where a reply sits relative to that
+          # frame would fail the healthy run for want of a frame nobody read.
+          #
+          # ONE deadline across all six, not six of them: six waits that each
+          # restart the turn timeout let a socket that has gone quiet hold J5
+          # for six times as long as any single turn is allowed to take.
+          deadline = System.monotonic_time(:millisecond) + ctx.turn_timeout_ms
+
           Enum.reduce([b_id, slow_id, done_id], ctx, fn id, ctx ->
-            case SimClient.await(
-                   ctx.client,
-                   watermark,
-                   &(&1["type"] == "message" and &1["role"] == "assistant" and
-                       &1["replyToClientMessageId"] == id),
-                   ctx.turn_timeout_ms
-                 ) do
-              {:ok, _frame, client} -> %{ctx | client: client}
-              {:error, _reason, client} -> %{ctx | client: client}
-            end
+            ctx
+            |> await_frame_into(
+              watermark,
+              deadline,
+              &(&1["type"] == "message" and &1["role"] == "assistant" and
+                  &1["replyToClientMessageId"] == id)
+            )
+            |> await_frame_into(
+              watermark,
+              deadline,
+              &(&1["type"] == "event" and &1["event"] == "prompt_turn_state" and
+                  get_in(&1, ["payload", "messageId"]) == id and
+                  get_in(&1, ["payload", "terminalState"]) == true)
+            )
           end)
+          |> settle()
         end)
 
       frames = SimClient.frames_since(ctx.client, watermark)
@@ -735,26 +752,40 @@ defmodule Tightbeam.ClientE2E.Journeys do
               &1["replyToClientMessageId"] == b_id)
         )
 
-      cross_talk =
-        Enum.find(
-          frames,
-          &(&1["type"] == "message" and &1["role"] == "assistant" and
-              &1["replyToClientMessageId"] == b_id and &1["sessionKey"] != session_key)
-        )
+      posts = [
+        %{id: slow_id, session_key: ctx.main_key},
+        %{id: b_id, session_key: session_key},
+        %{id: done_id, session_key: ctx.main_key}
+      ]
+
+      # EVERY reply, not just Smoke B's, and BEFORE the concurrency gate: a
+      # bubble in the wrong stream is a defect whatever the lanes did, and the
+      # delivery oracle that also checks it is only reached once the substrate
+      # has been shown to have run them together.
+      cross_talk = wrong_stream_replies(frames, posts)
 
       turns =
         Enum.map([slow_id, b_id, done_id], &Substrate.turn_for_client_message(ctx.base_dir, &1))
 
-      [slow_turn, b_turn, _done_turn] = turns
+      [slow_turn, b_turn, done_turn] = turns
 
       # SIMULTANEITY, two independent witnesses, both of which are about ONE
       # instant rather than a maximum merged across samples:
       #   - a single sample that caught both lanes running at once, and
-      #   - the two turn rows' own start/end intervals overlapping.
+      #   - the turn rows' own start/end intervals overlapping.
       # Either one proves the substrate ran them concurrently; the interval
       # join does not depend on the sampler being lucky.
+      #
+      # EITHER of Main's turns against B's, because either one overlapping B is
+      # the lanes running beside each other — and the delivery oracle accepts a
+      # reply landing inside any of these turns, so a gate that only knew about
+      # `slow` could refuse a run the oracle was ready to pass.
       sampled_together? = Substrate.simultaneous?(samples, [ctx.main_key, session_key])
-      intervals_overlapped? = Substrate.turns_overlapped?(slow_turn, b_turn)
+
+      intervals_overlapped? =
+        Substrate.turns_overlapped?(slow_turn, b_turn) or
+          Substrate.turns_overlapped?(done_turn, b_turn)
+
       substrate_concurrent? = sampled_together? or intervals_overlapped?
 
       # Did the substrate have the OPPORTUNITY to overlap them? The question is
@@ -762,36 +793,29 @@ defmodule Tightbeam.ClientE2E.Journeys do
       # Main necessarily STARTS after Main ends — using its start time put the
       # serialized case into INCOMPLETE and made the queued-behind FAIL branch
       # unreachable, which a probe confirmed.
-      had_opportunity? =
-        with %{"createdAt" => b_created} when is_integer(b_created) <- b_turn,
-             %{"endedAt" => main_end} when is_integer(main_end) <- slow_turn do
-          b_created < main_end
-        else
-          _ -> false
-        end
+      had_opportunity? = lanes_had_opportunity?(slow_turn, b_turn, done_turn)
 
       witness =
         "sampled_together=#{sampled_together?} intervals_overlapped=#{intervals_overlapped?} widest_sample=#{Substrate.widest_sample(samples)}"
 
-      # The PREMISE this journey needs: Main's slow turn must still have been
-      # running when Smoke B's reply arrived. When the model answers the slow
-      # prompt faster than the trivial one, there is no overlap to observe —
-      # and reporting FAIL then would blame the substrate for the model's
-      # speed. That case is INCOMPLETE: the driver could not establish the
-      # conditions the assertion needs. The substrate's own witness (two
-      # `running` rows in different lanes, sampled throughout) is what decides
-      # which of the two it was.
-      b_index = Enum.find_index(reply_order, &(&1 == b_id))
-      slow_index = Enum.find_index(reply_order, &(&1 == slow_id))
-      client_saw_overlap? = is_integer(b_index) and (is_nil(slow_index) or b_index < slow_index)
+      # The three posts, each with the stream it went to, the `messages.seq` the
+      # store gave its reply — the per-store COMMIT order — and its turn's own
+      # interval. That the wire publishes in commit order is what this row
+      # ASSERTS, not something it assumes: publication happens from each writer
+      # after its transaction returns, so two writers to one stream can commit
+      # in one order and publish in the other.
+      expected = expected_deliveries(ctx.base_dir, posts)
 
       row =
         cond do
           is_nil(b_reply) ->
             Scorecard.fail("10", "concurrency", "Smoke B never replied", journey: "J5")
 
-          not is_nil(cross_talk) ->
-            Scorecard.fail("10", "concurrency", "cross-talk: a reply landed in the wrong stream",
+          cross_talk != [] ->
+            Scorecard.fail(
+              "10",
+              "concurrency",
+              "cross-talk: #{inspect(cross_talk)} landed in a stream it was not posted to",
               journey: "J5"
             )
 
@@ -811,22 +835,18 @@ defmodule Tightbeam.ClientE2E.Journeys do
               journey: "J5"
             )
 
-          substrate_concurrent? and client_saw_overlap? ->
-            Scorecard.pass("10", "concurrency", journey: "J5")
-
-          # The substrate PROVABLY ran both lanes at once, yet the client never
-          # saw B's reply arrive during Main's turn. That is a client/WS
-          # delivery failure and it FAILS — calling it incomplete would launder
-          # exactly the delayed-frame defect this journey should catch.
+          # The substrate PROVABLY ran both lanes at once, so what the client
+          # showed is now the whole question, and a delayed or reordered frame
+          # FAILS — calling it incomplete would launder exactly the defect this
+          # journey should catch.
           substrate_concurrent? ->
-            Scorecard.fail(
-              "10",
-              "concurrency",
-              "the substrate ran both lanes simultaneously (#{witness}) but the client did not " <>
-                "see Smoke B's reply during Main's turn (reply order #{inspect(reply_order)}) — " <>
-                "a delayed client frame, not a lane defect",
-              journey: "J5"
-            )
+            case concurrency_delivery_error(frames, expected) do
+              nil ->
+                Scorecard.pass("10", "concurrency", journey: "J5")
+
+              error ->
+                Scorecard.fail("10", "concurrency", "#{error} (#{witness})", journey: "J5")
+            end
 
           # No simultaneity witness, and B only started after Main had already
           # finished: the substrate serialized the two lanes.
@@ -897,6 +917,314 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {ctx, immediate} = j8_immediate_wake(ctx)
     {ctx, delayed} = j8_delayed_wake(ctx)
     {ctx, [immediate, delayed]}
+  end
+
+  # How long a reply may trail its own store stamp and still count as delivered
+  # live. The path measures 0-1ms end to end (stamp -> commit -> publish ->
+  # client frame, all on one host); a second is three orders of magnitude above
+  # that and an order below what a person would notice as waiting, so what
+  # crosses it is a frame that waited for something.
+  @delivery_budget_ms 1_000
+
+  @doc """
+  J5's client-side oracle: what a client must show while two lanes run at once.
+
+  `expected` is one entry per post this journey made — `%{id: clientMessageId,
+  session_key: the stream it was posted to, committed_seq: and committed_at:
+  its reply's `messages.seq` and store stamp (nil when the store holds no
+  reply), started_at: and ended_at: its turn row's own interval}` — so every
+  leg is scoped to THIS journey's three turns and a frame belonging to any
+  other turn can neither satisfy a leg nor break one.
+
+  No leg asks which model answered first. A trivial prompt in a fresh stream
+  routinely outlives a deliberately slow one in a warm stream — it pays a new
+  harness session and whatever preamble the agent elects — and a model's speed
+  is not evidence about delivery. The legs, in order:
+
+  1. the store holds a reply for every post. Its silence must not read as the
+     client's success: the later legs would compare lists that agree on what
+     they both omit;
+  2. every one of those replies reached the client;
+  3. within EACH stream, they arrived in the order the store COMMITTED them —
+     a frame reordered, or held past a later commit in its own stream, shows up
+     here. Per stream and not across them, because that is the guarantee the
+     wire makes: `ConnRegistry` keeps its delivered-seq cursor per session, and
+     two streams' publications are independent, so one lane committing before
+     another and publishing after it is ordinary concurrency rather than a
+     defect. A global order would fail healthy runs.
+
+     WHAT THIS LEG DOES NOT REACH, since the row should not claim it: J5's
+     three posts cannot produce two CONCURRENT writers to one stream. Main's
+     two turns are serialized by its own lane and Smoke B is a second stream
+     with its own cursor, so the drop this leg is shaped to catch — a publish
+     out of commit order inside ONE session, which the cursor then suppresses
+     forever — is not reachable from this journey. Reaching it needs two
+     writers to one session at once (a client post's echo against a marker
+     appended by something else), which is a different construction than three
+     posts from one client;
+  4. each reply carried the sessionKey of the stream it answers, and so did the
+     terminal turn-state frame it is judged against. Correlating that frame by
+     `messageId` alone would let one labelled with the wrong stream stand in for
+     a frame the client was never shown;
+  5. each reply arrived BEFORE its own turn's terminal `prompt_turn_state`.
+     The substrate publishes those back to back at the end of the turn, so
+     their order is the edge that catches a reply held behind the close of the
+     very turn that produced it — the case the order leg cannot see when the
+     held reply was committed last anyway. A turn whose terminal state never
+     reached the client fails here too: an indicator left spinning is not a
+     delivered turn;
+  6. EVERY reply reached the client within `budget_ms` of its own store stamp
+     (`committed_at`, `messages.timestamp`, taken as the row is inserted; a
+     reply with no stamp fails here rather than skipping the check). The
+     interval it measures is stamp -> commit -> publish -> frame, so a slow
+     COMMIT counts against it as well as a slow publication; that is honest
+     about what a client waited for, and the commit itself is microseconds of a
+     one-second budget.
+
+     Against the stamp and NOT against `turns.endedAt`, which is the timestamp
+     this leg used to trust: the lane writes `endedAt` after the runner returns
+     and the runner publishes before returning, so a stalled publication drags
+     `endedAt` along with it and the bound measured the delay against itself.
+
+     This is the one leg with a number in it. A frame that arrives eventually,
+     in the right order, behind its own already-closed turn has no edge to be
+     caught at — it is the last thing that happens in the run, so nothing else
+     moves while it waits, and no successor event can bound it. Where no edge
+     exists, the number: `@delivery_budget_ms`, three orders of magnitude above
+     the 0-1ms this path measures and an order below anything a person would
+     call waiting. What it names is a frame that WAITED for something, never a
+     slow one. THE RESIDUAL, recorded rather than papered over: a delay shorter
+     than the budget is invisible to this row, and no threshold can be chosen
+     that both catches every delay and never fires on a healthy run;
+  7. and some reply ARRIVED, by the driver's own clock, STRICTLY inside another
+     of these turns (`started_at`..`ended_at` by the substrate's). This is the
+     cross-lane liveness the journey exists to prove, and it holds whichever
+     lane finishes first. It is deliberately a clock question rather than a
+     frame-order one: a gateway that withheld every frame and flushed them in
+     perfect order at the end satisfies every order leg and fails this. Strict
+     bounds, because both clocks are millisecond truncations of one source: an
+     arrival landing exactly on a turn's boundary is ambiguous, and an oracle
+     must not accept ambiguity as proof. A flush timed to the millisecond of the
+     last close would otherwise pass as live delivery.
+
+  Returns nil when every leg holds, else the text of the first that did not.
+  """
+  @spec concurrency_delivery_error([map()], [map()], pos_integer()) :: String.t() | nil
+  def concurrency_delivery_error(frames, expected, budget_ms \\ @delivery_budget_ms) do
+    replies = reply_indexes(frames, expected)
+    terminals = turn_state_indexes(frames, expected, &terminal_turn_state?/1)
+
+    uncommitted = for %{id: id, committed_seq: nil} <- expected, do: id
+    missing = for %{id: id} <- expected, not is_map_key(replies, id), do: id
+
+    cond do
+      uncommitted != [] ->
+        "the store holds no reply row for #{inspect(uncommitted)} — the substrate never " <>
+          "produced what the client is being asked to have shown"
+
+      missing != [] ->
+        "the store committed replies the client never received: #{inspect(missing)}"
+
+      true ->
+        misordered =
+          expected
+          |> Enum.group_by(& &1.session_key)
+          |> Enum.find_value(fn {key, posts} ->
+            delivered = order_by(posts, fn %{id: id} -> replies[id].index end)
+            committed = order_by(posts, & &1.committed_seq)
+            if delivered != committed, do: {key, delivered, committed}
+          end)
+
+        cross_talk = wrong_stream_replies(frames, expected)
+
+        held =
+          for %{id: id} <- expected,
+              is_nil(terminals[id]) or replies[id].index > terminals[id],
+              do: id
+
+        undated = for %{id: id} <- expected, not is_integer(replies[id].received_at), do: id
+
+        cond do
+          misordered ->
+            {key, delivered, committed} = misordered
+
+            "in #{key} the client showed replies in an order the store never committed: " <>
+              "client #{inspect(delivered)}, committed #{inspect(committed)}"
+
+          cross_talk != [] ->
+            "cross-talk: #{inspect(cross_talk)} answered in a stream it was not posted to"
+
+          held != [] ->
+            "#{inspect(held)} did not reach the client before its own turn's terminal state — " <>
+              "the reply was held behind the close of the very turn that produced it"
+
+          undated != [] ->
+            "the driver recorded no arrival time for #{inspect(undated)}, so live delivery " <>
+              "cannot be judged for this run"
+
+          (late = late_arrivals(expected, replies, budget_ms)) != [] ->
+            "#{inspect(late)} reached the client more than #{budget_ms}ms after the store " <>
+              "stamped it — delivered, but not delivered live"
+
+          not cross_lane_live?(expected, replies) ->
+            "no reply arrived while another of these streams' turns was still open — " <>
+              "the frames were delivered, but not while the other lane was running"
+
+          true ->
+            nil
+        end
+    end
+  end
+
+  # Keep reading after the last awaited frame. Every wait here stops the moment
+  # its predicate matches, so a frame the gateway sends AFTER the last one — a
+  # second bubble for a post, in a stream it was never posted to — would never
+  # be read, and an oracle can only judge frames the driver holds. This is J1's
+  # settle window, for J1's reason: a negative proved by not-looking is not a
+  # proof.
+  defp settle(ctx), do: %{ctx | client: SimClient.settle(ctx.client, ctx.settle_ms)}
+
+  # Read until `predicate` matches, keeping whatever arrived on the way. A frame
+  # that never comes is left to the oracle to name — the wait decides only when
+  # to stop reading.
+  defp await_frame_into(ctx, watermark, deadline, predicate) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    case SimClient.await(ctx.client, watermark, predicate, remaining) do
+      {:ok, _frame, client} -> %{ctx | client: client}
+      {:error, _reason, client} -> %{ctx | client: client}
+    end
+  end
+
+  # Every reply whose arrival trails its own store stamp by more than the
+  # budget. The stamp is taken as the row is written, so this measures how long
+  # the FRAME waited, not how long the model thought.
+  defp late_arrivals(expected, replies, budget_ms) do
+    for %{id: id, committed_at: committed_at} <- expected,
+        not is_integer(committed_at) or replies[id].received_at - committed_at > budget_ms,
+        do: id
+  end
+
+  defp cross_lane_live?(expected, replies) do
+    Enum.any?(expected, fn %{id: id, session_key: key} ->
+      at = replies[id].received_at
+
+      Enum.any?(expected, fn other ->
+        other.session_key != key and is_integer(other.started_at) and
+          is_integer(other.ended_at) and other.started_at < at and at < other.ended_at
+      end)
+    end)
+  end
+
+  @doc """
+  Whether the substrate ever had the chance to run these lanes beside each
+  other — the question that separates "the lanes are not parallel" (FAIL) from
+  "there was nothing to observe" (INCOMPLETE).
+
+  Asked of each ADJACENT pair in post order, and always of the LATER post's
+  enqueue against the EARLIER turn's close: Smoke B was posted after Main's slow
+  prompt, and Main's `done` after Smoke B. Comparing a turn's enqueue against
+  the close of something posted after it proves nothing — B is created before
+  `done` exists, so `b.createdAt < done.endedAt` is true in a perfectly
+  sequential run and would report every such run as a parallelism failure.
+
+  It is the ENQUEUE and not the start on the later side: a turn serialized
+  behind another necessarily starts after it ends, so using its start makes the
+  queued-behind case unreachable.
+  """
+  @spec lanes_had_opportunity?(map() | nil, map() | nil, map() | nil) :: boolean()
+  def lanes_had_opportunity?(slow_turn, b_turn, done_turn) do
+    queued_while_running?(b_turn, slow_turn) or queued_while_running?(done_turn, b_turn)
+  end
+
+  defp queued_while_running?(%{"createdAt" => created}, %{"endedAt" => ended})
+       when is_integer(created) and is_integer(ended),
+       do: created < ended
+
+  defp queued_while_running?(_later, _earlier), do: false
+
+  # Every post with ANY assistant frame answering it in a stream it was not
+  # posted to. All of its frames and not just the first: a second bubble for the
+  # same post, rendered in the wrong session, is the same defect and a check
+  # that stopped at the first correctly-labelled one could not see it.
+  defp wrong_stream_replies(frames, posts) do
+    for %{id: id, session_key: key} <- posts,
+        frame <- frames,
+        assistant_reply?(frame),
+        frame["replyToClientMessageId"] == id,
+        frame["sessionKey"] != key,
+        uniq: true,
+        do: id
+  end
+
+  defp order_by(expected, key_fun), do: expected |> Enum.sort_by(key_fun) |> Enum.map(& &1.id)
+
+  # %{clientMessageId => %{frame, index, received_at}} for the replies to THESE
+  # posts, in the stream each was posted to. The FIRST frame answering a post is
+  # the one it was answered by; a later duplicate cannot move its place in the
+  # arrival order.
+  defp reply_indexes(frames, expected) do
+    ids = MapSet.new(expected, & &1.id)
+
+    frames
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {frame, index}, acc ->
+      id = frame["replyToClientMessageId"]
+
+      if assistant_reply?(frame) and MapSet.member?(ids, id) and not is_map_key(acc, id),
+        do: Map.put(acc, id, %{frame: frame, index: index, received_at: frame["receivedAt"]}),
+        else: acc
+    end)
+  end
+
+  # %{clientMessageId => index} of the FIRST matching turn-state frame for each
+  # post — matched on the post's stream as well as its id, so a frame carrying
+  # the wrong sessionKey cannot stand in for one the client never saw.
+  defp turn_state_indexes(frames, expected, match?) do
+    posts = Map.new(expected, &{&1.id, &1.session_key})
+
+    frames
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {frame, index}, acc ->
+      id = get_in(frame, ["payload", "messageId"])
+
+      if match?.(frame) and Map.get(posts, id) == get_in(frame, ["payload", "sessionKey"]) and
+           not is_map_key(acc, id),
+         do: Map.put(acc, id, index),
+         else: acc
+    end)
+  end
+
+  defp assistant_reply?(frame),
+    do: frame["type"] == "message" and frame["role"] == "assistant"
+
+  defp terminal_turn_state?(frame) do
+    frame["type"] == "event" and frame["event"] == "prompt_turn_state" and
+      get_in(frame, ["payload", "terminalState"]) == true
+  end
+
+  # Each post paired with the stream it went to, the `messages.seq` of the reply
+  # the store holds for it, and its turn row's own interval.
+  defp expected_deliveries(base_dir, posts) do
+    session_keys = posts |> Enum.map(& &1.session_key) |> Enum.uniq()
+
+    committed =
+      session_keys
+      |> Enum.flat_map(&Substrate.messages(base_dir, &1))
+      |> Enum.filter(&is_binary(&1["replyToClientMessageId"]))
+      |> Map.new(&{&1["replyToClientMessageId"], {&1["seq"], &1["timestamp"]}})
+
+    Enum.map(posts, fn post ->
+      turn = Substrate.turn_for_client_message(base_dir, post.id) || %{}
+      {seq, committed_at} = Map.get(committed, post.id, {nil, nil})
+
+      Map.merge(post, %{
+        committed_seq: seq,
+        committed_at: committed_at,
+        started_at: turn["startedAt"],
+        ended_at: turn["endedAt"]
+      })
+    end)
   end
 
   defp j6_model_change(ctx) do

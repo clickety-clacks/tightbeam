@@ -122,11 +122,19 @@ defmodule Tightbeam.ClientE2E.Substrate do
     |> List.first()
   end
 
-  @doc "Messages for a session in stream order (the transcript the client replays)."
+  @doc """
+  Messages for a session in stream order (the transcript the client replays).
+
+  `timestamp` is taken as the row is inserted, inside the append transaction —
+  so it dates the write, a hair before the commit that follows it. It is the
+  only clock in the store that a stalled PUBLICATION cannot move: the lane
+  writes `turns.endedAt` after the runner returns, and the runner publishes
+  before it returns, so `endedAt` travels with any delay it might have measured.
+  """
   @spec messages(base_dir(), String.t()) :: [map()]
   def messages(base_dir, session_key) do
     query(base_dir, """
-    SELECT seq, id, role, content, sender, clientMessageId, replyToClientMessageId
+    SELECT seq, id, role, content, sender, clientMessageId, replyToClientMessageId, timestamp
     FROM messages WHERE sessionKey = #{quote_string(session_key)} ORDER BY seq
     """)
   end

@@ -237,11 +237,30 @@ on 2026-07-25:
 10. [auto: J5] Create session "Smoke B". Post a slow prompt in Main ("write a haiku
     about each of 10 planets"), then IMMEDIATELY post in Smoke B ("what is
     2+2?"), then a third in Main ("now say DONE").
-    PASS: Smoke B's reply arrives while Main's first turn is still running
-    (different lanes run in parallel); Main's two turns complete in order;
-    ALL turns reach `delivered` with assistant bubbles; no cross-talk
-    (each reply in its own stream). DB: at peak, two `running` rows with
-    DIFFERENT sessionKeys.
+    PASS: the store holds a reply for all three posts and the client received
+    every one of them; within each stream they arrive in the order the store
+    committed them (across streams the cursors are independent, so a different
+    interleaving is ordinary concurrency, not a defect); each
+    arrives before its own turn's terminal state (a reply held behind the close
+    of its own turn is a delayed frame even when it was committed last anyway);
+    each lands in the stream it was posted to (no cross-talk); each reaches the
+    client within a second of the moment the STORE STAMPED it — `messages.
+    timestamp`, not `turns.endedAt`, which is written after publication and so
+    moves along with any stall it might have measured (a frame that arrives
+    eventually, in the right order, long after its commit is a delayed frame —
+    the one condition stated as a duration, because nothing else in the run
+    moves while such a frame waits, so there is no event to catch it at; a
+    delay shorter than that budget is out of this row's reach and no threshold
+    exists that both catches every delay and never fires on a healthy run); and
+    one of them ARRIVES, by the clock, strictly inside ANOTHER of
+    these turns by the substrate's — different lanes run in parallel. That last
+    one is what tells live delivery from a gateway that withheld every frame and
+    flushed them, in perfect order, once both lanes were done. Main's two turns
+    complete in order; ALL turns reach `delivered`.
+    DB: at peak, two `running` rows with DIFFERENT sessionKeys.
+    Which prompt the model answers first decides nothing here: a trivial
+    prompt in a fresh stream routinely outlives a slow one in a warm stream,
+    and a model's speed is not evidence about delivery.
 
 ## 6. Slash commands (current contract)
 

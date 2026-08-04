@@ -14,7 +14,12 @@ defmodule Tightbeam.ClientE2E.SimClient do
   ## The frame log and watermarks
 
   Every frame the client receives is appended to `frames`, in arrival order,
-  and never consumed: oracles re-read history, and a turn's proof usually
+  stamped with a `receivedAt` millisecond of the DRIVER's own clock — an
+  observation about this client, not a reach into the gateway, and the only
+  way an oracle can tell live delivery from an order-preserving flush of
+  everything at the end.
+
+  The log is never consumed: oracles re-read history, and a turn's proof usually
   spans several frames (echo → typing on → progress → reply → typing off).
   `mark/1` returns a watermark into that log and `await/4` scans forward from
   one, so an assertion about THIS turn cannot be satisfied by a frame from the
@@ -383,10 +388,15 @@ defmodule Tightbeam.ClientE2E.SimClient do
 
   defp record(client, body) do
     case JSON.decode(body) do
-      {:ok, frame} when is_map(frame) -> %{client | frames: client.frames ++ [frame]}
-      _ -> %{client | frames: client.frames ++ [%{"type" => "__undecodable__", "raw" => body}]}
+      {:ok, frame} when is_map(frame) ->
+        %{client | frames: client.frames ++ [Map.put(frame, "receivedAt", now_ms())]}
+
+      _ ->
+        %{client | frames: client.frames ++ [%{"type" => "__undecodable__", "raw" => body}]}
     end
   end
+
+  defp now_ms, do: System.system_time(:millisecond)
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
