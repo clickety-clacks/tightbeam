@@ -237,6 +237,10 @@ defmodule Tightbeam.JobForensicsTest do
 
   test "proof 4: an overdue escalation appends its rung and target", %{db: db} do
     work_item(db, "wi_esc")
+    # The rung this escalation lands on. The ladder verifies its top rung rather
+    # than composing the key, so an owner who never seeded a main stream has
+    # nobody to escalate TO — a different proof from this one.
+    session(db, Org.personal_session_key("flynn"))
     session(db, "parent")
     session(db, "holder", "parent")
     assignment(db, "asg_esc", "wi_esc")
@@ -724,7 +728,7 @@ defmodule Tightbeam.JobForensicsTest do
   end
 
   defp turn(db, session_key, opts \\ []) do
-    {:ok, seq} =
+    {:ok, {:ok, seq}} =
       DB.transaction(db, fn txn ->
         Ledger.enqueue_in_txn(txn, %{
           session_key: session_key,

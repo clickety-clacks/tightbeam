@@ -375,17 +375,24 @@ defmodule Tightbeam.AdapterHealTest do
         model: nil
       })
 
-    Org.create(db, %{
-      session_key: "k1",
-      display_name: "Main",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("claude-fable-5")
-    })
+    # flynn's actual main stream. `k1` is named "Main" but is not keyed as one,
+    # and adjudication notices climb the lineage ladder to the OWNER's main
+    # session — which the ladder now verifies exists instead of composing its
+    # key. Without this row every episode here is undeliverable and stays
+    # claimed, which is a different proof from the ones in this file.
+    for key <- [Org.personal_session_key("flynn"), "k1"] do
+      Org.create(db, %{
+        session_key: key,
+        display_name: "Main",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("claude-fable-5")
+      })
+    end
 
     base = Path.join(System.tmp_dir!(), "heal_base_#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
@@ -2336,7 +2343,7 @@ defmodule Tightbeam.AdapterHealTest do
     Agent.update(:swap_checkout, fn _ -> {:ok, adapter, 1} end)
   end
 
-  # `harness_for_ref/2` reads the OWNING host's inventory, so the catalog has to
+  # `ModelCatalog.route/2` reads the OWNING host's inventory, so the catalog has to
   # know testhost at all — the setup's instance enumerates the real registry and
   # drops it.
   defp seed_swap_catalog(ctx, efforts \\ []) do

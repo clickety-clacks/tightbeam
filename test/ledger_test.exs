@@ -161,6 +161,131 @@ defmodule Tightbeam.LedgerTest do
     assert length(Ledger.non_terminal_older_than(db, -1)) == 2
   end
 
+  # The single writer every turn passes through. `Org.personal_session_key/1`
+  # COMPOSES a key from a user id, so a well-formed address can name no session
+  # at all — and the enqueue that accepts one has already lost the prompt.
+  test "enqueue refuses a turn addressed to a session that has no row", %{db: db} do
+    assert {:error, :no_session} =
+             Ledger.enqueue(db, %{
+               session_key: "agent:main:clawline:flynn:main",
+               message_id: "m-phantom",
+               origin: "process:tightbeam",
+               prompt: "Model adjudication required."
+             })
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+  end
+
+  # The guard is EXISTENCE, not activeness, and this is the line it must not
+  # cross: a `targetGate = 0` decision notice delivers to a retired target by
+  # design, and spec escalation-delivery-v1 forbids an active-session gate on
+  # that path. The retired target's turn is unclaimable all the same — naming it
+  # is `claim_next/3`'s job, not this write's.
+  test "enqueue still accepts a notice addressed to a retired session", %{db: db} do
+    :ok = DB.execute(db, "UPDATE sessions SET state = 'retired' WHERE sessionKey = 'k2'")
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(db, %{
+               session_key: "k2",
+               message_id: "m-retired",
+               origin: "process:tightbeam",
+               prompt: "a decision that outlived its session"
+             })
+
+    assert {:unclaimable, :session_retired} = Ledger.claim_next(db, "k2", "lane")
+  end
+
+  # `:none` meaning both "nothing queued" and "queued work nobody can ever
+  # claim" is what let six orphaned turns look like an idle queue for hours.
+  test "claim_next separates an empty queue from work nobody can claim", %{db: db} do
+    assert :none = Ledger.claim_next(db, "k1", "lane")
+
+    insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+
+    assert {:unclaimable, :no_session} =
+             Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
+  end
+
+  # An adjudication hold is DESIGNED waiting: the turn is claimable the moment
+  # the ruling lands. Reporting it unclaimable would age live work into `failed`.
+  test "claim_next reports a held turn as an empty claim, never unclaimable", %{db: db} do
+    enqueue!(db, "k1", "held behind an adjudication")
+    :ok = DB.execute(db, "UPDATE sessions SET adjudicationHold = '*' WHERE sessionKey = 'k1'")
+
+    assert :none = Ledger.claim_next(db, "k1", "lane")
+  end
+
+  test "unclaimable turns age into failed carrying the reason", %{db: db} do
+    seq = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+
+    assert [^seq] =
+             Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+
+    assert {:ok, [["failed", error]]} =
+             DB.query(db, "SELECT status, error FROM turns WHERE seq = ?1", [seq])
+
+    assert error =~ "no session row"
+
+    # The named terminal rides the existing at-least-once publication feed.
+    assert [%{seq: ^seq, status: "failed"}] = Ledger.unpublished_terminals(db)
+    assert Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session) == []
+  end
+
+  # Review finding 3. The diagnosis and the failure are separate transactions,
+  # so the cause has to be re-asserted by the UPDATE itself. A session created
+  # in that window makes the turn claimable again, and aging it anyway destroys
+  # live work on the strength of a reading that had already expired.
+  test "a session appearing after the diagnosis spares its turn", %{db: db} do
+    seq = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+
+    assert {:unclaimable, :no_session} =
+             Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO sessions
+        (sessionKey, displayName, ownerUserId, origin, archetype, identityName,
+         harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
+      VALUES
+        ('agent:main:clawline:flynn:main', 'Flynn', 'flynn', 'user:flynn', 'default',
+         'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
+      """)
+
+    assert Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session) == []
+    assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq = ?1", [seq])
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
+  end
+
+  # Re-review finding. Identifying the aged rows by the error string this
+  # function itself wrote makes a second aging re-report the first batch, so the
+  # lane announces rows it did not touch. Only the statement that did the work
+  # knows what it did.
+  test "aging reports the rows it transitioned, never a previous batch", %{db: db} do
+    first = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+    assert [^first] = Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+
+    second = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+    assert [^second] = Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+  end
+
+  # A turn the ledger would refuse today, written the way the pre-guard gateway
+  # wrote it — the reproduction for the ORPHANS already in a live database.
+  defp insert_orphan_turn(db, session_key) do
+    :ok =
+      DB.execute(db, """
+        INSERT INTO turns (sessionKey, messageId, origin, prompt, createdAt)
+        VALUES ('#{session_key}', 'm_#{System.unique_integer([:positive])}',
+                'process:tightbeam', 'orphan', 1)
+      """)
+
+    {:ok, [[seq]]} =
+      DB.query(db, "SELECT seq FROM turns WHERE sessionKey = ?1 ORDER BY seq DESC LIMIT 1", [
+        session_key
+      ])
+
+    seq
+  end
+
   test "transaction rollback leaves no partial rows", %{db: db} do
     assert {:error, _} =
              DB.transaction(db, fn txn ->

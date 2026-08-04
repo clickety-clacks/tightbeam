@@ -72,6 +72,12 @@ defmodule Tightbeam.Placement do
   alias Tightbeam.{Archetypes, DB, Harness, Homes, Identity, Org, Rails}
   import Bitwise
 
+  defmodule Refusal do
+    @moduledoc "A placement refusal that synchronous and turn boundaries can relay by name."
+    @enforce_keys [:code, :host, :harness, :message]
+    defexception [:code, :host, :harness, :message]
+  end
+
   # Non-interactive, bounded ssh everywhere placement reaches out: a dead or
   # misconfigured host must fail in seconds with a reason, never hang on TCP
   # timeouts or an invisible password prompt.
@@ -131,6 +137,22 @@ defmodule Tightbeam.Placement do
   # DB owner and the base_dir the local entry is built from.
   defp hosts_for(config), do: hosts(config.base_dir, Map.get(config, :db, DB))
 
+  @doc "The named denial for a host absent from the configured host registry."
+  @spec unknown_host_denial(String.t(), String.t() | nil) :: %{
+          code: String.t(),
+          message: String.t()
+        }
+  def unknown_host_denial(host, harness \\ nil) do
+    harness_scope = if harness, do: " for #{harness}", else: ""
+
+    %{
+      code: "unknown_host",
+      message:
+        "host #{host} is not configured#{harness_scope}; run tightbeam assimilate " <>
+          "<ssh-dest> --name #{host} --as-user <adminUserId>"
+    }
+  end
+
   @doc """
   The gateway machine's registered name — its real hostname (override:
   :local_host_name config / TIGHTBEAM_LOCAL_HOST_NAME). This is a NAME, not
@@ -155,7 +177,7 @@ defmodule Tightbeam.Placement do
   """
   @spec holder_workdir(map(), map()) :: String.t()
   def holder_workdir(config, holder_session) do
-    host = hosts_for(config)[holder_session.host] || %{ssh: nil, base_dir: config.base_dir}
+    host = fetch_session_host!(config, holder_session)
     path = workdir_path(config, holder_session)
 
     url =
@@ -183,7 +205,7 @@ defmodule Tightbeam.Placement do
   @doc "Materialize one already-resolved identity snapshot at the session's exact cwd."
   @spec materialize_identity(map(), map(), Identity.snapshot(), keyword()) :: Identity.snapshot()
   def materialize_identity(config, session, snapshot, opts \\ []) do
-    host = Map.fetch!(hosts_for(config), session.host)
+    host = fetch_session_host!(config, session)
     cwd = holder_workdir(config, session)
     materialize_identity(config, host, session, snapshot, cwd, opts)
   end
@@ -208,7 +230,7 @@ defmodule Tightbeam.Placement do
   @doc "Derive a session's durable workspace path without creating it."
   @spec workdir_path(map(), map()) :: String.t()
   def workdir_path(config, session) do
-    host = hosts_for(config)[session.host] || %{base_dir: config.base_dir}
+    host = fetch_session_host!(config, session)
 
     digest =
       :crypto.hash(:sha256, session.session_key)
@@ -237,7 +259,7 @@ defmodule Tightbeam.Placement do
   @spec effort_observation(map(), map(), String.t(), term()) ::
           {:ok, map()} | {:error, String.t()}
   def effort_observation(config, session, root, baseline \\ nil) do
-    host = Map.fetch!(hosts_for(config), session.host)
+    host = fetch_session_host!(config, session)
     stamp_dir = Path.join(workdir_path(config, session), @effort_stamp_dir)
     stamp = Path.join(stamp_dir, "#{Tightbeam.Id.uuid4()}.stamp")
     command = effort_observation_command(root, stamp_dir, stamp, prior_stamp(baseline))
@@ -842,10 +864,26 @@ defmodule Tightbeam.Placement do
          }}
 
       not Map.has_key?(hosts, host) ->
-        {:error, %{code: "unknown_host", message: "host #{host} is not configured"}}
+        {:error, unknown_host_denial(host)}
 
       true ->
         {:ok, host}
+    end
+  end
+
+  defp fetch_session_host!(config, session) do
+    case Map.fetch(hosts_for(config), session.host) do
+      {:ok, host} ->
+        host
+
+      :error ->
+        denial = unknown_host_denial(session.host, Map.get(session, :harness))
+
+        raise Refusal,
+          code: denial.code,
+          host: session.host,
+          harness: Map.get(session, :harness),
+          message: denial.message
     end
   end
 

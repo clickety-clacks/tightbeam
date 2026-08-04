@@ -89,6 +89,7 @@ defmodule Tightbeam.Gateway do
     Spinup,
     SubagentMarkers,
     Supervision,
+    Unroutable,
     Wakes,
     WorkItems,
     WorkState
@@ -713,10 +714,10 @@ defmodule Tightbeam.Gateway do
               {name, %{ssh: ssh} = host} when not is_nil(ssh) ->
                 [%{name: name, ssh: ssh, cli_bin: host[:cli_bin]}]
 
-            {_name, %{ssh: nil}} ->
-              []
-          end)
-          |> Enum.sort_by(& &1.name)
+              {_name, %{ssh: nil}} ->
+                []
+            end)
+            |> Enum.sort_by(& &1.name)
 
           %{hosts: hosts}
         end),
@@ -893,40 +894,59 @@ defmodule Tightbeam.Gateway do
       nil ->
         :skipped
 
-      {target, role_ref, role_fallback} ->
-        input = %{
-          session_key: target,
-          role: "user",
-          content: stamped,
-          device_id: opts[:device_id],
-          client_message_id: opts[:client_message_id],
-          attachments: opts[:attachments] || [],
-          sender: opts[:sender]
-        }
+      {target, role_ref, role_fallback} when not is_nil(target) ->
+        if Ledger.enqueueable_in_txn?(txn, target) do
+          append_and_enqueue_in_txn(
+            txn,
+            target,
+            role_ref,
+            role_fallback,
+            origin,
+            stamped,
+            opts
+          )
+        else
+          # Asked BEFORE the echo, because the echo commits in this same
+          # transaction and a raise is not available to take it back (it would
+          # roll the caller's wake `fired` mark back with it). The ledger still
+          # refuses independently — it is the single writer — but a message with
+          # no turn is history nobody can answer, so nothing is written at all.
+          refuse_undeliverable_turn(txn, target, origin, opts)
+        end
+    end
+  end
 
-        case Projection.append_in_txn(txn, input) do
-          {:appended, message} ->
-            {assignment_id, job_ref} = turn_attribution(txn, opts)
+  defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
+    input = %{
+      session_key: target,
+      role: "user",
+      content: stamped,
+      device_id: opts[:device_id],
+      client_message_id: opts[:client_message_id],
+      attachments: opts[:attachments] || [],
+      sender: opts[:sender]
+    }
 
-            Ledger.enqueue_in_txn(txn, %{
-              session_key: target,
-              message_id: message.id,
-              wake_id: opts[:wake_id],
-              origin: origin,
-              prompt: stamped,
-              role_ref: role_ref || opts[:role_ref],
-              role_fallback: role_fallback || opts[:role_fallback] || false,
-              assignment_id: assignment_id,
-              job_ref: job_ref
-            })
+    case Projection.append_in_txn(txn, input) do
+      {:appended, message} ->
+        {assignment_id, job_ref} = turn_attribution(txn, opts)
 
-            if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
-              DB.Txn.q(
-                txn,
-                "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-                [opts[:wake_id], System.system_time(:millisecond)]
-              )
-            end
+        enqueued =
+          Ledger.enqueue_in_txn(txn, %{
+            session_key: target,
+            message_id: message.id,
+            wake_id: opts[:wake_id],
+            origin: origin,
+            prompt: stamped,
+            role_ref: role_ref || opts[:role_ref],
+            role_fallback: role_fallback || opts[:role_fallback] || false,
+            assignment_id: assignment_id,
+            job_ref: job_ref
+          })
+
+        case enqueued do
+          {:ok, _seq} ->
+            fire_wake_in_txn(txn, opts)
 
             # Nag-by-re-arm: a bracket wake that just fired re-arms its
             # replacement IN this transaction if the item is still holderless
@@ -937,9 +957,39 @@ defmodule Tightbeam.Gateway do
 
             {:appended, target, message, opts}
 
-          other ->
-            other
+          # The ledger is the single writer and refuses on its own authority, so
+          # this stays reachable for any future caller even though the check
+          # above already declined this one in the same transaction.
+          {:error, :no_session} ->
+            refuse_undeliverable_turn(txn, target, origin, opts)
         end
+
+      other ->
+        other
+    end
+  end
+
+  # The wake is still CONSUMED — leaving it pending would redeliver the same
+  # undeliverable notice every tick — and the loss is named rather than left as
+  # a queued row nobody can claim.
+  defp refuse_undeliverable_turn(txn, target, origin, opts) do
+    fire_wake_in_txn(txn, opts)
+
+    Logger.error(
+      "refusing a turn addressed to #{target}: no session row exists for that key " <>
+        "(origin=#{origin} wake=#{opts[:wake_id] || "none"} sender=#{opts[:sender] || "none"})"
+    )
+
+    :skipped
+  end
+
+  defp fire_wake_in_txn(txn, opts) do
+    if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
+      DB.Txn.q(
+        txn,
+        "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+        [opts[:wake_id], System.system_time(:millisecond)]
+      )
     end
   end
 
@@ -1035,9 +1085,22 @@ defmodule Tightbeam.Gateway do
         {session_key, nil, false}
 
       _ when gate.reresolve == "lineage" ->
+        # Re-resolution answers "who owns this now", and NOBODY is one of the
+        # answers. Until the ladder could say so, a notice whose recorded target
+        # had gone was re-addressed to a composed personal key that named no
+        # session, and the substrate queued it there forever.
         case Supervision.ladder_target(txn, gate.reresolve_seed, gate.reresolve_rung) do
-          nil -> nil
-          target -> {target, nil, false}
+          nil ->
+            Logger.error(
+              "substrate notice for #{session_key} is undeliverable: re-resolving the lineage " <>
+                "from #{gate.reresolve_seed} rung #{gate.reresolve_rung} found no active " <>
+                "session to own it"
+            )
+
+            nil
+
+          target ->
+            {target, nil, false}
         end
 
       _ ->
@@ -1297,7 +1360,7 @@ defmodule Tightbeam.Gateway do
   # RESOLUTION IS DELIBERATELY LENIENT: an id it cannot find passes through as
   # if it were a family, and NOTHING here refuses it. That is safe only because
   # resolve-then-validate is ONE PIPELINE — every caller hands the result to
-  # `validate_catalog_model/5`, which is where an unknown selection is refused
+  # `validate_catalog_model/4`, which is where an unknown selection is refused
   # by name against the host's live catalog. The gate lives there, once, at the
   # boundary that knows the host. A future caller that resolves without
   # validating reintroduces silent acceptance of an unknown model.
@@ -1440,19 +1503,6 @@ defmodule Tightbeam.Gateway do
   # A catalog entry for a reader who has to pick one — an operator reading a
   # refusal, an adjudicator reading a brief. Fields are named, because what the
   # reader must produce next is flags, not a packed string.
-  defp describe_entry(entry) do
-    qualifiers =
-      [
-        entry.context && "context #{entry.context}",
-        entry.efforts != [] && "efforts: #{Enum.join(entry.efforts, "|")}"
-      ]
-      |> Enum.filter(&is_binary/1)
-
-    case qualifiers do
-      [] -> entry.family
-      parts -> "#{entry.family} (#{Enum.join(parts, ", ")})"
-    end
-  end
 
   # Which KIND of credential this session's turns actually run on — an API key or
   # a subscription. A fact about {the session's host, its harness's provider},
@@ -1802,8 +1852,9 @@ defmodule Tightbeam.Gateway do
   defp adjudication_model_inventories(session) do
     Map.new(Harness.all(), fn module ->
       {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
+
       {module.wire_name(),
-       %{health: inspect(health), models: Enum.map(models, &describe_entry/1)}}
+       %{health: inspect(health), models: Enum.map(models, &ModelCatalog.describe_entry/1)}}
     end)
   end
 
@@ -3233,18 +3284,134 @@ defmodule Tightbeam.Gateway do
             {:ok, nil}
           end
 
-        with {:ok, overrides} <- override_result,
-             {:ok, host} <-
-               Placement.resolve(archetype, p[:host], Placement.hosts(config.base_dir, db)) do
-          create_spawn(config, db, call, caller, archetype, host, overrides)
-        else
-          {:error, denial} -> classified_spawn_denial(denial, "config_denied", "placement_denied")
+        case override_result do
+          {:ok, overrides} ->
+            harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
+
+            module =
+              if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
+
+            default_model = archetype.defaults[:model] || defaults.model
+
+            with {:ok, placement} <-
+                   resolve_spawn_host(config, db, archetype, p, module, default_model) do
+              create_spawn(config, db, call, caller, archetype, placement, overrides)
+            else
+              {:error, denial} ->
+                classified_spawn_denial(denial, "config_denied", "placement_denied")
+            end
+
+          {:error, denial} ->
+            classified_spawn_denial(denial, "config_denied", "placement_denied")
         end
     end
   end
 
-  defp create_spawn(config, db, call, caller, archetype, host, overrides) do
+  defp resolve_spawn_host(config, db, archetype, %{host: host}, _module, _default_model)
+       when is_binary(host) do
+    with {:ok, resolved} <-
+           Placement.resolve(archetype, host, Placement.hosts(config.base_dir, db)),
+         do: {:ok, %{host: resolved}}
+  end
+
+  defp resolve_spawn_host(
+         config,
+         db,
+         %{where: ["*"]} = archetype,
+         _p,
+         _module,
+         _default_model
+       ) do
+    with {:ok, resolved} <-
+           Placement.resolve(archetype, nil, Placement.hosts(config.base_dir, db)),
+         do: {:ok, %{host: resolved}}
+  end
+
+  defp resolve_spawn_host(config, db, archetype, p, module, default_model) do
+    hosts = Placement.hosts(config.base_dir, db)
+    harness = module.wire_name()
+
+    case archetype.where do
+      [host] when is_map_key(hosts, host) ->
+        {:ok, %{host: host}}
+
+      _multiple_or_missing ->
+        resolve_spawn_host_candidates(
+          config,
+          db,
+          archetype,
+          p,
+          module,
+          default_model,
+          hosts,
+          harness
+        )
+    end
+  end
+
+  defp resolve_spawn_host_candidates(
+         config,
+         db,
+         archetype,
+         p,
+         module,
+         default_model,
+         hosts,
+         harness
+       ) do
+    result =
+      Enum.reduce_while(archetype.where, [], fn host, failures ->
+        candidate =
+          with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
+               :ok <- validate_credential(config, harness, host),
+               model = spawn_model_selection(host, harness, p, default_model),
+               {:ok, routed} <- route_spawn_candidate(host, harness, model),
+               :ok <- Spinup.ensure_ready(config, module.id(), host, spinup_opts(config, db)) do
+            {:ok, %{host: host, model: model, routed: routed}}
+          end
+
+        case candidate do
+          {:ok, placement} ->
+            {:halt, {:ok, placement}}
+
+          {:error, %Unroutable{} = unroutable} ->
+            {:cont, [{host, {:error, routing_error(unroutable)}} | failures]}
+
+          {:error, denial} ->
+            {:cont, [{host, {:error, denial}} | failures]}
+        end
+      end)
+
+    case result do
+      {:ok, placement} ->
+        {:ok, placement}
+
+      failures when is_list(failures) ->
+        causes =
+          failures
+          |> Enum.reverse()
+          |> Enum.map_join("\n", fn {host, {:error, denial}} ->
+            "  #{host}: #{denial.message}"
+          end)
+
+        {:error,
+         %{
+           code: "host_unready",
+           message:
+             "no host in archetype #{archetype.name}'s where can run #{harness}:\n#{causes}"
+         }}
+    end
+  end
+
+  defp route_spawn_candidate(host, harness, %Model{} = model),
+    do: ModelCatalog.route(host, harness, model, ModelCatalog)
+
+  defp route_spawn_candidate(_host, _harness, _model),
+    do: {:error, %{code: "model_unavailable", message: "model must be specified"}}
+
+  defp create_spawn(config, db, call, caller, archetype, placement, overrides) do
     p = call.params
+    host = placement.host
     defaults = defaults(config, db)
     harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
     module = if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
@@ -3256,21 +3423,26 @@ defmodule Tightbeam.Gateway do
     # not name is composed against what the chosen model actually offers.
     default_model = archetype.defaults[:model] || defaults.model
 
-    model =
-      compose_model_selection(
-        host,
-        harness_string,
-        default_model,
-        resolve_selection(host, harness_string, p, default_model)
-      )
-
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
+
+    prepared =
+      case placement do
+        %{model: %Model{} = model, routed: routed} ->
+          {:ok, {model, routed}}
+
+        %{host: ^host} ->
+          model = spawn_model_selection(host, harness_string, p, default_model)
+
+          with :ok <- validate_credential(config, harness_string, host),
+               {:ok, routed} <-
+                 validate_catalog_model(host, harness_string, model, from_default?(p)),
+               :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)),
+               do: {:ok, {model, routed}}
+      end
 
     # Placement resolved the host FIRST, so the ref is judged against the account
     # that will actually run the turn (#88) — not the gateway's.
-    with :ok <- validate_credential(config, harness_string, host),
-         :ok <- validate_catalog_model(config, host, harness_string, model, from_default?(p)),
-         :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)) do
+    with {:ok, {model, routed}} <- prepared do
       input = %{
         display_name: p.display_name,
         kind: "custom",
@@ -3284,7 +3456,7 @@ defmodule Tightbeam.Gateway do
         identity_name: identity_name,
         host: host,
         harness: harness_string,
-        provider: catalog_provider!(host, harness_string, model),
+        provider: routed.provider,
         model: model
       }
 
@@ -3348,14 +3520,28 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp spawn_model_selection(host, harness, params, default_model) do
+    compose_model_selection(
+      host,
+      harness,
+      default_model,
+      resolve_selection(host, harness, params, default_model)
+    )
+  end
+
   defp classified_spawn_denial(denial, config_code, placement_code) do
-    if denial[:code] in ["host_not_allowed", "unknown_host"],
+    if denial[:code] in ["host_not_allowed", "unknown_host", "host_unready"],
       do: classified_denial(placement_code, denial),
       else: classified_denial(config_code, denial)
   end
 
+  # A routability refusal keeps its OWN code and sentence. The list is asked of
+  # the routability owner rather than spelled here, because a hand-kept list held
+  # only the two codes the old mechanism produced — so a needs-an-effort refusal
+  # (composition and validation read the catalog separately, and an async refresh
+  # can land between them) came back re-labelled a PLACEMENT denial.
   defp classified_denial(code, denial) do
-    if denial[:code] in ["model_unavailable", "catalog_unavailable"] do
+    if denial[:code] in Unroutable.codes() do
       Map.put(denial, :detail, denial)
     else
       %{code: code, message: denial[:message] || inspect(denial), detail: denial}
@@ -3411,9 +3597,8 @@ defmodule Tightbeam.Gateway do
               )
 
             with :ok <- validate_credential(config, harness, session.host),
-                 :ok <-
+                 {:ok, routed} <-
                    validate_catalog_model(
-                     config,
                      session.host,
                      harness,
                      model,
@@ -3438,7 +3623,7 @@ defmodule Tightbeam.Gateway do
                 db,
                 call.session_key,
                 harness,
-                catalog_provider!(session.host, harness, model),
+                routed.provider,
                 model
               )
 
@@ -3657,9 +3842,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp apply_model_change(config, db, _call, session, new_ref) do
-    with :ok <- validate_catalog_model(config, session.host, session.harness, new_ref, false),
-         {%{provider: provider}, _health} <-
-           ModelCatalog.entry(session.host, session.harness, new_ref, ModelCatalog) do
+    with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
       result =
         run_session_mutation(session.session_key, fn ->
           apply_tuned_model(
@@ -3667,7 +3850,7 @@ defmodule Tightbeam.Gateway do
             db,
             session,
             new_ref,
-            Atom.to_string(provider)
+            routed.provider
           )
         end)
 
@@ -3812,94 +3995,31 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # Every refusal names the harness, the HOST that owns the catalog, and the
-  # repair ON THAT HOST. The catalog belongs to the account that will run the
-  # turn, so sending an operator to the gateway to fix a satellite's grant — as
-  # this did before per-host catalogs — sent them to the wrong machine.
-  defp validate_catalog_model(config, host, harness, model, configured_default?) do
-    case match?(%Model{}, model) && ModelCatalog.member?(host, harness, model) do
-      %{present?: true, health: :fresh} ->
-        :ok
-
-      %{health: :fresh} ->
+  # A RELAY, not a second opinion. `ModelCatalog.route/3` owns which selections
+  # are routable and why, so every refusal here names the harness, the HOST that
+  # owns the catalog, and the repair on that host — including the lessons this
+  # copy used to hold alone (the client_version filter) and the one it used to
+  # get wrong (a missing tier reported as a missing model).
+  #
+  # It returns the ROUTED answer, so its callers no longer look the entry up a
+  # second time to learn the provider.
+  defp validate_catalog_model(host, harness, model, configured_default?) do
+    with %Model{} <- model,
+         {:ok, routed} <- ModelCatalog.route(host, harness, model, ModelCatalog) do
+      {:ok, routed}
+    else
+      {:error, %Unroutable{} = unroutable} ->
         warn_dead_default(host, harness, model, configured_default?)
+        {:error, routing_error(unroutable)}
 
-        {:error,
-         %{
-           code: "model_unavailable",
-           message:
-             "model #{inspect(Model.describe(model))} is not offered by #{harness} on host #{host}" <>
-               offered_models_hint(host, harness)
-         }}
-
-      %{health: {:unavailable, {:needs_onboarding, reason}}} ->
-        warn_dead_default(host, harness, model, configured_default?)
-        provider = Harness.parse!(harness).credential_provider()
-
-        message =
-          if reason == :missing do
-            "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: " <>
-              missing_credential_message(config, provider, harness, host)
-          else
-            "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: no " <>
-              "#{harness} model catalog there, because #{provider} has no usable credential " <>
-              "on #{host} (#{inspect(reason)}). A catalog is derived on the host that runs " <>
-              "the turn, so this is #{host}'s grant to fix; run tightbeam onboard " <>
-              "#{provider} on #{host}"
-          end
-
-        {:error,
-         %{
-           code: "catalog_unavailable",
-           message: message
-         }}
-
-      # The codex models endpoint filters by the caller's client_version and says
-      # nothing about it: too old a binary and every model is dropped, with a 200.
-      # Blaming the account here would send the operator to re-onboard a grant
-      # that was never the problem.
-      %{health: {:unavailable, {:empty_catalog_for_client_version, version}}} ->
-        warn_dead_default(host, harness, model, configured_default?)
-
-        {:error,
-         %{
-           code: "catalog_unavailable",
-           message:
-             "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: the " <>
-               "provider returned an EMPTY model list for client_version #{inspect(version)}, " <>
-               "which is the #{harness} binary's own version on #{host}. The credential is " <>
-               "not implicated; upgrade #{harness} on #{host}"
-         }}
-
-      %{health: health} ->
-        warn_dead_default(host, harness, model, configured_default?)
-
-        {:error,
-         %{
-           code: "catalog_unavailable",
-           message:
-             "cannot validate model #{inspect(Model.describe(model))} for #{harness} on host #{host}: " <>
-               "#{inspect(health)}"
-         }}
-
-      false ->
+      _not_a_model ->
         warn_dead_default(host, harness, model, configured_default?)
         {:error, %{code: "model_unavailable", message: "model must be specified"}}
     end
   end
 
-  # A refusal that names only the rejected value makes the operator guess. The
-  # catalog is already in hand, so say what IS offered — harness-agnostic, and for
-  # claude it reflects the selectable filter rather than the raw API list.
-  defp offered_models_hint(host, harness) do
-    case ModelCatalog.get(host, harness, ModelCatalog) do
-      {[_ | _] = entries, _health} ->
-        "; offered: " <>
-          (entries |> Enum.map(&describe_entry/1) |> Enum.sort() |> Enum.join(", "))
-
-      _ ->
-        ""
-    end
+  defp routing_error(%Unroutable{} = unroutable) do
+    %{code: Unroutable.code(unroutable), message: Unroutable.message(unroutable)}
   end
 
   defp validate_credential(config, harness, machine) do
@@ -4664,7 +4784,7 @@ defmodule Tightbeam.Gateway do
     session = Org.get(db, episode.session_key)
     ruled = Model.from_params(call.params)
 
-    with {:ok, harness, provider} <- harness_for_ref(session.host, ruled) do
+    with {:ok, %{harness: harness, provider: provider}} <- ModelCatalog.route(session.host, ruled) do
       if harness != session.harness do
         %{
           code: "cross_harness_requires_respawn",
@@ -4689,7 +4809,7 @@ defmodule Tightbeam.Gateway do
         end
       end
     else
-      {:error, error} -> error
+      {:error, unroutable} -> routing_error(unroutable)
     end
   end
 
@@ -4714,6 +4834,7 @@ defmodule Tightbeam.Gateway do
            ) do
         {:ok, {:applied, delivery, wake_id}} ->
           complete_delivery(db, delivery)
+
           Map.merge(published_identity(applied_model), %{
             ok: true,
             action: "swap",
@@ -4873,7 +4994,7 @@ defmodule Tightbeam.Gateway do
     old = Org.get(db, episode.session_key)
     ruled = Model.from_params(call.params)
 
-    with {:ok, harness, provider} <- harness_for_ref(old.host, ruled) do
+    with {:ok, %{harness: harness, provider: provider}} <- ModelCatalog.route(old.host, ruled) do
       new_session_key = "agent:" <> Tightbeam.Id.uuid4()
 
       {:ok, transferred_rows} =
@@ -5083,7 +5204,7 @@ defmodule Tightbeam.Gateway do
           }
       end
     else
-      {:error, error} -> error
+      {:error, unroutable} -> routing_error(unroutable)
     end
   end
 
@@ -5460,69 +5581,6 @@ defmodule Tightbeam.Gateway do
     count > 0
   end
 
-  # Matches the COMPLETE selection, effort included. Resolving on family and
-  # context alone would let a ruling respawn a session at an effort the model
-  # does not offer, and would call two harnesses ambiguous when only one of
-  # them offers the level asked for.
-  # THE ONE ANSWER to "can this selection be routed, and if not why". Routability
-  # is a question about the WHOLE fleet — one harness tiering a model says
-  # nothing while another offers it untiered — so every entry naming the model
-  # is gathered BEFORE anything is refused. A second gate in front of this,
-  # deciding the same thing from a narrower view, is what refused a valid
-  # untiered ruling on the strength of the first tiered entry it happened to
-  # find. The refusal belongs here, on the complete answer.
-  defp harness_for_ref(host, %Model{} = ref) do
-    naming_model =
-      Enum.flat_map(Harness.all(), fn module ->
-        case ModelCatalog.entry(host, module.wire_name(), ref) do
-          {%{} = entry, :fresh} -> [{module, entry}]
-          _ -> []
-        end
-      end)
-
-    case Enum.filter(naming_model, fn {_module, entry} ->
-           ModelCatalog.offers_effort?(entry, ref.effort)
-         end) do
-      [{module, entry}] ->
-        {:ok, module.wire_name(), Atom.to_string(entry.provider)}
-
-      [] ->
-        {:error, unroutable(ref, naming_model)}
-
-      _ ->
-        {:error,
-         %{code: "ambiguous_ref", message: "model appears in multiple harness inventories"}}
-    end
-  end
-
-  # Each cause named as itself. Reporting "not in inventory" for a model that is
-  # plainly there, because only its TIER was wrong, sends the reader after the
-  # wrong thing.
-  defp unroutable(_ref, []),
-    do: %{code: "model_unavailable", message: "model is not in a fresh harness inventory"}
-
-  defp unroutable(%Model{effort: nil} = ref, naming_model) do
-    %{
-      code: "invalid",
-      message:
-        "#{Model.to_ref(ref)} has effort tiers on " <>
-          "#{Enum.map_join(naming_model, ", ", fn {module, entry} -> "#{module.wire_name()} (#{Enum.join(entry.efforts, "|")})" end)}" <>
-          "; the ruling must name one with --effort"
-    }
-  end
-
-  defp unroutable(%Model{} = ref, naming_model) do
-    %{
-      code: "model_unavailable",
-      message:
-        "#{Model.to_ref(ref)} does not offer effort #{inspect(ref.effort)} on any fresh " <>
-          "harness; offered: " <>
-          Enum.map_join(naming_model, ", ", fn {module, entry} ->
-            "#{module.wire_name()} (#{Enum.join(entry.efforts, "|")})"
-          end)
-    }
-  end
-
   # Says four things and nothing more: the engine changed, from what to what,
   # that earlier history is RETAINED rather than deleted, and that this is
   # expected. `Projection.list_after/5` floors at the barrier — it never deletes
@@ -5544,16 +5602,6 @@ defmodule Tightbeam.Gateway do
 
   defp describe_engine(harness, nil), do: "#{harness}"
   defp describe_engine(harness, model), do: "#{harness} (#{Model.describe(model)})"
-
-  defp catalog_provider!(host, harness, ref) do
-    case ModelCatalog.entry(host, harness, ref) do
-      {%{provider: provider}, _health} ->
-        Atom.to_string(provider)
-
-      {nil, _health} ->
-        raise "catalog entry missing after validation: #{harness}/#{ref} on #{host}"
-    end
-  end
 
   defp commit_host_rearm(_config, _db, _session, _host, 0),
     do: {:error, "holder assignments kept changing while the workspace moved"}
