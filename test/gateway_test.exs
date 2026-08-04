@@ -1235,6 +1235,44 @@ defmodule Tightbeam.GatewayTest do
     end)
   end
 
+  test "children installs the CLI from the RELEASE layout when there is no source tree", ctx do
+    # The release-install defect both first-install agents found within minutes
+    # of each other (macOS and linux, 2026-08-04): the seeding knew only
+    # cli/target/release, so every npm install got a bin/tightbeam telling a
+    # toolchain-free customer to run cargo. In a release, the compiled CLI is
+    # the npm package's own bin — a sibling of RELEASE_ROOT.
+    pkg_dir =
+      Path.join(System.tmp_dir!(), "gateway_release_cli_#{System.unique_integer([:positive])}")
+
+    release_root = Path.join(pkg_dir, "release")
+    File.mkdir_p!(Path.join(pkg_dir, "bin"))
+    File.mkdir_p!(release_root)
+    File.write!(Path.join(pkg_dir, "bin/tightbeam"), "release-cli-binary")
+
+    # cwd deliberately holds NO cli/target — a customer box has no source tree.
+    cwd = Path.join(pkg_dir, "cwd")
+    File.mkdir_p!(cwd)
+    base = Path.join(pkg_dir, "base")
+
+    previous = System.get_env("RELEASE_ROOT")
+    System.put_env("RELEASE_ROOT", release_root)
+
+    on_exit(fn ->
+      if previous,
+        do: System.put_env("RELEASE_ROOT", previous),
+        else: System.delete_env("RELEASE_ROOT")
+
+      File.rm_rf!(pkg_dir)
+    end)
+
+    File.cd!(cwd, fn ->
+      Gateway.children(gateway_config(base, ctx.db, 0))
+      installed = Path.join(base, "bin/tightbeam")
+      assert File.read!(installed) == "release-cli-binary"
+      assert File.stat!(installed).mode |> Bitwise.band(0o777) == 0o755
+    end)
+  end
+
   test "children installs the codex hook-trust shim and preserves missing or self-resolved codex",
        ctx do
     root =

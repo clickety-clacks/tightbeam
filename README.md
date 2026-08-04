@@ -304,19 +304,16 @@ meet the requirements above. `UserName` keeps the process off root.
   <key>UserName</key><string>you</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/mix</string>
-    <string>run</string>
-    <string>--no-halt</string>
+    <string>/Users/you/.local/bin/tightbeam-gateway</string>
   </array>
-  <key>WorkingDirectory</key><string>/Users/you/src/tightbeam_ex</string>
+  <key>WorkingDirectory</key><string>/Users/you</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>gibson</string>
     <key>TIGHTBEAM_BASE_DIR</key><string>/Users/you/.tightbeam</string>
     <key>TIGHTBEAM_PORT</key><string>11373</string>
     <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://gibson.local:11373</string>
-    <key>MIX_ENV</key><string>dev</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
@@ -352,9 +349,8 @@ Wants=network-online.target
 Type=exec
 User=you
 Group=you
-WorkingDirectory=/home/you/src/tightbeam_ex
-ExecStart=/home/you/.local/bin/mix run --no-halt
-Environment=MIX_ENV=dev
+WorkingDirectory=/home/you
+ExecStart=/home/you/.local/bin/tightbeam-gateway
 Environment=TIGHTBEAM_LOCAL_HOST_NAME=gibson
 Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
 Environment=TIGHTBEAM_PORT=11373

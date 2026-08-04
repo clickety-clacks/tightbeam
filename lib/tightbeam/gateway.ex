@@ -1569,28 +1569,42 @@ defmodule Tightbeam.Gateway do
     bin_dir = Path.join(base_dir, "bin")
     File.mkdir_p!(bin_dir)
     wrapper = Path.join(bin_dir, "tightbeam")
-    rust_cli = Path.expand("cli/target/release/tightbeam", File.cwd!())
 
-    if File.exists?(rust_cli) do
-      # Removed first, not copied over. On macOS, writing into an existing Mach-O
-      # invalidates its code signature and the kernel SIGKILLs it on exec -- exit 137,
-      # no output, indistinguishable from a corrupt build. Observed while replacing this
-      # very wrapper by hand.
-      File.rm(wrapper)
-      File.cp!(rust_cli, wrapper)
-    else
-      # There is NO fallback. There used to be one, to the retired TypeScript CLI
-      # in a sibling checkout: on a machine that had that checkout the operator
-      # silently got a different implementation than the gateway that installed
-      # it, and on a machine without it an executable that died on a path they
-      # never chose. A fallback to a retired implementation only ever fires where
-      # nobody is watching, so it is gone.
-      Logger.warning(
-        "tightbeam CLI not built: #{rust_cli} is missing, so #{wrapper} will refuse " <>
-          "to run. Build it with: cargo build --release --manifest-path cli/Cargo.toml"
-      )
+    # TWO LAYOUTS SHIP A CLI, and this used to know only one of them. A release
+    # install carries the compiled CLI as the npm package's own bin — a sibling
+    # of the release root the running gateway can locate exactly — while a
+    # source checkout builds it under cli/target. Knowing only the source path
+    # meant every release install seeded a wrapper pointing at a directory that
+    # does not exist there, telling a toolchain-free customer to run cargo:
+    # found by BOTH first-install agents, macOS and linux, within minutes of
+    # each other (2026-08-04). Not a fallback between implementations — both
+    # candidates are the same binary, differing only in who compiled it.
+    candidates =
+      case System.get_env("RELEASE_ROOT") do
+        nil -> []
+        release_root -> [Path.expand("../bin/tightbeam", release_root)]
+      end ++ [Path.expand("cli/target/release/tightbeam", File.cwd!())]
 
-      File.write!(wrapper, refusing_wrapper(rust_cli))
+    case Enum.find(candidates, &File.exists?/1) do
+      rust_cli when is_binary(rust_cli) ->
+        # Removed first, not copied over. On macOS, writing into an existing Mach-O
+        # invalidates its code signature and the kernel SIGKILLs it on exec -- exit 137,
+        # no output, indistinguishable from a corrupt build. Observed while replacing
+        # this very wrapper by hand.
+        File.rm(wrapper)
+        File.cp!(rust_cli, wrapper)
+
+      nil ->
+        # There is NO fallback to another implementation (a retired one used to
+        # live here and only ever fired where nobody was watching). The refusal
+        # names every place a CLI could have been.
+        Logger.warning(
+          "tightbeam CLI not found (looked for #{Enum.join(candidates, ", ")}), so " <>
+            "#{wrapper} will refuse to run. On a source checkout, build it with: " <>
+            "cargo build --release --manifest-path cli/Cargo.toml"
+        )
+
+        File.write!(wrapper, refusing_wrapper(candidates))
     end
 
     File.chmod!(wrapper, 0o755)
@@ -1602,11 +1616,12 @@ defmodule Tightbeam.Gateway do
   # `bin/tightbeam` still EXISTS when the CLI was not built, because its absence
   # is itself confusing — but it does exactly one thing: say what is missing and
   # how to build it.
-  defp refusing_wrapper(rust_cli) do
+  defp refusing_wrapper(candidates) do
     """
     #!/bin/sh
-    echo "tightbeam CLI is not installed: #{rust_cli} was missing when the gateway booted." >&2
-    echo "Build it with: cargo build --release --manifest-path cli/Cargo.toml" >&2
+    echo "tightbeam CLI is not installed: none of these existed when the gateway booted:" >&2
+    #{Enum.map_join(candidates, "\n", fn c -> ~s(echo "  #{c}" >&2) end)}
+    echo "On a source checkout, build it with: cargo build --release --manifest-path cli/Cargo.toml" >&2
     exit 127
     """
   end
