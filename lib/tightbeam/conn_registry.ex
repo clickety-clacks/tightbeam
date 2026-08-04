@@ -26,26 +26,32 @@ defmodule Tightbeam.ConnRegistry do
   projection.ex:95-96 and its caller publishes afterwards — so two writers to
   one session can commit in one order and publish in the other. When they do,
   this module drops the earlier frame at :161-162 and a connected client never
-  sees it; only a reconnect's replay repairs it. This module enforces the
-  per-connection monotonic filter and cannot enforce the ordering it rests on.
+  sees it; only a replay restores it, on reconnect or on a re-auth of the same
+  socket (wire/socket.ex:299-303). This module enforces the per-connection
+  monotonic filter and cannot enforce the ordering it rests on.
 
   The publication sites, every one of them post-commit: gateway.ex:1701 (an
   agent's reply, published from the turn's own task), :1043 (a delivery echo,
   from whichever process ran the dispatch — a socket, a wake, a control route),
-  and :4142, :5195, :5767 (markers), all through the helper at :5772; plus
-  event_log.ex:324, after the transaction opened at :297. SCOPE OF THAT LIST:
-  it is the message path, read at 422ff58. The remaining `DB.transaction`
-  callers were not audited, so treat it as where to start rather than as
-  exhaustive, and re-derive the lines before trusting them.
+  :4142 (a credential-transition notice the substrate authors), and :5195,
+  :5767 (markers), all through the helper at :5772; plus event_log.ex:324,
+  after the transaction opened at :297. SCOPE OF THAT LIST: it is the message
+  path, read at 422ff58. The remaining `DB.transaction` callers were not
+  audited, so treat it as where to start rather than as exhaustive, and
+  re-derive the lines before trusting them.
 
-  No reproduction is known. The client-e2e concurrency journey (J5) cannot
-  produce one: its two streams keep separate cursors, and one stream's turns
-  are serialized by its own lane, so it never puts two concurrent writers on a
-  single session. Reaching this needs exactly that — a client post's echo
-  against a marker appended by something else, at the same instant.
+  WHAT SERIALIZES, AND WHAT DOES NOT: a session's lane serializes its TURNS, not
+  the writes to it. A client post's echo and a running turn's reply are two
+  independent writers to one session, from two processes, with nothing ordering
+  them against each other. The client-e2e concurrency journey (J5) creates both
+  of those writers on its Main stream — so it is not immune by construction. It
+  is immune only by timing: its three posts land together at the start and the
+  replies commit seconds later, so the two never write at the same instant.
 
-  Making publication ride commit order is a design in its own right and is not
-  attempted here.
+  No reproduction is known. One would need those two writes to land together,
+  which J5 does not arrange and which nothing in the suite currently does.
+
+  Fixing this is a design in its own right and is not attempted here.
   """
 
   use GenServer
