@@ -379,7 +379,9 @@ COMMANDS:
   attend [--high]
       Elect the attention tier of the reply you are about to give, during your
       own turn. --high marks it high; without the flag it is normal, which is
-      also what electing nothing gives you. Two tiers, no others.
+      also what electing nothing gives you. Those two, no others: `low` is in
+      the same vocabulary but is the substrate's election over its own ambient
+      notices, never something a reply asks for.
   transcript (--session <key> | --name <displayName>)
              [--before <messageId> | --after <messageId>] [--limit <n>]
       Read a session's conversation from the substrate's own rows. --name is a

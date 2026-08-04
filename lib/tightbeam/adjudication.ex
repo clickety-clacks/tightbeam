@@ -19,6 +19,8 @@ defmodule Tightbeam.Adjudication do
 
   alias Tightbeam.DB.Txn
 
+  require Logger
+
   @conditions ~w(auth_failed model_unavailable boot_failed quota_exhausted other)
 
   @adapter_fault_prefix "adapter_fault:"
@@ -196,11 +198,31 @@ defmodule Tightbeam.Adjudication do
     end
   end
 
-  @doc "Schedule the deterministic owner wake and perform claimed→notified in the same txn."
+  @doc """
+  Schedule the deterministic owner wake and perform claimed→notified in the same
+  txn. `:undeliverable` when the ladder names nobody: an episode nobody can be
+  notified of stays `claimed` rather than recording a notification that was
+  addressed to a session which does not exist.
+  """
   def notify_in_txn(%Txn{} = txn, episode, prompt, response_window_ms) do
-    target =
-      Supervision.ladder_target(txn, episode.reresolve_seed, episode.reresolve_rung)
+    case Supervision.ladder_target(txn, episode.reresolve_seed, episode.reresolve_rung) do
+      nil ->
+        Logger.error(
+          "model adjudication for #{episode.session_key} " <>
+            "(condition=#{episode.condition} cause=#{episode.cause || "unclassified"}) is " <>
+            "undeliverable: the lineage ladder from #{episode.reresolve_seed} rung " <>
+            "#{episode.reresolve_rung} is exhausted and its owner has no active main session — " <>
+            "the episode stays claimed and unnotified"
+        )
 
+        :undeliverable
+
+      target ->
+        notify_target_in_txn(txn, episode, prompt, response_window_ms, target)
+    end
+  end
+
+  defp notify_target_in_txn(%Txn{} = txn, episode, prompt, response_window_ms, target) do
     wake_id =
       deterministic_wake_in_txn(
         txn,
@@ -419,50 +441,26 @@ defmodule Tightbeam.Adjudication do
                   reresolve_rung: episode.reresolve_rung + 1
               }
 
-              target = Supervision.ladder_target(txn, next.reresolve_seed, next.reresolve_rung)
-              wake_id = deterministic_wake_in_txn(txn, next, "owner", target, old_prompt)
+              case Supervision.ladder_target(txn, next.reresolve_seed, next.reresolve_rung) do
+                # No rung above the one already notified. NOTHING is lost here:
+                # the episode was delivered to the rung it has, and the ladder
+                # simply has a top. So this writes nothing, says nothing, and
+                # escalates the moment a higher rung exists — which is what
+                # makes recovery automatic instead of waiting out a window.
+                nil ->
+                  false
 
-              Wakes.cancel_pending_in_txn(txn, episode.owner_wake_id)
-
-              Txn.q(
-                txn,
-                """
-                UPDATE adjudication_episodes
-                SET status='notified', correlationKey=?4, ownerTarget=?5, ownerWakeId=?6,
-                    reresolveRung=?7, deadlineAt=?8
-                WHERE sessionKey=?1 AND condition=?2 AND status=?3 AND correlationKey=?9
-                """,
-                [
-                  session_key,
-                  condition,
-                  status,
-                  next.correlation_key,
-                  target,
-                  wake_id,
-                  next.reresolve_rung,
-                  now() + response_window_ms,
-                  episode.correlation_key
-                ]
-              )
-
-              if Txn.changes(txn) == 1 do
-                CausalEvents.append_in_txn(txn, %{
-                  kind: "adjudication_escalate",
-                  assignment_id: episode.assignment_id,
-                  job_ref: episode.job_ref,
-                  session_key: session_key,
-                  detail: %{
-                    episodeId: episode.episode_id,
-                    fromState: status,
-                    toState: "notified",
-                    toRung: next.reresolve_rung,
-                    toTarget: target
-                  }
-                })
-
-                true
-              else
-                false
+                target ->
+                  escalate_to_in_txn(
+                    txn,
+                    episode,
+                    next,
+                    status,
+                    condition,
+                    target,
+                    old_prompt,
+                    response_window_ms
+                  )
               end
             end
 
@@ -473,6 +471,63 @@ defmodule Tightbeam.Adjudication do
     end)
 
     :ok
+  end
+
+  defp escalate_to_in_txn(
+         %Txn{} = txn,
+         episode,
+         next,
+         status,
+         condition,
+         target,
+         old_prompt,
+         response_window_ms
+       ) do
+    session_key = episode.session_key
+    wake_id = deterministic_wake_in_txn(txn, next, "owner", target, old_prompt)
+
+    Wakes.cancel_pending_in_txn(txn, episode.owner_wake_id)
+
+    Txn.q(
+      txn,
+      """
+      UPDATE adjudication_episodes
+      SET status='notified', correlationKey=?4, ownerTarget=?5, ownerWakeId=?6,
+          reresolveRung=?7, deadlineAt=?8
+      WHERE sessionKey=?1 AND condition=?2 AND status=?3 AND correlationKey=?9
+      """,
+      [
+        session_key,
+        condition,
+        status,
+        next.correlation_key,
+        target,
+        wake_id,
+        next.reresolve_rung,
+        now() + response_window_ms,
+        episode.correlation_key
+      ]
+    )
+
+    if Txn.changes(txn) == 1 do
+      CausalEvents.append_in_txn(txn, %{
+        kind: "adjudication_escalate",
+        assignment_id: episode.assignment_id,
+        job_ref: episode.job_ref,
+        session_key: session_key,
+        detail: %{
+          episodeId: episode.episode_id,
+          fromState: status,
+          toState: "notified",
+          toRung: next.reresolve_rung,
+          toTarget: target
+        }
+      })
+
+      true
+    else
+      false
+    end
   end
 
   ## Adapter-heal auto-release (spec s4-operability-v1 §2)

@@ -18,7 +18,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, Ledger, EventLog}
+  alias Tightbeam.{DB, EventLog, Ledger, Placement}
 
   defstruct [
     :session_key,
@@ -176,7 +176,7 @@ defmodule Tightbeam.SessionLane do
       )
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
-    finalize(state, seq, {:error, :task_crash})
+    finalize(state, seq, crash_outcome(reason))
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -187,6 +187,11 @@ defmodule Tightbeam.SessionLane do
   def handle_info(_msg, state), do: {:noreply, state}
 
   ## Internals
+
+  defp crash_outcome({%Placement.Refusal{} = refusal, _stacktrace}),
+    do: {:error, refusal.message}
+
+  defp crash_outcome(_reason), do: {:error, :task_crash}
 
   defp maybe_start(%{task_ref: ref} = state) when not is_nil(ref), do: state
 
@@ -222,6 +227,22 @@ defmodule Tightbeam.SessionLane do
 
       :none ->
         state
+
+      {:unclaimable, reason} ->
+        # Backstop. `Ledger.enqueue_in_txn/2` refuses to write a turn nobody can
+        # claim, so reaching here means a row predates that guard or a session
+        # retired between the enqueue and this claim. Either way the wait is
+        # over: no claim will ever move it, and a queued row that cannot move is
+        # exactly the shape that hid six lost prompts. Aging it into `failed`
+        # names the cause and publishes through the reconciler's terminal feed.
+        seqs = Ledger.fail_unclaimable(state.db, state.session_key, reason)
+
+        Logger.error(
+          "aged #{length(seqs)} unclaimable turn(s) for #{state.session_key} into failed: " <>
+            "#{reason} (seqs #{Enum.join(seqs, ",")})"
+        )
+
+        state
     end
   end
 
@@ -236,13 +257,13 @@ defmodule Tightbeam.SessionLane do
 
         {:error, %{reason: reason, terminal_publish: fun, adjudicate_in_txn: action} = attrs}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"failed", inspect(reason), fun, action, Map.get(attrs, :post_commit)}
+          {"failed", error_text(reason), fun, action, Map.get(attrs, :post_commit)}
 
         {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
-          {"failed", inspect(reason), fun, nil, nil}
+          {"failed", error_text(reason), fun, nil, nil}
 
         {:error, reason} ->
-          {"failed", inspect(reason), nil, nil, nil}
+          {"failed", error_text(reason), nil, nil, nil}
       end
 
     finish_result =
@@ -290,4 +311,7 @@ defmodule Tightbeam.SessionLane do
   # row is marked published. The publisher hook is injected by the composition
   # root; in E1 the ledger's publishedAt marking is the observable seam.
   defp publish_terminal(state, seq), do: Ledger.mark_published(state.db, seq)
+
+  defp error_text(reason) when is_binary(reason), do: reason
+  defp error_text(reason), do: inspect(reason)
 end

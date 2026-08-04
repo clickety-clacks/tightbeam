@@ -2,12 +2,32 @@ defmodule Tightbeam.Projection do
   @moduledoc """
   The messages projection store: a one-way cache of finalized harness truth
   for wire replay and display.
+
+  `attentionTier` widened its VALUE domain (it now also carries -1, `:low`)
+  without changing its column type, so `Tightbeam.Schema`'s shape stamp is
+  unbumped on purpose: the stamp refuses a database this build cannot READ,
+  and every row an older build wrote is still read correctly here. Nothing
+  older ever wrote a -1, and nothing older reads this table.
   """
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
+
+  @typedoc """
+  The attention an author elects for a message. ONE vocabulary, shared by the
+  agent's `attend` election over its own reply and by the substrate's notices
+  (`Tightbeam.EventLog.notice/5`) — same tier names, same `attentionTier`
+  payload key, same client consumer. `:low` extends the original normal|high
+  pair DOWNWARD for ambient substrate information a client hides by default.
+
+  Elevation is a NEW higher-attention message referencing the event, never a
+  mutation of one already sent: these are records.
+  """
+  @type attention :: :low | :normal | :high
+
+  @attention_tiers %{low: -1, normal: 0, high: 1}
 
   @typedoc """
   A stored message. `seq` is the per-store commit order (the replay/live
@@ -142,16 +162,39 @@ defmodule Tightbeam.Projection do
     end
   end
 
-  @doc "Append a Tightbeam-authored transcript marker inside an existing transaction."
-  @spec append_marker_in_txn(Txn.t(), String.t(), String.t()) :: {:appended, message()}
-  def append_marker_in_txn(%Txn{} = txn, session_key, content) do
+  @doc """
+  Append a Tightbeam-authored transcript marker inside an existing
+  transaction. The marker elects its own attention the way an agent elects
+  its reply's — markers are not turns, so the election rides the message
+  rather than `turns.replyAttention`, but it is the same vocabulary and
+  reaches the client through the same `attentionTier` key.
+  """
+  @spec append_marker_in_txn(Txn.t(), String.t(), String.t(), attention()) ::
+          {:appended, message()}
+  def append_marker_in_txn(%Txn{} = txn, session_key, content, attention \\ :normal) do
     append_in_txn(txn, %{
       session_key: session_key,
       role: "assistant",
       content: content,
-      sender: "process:tightbeam"
+      sender: "process:tightbeam",
+      attention_tier: attention_tier(attention)
     })
   end
+
+  @doc "The stored tier for an elected attention name."
+  @spec attention_tier(attention()) :: integer()
+  def attention_tier(attention) when is_map_key(@attention_tiers, attention),
+    do: Map.fetch!(@attention_tiers, attention)
+
+  @doc """
+  The elected attention a stored tier means. Total over what this store
+  writes; anything else is a database in a shape nobody wrote, so it raises
+  rather than guessing a name.
+  """
+  @spec attention_name(integer()) :: String.t()
+  def attention_name(-1), do: "low"
+  def attention_name(0), do: "normal"
+  def attention_name(1), do: "high"
 
   @doc "Fetch one message by store id, or nil."
   @spec get(db(), String.t()) :: message() | nil

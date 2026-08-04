@@ -24,7 +24,16 @@ defmodule Tightbeam.Dispatch do
   still appends a "verb" row with the error.
   """
 
-  alias Tightbeam.{Assignments, DB, Escalation, EventLog, RailEpisodes, RailRemedy, Rules}
+  alias Tightbeam.{
+    Assignments,
+    DB,
+    Escalation,
+    EventLog,
+    Placement,
+    RailEpisodes,
+    RailRemedy,
+    Rules
+  }
 
   @typedoc """
   A verb call. `origin` is WHO (\"user:flynn\" | \"agent:<handle>\") — never
@@ -267,7 +276,11 @@ defmodule Tightbeam.Dispatch do
   defp invoke(handler, call) do
     {:returned, handler.(call)}
   rescue
-    exception -> {:raised, exception}
+    exception in Placement.Refusal ->
+      {:returned, %{code: exception.code, message: exception.message}}
+
+    exception ->
+      {:raised, exception}
   end
 
   defp gated_ref(call) do

@@ -143,6 +143,124 @@ defmodule Tightbeam.PlacementTest do
     assert error.message =~ inspect(reason)
   end
 
+  test "workdir_path names a disappeared host instead of falling back to the gateway", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    register_hosts(db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/tightbeam", cli_bin: nil}
+    })
+
+    session = %{
+      session_key: "remote-session",
+      host: "eurisko",
+      harness: "claude",
+      cli_token: "secret"
+    }
+
+    remote_workdir = Placement.workdir_path(%{base_dir: base_dir, db: db}, session)
+    assert String.starts_with?(remote_workdir, "/srv/tightbeam/work/")
+
+    :ok = DB.execute(db, "DELETE FROM hosts WHERE name='eurisko'")
+
+    {error, stacktrace} =
+      try do
+        Placement.workdir_path(%{base_dir: base_dir, db: db}, session)
+        flunk("workdir_path accepted a disappeared host")
+      rescue
+        error in Placement.Refusal -> {error, __STACKTRACE__}
+      end
+
+    assert error.code == "unknown_host"
+    assert error.host == "eurisko"
+    assert error.harness == "claude"
+    assert error.message =~ "host eurisko is not configured for claude"
+    assert error.message =~ "tightbeam assimilate <ssh-dest> --name eurisko"
+    assert {Placement, :workdir_path, 2, _location} = Enum.at(stacktrace, 1)
+    refute File.exists?(Path.join(base_dir, "work"))
+  end
+
+  test "holder_workdir independently names a disappeared host instead of falling back", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    register_hosts(db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/tightbeam", cli_bin: nil}
+    })
+
+    session = %{
+      session_key: "remote-holder",
+      host: "eurisko",
+      harness: "codex",
+      cli_token: "secret"
+    }
+
+    :ok = DB.execute(db, "DELETE FROM hosts WHERE name='eurisko'")
+
+    {error, stacktrace} =
+      try do
+        Placement.holder_workdir(%{base_dir: base_dir, db: db, port: 4000}, session)
+        flunk("holder_workdir accepted a disappeared host")
+      rescue
+        error in Placement.Refusal -> {error, __STACKTRACE__}
+      end
+
+    assert error.code == "unknown_host"
+    assert error.host == "eurisko"
+    assert error.harness == "codex"
+    assert error.message =~ "host eurisko is not configured for codex"
+    assert error.message =~ "tightbeam assimilate <ssh-dest> --name eurisko"
+    assert {Placement, :holder_workdir, 2, _location} = Enum.at(stacktrace, 1)
+    refute File.exists?(Path.join(base_dir, "work"))
+  end
+
+  test "materialize_identity names a disappeared session host", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    session = %{
+      session_key: "vanished-materialization",
+      host: "eurisko",
+      harness: "codex",
+      cli_token: "secret"
+    }
+
+    expected =
+      "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
+        "--name eurisko --as-user <adminUserId>"
+
+    error =
+      assert_raise Placement.Refusal, fn ->
+        Placement.materialize_identity(
+          %{base_dir: base_dir, db: db},
+          session,
+          %{revision: "abc", skills: %{}}
+        )
+      end
+
+    assert error.code == "unknown_host"
+    assert error.message == expected
+  end
+
+  test "effort_observation names a disappeared session host", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    session = %{session_key: "vanished-effort", host: "eurisko", harness: "claude"}
+
+    expected =
+      "host eurisko is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
+        "--name eurisko --as-user <adminUserId>"
+
+    error =
+      assert_raise Placement.Refusal, fn ->
+        Placement.effort_observation(%{base_dir: base_dir, db: db}, session, "/work")
+      end
+
+    assert error.code == "unknown_host"
+    assert error.message == expected
+  end
+
   test "move_workdir copies local to local", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-local")
     new_base = Path.join(base_dir, "new-local")
