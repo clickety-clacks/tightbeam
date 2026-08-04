@@ -49,9 +49,12 @@ fi
 # failed `nodedown` against a gateway that was plainly running. A name that only the
 # start path knows is not a name.
 #
-# Those commands find the node by NAME, so they must resolve to the SAME name the
-# gateway was started under: the same `TIGHTBEAM_NODE` if one was set, otherwise the same
-# `TIGHTBEAM_PORT`. Saying "the same port" alone is false whenever an override is in play.
+# Those commands find the node by NAME, so they must run in an environment that resolves
+# to the SAME name the gateway was started under. Three inputs decide it, in this order:
+# `RELEASE_NODE`, then `TIGHTBEAM_NODE`, then `TIGHTBEAM_PORT`. State it as the whole
+# environment rather than as a list of variables to remember — twice now a shorter
+# version of this sentence has been WRONG by omission ("the same port", then "the port or
+# TIGHTBEAM_NODE"), each time describing a guarantee this script does not give.
 #
 # A LEADING FLAG STILL MEANS `start`. The previous form was `start "$@"`, so
 # `tightbeam-gateway --erl "+sbwt none"` passed that option to start; treating a
