@@ -305,6 +305,87 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert detail =~ "adapter transport died: credential socket closed"
   end
 
+  test "an adapter killed inside the park window is still recorded as a death", ctx do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
+    File.write!(path, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :"coordinator_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    ref = Process.monitor(adapter)
+
+    # Order the two messages the way ONLY a park can order them. Suspending the
+    # coordinator puts the close request in its mailbox ahead of the death, so
+    # do_close_adapter's selective receive is what collects the :DOWN and
+    # handle_info/2 never sees it. That is the whole hazard: the park window is
+    # a second, silent path a genuine death can leave by.
+    :erlang.suspend_process(coordinator)
+    :ok = AdapterCoordinator.request_close_adapter(coordinator, key)
+    send(adapter, {:acp_exit, 137})
+    assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
+    :erlang.resume_process(coordinator)
+
+    assert eventually(fn ->
+             ctx.db |> EventLog.lifecycle_events() |> Enum.any?(&(&1.kind == "adapter_down"))
+           end)
+
+    assert [%{kind: "adapter_down", detail: detail}] =
+             ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
+
+    # The row says which state the adapter died in. A park that was ASKED for
+    # and got :normal is not a death and stays unrecorded (the test below);
+    # this one was killed while the park was in flight.
+    assert detail =~ "parked=true"
+    assert detail =~ "137"
+  end
+
+  test "a park that closes the adapter as asked records no death", ctx do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
+    File.write!(path, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :"coordinator_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    ref = Process.monitor(adapter)
+
+    assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
+    assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
+
+    assert [] = ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
+  end
+
   test "an adapter dying with a draining gateway is lifecycle, not an [error]", ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
