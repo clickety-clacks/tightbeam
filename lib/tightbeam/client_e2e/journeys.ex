@@ -734,6 +734,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
                   get_in(&1, ["payload", "terminalState"]) == true)
             )
           end)
+          |> settle()
         end)
 
       frames = SimClient.frames_since(ctx.client, watermark)
@@ -1080,6 +1081,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
         end
     end
   end
+
+  # Keep reading after the last awaited frame. Every wait here stops the moment
+  # its predicate matches, so a frame the gateway sends AFTER the last one — a
+  # second bubble for a post, in a stream it was never posted to — would never
+  # be read, and an oracle can only judge frames the driver holds. This is J1's
+  # settle window, for J1's reason: a negative proved by not-looking is not a
+  # proof.
+  defp settle(ctx), do: %{ctx | client: SimClient.settle(ctx.client, ctx.settle_ms)}
 
   # Read until `predicate` matches, keeping whatever arrived on the way. A frame
   # that never comes is left to the oracle to name — the wait decides only when

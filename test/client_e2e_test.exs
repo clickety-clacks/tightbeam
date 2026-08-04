@@ -635,9 +635,10 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "cross-talk is caught for EVERY post, not just Smoke B's" do
-      # Main's slow reply delivered into Smoke B's stream. The surrounding
-      # journey checks only B's reply for cross-talk, so this leg is the only
-      # thing standing between that defect and a green row.
+      # Main's slow reply delivered into Smoke B's stream. The journey checks
+      # this for all three posts before the concurrency gate as well; the leg is
+      # here so the oracle refuses it on its own evidence rather than relying on
+      # a caller to have looked first.
       frames =
         Enum.map(b_answers_first(), fn frame ->
           if frame["replyToClientMessageId"] == "slow",
