@@ -136,6 +136,20 @@ overrides the port. Whatever you set for the service, set for the shell you run
 the CLI from: if they disagree, the CLI looks for its gateway in a directory
 that does not have one.
 
+### More than one gateway on one machine
+
+Supported, and it needs nothing from you beyond what a second instance needs
+anyway: its own `TIGHTBEAM_BASE_DIR` and its own `TIGHTBEAM_PORT`.
+
+A release build also runs a named Erlang node, and two nodes on a machine cannot
+share a name. `tightbeam-gateway` derives one from the port —
+`tightbeam_gateway_<port>` — so distinct ports give distinct nodes. Set
+`TIGHTBEAM_NODE` if you want to name it yourself; it is the only reason to.
+
+If a second gateway ever exits complaining that a name `seems to be in use by
+another Erlang node`, that is this: two instances resolved to the same node name,
+almost certainly because they were given the same port.
+
 With at least one usable harness through preflight, the first boot creates the
 base dir and serves, but **cannot run a turn yet**: it has no credentials, so it
 prints a NOT READY summary naming every gap. Harness homes are projected per
@@ -245,6 +259,7 @@ The service must **start with no interactive login**, **survive logout**,
 | `TIGHTBEAM_LOCAL_HOST_NAME` | **Set this. It is the one that bites.** The homes tree is keyed `homes/<machine>/<harness>`, and the machine name defaults to the OS hostname. If the hostname is unstable — a container that gets a new id per start, a renamed machine — every restart projects a NEW home tree and silently orphans the durable harness state (codex `sessions/`, claude `projects/`) under the old name. It does not fail; it just quietly stops finding the old conversations. Pin it to a name you choose and never change it. |
 | `TIGHTBEAM_BASE_DIR` | The org: `auth/`, `identity/`, `homes/`, `state.db`, `work/`. Defaults to `TIGHTBEAM_HOME`, else `~/.tightbeam`. |
 | `TIGHTBEAM_PORT` | Rewritten into `gateway.json` at every boot. |
+| `TIGHTBEAM_NODE` | The release's Erlang node name. Defaults to `tightbeam_gateway_<port>`, which is already unique per instance — set it only if you want to choose the name. |
 | `TIGHTBEAM_ADVERTISED_URL` | The URL clients are told to connect back on. `mix tightbeam.doctor` fails without it. |
 | `TIGHTBEAM_DEFAULT_MODEL` | The default model itself, undecorated (`claude-sonnet-5`). Must be live for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
 | `TIGHTBEAM_DEFAULT_EFFORT` | The default reasoning level (`low`…`max`). Required when the default model offers effort tiers — a model is selected by FIELDS, never one packed string. |

@@ -15,4 +15,31 @@ while [ -L "$SELF" ]; do
   esac
 done
 DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+# ONE ERLANG NODE NAME PER INSTANCE, DERIVED FROM THE PORT.
+#
+# A mix release names its node after the RELEASE, so every instance on a machine
+# claimed `tightbeam_gateway@<host>` and the second one refused to boot with
+#
+#   Protocol 'inet_tcp': the name tightbeam_gateway@eezo seems to be in use by
+#   another Erlang node
+#
+# — a message naming no port, no base dir, and nothing an operator would connect to
+# Tightbeam. Nothing in the product prevents two gateways coexisting; only this
+# default did. The port is the right discriminator because two instances need
+# different ports anyway, so a collision here means a collision there too, reported
+# by whichever notices first.
+#
+# `TIGHTBEAM_NODE` overrides it for anyone who wants a name of their own; an explicit
+# `RELEASE_NODE` still wins, since that is the release runtime's own knob and this
+# script has no business overruling it.
+if [ -z "${RELEASE_NODE:-}" ]; then
+  if [ -n "${TIGHTBEAM_NODE:-}" ]; then
+    RELEASE_NODE="$TIGHTBEAM_NODE"
+  else
+    RELEASE_NODE="tightbeam_gateway_${TIGHTBEAM_PORT:-4321}"
+  fi
+  export RELEASE_NODE
+fi
+
 exec "$DIR/release/bin/tightbeam_gateway" start "$@"
