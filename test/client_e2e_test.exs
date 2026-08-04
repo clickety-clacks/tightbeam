@@ -590,12 +590,35 @@ defmodule Tightbeam.ClientE2ETest do
                "never received: [\"b\"]"
     end
 
-    test "replies shown in an order the store never committed fail" do
-      # Delivered slow -> done -> b against a store that committed slow -> b ->
-      # done: the frame was held past a later commit. This is the shape a
-      # publication that does not ride commit order produces.
-      assert j5_oracle(b_answers_last(), [slow: 1, b: 2, done: 3], b_last_turns()) =~
+    test "replies shown in an order their OWN stream never committed fail" do
+      # Main delivered slow -> done against a store that committed done -> slow.
+      # This is the shape a publication that does not ride commit order
+      # produces, and the shape ConnRegistry's per-session cursor turns into a
+      # permanently dropped frame.
+      assert j5_oracle(b_answers_last(), [done: 1, slow: 2, b: 3], b_last_turns()) =~
                "an order the store never committed"
+    end
+
+    test "two streams interleaving differently from the global seq order is NOT a defect" do
+      # B commits seq 1 but publishes after Main's seq 2: the streams' cursors
+      # are independent, so the client seeing slow -> b -> done while the store
+      # committed b -> slow -> done is ordinary concurrency. A global order
+      # check would fail this healthy run.
+      interleaved = [
+        j5_running(@main, "slow", 100),
+        j5_running(@smoke_b, "b", 110),
+        j5_reply(@main, "slow", 290),
+        j5_delivered(@main, "slow", 290),
+        j5_reply(@smoke_b, "b", 295),
+        j5_delivered(@smoke_b, "b", 295),
+        j5_running(@main, "done", 300),
+        j5_reply(@main, "done", 350),
+        j5_delivered(@main, "done", 350)
+      ]
+
+      turns = [slow: {100, 290}, b: {110, 295}, done: {300, 350}]
+
+      assert j5_oracle(interleaved, [b: 1, slow: 2, done: 3], turns) == nil
     end
 
     test "cross-talk is caught for EVERY post, not just Smoke B's" do

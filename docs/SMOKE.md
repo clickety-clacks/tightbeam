@@ -238,7 +238,9 @@ on 2026-07-25:
     about each of 10 planets"), then IMMEDIATELY post in Smoke B ("what is
     2+2?"), then a third in Main ("now say DONE").
     PASS: the store holds a reply for all three posts and the client received
-    every one of them; they arrive in the order the store committed them; each
+    every one of them; within each stream they arrive in the order the store
+    committed them (across streams the cursors are independent, so a different
+    interleaving is ordinary concurrency, not a defect); each
     arrives before its own turn's terminal state (a reply held behind the close
     of its own turn is a delayed frame even when it was committed last anyway);
     each lands in the stream it was posted to (no cross-talk); each reaches the

@@ -144,7 +144,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of its own turn's close; and one of them ARRIVES, by the driver's clock, while another of these turns is still open by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
+        "within each stream, assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), each within a second of its own turn's close; and one of them ARRIVES, by the driver's clock, strictly inside another of these turns by the substrate's; Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -937,8 +937,13 @@ defmodule Tightbeam.ClientE2E.Journeys do
      client's success: the later legs would compare lists that agree on what
      they both omit;
   2. every one of those replies reached the client;
-  3. they arrived in the order the store COMMITTED them — a frame reordered, or
-     held past a later commit, shows up here;
+  3. within EACH stream, they arrived in the order the store COMMITTED them —
+     a frame reordered, or held past a later commit in its own stream, shows up
+     here. Per stream and not across them, because that is the guarantee the
+     wire makes: `ConnRegistry` keeps its delivered-seq cursor per session, and
+     two streams' publications are independent, so one lane committing before
+     another and publishing after it is ordinary concurrency rather than a
+     defect. A global order would fail healthy runs;
   4. each reply carried the sessionKey of the stream it answers, and so did the
      terminal turn-state frame it is judged against. Correlating that frame by
      `messageId` alone would let one labelled with the wrong stream stand in for
@@ -994,8 +999,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
         "the store committed replies the client never received: #{inspect(missing)}"
 
       true ->
-        delivered_order = order_by(expected, fn %{id: id} -> replies[id].index end)
-        committed_order = order_by(expected, & &1.committed_seq)
+        misordered =
+          expected
+          |> Enum.group_by(& &1.session_key)
+          |> Enum.find_value(fn {key, posts} ->
+            delivered = order_by(posts, fn %{id: id} -> replies[id].index end)
+            committed = order_by(posts, & &1.committed_seq)
+            if delivered != committed, do: {key, delivered, committed}
+          end)
 
         cross_talk =
           for %{id: id, session_key: key} <- expected,
@@ -1010,9 +1021,11 @@ defmodule Tightbeam.ClientE2E.Journeys do
         undated = for %{id: id} <- expected, not is_integer(replies[id].received_at), do: id
 
         cond do
-          delivered_order != committed_order ->
-            "the client showed replies in an order the store never committed: " <>
-              "client #{inspect(delivered_order)}, committed #{inspect(committed_order)}"
+          misordered ->
+            {key, delivered, committed} = misordered
+
+            "in #{key} the client showed replies in an order the store never committed: " <>
+              "client #{inspect(delivered)}, committed #{inspect(committed)}"
 
           cross_talk != [] ->
             "cross-talk: #{inspect(cross_talk)} answered in a stream it was not posted to"
