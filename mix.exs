@@ -10,7 +10,23 @@ defmodule Tightbeam.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       name: "Tightbeam",
-      docs: [main: "Tightbeam", extras: ["docs/ARCHITECTURE.md", "docs/HANDOFF.md"]]
+      docs: [main: "Tightbeam", extras: ["docs/ARCHITECTURE.md", "docs/HANDOFF.md"]],
+      releases: releases()
+    ]
+  end
+
+  # The npm-installable gateway (Flynn rulings 2026-08-03: one package carrying CLI and
+  # gateway so the version handshake holds by construction; mix release bundled
+  # per-platform; no registry until a real release — installs are tarball/git URL).
+  # `include_executables_for: [:unix]` and bundled ERTS: `npm install` must yield a
+  # working install with NO Elixir toolchain on the host — that is the entire point.
+  defp releases do
+    [
+      tightbeam_gateway: [
+        include_erts: true,
+        include_executables_for: [:unix],
+        strip_beams: true
+      ]
     ]
   end
 

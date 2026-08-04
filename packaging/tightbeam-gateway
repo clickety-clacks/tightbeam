@@ -1,0 +1,18 @@
+#!/bin/sh
+# Launches the bundled BEAM release in the foreground, exactly like the README's
+# `mix run --no-halt` — same env contract (TIGHTBEAM_BASE_DIR, TIGHTBEAM_PORT, ...),
+# no service-manager opinions (launchd/systemd stay README guidance, per ruling).
+#
+# npm exposes bins as SYMLINKS in node_modules/.bin, so $0's directory is the symlink's
+# home, not the package's. Resolve the link first — measured failure, not speculation:
+# the unresolved form exec'd node_modules/release/... which does not exist.
+SELF="$0"
+while [ -L "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(dirname "$SELF")/$LINK" ;;
+  esac
+done
+DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+exec "$DIR/release/bin/tightbeam_gateway" start "$@"
