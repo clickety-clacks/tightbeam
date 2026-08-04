@@ -345,12 +345,22 @@ defmodule Tightbeam.WorkStateTest do
     dropped_item = create_item(ctx, "Dropped composition")
     stale_item_client = item_client(WorkState.item_detail(ctx.db, dropped_item.id))
     dropped_assignment = handlers["assign"].(assign_call("holder", "dropped", dropped_item.id))
-    [_open_frame, _dropped_composition] = receive_pushes(2)
+
+    # Exact shapes, not blind binds: a `_frame` match cannot fail for its
+    # stated reason — it would swallow any frame at all. (Salvaged from the
+    # observability worktree's uncommitted delta, 2026-08-04.)
+    [
+      %{"type" => "work_state_event", "from" => nil, "to" => "open"},
+      %{"type" => "work_item_event", "kind" => "composition"}
+    ] = receive_pushes(2)
+
     handlers["attest"].(attest_call(dropped_assignment.id, "progress", "holder"))
-    [_progress_frame] = receive_pushes(1)
+    [%{"type" => "work_state_event", "from" => "open", "to" => "active"}] = receive_pushes(1)
     stale_assignment_client = assignment_client(WorkState.list(ctx.db, %{state: "all"}))
     handlers["attest"].(attest_call(dropped_assignment.id, "completion", "holder"))
-    [_dropped_final] = receive_pushes(1)
+
+    [%{"type" => "work_state_event", "from" => "active", "to" => "claims-done"}] =
+      receive_pushes(1)
 
     refute stale_assignment_client.view == assignment_truth(ctx.db)
     refute stale_item_client.view == item_truth(ctx.db, dropped_item.id)
