@@ -19,11 +19,33 @@ defmodule Tightbeam.ConnRegistry do
      publication of a pre-watermark commit forever, closing the
      replay/live race.
 
-  ORDERING DEPENDENCY: the filter is safe ONLY if publications for
-  a session arrive in commit (seq) order. That is guaranteed by publishing
-  from the single-writer commit path (Tightbeam.DB), not by this module. This
-  module enforces the per-connection monotonic filter; the caller must not
-  publish out of seq order.
+  ORDERING DEPENDENCY, AND IT IS UNMET: the filter above is safe ONLY if
+  publications for a session arrive in commit (seq) order, and nothing
+  currently provides that. Every publication happens AFTER its transaction has
+  returned, from the caller's own process — `Projection.append/2` commits at
+  projection.ex:95-96 and its caller publishes afterwards — so two writers to
+  one session can commit in one order and publish in the other. When they do,
+  this module drops the earlier frame at :161-162 and a connected client never
+  sees it; only a reconnect's replay repairs it. This module enforces the
+  per-connection monotonic filter and cannot enforce the ordering it rests on.
+
+  The publication sites, every one of them post-commit: gateway.ex:1701 (an
+  agent's reply, published from the turn's own task), :1043 (a delivery echo,
+  from whichever process ran the dispatch — a socket, a wake, a control route),
+  and :4142, :5195, :5767 (markers), all through the helper at :5772; plus
+  event_log.ex:324, after the transaction opened at :297. SCOPE OF THAT LIST:
+  it is the message path, read at 422ff58. The remaining `DB.transaction`
+  callers were not audited, so treat it as where to start rather than as
+  exhaustive, and re-derive the lines before trusting them.
+
+  No reproduction is known. The client-e2e concurrency journey (J5) cannot
+  produce one: its two streams keep separate cursors, and one stream's turns
+  are serialized by its own lane, so it never puts two concurrent writers on a
+  single session. Reaching this needs exactly that — a client post's echo
+  against a marker appended by something else, at the same instant.
+
+  Making publication ride commit order is a design in its own right and is not
+  attempted here.
   """
 
   use GenServer
