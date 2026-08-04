@@ -24,7 +24,7 @@ defmodule Tightbeam.Spinup do
     {result, detail} =
       case Map.fetch(Placement.hosts(config.base_dir, db), host_name) do
         :error ->
-          denial = %{code: "unknown_host", message: "host #{host_name} is not configured"}
+          denial = Placement.unknown_host_denial(host_name, module.wire_name())
           {{:error, denial}, "DENIED: #{denial.message}"}
 
         {:ok, host} ->

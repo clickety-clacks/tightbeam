@@ -29,24 +29,26 @@ IO.puts("[l0-smoke] sample claude refs: #{inspect(Enum.map(Enum.take(c_entries, 
 IO.puts("[l0-smoke] sample codex refs:  #{inspect(Enum.map(Enum.take(x_entries, 6), & &1.ref))}")
 
 # Validation semantics (the gate a spawn passes through):
-default_ref = "claude-sonnet-5[medium]"   # the canonical default
-dead_ref = "claude-fable-5"               # bare ref for a with-efforts model: dead
-bogus = ModelCatalog.member?("claude", "definitely-not-a-real-model-xyz", :smoke_cat)
-default_present = ModelCatalog.member?("claude", default_ref, :smoke_cat)
-dead = ModelCatalog.member?("claude", dead_ref, :smoke_cat)
+host = Tightbeam.Placement.local_host_name()
+default_ref = Tightbeam.Model.new("claude-sonnet-5", effort: "medium")  # the canonical default
+dead_ref = Tightbeam.Model.new("claude-fable-5")   # bare ref for a with-efforts model: dead
+bogus = ModelCatalog.route(host, "claude", Tightbeam.Model.new("definitely-not-a-real-model-xyz"), :smoke_cat)
+default_present = ModelCatalog.route(host, "claude", default_ref, :smoke_cat)
+dead = ModelCatalog.route(host, "claude", dead_ref, :smoke_cat)
 
-IO.puts("[l0-smoke] member?(canonical default #{default_ref}) => #{inspect(default_present)}")
-IO.puts("[l0-smoke] member?(dead bare #{dead_ref}) => #{inspect(dead)}")
-IO.puts("[l0-smoke] member?(bogus) => #{inspect(bogus)}")
+IO.puts("[l0-smoke] route(canonical default #{Tightbeam.Model.to_ref(default_ref)}) => #{inspect(default_present)}")
+IO.puts("[l0-smoke] route(dead bare #{Tightbeam.Model.to_ref(dead_ref)}) => #{inspect(dead)}")
+IO.puts("[l0-smoke] route(bogus) => #{inspect(bogus)}")
 
 no_hang = elapsed < 20_000
 real_fresh = c_health == :fresh and length(c_entries) > 0
 codex_fresh = x_health == :fresh and length(x_entries) > 0
-# canonical default must validate (present+fresh); dead/bogus must be absent+fresh (→ classified model_unavailable)
+# The canonical default must route; the other two must be refused BY THEIR OWN
+# CAUSE — a tierless ref for a tiered model needs a tier, a made-up family is absent.
 validation_ok =
-  match?(%{present?: true, health: :fresh}, default_present) and
-    match?(%{present?: false, health: :fresh}, dead) and
-    match?(%{present?: false, health: :fresh}, bogus)
+  match?({:ok, _}, default_present) and
+    match?({:error, %Tightbeam.Unroutable{cause: :needs_effort}}, dead) and
+    match?({:error, %Tightbeam.Unroutable{cause: :family_absent}}, bogus)
 
 pass = no_hang and real_fresh and codex_fresh and validation_ok
 IO.puts("[l0-smoke] no_hang=#{no_hang} claude_fresh=#{real_fresh} codex_fresh=#{codex_fresh} validation_ok=#{validation_ok}")

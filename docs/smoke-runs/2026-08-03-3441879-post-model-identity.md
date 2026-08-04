@@ -157,14 +157,27 @@ nothing is written down. The fast/slow split in the evidence is exactly what tha
 An operator auditing adapter health sees zero deaths on a machine where adapters were
 killed and replaced. Recovery being automatic is right; recovery being invisible is not.
 
-**A1 — a hard gateway kill orphans queued turns.** Three turns end the run permanently
-`queued`, `startedAt` NULL, no error, against 145 delivered. Each one's `createdAt` lands
-within milliseconds of a `gateway_sigkill` (42ms, 5ms). The gateway itself recovers every
-time; the turn queued at the moment of death is never started and never failed. It is lost
-work that announces nothing — a queued turn that will never run is indistinguishable from
-one about to run. SIGTERM does not do this, so it is specific to the path where no shutdown
-hook runs to drain. On boot, such a turn should be re-queued or failed BY NAME; which one is
-a product decision, but either beats silence.
+**A1 — undeliverable notices are accepted into a queue that can never move.**
+
+CORRECTED 2026-08-03 (this section originally blamed gateway-SIGKILL timing, on the
+strength of createdAt landing within milliseconds of a kill. That attribution was WRONG —
+a coincidence of timestamps, not a cause. The DB-verified account is below; the wrong
+story is left named rather than deleted so nobody re-derives it.)
+
+No user prompt was ever lost. All 148 soak prompts were accounted for. The orphans are the
+substrate's OWN escalation notices: origin `process:tightbeam`, content "Model adjudication
+required ... cause=adapter_fault", every one addressed to `Org.personal_session_key` of a
+user with ZERO rows in `sessions`. A main session is created lazily on first client
+connect, and `soak-driver` never connects — so the address was well-formed and pointed at
+nothing. `ladder_target`'s @spec is `String.t()`, so "nobody" was unrepresentable; the
+enqueue gate rejected the phantom and then re-resolved to the same key and accepted it
+unchecked; `claim_next` returned `:none` for both "queue empty" and "unclaimable forever";
+and `pending_sessions` never joins `sessions`, so the reconciler nudged a ghost every 5s
+for 50 minutes. Row-vs-row, not row-vs-process — and every component behaved as written.
+
+Six times the system said "a human must rule on this" into a void. Worse than a lost
+prompt in one dimension: a user eventually notices a missing reply; nobody notices an
+undelivered fault report.
 
 Both oracles are correct and should not be relaxed to go green.
 

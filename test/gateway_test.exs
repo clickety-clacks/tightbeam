@@ -1015,6 +1015,24 @@ defmodule Tightbeam.GatewayTest do
              Org.get(ctx.db, Org.personal_session_key(device.user_id))
   end
 
+  # Both spellings of the routability question reach the running catalog: the
+  # fleet one that adjudication asks, and the per-harness one that validation and
+  # boot ask. Written against the DEFAULT server, because that is the whole
+  # difference between them and a spelling that raises instead of routing is not
+  # an API at all.
+  test "route answers the fleet and one harness alike, against the running catalog", _ctx do
+    put_host_catalog("testhost", "claude", [{"tiered-here", ["low", "high"]}])
+
+    assert {:ok, %{harness: "claude", provider: "anthropic"}} =
+             ModelCatalog.route("testhost", Model.new("tiered-here", effort: "high"))
+
+    assert {:ok, %{harness: "claude"}} =
+             ModelCatalog.route("testhost", "claude", Model.new("tiered-here", effort: "high"))
+
+    assert {:error, %Tightbeam.Unroutable{cause: :needs_effort}} =
+             ModelCatalog.route("testhost", "claude", Model.new("tiered-here"))
+  end
+
   # Task #41. A model the adapter cannot select must be refused by NAME and the
   # operator told what IS available — before, this died deep in the adapter as
   # "Invalid value for config option model", on every session/new and session/load.
@@ -1030,7 +1048,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-opus-5"}
              })
 
-    assert message =~ ~s(model "claude-opus-5" is not offered by claude on host testhost)
+    assert message =~ ~s("claude-opus-5" is not offered by claude on host testhost)
 
     # The hint is the point: naming only the rejection makes the operator guess.
     assert message =~ "offered:"
@@ -1928,6 +1946,300 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
   end
 
+  test "spawn uses the next where host when the first cannot run the requested harness", ctx do
+    base_dir = placement_test_base("later-eligible", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("racter", "codex")
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn
+        :openai, "eurisko" -> {:needs_onboarding, :missing}
+        :openai, "racter" -> :onboarded
+      end)
+      |> Map.put(:sh, fn _command -> {"", 0} end)
+
+    assert %{session_key: session_key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Placed later",
+                 idempotency_key: "spawn-later-eligible"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "racter"
+  end
+
+  test "spawn uses the next where host when the first has no usable catalog", ctx do
+    base_dir = placement_test_base("later-catalog", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("eurisko", "codex")
+    await_host_catalog("racter", "codex")
+    degrade_host_catalog("eurisko", "codex", :ssh_unreachable)
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
+      |> Map.put(:sh, fn _command -> {"", 0} end)
+
+    assert %{session_key: session_key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Catalog placed later",
+                 idempotency_key: "spawn-later-catalog"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "racter"
+  end
+
+  test "spawn refusal relays each where host's catalog cause and remedy", ctx do
+    base_dir = placement_test_base("catalog-causes", ["eurisko", "racter"])
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("eurisko", "codex")
+    await_host_catalog("racter", "codex")
+
+    degrade_host_catalog(
+      "eurisko",
+      "codex",
+      {:empty_catalog_for_client_version, "0.145.0"}
+    )
+
+    degrade_host_catalog("racter", "codex", {:needs_onboarding, :missing})
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
+
+    assert %{code: "placement_denied", detail: %{code: "host_unready"}, message: message} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Catalog nowhere",
+                 idempotency_key: "spawn-catalog-nowhere"
+               }
+             })
+
+    assert message =~ "eurisko: cannot route gpt-5.6-sol (effort medium) on eurisko"
+    assert message =~ "upgrade codex on eurisko"
+    assert message =~ "racter: cannot route gpt-5.6-sol (effort medium) on racter"
+    assert message =~ "run tightbeam onboard openai on racter"
+  end
+
+  test "spawn uses the next where host when the first fails live spinup", ctx do
+    base_dir = placement_test_base("later-spinup", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("eurisko", "codex")
+    await_host_catalog("racter", "codex")
+
+    sh = fn command ->
+      if List.last(command) == "true" and Enum.member?(command, "eurisko") do
+        {"ssh: connect to host eurisko port 22: Connection refused", 255}
+      else
+        {"", 0}
+      end
+    end
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
+      |> Map.put(:sh, sh)
+
+    assert %{session_key: session_key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Spinup placed later",
+                 idempotency_key: "spawn-later-spinup"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "racter"
+  end
+
+  test "spawn stops after the first ready where host and probes it once", ctx do
+    base_dir = placement_test_base("first-ready-once", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("eurisko", "codex")
+    await_host_catalog("racter", "codex")
+    parent = self()
+
+    sh = fn command ->
+      if List.last(command) == "true" do
+        host = Enum.find(["eurisko", "racter"], &Enum.member?(command, &1))
+        send(parent, {:spinup_probe, host})
+      end
+
+      {"", 0}
+    end
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
+      |> Map.put(:sh, sh)
+
+    assert %{session_key: session_key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "First ready once",
+                 idempotency_key: "spawn-first-ready-once"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "eurisko"
+    assert_receive {:spinup_probe, "eurisko"}
+    refute_receive {:spinup_probe, _host}
+  end
+
+  test "spawn acts on the routed answer from the candidate decision", ctx do
+    base_dir = placement_test_base("one-route-answer", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("eurisko", "codex")
+    await_host_catalog("racter", "codex")
+    degraded = :atomics.new(1, [])
+
+    sh = fn command ->
+      if List.last(command) == "true" and Enum.member?(command, "eurisko") and
+           :atomics.compare_exchange(degraded, 1, 0, 1) == :ok do
+        degrade_host_catalog("eurisko", "codex", :catalog_refreshed)
+      end
+
+      {"", 0}
+    end
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
+      |> Map.put(:sh, sh)
+
+    assert %{session_key: session_key} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "One route answer",
+                 idempotency_key: "spawn-one-route-answer"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).host == "eurisko"
+  end
+
+  test "spawn refusal gives an unconfigured where host its assimilation remedy", ctx do
+    base_dir = placement_test_base("missing-host-remedy", ["eurisko"])
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+
+    assert %{code: "placement_denied", detail: %{code: "host_unready"}, message: message} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Missing host",
+                 idempotency_key: "spawn-missing-host-remedy"
+               }
+             })
+
+    assert message =~ "no host in archetype default's where can run codex"
+    assert message =~ "eurisko: host eurisko is not configured"
+    assert message =~ "tightbeam assimilate <ssh-dest> --name eurisko"
+  end
+
+  test "spawn refusal names every where host, harness, cause, and remedy", ctx do
+    base_dir = placement_test_base("all-ineligible", ["eurisko", "racter"])
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn :openai, _host -> {:needs_onboarding, :missing} end)
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "host_unready"},
+             message: message
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Nowhere",
+                 idempotency_key: "spawn-all-ineligible"
+               }
+             })
+
+    assert message =~ "no host in archetype default's where can run codex"
+
+    for {host, base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
+      assert message =~ "Tightbeam has no credential for openai on #{host}"
+      assert message =~ Path.join(base, "auth")
+      assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
+    end
+  end
+
   test "spawn fails closed when a registered host has no credential server", ctx do
     machine = "credential-worker-missing"
     base_dir = move_test_base(ctx.db, "credential-server-missing", machine)
@@ -2479,7 +2791,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{code: "model_unavailable", message: message} =
              place.("worker", "gateway-only-model", "k-worker-bad")
 
-    assert message =~ ~s(model "gateway-only-model" is not offered by claude on host worker)
+    assert message =~ ~s("gateway-only-model" is not offered by claude on host worker)
     assert message =~ "worker-only-model"
 
     # Symmetrically, on the gateway's own host (session k1) the gateway's ref is
@@ -2740,6 +3052,25 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
     refute_received {:spinup_command, _}
+  end
+
+  test "invalid spawn overrides still precede an invalid harness", ctx do
+    base_dir = role_test_base("override-before-harness")
+    Archetypes.load!(base_dir)
+
+    result =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"].(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{
+          display_name: "Invalid both",
+          idempotency_key: "override-before-harness",
+          harness: "not-a-harness",
+          overrides: %{"skills_add" => ["missing-skill"]}
+        }
+      })
+
+    assert %{code: "config_denied", detail: %{code: "invalid_overrides"}} = result
   end
 
   test "semantically empty spawn overrides store NULL and the bare identity name", ctx do
@@ -4552,6 +4883,98 @@ defmodule Tightbeam.GatewayTest do
              "typing:false",
              "activity:false"
            ]
+  end
+
+  test "a disappeared turn host reaches the socket turn-state payload by name", ctx do
+    ensure_global_registry()
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "placement-refusal",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    {Tightbeam.LaneManager, lane_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
+
+    lane_sup =
+      start_supervised!(
+        {DynamicSupervisor, strategy: :one_for_one, name: :placement_refusal_lane_supervisor}
+      )
+
+    manager =
+      start_supervised!({
+        LaneManager,
+        db: ctx.db,
+        lane_sup: lane_sup,
+        task_sup: Tightbeam.TurnTaskSupervisor,
+        runner: Keyword.fetch!(lane_opts, :runner),
+        terminal_publisher: Keyword.fetch!(lane_opts, :terminal_publisher),
+        interval: 60_000,
+        name: :placement_refusal_lane_manager
+      })
+
+    Org.set_host(ctx.db, "k1", "eurisko")
+
+    expected =
+      "host eurisko is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
+        "--name eurisko --as-user <adminUserId>"
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "try vanished host",
+               db: ctx.db,
+               conn_registry: Tightbeam.ConnRegistry,
+               lane_manager: manager,
+               device_id: "placement-refusal",
+               client_message_id: "c_placement_refusal"
+             )
+
+    frames = collect_pushes(10, [])
+
+    failed =
+      Enum.find(frames, fn
+        %{
+          "type" => "event",
+          "event" => "prompt_turn_state",
+          "payload" => %{"state" => "failed"}
+        } ->
+          true
+
+        _ ->
+          false
+      end)
+
+    assert failed["payload"]["error"] == expected
+
+    assert Enum.any?(frames, fn
+             %{"type" => "message", "content" => content} ->
+               content ==
+                 "[turn failed]\n\nThe agent could not answer the message above: " <> expected
+
+             _ ->
+               false
+           end)
   end
 
   # Install a fresh catalog for one {host, harness}, so a test can give two hosts
@@ -6989,6 +7412,28 @@ defmodule Tightbeam.GatewayTest do
     register_hosts(db, %{
       remote_host => %{ssh: remote_host, base_dir: "/remote/tb", cli_bin: nil}
     })
+
+    base_dir
+  end
+
+  defp placement_test_base(suffix, where) do
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_placement_#{suffix}_#{System.unique_integer([:positive])}"
+      )
+
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    hosts = Enum.map_join(where, ", ", &inspect/1)
+    File.write!(Path.join(manifests, "default.toml"), "name = \"default\"\nwhere = [#{hosts}]\n")
+    Archetypes.load!(base_dir)
+
+    on_exit(fn ->
+      File.rm_rf!(base_dir)
+      :persistent_term.erase(Archetypes)
+    end)
 
     base_dir
   end
