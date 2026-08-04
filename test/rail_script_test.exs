@@ -1633,6 +1633,35 @@ defmodule Tightbeam.RailScriptTest do
                )
 
       assert System.monotonic_time(:millisecond) - started < 1_000
+
+      # REAP THE ESCAPEE BEFORE LEAVING. The daemon child setsids out of the
+      # process group — escaping the timeout kill is the very thing this leg
+      # proves — and then self-exits after 5s. A test that returns while its
+      # fixture is still alive hands those seconds to whoever runs next: with
+      # random test order on a slow runner, that was the suite-end census,
+      # which correctly refused to call the run green (CI macOS, run
+      # 30944574943). The fixture is this test's; waiting for it is too.
+      deadline = System.monotonic_time(:millisecond) + 8_000
+
+      wait_for_exit = fn wait ->
+        alive? = fn ->
+          {out, 0} = System.cmd("ps", ["-eo", "command="])
+          String.contains?(out, Path.join(ctx.base_dir, "identity/rails/scripts"))
+        end
+
+        while_alive = fn f ->
+          if alive?.() and System.monotonic_time(:millisecond) < deadline do
+            Process.sleep(100)
+            f.(f)
+          else
+            refute alive?.(), "the daemon fixture outlived its 5s self-exit"
+          end
+        end
+
+        wait.(while_alive)
+      end
+
+      wait_for_exit.(fn f -> f.(f) end)
     end
 
     # The fabrication this closes lived on the WRAPPER's side of the seam: the substrate
