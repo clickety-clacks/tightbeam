@@ -1617,10 +1617,16 @@ defmodule Tightbeam.Gateway do
   # is itself confusing — but it does exactly one thing: say what is missing and
   # how to build it.
   defp refusing_wrapper(candidates) do
+    # Paths ride inside SINGLE quotes with the only metacharacter a single-quoted
+    # sh string has — the quote itself — escaped. Double quotes left `$()`,
+    # backticks and `"` live: a hostile-or-merely-odd base_dir path would EXECUTE
+    # on invocation instead of reliably reporting and exiting 127.
+    quoted = fn path -> "'" <> String.replace(path, "'", "'\\''") <> "'" end
+
     """
     #!/bin/sh
     echo "tightbeam CLI is not installed: none of these existed when the gateway booted:" >&2
-    #{Enum.map_join(candidates, "\n", fn c -> ~s(echo "  #{c}" >&2) end)}
+    #{Enum.map_join(candidates, "\n", fn c -> "echo \"  \"#{quoted.(c)} >&2" end)}
     echo "On a source checkout, build it with: cargo build --release --manifest-path cli/Cargo.toml" >&2
     exit 127
     """

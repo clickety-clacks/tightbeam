@@ -304,6 +304,7 @@ meet the requirements above. `UserName` keeps the process off root.
   <key>UserName</key><string>you</string>
   <key>ProgramArguments</key>
   <array>
+    <!-- npm decides where -g bins land; ask it: `command -v tightbeam-gateway` -->
     <string>/Users/you/.local/bin/tightbeam-gateway</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/you</string>
@@ -350,6 +351,7 @@ Type=exec
 User=you
 Group=you
 WorkingDirectory=/home/you
+# npm decides where -g bins land; use the output of: command -v tightbeam-gateway
 ExecStart=/home/you/.local/bin/tightbeam-gateway
 Environment=TIGHTBEAM_LOCAL_HOST_NAME=gibson
 Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
