@@ -13,6 +13,8 @@ to get to gibson. i'm going to bed so you have all night to fix whatever."
 | Release runtime (npm) | PASS | installed from the tarball, booted READY, and **ran a real turn** |
 | Code review | 4 rounds, cleared | 9 blocking findings across the npm/boot work, all confirmed and fixed |
 | G7 adapter deaths | MERGED | soak oracle A3 was failing before it and passes after |
+| G8 row 10 oracle | MERGED | row 10 PASS on both harnesses; APPROVE after 13 rounds / 21 findings |
+| T2b client journeys | PASS (both legs) | codex at seven consecutive SHAs; claude whole leg green |
 
 **Run verdict: PASS.** Nothing on Flynn's gate — "anything that affects the core
 loop/operations of tightbeam in such a way that it makes it fail" — is outstanding.
@@ -175,3 +177,26 @@ disposable arenas and taken while the grant had five hours of validity left, so 
 refresh — and therefore no rotation — could occur ([[two writers of one credential]]).
 The stale `erl_crash.dump` from 2026-07-28 in the repo root was left alone: not mine, and
 not this run's.
+
+## Postscript: G8's blocked leg, and a hypothesis killed by measurement
+
+Row 10's oracle went in after G8 refuted its own premise: the named mechanism (a dropped
+or delayed frame) was measured at 0ms publish-to-arrival, commit order equal to arrival
+order. The row had been asserting that one model answered before another, inferred from a
+fact that does not date either. It now asserts what a client must SHOW, per stream,
+because per stream is the guarantee the wire actually makes.
+
+Its claude leg blocked three times out of four on `ETIMEDOUT` at preflight — a name only
+visible because of the probe repair earlier the same night, which was the fix's first
+real use. The lane's own reading was environmental egress flakiness under load, offered
+explicitly as a hypothesis rather than a finding. That was the right way to offer it, and
+it made it cheap to test: 40 consecutive connects to the probe's exact endpoint, no
+credential, at load average 11.14 — inside the band where the timeouts happened — came
+back 40/40 in under 0.52s with zero failures.
+
+So load and egress are out, along with the grant and the credential copy, each ruled out
+by a measurement rather than an argument. What survives is narrow and unexplained: the
+same preflight passes against the template directory and fails against a provisioned copy
+of it, twice, at two revisions. That is in ROADMAP as a well-isolated unknown, which is a
+better artifact than a plausible story — the same discipline that took three wrong
+theories off the soak earlier the same night.
