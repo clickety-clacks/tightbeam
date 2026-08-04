@@ -237,12 +237,15 @@ on 2026-07-25:
 10. [auto: J5] Create session "Smoke B". Post a slow prompt in Main ("write a haiku
     about each of 10 planets"), then IMMEDIATELY post in Smoke B ("what is
     2+2?"), then a third in Main ("now say DONE").
-    PASS: the replies arrive in the order the store committed them, and one of
-    them arrives while ANOTHER stream's turn is still running (different lanes
-    run in parallel, and neither one's frames wait for the other to finish);
-    Main's two turns complete in order; ALL turns reach `delivered` with
-    assistant bubbles; no cross-talk (each reply in its own stream). DB: at
-    peak, two `running` rows with DIFFERENT sessionKeys.
+    PASS: the store holds a reply for all three posts and the client received
+    every one of them; they arrive in the order the store committed them; each
+    arrives before its own turn's terminal state (a reply held behind the close
+    of its own turn is a delayed frame even when it was committed last anyway);
+    each lands in the stream it was posted to (no cross-talk); and one of them
+    arrives while ANOTHER of these streams' turns is still open — different
+    lanes run in parallel, and neither one's frames wait for the other to
+    finish. Main's two turns complete in order; ALL turns reach `delivered`.
+    DB: at peak, two `running` rows with DIFFERENT sessionKeys.
     Which prompt the model answers first decides nothing here: a trivial
     prompt in a fresh stream routinely outlives a slow one in a warm stream,
     and a model's speed is not evidence about delivery.

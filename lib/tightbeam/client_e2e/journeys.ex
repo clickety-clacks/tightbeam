@@ -144,7 +144,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "concurrency",
       action: "slow prompt in Main, immediate post in Smoke B, then a second post in Main",
       client:
-        "assistant bubbles arrive in the order the store committed them, and one of them arrives while another stream's turn is still running; every assistant bubble carries its own sessionKey (no cross-talk); Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
+        "assistant bubbles arrive in the order the store committed them, each before its own turn's terminal state and in the stream it was posted to (no cross-talk), and one of them arrives while another of these streams' turns is still open; Main's two turns complete in post order. When the substrate never ran the lanes together there is no overlap to observe and the row is INCOMPLETE, not FAIL — the substrate column decides which",
       substrate:
         "at peak, two `running` rows with DIFFERENT sessionKeys (sampled DURING the run); all turns `delivered`"
     },
@@ -774,16 +774,16 @@ defmodule Tightbeam.ClientE2E.Journeys do
       witness =
         "sampled_together=#{sampled_together?} intervals_overlapped=#{intervals_overlapped?} widest_sample=#{Substrate.widest_sample(samples)}"
 
-      # The order the STORE committed the three replies — `messages.seq` is the
-      # per-store commit order and the order the wire publishes in, so the
-      # client's frame order is checked against what actually happened rather
-      # than against which prompt the model happened to answer first.
-      committed_order =
-        committed_reply_order(
-          ctx.base_dir,
-          [ctx.main_key, session_key],
-          [slow_id, b_id, done_id]
-        )
+      # The three posts, each with the stream it went to and the `messages.seq`
+      # the store gave its reply — the per-store commit order, and the order the
+      # wire publishes in. The client's frames are checked against what actually
+      # happened rather than against which prompt the model answered first.
+      expected =
+        expected_deliveries(ctx.base_dir, [
+          %{id: slow_id, session_key: ctx.main_key},
+          %{id: b_id, session_key: session_key},
+          %{id: done_id, session_key: ctx.main_key}
+        ])
 
       row =
         cond do
@@ -816,7 +816,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
           # FAILS — calling it incomplete would launder exactly the defect this
           # journey should catch.
           substrate_concurrent? ->
-            case concurrency_delivery_error(frames, committed_order) do
+            case concurrency_delivery_error(frames, expected) do
               nil ->
                 Scorecard.pass("10", "concurrency", journey: "J5")
 
@@ -898,105 +898,167 @@ defmodule Tightbeam.ClientE2E.Journeys do
   @doc """
   J5's client-side oracle: what a client must show while two lanes run at once.
 
-  Neither leg asks which model answered first. A trivial prompt in a fresh
-  stream routinely outlives a deliberately slow one in a warm one — it pays a
-  new harness session and whatever preamble the agent elects — and a model's
-  speed is not evidence about delivery. What the two legs assert is that
-  publication is faithful to the store and that it is LIVE:
+  `expected` is one entry per post this journey made —
+  `%{id: clientMessageId, session_key: the stream it was posted to,
+  committed_seq: the reply row's `messages.seq`, or nil when the store holds no
+  reply for it}` — so every leg below is scoped to THIS journey's three turns.
+  A frame belonging to any other turn can neither satisfy a leg nor break one.
 
-  - the replies arrive in the order the store COMMITTED them (`committed`, the
-    reply rows in `messages.seq` order). A frame the wire reorders, holds past
-    a later commit, or drops for good shows up here and nowhere else;
-  - some reply reaches the client while ANOTHER stream's turn is still
-    running. Judged on the client's own frame ORDER — that turn's `running`
-    state arrived before the reply and its terminal state after it — so it
-    needs no clock and holds whichever lane finishes first. A gateway that
-    withheld one lane's frames until the other lane's turn ended would satisfy
-    the order leg and fail this one.
+  No leg asks which model answered first. A trivial prompt in a fresh stream
+  routinely outlives a deliberately slow one in a warm stream — it pays a new
+  harness session and whatever preamble the agent elects — and a model's speed
+  is not evidence about delivery. What the legs assert, in order, is:
 
-  Returns nil when both hold, else the text of the first that did not.
+  1. the store holds a reply for every post (else the client's silence is the
+     substrate's, and the later legs would compare empty lists and pass);
+  2. every one of those replies reached the client;
+  3. they arrived in the order the store COMMITTED them — a frame reordered or
+     held past a later commit shows up here;
+  4. each reply carried the sessionKey of the stream it answers (no cross-talk,
+     for every post rather than for one of them);
+  5. each reply arrived BEFORE its own turn's terminal `prompt_turn_state`.
+     Those two are published back to back at the end of the turn, so this is
+     the edge that catches a reply held behind its own turn's close — the case
+     an order check cannot see when the held frame was committed last anyway.
+     A turn whose terminal state never arrived fails here too: a client left
+     with a spinning indicator has not been told the turn ended;
+  6. some reply arrived while ANOTHER of these streams' turns was open — after
+     that turn's `running` frame and before its terminal one. This is the
+     cross-lane liveness the journey exists to prove, and it holds whichever
+     lane finishes first. Both bounding frames must be present: an open-ended
+     window would let a turn nobody closed vouch for everything after it.
+
+  Returns nil when every leg holds, else the text of the first that did not.
   """
-  @spec concurrency_delivery_error([map()], [String.t()]) :: String.t() | nil
-  def concurrency_delivery_error(frames, committed) do
-    delivered =
-      for frame <- frames,
-          assistant_reply?(frame),
-          frame["replyToClientMessageId"] in committed,
-          do: frame["replyToClientMessageId"]
+  @spec concurrency_delivery_error([map()], [
+          %{id: String.t(), session_key: String.t(), committed_seq: integer() | nil}
+        ]) :: String.t() | nil
+  def concurrency_delivery_error(frames, expected) do
+    replies = reply_indexes(frames, expected)
+    terminals = turn_state_indexes(frames, expected, &terminal_turn_state?/1)
+    runnings = turn_state_indexes(frames, expected, &running_turn_state?/1)
 
-    missing = committed -- delivered
+    uncommitted = for %{id: id, committed_seq: nil} <- expected, do: id
+    missing = for %{id: id} <- expected, not is_map_key(replies, id), do: id
 
     cond do
+      uncommitted != [] ->
+        "the store holds no reply row for #{inspect(uncommitted)} — the substrate never " <>
+          "produced what the client is being asked to have shown"
+
       missing != [] ->
         "the store committed replies the client never received: #{inspect(missing)}"
 
-      delivered != committed ->
-        "the client showed replies in an order the store never committed: " <>
-          "client #{inspect(delivered)}, committed #{inspect(committed)}"
-
-      not live_interleave?(frames) ->
-        "no reply reached the client while another stream's turn was still running — " <>
-          "each lane's frames waited for its neighbour to finish"
-
       true ->
-        nil
+        delivered_order = order_by(expected, fn %{id: id} -> replies[id].index end)
+        committed_order = order_by(expected, & &1.committed_seq)
+
+        cross_talk =
+          for %{id: id, session_key: key} <- expected,
+              replies[id].frame["sessionKey"] != key,
+              do: id
+
+        held =
+          for %{id: id} <- expected,
+              is_nil(terminals[id]) or replies[id].index > terminals[id],
+              do: id
+
+        cond do
+          delivered_order != committed_order ->
+            "the client showed replies in an order the store never committed: " <>
+              "client #{inspect(delivered_order)}, committed #{inspect(committed_order)}"
+
+          cross_talk != [] ->
+            "cross-talk: #{inspect(cross_talk)} answered in a stream it was not posted to"
+
+          held != [] ->
+            "#{inspect(held)} did not reach the client before its own turn's terminal state — " <>
+              "the reply was held behind the close of the very turn that produced it"
+
+          not cross_lane_live?(expected, replies, runnings, terminals) ->
+            "no reply reached the client while another of these streams' turns was open — " <>
+              "each lane's frames waited for its neighbour to finish"
+
+          true ->
+            nil
+        end
     end
   end
 
-  defp live_interleave?(frames) do
-    windows = running_windows(frames)
+  defp cross_lane_live?(expected, replies, runnings, terminals) do
+    windows =
+      for %{id: id, session_key: key} <- expected,
+          is_integer(runnings[id]) and is_integer(terminals[id]),
+          do: {key, runnings[id], terminals[id]}
 
-    frames
-    |> Enum.with_index()
-    |> Enum.any?(fn {frame, index} ->
-      assistant_reply?(frame) and
-        Enum.any?(windows, fn {session_key, from, to} ->
-          session_key != frame["sessionKey"] and from < index and index < to
-        end)
+    Enum.any?(expected, fn %{id: id, session_key: key} ->
+      at = replies[id].index
+
+      Enum.any?(windows, fn {other_key, from, to} ->
+        other_key != key and from < at and at < to
+      end)
     end)
   end
 
-  # {sessionKey, index of its `running` frame, index of its terminal frame} for
-  # every turn the client watched. A turn whose terminal state never arrived was
-  # still running at the end of the window, so its window runs to the end.
-  defp running_windows(frames) do
-    indexed = Enum.with_index(frames)
-    unterminated = length(frames)
+  defp order_by(expected, key_fun), do: expected |> Enum.sort_by(key_fun) |> Enum.map(& &1.id)
 
-    for {frame, index} <- indexed, turn_state?(frame, "running") do
-      correlation = get_in(frame, ["payload", "messageId"])
+  # %{clientMessageId => %{frame, index}} for the replies to THESE posts. The
+  # first frame answering a post is the one it was answered by; a later
+  # duplicate cannot move its place in the arrival order.
+  defp reply_indexes(frames, expected) do
+    ids = MapSet.new(expected, & &1.id)
 
-      terminal =
-        Enum.find_value(indexed, unterminated, fn {candidate, candidate_index} ->
-          candidate_index > index and terminal_turn_state?(candidate, correlation) and
-            candidate_index
-        end)
+    frames
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {frame, index}, acc ->
+      id = frame["replyToClientMessageId"]
 
-      {get_in(frame, ["payload", "sessionKey"]), index, terminal}
-    end
+      if assistant_reply?(frame) and MapSet.member?(ids, id) and not is_map_key(acc, id),
+        do: Map.put(acc, id, %{frame: frame, index: index}),
+        else: acc
+    end)
+  end
+
+  # %{clientMessageId => index} of the FIRST matching turn-state frame for each
+  # of these posts.
+  defp turn_state_indexes(frames, expected, match?) do
+    ids = MapSet.new(expected, & &1.id)
+
+    frames
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {frame, index}, acc ->
+      id = get_in(frame, ["payload", "messageId"])
+
+      if match?.(frame) and MapSet.member?(ids, id) and not is_map_key(acc, id),
+        do: Map.put(acc, id, index),
+        else: acc
+    end)
   end
 
   defp assistant_reply?(frame),
     do: frame["type"] == "message" and frame["role"] == "assistant"
 
-  defp turn_state?(frame, state) do
-    frame["type"] == "event" and frame["event"] == "prompt_turn_state" and
-      get_in(frame, ["payload", "state"]) == state
-  end
+  defp prompt_turn_state?(frame),
+    do: frame["type"] == "event" and frame["event"] == "prompt_turn_state"
 
-  defp terminal_turn_state?(frame, correlation) do
-    frame["type"] == "event" and frame["event"] == "prompt_turn_state" and
-      get_in(frame, ["payload", "messageId"]) == correlation and
-      get_in(frame, ["payload", "terminalState"]) == true
-  end
+  defp running_turn_state?(frame),
+    do: prompt_turn_state?(frame) and get_in(frame, ["payload", "state"]) == "running"
 
-  # The reply rows for these posts, in the store's own commit order.
-  defp committed_reply_order(base_dir, session_keys, client_message_ids) do
-    session_keys
-    |> Enum.flat_map(&Substrate.messages(base_dir, &1))
-    |> Enum.filter(&(&1["replyToClientMessageId"] in client_message_ids))
-    |> Enum.sort_by(& &1["seq"])
-    |> Enum.map(& &1["replyToClientMessageId"])
+  defp terminal_turn_state?(frame),
+    do: prompt_turn_state?(frame) and get_in(frame, ["payload", "terminalState"]) == true
+
+  # Each post paired with the stream it went to and the `messages.seq` of the
+  # reply the store holds for it (nil when it holds none).
+  defp expected_deliveries(base_dir, posts) do
+    session_keys = posts |> Enum.map(& &1.session_key) |> Enum.uniq()
+
+    committed =
+      session_keys
+      |> Enum.flat_map(&Substrate.messages(base_dir, &1))
+      |> Enum.filter(&is_binary(&1["replyToClientMessageId"]))
+      |> Map.new(&{&1["replyToClientMessageId"], &1["seq"]})
+
+    Enum.map(posts, &Map.put(&1, :committed_seq, committed[&1.id]))
   end
 
   defp j6_model_change(ctx) do
