@@ -34,21 +34,22 @@ Effort brackets (claude-x[low..max], sol[low..xhigh]) tune depth within a capsul
 ## How to read the activity tables
 
 ONE column of minds per activity, IN ORDER: use the first available, step rightward
-if it is not. If NONE is available, PARK the work until one recovers — the end of the
-list IS the floor; nothing off-list may do the work. `any` = no floor: any available
-mind may do it.
+if it is not. If NONE is available, the work is BLOCKED — the end of the list IS the
+floor; nothing off-list may do the work. `any` = no floor: any available mind may do
+it.
 
-Adjudicate at spawn AND again whenever a mind fails you mid-work — a refused spawn
-names its reason, a harness out of tokens is a reason to step rightward; switch and
-continue rather than stop. A park is a decision on the record, never a silent stall:
-attest it with the reason and schedule a re-check wake or escalate to your owner.
+Decide at spawn AND again whenever a mind fails you mid-work — a refused spawn names
+its reason, a harness out of tokens is a reason to step rightward; switch and continue
+rather than stop. When no mind on the list is available, follow `model-policy.md`'s
+three moves: switch is off the table by definition, so assert `work-blocked` over the
+affected session and report up, or surface the credential need to the user. Never a
+silent stall, never a retry loop against a wall.
 
 ## Substrate activities
 
-| Activity | Wants | Minds, in order (park if none) |
+| Activity | Wants | Minds, in order (blocked if none) |
 |---|---|---|
 | General user conversation (default agent) | breadth, warmth, cheap to idle | sonnet[medium], opus[medium] |
 | Onboarding / discovery conversations | judgment about people, reframing | fable[high], opus[high], sol[low] |
-| Adjudication briefs (owner ruling) | fast sound judgment over facts | the owner's own mind — no swap; opus-class or sol[low] if re-staffed |
 | Failure classification, log triage | fast pattern matching | luna[high], haiku, sonnet[low], any |
 | Guidance / law authoring | wisdom-grade writing | fable[high], opus[high], sol[xhigh] |
