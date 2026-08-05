@@ -71,3 +71,18 @@ move 3, chosen by inference. Step 41: PASS on eezo. (Still waived on
 shrdlu: no key there, and one credentialed pass proves the leg.)
 
 §11 scorecard: 34-40 PASS on eezo+shrdlu; 41 PASS on eezo, WAIVED(shrdlu).
+
+## Steps 42-43 added and green (main at bf0128b)
+
+Each new step caught real defects on its first runs:
+- 42 (prod lifecycle over live ticks): a prod wake scheduled pre-block fired
+  post-block — the prodder's true act time is the wake FIRE; recognition now
+  rides it (supervision-owned wakes only, consumed as canceled with the
+  reason named). 42 PASS both platforms after the fix.
+- 43 (real SIGKILL mid-turn): run 1 exposed shared-adapters npm churn →
+  single-flight provisioning (Spinup.Flight) + launch-awaits-flight; run 2
+  exposed the never-launched-row-as-kill_failed fence that permanently
+  disabled a harness on reboot → reconciliation now resolves a launch that
+  demonstrably never minted a process, everything else keeps the refusal.
+  Dispatched investigator disproved the park-vs-live-turn hypothesis by live
+  instrumentation. 43 PASS on eezo (credentialed), WAIVED(shrdlu: no key).
