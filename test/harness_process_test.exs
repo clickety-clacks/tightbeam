@@ -62,6 +62,9 @@ defmodule Tightbeam.HarnessProcessTest do
     start_supervised!({DB, path: db_path, name: db})
     start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: sup})
     :ok = HarnessProcess.ensure_schema(db)
+    # Reconciliation records what it found; the gateway has this table long
+    # before the coordinator starts.
+    :ok = EventLog.ensure_schema(db)
 
     on_exit(fn ->
       cleanup_result = kill_fixture_groups(test_dir)
@@ -773,26 +776,28 @@ defmodule Tightbeam.HarnessProcessTest do
     refute HarnessProcess.fenced?(ctx.db, key)
   end
 
+  # The exemplar is an identity we cannot READ — a file whose contents name no
+  # process. It used to be a launch that never wrote one at all, which is the
+  # opposite fact (see the unlaunched tests below) and made this test a receipt
+  # for the defect that fenced claude:shared@eezo forever after a mid-launch
+  # crash.
   test "a kill_failed durable park fences checkout after coordinator recreation", ctx do
     key = {:claude, "shared", "testhost"}
 
-    opts =
+    _opts =
       HarnessProcess.prepare_launch(
         [
           cmd: [System.find_executable("false")],
-          stderr_path: Path.join(ctx.test_dir, "never-launched.stderr"),
+          stderr_path: Path.join(ctx.test_dir, "unreadable-identity.stderr"),
           process_helper: @helper
         ],
         ctx.db,
         key
       )
 
-    assert {:error, _reason} =
-             HarnessProcess.capture_identity(
-               ctx.db,
-               Keyword.fetch!(opts, :harness_process_launch_id),
-               0
-             )
+    assert [%{identity_path: identity_path, os_pid: nil}] = HarnessProcess.list(ctx.db)
+    File.write!(identity_path, "this names no process\n")
+    on_exit(fn -> File.rm(identity_path) end)
 
     assert {:ok, %{state: "park_requested"}} = HarnessProcess.begin_park(ctx.db, key)
     owner = self()
@@ -815,6 +820,82 @@ defmodule Tightbeam.HarnessProcessTest do
 
     refute_receive :adapter_started
     assert [%{state: "kill_failed"}] = AdapterCoordinator.harness_processes(coordinator)
+  end
+
+  # SMOKE §11 step 43: the gateway was SIGKILLed between `prepare_launch`'s
+  # INSERT and the spawn, so the row claimed a process the launcher had never
+  # started. Reconciliation read the absent identity file as "cannot identify
+  # this process" and recorded kill_failed, which fenced claude:shared@eezo
+  # permanently — every session on the host failed forever, on a reboot whose
+  # only job was recovery.
+  test "a launch that never minted a process is resolved by reconciliation, not fenced", ctx do
+    key = {:claude, "shared", "testhost"}
+
+    HarnessProcess.prepare_launch(
+      [
+        cmd: [System.find_executable("false")],
+        stderr_path: Path.join(ctx.test_dir, "never-launched.stderr"),
+        process_helper: @helper
+      ],
+      ctx.db,
+      key
+    )
+
+    assert [%{state: "launching", os_pid: nil, identity_path: identity_path}] =
+             HarnessProcess.list(ctx.db)
+
+    refute File.exists?(identity_path)
+
+    assert :ok = HarnessProcess.reconcile(ctx.db)
+
+    assert [%{state: "exited", resolved_at: resolved_at, last_error: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_launch_unlaunched" and &1.subject == "claude:shared@testhost")
+           )
+  end
+
+  test "a key whose launch never minted a process is launchable again after reboot", ctx do
+    key = {:claude, "shared", "testhost"}
+
+    HarnessProcess.prepare_launch(
+      [
+        cmd: [System.find_executable("false")],
+        stderr_path: Path.join(ctx.test_dir, "never-launched-reboot.stderr"),
+        process_helper: @helper
+      ],
+      ctx.db,
+      key
+    )
+
+    assert {:ok, %{state: "park_requested"}} = HarnessProcess.begin_park(ctx.db, key)
+    owner = self()
+
+    # The successor coordinator reconciles at init, exactly as the rebooted
+    # gateway does.
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           send(owner, :adapter_started)
+           []
+         end,
+         db: ctx.db,
+         name: :unlaunched_recovery_coordinator}
+      )
+
+    refute HarnessProcess.fenced?(ctx.db, key)
+    assert [%{state: "exited"}] = AdapterCoordinator.harness_processes(coordinator)
+
+    AdapterCoordinator.adapter_for(coordinator, key)
+    assert_receive :adapter_started
   end
 
   defp launch_stubborn(ctx, key) do

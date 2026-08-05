@@ -272,7 +272,7 @@ defmodule Tightbeam.HarnessProcess do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
       kill(db, row)
     else
-      {:error, reason} -> kill_failed(db, row, reason)
+      {:error, reason} -> unidentified(db, row, reason)
     end
   end
 
@@ -339,9 +339,38 @@ defmodule Tightbeam.HarnessProcess do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
       kill(db, row, terminal_state)
     else
-      {:error, reason} -> kill_failed(db, row, reason)
+      {:error, reason} -> unidentified(db, row, reason)
     end
   end
+
+  # An identity we cannot READ and a launch that never MINTED one are opposite
+  # facts wearing the same error. The launcher creates the identity file before
+  # it forks, so for a row that never captured a pid an absent file is the
+  # launcher's own record that it never ran: no session was created, no process
+  # group exists, and nothing can outlive the row. That is the park's success
+  # condition, not its failure — recorded as kill_failed it fenced the key
+  # FOREVER over a process that never existed, and a crash anywhere between
+  # `prepare_launch`'s INSERT and the spawn is enough to leave that row behind.
+  #
+  # Every other shape stays a refusal. A row that HAS a recorded pid is a
+  # process we can no longer authorize a signal for, not a process we know is
+  # gone; an invalid file, a read timeout, and a remote read (whose failure
+  # cannot tell a missing file from an unreachable host) all keep the fence.
+  # The caller's terminal state is not used: it names how the process ENDED,
+  # and there was no process to kill or to close gracefully.
+  defp unidentified(db, %{os_pid: nil} = row, {:identity_unavailable, :enoent}) do
+    :ok =
+      EventLog.lifecycle(
+        db,
+        "harness_launch_unlaunched",
+        row.adapter_key,
+        inspect(%{launch_id: row.launch_id, state: row.state})
+      )
+
+    resolve(db, row, "exited")
+  end
+
+  defp unidentified(db, row, reason), do: kill_failed(db, row, reason)
 
   defp kill(db, row, terminal_state \\ "killed") do
     attempted_at = now()
