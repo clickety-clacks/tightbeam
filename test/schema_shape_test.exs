@@ -85,14 +85,14 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh bootstrap interrupted midway is resumed, not refused", %{db: db} do
     # A GENUINE interruption stopped mid-run, not its end state rebuilt by hand
     # — the question is WHEN the stamp lands relative to the tables, and only a
-    # real run can answer it. `coordinator_epochs` is the last module, so this
-    # fails well AFTER `sessions` exists: exactly the window. Stamped last, what
+    # real run can answer it. `work_state_events` is near the END of the module list
+    # and executes its DDL directly (the stub matches SQL text, so a module that
+    # wraps its DDL in a transaction closure cannot be interrupted this way), so
+    # this fails well AFTER `sessions` exists: exactly the window. Stamped last, what
     # that leaves is indistinguishable from a database written before this
     # build, and the next boot refused one this build had just created.
     failing =
-      start_supervised!(
-        {Tightbeam.SchemaShapeTest.FailingDb, db: db, fragment: "coordinator_epochs"}
-      )
+      start_supervised!({Tightbeam.SchemaShapeTest.FailingDb, db: db, fragment: "work_state"})
 
     assert catch_error(Schema.ensure_all(failing))
 
@@ -103,10 +103,10 @@ defmodule Tightbeam.SchemaShapeTest do
     # Boot again against the real server: this must RESUME, not refuse.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordinator_epochs"]]} =
+    assert {:ok, [["work_state_events"]]} =
              DB.query(
                db,
-               "SELECT name FROM sqlite_master WHERE type='table' AND name='coordinator_epochs'"
+               "SELECT name FROM sqlite_master WHERE type='table' AND name='work_state_events'"
              )
   end
 

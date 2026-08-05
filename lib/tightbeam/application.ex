@@ -230,12 +230,6 @@ defmodule Tightbeam.Application do
         Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),
       effort_checkin_horizon_ms:
         Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000),
-      adjudication_claim_window_ms:
-        Application.get_env(:tightbeam, :adjudication_claim_window_ms, 300_000),
-      adjudication_response_window_ms:
-        Application.get_env(:tightbeam, :adjudication_response_window_ms, 86_400_000),
-      adjudication_park_fallback_ms:
-        Application.get_env(:tightbeam, :adjudication_park_fallback_ms, 14_400_000),
       critical_lease_hard_cap_ms:
         Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000),
       onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000)

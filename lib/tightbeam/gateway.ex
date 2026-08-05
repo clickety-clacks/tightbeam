@@ -1760,6 +1760,12 @@ defmodule Tightbeam.Gateway do
             # condition, and it re-raised — gibson livelocked Flynn's session
             # behind a ruling whose only documented exit, `tightbeam adjudicate`,
             # was parsed in args.rs and never routed in dispatch.rs.
+            # The refusal replaces the SENTENCE, never the evidence. `reason` is
+            # what the user reads; `raw_reason` and `failed_stage` are what the
+            # record keeps, because the sentence is a flattening and the next
+            # misclassification will be diagnosed from what it flattened.
+            raw_reason = reason
+
             reason =
               case unonboarded_refusal(session, failed_stage) do
                 {:refused, message} -> message
@@ -1787,17 +1793,24 @@ defmodule Tightbeam.Gateway do
             end
 
             # The RECORD half of the substrate's obligation. `Ledger.finish_in_txn`
-            # writes the failed row and its reason sentence; this keeps the raw
-            # error envelope that the sentence flattens, in the same transaction,
-            # so the record and the terminal state cannot disagree. It runs only
-            # when the finish WON, which is what stops a double-finish from
-            # double-recording.
+            # writes the failed row and the sentence the user saw; this keeps
+            # what that sentence flattened — WHICH STAGE died and the underlying
+            # term — in the same transaction, so the record and the terminal
+            # state cannot disagree. It runs only when the finish WON, which is
+            # what stops a double-finish from double-recording.
+            #
+            # The stage is the load-bearing half. Gibson's first production
+            # touch was misdiagnosed three times because "the turn failed" was
+            # all the durable evidence there was: a checkout fault, a mid-engine
+            # fault and a prompt-dispatch fault all read identically after the
+            # fact.
             record_in_txn = fn txn ->
               detail =
                 try do
-                  JSON.encode!(reason)
+                  JSON.encode!(%{stage: failed_stage, reason: raw_reason})
                 rescue
-                  _ -> JSON.encode!(%{term: inspect(reason)})
+                  _ ->
+                    JSON.encode!(%{stage: inspect(failed_stage), term: inspect(raw_reason)})
                 end
 
               EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)

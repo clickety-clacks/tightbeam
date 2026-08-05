@@ -32,9 +32,8 @@ defmodule Tightbeam.Id do
 
   NOT strictly ordered: two ULIDs minted in the same millisecond order by their
   random suffixes, so one may sort before another minted earlier. Use it as a
-  stable handle (an episodeId), never where a strictly-increasing value is
-  required — a coordinator epoch needs `AdapterCoordinator.mint_epoch/1`, whose
-  durable counter cannot tie.
+  stable handle, never where a strictly-increasing value is required — that
+  needs a durable counter, which cannot tie.
 
       iex> id = Tightbeam.Id.ulid()
       iex> String.length(id)

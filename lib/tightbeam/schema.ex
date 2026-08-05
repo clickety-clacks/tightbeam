@@ -26,8 +26,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.RailRemedy,
     Tightbeam.Supervision,
     Tightbeam.WorkState,
-    Tightbeam.HarnessProcess,
-    Tightbeam.AdapterCoordinator
+    Tightbeam.HarnessProcess
   ]
 
   # The shape this build writes. Bump it when a production table changes in a

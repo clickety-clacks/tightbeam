@@ -51,18 +51,6 @@ if value = System.get_env("TIGHTBEAM_WORK_ITEM_TRIAGE_DEADLINE_MS") do
   config :tightbeam, :work_item_triage_deadline_ms, String.to_integer(value)
 end
 
-if value = System.get_env("TIGHTBEAM_ADJUDICATION_CLAIM_WINDOW_MS") do
-  config :tightbeam, :adjudication_claim_window_ms, String.to_integer(value)
-end
-
-if value = System.get_env("TIGHTBEAM_ADJUDICATION_RESPONSE_WINDOW_MS") do
-  config :tightbeam, :adjudication_response_window_ms, String.to_integer(value)
-end
-
-if value = System.get_env("TIGHTBEAM_ADJUDICATION_PARK_FALLBACK_MS") do
-  config :tightbeam, :adjudication_park_fallback_ms, String.to_integer(value)
-end
-
 if value = System.get_env("TIGHTBEAM_ADVERTISED_URL") do
   config :tightbeam, :advertised_url, value
 end

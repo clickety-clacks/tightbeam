@@ -20,6 +20,8 @@ defmodule Tightbeam.Ledger do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
+  require Logger
+
   @typedoc "A queued/claimed turn as returned by claim_next/3."
   @type turn :: %{
           seq: integer(),
@@ -279,11 +281,31 @@ defmodule Tightbeam.Ledger do
 
     if queued? do
       case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
-        [] -> {:unclaimable, :no_session}
-        [["retired"]] -> {:unclaimable, :session_retired}
-        # Active, so the only thing standing between this turn and a claim is an
-        # adjudication hold — designed waiting, healed by the ruling.
-        _ -> :none
+        [] ->
+          {:unclaimable, :no_session}
+
+        [["retired"]] ->
+          {:unclaimable, :session_retired}
+
+        # UNREACHABLE BY CONSTRUCTION since adjudication was deleted. The claim
+        # UPDATE's only session predicate is `state = 'active'`, so an active
+        # session with queued work and no running row must have matched it in
+        # this same transaction. The hold used to make this arm ordinary
+        # ("designed waiting, healed by the ruling"); nothing does now.
+        #
+        # It stays `:none` rather than raising because a lane must not crash on
+        # a queue read, but it must not be SILENT either: reaching here means
+        # the claim UPDATE and this read disagree inside one transaction, and
+        # reporting that as a plain empty queue is the same collapse the
+        # `:unclaimable` split above exists to prevent.
+        [[state]] ->
+          Logger.error(
+            "claim_next: #{session_key} is #{state} with queued work that the claim " <>
+              "UPDATE did not match, in one transaction — reporting :none, but this " <>
+              "is an invariant violation, not an idle queue"
+          )
+
+          :none
       end
     else
       :none

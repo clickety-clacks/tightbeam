@@ -81,7 +81,7 @@ defmodule Tightbeam.Model do
 
   @doc """
   A human-readable line naming every field, for prose read by an operator or an
-  agent (adjudication briefs, tombstones). Unambiguous on purpose: nothing here
+  agent (failure records, tombstones). Unambiguous on purpose: nothing here
   is parsed back.
 
       iex> Tightbeam.Model.describe(Tightbeam.Model.new("claude-fable-5", context: "1m", effort: "high"))

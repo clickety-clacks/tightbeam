@@ -3,7 +3,7 @@ defmodule Tightbeam.Unroutable do
   Why a model selection cannot be routed, as a value, plus the one sentence that
   says it.
 
-  Four mechanisms used to decide routability: adjudication's `harness_for_ref`,
+  Four mechanisms used to decide routability: the harness resolver,
   spawn/tune's `validate_catalog_model`, readiness's model column, and
   `ModelCatalog.member?`, whose `present?: false` meant three different things at
   once and so could not be reported honestly by anyone holding it. Each named its

@@ -489,36 +489,25 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     key = {:claude, "default", "testhost"}
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
 
-    assert wait_until(
-             fn -> match?({:ok, {_, 1}}, AdapterCoordinator.ready_token(coordinator, key)) end,
-             500
-           )
+    assert wait_until(fn -> AdapterCoordinator.ready?(coordinator, key) end, 500)
 
-    {:ok, closed_token} = AdapterCoordinator.ready_token(coordinator, key)
     ref = Process.monitor(adapter)
 
     assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
     assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
 
-    # A planned teardown IS a death in the token algebra: the successor must be
-    # a NEW generation, or a credential stop/start landing inside a probe-retry
-    # window would re-mint the SAME ready token and the strict heal sweep would
-    # never feed the re-held session (task #103 review). Still no crash
-    # bookkeeping: no lifecycle row, no failure count.
+    # A planned teardown IS a death for generation purposes: the successor must
+    # be a NEW generation, so nothing downstream can mistake it for the process
+    # it replaced. Still no crash bookkeeping: no lifecycle row, no failure
+    # count.
     assert coordinator_generation(coordinator, key) == 2
     assert EventLog.lifecycle_events(ctx.db) == []
 
-    # The successor boots as generation 2, and its ready token strictly
-    # outranks every token stamped against the closed process.
+    # The successor boots as generation 2.
     assert {:ok, _successor, 2} = AdapterCoordinator.adapter_for(coordinator, key)
 
-    assert wait_until(
-             fn -> match?({:ok, {_, 2}}, AdapterCoordinator.ready_token(coordinator, key)) end,
-             500
-           )
-
-    {:ok, reborn_token} = AdapterCoordinator.ready_token(coordinator, key)
-    assert AdapterCoordinator.newer_token?(reborn_token, closed_token)
+    assert wait_until(fn -> AdapterCoordinator.ready?(coordinator, key) end, 500)
+    assert coordinator_generation(coordinator, key) == 2
   end
 
   test "load-slot queue caps concurrency at three and releases on borrower exit", ctx do
@@ -906,9 +895,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   # messages nobody — so a test about a working engine dying must wait here.
   defp await_ready!(coordinator, key) do
     assert wait_until(
-             fn ->
-               match?({:ok, {_epoch, _gen}}, AdapterCoordinator.ready_token(coordinator, key))
-             end,
+             fn -> AdapterCoordinator.ready?(coordinator, key) end,
              2_000
            )
   end

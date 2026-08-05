@@ -606,10 +606,6 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  # A session's hold is OPEN whether it is wide ('*') or narrowed to an in-flight
-  # heal probe — a probe-in-flight hold is still a hold, so the resolved episode
-  # behind it is listed too. Admin visibility applies HERE ONLY; it never
-  # broadens the decision_requests rows above.
   @doc "Canonical SHA-256 action fingerprint."
   @spec digest(map()) :: String.t()
   def digest(call) do
