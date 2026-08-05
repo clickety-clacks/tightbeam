@@ -519,7 +519,25 @@ defmodule Tightbeam.Wakes do
         "supervision wake #{wake.wake_id} suppressed: work-blocked stands for #{holder}"
       )
 
-      transaction!(db, fn txn -> cancel_pending_in_txn(txn, wake.wake_id) end)
+      transaction!(db, fn txn ->
+        cancel_pending_in_txn(txn, wake.wake_id)
+
+        # REFUND THE RUNG. The prodder's bookkeeping increments prodCount when
+        # the wake is SCHEDULED (success_clear, for BOTH branches — escalation
+        # rungs advance the same counter), but the act is the DELIVERY — and
+        # this delivery did not happen. Without the refund, three suppressed
+        # prods would consume the ladder and ESCALATE to the spawner about a
+        # holder that was blocked the whole time (caught by SMOKE 42 on
+        # shrdlu, whose slower ticks let a prod be claimed before the block
+        # landed and fired after it). The refund is symmetric with the
+        # increment: schedule claims, fire settles, suppression voids.
+        Txn.q(
+          txn,
+          "UPDATE assignment_prods SET prodCount = MAX(prodCount - 1, 0) WHERE assignmentId = ?1",
+          [wake.assignment_id]
+        )
+      end)
+
       best_effort_lifecycle(db, "supervision_wake_suppressed", wake.wake_id, "holder=#{holder}")
       true
     else

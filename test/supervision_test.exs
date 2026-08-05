@@ -1392,6 +1392,11 @@ defmodule Tightbeam.SupervisionTest do
              &(&1.kind == "supervision_wake_suppressed" and &1.subject == wake_id)
            )
 
+    # The rung is REFUNDED: schedule claimed prodCount 1, the suppressed fire
+    # voided it. Without this, suppressed prods consume the ladder and a
+    # blocked holder gets escalated over — the SMOKE 42 shrdlu finding.
+    assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
+
     # An agent's own wake to the SAME blocked session still delivers — the
     # fact suppresses supervision's mail, never anyone else's.
     agent_wake =
