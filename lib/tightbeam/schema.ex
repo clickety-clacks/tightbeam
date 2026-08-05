@@ -26,6 +26,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.RailRemedy,
     Tightbeam.Supervision,
     Tightbeam.WorkState,
+    Tightbeam.Productions.BubbleSweeper,
     Tightbeam.HarnessProcess
   ]
 

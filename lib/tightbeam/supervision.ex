@@ -1060,10 +1060,17 @@ defmodule Tightbeam.Supervision do
   end
 
   defp sweep(state) do
+    # Blocked holders are pre-filtered at sweep granularity (review N11): the
+    # per-terminal evaluation would decline them anyway, but re-declining
+    # every tick writes a rail_sweep lifecycle row per tick, and work-blocked
+    # is designed to be long-lived. The turn-end path is untouched — a
+    # terminal still runs the full shift once. Retraction needs no wiring:
+    # the next tick reads the current fact and the holder is simply back.
     open_holders =
       state.db
       |> Assignments.list(%{state: "open"})
       |> Enum.map(& &1.holderKey)
+      |> Enum.reject(&ConditionFacts.standing?(state.db, "work-blocked", &1))
 
     {:ok, pending_rows} =
       DB.query(

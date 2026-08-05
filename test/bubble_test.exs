@@ -239,6 +239,117 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
   end
 
+  # Review B2: a cause turn whose lineage EXISTS but holds no active rung is
+  # the climb exhausting, and the climb exhausting is the alert — the silent
+  # arm is reserved for sessions with no lineage at all.
+  test "a cause turn under an all-retired lineage alerts instead of dying silently", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1, ?2)", [
+        "supervisor",
+        ctx.main.session_key
+      ])
+
+    seq = fail_turn!(ctx.db, "holder")
+    :ok = Bubble.recognize_terminal(ctx.db, seq)
+
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+    assert notice_turn(ctx.db, "supervisor") == []
+  end
+
+  # Review M5: a notice with a corrupt marker must not become the start of a
+  # new bubble; recognition declines and reports.
+  test "a malformed bubble marker declines recognition instead of climbing", ctx do
+    seq = fail_turn!(ctx.db, "holder")
+    {:ok, _} = DB.query(ctx.db, "UPDATE turns SET requestRef='bubble:12x' WHERE seq=?1", [seq])
+
+    :ok = Bubble.recognize_terminal(ctx.db, seq)
+
+    assert notice_turn(ctx.db, "supervisor") == []
+
+    assert Enum.any?(
+             Tightbeam.EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "bubble_marker_malformed" and &1.subject == "holder")
+           )
+  end
+
+  # Review M4: a bubble naming a cause turn that does not exist reports dirt
+  # rather than fabricating an "unknown" cause for a parent or a user.
+  test "a missing cause row declines recognition and reports", ctx do
+    seq = fail_turn!(ctx.db, "holder")
+    {:ok, _} = DB.query(ctx.db, "UPDATE turns SET requestRef='bubble:99999' WHERE seq=?1", [seq])
+
+    :ok = Bubble.recognize_terminal(ctx.db, seq)
+
+    assert notice_turn(ctx.db, "supervisor") == []
+    assert notice_turn(ctx.db, ctx.main.session_key) == []
+
+    assert Enum.any?(
+             Tightbeam.EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "bubble_cause_missing" and &1.subject == "holder")
+           )
+  end
+
+  # Spec proof 6's bubble counterpart: the LHS asserted against its surface.
+  test "the bubble LHS: terminal admission by notice-ness, suppression by owner", ctx do
+    cause = %{
+      notice?: false,
+      owner: "flynn",
+      session_key: "holder",
+      cause_seq: 1,
+      status: "failed"
+    }
+
+    notice = %{cause | notice?: true}
+
+    assert Bubble.bubble_production_matches?(ctx.db, "failed", cause)
+    assert Bubble.bubble_production_matches?(ctx.db, "failed_unknown", cause)
+    refute Bubble.bubble_production_matches?(ctx.db, "canceled", cause)
+    assert Bubble.bubble_production_matches?(ctx.db, "canceled", notice)
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "user-alerted",
+          scope: "flynn",
+          origin: "process:tightbeam"
+        })
+      end)
+
+    refute Bubble.bubble_production_matches?(ctx.db, "failed", cause)
+  end
+
+  # Review B1/B3b: the sweeper's cursor makes recognition sweep-reachable —
+  # a terminal whose cast was lost is picked up from the cursor, and the
+  # cursor never advances past a still-pending row (out-of-order terminals).
+  test "the sweeper recognizes from the cursor and halts at the terminal prefix", ctx do
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper,
+         db: ctx.db, interval: 3_600_000, name: :"bubble_sweeper_#{ctx.db}"}
+      )
+
+    # A failed cause whose cast was "lost" (never delivered by hand), and a
+    # still-queued younger sibling that must block the cursor behind it.
+    seq = fail_turn!(ctx.db, "holder")
+
+    :appended =
+      Tightbeam.Gateway.deliver_prompt("holder", "user:flynn", "still queued",
+        db: ctx.db,
+        device_id: "test",
+        client_message_id: "c-pending"
+      )
+
+    assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) >= 1
+    assert [[_, ref, _, _, _]] = notice_turn(ctx.db, "supervisor")
+    assert ref == "bubble:#{seq}"
+
+    {:ok, [[cursor]]} =
+      DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
+    assert cursor < seq + 2, "cursor must not pass the still-queued row"
+    assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == 0
+  end
+
   test "the substrate may not assert work-blocked; agents may not file the alert kinds", ctx do
     {:ok, refused} =
       DB.transaction(ctx.db, fn txn ->

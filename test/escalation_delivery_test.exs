@@ -487,7 +487,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
              # substrate-authored turn to the failing session's nearest active
              # ancestor, deduped by deterministic wakeId.
              {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt/4",
-              "enqueue_notice/3"} => 1,
+              "enqueue_notice/4"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
               "notify_stranded_ancestor/2"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "remove_override_result/3"} =>

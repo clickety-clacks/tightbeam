@@ -3,7 +3,7 @@ defmodule Tightbeam.Productions.Bubble do
   The fault-bubbling production (spec production-machine-v1 §Fault bubbling).
 
   This module is one rule of a Newell production machine: a declared left-hand
-  side over durable working memory (`bubble_production_matches?/4`) and a
+  side over durable working memory (`bubble_production_matches?/3`) and a
   procedural right-hand side (`climb/3`). It is NOT an obligation of the
   failing turn — the turn's own session already has the row, the reason and
   the marker by the time this fires; deleting this module would not touch
@@ -29,7 +29,8 @@ defmodule Tightbeam.Productions.Bubble do
   capacity exists, and retracts it. Recovery is recognized, never declared.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Gateway}
+  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, EventLog, Gateway, Org, Projection}
+  alias Tightbeam.Wire.Payloads
 
   require Logger
 
@@ -73,9 +74,9 @@ defmodule Tightbeam.Productions.Bubble do
     :ok
   end
 
-  defp recognize(db, seq, terminal, turn) do
-    if bubble_production_matches?(db, seq, terminal, turn) do
-      climb(db, seq, turn)
+  defp recognize(db, _seq, terminal, turn) do
+    if bubble_production_matches?(db, terminal, turn) do
+      climb(db, turn)
     else
       :ok
     end
@@ -84,10 +85,11 @@ defmodule Tightbeam.Productions.Bubble do
   @doc """
   The production's complete LHS, in one site, over durable state only (spec
   production-machine-v1 §Legibility): the terminal starts or continues a
-  bubble ∧ the turn's session exists (the context read answered) ∧ no
-  standing `user-alerted` fact for the owner. Where to climb TO is the RHS's
-  problem — a parentless cause session matches and then ends silently,
-  because its own marker already told the only audience there is.
+  bubble ∧ no standing `user-alerted` fact for the owner. The turn's-session-
+  exists conjunct is enforced upstream by `turn_context/2` answering at all —
+  a context this function receives has already passed it. Where to climb TO
+  is the RHS's problem: a parentless cause session matches and then ends
+  silently, because its own marker already told the only audience there is.
 
   Terminal admission, decided per state: `failed` and `failed_unknown` start
   a bubble — the work not happening with nobody having decided that. A
@@ -95,8 +97,8 @@ defmodule Tightbeam.Productions.Bubble do
   an authority, and bubbling it would report a decision as a fault. A
   `canceled` NOTICE still climbs — the underlying fault remains untold.
   """
-  @spec bubble_production_matches?(DB.server(), integer(), String.t(), map()) :: boolean()
-  def bubble_production_matches?(db, _seq, terminal, turn) do
+  @spec bubble_production_matches?(DB.server(), String.t(), map()) :: boolean()
+  def bubble_production_matches?(db, terminal, turn) do
     terminal_admits?(terminal, turn.notice?) and
       not ConditionFacts.standing?(db, "user-alerted", turn.owner)
   end
@@ -109,23 +111,34 @@ defmodule Tightbeam.Productions.Bubble do
 
   # RHS. Find the nearest ACTIVE ancestor of the session the terminal landed
   # in and enqueue the notice there; with none left, the terminal rung fires.
-  # A parentless cause session is its own terminal rung MINUS the alert: the
-  # marker already in its stream IS the user notice (spec §Fault bubbling 2),
-  # so a fresh bubble with no parent ends silently — but a NOTICE that died in
-  # a parentless session means the climb exhausted, and that is the alert.
-  defp climb(db, _seq, turn) do
+  # TWO UNLIKE ABSENCES, kept apart (review B2 — collapsing them silenced a
+  # whole class of fault): `:parentless` means the session has no spawnedBy
+  # at all — its own marker already told the only audience there is, so a
+  # fresh cause ends silently (spec §Fault bubbling 2). `:exhausted` means it
+  # HAS a lineage and no rung of it is active — a retired rung can never run
+  # a turn, so this is the climb ending, and the climb ending is the alert
+  # (spec §5), whether what died here was a notice or the cause itself.
+  defp climb(db, turn) do
     case next_active_ancestor(db, turn.session_key) do
-      nil ->
+      :parentless ->
         if turn.notice?, do: terminal_alert(db, turn), else: :ok
 
-      recipient ->
+      :exhausted ->
+        terminal_alert(db, turn)
+
+      {:ok, recipient} ->
         enqueue_notice(db, turn, recipient)
     end
   end
 
   defp enqueue_notice(db, turn, recipient) do
-    cause = cause_row(db, turn.cause_seq)
+    case cause_row(db, turn.cause_seq) do
+      {:ok, cause} -> enqueue_notice(db, turn, recipient, cause)
+      :missing -> report_missing_cause(db, turn)
+    end
+  end
 
+  defp enqueue_notice(db, turn, recipient, cause) do
     prompt =
       "Turn #{turn.cause_seq} in #{cause.session_key} could not run: " <>
         "#{cause.error || "reason unrecorded"}. You are the nearest ancestor " <>
@@ -148,7 +161,7 @@ defmodule Tightbeam.Productions.Bubble do
       # :skipped means the target evaporated between our read and the
       # delivery transaction. The notice turn was never created, so nothing
       # will terminalize and continue the climb — do it now.
-      :skipped -> climb(db, turn.cause_seq, %{turn | session_key: recipient, notice?: true})
+      :skipped -> climb(db, %{turn | session_key: recipient, notice?: true})
       _ -> :ok
     end
   end
@@ -158,26 +171,91 @@ defmodule Tightbeam.Productions.Bubble do
   # duplicate sentence), where the other order would file suppression without
   # anyone having been told (a silent fault, the one unforgivable outcome).
   defp terminal_alert(db, turn) do
-    cause = cause_row(db, turn.cause_seq)
+    case cause_row(db, turn.cause_seq) do
+      {:ok, cause} -> terminal_alert(db, turn, cause)
+      :missing -> report_missing_cause(db, turn)
+    end
+  end
 
-    EventLog.notice(
-      db,
-      "lineage_exhausted",
-      turn.owner,
-      "cause_seq=#{turn.cause_seq} session=#{cause.session_key}",
-      audience: {:ambient, turn.owner},
-      message:
-        "[no agent can act]\n\nWork owned by you cannot run, and no agent in " <>
-          "its lineage could be told: every ancestor's notice turn also " <>
-          "failed. Original failure — turn #{turn.cause_seq} in " <>
-          "#{cause.session_key}: #{cause.error || "reason unrecorded"}. " <>
-          "Tightbeam will not repeat this alert until a turn is observed to " <>
-          "run; fix the cause (credentials, quota, model) and any turn " <>
-          "delivering clears it.",
-      attention: :high
+  # ONE TRANSACTION (spec §5, literally: "in the same transaction it files
+  # user-alerted"): the lifecycle record, the marker in the owner's main
+  # stream, and the standing fact commit together — no window where the fact
+  # suppresses climbs for an alert nobody received, and none where the user
+  # was told but the machine forgot. The wire push happens after commit and
+  # may find nobody connected; store is truth, replay serves them.
+  defp terminal_alert(db, turn, cause) do
+    message =
+      "[no agent can act]\n\nWork owned by you cannot run, and no agent in " <>
+        "its lineage could be told: every ancestor's notice turn also " <>
+        "failed. Original failure — turn #{turn.cause_seq} in " <>
+        "#{cause.session_key}: #{cause.error || "reason unrecorded"}. " <>
+        "Tightbeam will not repeat this alert until a turn is observed to " <>
+        "run; any turn delivering clears it."
+
+    main_key = Org.personal_session_key(turn.owner)
+
+    {:ok, published} =
+      DB.transaction(db, fn txn ->
+        EventLog.lifecycle_in_txn(
+          txn,
+          "lineage_exhausted",
+          turn.owner,
+          "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
+        )
+
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "user-alerted",
+          scope: turn.owner,
+          origin: "process:tightbeam"
+        })
+
+        # The owner's main-session key is COMPOSED; when no row carries the
+        # stream, the fact and the record still commit — log it and be done;
+        # the alert becomes product surface when a main session exists.
+        case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
+          [["active"]] ->
+            {:appended, marker} = Projection.append_marker_in_txn(txn, main_key, message, :high)
+            {:ok, marker}
+
+          _ ->
+            :no_stream
+        end
+      end)
+
+    case published do
+      {:ok, marker} ->
+        ConnRegistry.publish_message(
+          Tightbeam.ConnRegistry,
+          main_key,
+          turn.owner,
+          marker.seq,
+          Payloads.server_message(marker),
+          fn pid, payload -> send(pid, {:push_message, main_key, marker.seq, payload}) end
+        )
+
+      :no_stream ->
+        Logger.info(
+          "lineage exhausted for #{turn.owner} with no active main session: " <>
+            "alert recorded and standing; no stream to carry it yet"
+        )
+    end
+
+    :ok
+  end
+
+  defp report_missing_cause(db, turn) do
+    Logger.error(
+      "bubble for #{turn.session_key} names cause turn #{turn.cause_seq}, " <>
+        "which does not exist; recognition declines rather than fabricating a cause"
     )
 
-    file_fact(db, "user-alerted", turn.owner)
+    EventLog.lifecycle(
+      db,
+      "bubble_cause_missing",
+      turn.session_key,
+      "cause_seq=#{turn.cause_seq}"
+    )
+
     :ok
   end
 
@@ -199,58 +277,91 @@ defmodule Tightbeam.Productions.Bubble do
 
     case rows do
       [[session_key, request_ref, owner, status]] ->
-        cause_seq = parse_cause_seq(request_ref, seq)
+        case parse_cause_seq(request_ref, seq) do
+          :malformed ->
+            Logger.error(
+              "turn #{seq} in #{session_key} carries a malformed bubble marker " <>
+                "(requestRef=#{inspect(request_ref)}); recognition declines rather " <>
+                "than climbing on a reference that names nothing"
+            )
 
-        %{
-          session_key: session_key,
-          owner: owner,
-          status: status,
-          cause_seq: cause_seq,
-          notice?: cause_seq != seq
-        }
+            EventLog.lifecycle(db, "bubble_marker_malformed", session_key, "seq=#{seq}")
+            nil
+
+          {kind, cause_seq} ->
+            %{
+              session_key: session_key,
+              owner: owner,
+              status: status,
+              cause_seq: cause_seq,
+              notice?: kind == :notice
+            }
+        end
 
       [] ->
         nil
     end
   end
 
-  defp parse_cause_seq("bubble:" <> cause, seq) do
+  defp parse_cause_seq("bubble:" <> cause, _seq) do
     case Integer.parse(cause) do
-      {cause_seq, ""} -> cause_seq
-      # A malformed marker is dirt: report it, treat the turn as its own
-      # cause rather than climbing on a reference that names nothing.
-      _ -> seq
+      {cause_seq, ""} -> {:notice, cause_seq}
+      # A malformed marker is DIRT (review M5): a turn that claims to be a
+      # rung of a climb but names no cause must not be promoted to the start
+      # of a new bubble — notices about notices do not exist — and must not
+      # be silently indulged. Report it; recognition declines.
+      _ -> :malformed
     end
   end
 
-  defp parse_cause_seq(_other, seq), do: seq
+  defp parse_cause_seq(_other, seq), do: {:cause, seq}
 
+  # Found and not-found are different facts (review M4): a missing cause row
+  # is dirt to report, never a fabricated "unknown" the substrate asserts as
+  # truth to a parent or a user.
   defp cause_row(db, cause_seq) do
     {:ok, rows} =
       DB.query(db, "SELECT sessionKey, error FROM turns WHERE seq = ?1", [cause_seq])
 
     case rows do
-      [[session_key, error]] -> %{session_key: session_key, error: error}
-      [] -> %{session_key: "unknown", error: nil}
+      [[session_key, error]] -> {:ok, %{session_key: session_key, error: error}}
+      [] -> :missing
     end
   end
 
   # First ancestor with an ACTIVE session row, walking spawnedBy. A missing
   # or retired rung is climbed past — it can never run a turn, which is the
-  # same fact a canceled notice proves, learned one enqueue cheaper.
+  # same fact a canceled notice proves, learned one enqueue cheaper. The two
+  # empty answers are DIFFERENT facts and stay different values: a session
+  # with no spawnedBy is `:parentless`; a session whose lineage exists but
+  # holds no active rung is `:exhausted`.
   defp next_active_ancestor(db, session_key, hops \\ 0)
-  defp next_active_ancestor(_db, _session_key, hops) when hops > @lineage_hop_limit, do: nil
+
+  defp next_active_ancestor(_db, _session_key, hops) when hops > @lineage_hop_limit,
+    do: :exhausted
 
   defp next_active_ancestor(db, session_key, hops) do
     case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
       {:ok, [[parent]]} when is_binary(parent) ->
         case DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [parent]) do
-          {:ok, [["active"]]} -> parent
-          _ -> next_active_ancestor(db, parent, hops + 1)
+          {:ok, [["active"]]} -> {:ok, parent}
+          _ -> exhausted_past(db, parent, hops)
         end
 
+      _ when hops == 0 ->
+        :parentless
+
       _ ->
-        nil
+        :exhausted
+    end
+  end
+
+  # Climbing past a dead rung: whatever the rest of the walk answers, this
+  # lineage EXISTS, so an empty tail is exhaustion, never parentlessness.
+  defp exhausted_past(db, parent, hops) do
+    case next_active_ancestor(db, parent, hops + 1) do
+      :parentless -> :exhausted
+      other -> other
     end
   end
 

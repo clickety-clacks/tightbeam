@@ -158,7 +158,7 @@ defmodule Tightbeam.ConditionFacts do
       DB.query(
         db,
         """
-        SELECT kind FROM condition_facts
+        SELECT kind FROM condition_facts INDEXED BY condition_facts_match
         WHERE kind IN (?1, ?2) AND scope = ?3
         ORDER BY id DESC LIMIT 1
         """,

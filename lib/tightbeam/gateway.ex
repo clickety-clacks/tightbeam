@@ -164,12 +164,14 @@ defmodule Tightbeam.Gateway do
     provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config, db)
-    # Post-commit recognition, in order: the bubble production first (a failed
-    # turn may need telling upward; spec production-machine-v1 §Fault
-    # bubbling), then the turn-end shift. Both recognize the same committed
-    # terminal; neither depends on the other.
+    # Post-commit recognition: both consumers of a committed terminal are
+    # FIRE-AND-FORGET casts into their own processes — the bubble sweeper and
+    # the supervision shift. Neither may run inside the lane or the
+    # LaneManager: recognition enqueues turns, enqueueing rings the
+    # LaneManager, and a synchronous hook is then a call to self (review B1
+    # found exactly that deadlock on the boot path).
     on_terminal = fn session_key, seq ->
-      Tightbeam.Productions.Bubble.recognize_terminal(db, seq)
+      Tightbeam.Productions.BubbleSweeper.recognize(seq)
       Supervision.notify_terminal(session_key, seq)
     end
 
@@ -305,6 +307,7 @@ defmodule Tightbeam.Gateway do
          adapter_opts: adapter_opts,
          db: db,
          name: Tightbeam.AdapterCoordinator},
+        {Tightbeam.Productions.BubbleSweeper, db: db},
         {Tightbeam.LaneManager,
          db: db,
          lane_sup: Tightbeam.LaneSupervisor,

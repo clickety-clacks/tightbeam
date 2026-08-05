@@ -16,8 +16,10 @@ it. Capsule characterizations and effort brackets live in `preferred-models.md`.
 Not configured, out of tokens, refused — you have exactly three legal moves:
 
 1. SWITCH: take another model from the table, if the task class permits it.
-2. BLOCK: assert `work-blocked` over the affected session (condition verb, scope =
-   the session key) and report the situation to your parent or the user.
+2. BLOCK: report the situation to your parent (or the user), and have the PARENT
+   assert `work-blocked` over the affected session (condition verb, scope = the
+   session key). A session cannot assert it over itself — the seam refuses
+   self-assertion by design; blocking is a supervisor's judgment.
 3. SURFACE: tell the user a credential or account needs re-onboarding.
 
 Never wait silently; never retry-loop against a wall.
