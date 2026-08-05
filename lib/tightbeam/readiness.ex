@@ -243,7 +243,8 @@ defmodule Tightbeam.Readiness do
 
     ["READY: #{ready} can run turns."] ++
       Enum.flat_map(blocked, &harness_lines/1) ++
-      archetype_lines(summary)
+      archetype_lines(summary) ++
+      supervision_lines()
   end
 
   def render(%{runnable?: false, harnesses: rows} = summary, config) do
@@ -271,6 +272,37 @@ defmodule Tightbeam.Readiness do
               "registered — sessions cannot be placed with it"
           end)
     end
+  end
+
+  # THE INSTALL IS NOT FINISHED UNTIL A SERVICE MANAGER OWNS THE GATEWAY, and the
+  # gateway can tell: a service manager sets these in the environment it starts
+  # us with (systemd exports INVOCATION_ID; launchd is reached through
+  # XPC_SERVICE_NAME). Foreground means no restart after a reboot and, worse, no
+  # log — a foreground launcher usually redirects with `tee`, which truncates on
+  # restart, so the run you need after a crash is destroyed by the restart.
+  # Measured on gibson 2026-08-05: the host rebooted, the gateway stayed down
+  # until noticed by hand, and the crash log had already been overwritten.
+  #
+  # A line, not a refusal: running in the foreground is exactly right while
+  # installing or debugging. The gateway states the fact and lets the operator
+  # decide, which is the same rule as every other readiness gap.
+  defp supervision_lines do
+    if supervised?() do
+      []
+    else
+      [
+        "",
+        "Running in the FOREGROUND: no service manager owns this gateway, so it " <>
+          "will not survive a logout or a reboot, and its log is whatever the " <>
+          "launcher redirected (a `tee` without -a truncates on restart). Fine " <>
+          "while installing; finish the install with the service step in the " <>
+          "README before relying on this host."
+      ]
+    end
+  end
+
+  defp supervised? do
+    System.get_env("INVOCATION_ID") != nil or System.get_env("XPC_SERVICE_NAME") != nil
   end
 
   defp harness_lines(row) do

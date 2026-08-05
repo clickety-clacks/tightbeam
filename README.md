@@ -229,9 +229,12 @@ never requires onboarding again.
 
 ### Then run a real turn
 
-In the connected client, open Main and send `hello, who are you?`. Installation
-has reached its end only when the assistant reply arrives and the typing
-indicator clears.
+In the connected client, open Main and send `hello, who are you?`. The turn
+loop works when the assistant reply arrives and the typing indicator clears.
+
+**This is not the end of the install.** One required step remains — installing
+the service (below). Until that is done you have a gateway that dies with your
+terminal and does not come back after a reboot.
 
 You do not install the ACP adapters by hand. `<base_dir>/adapters` stays empty
 until the first session spawns, at which point the gateway installs both
@@ -263,12 +266,31 @@ A row saying UNKNOWN is not a claim that the credential is bad. Use
 `mix tightbeam.doctor` for additional diagnostics; check credential liveness in
 the boot summary or the running gateway's catalog.
 
-## Installing as a service
+## Installing as a service — REQUIRED, and the install is not complete without it
 
-**This is how Tight Beam is meant to run, and it is part of installation — not an
-optional extra afterwards.** `mix run --no-halt` is a foreground process bound to
-your terminal: it dies when you log out and does not come back after a reboot.
-An install that leaves you with a foreground process is not finished.
+**This is the last required step of installation, not an optional extra
+afterwards.** A foreground gateway — `tightbeam-gateway` in a terminal, in tmux,
+under `mix run --no-halt` — dies when you log out and does not come back after a
+reboot. An install that leaves you with a foreground process is not finished.
+
+**THIS STEP NEEDS ROOT, AND A HUMAN.** Both unit files below are installed with
+`sudo`. An agent performing this install on someone's behalf must STOP HERE and
+hand the remaining commands to a person; it cannot complete the install alone.
+Say so plainly rather than substituting a foreground workaround.
+
+**What skipping it actually costs**, measured on a production host that ran
+foreground in tmux for a day (2026-08-05):
+
+- the machine rebooted and the gateway did not come back — every client sat
+  timing out until someone noticed and started it by hand;
+- the log was gone. A foreground launcher usually redirects with `tee`, which
+  TRUNCATES on restart, so the run you need after a crash is destroyed by the
+  restart. Under a service manager the log is the journal (linux) or the
+  `StandardOutPath` files (macOS), and the previous boot is still readable —
+  `journalctl -u tightbeam -b -1`. That difference is the whole post-mortem.
+
+The service must **start with no interactive login**, **survive logout**,
+**survive reboot**, and **restart on failure**.
 
 The service must **start with no interactive login**, **survive logout**,
 **survive reboot**, and **restart on failure**.

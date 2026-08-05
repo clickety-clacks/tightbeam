@@ -99,6 +99,12 @@ defmodule Tightbeam.ReadinessTest do
     for module <- Harness.all(), do: install_adapter!(ctx.base, module)
     catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m")}))
 
+    # Under a service manager — the shape a finished install actually runs in.
+    # systemd exports INVOCATION_ID; the foreground line below is the only other
+    # thing a ready install can say, and it must not fire here.
+    System.put_env("INVOCATION_ID", "test-supervised")
+    on_exit(fn -> System.delete_env("INVOCATION_ID") end)
+
     summary = Readiness.summary(ctx.config, catalog)
     assert summary.runnable?
     names = Enum.map_join(Harness.all(), ", ", &"#{&1.wire_name()} on testhost")
@@ -109,6 +115,29 @@ defmodule Tightbeam.ReadinessTest do
     # forbids certain substrings passes when EITHER guard holds and cannot tell
     # you the other has gone. Pinning the whole render makes both load-bearing.
     assert Readiness.render(summary, ctx.config) == ["READY: #{names} can run turns."]
+  end
+
+  test "a ready install with NO service manager says so — the install is not finished", ctx do
+    # The gap that cost a production host its uptime and its crash log (gibson,
+    # 2026-08-05): a gateway running foreground in tmux does not survive a
+    # reboot, and its `tee` log truncates on restart, so the run you need after
+    # a crash is destroyed by the restart. READY is exactly when an operator
+    # stops paying attention, so it is exactly where this has to be said.
+    for module <- Harness.all(), do: install_adapter!(ctx.base, module)
+    catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m")}))
+
+    System.delete_env("INVOCATION_ID")
+    System.delete_env("XPC_SERVICE_NAME")
+
+    summary = Readiness.summary(ctx.config, catalog)
+    assert summary.runnable?
+
+    rendered = Readiness.render(summary, ctx.config)
+
+    assert Enum.any?(rendered, &String.contains?(&1, "FOREGROUND")),
+           "a ready but unsupervised gateway said nothing about not surviving a reboot"
+
+    assert Enum.any?(rendered, &String.contains?(&1, "will not survive a logout or a reboot"))
   end
 
   ## Naming the gap and the fix — the identity-check standard
