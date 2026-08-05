@@ -43,3 +43,16 @@ Merged to main (review cleared: Fable spec + distinct Opus 5 code, both
 REVISE rounds addressed). Same driver, macOS platform, real application
 boot, port 11474, fresh base dir: SMOKE PASS 7/7. The scenario has now run
 green on both OSes, pre- and post-merge.
+
+## Expanded to SMOKE §11 (main at a74bcfb)
+
+The 7-observation script was one scenario, not an e2e suite. It is now SMOKE
+§11 (steps 34-41) with the driver expanded to 10 observations, adding the
+paths the first cut skipped: a REAL retire canceling a queued notice (the
+climb survives the messenger's cancellation), the prod production's live
+match/no-match around a verb-asserted work-blocked fact, and a full
+application stop/restart mid-climb converging to the alert through the
+sweeper's cursor — review B1's boot path, run for real. 10/10 on eezo and
+shrdlu. Step 41 (credentialed leg: a parent actually RUNS its notice turn
+and acts on model-policy guidance) is WAIVED by name on both hosts: no
+onboarded harness.
