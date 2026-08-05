@@ -36,3 +36,10 @@ addressed; see the revision commit). Re-gated on shrdlu: suite 1297/0, smoke
 7/7 PASS. This run exercises the revised architecture live: recognition rides
 the BubbleSweeper's cast edge and durable cursor — the wiring whose absence
 from coverage was blocking finding B1 — not hand-called recognition.
+
+## Post-merge sim on eezo (main at 00b52ef)
+
+Merged to main (review cleared: Fable spec + distinct Opus 5 code, both
+REVISE rounds addressed). Same driver, macOS platform, real application
+boot, port 11474, fresh base dir: SMOKE PASS 7/7. The scenario has now run
+green on both OSes, pre- and post-merge.
