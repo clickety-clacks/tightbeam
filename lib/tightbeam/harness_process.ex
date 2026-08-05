@@ -337,11 +337,65 @@ defmodule Tightbeam.HarnessProcess do
 
   defp reconcile_row(db, row, terminal_state \\ "killed") do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
-      kill(db, row, terminal_state)
+      if reboot_orphan?(row) do
+        reboot_orphan(db, row)
+      else
+        kill(db, row, terminal_state)
+      end
     else
       {:error, reason} -> unidentified(db, row, reason)
     end
   end
+
+  # A recorded pid from a PREVIOUS OS BOOT names a process that cannot exist:
+  # pids do not survive the kernel, so a boot-identity mismatch is proof the
+  # process died with the machine — the park's success condition, observed.
+  # Before this clause, the signal helper correctly REFUSED to signal (that
+  # pid may be reused by an unrelated process — the refusal is right) but the
+  # refusal was recorded as kill_failed, which fences the key forever: a
+  # machine reboot whose only job was recovery permanently disabled the
+  # harness (gibson, 2026-08-05, fence standing since the morning's restart).
+  #
+  # LOCAL rows only: a remote row's boot identity belongs to the REMOTE
+  # machine, and comparing it to ours would resolve a possibly-live process.
+  # Remote reboot orphans keep the fence until someone reads the remote boot.
+  defp reboot_orphan?(%{ssh: nil, boot_identity: recorded} = row) when is_binary(recorded) do
+    case local_boot_identity(row) do
+      {:ok, current} -> recorded != current
+      {:error, _} -> false
+    end
+  end
+
+  defp reboot_orphan?(_row), do: false
+
+  defp reboot_orphan(db, row) do
+    :ok =
+      EventLog.lifecycle(
+        db,
+        "harness_launch_reboot_orphan",
+        row.adapter_key,
+        inspect(%{launch_id: row.launch_id, recorded_boot: row.boot_identity})
+      )
+
+    resolve(db, row, "exited")
+  end
+
+  # The comparison value comes from the SAME code that recorded it: the Rust
+  # launcher's boot_identity(), via the helper's `boot-identity` subcommand on
+  # the row's own helper_path. Deliberately NOT reimplemented in Elixir —
+  # darwin's value includes st_birthtime, which the BEAM cannot read, and any
+  # format drift would read live processes as reboot orphans and resolve
+  # their fences. A helper that is missing or predates the subcommand answers
+  # {:error, _}, and the row keeps its fence — refusal stays the default.
+  defp local_boot_identity(%{helper_path: helper}) when is_binary(helper) do
+    case bounded_command(helper, ["boot-identity"], command_timeout_ms()) do
+      {output, 0} -> {:ok, String.trim(output)}
+      {:error, :timeout} -> {:error, :boot_identity_timeout}
+      {output, status} -> {:error, {:boot_identity_unavailable, status, one_line(output)}}
+    end
+  end
+
+  defp local_boot_identity(_row), do: {:error, :no_helper}
 
   # An identity we cannot READ and a launch that never MINTED one are opposite
   # facts wearing the same error. The launcher creates the identity file before

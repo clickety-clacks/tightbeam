@@ -46,6 +46,22 @@ fn main() {
         }
     }
 
+    // The launcher's boot identity, verbatim — the Elixir reconciler compares a
+    // recorded launch's boot identity against the CURRENT boot to prove a
+    // reboot orphan (a pid cannot survive the kernel), and the only safe source
+    // for that comparison is the SAME implementation that recorded it: a
+    // reimplementation that drifted by one field would read live processes as
+    // orphans and resolve their fences.
+    if args.first().is_some_and(|arg| arg == "boot-identity") {
+        match harness_process::print_boot_identity() {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if args.first().is_some_and(|arg| arg == "harness-group") {
         match harness_process::group(&args[1..]) {
             Ok(status) => std::process::exit(status),

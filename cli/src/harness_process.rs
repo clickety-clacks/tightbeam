@@ -106,6 +106,11 @@ fn wait_for_session_child(child: libc::pid_t) -> Result<i32, String> {
     }
 }
 
+pub fn print_boot_identity() -> Result<(), String> {
+    println!("{}", boot_identity()?);
+    Ok(())
+}
+
 pub fn group(args: &[String]) -> Result<i32, String> {
     if args.len() != 4 {
         return Err(

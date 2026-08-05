@@ -465,6 +465,9 @@ defmodule Tightbeam.HarnessProcessTest do
       racing_helper,
       """
       #!/bin/sh
+      # The reconciler asks for the current boot identity before it kills;
+      # that call is not part of this race's choreography — pass it through.
+      [ "$1" = "boot-identity" ] && exec #{@helper} "$@"
       if mkdir #{gate_dir}/first 2>/dev/null; then
         touch #{gate_dir}/first-started
         while [ ! -f #{gate_dir}/release-first ]; do sleep 0.01; done
@@ -504,33 +507,6 @@ defmodule Tightbeam.HarnessProcessTest do
     refute HarnessProcess.fenced?(ctx.db, key)
   end
 
-  test "a mismatched boot identity refuses the signal and remains retryable", ctx do
-    key = {:claude, "shared", "testhost"}
-    {_port, row} = launch_stubborn(ctx, key)
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE harness_processes SET bootIdentity = 'prior-boot' WHERE launchId = ?1",
-        [
-          row.launch_id
-        ]
-      )
-
-    assert :ok = HarnessProcess.reconcile(ctx.db)
-
-    assert [%{state: "kill_failed", kill_sent_at: nil, last_error: last_error}] =
-             HarnessProcess.list(ctx.db)
-
-    assert last_error =~ "boot identity does not match"
-
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE harness_processes SET bootIdentity = ?2 WHERE launchId = ?1", [
-        row.launch_id,
-        row.boot_identity
-      ])
-  end
-
   test "planned close returns reconciliation failure and keeps the launch fenced", ctx do
     path = Path.join(ctx.test_dir, "planned-close-adapter.js")
     File.write!(path, @fake_adapter)
@@ -566,17 +542,18 @@ defmodule Tightbeam.HarnessProcessTest do
 
     [%{launch_id: launch_id}] = AdapterCoordinator.harness_processes(coordinator)
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE harness_processes SET bootIdentity = 'prior-boot' WHERE launchId = ?1",
-        [launch_id]
-      )
+    # A GENUINE cannot-identify (a corrupted identity file the signal helper
+    # refuses to act on). This test once faked the row's bootIdentity, but a
+    # recorded-boot mismatch is now proof of a reboot orphan and RESOLVES —
+    # reality cannot produce a row that disagrees with the file it was
+    # captured from.
+    identity_path = Path.join([ctx.test_dir, "harness-processes", launch_id <> ".identity"])
+    File.write!(identity_path, "not\tan\tidentity\n")
 
-    assert {:error,
-            {:kill_failed,
-             {:signal_refused, "harness boot identity does not match the current boot"}}} =
+    assert {:error, {:kill_failed, {:signal_refused, refusal}}} =
              AdapterCoordinator.close_adapter(coordinator, key)
+
+    assert refusal =~ "identity"
 
     assert [%{state: "kill_failed", resolved_at: nil}] =
              AdapterCoordinator.harness_processes(coordinator)
@@ -620,12 +597,15 @@ defmodule Tightbeam.HarnessProcessTest do
 
     [%{launch_id: launch_id}] = AdapterCoordinator.harness_processes(coordinator)
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE harness_processes SET bootIdentity = 'prior-boot' WHERE launchId = ?1",
-        [launch_id]
-      )
+    # A GENUINE cannot-identify: corrupt the identity file the signal helper
+    # verifies before it will authorize a kill. (This test once faked the
+    # row's bootIdentity instead — but a recorded-boot mismatch is now proof
+    # of a reboot orphan and RESOLVES; reality cannot produce a row whose
+    # boot disagrees with its own identity file, since capture copies one
+    # from the other.)
+    identity_path = Path.join([ctx.test_dir, "harness-processes", launch_id <> ".identity"])
+    File.write!(identity_path, "not	an	identity
+")
 
     Process.exit(adapter, :kill)
 
@@ -857,6 +837,50 @@ defmodule Tightbeam.HarnessProcessTest do
     assert Enum.any?(
              EventLog.lifecycle_events(ctx.db),
              &(&1.kind == "harness_launch_unlaunched" and &1.subject == "claude:shared@testhost")
+           )
+  end
+
+  # The reboot-orphan sibling (gibson, 2026-08-05, second occurrence of the
+  # class): a row whose identity file names a pid from a PREVIOUS OS BOOT.
+  # The signal helper rightly refuses to signal it (the pid may be reused),
+  # but a boot-identity mismatch is PROOF the process died with the machine —
+  # recording the refusal as kill_failed fenced the harness forever on the
+  # reboot meant to recover it. The current boot identity is read from the
+  # helper's own `boot-identity` subcommand: same code that recorded it.
+  test "a launch from a previous OS boot is resolved as a reboot orphan, not fenced", ctx do
+    key = {:claude, "shared", "testhost"}
+
+    HarnessProcess.prepare_launch(
+      [
+        cmd: [System.find_executable("false")],
+        stderr_path: Path.join(ctx.test_dir, "reboot-orphan.stderr"),
+        process_helper: @helper
+      ],
+      ctx.db,
+      key
+    )
+
+    assert [%{identity_path: identity_path, launch_id: launch_id}] =
+             HarnessProcess.list(ctx.db)
+
+    # The identity file exactly as the launcher writes it — pid, pgid, boot
+    # identity, launch id — but with a boot identity no running kernel has.
+    File.mkdir_p!(Path.dirname(identity_path))
+    File.write!(identity_path, "999999	999999	boot-that-ended	#{launch_id}
+")
+
+    assert :ok = HarnessProcess.reconcile(ctx.db)
+
+    assert [%{state: "exited", last_error: nil, resolved_at: resolved_at}] =
+             HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_launch_reboot_orphan" and
+                 &1.subject == "claude:shared@testhost")
            )
   end
 
