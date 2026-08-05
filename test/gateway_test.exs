@@ -5614,7 +5614,10 @@ defmodule Tightbeam.GatewayTest do
 
     publish.("failed")
 
-    frames = collect_pushes(9, [])
+    # Eight, not nine: the `agent_progress state=failed` label frame is gone —
+    # the indicator is now DERIVED from the ledger (one emitter, typing carries
+    # pending-or-not) instead of narrated per path (Flynn's rule, 2026-08-04).
+    frames = collect_pushes(8, [])
 
     refute Enum.any?(frames, fn frame ->
              frame["type"] == "message" and

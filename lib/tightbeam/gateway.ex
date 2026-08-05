@@ -1647,7 +1647,7 @@ defmodule Tightbeam.Gateway do
       echo = Projection.get(db, turn.message_id)
       correlation = (echo && echo.client_message_id) || turn.message_id
       publish_turn_state(db, turn.session_key, correlation, "running", nil)
-      broadcast(db, session.owner_user_id, Payloads.assistant_typing(turn.session_key, true))
+      publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
       broadcast(
         db,
@@ -1662,7 +1662,7 @@ defmodule Tightbeam.Gateway do
       terminal_publish = fn terminal ->
         state = if terminal == "delivered", do: "delivered", else: "failed"
         publish_turn_state(db, turn.session_key, correlation, state, nil)
-        broadcast(db, session.owner_user_id, Payloads.assistant_typing(turn.session_key, false))
+        publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
         broadcast(
           db,
@@ -1752,21 +1752,8 @@ defmodule Tightbeam.Gateway do
             current_model = session_model_display(Org.get(db, turn.session_key).model)
 
             failure_publish = fn _terminal ->
-              # No assistant final will arrive to clear the indicator label —
-              # clear it explicitly (client treats state "failed" as terminal).
-              broadcast(
-                db,
-                session.owner_user_id,
-                Payloads.agent_progress(turn.session_key, correlation, 1_000_000, "", "failed")
-              )
-
               publish_turn_state(db, turn.session_key, correlation, "failed", inspect(reason))
-
-              broadcast(
-                db,
-                session.owner_user_id,
-                Payloads.assistant_typing(turn.session_key, false)
-              )
+              publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
               broadcast(
                 db,
@@ -2002,7 +1989,7 @@ defmodule Tightbeam.Gateway do
       publish_turn_state(db, session_key, correlation, state, error)
 
       with %{} = session <- Org.get(db, session_key) do
-        broadcast(db, session.owner_user_id, Payloads.assistant_typing(session_key, false))
+        publish_session_indicator(db, session_key, session.owner_user_id)
 
         broadcast(
           db,
@@ -2050,7 +2037,7 @@ defmodule Tightbeam.Gateway do
         publish_turn_state(db, call.session_key, correlation, "canceled", nil)
 
         with %{} = session <- Org.get(db, call.session_key) do
-          broadcast(db, session.owner_user_id, Payloads.assistant_typing(call.session_key, false))
+          publish_session_indicator(db, call.session_key, session.owner_user_id)
 
           broadcast(
             db,
@@ -5928,6 +5915,36 @@ defmodule Tightbeam.Gateway do
           # watermark — see Wire.Socket moduledoc).
           fn pid, payload -> send(pid, {:push_message, session_key, seq, payload}) end
         )
+    end
+  end
+
+  # THE INDICATOR IS DERIVED, NEVER NARRATED (Flynn's rule, 2026-08-04: "once a
+  # message of any type is delivered and there are no more pending messages, that
+  # typing indicator should be cleared"). One deterministic fact decides it — does
+  # this session have a turn in 'queued' or 'running'? — read from the ledger, the
+  # single-writer table every transition already funnels through. Every emission
+  # recomputes from that truth; no site asserts its own opinion, so no site can
+  # disagree. This replaced three hand-emitted variants: typing-on at turn start,
+  # unconditional typing-off per terminal path, and an `agent_progress
+  # state=failed` label whose comment asserted "client treats state failed as
+  # terminal" — a claim about another system that did not hold (the label
+  # outlived a 58ms failure by many seconds on the second production touch).
+  defp publish_session_indicator(db, session_key, owner_user_id) do
+    broadcast(
+      db,
+      owner_user_id,
+      Payloads.assistant_typing(session_key, session_pending?(db, session_key))
+    )
+  end
+
+  defp session_pending?(db, session_key) do
+    case DB.query(
+           db,
+           "SELECT COUNT(*) FROM turns WHERE sessionKey = ?1 AND status IN ('queued','running')",
+           [session_key]
+         ) do
+      {:ok, [[n]]} -> n > 0
+      _ -> false
     end
   end
 
