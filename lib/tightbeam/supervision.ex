@@ -1,11 +1,25 @@
 defmodule Tightbeam.Supervision do
-  @moduledoc "The serialized, durable reaction executor for stalled assignments."
+  @moduledoc """
+  The serialized, durable reaction executor for stalled assignments.
+
+  This module hosts productions of a Newell PRODUCTION MACHINE (spec
+  production-machine-v1): recognize-act cycles over durable working memory —
+  assignments, the ledger, wakes, condition facts, and the productions' own
+  bookkeeping rows (`assignment_prods`, `supervision_watermarks`). Recognition
+  is declared: a production's complete left-hand side lives in one named
+  function (`prod_production_matches?/3`) reading durable state only. The
+  right-hand side stays procedural Elixir — half a production system done
+  honestly. The turn-end schedule (`@turn_end_schedule`) is the machine's
+  CONFLICT-RESOLUTION STRATEGY: several productions could fire when a turn
+  ends, so they hold a fixed priority order and the first act wins the cycle.
+  """
 
   use GenServer
 
   alias Tightbeam.{
     Assignments,
     CausalEvents,
+    ConditionFacts,
     DB,
     Dispatch,
     Escalation,
@@ -164,6 +178,7 @@ defmodule Tightbeam.Supervision do
           :busy
           | :continuation
           | :idle
+          | :blocked
           | :duplicate
           | :coalesced
           | {:prodded, pos_integer()}
@@ -182,6 +197,80 @@ defmodule Tightbeam.Supervision do
       {:cleared, _prior_result} ->
         evaluate_terminal(db, handlers, n, session_key, terminal_seq)
     end
+  end
+
+  @doc """
+  The prod production's COMPLETE left-hand side (spec production-machine-v1
+  §The prod production), declared in this one site and read from durable
+  state only — rows, never process state. Conjuncts, in evaluation order:
+
+    1. an open assignment obligation exists for the holder;
+    2. this terminal seq was not already evaluated — the
+       `supervision_watermarks` dedupe (`:terminal_already_evaluated`) — and
+       is not older than the one that was (`:terminal_coalesced`);
+    3. no running or queued turn for the holder: a pending turn means the
+       strand is moving;
+    4. the holder session is active, not retired;
+    5. no pending wake for the holder, ANY origin — a scheduled wake means
+       the strand is not stalled regardless of who scheduled it
+       (`Wakes.pending_count/2` is the ground truth for "pending" here);
+    6. a terminal exists at all — the sweep also asks about strands that
+       have never ended a turn;
+    7. no standing `work-blocked` fact for the holder: an agent with
+       authority decided this session is not to be treated as stalled, and
+       the production simply does not match — the same absence-of-match as
+       a session with no open assignment.
+
+  One conjunct of the spec's LHS is deliberately NOT a match condition,
+  because the ground never gated on it: an attest newer than the prod
+  cycle's watermark (`assignment_prods.attestCount`) does not unmatch the
+  production — `claim_and_act` absorbs it, advancing the watermark and
+  resetting the ladder in the same cycle, and the prod still fires.
+
+  A no-match verdict names the failing conjunct. Verdicts the turn-end
+  schedule must still see — the rail production outranks the prod ladder
+  and runs regardless — carry the obligation with them.
+  """
+  @spec prod_production_matches?(DB.server(), String.t(), integer() | nil) ::
+          {:match, map()} | {:no_match, atom()} | {:no_match, atom(), map()}
+  def prod_production_matches?(db, session_key, terminal_seq) do
+    case Assignments.oldest_open(db, session_key) do
+      nil ->
+        {:no_match, :no_open_obligation}
+
+      assignment ->
+        with :new <- dedupe(watermark(db, session_key), terminal_seq),
+             :quiet <- turn_gate(db, session_key),
+             :live <- holder_state(db, session_key),
+             :none <- wake_gate(db, session_key),
+             :evaluable <- terminal_gate(terminal_seq),
+             :unblocked <- block_gate(db, session_key) do
+          {:match, assignment}
+        else
+          :duplicate -> {:no_match, :terminal_already_evaluated}
+          :coalesced -> {:no_match, :terminal_coalesced}
+          :moving -> {:no_match, :strand_moving}
+          :retired -> {:no_match, :holder_retired}
+          :pending -> {:no_match, :pending_wake, assignment}
+          :no_terminal -> {:no_match, :no_terminal, assignment}
+          :blocked -> {:no_match, :work_blocked, assignment}
+        end
+    end
+  end
+
+  defp turn_gate(db, session_key),
+    do: if(Ledger.pending_count(db, session_key) == 0, do: :quiet, else: :moving)
+
+  defp wake_gate(db, session_key),
+    do: if(Wakes.pending_count(db, session_key) == 0, do: :none, else: :pending)
+
+  defp terminal_gate(nil), do: :no_terminal
+  defp terminal_gate(_terminal_seq), do: :evaluable
+
+  defp block_gate(db, session_key) do
+    if ConditionFacts.standing?(db, "work-blocked", session_key),
+      do: :blocked,
+      else: :unblocked
   end
 
   @impl true
@@ -235,45 +324,46 @@ defmodule Tightbeam.Supervision do
     {:noreply, state}
   end
 
+  # Recognize, then act: the production's complete LHS is evaluated once, at
+  # cycle start, and everything downstream — including the schedule's gates —
+  # consults that verdict rather than re-reading working memory mid-cycle.
   defp evaluate_terminal(db, handlers, n, session_key, terminal_seq) do
-    case Assignments.oldest_open(db, session_key) do
-      nil ->
+    case prod_production_matches?(db, session_key, terminal_seq) do
+      {:no_match, :no_open_obligation} ->
         :idle
 
-      assignment ->
-        with :new <- dedupe(watermark(db, session_key), terminal_seq),
-             0 <- Ledger.pending_count(db, session_key) do
-          case holder_state(db, session_key) do
-            :retired ->
-              # Act-then-watermark (matches the remedy branch): doorbells are an
-              # idempotent CAS, so a crash before the watermark re-rings them on
-              # redelivery. Watermark-first would lose them permanently (a retired
-              # session never re-terminals).
-              doorbells_for_holder(db, session_key)
-              write_watermark(db, session_key, terminal_seq)
-              :stranded
+      {:no_match, :terminal_already_evaluated} ->
+        :duplicate
 
-            :live ->
-              evaluate_live(db, handlers, n, session_key, terminal_seq, assignment)
-          end
-        else
-          :duplicate ->
-            :duplicate
+      {:no_match, :terminal_coalesced} ->
+        :coalesced
 
-          :coalesced ->
-            :coalesced
+      {:no_match, :strand_moving} ->
+        :busy
 
-          count when is_integer(count) and count > 0 ->
-            :busy
-        end
+      {:no_match, :holder_retired} ->
+        # Act-then-watermark (matches the remedy branch): doorbells are an
+        # idempotent CAS, so a crash before the watermark re-rings them on
+        # redelivery. Watermark-first would lose them permanently (a retired
+        # session never re-terminals).
+        doorbells_for_holder(db, session_key)
+        write_watermark(db, session_key, terminal_seq)
+        :stranded
+
+      verdict ->
+        evaluate_live(db, handlers, n, session_key, terminal_seq, verdict)
     end
   end
 
   # ── THE TURN-END SCHEDULE (supervision-impl r21) ──────────────────────────
   #
-  # This list IS the end-of-turn shift: every governance that acts when a
-  # turn ends holds exactly one named slot here, and the shift runs them in
-  # this order, first halt wins. The order is SEMANTIC, not incidental:
+  # This list IS the end-of-turn shift — and, named for what it is, the
+  # production machine's CONFLICT-RESOLUTION STRATEGY (spec
+  # production-machine-v1): the standard production-system answer to "several
+  # rules could fire" — a fixed priority order, first act wins the cycle.
+  # Every governance that acts when a turn ends holds exactly one named slot
+  # here, and the shift runs them in this order, first halt wins. The order
+  # is SEMANTIC, not incidental:
   #
   #   :rail_enforcement  — the org's statutes get the turn before the
   #                        substrate's own ladder does (Rules.decide → remedy /
@@ -313,14 +403,24 @@ defmodule Tightbeam.Supervision do
   @doc "The end-of-turn shift, in execution order. Pinned by test; amend both."
   def turn_end_schedule, do: @turn_end_schedule
 
-  defp evaluate_live(db, handlers, n, session_key, terminal_seq, assignment) do
+  defp evaluate_live(db, handlers, n, session_key, terminal_seq, verdict) do
+    # Every verdict that reaches the schedule still carries the obligation:
+    # the rail production outranks the prod ladder and needs it even when the
+    # prod production did not match.
+    assignment =
+      case verdict do
+        {:match, assignment} -> assignment
+        {:no_match, _conjunct, assignment} -> assignment
+      end
+
     ctx = %{
       db: db,
       handlers: handlers,
       n: n,
       session_key: session_key,
       terminal_seq: terminal_seq,
-      assignment: assignment
+      assignment: assignment,
+      verdict: verdict
     }
 
     run_schedule(@turn_end_schedule, ctx)
@@ -343,24 +443,34 @@ defmodule Tightbeam.Supervision do
   end
 
   defp turn_end_step(:pending_wake_gate, ctx) do
-    if Wakes.pending_count(ctx.db, ctx.session_key) == 0,
-      do: :cont,
-      else: {:halt, :continuation}
+    case ctx.verdict do
+      {:no_match, :pending_wake, _assignment} -> {:halt, :continuation}
+      _verdict -> :cont
+    end
   end
 
   defp turn_end_step(:prod_ladder, ctx) do
-    if is_nil(ctx.terminal_seq) do
-      {:halt, :idle}
-    else
-      {:halt,
-       claim_and_act(
-         ctx.db,
-         ctx.handlers,
-         ctx.n,
-         ctx.session_key,
-         ctx.terminal_seq,
-         ctx.assignment
-       )}
+    case ctx.verdict do
+      {:no_match, :no_terminal, _assignment} ->
+        {:halt, :idle}
+
+      {:no_match, :work_blocked, _assignment} ->
+        # Not suppression bolted onto the prodder: the production does not
+        # match, so nothing is claimed and nothing is watermarked — the
+        # obligation stands, and retraction re-matches this same terminal
+        # (spec production-machine-v1).
+        {:halt, :blocked}
+
+      {:match, assignment} ->
+        {:halt,
+         claim_and_act(
+           ctx.db,
+           ctx.handlers,
+           ctx.n,
+           ctx.session_key,
+           ctx.terminal_seq,
+           assignment
+         )}
     end
   end
 
@@ -716,7 +826,24 @@ defmodule Tightbeam.Supervision do
     {:cleared, :terminus}
   end
 
+  # "Recognition happens at act time or it is not recognition." (spec
+  # production-machine-v1 §The prod production) The prodder is two-phase —
+  # the claim records a durable pending branch, and this drain dispatches it,
+  # possibly sweeps or a restart later — so the branch re-reads the standing
+  # work-blocked fact it was matched without and DISCARDS itself if the
+  # holder is now blocked. Nothing is lost: the obligation still stands in
+  # working memory, and the production re-matches from current state after
+  # retraction.
   defp dispatch_wake(db, handlers, pending, assignment, target) do
+    if ConditionFacts.standing?(db, "work-blocked", pending.sessionKey) do
+      clear_pending(db, pending)
+      {:cleared, nil}
+    else
+      deliver_wake(db, handlers, pending, assignment, target)
+    end
+  end
+
+  defp deliver_wake(db, handlers, pending, assignment, target) do
     prompt =
       case pending.pendingBranch do
         "prod" ->
