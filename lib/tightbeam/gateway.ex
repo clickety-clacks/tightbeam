@@ -516,6 +516,24 @@ defmodule Tightbeam.Gateway do
 
     cond do
       Enum.any?(results, fn {_harness, result} -> match?({:ok, _}, result) end) ->
+        # REPORT THE ONES THAT FAILED, even though another succeeded. This used
+        # to return :ok the moment ANY harness probed, discarding the rest — so
+        # a codex installed as a `.js` with a `#!/usr/bin/env node` shebang, on a
+        # box where node is not on the default PATH, was INSTALLED and
+        # UNRUNNABLE and boot said nothing. The org then reported it as merely
+        # un-onboarded, and the truth surfaced during OAuth as
+        # `{:provider_runtime_start_failed, %{failed: [%{reason: :degraded}]}}`
+        # — a credential written to disk and a verification that could never
+        # pass (Flynn, gibson, 2026-08-04). Present and runnable are two
+        # different facts; probing both and reporting one is the house defect.
+        for {harness, {:error, reason}} <- results do
+          Logger.warning(
+            "harness #{harness} is installed but CANNOT RUN: " <>
+              describe_probe_failure(reason) <>
+              " — no session will be placed on it until this is fixed."
+          )
+        end
+
         {:ok, for({harness, {:ok, _}} <- results, do: harness)}
 
       Enum.all?(results, fn {_harness, result} -> result == {:error, :not_found} end) ->
@@ -542,6 +560,13 @@ defmodule Tightbeam.Gateway do
         raise "no usable harness CLI is installed (#{detail}). Install a registered harness CLI and ensure it is on PATH."
     end
   end
+
+  defp describe_probe_failure(:not_found), do: "its CLI is not on PATH"
+
+  defp describe_probe_failure({:exec_failed, detail}),
+    do: "its CLI is on PATH but failed to execute (#{String.trim(detail)})"
+
+  defp describe_probe_failure(other), do: inspect(other)
 
   @doc "The immutable verb-handler table (see moduledoc list) — built once, passed to Dispatch."
   @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
