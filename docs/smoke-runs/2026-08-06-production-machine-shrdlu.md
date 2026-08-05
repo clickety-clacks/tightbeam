@@ -28,3 +28,11 @@ Seam note from run 1: through the CONDITION VERB a process:tightbeam origin
 dies at the authority check (not_authorized) before reaching ConditionFacts'
 agent_only_kind refusal — two doors, both closed, different codes. The smoke
 tests each seam at its own door.
+
+## Re-run after review revision (7ecf02a)
+
+Opus 5 code review returned REVISE (3 blocking, 3 medium, 8 nits — all
+addressed; see the revision commit). Re-gated on shrdlu: suite 1297/0, smoke
+7/7 PASS. This run exercises the revised architecture live: recognition rides
+the BubbleSweeper's cast edge and durable cursor — the wiring whose absence
+from coverage was blocking finding B1 — not hand-called recognition.
