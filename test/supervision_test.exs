@@ -4,6 +4,7 @@ defmodule Tightbeam.SupervisionTest do
 
   alias Tightbeam.{
     Assignments,
+    ConditionFacts,
     ConnRegistry,
     DB,
     EventLog,
@@ -1303,6 +1304,65 @@ defmodule Tightbeam.SupervisionTest do
     end
   end
 
+  # spec production-machine-v1 §The prod production: work-blocked is not
+  # suppression bolted onto the prodder — the production does not match, the
+  # same absence-of-match as a session with no open assignment.
+  test "a standing work-blocked fact unmatches the prod production until it is retracted", ctx do
+    file_fact(ctx.db, "work-blocked", "holder")
+
+    # The queue is never gated by the standing fact: the blocked holder's
+    # turn is accepted, claimed, and finished as ever — a parent that orders
+    # a retry must be able to land one.
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:no_match, :work_blocked, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    assert :blocked = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert Wakes.list_pending(ctx.db) == []
+    # Nothing was claimed and nothing watermarked: retraction re-matches this
+    # very terminal from current state.
+    assert Supervision.watermark(ctx.db, "holder") == nil
+
+    file_fact(ctx.db, "work-unblocked", "holder")
+
+    assert {:match, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+  end
+
+  # Recognition happens at act time or it is not recognition: the claim and
+  # the dispatch are two phases, and a fact filed between them must still be
+  # seen by the drain.
+  test "a pending branch claimed before work-blocked is discarded at drain, not dispatched",
+       ctx do
+    transient = Map.put(ctx.handlers, "wake", fn _ -> %{code: "server_error"} end)
+    seq = terminal!(ctx.db, "holder")
+    assert {:refused, "server_error"} = Supervision.evaluate(ctx.db, transient, 3, "holder", seq)
+    assert %{pendingBranch: "prod"} = Supervision.watermark(ctx.db, "holder")
+
+    file_fact(ctx.db, "work-blocked", "holder")
+
+    # The drain re-reads the standing fact and clears the branch without
+    # dispatching. The claim already advanced the dedupe watermark, so this
+    # terminal reads duplicate afterwards.
+    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert %{pendingBranch: nil} = Supervision.watermark(ctx.db, "holder")
+    assert Wakes.list_pending(ctx.db) == []
+    assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
+
+    file_fact(ctx.db, "work-unblocked", "holder")
+    seq2 = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq2)
+  end
+
+  test "work-blocked standing on another session leaves this holder's prods matching", ctx do
+    file_fact(ctx.db, "work-blocked", "supervisor")
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+  end
+
   defp terminal!(db, session_key) do
     message_id = "m_#{System.unique_integer([:positive])}"
 
@@ -1401,6 +1461,19 @@ defmodule Tightbeam.SupervisionTest do
     File.mkdir_p!(rules_dir)
     File.write!(Path.join(rules_dir, "turn-end.toml"), contents)
     Rules.load!(ctx.base, Map.keys(ctx.handlers))
+  end
+
+  # Agent origin on purpose: work-blocked is an agent-only kind, and
+  # ConditionFacts refuses it from process:tightbeam — the substrate never
+  # decides a session is blocked (spec production-machine-v1 §Standing facts).
+  defp file_fact(db, kind, scope) do
+    {:ok, %{fact_id: _}} =
+      DB.transaction(
+        db,
+        &ConditionFacts.file_in_txn(&1, %{kind: kind, scope: scope, origin: "session:supervisor"})
+      )
+
+    :ok
   end
 
   defp rail_sweep_details(db, session_key) do
