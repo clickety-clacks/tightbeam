@@ -615,20 +615,36 @@ defmodule Tightbeam.Gateway do
       "condition" => fn call ->
         p = call.params
 
-        if is_binary(p[:kind]) and p.kind != "" do
-          scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+        cond do
+          not (is_binary(p[:kind]) and p.kind != "") ->
+            %{code: "invalid", message: "a condition fact requires a kind"}
 
-          case ConditionFacts.file_idempotent(db, scheduler, %{
-                 kind: p.kind,
-                 scope: p[:scope],
-                 origin: call.origin,
-                 idempotency_key: p[:idempotency_key]
-               }) do
-            {:error, error} -> error
-            fact -> fact
-          end
-        else
-          %{code: "invalid", message: "a condition fact requires a kind"}
+          # `work-blocked`/`work-unblocked` assert an authority's judgment
+          # over a session (spec production-machine-v1 §Standing facts): the
+          # scope must be a session, and the caller must sit ABOVE it in the
+          # spawnedBy lineage, or be its owner (user or admin). ConditionFacts
+          # itself refuses the substrate; this seam refuses the unauthorized.
+          p.kind in ~w(work-blocked work-unblocked) and
+              not work_block_authority?(db, call, p[:scope]) ->
+            %{
+              code: "not_authorized",
+              message:
+                "#{p.kind} may only be asserted by the scope session's lineage " <>
+                  "above it or its owner, over an existing session scope"
+            }
+
+          true ->
+            scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+
+            case ConditionFacts.file_idempotent(db, scheduler, %{
+                   kind: p.kind,
+                   scope: p[:scope],
+                   origin: call.origin,
+                   idempotency_key: p[:idempotency_key]
+                 }) do
+              {:error, error} -> error
+              fact -> fact
+            end
         end
       end,
       "facts-read" => fn call -> facts_read_result(db, call) end,
@@ -2865,6 +2881,43 @@ defmodule Tightbeam.Gateway do
   end
 
   defp resolve_caller(_db, _origin), do: nil
+
+  # Authority for asserting `work-blocked`/`work-unblocked` over a session
+  # (spec production-machine-v1 §Standing facts): the scope names an existing
+  # session, and the caller is above it in the spawnedBy lineage, or is the
+  # scope session's owner (as a user principal), or is an admin. A session
+  # asserting over ITSELF is refused — the judgment "stop treating this
+  # session as stalled" belongs to whoever supervises it, not to it.
+  defp work_block_authority?(db, call, scope) do
+    with true <- is_binary(scope) and scope != "",
+         %{owner_user_id: owner} <- Org.get(db, scope) do
+      case call[:principal] do
+        {:user, user_id} ->
+          user_id == owner or match?(%{is_admin: true}, Devices.user(db, user_id))
+
+        {:session, caller_key} ->
+          caller_key != scope and caller_in_lineage_above?(db, scope, caller_key)
+
+        _ ->
+          false
+      end
+    else
+      _ -> false
+    end
+  end
+
+  defp caller_in_lineage_above?(db, scope, caller_key, hops \\ 0)
+  defp caller_in_lineage_above?(_db, _scope, _caller_key, hops) when hops > 32, do: false
+
+  defp caller_in_lineage_above?(db, scope, caller_key, hops) do
+    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [scope]) do
+      {:ok, [[parent]]} when is_binary(parent) ->
+        parent == caller_key or caller_in_lineage_above?(db, parent, caller_key, hops + 1)
+
+      _ ->
+        false
+    end
+  end
 
   defp admin_origin?(db, origin) do
     case resolve_caller(db, origin) do
