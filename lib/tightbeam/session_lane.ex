@@ -247,23 +247,23 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp finalize(state, seq, outcome) do
-    {terminal, error, publish, in_txn, post_commit} =
+    {terminal, error, publish, in_txn} =
       case outcome do
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
-          {"delivered", nil, fun, nil, nil}
+          {"delivered", nil, fun, nil}
 
         {:ok, _} ->
-          {"delivered", nil, nil, nil, nil}
+          {"delivered", nil, nil, nil}
 
-        {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action} = attrs}
+        {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"failed", error_text(reason), fun, action, Map.get(attrs, :post_commit)}
+          {"failed", error_text(reason), fun, action}
 
         {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
-          {"failed", error_text(reason), fun, nil, nil}
+          {"failed", error_text(reason), fun, nil}
 
         {:error, reason} ->
-          {"failed", error_text(reason), nil, nil, nil}
+          {"failed", error_text(reason), nil, nil}
       end
 
     finish_result =
@@ -285,8 +285,6 @@ defmodule Tightbeam.SessionLane do
 
     case finish_result do
       :ok ->
-        if is_function(post_commit, 0), do: post_commit.()
-
         if publish do
           publish.(terminal)
         else
