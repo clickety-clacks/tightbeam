@@ -118,6 +118,22 @@ defmodule Tightbeam.Application do
     # Waiting for a refresh already running is not a new probe, and boot does not
     # wait for us: start/2 has already returned.
     Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+      # THE GATEWAY INSTALLS ITS OWN ADAPTERS, before it judges readiness.
+      #
+      # This used to be deferred to "the next session spawn", which on a fresh
+      # org is a moment that never arrives: you cannot spawn until you have
+      # onboarded, onboarding VERIFIES by starting a runtime, and that runtime
+      # needs the adapter only a spawn would have installed. Circular, and every
+      # fresh install hit it — gibson twice, on both providers, surfacing as
+      # `harness command could not be executed: No such file or directory`
+      # (Flynn, 2026-08-04). Boot printed the npm command as a "manual
+      # fallback"; the only change is that we run it instead of describing it.
+      #
+      # In the readiness task, not inline: a cold npm install is minutes and boot
+      # must not block on the network. Failures log and never stop the gateway —
+      # one that serves beats one that refuses to start, and readiness already
+      # names a missing adapter.
+      Tightbeam.Gateway.install_local_adapters(config)
       Tightbeam.Readiness.await_settled()
 
       config

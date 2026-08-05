@@ -568,6 +568,33 @@ defmodule Tightbeam.Gateway do
 
   defp describe_probe_failure(other), do: inspect(other)
 
+  @doc """
+  Install the pinned ACP adapters for every registered harness on the local host.
+
+  Called from the readiness task at boot (see application.ex for why this is not
+  deferred to a session spawn). Never raises: a provisioning failure is logged and
+  reported by the readiness summary, not fatal.
+  """
+  @spec install_local_adapters(config()) :: :ok
+  def install_local_adapters(config) do
+    local = Placement.local_host_name()
+
+    for module <- Harness.all() do
+      case Tightbeam.Spinup.ensure_ready(config, module.id(), local, db: gateway_db(config)) do
+        :ok ->
+          :ok
+
+        {:error, denial} ->
+          Logger.warning(
+            "adapter provisioning for #{module.wire_name()} on #{local} did not complete: " <>
+              denial.message
+          )
+      end
+    end
+
+    :ok
+  end
+
   @doc "The immutable verb-handler table (see moduledoc list) — built once, passed to Dispatch."
   @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
   def handlers(config) do
