@@ -56,3 +56,18 @@ sweeper's cursor — review B1's boot path, run for real. 10/10 on eezo and
 shrdlu. Step 41 (credentialed leg: a parent actually RUNS its notice turn
 and acts on model-policy guidance) is WAIVED by name on both hosts: no
 onboarded harness.
+
+## Step 41 — the credentialed leg, CLOSED on eezo (main at ceea0b9)
+
+Onboarded anthropic via the real CLI (`onboard anthropic --api-key`, key on
+stdin from ~/tb-test-keys, ephemeral: base dir and banked copy deleted after
+the run). Parent session on claude with the live credential; child on codex
+with none. The child's turn failed for real; the bubble's notice reached the
+parent; a LIVE claude ran the notice turn to `delivered`; the climb ended;
+no alert filed. The parent's actual behavior closed the loop the rulings
+describe: it read the failure, attempted `onboard openai` itself, hit the
+interactive-OAuth wall, and escalated exactly that to Flynn — model-policy
+move 3, chosen by inference. Step 41: PASS on eezo. (Still waived on
+shrdlu: no key there, and one credentialed pass proves the leg.)
+
+§11 scorecard: 34-40 PASS on eezo+shrdlu; 41 PASS on eezo, WAIVED(shrdlu).
