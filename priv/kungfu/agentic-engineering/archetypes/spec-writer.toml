@@ -10,6 +10,8 @@ text = """
 
 #include "engineering-tenets.md"
 
+#include "subtraction.md"
+
 #include "preferred-models.md"
 
 #include "model-policy.md"

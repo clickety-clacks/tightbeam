@@ -45,3 +45,44 @@ target_role = "recon"
 subject = "diagnosis of prior fix for work item {work_item_id}"
 reviews = "{assignment_id}"
 work_item = "{work_item_id}"
+
+# Spec-backed work is a slice of product: before its implementation
+# dispatches, the product owner has rendered a spirit verdict on the spec.
+# The rail checks that the verdict EXISTS; what it says — and who arranges
+# the review — is entirely inference's (substrate records, inference acts).
+# A DENY rather than an auto-summoning remedy, deliberately: the remedy
+# engine anchors on an existing assignment, and a spec item's FIRST dispatch
+# has none — and per the subtraction doctrine, teaching the engine a new
+# anchor loses to naming the missing paper and letting a mind fetch it.
+# Born from the adjudication postmortem: an 11-round spec pipeline ran
+# spec->review->implementation with no product-owner edge to cross.
+[[rule]]
+name = "spec-dispatch-requires-spirit"
+verb = "dispatch"
+text = "spec-backed work needs a product-owner spirit verdict first: assign your product-owner a spirit review of this work item; a spirit-approved verdict releases this dispatch"
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "work_item.has_spec_ref", op = "eq", value = true },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["spirit-approved"] },
+]
+
+# STAGED, NOT ARMED — the review-rounds doorbell. Goal (Flynn, 2026-08-05):
+# at round four (recent norm is 1-2; the old process ran 4-10; grace built
+# in), SHINE LIGHT on a review that may be spinning by summoning the product
+# owner — while limiting nothing. The rails grammar has no non-blocking
+# effect today (deny/remedy/escalate all gate the verb), and a doorbell that
+# blocks IS the artificial limit the ruling forbids. Armed the day the
+# grammar grows a `notice` effect (record + summon + allow); the fact it
+# needs (assignment.review_verdict_count) ships now.
+#
+# [[rule]]
+# name = "review-rounds-doorbell"
+# verb = "attest"
+# text = "four or more review rounds on one assignment — the product owner should look"
+# effect = "notice"
+# deny_when = [
+#   { fact = "attest.kind", op = "eq", value = "verdict" },
+#   { fact = "assignment.review_verdict_count", op = "gte", value = 4 },
+# ]

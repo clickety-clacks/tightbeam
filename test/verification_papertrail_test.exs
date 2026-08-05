@@ -328,6 +328,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     assert Enum.map(loaded, & &1.name) == [
              "completion-requires-review",
              "refix-requires-diagnosis",
+             "spec-dispatch-requires-spirit",
              @verification_rule,
              @artifact_rule
            ]

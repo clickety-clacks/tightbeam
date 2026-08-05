@@ -75,6 +75,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     assert Enum.map(ctx.rules, & &1.name) == [
              "completion-requires-review",
              "refix-requires-diagnosis",
+             "spec-dispatch-requires-spirit",
              "completion-requires-verification",
              "completion-requires-results-artifact"
            ]

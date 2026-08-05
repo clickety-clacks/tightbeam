@@ -93,6 +93,7 @@ defmodule Tightbeam.Rules do
     assignment.independent_verdict_kinds
     assignment.cross_harness_verdict_kinds
     assignment.cross_provider_verdict_kinds
+    work_item.verdict_kinds
   )
   @independence_facts ~w(
     assignment.independent_verdict_kinds
@@ -121,6 +122,9 @@ defmodule Tightbeam.Rules do
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
     "work_item.is_bug" => :bool,
+    "work_item.has_spec_ref" => :bool,
+    "work_item.verdict_kinds" => {:list, :string},
+    "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
     "assign.declared_files_overlap_open" => :bool
   }
@@ -1154,6 +1158,89 @@ defmodule Tightbeam.Rules do
           end
 
         {value, cache}
+    end)
+  end
+
+  # Whether the call's work item pins a spec (specRefName). Neutral truth for
+  # the spirit-gate statute: spec-backed work is a slice of product, and the
+  # law can require a product-owner spirit verdict before its implementation
+  # dispatches. The substrate answers has-a-spec; the PO judges the spec.
+  defp compute_fact("work_item.has_spec_ref", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        {:ok, rows} =
+          DB.query(db, "SELECT specRefName IS NOT NULL FROM work_items WHERE id = ?1", [
+            work_item_id
+          ])
+
+        case rows do
+          [[flag]] -> {flag == 1, cache}
+          [] -> {nil, cache}
+        end
+    end)
+  end
+
+  # Verdict kinds across EVERY assignment of the call's work item — the
+  # item-scoped sibling of assignment.verdict_kinds, because on a FIRST
+  # dispatch no assignment exists to project and an assignment-scoped fact is
+  # nil, which can never satisfy a conjunct: a gate meant to fire before the
+  # first implementation must read the item. Empty list (never nil) once the
+  # item is known: "no verdicts yet" is an answer, not an absence.
+  defp compute_fact("work_item.verdict_kinds", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        {:ok, rows} =
+          DB.query(
+            db,
+            """
+            SELECT DISTINCT a.verdictKind
+              FROM attests AS a
+              JOIN assignments AS s ON s.id = a.assignmentId
+             WHERE s.workItemId = ?1 AND a.kind = 'verdict'
+             ORDER BY a.verdictKind
+            """,
+            [work_item_id]
+          )
+
+        {Enum.map(rows, &hd/1), cache}
+    end)
+  end
+
+  # How many review-verdict attests have landed on this assignment's REVIEW
+  # SUBJECT — the round counter. Anchored on COALESCE(reviewsAssignmentId, id)
+  # so the answer is the same whether the call's assignment IS a review (an
+  # attest landing on round N sees rounds 1..N-1 as its siblings) or is the
+  # reviewed subject itself. Total attests, NOT distinct kinds: five
+  # changes-requested verdicts are five rounds, and collapsing them would hide
+  # exactly the spin the round-count doorbell exists to light up.
+  defp compute_fact("assignment.review_verdict_count", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {:ok, [[count]]} =
+          DB.query(
+            db,
+            """
+            SELECT COUNT(*) FROM attests
+             WHERE kind = 'verdict'
+               AND assignmentId IN
+                   (SELECT id FROM assignments
+                     WHERE reviewsAssignmentId =
+                           (SELECT COALESCE(reviewsAssignmentId, id)
+                              FROM assignments WHERE id = ?1))
+            """,
+            [assignment.id]
+          )
+
+        {count, cache}
     end)
   end
 

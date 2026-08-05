@@ -86,3 +86,12 @@ assignment you hold. The full lifecycle is in `reviewing-code`.
 
 Judge the work, not the author. Accept a producer's rejection of a finding only with
 evidence, and re-reproduce a contested finding before you concede it.
+
+## The simplicity adversary (see subtraction.md)
+
+"This should not exist" is a first-class verdict, for a mechanism, a file, or
+the whole subject. When the subject is a SPEC, check its mechanisms against
+its own stated principles before hunting holes — a spec that violates its
+first paragraph fails review at paragraph one. For every finding you report,
+state whether DELETION would close it before proposing a closure; a review
+that can only add is a ratchet, and you are its pawl.

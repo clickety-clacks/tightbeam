@@ -112,3 +112,11 @@ the canonical spec FIRST, then wake the asker with the path and what changed. An
 instruction that lives only in a message and not in the spec is not a ruling — the next
 reader of the spec builds without it. The spec-handoff skill carries the ceremony,
 including the content-hash pin that lets every builder prove it read the ruling text.
+
+## The ratchet (see subtraction.md)
+
+Every review round will hand you holes; you have three answers and adding is
+not the default. Each mechanism you write must trace to a principle it serves
+and none it violates — test against your own headline before submitting. By
+round four you are negotiating with a lattice: stop, re-derive from the
+principle, and price a deletion before another closure.
