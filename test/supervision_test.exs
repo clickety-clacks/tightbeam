@@ -298,7 +298,7 @@ defmodule Tightbeam.SupervisionTest do
                  Gateway.deliver_prompt(
                    ctx.main.session_key,
                    "process:tightbeam",
-                   "Model adjudication required.",
+                   "a notice with no deliverable holder",
                    db: ctx.db,
                    sender: "process:tightbeam",
                    target_gate: gate
@@ -365,29 +365,6 @@ defmodule Tightbeam.SupervisionTest do
       end)
 
     assert Enum.map(stranded, & &1.id) == ["asg_1"]
-  end
-
-  test "an open model adjudication episode holds before rails and prod", ctx do
-    seq = terminal!(ctx.db, "holder")
-    now = System.system_time(:millisecond)
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        """
-        INSERT INTO adjudication_episodes
-          (sessionKey, condition, status, correlationKey, deadlineAt, openedAt)
-        VALUES ('holder', 'quota_exhausted', 'claimed', 'adj_hold', ?1, ?2)
-        """,
-        [now + 60_000, now]
-      )
-
-    assert {:held, :adjudication_hold} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
-
-    assert %{lastEvaluatedTerminal: ^seq} = Supervision.watermark(ctx.db, "holder")
-    assert Wakes.list_pending(ctx.db) == []
-    assert rail_sweep_details(ctx.db, "holder") == []
   end
 
   test "turn-end remedy acts once through the episode claim and records run-remedy", ctx do
@@ -1522,13 +1499,12 @@ defmodule Tightbeam.SupervisionTest do
   # schedule in Supervision.@turn_end_schedule may only change together with
   # (1) this literal, (2) the termination argument in supervision-impl-v1
   # §r21, and (3) a semantic justification for the new position — order is
-  # meaning here (hold freezes enforcement; statutes outrank the ladder; a
-  # pending wake silences everything downstream). If this test surprised you
+  # meaning here (statutes outrank the ladder; a pending wake silences
+  # everything downstream). If this test surprised you
   # red, you changed the shift without signing the lease — go read the
   # schedule comment in supervision.ex.
   test "the turn-end schedule is exactly the r21 shift, in order" do
     assert Tightbeam.Supervision.turn_end_schedule() == [
-             :adjudication_hold,
              :rail_enforcement,
              :pending_wake_gate,
              :prod_ladder

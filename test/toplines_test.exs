@@ -47,7 +47,7 @@ defmodule Tightbeam.ToplinesTest do
   # telemetry builder reddens proof 2 rather than sliding in unreviewed.
   @node_keys Enum.sort(
                ~w(active assignments attests bracket1_armed closing_attests creation_context
-                  fail_reason fan_out finished_at holds id jobs minds open_decision_requests
+                  fail_reason fan_out finished_at id jobs minds open_decision_requests
                   origin parent since_progress_ms spec_ref_name spec_ref_sha256 started_at
                   state title turns)a
              )
@@ -570,24 +570,11 @@ defmodule Tightbeam.ToplinesTest do
     assignment!(ctx.db, "asg_stale", work_item_id: "wi_stale", holder: "s_stale")
     close!(ctx.db, "asg_stale", "revoked", nil)
     wake!(ctx.db, "wk_stale_prompt", "s_stale", state: "pending")
-    episode!(ctx.db, "s_stale", "auth_failed", episode_id: "ep_stale", status: "notified")
 
     stale = node(roster(ctx), "wi_stale")
     assert stale.active.pending_session_wake == false, "a stale ex-holder is not a current holder"
-    assert stale.holds == []
     assert stale.jobs == 1, "the ever-held history still counts it"
     assert "wi_stale" in ids(roster(ctx, %{quiet_over: bound}))
-
-    # A CURRENT open holder's hold does appear, carried by the durable episode row.
-    episode!(ctx.db, "s_nudged", "boot_failed",
-      episode_id: "ep_live",
-      cause: "adapter_fault",
-      status: "claimed"
-    )
-
-    assert node(roster(ctx), "wi_pending").holds == [
-             %{episodeId: "ep_live", cause: "adapter_fault", sessionKey: "s_nudged"}
-           ]
   end
 
   ## Proof 10 — coverage: absence before the cutoff is unknown, never zero
@@ -955,7 +942,6 @@ defmodule Tightbeam.ToplinesTest do
       assignment!(db, "asg_theirs", work_item_id: "wi_theirs", holder: "s_theirs")
       attest!(db, "att_theirs", "asg_theirs", by_session: "s_theirs", ts: 3_500_000)
       wake!(db, "wk_theirs", "s_theirs", state: "pending", work_item_id: "wi_theirs")
-      episode!(db, "s_theirs", "auth_failed", episode_id: "ep_theirs", status: "claimed")
       marker!(db, "s_theirs", "sub_theirs", assignment_id: "asg_theirs")
       # A turn ATTRIBUTED to the invisible item and its assignment.
       turn!(db, 202, "s_theirs",
@@ -1133,29 +1119,6 @@ defmodule Tightbeam.ToplinesTest do
       )
 
     wake_id
-  end
-
-  defp episode!(db, session_key, condition, opts) do
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO adjudication_episodes
-          (sessionKey, condition, status, correlationKey, deadlineAt, openedAt, episodeId, cause)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
-        """,
-        [
-          session_key,
-          condition,
-          Keyword.get(opts, :status, "claimed"),
-          "corr_#{session_key}_#{condition}",
-          @default_created,
-          Keyword.get(opts, :episode_id),
-          Keyword.get(opts, :cause)
-        ]
-      )
-
-    :ok
   end
 
   defp marker!(db, principal, subagent_ref, opts) do

@@ -39,7 +39,6 @@ defmodule Tightbeam.GatewayTest do
   @archetype_reference_writers [
     {:main_session_seed, "lib/tightbeam/wire/socket.ex", "Org.create_in_txn"},
     {:typed_spawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
-    {:adjudication_respawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
     {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_in_txn"},
     {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
   ]
@@ -47,7 +46,6 @@ defmodule Tightbeam.GatewayTest do
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
-    Adjudication,
     Archetypes,
     Artifacts,
     Assignments,
@@ -1016,7 +1014,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   # Both spellings of the routability question reach the running catalog: the
-  # fleet one that adjudication asks, and the per-harness one that validation and
+  # fleet one that the catalog asks, and the per-harness one that validation and
   # boot ask. Written against the DEFAULT server, because that is the whole
   # difference between them and a spelling that raises instead of routing is not
   # an API at all.
@@ -4399,233 +4397,6 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k1").host == "testhost"
   end
 
-  test "effort request survives park/swap and respawn supersedes then re-arms", ctx do
-    parent =
-      Org.create(ctx.db, %{
-        session_key: "effort-parent",
-        display_name: "Effort parent",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
-
-    :ok =
-      DB.execute(
-        ctx.db,
-        "UPDATE sessions SET spawnedBy='effort-parent' WHERE sessionKey='k1'"
-      )
-
-    base_dir = role_test_base("effort-adjudication")
-    Archetypes.load!(base_dir)
-
-    config =
-      gateway_config(base_dir, ctx.db, 0)
-      # Injected at the SHELL: the real observation command is built, run and
-      # parsed; only what a filesystem would have said is supplied.
-      |> Map.put(:sh, fn _invocation -> {"B\tobserved\t0\n/w\n", 0} end)
-
-    item =
-      Assignments.__handle__(ctx.db, "dispatch", %{
-        verb: "dispatch",
-        origin: "agent:effort-parent",
-        principal: {:session, "effort-parent"},
-        session_key: "k1",
-        target_role: nil,
-        role_fallback: false,
-        params: %{subject: "adjudication motion", brief: "adjudication motion"},
-        effort_config: config
-      })
-
-    {:ok, [[probe_wake_id]]} =
-      DB.query(
-        ctx.db,
-        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-        [item.id]
-      )
-
-    # Rung one prods the holder; the owner's request is rung two.
-    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, probe_wake_id))
-
-    {:ok, [[second_probe_wake_id]]} =
-      DB.query(
-        ctx.db,
-        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-        [item.id]
-      )
-
-    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, second_probe_wake_id))
-
-    {:ok, [[request_id]]} =
-      DB.query(
-        ctx.db,
-        "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1 AND status='open'",
-        [item.id]
-      )
-
-    {:appended, failed_message} =
-      Projection.append(ctx.db, %{
-        session_key: "k1",
-        role: "user",
-        content: "failed prompt",
-        sender: "user:flynn"
-      })
-
-    {:ok, failed_seq} =
-      Ledger.enqueue(ctx.db, %{
-        session_key: "k1",
-        message_id: failed_message.id,
-        origin: "user:flynn",
-        prompt: "failed prompt"
-      })
-
-    :ok = DB.execute(ctx.db, "UPDATE turns SET status='running' WHERE seq=#{failed_seq}")
-    :ok = Ledger.finish(ctx.db, failed_seq, "failed", "quota")
-
-    handlers = Gateway.handlers(config)
-
-    for {action, model} <- [{"park", nil}, {"swap", "claude-sonnet-4-6"}] do
-      episode = notify_adjudication(ctx.db, "k1", parent.session_key)
-
-      call = %{
-        origin: "agent:effort-parent",
-        principal: {:session, parent.session_key},
-        session_key: "k1",
-        params: %{episode: episode.correlation_key, action: action, model: model}
-      }
-
-      if action == "swap" do
-        assert %{code: "adapter_unavailable"} = handlers["adjudicate"].(call)
-
-        assert {:ok, true} =
-                 DB.transaction(ctx.db, fn txn ->
-                   current = Adjudication.get_in_txn(txn, "k1", "other")
-                   Adjudication.resolve_in_txn(txn, current)
-                 end)
-      else
-        assert %{ok: true, action: "park"} = handlers["adjudicate"].(call)
-      end
-
-      assert {:ok, [[^request_id, "open"]]} =
-               DB.query(ctx.db, "SELECT id,status FROM decision_requests WHERE id=?1", [
-                 request_id
-               ])
-    end
-
-    assert %{status: "ruled", decision: "dismiss"} =
-             EffortCheckin.rule(ctx.db, config, %{
-               origin: "agent:effort-parent",
-               principal: {:session, parent.session_key},
-               params: %{request_id: request_id, action: "dismiss"}
-             })
-
-    assert {:ok, [[ruleable_probe_wake]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-               [item.id]
-             )
-
-    # A dismissal re-arms a FRESH bracket, so the agent is prodded once more
-    # before its owner is asked anything again.
-    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, ruleable_probe_wake))
-
-    assert {:ok, [[reprodded_probe_wake]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-               [item.id]
-             )
-
-    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, reprodded_probe_wake))
-
-    assert {:ok, [[motion_request_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT id FROM decision_requests WHERE assignmentId=?1 AND status='open'",
-               [item.id]
-             )
-
-    episode = notify_adjudication(ctx.db, "k1", parent.session_key)
-
-    catch_exit(
-      handlers["adjudicate"].(%{
-        origin: "agent:effort-parent",
-        principal: {:session, parent.session_key},
-        session_key: "k1",
-        params: %{
-          episode: episode.correlation_key,
-          action: "respawn",
-          model: "claude-sonnet-4-6"
-        }
-      })
-    )
-
-    assert {:ok, [[new_holder, "superseded"]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT a.holderKey,r.status
-               FROM assignments a JOIN decision_requests r ON r.assignmentId=a.id
-               WHERE a.id=?1 AND r.id=?2
-               """,
-               [item.id, motion_request_id]
-             )
-
-    refute new_holder == "k1"
-
-    assert {:ok, [[fresh_wake_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-               [item.id]
-             )
-
-    # Respawn re-armed on the NEW holder, so that holder gets the prod rung too.
-    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, fresh_wake_id))
-
-    assert {:ok, [[fresh_second_wake_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-               [item.id]
-             )
-
-    :ok = EffortCheckin.probe(ctx.db, config, Wakes.get(ctx.db, fresh_second_wake_id))
-
-    assert {:ok, [[fresh_request_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1 AND status='open'",
-               [item.id]
-             )
-
-    stop_episode = notify_adjudication(ctx.db, new_holder, parent.session_key)
-
-    catch_exit(
-      handlers["adjudicate"].(%{
-        origin: "agent:effort-parent",
-        principal: {:session, parent.session_key},
-        session_key: new_holder,
-        params: %{episode: stop_episode.correlation_key, action: "stop"}
-      })
-    )
-
-    assert {:ok, [["closed", "superseded"]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT a.state,r.status
-               FROM assignments a JOIN decision_requests r ON r.assignmentId=a.id
-               WHERE a.id=?1 AND r.id=?2
-               """,
-               [item.id, fresh_request_id]
-             )
-  end
-
   test "set_harness readiness denial leaves Org unchanged", ctx do
     base_dir = role_test_base("harness-unready", false)
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
@@ -5545,7 +5316,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
   end
 
-  test "an adjudication-routed failed turn suppresses the generic failure marker", ctx do
+  test "a failed turn publishes its reason as a chat marker and a terminal state", ctx do
     exact_registry =
       start_supervised!(%{
         id: :failed_conn_registry,
@@ -5596,36 +5367,31 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
-    assert {:error,
-            %{
-              reason: _,
-              terminal_publish: publish,
-              adjudicate_in_txn: adjudicate,
-              post_commit: _post_commit
-            }} =
+    assert {:error, %{reason: _, terminal_publish: publish, record_in_txn: record}} =
              runner.(Map.put(turn, :session_key, "k1"))
 
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
                assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom")
-               adjudicate.(txn)
+               record.(txn)
                true
              end)
 
     publish.("failed")
 
-    # Eight, not nine: the `agent_progress state=failed` label frame is gone —
-    # the indicator is now DERIVED from the ledger (one emitter, typing carries
-    # pending-or-not) instead of narrated per path (Flynn's rule, 2026-08-04).
-    frames = collect_pushes(8, [])
+    # EVERY failed turn speaks now. Adjudication used to route a failure into a
+    # brief instead of the marker, so deleting the brief (2026-08-05) would have
+    # left this class of failure with no channel at all — the "agent progress
+    # interrupted, no reason given" that Flynn hit on gibson twice.
+    frames = collect_pushes(9, [])
 
-    refute Enum.any?(frames, fn frame ->
+    assert Enum.any?(frames, fn frame ->
              frame["type"] == "message" and
                String.starts_with?(frame["content"] || "", "[turn failed]\n")
            end)
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "unclassified_harness_error" and event.subject == "k1"
+             event.kind == "harness_turn_error" and event.subject == "k1"
            end)
 
     assert Enum.any?(
@@ -5899,107 +5665,6 @@ defmodule Tightbeam.GatewayTest do
       end
 
     assert actual == expected
-  end
-
-  test "queued adjudication respawn resolves a removed archetype to neutral default", ctx do
-    ensure_global_registry()
-    base_dir = role_test_base("unlearn-respawn-race")
-    learn_engineering_identity!(base_dir)
-    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
-
-    owner =
-      Org.create(ctx.db, %{
-        session_key: "agent:respawn-owner",
-        display_name: "Respawn owner",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
-
-    old =
-      Org.create(ctx.db, %{
-        session_key: "user:respawn-race",
-        display_name: "Respawn race",
-        kind: "main",
-        is_built_in: true,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        spawned_by: owner.session_key,
-        archetype: "coder",
-        identity_name: "coder",
-        overrides: %{skills_add: ["role-skill"]},
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
-
-    {:appended, failed_message} =
-      Projection.append(ctx.db, %{
-        session_key: old.session_key,
-        role: "user",
-        content: "failed prompt",
-        sender: "user:flynn"
-      })
-
-    {:ok, failed_seq} =
-      Ledger.enqueue(ctx.db, %{
-        session_key: old.session_key,
-        message_id: failed_message.id,
-        origin: "user:flynn",
-        prompt: "failed prompt"
-      })
-
-    :ok = DB.execute(ctx.db, "UPDATE turns SET status='running' WHERE seq=#{failed_seq}")
-    :ok = Ledger.finish(ctx.db, failed_seq, "failed", "quota")
-    episode = notify_adjudication(ctx.db, old.session_key, owner.session_key)
-
-    # Suspend the catalog so respawn has already captured `old` but cannot enter
-    # its insert transaction. Repoint and unlearn then serialize ahead of it.
-    :ok = :sys.suspend(ModelCatalog)
-
-    try do
-      respawn =
-        Task.async(fn ->
-          handlers["adjudicate"].(%{
-            origin: "agent:respawn-owner",
-            principal: {:session, owner.session_key},
-            session_key: old.session_key,
-            params: %{
-              episode: episode.correlation_key,
-              action: "respawn",
-              model: "claude-sonnet-4-6"
-            }
-          })
-        end)
-
-      assert_process_mailbox(ModelCatalog, 1)
-
-      assert {:ok, {:ok, %{archetype: "default"}}} =
-               DB.transaction(ctx.db, fn txn ->
-                 Org.repoint_archetype_in_txn(txn, old.session_key, "default")
-               end)
-
-      assert %{state: "published", kungfu: "agentic-engineering"} =
-               handlers["unlearn"].(%{
-                 origin: "user:flynn",
-                 params: %{name: "agentic-engineering"}
-               })
-
-      :ok = :sys.resume(ModelCatalog)
-      assert %{ok: true, action: "respawn", session_key: new_key} = Task.await(respawn, 5_000)
-
-      assert %{archetype: "default", identity_name: "default", overrides: nil} =
-               Org.get(ctx.db, new_key)
-
-      refute Enum.any?(Org.list_all(ctx.db), &(&1.archetype == "coder"))
-    after
-      _ = :sys.resume(ModelCatalog)
-    end
   end
 
   test "identity apply refreshes one stamped session at a turn boundary without restarting runtime",
@@ -7303,29 +6968,6 @@ defmodule Tightbeam.GatewayTest do
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
     end
-  end
-
-  defp notify_adjudication(db, session_key, expected_owner) do
-    {:ok, episode} =
-      DB.transaction(db, fn txn ->
-        existing = Adjudication.get_in_txn(txn, session_key, "other")
-
-        episode =
-          case existing do
-            nil ->
-              Adjudication.claim_in_txn(txn, session_key, "other", claim_window_ms: 300_000)
-
-            %{status: "resolved"} ->
-              Adjudication.reopen_in_txn(txn, session_key, "other", claim_window_ms: 300_000)
-          end
-
-        assert {:ok, _wake_id, ^expected_owner} =
-                 Adjudication.notify_in_txn(txn, episode, "adjudicate", 86_400_000)
-
-        Adjudication.get_in_txn(txn, session_key, "other")
-      end)
-
-    episode
   end
 
   defp gateway_children_base! do

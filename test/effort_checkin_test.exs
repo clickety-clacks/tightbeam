@@ -479,23 +479,6 @@ defmodule Tightbeam.EffortCheckinTest do
     self_request = escalate(ctx, self.id)
     assert self_request.expecter_session_key == "parent"
 
-    held_parent =
-      session(ctx.db, "held-parent", "h1", Placement.local_host_name(), %{
-        spawned_by: "parent"
-      })
-
-    :ok =
-      DB.execute(
-        ctx.db,
-        "UPDATE sessions SET adjudicationHold='blocked' WHERE sessionKey='held-parent'"
-      )
-
-    held_opener =
-      dispatch(ctx, {:session, held_parent.session_key}, "holder", "held opener")
-
-    held_request = escalate(ctx, held_opener.id)
-    assert held_request.expecter_session_key == "parent"
-
     retired_parent =
       session(ctx.db, "retired-parent", "h1", Placement.local_host_name(), %{
         spawned_by: "parent"
@@ -577,7 +560,7 @@ defmodule Tightbeam.EffortCheckinTest do
     skipped_request = escalate(ctx, skipped.id)
 
     :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET adjudicationHold='held' WHERE sessionKey='parent'")
+      DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='parent'")
 
     EffortCheckin.deadline(
       ctx.db,
@@ -588,7 +571,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert request(ctx.db, skipped_request.id).expecter_user_id == "h1"
 
     :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET adjudicationHold=NULL WHERE sessionKey='parent'")
+      DB.execute(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='parent'")
 
     pinned = dispatch(ctx, {:session, "parent"}, "holder", "pinned")
     pinned_request = escalate(ctx, pinned.id)

@@ -256,7 +256,6 @@ defmodule Tightbeam.AdapterCoordinator do
        load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
        failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
        epoch: mint_epoch(db),
-       on_adapter_ready: Keyword.get(opts, :on_adapter_ready, fn _key_name, _token -> :ok end),
        adapters: %{},
        monitors: %{},
        # Monitor refs of adapter INSTANCES that completed boot. Readiness on the
@@ -508,7 +507,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   # A death is told to the sessions RESIDENT on the dead engine, not just to the
   # events table. "[adapter recovered]" already reaches those readers when the
-  # replacement comes up (Adjudication.probe_prompt/0); without this they only
+  # replacement comes up; without this they only
   # ever saw the good news, and a turn that stopped for an engine fault read as
   # a prompt that vanished — with no marker of its own, because the failure
   # path publishes terminal turn-state and no chat line.
@@ -699,17 +698,12 @@ defmodule Tightbeam.AdapterCoordinator do
       %{pid: ^pid} = entry when is_pid(pid) ->
         entry = %{entry | failures: 0, circuit: :closed, ready: true, last_failure: nil}
         state = %{state | ready_refs: put_ready_ref(state.ready_refs, entry.monitor)}
-        # EDGE half of the heal trigger. The hook is invoked with the FULL token
-        # so the sweep can decide replay-vs-new without asking us back (and
-        # without this process ever blocking on a DB transaction).
-        state.on_adapter_ready.(key_name(key), {state.epoch, entry.generation})
         {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
 
       # A ready message from an instance this entry no longer points at. It
       # died between announcing and being heard; the entry now describes a
       # successor that has not booted, and crediting it would declare a
-      # not-yet-serving adapter ready — and fire the heal EDGE against the
-      # wrong generation.
+      # not-yet-serving adapter ready.
       _ ->
         {:noreply, state}
     end

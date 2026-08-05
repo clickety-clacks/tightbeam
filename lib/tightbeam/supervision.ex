@@ -4,7 +4,6 @@ defmodule Tightbeam.Supervision do
   use GenServer
 
   alias Tightbeam.{
-    Adjudication,
     Assignments,
     CausalEvents,
     DB,
@@ -174,7 +173,6 @@ defmodule Tightbeam.Supervision do
           | {:acted, :rail_remedy}
           | {:acted, :rail_escalate}
           | {:retry, :rail_escalate}
-          | {:held, :adjudication_hold}
           | {:refused, String.t()}
   def evaluate(db, handlers, n, session_key, terminal_seq) do
     case drain(db, handlers, session_key) do
@@ -277,8 +275,6 @@ defmodule Tightbeam.Supervision do
   # turn ends holds exactly one named slot here, and the shift runs them in
   # this order, first halt wins. The order is SEMANTIC, not incidental:
   #
-  #   :adjudication_hold — an open adjudication freezes everything downstream
-  #                        (a held turn must not be enforced or prodded);
   #   :rail_enforcement  — the org's statutes get the turn before the
   #                        substrate's own ladder does (Rules.decide → remedy /
   #                        escalate / legibility rows; rails-mechanism-v1 owns
@@ -312,7 +308,7 @@ defmodule Tightbeam.Supervision do
   # the turn context, the order carries meaning, and the termination proof is
   # over the closed composition. Orgs extend turn-end behavior through
   # STATUTES (data, hosted by :rail_enforcement) — never by code injection.
-  @turn_end_schedule [:adjudication_hold, :rail_enforcement, :pending_wake_gate, :prod_ladder]
+  @turn_end_schedule [:rail_enforcement, :pending_wake_gate, :prod_ladder]
 
   @doc "The end-of-turn shift, in execution order. Pinned by test; amend both."
   def turn_end_schedule, do: @turn_end_schedule
@@ -335,13 +331,6 @@ defmodule Tightbeam.Supervision do
     case turn_end_step(step, ctx) do
       :cont -> run_schedule(rest, ctx)
       {:halt, result} -> result
-    end
-  end
-
-  defp turn_end_step(:adjudication_hold, ctx) do
-    case adjudication_hold(ctx.db, ctx.session_key, ctx.terminal_seq) do
-      {:held, :adjudication_hold} = held -> {:halt, held}
-      :fallthrough -> :cont
     end
   end
 
@@ -372,17 +361,6 @@ defmodule Tightbeam.Supervision do
          ctx.terminal_seq,
          ctx.assignment
        )}
-    end
-  end
-
-  defp adjudication_hold(_db, _session_key, nil), do: :fallthrough
-
-  defp adjudication_hold(db, session_key, terminal_seq) do
-    if Adjudication.open_for_session?(db, session_key) do
-      write_watermark(db, session_key, terminal_seq)
-      {:held, :adjudication_hold}
-    else
-      :fallthrough
     end
   end
 
@@ -955,12 +933,6 @@ defmodule Tightbeam.Supervision do
   end
 
   defp sweep(state) do
-    :ok =
-      Adjudication.escalate_due(
-        state.db,
-        Application.get_env(:tightbeam, :adjudication_response_window_ms, 86_400_000)
-      )
-
     open_holders =
       state.db
       |> Assignments.list(%{state: "open"})

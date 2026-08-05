@@ -60,7 +60,6 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.{
     AdapterCoordinator,
-    Adjudication,
     Archetypes,
     Artifacts,
     Assignments,
@@ -105,16 +104,6 @@ defmodule Tightbeam.Gateway do
     defexception message: "effort rearm snapshot changed"
   end
 
-  defmodule HealLost do
-    @moduledoc false
-    defexception message: "a human ruling already owns this adjudication episode"
-  end
-
-  defmodule AdjudicationSuperseded do
-    @moduledoc false
-    defexception message: "an adapter heal already resolved this adjudication episode"
-  end
-
   @typedoc "Gateway config (gateway.ts GatewayConfig)."
   @type config :: %{
           base_dir: String.t(),
@@ -127,9 +116,6 @@ defmodule Tightbeam.Gateway do
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
           effort_checkin_horizon_ms: pos_integer(),
-          adjudication_claim_window_ms: pos_integer(),
-          adjudication_response_window_ms: pos_integer(),
-          adjudication_park_fallback_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
           onboarding_lease_ms: pos_integer()
         }
@@ -161,14 +147,6 @@ defmodule Tightbeam.Gateway do
     :ok = Schema.ensure_all(db)
 
     :ok = Assignments.audit_review_item_conflicts(db)
-
-    :ok = Adjudication.reconcile(db)
-
-    :ok =
-      Adjudication.escalate_due(
-        db,
-        Map.get(config, :adjudication_response_window_ms, 86_400_000)
-      )
 
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
@@ -233,21 +211,6 @@ defmodule Tightbeam.Gateway do
     # opens transactions and broadcasts, and the coordinator must never block on
     # either (adapter checkouts queue behind it). Idempotence is durable — one
     # probe per (hold, token) — so an at-least-once, unordered invocation is safe.
-    heal_config = Map.put(config, :db, db)
-
-    on_adapter_ready = fn key_name, token ->
-      Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-        adapter_healed(
-          heal_config,
-          db,
-          Adjudication.adapter_fault_cause_for_name(key_name),
-          token
-        )
-      end)
-
-      :ok
-    end
-
     # The configured delivery dependencies, forwarded to every prompt wake: a
     # wake consumer never constructs or substitutes its own delivery config.
     delivery_config = [
@@ -318,8 +281,7 @@ defmodule Tightbeam.Gateway do
          deliver: deliver,
          internal_consumers: %{
            "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
-           Adjudication.probe_retry_consumer() => &adapter_heal_retry(heal_config, db, &1)
+           "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
          },
          tick_ms: config.wake_tick_ms,
          name: Tightbeam.WakeScheduler},
@@ -335,7 +297,6 @@ defmodule Tightbeam.Gateway do
          adapter_context: adapter_context,
          adapter_opts: adapter_opts,
          db: db,
-         on_adapter_ready: on_adapter_ready,
          name: Tightbeam.AdapterCoordinator},
         {Tightbeam.LaneManager,
          db: db,
@@ -894,7 +855,6 @@ defmodule Tightbeam.Gateway do
       "critical" => fn call -> critical_result(config, db, call) end,
       "spawn" => fn call -> spawn_result(config, db, call) end,
       "tune" => fn call -> tune_result(config, db, call) end,
-      "adjudicate" => fn call -> adjudicate_result(config, db, call) end,
       "retire" => fn call -> retire_result(config, db, call) end
     }
   end
@@ -1727,10 +1687,6 @@ defmodule Tightbeam.Gateway do
         )
       end
 
-      # The failure's STAGE is what classifies its cause; the reason itself is
-      # passed through byte-for-byte (it is the chat bubble and the turn row).
-      adapter_key = adapter_key(session)
-
       outcome =
         with {:ok, adapter, generation} <-
                stage(:checkout, checkout_adapter(session)),
@@ -1785,25 +1741,37 @@ defmodule Tightbeam.Gateway do
           {:ok, %{terminal_publish: terminal_publish}}
         else
           {:error, {failed_stage, reason}} ->
-            # A FAULT WHOSE CAUSE IS A MISSING CREDENTIAL IS NOT AN ADJUDICATION.
-            # The first real production touch proved the alternative (gibson,
-            # 2026-08-04): "hi" on a fresh un-onboarded org faulted the adapter
-            # and greeted the brand-new admin with park|swap grammar whose own
-            # evidence said `needs_onboarding, :missing`. No ruling can conjure
-            # a credential, so when the engine fails on a harness the catalog
-            # AFFIRMATIVELY knows needs onboarding, the turn fails with the boot
-            # sentence and its one action instead — no episode, no hold, no
-            # "interrupted". Transient health (catalog not yet derived, a failed
-            # fetch) does not requalify the fault: those self-resolve and the
-            # adjudication path remains right for them.
-            onboarding_refusal = unonboarded_refusal(session, failed_stage)
-
-            condition = Adjudication.classify(reason)
-            cause = adjudication_cause(failed_stage, reason, adapter_key)
-            brief_inventories = adjudication_model_inventories(session)
-            current_model = session_model_display(Org.get(db, turn.session_key).model)
+            # A FAILED TURN FAILS. It does not freeze the session behind a
+            # ruling. Adjudication — episodes, holds, an escalation ladder, a
+            # `tightbeam adjudicate` verb — was deleted 2026-08-05 (Flynn: "why
+            # is the substrate making a model selection?"), because model choice
+            # is judgment and judgment belongs to inference, not to a substrate
+            # mechanism. The pattern spec said exactly that in its first
+            # paragraph and the implementation contradicted it anyway.
+            #
+            # The substrate owes three things here and owes nothing else: the
+            # truth (a `failed` turn row), the named reason (`turns.error` and
+            # the `[turn failed]` marker in chat), and the record (the lifecycle
+            # event). An agent reading model-policy guidance decides what to do
+            # about it — retry elsewhere, spawn something else, or refuse.
+            #
+            # What this replaced was not merely excess: the hold healed into
+            # itself. Clearing it resumed the turn, the turn re-hit the same
+            # condition, and it re-raised — gibson livelocked Flynn's session
+            # behind a ruling whose only documented exit, `tightbeam adjudicate`,
+            # was parsed in args.rs and never routed in dispatch.rs.
+            reason =
+              case unonboarded_refusal(session, failed_stage) do
+                {:refused, message} -> message
+                :not_applicable -> reason
+              end
 
             failure_publish = fn _terminal ->
+              # THE ERROR MUST REACH THE CHAT. Every failed turn gets the marker
+              # now; the adjudication path used to skip it because the brief was
+              # its message, and a failure that lost its brief showed Flynn
+              # "agent progress interrupted" with no reason attached.
+              append_turn_failed_marker(db, turn.session_key, error_sentence(reason))
               publish_turn_state(db, turn.session_key, correlation, "failed", inspect(reason))
               publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
@@ -1818,129 +1786,28 @@ defmodule Tightbeam.Gateway do
               )
             end
 
-            adjudicate_with_owner_in_txn = fn txn ->
-              DB.Txn.q(
-                txn,
-                "UPDATE sessions SET adjudicationHold='*', updatedAt=?2 WHERE sessionKey=?1",
-                [turn.session_key, System.system_time(:millisecond)]
-              )
+            # The RECORD half of the substrate's obligation. `Ledger.finish_in_txn`
+            # writes the failed row and its reason sentence; this keeps the raw
+            # error envelope that the sentence flattens, in the same transaction,
+            # so the record and the terminal state cannot disagree. It runs only
+            # when the finish WON, which is what stops a double-finish from
+            # double-recording.
+            record_in_txn = fn txn ->
+              detail =
+                try do
+                  JSON.encode!(reason)
+                rescue
+                  _ -> JSON.encode!(%{term: inspect(reason)})
+                end
 
-              episode_opts = [
-                claim_window_ms: Map.get(config, :adjudication_claim_window_ms, 300_000),
-                reresolve_seed: turn.session_key,
-                reresolve_rung: 1,
-                cause: cause,
-                failing_wake_id: turn.wake_id,
-                failing_seq: turn.seq
-              ]
-
-              episode =
-                Adjudication.claim_in_txn(
-                  txn,
-                  turn.session_key,
-                  condition,
-                  episode_opts
-                ) ||
-                  Adjudication.reopen_in_txn(
-                    txn,
-                    turn.session_key,
-                    condition,
-                    episode_opts
-                  )
-
-              if episode do
-                adjudication_prompt =
-                  adjudication_brief(
-                    session,
-                    condition,
-                    cause,
-                    current_model,
-                    brief_inventories
-                  )
-
-                Adjudication.notify_in_txn(
-                  txn,
-                  episode,
-                  adjudication_prompt,
-                  Map.get(config, :adjudication_response_window_ms, 86_400_000)
-                )
-              end
+              EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)
             end
-
-            # BEFORE holding anything: is the ruling the hold waits for even
-            # deliverable? A hold only a ruling can release must not be entered
-            # when no ruling can arrive (Flynn, 2026-08-04: "if there's nothing
-            # to deliver to, log it and be done with it"). With no one to
-            # notify: no hold, no episode, no parked queue — the turn already
-            # failed with its named reason, and that is the whole story.
-            # Supervision's escalation has always done this (nil ladder ->
-            # log + terminus); adjudication now matches.
-            adjudicate_in_txn = fn txn ->
-              # The RECORD is unconditional — it is the "log it" half of the
-              # rule, and a fault with no one to tell is still a fault that
-              # happened. Only the hold, the episode and the notify depend on
-              # somebody existing to rule.
-              if condition == "other" do
-                Adjudication.record_unclassified_in_txn(txn, turn.session_key, reason)
-              end
-
-              case Tightbeam.Supervision.ladder_target(txn, turn.session_key, 1) do
-                nil ->
-                  Logger.error(
-                    "model adjudication for #{turn.session_key} " <>
-                      "(condition=#{condition} cause=#{cause || "unclassified"}) " <>
-                      "has no deliverable owner: the lineage ladder is exhausted " <>
-                      "and its owner has no active main session — logged and " <>
-                      "done; no hold taken, the turn failed with its own reason"
-                  )
-
-                  :undeliverable
-
-                _target ->
-                  adjudicate_with_owner_in_txn.(txn)
-              end
-            end
-
-            # The refusal replaces the REASON and the adjudication, and nothing
-            # else: the same terminal publish, the same failed turn row, the
-            # same indicator clearing. The user sees one sentence naming the
-            # missing credential and the command that supplies it.
-            {reason, adjudicate_in_txn, failure_publish} =
-              case onboarding_refusal do
-                {:refused, message} ->
-                  # THE ERROR MUST REACH THE CHAT. An adjudication-routed failure
-                  # deliberately skips the generic `[turn failed]` marker because
-                  # the brief IS its message — so suppressing the brief without
-                  # restoring the marker left this failure with no channel at
-                  # all: gibson showed "agent progress interrupted" and never
-                  # said why (Flynn, 2026-08-04, second production touch). A
-                  # failed turn with no marker is a prompt that silently
-                  # vanishes; this one now speaks like every other error.
-                  {message, fn _txn -> :not_adjudicated end,
-                   fn terminal ->
-                     append_turn_failed_marker(db, turn.session_key, message)
-                     failure_publish.(terminal)
-                   end}
-
-                :not_applicable ->
-                  {reason, adjudicate_in_txn, failure_publish}
-              end
 
             {:error,
              %{
                reason: reason,
                terminal_publish: failure_publish,
-               adjudicate_in_txn: adjudicate_in_txn,
-               post_commit: fn ->
-                 # LEVEL half of the heal trigger. Reading readiness AFTER the
-                 # hold commits is what closes the lost-edge window: a ready
-                 # that fired before the hold existed (so the edge sweep saw
-                 # nothing to sweep) is still observed here. It runs post-commit
-                 # rather than in the transaction because the coordinator writes
-                 # to the DB, and the txn body executes inside the DB owner.
-                 heal_level_check(config, db, turn.session_key, cause, adapter_key)
-                 Wakes.fire_due(config[:wake_scheduler] || Tightbeam.WakeScheduler)
-               end
+               record_in_txn: record_in_txn
              }}
         end
 
@@ -1951,64 +1818,7 @@ defmodule Tightbeam.Gateway do
   defp stage(stage, {:error, reason}), do: {:error, {stage, reason}}
   defp stage(_stage, result), do: result
 
-  # Which failures the adapter's own recovery can release, and which are genuine
-  # decisions a human owns (spec s4-operability-v1 §2.1). A cause outside these
-  # two classes stays NULL — indistinguishable from a legacy hold, and equally
-  # never swept.
-  defp adjudication_cause(:checkout, _reason, key), do: Adjudication.adapter_fault_cause(key)
-
-  defp adjudication_cause(:session, {:adapter_unavailable, _reason}, key),
-    do: Adjudication.adapter_fault_cause(key)
-
-  defp adjudication_cause(:session, {:model_apply_failed, _reason}, _key), do: "model_decision"
-
-  defp adjudication_cause(:prompt, reason, key) when reason in [:closed, :prompt_dispatch_failed],
-    do: Adjudication.adapter_fault_cause(key)
-
-  # The adapter died mid-turn (or stopped answering). A runtime adapter fault,
-  # and heal-eligible: the replacement adapter's ready event releases the hold.
-  defp adjudication_cause(:prompt, {:adapter_unavailable, _reason}, key),
-    do: Adjudication.adapter_fault_cause(key)
-
-  defp adjudication_cause(_stage, _reason, _key), do: nil
-
-  defp session_model_display(model), do: Model.describe(model)
-
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
-
-  # `condition` is the coarse classification bucket the episode is keyed on;
-  # `cause` is the precise reason the record already carries. The human reading
-  # this decides from the cause, so it is the line that must be here — a brief
-  # that only says `condition=other` tells them nothing they can act on.
-  defp adjudication_brief(session, condition, cause, current_model, inventories) do
-    archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
-
-    """
-    Model adjudication required.
-    affected_session=#{session.session_key}
-    condition=#{condition}
-    cause=#{cause || "unclassified"}
-    current_model=#{current_model}
-    current_harness=#{session.harness}
-    model_preferences=#{Enum.map_join(archetype.model_preferences, ", ", &Model.describe/1)}
-    live_catalog_host=#{session.host}
-    live_catalog=#{JSON.encode!(inventories)}
-
-    Reply with: tightbeam adjudicate --episode <correlationKey> --action park|swap|respawn|stop [--model <family>] [--effort <level>] [--context <variant>] [--reason <text>]
-    """
-  end
-
-  # The affected session's OWN host: an adjudicator choosing a replacement model
-  # needs what that host can run, not what the gateway can. Read this outside the
-  # ruling transaction; catalog refresh may consult the DB owner.
-  defp adjudication_model_inventories(session) do
-    Map.new(Harness.all(), fn module ->
-      {models, health} = ModelCatalog.get(session.host, module.wire_name(), ModelCatalog)
-
-      {module.wire_name(),
-       %{health: inspect(health), models: Enum.map(models, &ModelCatalog.describe_entry/1)}}
-    end)
-  end
 
   # Wire publication for terminals that lost their runner closure: turns
   # recovered at boot (failed_unknown), task crashes, republished rows. The
@@ -4748,933 +4558,6 @@ defmodule Tightbeam.Gateway do
     assignments
   end
 
-  defp adjudicate_result(config, db, call) do
-    p = call.params
-    episode = Adjudication.get_by_correlation(db, p[:episode])
-
-    caller_key =
-      case call[:principal] do
-        {:session, key} -> key
-        _ -> nil
-      end
-
-    cond do
-      is_nil(episode) or episode.status != "notified" ->
-        # The other direction of the heal-vs-ruling race: this ruling lost to an
-        # adapter heal that already resolved the episode. It is an acknowledged
-        # no-op, not a silent one.
-        if episode && episode.heal_token,
-          do: log_superseded(db, episode, call.params[:action])
-
-        %{code: "denied", message: "stale or unknown adjudication episode"}
-
-      caller_key != episode.owner_target ->
-        %{code: "denied", message: "current adjudication owner required"}
-
-      p[:action] not in ~w(park swap respawn stop) ->
-        %{code: "invalid", message: "action must be park, swap, respawn, or stop"}
-
-      p[:action] in ~w(swap respawn) and is_nil(Model.from_params(p)) ->
-        %{code: "invalid", message: "--model is required for #{p.action}"}
-
-      true ->
-        adjudicate_action(config, db, call, episode)
-    end
-  end
-
-  defp adjudicate_action(config, db, call, episode) do
-    action = fn ->
-      case call.params.action do
-        "park" -> adjudicate_park(config, db, call, episode)
-        "swap" -> adjudicate_swap(config, db, call, episode)
-        "respawn" -> adjudicate_respawn(config, db, call, episode)
-        "stop" -> adjudicate_stop(config, db, call, episode)
-      end
-    end
-
-    # A ruling validated as `notified` can still lose to an adapter heal before
-    # its action transaction commits (the inverse TOCTOU of the heal's own CAS).
-    # That is an acknowledged no-op, not a crash: the transaction rolled back, so
-    # nothing the RULING decides survives, and the caller gets the same denial it
-    # would have got a millisecond earlier. Swap closes this window separately by
-    # rechecking the episode before touching the harness inside its one ruling
-    # transaction.
-    case run_session_mutation(episode.session_key, fn ->
-           try do
-             {:ok, action.()}
-           rescue
-             AdjudicationSuperseded -> :superseded
-           end
-         end) do
-      {:ok, result} ->
-        result
-
-      :superseded ->
-        log_superseded(db, episode, call.params[:action])
-        %{code: "denied", message: "stale or unknown adjudication episode"}
-    end
-  end
-
-  # DB.transaction CATCHES a raise and RETURNS {:error, exception} — it does not
-  # propagate. A superseded ruling therefore arrives here as a RETURN VALUE, and a
-  # hard {:ok, _} match on it is a MatchError that crashes the wire call instead of
-  # denying the ruling (cross-review round 2, F3). Re-raising OUTSIDE the
-  # transaction is what puts it in reach of adjudicate_action's rescue; the
-  # transaction has already rolled back, so nothing the ruling decided survives.
-  defp ruling_transaction(db, fun) do
-    case DB.transaction(db, fun) do
-      {:ok, result} -> {:ok, result}
-      {:error, %AdjudicationSuperseded{} = superseded} -> raise superseded
-      {:error, error} -> raise error
-    end
-  end
-
-  # `resolved` with a healToken means a heal won; anything else is the ordinary
-  # stale-correlation case the ruling paths have always raised on.
-  defp superseded_or_stale(%{status: "resolved", heal_token: token}) when not is_nil(token),
-    do: %AdjudicationSuperseded{}
-
-  defp superseded_or_stale(_episode), do: RuntimeError.exception("stale adjudication episode")
-
-  defp log_superseded(db, episode, action) do
-    EventLog.lifecycle(
-      db,
-      "adjudication_ruling_superseded",
-      episode.session_key,
-      JSON.encode!(%{
-        episodeId: episode.episode_id,
-        cause: episode.cause,
-        healToken: episode.heal_token,
-        action: action
-      })
-    )
-  end
-
-  defp adjudicate_stop(config, db, call, episode) do
-    session = Org.get(db, episode.session_key)
-
-    {:ok, result} =
-      ruling_transaction(db, fn txn ->
-        current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
-
-        if current && Adjudication.resolve_in_txn(txn, current) do
-          result =
-            retire_cascade_in_txn(
-              txn,
-              current.session_key,
-              session.owner_user_id,
-              "retired: adjudication stopped session before execution"
-            )
-
-          EventLog.lifecycle_in_txn(
-            txn,
-            "model_adjudication_stop",
-            current.session_key,
-            JSON.encode!(%{
-              reason: call.params[:reason],
-              condition: current.condition,
-              correlationKey: current.correlation_key
-            })
-          )
-
-          result
-        else
-          raise superseded_or_stale(current)
-        end
-      end)
-
-    Enum.each(result.retired, fn retired ->
-      broadcast(db, session.owner_user_id, Payloads.stream_deleted(retired.session_key))
-      Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
-
-      Enum.each(retired.assignments, fn assignment ->
-        emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
-      end)
-    end)
-
-    reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
-
-    %{
-      ok: true,
-      action: "stop",
-      session_key: episode.session_key,
-      retired_session_keys: Enum.map(result.retired, & &1.session_key),
-      deferred: result.deferred
-    }
-  end
-
-  defp adjudicate_park(config, db, call, episode) do
-    session = Org.get(db, episode.session_key)
-
-    due_at =
-      System.system_time(:millisecond) +
-        Map.get(config, :adjudication_park_fallback_ms, 14_400_000)
-
-    scope = session.harness <> ":" <> session.identity_name
-
-    {:ok, {wake_id, delivery}} =
-      ruling_transaction(db, fn txn ->
-        current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
-
-        wake =
-          Wakes.schedule_in_txn(txn, %{
-            session_key: current.session_key,
-            origin: "process:tightbeam",
-            creator_session_key: current.owner_target,
-            prompt:
-              "Quota recovery check: re-derive the model block and re-adjudicate from current facts.",
-            due_at: due_at,
-            condition_kind: "quota-recovered",
-            condition_scope: scope
-          })
-
-        if Adjudication.resolve_in_txn(txn, current, wake.wake_id) do
-          EventLog.lifecycle_in_txn(
-            txn,
-            "adjudication_block",
-            current.session_key,
-            JSON.encode!(%{
-              reason: call.params[:reason],
-              condition: current.condition,
-              correlationKey: current.correlation_key,
-              by: current.owner_target
-            })
-          )
-
-          already_recovered =
-            Txn.q(
-              txn,
-              "SELECT 1 FROM condition_facts WHERE kind='quota-recovered' AND scope=?1 ORDER BY id DESC LIMIT 1",
-              [scope]
-            ) != []
-
-          delivery =
-            if already_recovered do
-              Wakes.cancel_pending_in_txn(txn, wake.wake_id)
-
-              delivered =
-                deliver_prompt_in_txn(
-                  txn,
-                  current.session_key,
-                  "process:tightbeam",
-                  "Quota is already recorded recovered. Re-derive the block and re-adjudicate.",
-                  wake_id: wake.wake_id,
-                  sender: "process:tightbeam"
-                )
-
-              arm_hold_in_txn(txn, current.session_key, wake.wake_id)
-              delivered
-            end
-
-          {wake.wake_id, delivery}
-        else
-          raise superseded_or_stale(current)
-        end
-      end)
-
-    if delivery, do: complete_delivery(db, delivery)
-    %{ok: true, action: "park", recovery_wake_id: wake_id}
-  end
-
-  defp adjudicate_swap(_config, db, call, episode) do
-    session = Org.get(db, episode.session_key)
-    ruled = Model.from_params(call.params)
-
-    with {:ok, %{harness: harness, provider: provider}} <- ModelCatalog.route(session.host, ruled) do
-      if harness != session.harness do
-        %{
-          code: "cross_harness_requires_respawn",
-          message: "use --action respawn for a cross-harness model"
-        }
-      else
-        case strict_model_adapter(db, session) do
-          {:ok, adapter, sid} ->
-            adjudicate_model_swap(
-              db,
-              call,
-              ruled,
-              episode,
-              harness,
-              provider,
-              adapter,
-              sid
-            )
-
-          {:error, reason} ->
-            strict_apply_error(reason)
-        end
-      end
-    else
-      {:error, unroutable} -> routing_error(unroutable)
-    end
-  end
-
-  # The session-mutation worker owns this prepare → apply → commit sequence, so
-  # it survives the wire caller and excludes tune, competing rulings, and heal.
-  # Each DB transaction closes before the Adapter call begins.
-  defp adjudicate_model_swap(db, call, ruled, episode, harness, provider, adapter, sid) do
-    with {:ok, {:prepared, prepared}} <- prepare_adjudicated_model_swap(db, episode),
-         {:ok, applied_model} <-
-           Adapter.apply_model_strict(
-             adapter,
-             sid,
-             ruled,
-             prepared.record_model
-           ) do
-      case commit_adjudicated_model_swap(
-             db,
-             prepared,
-             applied_model,
-             harness,
-             provider
-           ) do
-        {:ok, {:applied, delivery, wake_id}} ->
-          complete_delivery(db, delivery)
-
-          Map.merge(published_identity(applied_model), %{
-            ok: true,
-            action: "swap",
-            recovery_wake_id: wake_id
-          })
-
-        {:ok, {:denied, current}} ->
-          :ok = Adapter.forget_model_residency(adapter, sid)
-
-          if current && current.heal_token,
-            do: log_superseded(db, current, call.params[:action])
-
-          %{code: "denied", message: "stale or unknown adjudication episode"}
-
-        {:ok, :model_commit_race} ->
-          :ok = Adapter.forget_model_residency(adapter, sid)
-          strict_apply_error(:model_readback_unavailable)
-
-        {:error, error} ->
-          :ok = Adapter.forget_model_residency(adapter, sid)
-          raise error
-      end
-    else
-      {:ok, {:denied, current}} ->
-        if current && current.heal_token,
-          do: log_superseded(db, current, call.params[:action])
-
-        %{code: "denied", message: "stale or unknown adjudication episode"}
-
-      {:error, reason} when is_atom(reason) ->
-        strict_apply_error(reason)
-
-      {:error, error} ->
-        raise error
-    end
-  end
-
-  defp prepare_adjudicated_model_swap(db, episode) do
-    DB.transaction(db, fn txn ->
-      current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
-
-      if is_nil(current) or current.status != "notified" do
-        {:denied, current}
-      else
-        {record_model, record_harness} = read_recorded_model(txn, current.session_key)
-
-        {:prepared,
-         %{
-           current: current,
-           record_model: record_model,
-           record_harness: record_harness
-         }}
-      end
-    end)
-  end
-
-  defp commit_adjudicated_model_swap(db, prepared, applied_model, harness, provider) do
-    DB.transaction(db, fn txn ->
-      current =
-        Adjudication.get_by_correlation_in_txn(
-          txn,
-          prepared.current.correlation_key
-        )
-
-      cond do
-        is_nil(current) or current.status != "notified" ->
-          {:denied, current}
-
-        true ->
-          {record_model, record_harness} = read_recorded_model(txn, current.session_key)
-
-          if {record_model, record_harness} !=
-               {prepared.record_model, prepared.record_harness} do
-            :model_commit_race
-          else
-            case Org.swap_model_in_txn(
-                   txn,
-                   current.session_key,
-                   {record_model, record_harness},
-                   {applied_model, harness, provider}
-                 ) do
-              {:ok, _} -> :ok
-              {:duplicate, _} -> :ok
-              :stale -> raise("model mutation race inside serialized ruling")
-            end
-
-            recovery_prompt =
-              "Your previous turn failed: #{current.condition}. You now run on #{Model.describe(applied_model)}. Re-derive state from the facts and continue."
-
-            wake_id =
-              Adjudication.deterministic_wake_in_txn(
-                txn,
-                current,
-                "recovery",
-                current.session_key,
-                recovery_prompt
-              )
-
-            unless Adjudication.resolve_in_txn(txn, current, wake_id),
-              do: raise("adjudication changed inside serialized ruling")
-
-            delivery =
-              deliver_prompt_in_txn(
-                txn,
-                current.session_key,
-                "process:tightbeam",
-                recovery_prompt,
-                wake_id: wake_id,
-                sender: "process:tightbeam",
-                fire_wake_in_txn: true
-              )
-
-            arm_hold_in_txn(txn, current.session_key, wake_id)
-
-            EventLog.lifecycle_in_txn(
-              txn,
-              "model_adjudication",
-              current.session_key,
-              JSON.encode!(%{
-                from_model: record_model && Model.to_ref(record_model),
-                from_effort: record_model && record_model.effort,
-                to_model: Model.to_ref(applied_model),
-                to_effort: applied_model.effort,
-                from_harness: record_harness,
-                to_harness: harness,
-                trigger: current.condition,
-                adjudicated_by: current.owner_target,
-                correlationKey: current.correlation_key,
-                harness_crossed: false,
-                context_discarded: false
-              })
-            )
-
-            {:applied, delivery, wake_id}
-          end
-      end
-    end)
-  end
-
-  defp strict_apply_error(reason) do
-    code =
-      case reason do
-        atom when is_atom(atom) -> Atom.to_string(atom)
-        _ -> "model_apply_failed"
-      end
-
-    %{code: code, message: "strict model apply failed: #{inspect(reason)}"}
-  end
-
-  defp adjudicate_respawn(config, db, call, episode),
-    do: adjudicate_respawn(config, db, call, episode, 8)
-
-  defp adjudicate_respawn(_config, _db, _call, _episode, 0),
-    do: %{code: "workspace_move_race", message: "assignments kept changing during respawn"}
-
-  defp adjudicate_respawn(config, db, call, episode, attempts) do
-    old = Org.get(db, episode.session_key)
-    ruled = Model.from_params(call.params)
-
-    with {:ok, %{harness: harness, provider: provider}} <- ModelCatalog.route(old.host, ruled) do
-      new_session_key = "agent:" <> Tightbeam.Id.uuid4()
-
-      {:ok, transferred_rows} =
-        DB.query(
-          db,
-          "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id",
-          [old.session_key]
-        )
-
-      transferred_assignment_ids = Enum.map(transferred_rows, &hd/1)
-
-      prepared_rearms =
-        EffortCheckin.prepare_transferred_rearms(
-          db,
-          config,
-          %{old | session_key: new_session_key},
-          transferred_assignment_ids
-        )
-
-      transaction_result =
-        DB.transaction(db, fn txn ->
-          current_assignment_ids =
-            Txn.q(
-              txn,
-              "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id",
-              [old.session_key]
-            )
-            |> Enum.map(&hd/1)
-
-          unless current_assignment_ids == transferred_assignment_ids and
-                   EffortCheckin.prepared_rearms_current?(
-                     txn,
-                     old.session_key,
-                     prepared_rearms
-                   ) do
-            raise EffortRearmRace
-          end
-
-          current = Adjudication.get_by_correlation_in_txn(txn, episode.correlation_key)
-
-          {archetype, overrides, identity_name} =
-            if Archetypes.get(old.archetype) do
-              {old.archetype, old.overrides, old.identity_name}
-            else
-              # Unlearn may have published while this respawn was queued after
-              # snapshotting `old`. Resolve at the DB-owner boundary exactly as
-              # repoint does, leaving no reference to the removed identity.
-              {"default", nil, "default"}
-            end
-
-          new_session =
-            Org.create_in_txn(txn, %{
-              session_key: new_session_key,
-              display_name: old.display_name,
-              kind: old.kind,
-              owner_user_id: old.owner_user_id,
-              origin: old.origin,
-              spawned_by: old.spawned_by,
-              archetype: archetype,
-              overrides: overrides,
-              identity_name: identity_name,
-              host: old.host,
-              harness: harness,
-              provider: provider,
-              model: ruled
-            })
-
-          recovery_prompt =
-            "Your predecessor's turn failed: #{current.condition}. Continue on #{Model.describe(ruled)}; re-derive state from durable facts."
-
-          wake_id =
-            Adjudication.deterministic_wake_in_txn(
-              txn,
-              current,
-              "recovery",
-              new_session.session_key,
-              recovery_prompt
-            )
-
-          [[failed_prompt_seq]] =
-            Txn.q(
-              txn,
-              """
-              SELECT COALESCE(m.seq, 0) FROM turns AS t
-              JOIN messages AS m ON m.id=t.messageId
-              WHERE t.sessionKey=?1 AND t.status='failed'
-              ORDER BY t.seq DESC LIMIT 1
-              """,
-              [old.session_key]
-            )
-
-          Txn.q(
-            txn,
-            "UPDATE sessions SET clearedThroughSeq=?2 WHERE sessionKey=?1",
-            [old.session_key, failed_prompt_seq]
-          )
-
-          {:appended, marker} =
-            Projection.append_in_txn(txn, %{
-              session_key: old.session_key,
-              role: "assistant",
-              content:
-                "[model recovery]\n\nThis session continues as #{new_session.session_key} on #{Model.describe(ruled)}.",
-              sender: "process:tightbeam"
-            })
-
-          Txn.q(
-            txn,
-            "UPDATE roles SET boundSessionKey=?2, updatedAt=?3 WHERE boundSessionKey=?1",
-            [old.session_key, new_session.session_key, System.system_time(:millisecond)]
-          )
-
-          Txn.q(txn, "UPDATE assignments SET holderKey=?2 WHERE holderKey=?1 AND state='open'", [
-            old.session_key,
-            new_session.session_key
-          ])
-
-          EffortCheckin.apply_prepared_rearms_in_txn(
-            txn,
-            config,
-            new_session.session_key,
-            prepared_rearms
-          )
-
-          retire_session_in_txn(
-            txn,
-            old.session_key,
-            old.owner_user_id,
-            "retired: adjudication respawned session before execution"
-          )
-
-          unless Adjudication.resolve_in_txn(txn, current, wake_id),
-            do: raise(superseded_or_stale(current))
-
-          delivery =
-            deliver_prompt_in_txn(
-              txn,
-              new_session.session_key,
-              "process:tightbeam",
-              recovery_prompt,
-              wake_id: wake_id,
-              sender: "process:tightbeam",
-              fire_wake_in_txn: true
-            )
-
-          arm_hold_in_txn(txn, new_session.session_key, wake_id)
-
-          EventLog.lifecycle_in_txn(
-            txn,
-            "model_adjudication",
-            old.session_key,
-            JSON.encode!(%{
-              from_model: old.model && Model.to_ref(old.model),
-              from_effort: old.model && old.model.effort,
-              to_model: Model.to_ref(ruled),
-              to_effort: ruled.effort,
-              from_harness: old.harness,
-              to_harness: harness,
-              trigger: current.condition,
-              adjudicated_by: current.owner_target,
-              correlationKey: current.correlation_key,
-              harness_crossed: old.harness != harness,
-              context_discarded: true
-            })
-          )
-
-          {new_session, delivery, wake_id, marker}
-        end)
-
-      case transaction_result do
-        {:error, %EffortRearmRace{}} ->
-          adjudicate_respawn(config, db, call, episode, attempts - 1)
-
-        {:error, %AdjudicationSuperseded{} = superseded} ->
-          raise superseded
-
-        {:error, error} ->
-          raise error
-
-        {:ok, {new_session, delivery, wake_id, marker}} ->
-          publish_message(db, old.session_key, marker)
-
-          broadcast(
-            db,
-            old.owner_user_id,
-            Payloads.stream_history_cleared(old.session_key)
-          )
-
-          complete_delivery(db, delivery)
-
-          broadcast(db, old.owner_user_id, Payloads.stream_deleted(old.session_key))
-
-          broadcast(
-            db,
-            new_session.owner_user_id,
-            Payloads.stream_created(Payloads.stream_session(new_session))
-          )
-
-          reap_retired_sessions(config, db, [old.session_key])
-
-          %{
-            ok: true,
-            action: "respawn",
-            retired_session_key: old.session_key,
-            session_key: new_session.session_key,
-            recovery_wake_id: wake_id
-          }
-      end
-    else
-      {:error, unroutable} -> routing_error(unroutable)
-    end
-  end
-
-  @doc """
-  Auto-release every session held on an adapter fault for `cause`, because that
-  adapter is ready again at `token` (spec s4-operability-v1 §2 — dark factory: no
-  operator verb exists for this). Idempotent: one probe per (hold, token), so a
-  replayed ready event does nothing.
-
-  The EDGE trigger (a ready event) calls this for all held sessions; the LEVEL
-  trigger (a hold committing while the adapter is already ready) calls it for
-  one; the probe RETRY calls it for one with `include_equal: true` — a re-hold
-  is a new hold, and its one probe may re-use the token that probed its
-  predecessor (spec §2, ruled 2026-07-28).
-  """
-  @spec adapter_healed(map(), DB.server(), String.t(), AdapterCoordinator.heal_token(), keyword()) ::
-          [{String.t(), String.t(), :released | :lost | {:error, term()}}]
-  def adapter_healed(config, db, cause, token, opts \\ []) do
-    encoded = AdapterCoordinator.encode_token(token)
-    only = Keyword.get(opts, :session_key)
-    only_condition = Keyword.get(opts, :condition)
-
-    Adjudication.heal_candidates(db, cause, token, Keyword.take(opts, [:include_equal]))
-    |> Enum.filter(fn {session_key, condition} ->
-      (is_nil(only) or session_key == only) and
-        (is_nil(only_condition) or condition == only_condition)
-    end)
-    |> Enum.map(fn {session_key, condition} ->
-      {session_key, condition, release_hold(config, db, session_key, condition, cause, encoded)}
-    end)
-  end
-
-  # ONE atomic transition per held session: resolve the episode, dispose the
-  # owner wake, create the probe wake AND its turn, and narrow the hold
-  # '*' → probeWakeId. The hold narrowing is the CAS that decides every race —
-  # a human ruling that got there first armed its own recovery hold, so '*' no
-  # longer matches and this transition loses cleanly.
-  defp release_hold(config, db, session_key, condition, cause, encoded_token) do
-    result =
-      with_session_mutation_lock(session_key, fn ->
-        DB.transaction(db, fn txn ->
-          # The DB is one serialized writer under BEGIN IMMEDIATE, so reading and
-          # then writing in the same transaction IS the compare-and-swap. BOTH
-          # guards are read before any write, so a loser leaves nothing behind:
-          # the session must still be held WIDE, and the episode must still be in a
-          # state a heal may take. A human ruling that resolved the episode is NOT
-          # such a state, and a delayed park leaves the hold wide while doing
-          # exactly that — so the hold alone is not a sufficient guard (F3).
-          held? =
-            Txn.q(txn, "SELECT adjudicationHold FROM sessions WHERE sessionKey=?1", [
-              session_key
-            ])
-
-          episode = Adjudication.get_in_txn(txn, session_key, condition)
-
-          if held? == [["*"]] and is_map(episode) and Adjudication.heal_eligible?(episode) do
-            probe_wake_id = Adjudication.probe_wake_in_txn(txn, episode, encoded_token)
-
-            unless Adjudication.heal_resolve_in_txn(txn, episode, probe_wake_id, encoded_token),
-              do: raise(HealLost)
-
-            disposition = Adjudication.dispose_owner_wake_in_txn(txn, episode)
-
-            delivery =
-              deliver_prompt_in_txn(
-                txn,
-                session_key,
-                "process:tightbeam",
-                Adjudication.probe_prompt(),
-                wake_id: probe_wake_id,
-                sender: "process:tightbeam",
-                fire_wake_in_txn: true
-              )
-
-            # No probe TURN means no probe terminal to clear the hold; refuse to
-            # narrow the hold rather than wedge the session on a wake that will
-            # never be answered.
-            unless match?({:appended, _target, _message, _opts}, delivery),
-              do: raise("heal probe was not enqueued: #{inspect(delivery)}")
-
-            arm_hold_in_txn(txn, session_key, probe_wake_id)
-
-            EventLog.lifecycle_in_txn(
-              txn,
-              "adjudication_hold_healed",
-              session_key,
-              JSON.encode!(%{
-                cause: cause,
-                condition: condition,
-                episodeId: episode.episode_id,
-                healToken: encoded_token,
-                probeWakeId: probe_wake_id,
-                ownerWake: to_string(disposition)
-              })
-            )
-
-            {:released, delivery}
-          else
-            :lost
-          end
-        end)
-      end)
-
-    case result do
-      {:ok, {:released, delivery}} ->
-        complete_delivery(db, delivery)
-        Wakes.fire_due(config[:wake_scheduler] || Tightbeam.WakeScheduler)
-        :released
-
-      {:ok, :lost} ->
-        heal_lost(db, session_key, cause, condition, encoded_token)
-        :lost
-
-      {:error, %HealLost{}} ->
-        # The episode-state CAS lost mid-transaction; the raise rolled the
-        # attempt back. A legitimate no-op, same as losing the hold CAS.
-        heal_lost(db, session_key, cause, condition, encoded_token)
-        :lost
-
-      {:error, error} ->
-        # NOT a lost race — the transaction itself failed (probe not enqueued,
-        # DB error). A retry consumer must keep its wake pending on this arm:
-        # consuming it would eat the hold's only feeder.
-        Logger.error(
-          "adjudication heal errored for #{session_key} (#{condition}): #{inspect(error)}"
-        )
-
-        # The hold stays wide and this arm is the last thing that would have
-        # opened it, so the only remaining actor is a person — and the session
-        # they would be reading looks merely quiet. Say so in it.
-        EventLog.notice(
-          db,
-          "adjudication_heal_error",
-          session_key,
-          JSON.encode!(%{
-            cause: cause,
-            condition: condition,
-            healToken: encoded_token,
-            error: inspect(error)
-          }),
-          audience: {:session, session_key},
-          attention: :high,
-          message:
-            "[hold not released]\n\nThe adapter this session was waiting on recovered, " <>
-              "but releasing the hold failed: #{inspect(error)}. The session stays held " <>
-              "until someone adjudicates it (`tightbeam adjudicate`)."
-        )
-
-        {:error, error}
-    end
-  end
-
-  # Dark != silent: the decision NOT to probe is recorded (a human ruling owns
-  # this hold, or another episode's release narrowed it first).
-  defp heal_lost(db, session_key, cause, condition, encoded_token) do
-    EventLog.lifecycle(
-      db,
-      "adjudication_heal_lost",
-      session_key,
-      JSON.encode!(%{cause: cause, condition: condition, healToken: encoded_token})
-    )
-  end
-
-  defp heal_level_check(config, db, session_key, cause, adapter_key) do
-    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
-
-    with true <- Adjudication.adapter_fault?(cause),
-         {:ok, token} <- AdapterCoordinator.ready_token(coordinator, adapter_key) do
-      adapter_healed(config, db, cause, token, session_key: session_key)
-    else
-      _ -> :ok
-    end
-  rescue
-    _ -> :ok
-  catch
-    :exit, _ -> :ok
-  end
-
-  # Probe RETRY (spec s4-operability-v1 §2, ruled 2026-07-28): the wake a
-  # non-delivered probe terminal armed, fired after its backoff. BOUND: the
-  # payload names the episode, cause, and the failed probe it retries, and the
-  # consumer acts only while that episode's re-hold is still current — a
-  # superseding probe or re-hold makes this wake a consumed no-op. Readiness is
-  # re-read NOW; an equal token is permitted because this is a new hold's one
-  # probe, not a replayed ready event. A not-ready adapter probes nothing: the
-  # next genuine ready edge (strictly newer — teardown bumps the generation)
-  # owns the wake-up. A heal transaction ERROR keeps the wake PENDING with its
-  # dueAt pushed one backoff out, and a malformed payload raises (loud, still
-  # pending) — only a completed attempt or a legitimate lost race consumes the
-  # hold's feeder.
-  defp adapter_heal_retry(config, db, wake) do
-    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
-
-    %{
-      "episodeId" => episode_id,
-      "sessionKey" => session_key,
-      "condition" => condition,
-      "cause" => cause,
-      "after" => after_wake
-    } = JSON.decode!(wake.prompt)
-
-    episode = Adjudication.get(db, session_key, condition)
-
-    # Still-current: same episode incarnation, and no newer probe has replaced
-    # the failed one this wake retries (a reopen NULLs recoveryWakeId, which is
-    # this same failure re-briefed, not a successor).
-    current? =
-      is_map(episode) and episode.episode_id == episode_id and
-        (is_nil(episode.recovery_wake_id) or episode.recovery_wake_id == after_wake)
-
-    outcomes =
-      with true <- current?,
-           {:ok, token} <-
-             AdapterCoordinator.ready_token(coordinator, parse_adapter_fault_key!(cause)) do
-        adapter_healed(config, db, cause, token,
-          session_key: session_key,
-          condition: condition,
-          include_equal: true
-        )
-      else
-        _ -> []
-      end
-
-    case Enum.find(outcomes, &match?({_, _, {:error, _}}, &1)) do
-      nil ->
-        {:ok, _} =
-          DB.transaction(db, fn txn ->
-            Txn.q(
-              txn,
-              "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-              [wake.wake_id, System.system_time(:millisecond)]
-            )
-
-            :ok
-          end)
-
-        :ok
-
-      {_session_key, _condition, {:error, error}} ->
-        # release_hold already logged the error loudly; keep the feeder alive.
-        {:ok, _} =
-          DB.transaction(db, fn txn ->
-            Txn.q(
-              txn,
-              "UPDATE wakes SET dueAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-              [wake.wake_id, System.system_time(:millisecond) + Adjudication.probe_retry_ms()]
-            )
-
-            :ok
-          end)
-
-        {:error, error}
-    end
-  end
-
-  # Inverse of AdapterCoordinator.key_name/1, from the cause encoding: the
-  # episode names the adapter it is waiting on, and the retry asks about THAT
-  # adapter — not whatever the session points at today. §2.1 pins the canonical
-  # key encoding, so a shape this cannot parse is an invariant failure: raise
-  # where it is diagnosable rather than consume the hold's only feeder.
-  defp parse_adapter_fault_key!("adapter_fault:" <> key_name) do
-    [harness, rest] = String.split(key_name, ":", parts: 2)
-    [archetype, host] = String.split(rest, "@", parts: 2)
-    {Harness.parse!(harness).id(), archetype, host}
-  end
-
-  defp arm_hold_in_txn(txn, session_key, wake_id) do
-    Txn.q(txn, "UPDATE sessions SET adjudicationHold=?2, updatedAt=?3 WHERE sessionKey=?1", [
-      session_key,
-      wake_id,
-      System.system_time(:millisecond)
-    ])
-  end
-
   # Retire durability owns the ordering: every DB transition commits before
   # this seam touches a harness. Adapters are shared by key, so each retired
   # harness SID is closed independently and the adapter itself is closed only
@@ -5863,20 +4746,6 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp strict_model_adapter(db, session) do
-    with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
-         coordinator when is_pid(coordinator) <- Process.whereis(Tightbeam.AdapterCoordinator),
-         {:ok, adapter, _generation} <-
-           AdapterCoordinator.adapter_for(
-             coordinator,
-             {Harness.parse!(session.harness).id(), "shared", session.host}
-           ) do
-      {:ok, adapter, sid}
-    else
-      _ -> {:error, :adapter_unavailable}
-    end
-  end
-
   defp push_known_model(_adapter, _sid, nil), do: :ok
 
   defp push_known_model(adapter, sid, model) do
@@ -5906,6 +4775,11 @@ defmodule Tightbeam.Gateway do
   # A failed turn with no marker is a prompt that silently vanishes: the
   # echo shows, the indicator clears, and no reply ever comes. The WHY
   # belongs in the chat where the reply would have been.
+  # Same shape as SessionLane.error_text/1: a reason that is already a sentence
+  # is one, anything else is inspected rather than guessed at.
+  defp error_sentence(reason) when is_binary(reason), do: reason
+  defp error_sentence(reason), do: inspect(reason)
+
   defp append_turn_failed_marker(db, session_key, reason) do
     append_marker(
       db,

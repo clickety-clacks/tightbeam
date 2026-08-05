@@ -1,7 +1,7 @@
 defmodule Tightbeam.Toplines do
   @moduledoc """
   The work telemetry the substrate already knows (spec topline-map-v1). A pure
-  READ over durable work, assignment, turn, attest, wake, adjudication and
+  READ over durable work, assignment, turn, attest, wake and
   creation-context rows: no table, no column, no migration, no emission.
 
   Four surfaces, one telemetry builder: the roster, the caller-visible causal
@@ -35,9 +35,9 @@ defmodule Tightbeam.Toplines do
      to the response against a database where those rows are absent. That is
      why candidate parent edges are authorization-filtered BEFORE traversal
      (an invisible parent is indistinguishable from a conversational turn),
-     why the traversal order is over visible nodes only, and why holds and
-     pending wakes are selected by the current holder's SESSION KEY rather
-     than through any item-attributed carrier.
+     why the traversal order is over visible nodes only, and why pending
+     wakes are selected by the current holder's SESSION KEY rather than
+     through any item-attributed carrier.
   """
 
   alias Tightbeam.{CausalEvents, DB}
@@ -45,7 +45,6 @@ defmodule Tightbeam.Toplines do
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
   @terminal_states ~w(closed failed iceboxed)
-  @open_hold_states ~w(claimed notified)
 
   @doc """
   The `toplines` verb: the roster with full telemetry, or the caller-visible
@@ -333,13 +332,12 @@ defmodule Tightbeam.Toplines do
       # absent evidence. The coverage null rule is scoped to COUNTS, and
       # `--quiet-over` is defined against `running_turn = false` — nulling it here
       # would silently drop every pre-cutoff item out of `--quiet-over`, which is
-      # the worse failure. `pending_session_wake` and `holds` carry no such caveat:
-      # both are session-keyed through durable assignment columns.
+      # the worse failure. `pending_session_wake` carries no such caveat: it is
+      # session-keyed through durable assignment columns.
       active: %{
         running_turn: Enum.any?(union, &(&1.status == "running")),
         pending_session_wake: pending_session_wake?(world, holders)
       },
-      holds: holds(world, holders),
       since_progress_ms: world.now - anchor(world, item, set, union)
     }
   end
@@ -480,13 +478,6 @@ defmodule Tightbeam.Toplines do
   # item-attributed wakes.
   defp pending_session_wake?(world, holders) do
     Enum.any?(holders, &MapSet.member?(world.pending_wake_sessions, &1))
-  end
-
-  defp holds(world, holders) do
-    holders
-    |> Enum.flat_map(&Map.get(world.holds_by_session, &1, []))
-    |> Enum.sort_by(&{&1.sessionKey, &1.condition})
-    |> Enum.map(&Map.take(&1, [:episodeId, :cause, :sessionKey]))
   end
 
   ## The progress clock
@@ -637,7 +628,6 @@ defmodule Tightbeam.Toplines do
       markers_by_assignment: markers_by_assignment(db),
       open_requests: open_requests(db),
       pending_wake_sessions: pending_wake_sessions(db),
-      holds_by_session: holds_by_session(db),
       dispositions: dispositions(db),
       session_owners: session_owners(db)
     }
@@ -858,26 +848,6 @@ defmodule Tightbeam.Toplines do
       )
 
     MapSet.new(rows, &hd/1)
-  end
-
-  defp holds_by_session(db) do
-    states = Enum.map_join(@open_hold_states, ", ", &"'#{&1}'")
-
-    {:ok, rows} =
-      DB.query(db, """
-      SELECT sessionKey, condition, episodeId, cause
-      FROM adjudication_episodes
-      WHERE status IN (#{states})
-      """)
-
-    rows
-    |> Enum.group_by(&hd/1)
-    |> Map.new(fn {session_key, grouped} ->
-      {session_key,
-       Enum.map(grouped, fn [_key, condition, episode_id, cause] ->
-         %{sessionKey: session_key, condition: condition, episodeId: episode_id, cause: cause}
-       end)}
-    end)
   end
 
   # Dispositions append a `disposition_transition` causal event with

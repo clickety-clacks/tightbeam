@@ -62,18 +62,16 @@ defmodule Tightbeam.ConformanceSupport do
     ~w(grammar-root-table-rejected grammar-nested-accepted)
   ]
   @world_keys MapSet.new(
-                ~w(users sessions roles work_items assignments attests retune adjudicate adjudication_episode ledger wakes turn)
+                ~w(users sessions roles work_items assignments attests retune ledger wakes turn)
               )
   @world_shapes %{
     "users" => ~w(id admin),
-    "sessions" => ~w(key owner archetype harness provider host model adjudicationHold),
+    "sessions" => ~w(key owner archetype harness provider host model),
     "roles" => ~w(name session),
     "work_items" => ~w(id title),
     "assignments" => ~w(id holder creator reviews files),
     "attests" => ~w(assignment kind by verdict_kind),
     "retune" => ~w(session harness provider),
-    "adjudicate" => ~w(session hold),
-    "adjudication_episode" => ~w(session status),
     "ledger" => ~w(session pending),
     "wakes" => ~w(target creatorSessionKey at),
     "turn" => ~w(session seq window_start)
@@ -331,7 +329,7 @@ defmodule Tightbeam.ConformanceSupport do
     reject_unknown!(world, @world_keys, "#{path} world")
 
     Enum.each(world, fn {key, rows} ->
-      rows = if key in ~w(adjudicate ledger turn), do: List.wrap(rows), else: rows
+      rows = if key in ~w(ledger turn), do: List.wrap(rows), else: rows
       assert is_list(rows), "#{path}: world.#{key} must be a row or row list"
 
       Enum.each(rows, fn row ->
@@ -366,20 +364,6 @@ defmodule Tightbeam.ConformanceSupport do
   defp validate_world_row!("sessions", row, path) do
     for key <- ~w(key owner archetype),
         do: assert(Map.has_key?(row, key), "#{path}: world.sessions row needs #{key}")
-
-    if Map.has_key?(row, "adjudicationHold") do
-      hold = row["adjudicationHold"]
-
-      assert is_nil(hold) or hold == "*" or (is_binary(hold) and hold != ""),
-             "#{path}: adjudicationHold must be null, '*', or a recovery wake id"
-    end
-  end
-
-  defp validate_world_row!("adjudication_episode", row, path) do
-    assert is_binary(row["session"]), "#{path}: adjudication_episode needs session"
-
-    assert row["status"] in ~w(claimed notified),
-           "#{path}: adjudication_episode status must be claimed or notified"
   end
 
   defp validate_world_row!(_key, _row, _path), do: :ok
@@ -543,10 +527,6 @@ defmodule Tightbeam.ConformanceSupport do
 
       {"C6", _, "remedy-episode-idempotent"} ->
         run_remedy_episode_contract(fixture)
-
-      {"C7", _, "adjudication-hold-order"} ->
-        run_rules_decide(fixture)
-        run_acting_layer(fixture)
 
       {"C7", _, name}
       when name in ~w(idle-open-obligation busy-or-queued-no-sweep satisfied-obligation-no-sweep) ->
@@ -1737,7 +1717,6 @@ defmodule Tightbeam.ConformanceSupport do
 
   def run_scheduled_wake_contract(fixture) do
     assert Supervision.turn_end_schedule() == [
-             :adjudication_hold,
              :rail_enforcement,
              :pending_wake_gate,
              :prod_ladder
@@ -2672,16 +2651,6 @@ defmodule Tightbeam.ConformanceSupport do
               assert RailRemedy.episode(db, rule, assignment_id) == nil
 
               cond do
-                fixture["name"] == "adjudication-hold-order" and
-                    Map.get(kase["world"], "adjudication_episode", []) != [] ->
-                  assert result == {:held, :adjudication_hold}
-
-                  assert %{lastEvaluatedTerminal: ^terminal_seq} =
-                           Supervision.watermark(db, session_key)
-
-                  assert Supervision.prod_state(db, assignment_id) == nil
-                  refute lifecycle_kind?(db, "rail_sweep")
-
                 fixture["name"] == "busy-or-queued-no-sweep" ->
                   assert result == :busy
                   assert Supervision.prod_state(db, assignment_id) == nil
@@ -2849,26 +2818,6 @@ defmodule Tightbeam.ConformanceSupport do
       end)
     end)
 
-    if Map.has_key?(world, "adjudicate") do
-      flunk(
-        "world.adjudicate cannot bypass the pinned owner verb; " <>
-          "the governing spec's {session, hold} shape does not match Gateway adjudicate"
-      )
-    end
-
-    Enum.each(Map.get(world, "adjudication_episode", []), fn episode ->
-      {:ok, _} =
-        DB.query(
-          db,
-          """
-          INSERT INTO adjudication_episodes
-            (sessionKey, condition, status, correlationKey, deadlineAt, openedAt)
-          VALUES (?1, 'other', ?2, ?3, 4102444800000, 1)
-          """,
-          [episode["session"], episode["status"], "fixture-#{episode["session"]}"]
-        )
-    end)
-
     Enum.each(Map.get(world, "wakes", []), fn wake ->
       Wakes.schedule(db, %{
         session_key: wake["target"],
@@ -2914,16 +2863,6 @@ defmodule Tightbeam.ConformanceSupport do
                      wake_id: nil
                    })
         end)
-      end
-    end)
-
-    Enum.each(Map.get(world, "sessions", []), fn session ->
-      if Map.has_key?(session, "adjudicationHold") do
-        {:ok, _} =
-          DB.query(db, "UPDATE sessions SET adjudicationHold=?2 WHERE sessionKey=?1", [
-            session["key"],
-            session["adjudicationHold"]
-          ])
       end
     end)
 
@@ -3090,7 +3029,6 @@ defmodule Tightbeam.ConformanceSupport do
 
     List.wrap(Map.get(world, "ledger", []))
     |> Enum.any?(&(Map.get(&1, "pending", 0) > 0)) or
-      Map.get(world, "adjudication_episode", []) != [] or
       get_in(world, ["turn", "seq"]) == nil
   end
 
@@ -3417,12 +3355,16 @@ defmodule Tightbeam.ConformanceTest do
     # orphaned-running-failed) and the missing-producer/producer-present F1
     # loadset twin; producer-backed-gate was replaced 1:1 by
     # artifact-backed-gate. The ten exact-mechanism skips are untouched.
-    assert length(@fixtures) == 65
-    assert active_fixtures == 55
+    #
+    # Deleting adjudication (2026-08-05) removed one more: C7's
+    # adjudication-hold-order, whose whole subject was a hold freezing the
+    # turn-end shift. The shift itself is unchanged minus that first slot.
+    assert length(@fixtures) == 64
+    assert active_fixtures == 54
     assert exact_skips == 10
-    assert activated_fixture_tests == 42
+    assert activated_fixture_tests == 41
     assert activated_class_tests == 5
-    assert activated_tests == 47
+    assert activated_tests == 46
   end
 
   # The structural guard for the defect this file used to carry: a catch-all clause
@@ -3469,7 +3411,7 @@ defmodule Tightbeam.ConformanceTest do
       )
     end)
 
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 52
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 51
 
     assert %{
              scope: "case",
@@ -3492,12 +3434,6 @@ defmodule Tightbeam.ConformanceTest do
                }
              end)
     end
-  end
-
-  test "C7 claimed and notified adjudication episodes suppress rails and prod before watermark" do
-    fixture = fixture!("C7", "adjudication-hold-order")
-    Corpus.run_rules_decide(fixture)
-    Corpus.run_acting_layer(fixture)
   end
 
   # ExUnit's per-test default is 60s, a number chosen for the in-memory unit tests that

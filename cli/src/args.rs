@@ -2065,7 +2065,6 @@ mod tests {
             "withdraw",
             "decision-request",
             "critical",
-            "adjudicate",
             "work-item-update",
             "work-item-list",
             "assignment-get",

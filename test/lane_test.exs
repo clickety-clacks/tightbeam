@@ -18,7 +18,6 @@ defmodule Tightbeam.LaneTest do
         modelContext TEXT,
         harness TEXT NOT NULL,
         state TEXT NOT NULL DEFAULT 'active',
-        adjudicationHold TEXT,
         updatedAt INTEGER NOT NULL DEFAULT 0
       );
       INSERT INTO sessions (sessionKey, model, thinkingLevel, harness)
@@ -286,7 +285,7 @@ defmodule Tightbeam.LaneTest do
       DB.execute(ctx.db, """
         INSERT INTO turns (sessionKey, messageId, origin, prompt, createdAt)
         VALUES ('agent:main:clawline:flynn:main', 'm_orphan', 'process:tightbeam',
-                'Model adjudication required.', 1)
+                'an orphan prompt', 1)
       """)
 
     {:ok, [[seq]]} = DB.query(ctx.db, "SELECT seq FROM turns WHERE messageId = 'm_orphan'")

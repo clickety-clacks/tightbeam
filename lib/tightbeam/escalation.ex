@@ -7,7 +7,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{Adjudication, ConditionFacts, DB, EventLog, Org, Roles, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
 
   @default_decision_deadline_ms 86_400_000
@@ -567,11 +567,6 @@ defmodule Tightbeam.Escalation do
   @doc """
   List visible decision requests. Owner/admin and raiser visibility are disjoint
   filters.
-
-  The listing also carries ADJUDICATION HOLDS, as a read-time union over
-  adjudication episodes (spec s4-operability-v1 §2.3 — dark ≠ opaque). The
-  decision_requests table is untouched: a hold is never a row there, its kind
-  CHECK stays locked, and kind-filtering consumers see only a new kind value.
   """
   @spec list(DB.server(), map(), String.t() | nil, keyword()) :: [map()]
   def list(db, call, status \\ "open", opts \\ []) do
@@ -586,41 +581,14 @@ defmodule Tightbeam.Escalation do
         params
       )
 
-    requests = Enum.map(rows, &(request_from_row(&1) |> list_projection()))
-
-    if status in [nil, "open"] do
-      merge_holds(requests, hold_rows(db, opts))
-    else
-      requests
-    end
-  end
-
-  # Holds interleave by raisedAt into the EXISTING order. This walks the request
-  # list and INSERTS holds into it rather than sorting the union: the existing
-  # sequence is emitted in the order the query returned it, so it cannot be
-  # permuted by a clock rollback or a migrated row whose timestamp does not track
-  # its rowid (cross-review F7 — a global sort could reorder existing rows, and
-  # the spec pins that existing results are NOT reordered).
-  defp merge_holds(requests, []), do: requests
-
-  defp merge_holds([], holds), do: Enum.sort_by(holds, &(-&1.raised_at))
-
-  defp merge_holds([request | rest], holds) do
-    {earlier, later} = Enum.split_with(holds, &(&1.raised_at > request.raised_at))
-    Enum.sort_by(earlier, &(-&1.raised_at)) ++ [request | merge_holds(rest, later)]
+    Enum.map(rows, &(request_from_row(&1) |> list_projection()))
   end
 
   @doc """
-  Fetch one visible decision request including its halted-call context. A
-  `"hold:"<episodeId>` id resolves to the synthetic hold row, read-only, under
-  the same visibility rule as the listing.
+  Fetch one visible decision request including its halted-call context.
   """
   @spec get(DB.server(), map(), String.t(), keyword()) :: map() | nil
   def get(db, call, id, opts \\ [])
-
-  def get(db, _call, "hold:" <> episode_id, opts) do
-    Enum.find(hold_rows(db, opts), &(&1.id == "hold:" <> episode_id))
-  end
 
   def get(db, call, id, opts) do
     {where, params} = visibility(call, Keyword.get(opts, :owner_user_id))
@@ -642,48 +610,6 @@ defmodule Tightbeam.Escalation do
   # heal probe — a probe-in-flight hold is still a hold, so the resolved episode
   # behind it is listed too. Admin visibility applies HERE ONLY; it never
   # broadens the decision_requests rows above.
-  defp hold_rows(db, opts) do
-    owner_user_id = Keyword.get(opts, :owner_user_id)
-    admin? = Keyword.get(opts, :admin, false)
-
-    if admin? or is_binary(owner_user_id) do
-      {:ok, rows} =
-        DB.query(
-          db,
-          """
-          SELECT e.episodeId, e.sessionKey, e.cause, e.openedAt
-          FROM adjudication_episodes AS e
-          JOIN sessions AS s ON s.sessionKey = e.sessionKey
-          WHERE s.adjudicationHold IS NOT NULL
-            AND e.episodeId IS NOT NULL
-            AND (e.status IN ('claimed','notified')
-                 OR (e.status = 'resolved' AND e.recoveryWakeId = s.adjudicationHold))
-            AND (?1 = 1 OR s.ownerUserId = ?2)
-          ORDER BY e.openedAt DESC
-          """,
-          [if(admin?, do: 1, else: 0), owner_user_id]
-        )
-
-      Enum.map(rows, fn [episode_id, session_key, cause, opened_at] ->
-        %{
-          kind: "adjudication_hold",
-          id: "hold:" <> episode_id,
-          status: "open",
-          cause: cause,
-          disposition:
-            if(Adjudication.adapter_fault?(cause),
-              do: "auto_on_adapter_heal",
-              else: "awaits_ruling"
-            ),
-          session_key: session_key,
-          raised_at: opened_at
-        }
-      end)
-    else
-      []
-    end
-  end
-
   @doc "Canonical SHA-256 action fingerprint."
   @spec digest(map()) :: String.t()
   def digest(call) do

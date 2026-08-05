@@ -169,8 +169,7 @@ defmodule Tightbeam.Ledger do
   end
 
   @typedoc """
-  Why queued work exists that no claim can ever reach. NOT a hold: an
-  adjudication hold is designed waiting and stays `:none`.
+  Why queued work exists that no claim can ever reach.
   """
   @type unclaimable :: :no_session | :session_retired
 
@@ -226,8 +225,6 @@ defmodule Tightbeam.Ledger do
                                AND EXISTS (
                                  SELECT 1 FROM sessions AS s
                                  WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
-                                   AND (s.adjudicationHold IS NULL OR
-                                        (s.adjudicationHold != '*' AND t.wakeId = s.adjudicationHold))
                                )
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
@@ -355,7 +352,7 @@ defmodule Tightbeam.Ledger do
     if won, do: :ok, else: :already_terminal
   end
 
-  @doc "Terminal transition inside the caller's transaction; recovery completion releases its hold."
+  @doc "Terminal transition inside the caller's transaction."
   @spec finish_in_txn(Txn.t(), integer(), terminal(), String.t() | nil) :: boolean()
   def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
@@ -367,68 +364,7 @@ defmodule Tightbeam.Ledger do
       [seq, terminal, now, error]
     )
 
-    won = Txn.changes(txn) == 1
-
-    if won do
-      episode = if terminal == "delivered", do: nil, else: probe_episode(txn, seq)
-
-      if is_nil(episode) do
-        Txn.q(
-          txn,
-          """
-          UPDATE sessions SET adjudicationHold = NULL, updatedAt = ?2
-          WHERE sessionKey = (SELECT sessionKey FROM turns WHERE seq = ?1)
-            AND adjudicationHold = (SELECT wakeId FROM turns WHERE seq = ?1)
-          """,
-          [seq, now]
-        )
-      else
-        # PROBE-TERMINAL TOTALITY (spec s4-operability-v1 §2): a heal probe
-        # clears the hold only by SUCCEEDING. failed / canceled / task-crash all
-        # land here and re-hold, so the adapter fault has to actually heal before
-        # the session runs real work. The human recovery path is untouched — only
-        # the heal sweep stamps the healToken this predicate requires.
-        rehold_probe(txn, seq, now, episode)
-      end
-    end
-
-    won
-  end
-
-  @doc """
-  Re-hold the session of a probe turn identified by `seq`, wide (`'*'`), and arm
-  the re-hold's probe retry (spec s4-operability-v1 §2: a re-hold is a NEW hold
-  and owes its own probe — the failed probe's adapter may already be ready and
-  will then never emit another heal edge). `episode` is the probe episode the
-  caller already resolved for this turn's wake. Shared by the terminal writers;
-  idempotent, including the retry (one per failed probe wake).
-  """
-  @spec rehold_probe(Txn.t(), integer(), integer(), map()) :: :ok
-  def rehold_probe(%Txn{} = txn, seq, now, episode) do
-    Txn.q(
-      txn,
-      """
-      UPDATE sessions SET adjudicationHold = '*', updatedAt = ?2
-      WHERE sessionKey = (SELECT sessionKey FROM turns WHERE seq = ?1)
-        AND adjudicationHold = (SELECT wakeId FROM turns WHERE seq = ?1)
-      """,
-      [seq, now]
-    )
-
-    if Txn.changes(txn) == 1 do
-      Tightbeam.Adjudication.schedule_probe_retry_in_txn(txn, episode)
-    end
-
-    :ok
-  end
-
-  defp probe_episode(%Txn{} = txn, seq) do
-    with [[wake_id]] when is_binary(wake_id) <-
-           Txn.q(txn, "SELECT wakeId FROM turns WHERE seq = ?1", [seq]) do
-      Tightbeam.Adjudication.probe_episode_for_wake_in_txn(txn, wake_id)
-    else
-      _ -> nil
-    end
+    Txn.changes(txn) == 1
   end
 
   @doc """
@@ -473,11 +409,6 @@ defmodule Tightbeam.Ledger do
         rows = Txn.q(txn, "SELECT seq FROM turns WHERE status = 'running'")
         seqs = Enum.map(rows, fn [seq] -> seq end)
 
-        # A probe in flight across a restart is a NON-DELIVERED probe terminal:
-        # its hold must survive as a wide hold rather than be freed by the
-        # boot-reconciliation sweep (spec s4-operability-v1 §2, totality).
-        # Read before the UPDATE only for the seqs; the re-hold is keyed by seq
-        # and so is order-independent.
         Txn.q(
           txn,
           """
@@ -487,10 +418,6 @@ defmodule Tightbeam.Ledger do
           """,
           [now]
         )
-
-        for seq <- seqs,
-            episode = probe_episode(txn, seq),
-            do: rehold_probe(txn, seq, now, episode)
 
         seqs
       end)

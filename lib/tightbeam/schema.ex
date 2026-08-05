@@ -9,7 +9,6 @@ defmodule Tightbeam.Schema do
     Tightbeam.Assets,
     Tightbeam.Artifacts,
     Tightbeam.CausalEvents,
-    Tightbeam.Adjudication,
     Tightbeam.Devices,
     Tightbeam.Idempotency,
     Tightbeam.ConditionFacts,

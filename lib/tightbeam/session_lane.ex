@@ -255,7 +255,7 @@ defmodule Tightbeam.SessionLane do
         {:ok, _} ->
           {"delivered", nil, nil, nil, nil}
 
-        {:error, %{reason: reason, terminal_publish: fun, adjudicate_in_txn: action} = attrs}
+        {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action} = attrs}
         when is_function(fun, 1) and is_function(action, 1) ->
           {"failed", error_text(reason), fun, action, Map.get(attrs, :post_commit)}
 

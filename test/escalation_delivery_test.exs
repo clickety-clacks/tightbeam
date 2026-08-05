@@ -492,14 +492,6 @@ defmodule Tightbeam.EscalationDeliveryTest do
              {"lib/tightbeam/wakes.ex", "Gateway.deliver_prompt_in_txn/5", "fire_in_txn/2"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "deliver_prompt/4"} =>
                1,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "adjudicate_park/4"} =>
-               1,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5",
-              "commit_adjudicated_model_swap/5"} => 1,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5",
-              "adjudicate_respawn/5"} => 1,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "release_hold/6"} =>
-               1,
              # `deliver_prompt_in_txn/5` declines undeliverable addresses BEFORE
              # appending the echo, and hands the append+enqueue pair to this one
              # private. Still exactly one turn sink; it simply has a name now.

@@ -37,7 +37,6 @@ defmodule Tightbeam.Org do
           model: Model.t() | nil,
           host: String.t(),
           cleared_through_seq: integer(),
-          adjudication_hold: String.t() | nil,
           state: String.t(),
           created_at: integer(),
           updated_at: integer()
@@ -84,7 +83,6 @@ defmodule Tightbeam.Org do
     modelContext  TEXT,
     host          TEXT NOT NULL DEFAULT 'local',
     clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
-    adjudicationHold TEXT,
     state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
     createdAt     INTEGER NOT NULL,
     updatedAt     INTEGER NOT NULL
@@ -804,7 +802,7 @@ defmodule Tightbeam.Org do
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
            identityRevision, cliToken, harness, provider,
-           model, thinkingLevel, modelContext, host, clearedThroughSeq, adjudicationHold, state, createdAt, updatedAt
+           model, thinkingLevel, modelContext, host, clearedThroughSeq, state, createdAt, updatedAt
     FROM sessions
     """
   end
@@ -832,7 +830,6 @@ defmodule Tightbeam.Org do
          model_context,
          host,
          cleared_through_seq,
-         adjudication_hold,
          state,
          created_at,
          updated_at
@@ -858,7 +855,6 @@ defmodule Tightbeam.Org do
       model: model && %Model{family: model, effort: thinking_level, context: model_context},
       host: host,
       cleared_through_seq: cleared_through_seq,
-      adjudication_hold: adjudication_hold,
       state: state,
       created_at: created_at,
       updated_at: updated_at

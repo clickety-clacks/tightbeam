@@ -844,7 +844,7 @@ defmodule Tightbeam.EffortCheckin do
           rung: rung + 1
         }
 
-      session.state == "active" and is_nil(session.adjudication_hold) ->
+      session.state == "active" ->
         %{
           session_key: key,
           user_id: nil,
@@ -1113,10 +1113,10 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp session_in_txn(txn, key) do
-    [[key, owner, spawned_by, host, state, hold, built_in]] =
+    [[key, owner, spawned_by, host, state, built_in]] =
       Txn.q(
         txn,
-        "SELECT sessionKey, ownerUserId, spawnedBy, host, state, adjudicationHold, isBuiltIn FROM sessions WHERE sessionKey = ?1",
+        "SELECT sessionKey, ownerUserId, spawnedBy, host, state, isBuiltIn FROM sessions WHERE sessionKey = ?1",
         [key]
       )
 
@@ -1126,7 +1126,6 @@ defmodule Tightbeam.EffortCheckin do
       spawned_by: spawned_by,
       host: host,
       state: state,
-      adjudication_hold: hold,
       is_built_in: built_in == 1
     }
   end

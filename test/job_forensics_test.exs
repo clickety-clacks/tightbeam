@@ -10,7 +10,6 @@ defmodule Tightbeam.JobForensicsTest do
   alias Tightbeam.Model
 
   alias Tightbeam.{
-    Adjudication,
     CausalEvents,
     DB,
     EffortCheckin,
@@ -64,15 +63,12 @@ defmodule Tightbeam.JobForensicsTest do
     for {table, column} <- [
           {"wakes", "assignmentId"},
           {"wakes", "canceledAt"},
-          {"adjudication_episodes", "assignmentId"},
-          {"adjudication_episodes", "jobRef"},
           {"subagent_markers", "assignmentId"}
         ] do
       assert column in columns(db, table), "#{table}.#{column} must exist after ensure_schema"
     end
 
     :ok = Wakes.ensure_schema(db)
-    :ok = Adjudication.ensure_schema(db)
     :ok = SubagentMarkers.ensure_schema(db)
     :ok = CausalEvents.ensure_schema(db)
 
@@ -166,107 +162,6 @@ defmodule Tightbeam.JobForensicsTest do
   end
 
   ## Proof 4 — episode attribution + adjudication events
-
-  test "proof 4: an episode carries its FAILING TURN's attribution, and reopen appends", %{db: db} do
-    work_item(db, "wi_epi")
-    session(db, "holder")
-    assignment(db, "asg_epi", "wi_epi")
-
-    # The failing turn is the durable carrier; the resolver reads THAT row.
-    seq = turn(db, "holder", assignment_id: "asg_epi", job_ref: "wi_epi", status: "failed")
-
-    {:ok, episode} =
-      DB.transaction(db, fn txn ->
-        Adjudication.claim_in_txn(txn, "holder", "other",
-          claim_window_ms: 300_000,
-          cause: "adapter_fault:claude:shared@testhost",
-          failing_seq: seq
-        )
-      end)
-
-    assert episode.assignment_id == "asg_epi"
-    assert episode.job_ref == "wi_epi"
-
-    # v1 reads still see the same CURRENT row.
-    assert Adjudication.get(db, "holder", "other").status == "claimed"
-    assert Adjudication.get_by_correlation(db, episode.correlation_key).condition == "other"
-
-    {:ok, _} =
-      DB.transaction(db, fn txn ->
-        Adjudication.resolve_in_txn(
-          txn,
-          %{episode | status: "notified"} |> notified_in_txn(txn)
-        )
-      end)
-
-    {:ok, reopened} =
-      DB.transaction(db, fn txn ->
-        Adjudication.reopen_in_txn(txn, "holder", "other",
-          claim_window_ms: 300_000,
-          cause: "adapter_fault:claude:shared@testhost",
-          failing_seq: seq,
-          reresolve_rung: 2
-        )
-      end)
-
-    assert [%{kind: "adjudication_reopen"} = event] = CausalEvents.for_job(db, "wi_epi", [])
-    assert event.assignment_id == "asg_epi"
-    assert event.job_ref == "wi_epi"
-    assert event.session_key == "holder"
-    assert event.detail["episodeId"] == reopened.episode_id
-    assert event.detail["fromState"] == "resolved"
-    assert event.detail["toState"] == "claimed"
-    assert event.detail["toRung"] == 2
-  end
-
-  test "proof 4: an episode whose failing turn has NULL attribution stamps NULL", %{db: db} do
-    session(db, "holder")
-    seq = turn(db, "holder", status: "failed")
-
-    {:ok, episode} =
-      DB.transaction(db, fn txn ->
-        Adjudication.claim_in_txn(txn, "holder", "other",
-          claim_window_ms: 300_000,
-          failing_seq: seq
-        )
-      end)
-
-    assert is_nil(episode.assignment_id)
-    assert is_nil(episode.job_ref)
-  end
-
-  test "proof 4: an overdue escalation appends its rung and target", %{db: db} do
-    work_item(db, "wi_esc")
-    # The rung this escalation lands on. The ladder verifies its top rung rather
-    # than composing the key, so an owner who never seeded a main stream has
-    # nobody to escalate TO — a different proof from this one.
-    session(db, Org.personal_session_key("flynn"))
-    session(db, "parent")
-    session(db, "holder", "parent")
-    assignment(db, "asg_esc", "wi_esc")
-    seq = turn(db, "holder", assignment_id: "asg_esc", job_ref: "wi_esc", status: "failed")
-
-    {:ok, episode} =
-      DB.transaction(db, fn txn ->
-        claimed =
-          Adjudication.claim_in_txn(txn, "holder", "other",
-            claim_window_ms: 0,
-            failing_seq: seq
-          )
-
-        {:ok, _wake, _target} = Adjudication.notify_in_txn(txn, claimed, "adjudicate", 0)
-        claimed
-      end)
-
-    :ok = Adjudication.escalate_due(db, 86_400_000)
-
-    assert [%{kind: "adjudication_escalate"} = event] = CausalEvents.for_job(db, "wi_esc", [])
-    assert event.assignment_id == "asg_esc"
-    assert event.detail["episodeId"] == episode.episode_id
-    assert event.detail["toState"] == "notified"
-    assert event.detail["toRung"] == 2
-    assert is_binary(event.detail["toTarget"])
-  end
 
   ## Proof 5 — marker attribution
 
@@ -751,16 +646,6 @@ defmodule Tightbeam.JobForensicsTest do
       ])
 
     seq
-  end
-
-  defp notified_in_txn(episode, txn) do
-    Txn.q(
-      txn,
-      "UPDATE adjudication_episodes SET status='notified' WHERE sessionKey=?1 AND condition=?2",
-      [episode.session_key, episode.condition]
-    )
-
-    episode
   end
 
   defp fetch_item(db, id) do

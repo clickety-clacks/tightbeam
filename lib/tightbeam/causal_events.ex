@@ -7,17 +7,7 @@ defmodule Tightbeam.CausalEvents do
 
   NECESSITY RULE (binding — this table is not a log): a kind is admitted ONLY if
   its fact is destroyed by an overwrite or has no timestamped home. The
-  per-kind audit that admitted the six below:
-
-  - `adjudication_reopen` — `Adjudication.reopen_in_txn/4` overwrites status,
-    correlationKey, openedAt and resolvedAt in place. Nothing else records that
-    a resolved episode reopened.
-  - `adjudication_escalate` — `escalate_due/2` overwrites status, ownerTarget,
-    ownerWakeId, reresolveRung and deadlineAt in place. The rung/target
-    progression is PARTIALLY recoverable (each owner wake row carries
-    reresolveRung, its target sessionKey and createdAt, joinable via the
-    idempotency row), but the STATE transition and its binding to the episode
-    are not — so the kind stays, and the wake rows corroborate it.
+  per-kind audit that admitted each kind below:
   - `effort_rung_advance` — `EffortCheckin.deadline_in_txn/3` overwrites
     expecterSessionKey, expecterUserId and lineageRung on the request row. The
     replacement deadline wake carries no rung (it is scheduled without
@@ -45,8 +35,7 @@ defmodule Tightbeam.CausalEvents do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @kinds ~w(adjudication_reopen adjudication_escalate effort_rung_advance
-            prod_fired prod_answered disposition_transition)
+  @kinds ~w(effort_rung_advance prod_fired prod_answered disposition_transition)
 
   # The v2-EPOCH CUTOFF: when causal_events first came into existence. Attests
   # filed before it are pre-v2 history that this table was never going to record,
@@ -67,8 +56,8 @@ defmodule Tightbeam.CausalEvents do
     assignmentId TEXT,
     sessionKey   TEXT,
     kind         TEXT NOT NULL CHECK (kind IN
-      ('adjudication_reopen','adjudication_escalate','effort_rung_advance',
-       'prod_fired','prod_answered','disposition_transition')),
+      ('effort_rung_advance','prod_fired','prod_answered',
+       'disposition_transition')),
     detail       TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS causal_events_job ON causal_events (jobRef, seq);

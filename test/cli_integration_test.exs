@@ -53,7 +53,7 @@ defmodule Tightbeam.CliIntegrationTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     # Delegate to the ONE canonical schema list. A hand-kept copy here is how
-    # this test ran without adjudication_episodes: three lists had to agree and
+    # this test ran without one of the schema modules: three lists had to agree and
     # did not.
     :ok = Tightbeam.Schema.ensure_all(db)
 

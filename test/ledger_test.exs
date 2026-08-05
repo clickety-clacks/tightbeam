@@ -170,7 +170,7 @@ defmodule Tightbeam.LedgerTest do
                session_key: "agent:main:clawline:flynn:main",
                message_id: "m-phantom",
                origin: "process:tightbeam",
-               prompt: "Model adjudication required."
+               prompt: "a prompt nobody can claim"
              })
 
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
@@ -204,15 +204,6 @@ defmodule Tightbeam.LedgerTest do
 
     assert {:unclaimable, :no_session} =
              Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
-  end
-
-  # An adjudication hold is DESIGNED waiting: the turn is claimable the moment
-  # the ruling lands. Reporting it unclaimable would age live work into `failed`.
-  test "claim_next reports a held turn as an empty claim, never unclaimable", %{db: db} do
-    enqueue!(db, "k1", "held behind an adjudication")
-    :ok = DB.execute(db, "UPDATE sessions SET adjudicationHold = '*' WHERE sessionKey = 'k1'")
-
-    assert :none = Ledger.claim_next(db, "k1", "lane")
   end
 
   test "unclaimable turns age into failed carrying the reason", %{db: db} do
