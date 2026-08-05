@@ -86,3 +86,13 @@ Each new step caught real defects on its first runs:
   demonstrably never minted a process, everything else keeps the refusal.
   Dispatched investigator disproved the park-vs-live-turn hypothesis by live
   instrumentation. 43 PASS on eezo (credentialed), WAIVED(shrdlu: no key).
+
+## Production deploy (2a09afe) — both hosts verified
+
+gibson: e499123 -> 2a09afe. Reboot-orphan fence self-resolved at boot; live
+turn DELIVERED ("ALIVE", ~5s) on Flynn's main session — OAuth refresh valid,
+adapter circuit closed/healthy. tars: e499123 -> 2a09afe, boot clean (empty
+org, no turn test; graceful-stop gap filed — macOS build ignores SIGTERM).
+Deploy artifacts: CI run 31046745837. The day's arc closed: the harness that
+was silently down since the morning reboot is serving again, unbricked by
+recognition, not surgery.
