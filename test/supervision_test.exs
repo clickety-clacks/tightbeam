@@ -1357,6 +1357,57 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq2)
   end
 
+  # The prodder's TRUE act time is the wake FIRE (spec §The prod production;
+  # the e2e that forced this fix watched a prod land after the block): a wake
+  # scheduled by a pre-block drain is suppressed at delivery, consumed as
+  # canceled with the reason named, never delivered.
+  test "a prod wake scheduled before work-blocked is suppressed at fire, not delivered", ctx do
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert [%{wake_id: wake_id}] = Wakes.list_pending(ctx.db)
+
+    file_fact(ctx.db, "work-blocked", "holder")
+
+    parent = self()
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         deliver: fn wake ->
+           send(parent, {:delivered, wake.wake_id})
+           true
+         end,
+         tick_ms: 60_000,
+         name: :suppression_scheduler}
+      )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    refute_receive {:delivered, ^wake_id}, 200
+
+    assert Wakes.get(ctx.db, wake_id).state == "canceled"
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "supervision_wake_suppressed" and &1.subject == wake_id)
+           )
+
+    # An agent's own wake to the SAME blocked session still delivers — the
+    # fact suppresses supervision's mail, never anyone else's.
+    agent_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "session:supervisor",
+        prompt: "a colleague checking in",
+        due_at: 0
+      })
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:delivered, delivered_id}, 500
+    assert delivered_id == agent_wake.wake_id
+  end
+
   test "work-blocked standing on another session leaves this holder's prods matching", ctx do
     file_fact(ctx.db, "work-blocked", "supervisor")
     seq = terminal!(ctx.db, "holder")

@@ -82,6 +82,17 @@ defmodule Tightbeam.Spinup do
   # re-check after installing, the failure remedies — is shared, so a fix to either one
   # cannot drift to only one side.
   defp provision_adapter(target, module, path, locality) do
+    # SINGLE-FLIGHT PER HOST (Tightbeam.Spinup.Flight): the adapters dir is
+    # shared across harnesses and npm rewrites node_modules while it works —
+    # two concurrent provisions interleave in one directory, and either can
+    # momentarily unlink a binary the other harness already installed
+    # (SMOKE §11 step 43 caught a launch exec'ing into that window).
+    Tightbeam.Spinup.Flight.run(target.host_name, fn ->
+      provision_adapter_in_flight(target, module, path, locality)
+    end)
+  end
+
+  defp provision_adapter_in_flight(target, module, path, locality) do
     install_dir = Path.join(target.host_config.base_dir, "adapters")
     command = install_command(target, install_dir, locality)
 

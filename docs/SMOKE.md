@@ -505,3 +505,18 @@ and raises on any miss.
     `work-blocked` + report up. This is agent effectiveness on top of
     substrate functionality; score it on a credentialed org only, and waive
     it by name elsewhere ("no onboarded harness on <host>").
+
+42. [auto: scripts/pm_prod_smoke.exs] The prod production over REAL sweep
+    time: prods arrive and the ladder advances on its own clock;
+    `work-blocked` freezes the count across live ticks (the recheck rides
+    the wake FIRE — the prodder's true act time; this step's first run
+    caught a prod landing post-block from a pre-block wake); retraction
+    plus a fresh terminal resumes it. Uncredentialed by design.
+43. [auto: scripts/pm_crash_smoke.sh] A REAL crash mid-turn: SIGKILL the
+    beam under a live credentialed turn, reboot the same base dir, and
+    require convergence — the orphan recovered as `failed_unknown`, the
+    bubble's notice delivered by the live parent, no alert. Credentialed
+    (needs ~/tb-test-keys); WAIVED by name elsewhere. This step's first
+    two runs surfaced the single-flight provisioning contract and the
+    park-fence/kill_failed defect chain — treat any new red as a finding,
+    not a flake.

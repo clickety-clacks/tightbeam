@@ -24,7 +24,7 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{DB, EventLog, Gateway}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Gateway}
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
@@ -468,7 +468,11 @@ defmodule Tightbeam.Wakes do
       delivered =
         case wake.consumer do
           "prompt" ->
-            attempt_delivery(fn -> deliver.(wake) end)
+            if suppressed_by_recognition?(db, wake) do
+              false
+            else
+              attempt_delivery(fn -> deliver.(wake) end)
+            end
 
           consumer ->
             case Map.fetch(consumers, consumer) do
@@ -488,6 +492,39 @@ defmodule Tightbeam.Wakes do
 
     evaluate_conditions(state, :tick)
     :ok
+  end
+
+  # THE PRODDER'S TRUE ACT TIME (spec production-machine-v1 §The prod
+  # production). The prodder is three-phase on the ground: match records a
+  # pending branch, drain SCHEDULES a wake, and this sweep FIRES it — so a
+  # work-blocked fact asserted after the drain's recheck but before the fire
+  # still has one effectful edge left to recognize at. Only supervision's own
+  # wakes are eligible: origin `process:tightbeam` AND an assignmentId AND the
+  # prompt consumer — today that combination is scheduled nowhere else (the
+  # escalation decision notices carry no assignmentId), and it must stay that
+  # way or this discriminator learns to suppress someone else's mail. The
+  # holder is `reresolveSeed` for an escalation wake (its TARGET is the
+  # ancestor being told) and the target itself for a prod. Nothing here gates
+  # the turn queue: a suppressed wake is supervision's own prompt withdrawn by
+  # recognition, consumed as `canceled` with the reason named — never a turn,
+  # never an agent's wake.
+  defp suppressed_by_recognition?(db, wake) do
+    supervision_owned? =
+      wake.origin == "process:tightbeam" and is_binary(wake.assignment_id)
+
+    holder = wake.reresolve_seed || wake.session_key
+
+    if supervision_owned? and ConditionFacts.standing?(db, "work-blocked", holder) do
+      Logger.info(
+        "supervision wake #{wake.wake_id} suppressed: work-blocked stands for #{holder}"
+      )
+
+      transaction!(db, fn txn -> cancel_pending_in_txn(txn, wake.wake_id) end)
+      best_effort_lifecycle(db, "supervision_wake_suppressed", wake.wake_id, "holder=#{holder}")
+      true
+    else
+      false
+    end
   end
 
   # A wake nobody can deliver is still CONSUMED — leaving it pending would spin the

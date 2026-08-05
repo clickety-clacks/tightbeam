@@ -293,6 +293,14 @@ defmodule Tightbeam.Acp.Adapter do
     module = Harness.module!(harness)
     preset = module.session_config(%{}, "")
 
+    # A LAUNCH waits out adapter provisioning in flight for this host (a
+    # no-op call in the permanent steady state): npm churn in the shared
+    # adapters dir can momentarily unlink an installed binary, and exec'ing
+    # into that window dies with an ENOENT whose cause is two seconds of
+    # internal housekeeping. Bounded by the provision's own completion; a
+    # launch that then still finds nothing fails with the ENOENT it earned.
+    :ok = Tightbeam.Spinup.Flight.await(Tightbeam.Placement.local_host_name())
+
     {:ok, conn} =
       Conn.start_link(
         cmd: Keyword.fetch!(opts, :cmd),

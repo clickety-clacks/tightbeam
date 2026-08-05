@@ -300,6 +300,7 @@ defmodule Tightbeam.Gateway do
          prod_limit: prod_limit,
          sweep_ms: config.wake_tick_ms,
          name: Tightbeam.Supervision},
+        {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
         {Tightbeam.AdapterCoordinator,
          adapter_sup: Tightbeam.AdapterSupervisor,
