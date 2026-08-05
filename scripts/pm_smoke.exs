@@ -231,4 +231,162 @@ PmSmoke.assert!(
 )
 
 IO.puts("SMOKE 7 retraction: delivered turn cleared user-alerted")
-IO.puts("SMOKE PASS: all 7 observations green")
+
+# 8. RETIRE: a queued notice canceled by a real retire still climbs — the
+#    fault remains untold, and cancellation of the MESSENGER is not a ruling
+#    on the fault. Second owner so flynn's standing state can't interfere.
+{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('kay', 0, 1)")
+
+mk_owned = fn key, owner, spawned_by, built_in ->
+  Org.create(db, %{
+    session_key: key,
+    display_name: key,
+    owner_user_id: owner,
+    origin: "user:#{owner}",
+    archetype: "default",
+    harness: "claude",
+    provider: "anthropic",
+    host: Tightbeam.Placement.local_host_name(),
+    model: Model.new("sonnet", effort: "medium"),
+    spawned_by: spawned_by,
+    is_built_in: built_in
+  })
+end
+
+kay_main = mk_owned.(Org.personal_session_key("kay"), "kay", nil, true)
+_kay_sup = mk_owned.("kay:sup", "kay", kay_main.session_key, false)
+_kay_child = mk_owned.("kay:child", "kay", "kay:sup", false)
+
+:appended = Gateway.deliver_prompt("kay:child", "user:kay", "doomed work", db: db)
+
+kay_cause =
+  PmSmoke.await(
+    fn ->
+      case PmSmoke.q!(
+             db,
+             "SELECT seq FROM turns WHERE sessionKey='kay:child' AND status IN ('failed','failed_unknown')"
+           ) do
+        [[seq]] -> {:ok, seq}
+        _ -> :retry
+      end
+    end,
+    "kay cause fails"
+  )
+
+# The notice lands queued in kay:sup; retire kay:sup THROUGH THE REAL VERB
+# before its lane can fail it, so the cancel path — not the failure path —
+# is what continues the climb. Race-tolerant: if the lane failed it first,
+# the climb continued anyway and the observation below still holds.
+PmSmoke.await(
+  fn ->
+    case PmSmoke.q!(db, "SELECT seq FROM turns WHERE sessionKey='kay:sup' AND requestRef=?1", [
+           "bubble:#{kay_cause}"
+         ]) do
+      [[_]] -> {:ok, true}
+      _ -> :retry
+    end
+  end,
+  "kay notice enqueued"
+)
+
+handlers = Gateway.handlers(%{db: db})
+
+retire_result =
+  handlers["retire"].(%{
+    origin: "user:kay",
+    principal: {:user, "kay"},
+    session_key: "kay:sup",
+    params: %{reason: "smoke retire"}
+  })
+
+IO.puts("SMOKE 8a retire verb: #{inspect(Map.take(retire_result, [:ok, :retired, :code]))}")
+
+PmSmoke.await(
+  fn ->
+    if ConditionFacts.standing?(db, "user-alerted", "kay"), do: {:ok, true}, else: :retry
+  end,
+  "kay climb survives retire and alerts"
+)
+
+IO.puts("SMOKE 8 canceled-messenger climb: kay alerted despite retired rung")
+
+# 9. PROD SUPPRESSION, live: an open assignment prods on terminal; a standing
+#    work-blocked stops the production matching; retraction resumes it.
+{:ok, _} =
+  DB.query(
+    db,
+    """
+    INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt, state)
+    VALUES ('asg_smoke', 'smoke assignment', 'smoke:sup', 'flynn', 1, 'open')
+    """
+  )
+
+blocked =
+  handlers["condition"].(%{
+    origin: "session:#{main.session_key}",
+    principal: {:session, main.session_key},
+    params: %{kind: "work-blocked", scope: "smoke:sup"}
+  })
+
+PmSmoke.assert!(match?(%{fact_id: _}, blocked), "main blocks smoke:sup")
+
+verdict_blocked = Tightbeam.Supervision.prod_production_matches?(db, "smoke:sup", "asg_smoke")
+
+unblocked =
+  handlers["condition"].(%{
+    origin: "session:#{main.session_key}",
+    principal: {:session, main.session_key},
+    params: %{kind: "work-unblocked", scope: "smoke:sup"}
+  })
+
+PmSmoke.assert!(match?(%{fact_id: _}, unblocked), "main unblocks smoke:sup")
+verdict_open = Tightbeam.Supervision.prod_production_matches?(db, "smoke:sup", "asg_smoke")
+
+IO.puts(
+  "SMOKE 9 prod production: blocked=#{inspect(elem(verdict_blocked, 0))} " <>
+    "unblocked=#{inspect(elem(verdict_open, 0))}"
+)
+
+PmSmoke.assert!(elem(verdict_blocked, 0) == :no_match, "blocked holder does not match")
+PmSmoke.assert!(elem(verdict_open, 0) == :match, "retraction resumes the match")
+
+# 10. RESTART CONVERGENCE (review B1's boot path): stop the application with
+#     work mid-flight, restart it, and require the machine to CONVERGE from
+#     whatever state the crash left — the sweeper's cursor picks up whatever
+#     the cast edge lost. New owner, fresh lineage, kill between the cause
+#     failing and the climb completing.
+{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('rin', 0, 1)")
+rin_main = mk_owned.(Org.personal_session_key("rin"), "rin", nil, true)
+_rin_sup = mk_owned.("rin:sup", "rin", rin_main.session_key, false)
+_rin_child = mk_owned.("rin:child", "rin", "rin:sup", false)
+
+:appended = Gateway.deliver_prompt("rin:child", "user:rin", "work at crash time", db: db)
+
+PmSmoke.await(
+  fn ->
+    case PmSmoke.q!(
+           db,
+           "SELECT seq FROM turns WHERE sessionKey='rin:child' AND status IN ('failed','failed_unknown')"
+         ) do
+      [[_]] -> {:ok, true}
+      _ -> :retry
+    end
+  end,
+  "rin cause fails"
+)
+
+:ok = Application.stop(:tightbeam)
+IO.puts("SMOKE 10a application stopped mid-climb")
+{:ok, _} = Application.ensure_all_started(:tightbeam)
+IO.puts("SMOKE 10b application restarted; awaiting convergence")
+
+PmSmoke.await(
+  fn ->
+    if ConditionFacts.standing?(db, "user-alerted", "rin"), do: {:ok, true}, else: :retry
+  end,
+  "rin converges to alerted after restart",
+  120
+)
+
+IO.puts("SMOKE 10 restart convergence: rin alerted from post-restart recognition")
+IO.puts("SMOKE PASS: all 10 observations green")

@@ -316,6 +316,11 @@ real gateway (`mix run --no-start scripts/client_e2e.exs`). `[manual]` steps
 stay this runbook's, run by a human, and appear in the scorecard as
 verdict-neutral MANUAL rows.
 
+Section 11 (steps 34–40) is driven by a separate hermetic driver,
+`scripts/pm_smoke.exs` — it needs no client and no credential, so it stays
+outside the sim-client journey registry; step 41 is the section's one manual,
+credentialed row.
+
 Steps 14-16 are driven: J7 restarts the gateway for real (SIGTERM the captured
 pid, await exit AND the port going unreachable, restart on the same port and
 base_dir, confirm a NEW pid) and J8 drives wakes through `/agent/dispatch`,
@@ -458,3 +463,45 @@ the literal syntax will not run as written — reach the verbs through dispatch.
     a context where the role is unbound.
     PASS: refused ("unknown or unbound role"); after binding, the same
     call succeeds and the delivered stamp reads `[from agent:probe-office]`.
+
+## 11. Production machine (facts, prodding, fault bubble)
+
+Spec: `production-machine-v1.md`; tenet T-RECOGNITION. The whole section is
+harness-INDEPENDENT — every mechanism under test is substrate recognition
+over the ledger, and the cause failure is an UN-onboarded harness, so this
+section deliberately runs with no credential and needs no per-harness legs
+except step 41. `[auto: PM<n>]` names the observation in
+`scripts/pm_smoke.exs` (`mix run --no-start`, fresh TIGHTBEAM_BASE_DIR,
+non-default port), which walks steps 34–40 against a real application boot
+and raises on any miss.
+
+34. [auto: PM1-2] A spawned session's turn fails (no credential) →
+    `[turn failed]` in its own stream, and a notice turn in its parent's
+    queue: `requestRef = bubble:<cause_seq>`, origin `process:tightbeam`.
+    PASS: both rows, exact marker.
+35. [auto: PM3-4] Every rung's notice fails (same wall) → the SAME cause
+    climbs to the owner's main; its failure posts `[no agent can act]` into
+    the main stream (a wire message, not a turn) naming the child, and
+    `user-alerted` stands for the OWNER user id.
+36. [auto: PM5] A fresh failure under the alerted owner does not re-climb:
+    still exactly one notice per rung. PASS: notice count unchanged.
+37. [auto: PM6] Seams: `process:tightbeam` filing `work-blocked` is refused
+    (`agent_only_kind`, at ConditionFacts); a session self-asserting is
+    refused (`not_authorized`, at the verb); the lineage parent's assertion
+    is accepted.
+38. [auto: PM7] The first `delivered` turn for the alerted owner files
+    `user-alert-cleared`; `standing?` flips false.
+39. [auto: PM8] A queued notice canceled by a REAL `retire` of its recipient
+    still climbs — cancellation of the messenger is not a ruling on the
+    fault. PASS: the retiree's owner ends alerted.
+40. [auto: PM9-10] The prod production stops matching for a `work-blocked`
+    holder and matches again on retraction; and an `Application.stop`/
+    restart mid-climb CONVERGES: the sweeper's cursor recognizes what the
+    cast edge lost, and the owner ends alerted. This is review B1's boot
+    path, exercised for real.
+41. [manual] [divergent] The credentialed leg: with a harness onboarded, a
+    parent that RECEIVES a notice turn actually runs it (delivered), reads
+    the model-policy guidance in its context, and acts — retry, redirect, or
+    `work-blocked` + report up. This is agent effectiveness on top of
+    substrate functionality; score it on a credentialed org only, and waive
+    it by name elsewhere ("no onboarded harness on <host>").
